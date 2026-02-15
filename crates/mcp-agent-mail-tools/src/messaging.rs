@@ -111,6 +111,123 @@ fn contact_blocked_error() -> McpError {
     )
 }
 
+fn contact_required_error(
+    project_key: &str,
+    sender_name: &str,
+    blocked_recipients: &[String],
+    attempted: &[String],
+    ttl_seconds: i64,
+) -> McpError {
+    let mut blocked_sorted = blocked_recipients.to_vec();
+    blocked_sorted.sort();
+    blocked_sorted.dedup();
+    let recipient_list = blocked_sorted.join(", ");
+    let sample_target = blocked_sorted.first().cloned().unwrap_or_default();
+
+    let mut err_msg_parts = vec![
+        format!("Contact approval required for recipients: {recipient_list}."),
+        format!(
+            "Before retrying, request approval with \
+             `request_contact(project_key='{project_key}', from_agent='{sender_name}', \
+             to_agent='{sample_target}')` or run \
+             `macro_contact_handshake(project_key='{project_key}', requester='{sender_name}', \
+             target='{sample_target}', auto_accept=True)`."
+        ),
+        "Alternatively, send your message inside a recent thread that already includes them by reusing its thread_id.".to_string(),
+    ];
+    if !attempted.is_empty() {
+        err_msg_parts.push(format!(
+            "Automatic handshake attempts already ran for: {}; wait for approval or retry the suggested calls explicitly.",
+            attempted.join(", ")
+        ));
+    }
+    let err_msg = err_msg_parts.join(" ");
+
+    let mut examples = vec![json!({
+        "tool": "macro_contact_handshake",
+        "arguments": {
+            "project_key": project_key,
+            "requester": sender_name,
+            "target": blocked_recipients.first().cloned().unwrap_or_default(),
+            "auto_accept": true,
+            "ttl_seconds": ttl_seconds,
+        }
+    })];
+    for nm in blocked_recipients.iter().take(3) {
+        examples.push(json!({
+            "tool": "request_contact",
+            "arguments": {
+                "project_key": project_key,
+                "from_agent": sender_name,
+                "to_agent": nm,
+                "ttl_seconds": ttl_seconds,
+            }
+        }));
+    }
+
+    legacy_tool_error(
+        "CONTACT_REQUIRED",
+        err_msg,
+        true,
+        json!({
+            "recipients_blocked": blocked_sorted,
+            "remedies": [
+                "Call request_contact(project_key, from_agent, to_agent) to request approval",
+                "Call macro_contact_handshake(project_key, requester, target, auto_accept=true) to automate"
+            ],
+            "auto_contact_attempted": attempted,
+            "suggested_tool_calls": examples,
+        }),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContactPolicyDecision {
+    Allow,
+    RequireApproval,
+    BlockAll,
+}
+
+fn contact_policy_decision(
+    sender_name: &str,
+    recipient_name: &str,
+    policy_raw: &str,
+    recent_ok: bool,
+    approved: bool,
+) -> ContactPolicyDecision {
+    // 1) Allow self messages first.
+    if recipient_name == sender_name {
+        return ContactPolicyDecision::Allow;
+    }
+
+    let mut policy = policy_raw.to_lowercase();
+    if !["open", "auto", "contacts_only", "block_all"].contains(&policy.as_str()) {
+        policy = "auto".to_string();
+    }
+
+    // 2) block_all is an immediate hard stop.
+    if policy == "block_all" {
+        return ContactPolicyDecision::BlockAll;
+    }
+
+    if policy == "open" {
+        return ContactPolicyDecision::Allow;
+    }
+
+    // 3) auto + recent contact.
+    if policy == "auto" && recent_ok {
+        return ContactPolicyDecision::Allow;
+    }
+
+    // 4) approved AgentLink.
+    if approved {
+        return ContactPolicyDecision::Allow;
+    }
+
+    // 5) otherwise blocked.
+    ContactPolicyDecision::RequireApproval
+}
+
 async fn resolve_or_register_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -931,42 +1048,37 @@ effective_free_bytes={free}"
         let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
         let mut blocked: Vec<String> = Vec::new();
-        for agent in recipient_map.values() {
-            if agent.name == sender.name {
+        for name in resolved_to
+            .iter()
+            .chain(resolved_cc_recipients.iter())
+            .chain(resolved_bcc_recipients.iter())
+        {
+            let Some(agent) = recipient_map.get(&name.to_lowercase()) else {
                 continue;
-            }
-            if auto_ok_names.contains(&agent.name) {
-                continue;
-            }
+            };
             let rec_id = agent.id.unwrap_or(0);
-            let mut policy = agent.contact_policy.to_lowercase();
-            if !["open", "auto", "contacts_only", "block_all"].contains(&policy.as_str()) {
-                policy = "auto".to_string();
-            }
-            if policy == "open" {
-                continue;
-            }
-            if policy == "block_all" {
-                return Err(contact_blocked_error());
-            }
+            let recent_ok = auto_ok_names.contains(&agent.name) || recent_set.contains(&rec_id);
             let approved = approved_set.contains(&rec_id);
-            let recent = recent_set.contains(&rec_id);
-            if policy == "auto" {
-                if approved || recent {
-                    continue;
-                }
-            } else if policy == "contacts_only" && approved {
-                continue;
+            match contact_policy_decision(
+                &sender.name,
+                &agent.name,
+                &agent.contact_policy,
+                recent_ok,
+                approved,
+            ) {
+                ContactPolicyDecision::Allow => {}
+                ContactPolicyDecision::BlockAll => return Err(contact_blocked_error()),
+                ContactPolicyDecision::RequireApproval => blocked.push(agent.name.clone()),
             }
-            blocked.push(agent.name.clone());
         }
 
+        let mut attempted: Vec<String> = Vec::new();
         if !blocked.is_empty() {
             let effective_auto_contact =
                 auto_contact_if_blocked.unwrap_or(config.messaging_auto_handshake_on_block);
             if effective_auto_contact {
                 for name in &blocked {
-                    let _ = Box::pin(crate::macros::macro_contact_handshake(
+                    if Box::pin(crate::macros::macro_contact_handshake(
                         ctx,
                         project.human_key.clone(),
                         Some(sender.name.clone()),
@@ -985,7 +1097,11 @@ effective_free_bytes={free}"
                         None,
                         None,
                     ))
-                    .await;
+                    .await
+                    .is_ok()
+                    {
+                        attempted.push(name.clone());
+                    }
                 }
 
                 let approved_ids = db_outcome_to_mcp_result(
@@ -1027,31 +1143,12 @@ effective_free_bytes={free}"
         }
 
         if !blocked.is_empty() {
-            let blocked_sorted: Vec<String> = {
-                let mut v = blocked.clone();
-                v.sort();
-                v.dedup();
-                v
-            };
-            let recipient_list = blocked_sorted.join(", ");
-            let sample = blocked_sorted.first().cloned().unwrap_or_default();
-            return Err(legacy_tool_error(
-                "CONTACT_REQUIRED",
-                format!(
-                    "Contact approval required for recipients: {recipient_list}. \
-                     Before retrying, request approval with \
-                     `request_contact(project_key='{project_key}', from_agent='{sender_name}', \
-                     to_agent='{sample}')` or run \
-                     `macro_contact_handshake(project_key='{project_key}', \
-                     requester='{sender_name}', target='{sample}', auto_accept=True)`.",
-                    project_key = project.human_key,
-                    sender_name = sender.name,
-                ),
-                true,
-                json!({
-                    "blocked_recipients": blocked_sorted,
-                    "sample_target": sample,
-                }),
+            return Err(contact_required_error(
+                &project.human_key,
+                &sender.name,
+                &blocked,
+                &attempted,
+                ttl_seconds,
             ));
         }
     }
@@ -1775,6 +1872,161 @@ mod tests {
         assert!(
             !payload.contains_key("data"),
             "CONTACT_BLOCKED parity requires no data payload"
+        );
+    }
+
+    #[test]
+    fn contact_required_error_message_parity() {
+        let blocked = vec!["BlueLake".to_string(), "RedCat".to_string()];
+        let attempted = vec!["BlueLake".to_string()];
+        let err = contact_required_error("/tmp/project", "GreenCastle", &blocked, &attempted, 3600);
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "Contact approval required for recipients: BlueLake, RedCat. Before retrying, request approval with `request_contact(project_key='/tmp/project', from_agent='GreenCastle', to_agent='BlueLake')` or run `macro_contact_handshake(project_key='/tmp/project', requester='GreenCastle', target='BlueLake', auto_accept=True)`. Alternatively, send your message inside a recent thread that already includes them by reusing its thread_id. Automatic handshake attempts already ran for: BlueLake; wait for approval or retry the suggested calls explicitly."
+        );
+    }
+
+    #[test]
+    fn contact_required_error_payload_parity() {
+        let blocked = vec!["Zulu".to_string(), "Alpha".to_string(), "Zulu".to_string()];
+        let attempted = vec!["Zulu".to_string()];
+        let err = contact_required_error("/tmp/project", "GreenCastle", &blocked, &attempted, 1800);
+
+        let data = err
+            .data
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|root| root.get("error"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|payload| payload.get("data"))
+            .and_then(serde_json::Value::as_object)
+            .expect("CONTACT_REQUIRED payload should include error.data object");
+
+        assert_eq!(
+            data.get("recipients_blocked"),
+            Some(&serde_json::json!(["Alpha", "Zulu"]))
+        );
+        assert_eq!(
+            data.get("remedies"),
+            Some(&serde_json::json!([
+                "Call request_contact(project_key, from_agent, to_agent) to request approval",
+                "Call macro_contact_handshake(project_key, requester, target, auto_accept=true) to automate"
+            ]))
+        );
+        assert_eq!(
+            data.get("auto_contact_attempted"),
+            Some(&serde_json::json!(["Zulu"]))
+        );
+
+        let calls = data
+            .get("suggested_tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .expect("CONTACT_REQUIRED payload should include suggested_tool_calls array");
+        assert_eq!(
+            calls[0],
+            serde_json::json!({
+                "tool": "macro_contact_handshake",
+                "arguments": {
+                    "project_key": "/tmp/project",
+                    "requester": "GreenCastle",
+                    "target": "Zulu",
+                    "auto_accept": true,
+                    "ttl_seconds": 1800,
+                }
+            })
+        );
+        assert_eq!(
+            calls[1],
+            serde_json::json!({
+                "tool": "request_contact",
+                "arguments": {
+                    "project_key": "/tmp/project",
+                    "from_agent": "GreenCastle",
+                    "to_agent": "Zulu",
+                    "ttl_seconds": 1800,
+                }
+            })
+        );
+        assert_eq!(
+            calls[2],
+            serde_json::json!({
+                "tool": "request_contact",
+                "arguments": {
+                    "project_key": "/tmp/project",
+                    "from_agent": "GreenCastle",
+                    "to_agent": "Alpha",
+                    "ttl_seconds": 1800,
+                }
+            })
+        );
+        assert_eq!(
+            calls[3],
+            serde_json::json!({
+                "tool": "request_contact",
+                "arguments": {
+                    "project_key": "/tmp/project",
+                    "from_agent": "GreenCastle",
+                    "to_agent": "Zulu",
+                    "ttl_seconds": 1800,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn contact_policy_decision_self_allowed_even_if_block_all() {
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentA", "block_all", false, false),
+            ContactPolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn contact_policy_decision_block_all_overrides_recent_and_approved() {
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentB", "block_all", true, true),
+            ContactPolicyDecision::BlockAll
+        );
+    }
+
+    #[test]
+    fn contact_policy_decision_auto_recent_then_link() {
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentB", "auto", true, false),
+            ContactPolicyDecision::Allow
+        );
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentB", "auto", false, true),
+            ContactPolicyDecision::Allow
+        );
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentB", "auto", false, false),
+            ContactPolicyDecision::RequireApproval
+        );
+    }
+
+    #[test]
+    fn contact_policy_decision_contacts_only_requires_link() {
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentB", "contacts_only", true, false),
+            ContactPolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentB", "contacts_only", false, true),
+            ContactPolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn contact_policy_decision_invalid_policy_defaults_to_auto() {
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentB", "unexpected_policy", true, false),
+            ContactPolicyDecision::Allow
+        );
+        assert_eq!(
+            contact_policy_decision("AgentA", "AgentB", "unexpected_policy", false, false),
+            ContactPolicyDecision::RequireApproval
         );
     }
 

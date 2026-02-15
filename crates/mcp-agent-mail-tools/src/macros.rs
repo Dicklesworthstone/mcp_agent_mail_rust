@@ -374,7 +374,9 @@ pub async fn macro_prepare_thread(
 /// - `reason`: Reservation reason
 /// - `auto_release`: Release after operation
 #[allow(clippy::too_many_arguments)]
-#[tool(description = "Reserve a set of file paths and optionally release them at the end of the workflow.")]
+#[tool(
+    description = "Reserve a set of file paths and optionally release them at the end of the workflow."
+)]
 pub async fn macro_file_reservation_cycle(
     ctx: &McpContext,
     project_key: String,
@@ -481,7 +483,9 @@ pub async fn macro_file_reservation_cycle(
 /// - `program`: Program for registration
 /// - `model`: Model for registration
 /// - `task_description`: Task for registration
-#[tool(description = "Request contact permissions and optionally auto-approve plus send a welcome message.")]
+#[tool(
+    description = "Request contact permissions and optionally auto-approve plus send a welcome message."
+)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn macro_contact_handshake(
     ctx: &McpContext,
