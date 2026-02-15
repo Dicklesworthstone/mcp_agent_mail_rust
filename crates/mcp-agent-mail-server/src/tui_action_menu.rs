@@ -26,6 +26,11 @@ pub struct ActionEntry {
     pub action: ActionKind,
     /// Whether this action is destructive (shows red, triggers modal).
     pub is_destructive: bool,
+    /// Whether this action is currently available. Disabled actions are
+    /// rendered dimmed and cannot be invoked.
+    pub enabled: bool,
+    /// Human-readable reason why this action is disabled (shown in tooltip/toast).
+    pub disabled_reason: Option<String>,
 }
 
 impl ActionEntry {
@@ -38,6 +43,8 @@ impl ActionEntry {
             keybinding: None,
             action,
             is_destructive: false,
+            enabled: true,
+            disabled_reason: None,
         }
     }
 
@@ -59,6 +66,14 @@ impl ActionEntry {
     #[must_use]
     pub const fn destructive(mut self) -> Self {
         self.is_destructive = true;
+        self
+    }
+
+    /// Mark as disabled with an explanation.
+    #[must_use]
+    pub fn disabled(mut self, reason: impl Into<String>) -> Self {
+        self.enabled = false;
+        self.disabled_reason = Some(reason.into());
         self
     }
 
@@ -192,6 +207,8 @@ const ACTION_MENU_BG: PackedRgba = PackedRgba::rgb(30, 30, 35);
 const ACTION_MENU_BORDER: PackedRgba = PackedRgba::rgb(80, 80, 100);
 const ACTION_MENU_SELECTED_BG: PackedRgba = PackedRgba::rgb(60, 80, 120);
 const ACTION_MENU_DESTRUCTIVE: PackedRgba = PackedRgba::rgb(255, 100, 100);
+const ACTION_MENU_DISABLED_FG: PackedRgba = PackedRgba::rgb(100, 100, 110);
+const ACTION_MENU_DISABLED_REASON: PackedRgba = PackedRgba::rgb(80, 80, 90);
 #[allow(dead_code)] // Reserved for future use when rendering keybinding hints
 const ACTION_MENU_KEYBINDING: PackedRgba = PackedRgba::rgb(150, 150, 180);
 
@@ -214,10 +231,16 @@ impl<'a> ActionMenu<'a> {
             .state
             .entries
             .iter()
-            .map(|e| e.label.len() + e.keybinding.as_ref().map_or(0, |k| k.len() + 3))
+            .map(|e| {
+                let mut w = e.label.len() + e.keybinding.as_ref().map_or(0, |k| k.len() + 3);
+                if !e.enabled {
+                    w += e.disabled_reason.as_ref().map_or(0, |r| r.len() + 2);
+                }
+                w
+            })
             .max()
             .unwrap_or(10);
-        let width = (max_label_len + 4).clamp(20, 40) as u16;
+        let width = (max_label_len + 4).clamp(20, 50) as u16;
         let height = (self.state.len() + 2).min(12) as u16;
 
         // Position near anchor row, biased to the right side
@@ -259,6 +282,14 @@ impl<'a> ActionMenu<'a> {
                 text.push_str(kb);
                 text.push(']');
             }
+            // Append disabled reason as dimmed suffix.
+            let label_len = text.len();
+            if !entry.enabled {
+                if let Some(ref reason) = entry.disabled_reason {
+                    text.push_str("  ");
+                    text.push_str(reason);
+                }
+            }
 
             // Render each character
             for (j, ch) in text.chars().enumerate() {
@@ -267,7 +298,14 @@ impl<'a> ActionMenu<'a> {
                     break;
                 }
                 let mut cell = Cell::from_char(ch);
-                if entry.is_destructive {
+                if !entry.enabled {
+                    // Disabled: dimmed text; reason part even dimmer.
+                    cell.fg = if j >= label_len {
+                        ACTION_MENU_DISABLED_REASON
+                    } else {
+                        ACTION_MENU_DISABLED_FG
+                    };
+                } else if entry.is_destructive {
                     cell.fg = ACTION_MENU_DESTRUCTIVE;
                 } else if is_selected {
                     cell.fg = PackedRgba::rgb(255, 255, 255);
@@ -360,6 +398,8 @@ pub enum ActionMenuResult {
     Dismissed,
     /// An action was selected.
     Selected(ActionKind, String),
+    /// A disabled action was attempted. Contains the reason string.
+    DisabledAttempt(String),
 }
 
 /// Manages the action menu lifecycle.
@@ -425,10 +465,19 @@ impl ActionMenuManager {
             }
             KeyCode::Enter => {
                 if let Some(entry) = state.selected_entry() {
-                    let action = entry.action.clone();
-                    let context = state.context_id().to_string();
-                    self.active = None;
-                    Some(ActionMenuResult::Selected(action, context))
+                    if !entry.enabled {
+                        // Disabled: report reason via DisabledAttempt result.
+                        let reason = entry
+                            .disabled_reason
+                            .clone()
+                            .unwrap_or_else(|| "Action unavailable".into());
+                        Some(ActionMenuResult::DisabledAttempt(reason))
+                    } else {
+                        let action = entry.action.clone();
+                        let context = state.context_id().to_string();
+                        self.active = None;
+                        Some(ActionMenuResult::Selected(action, context))
+                    }
                 } else {
                     Some(ActionMenuResult::Consumed)
                 }
@@ -870,5 +919,65 @@ mod tests {
         assert!(!actions.iter().any(|a| a.label == "Approve"));
         assert!(!actions.iter().any(|a| a.label == "Deny"));
         assert!(actions.iter().any(|a| a.label == "View agent"));
+    }
+
+    // ── disabled entry tests ────────────────────────────────────
+
+    #[test]
+    fn disabled_entry_builder() {
+        let entry = ActionEntry::new("Release", ActionKind::Dismiss)
+            .disabled("No active reservation");
+        assert!(!entry.enabled);
+        assert_eq!(
+            entry.disabled_reason.as_deref(),
+            Some("No active reservation")
+        );
+    }
+
+    #[test]
+    fn enabled_entry_by_default() {
+        let entry = ActionEntry::new("View", ActionKind::Dismiss);
+        assert!(entry.enabled);
+        assert!(entry.disabled_reason.is_none());
+    }
+
+    #[test]
+    fn disabled_entry_blocks_selection() {
+        let entries = vec![
+            ActionEntry::new("Enabled", ActionKind::Execute("ok".into())),
+            ActionEntry::new("Disabled", ActionKind::Execute("nope".into()))
+                .disabled("Not available"),
+        ];
+        let mut mgr = ActionMenuManager::new();
+        mgr.open(entries, 0, "ctx");
+
+        // Select second (disabled) entry.
+        let event = Event::Key(ftui::KeyEvent::new(KeyCode::Down));
+        mgr.handle_event(&event);
+
+        // Try Enter on disabled entry.
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        let result = mgr.handle_event(&enter);
+        assert!(
+            matches!(result, Some(ActionMenuResult::DisabledAttempt(ref r)) if r == "Not available"),
+            "Enter on disabled should return DisabledAttempt, got {:?}",
+            result,
+        );
+        // Menu should still be open.
+        assert!(mgr.is_active());
+    }
+
+    #[test]
+    fn enabled_entry_allows_selection() {
+        let entries = vec![
+            ActionEntry::new("Go", ActionKind::Execute("go".into())),
+        ];
+        let mut mgr = ActionMenuManager::new();
+        mgr.open(entries, 0, "ctx");
+
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        let result = mgr.handle_event(&enter);
+        assert!(matches!(result, Some(ActionMenuResult::Selected(_, _))));
+        assert!(!mgr.is_active());
     }
 }

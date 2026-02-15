@@ -68,6 +68,17 @@ const REMOTE_EVENTS_PER_TICK: usize = 64;
 static DEFERRED_CONFIRMED_ACTION: std::sync::Mutex<Option<(String, String)>> =
     std::sync::Mutex::new(None);
 
+/// Tracks the outcome of a dispatched action for feedback surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// Operation started — shown as in-flight indicator.
+    InFlight { operation: String },
+    /// Operation completed successfully.
+    Success { operation: String, summary: String },
+    /// Operation failed with an error.
+    Failure { operation: String, error: String },
+}
+
 /// Semantic transition kind inferred from source/destination screen categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransitionKind {
@@ -830,6 +841,8 @@ pub struct MailAppModel {
     mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher,
     /// Coach hint manager for one-shot contextual tips.
     coach_hints: CoachHintManager,
+    /// Recent action outcomes for feedback surfaces.
+    action_outcomes: Vec<ActionOutcome>,
 }
 
 impl MailAppModel {
@@ -892,6 +905,7 @@ impl MailAppModel {
             screen_panics: RefCell::new(HashMap::new()),
             mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher::new(),
             coach_hints: CoachHintManager::new(),
+            action_outcomes: Vec::new(),
         }
     }
 
@@ -1130,15 +1144,18 @@ impl MailAppModel {
             }
 
             // ── Server-dispatched operations ──────────────────────
-            // These produce a toast confirmation; actual execution is
+            // These produce an in-flight toast; actual execution is
             // delegated to the screen's update handler via ActionExecute.
             "acknowledge" | "mark_read" | "renew" | "release"
             | "force_release" | "summarize"
             | "approve_contact" | "deny_contact" | "block_contact" => {
                 let op = operation.to_string();
                 let ctx = context.to_string();
+                self.action_outcomes.push(ActionOutcome::InFlight {
+                    operation: cmd.to_string(),
+                });
                 self.notifications.notify(
-                    Toast::new(format!("Executing: {cmd}"))
+                    Toast::new(format!("Executing: {cmd}…"))
                         .icon(ToastIcon::Info)
                         .duration(Duration::from_secs(2)),
                 );
@@ -1174,6 +1191,39 @@ impl MailAppModel {
             return self.dispatch_execute_operation(&operation, &context);
         }
         Cmd::none()
+    }
+
+    /// Record an action outcome (success or failure) and show a toast.
+    pub fn record_action_outcome(&mut self, outcome: ActionOutcome) {
+        match &outcome {
+            ActionOutcome::Success { operation, summary } => {
+                self.notifications.notify(
+                    Toast::new(format!("{operation}: {summary}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+            }
+            ActionOutcome::Failure { operation, error } => {
+                self.notifications.notify(
+                    Toast::new(format!("{operation} failed: {error}"))
+                        .icon(ToastIcon::Error)
+                        .duration(Duration::from_secs(5)),
+                );
+            }
+            ActionOutcome::InFlight { .. } => {}
+        }
+        // Remove any prior InFlight for the same operation.
+        if let ActionOutcome::Success { ref operation, .. }
+        | ActionOutcome::Failure { ref operation, .. } = outcome
+        {
+            self.action_outcomes
+                .retain(|o| !matches!(o, ActionOutcome::InFlight { operation: op } if op == operation));
+        }
+        // Cap outcome history to 20 entries.
+        if self.action_outcomes.len() >= 20 {
+            self.action_outcomes.remove(0);
+        }
+        self.action_outcomes.push(outcome);
     }
 
     /// Current accessibility settings.
@@ -2240,6 +2290,14 @@ impl Model for MailAppModel {
                         }
                         ActionMenuResult::Selected(action, context) => {
                             return self.dispatch_action_menu_selection(action, &context);
+                        }
+                        ActionMenuResult::DisabledAttempt(reason) => {
+                            self.notifications.notify(
+                                Toast::new(reason)
+                                    .icon(ToastIcon::Warning)
+                                    .duration(Duration::from_secs(3)),
+                            );
+                            return Cmd::none();
                         }
                     }
                 }
@@ -7556,13 +7614,10 @@ mod tests {
         let mut model = test_model();
         // Open action menu
         model.action_menu.open(
-            vec![crate::tui_action_menu::ActionEntry {
-                label: "Test".to_string(),
-                description: None,
-                keybinding: None,
-                action: crate::tui_action_menu::ActionKind::Execute("test".to_string()),
-                is_destructive: false,
-            }],
+            vec![crate::tui_action_menu::ActionEntry::new(
+                "Test",
+                crate::tui_action_menu::ActionKind::Execute("test".to_string()),
+            )],
             5, // anchor_row
             "test-ctx",
         );
@@ -7871,5 +7926,76 @@ mod tests {
         let cmd = model.drain_deferred_confirmed_action();
         assert!(matches!(cmd, Cmd::Msg(_)), "acknowledge → Cmd::Msg");
         assert!(read_deferred().is_none(), "static should be drained");
+    }
+
+    // ── ActionOutcome tests ─────────────────────────────────────
+
+    #[test]
+    fn action_outcome_success_shows_toast() {
+        let mut model = test_model();
+        model.record_action_outcome(ActionOutcome::Success {
+            operation: "acknowledge".into(),
+            summary: "Message 42 acknowledged".into(),
+        });
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > 0);
+        assert_eq!(model.action_outcomes.len(), 1);
+    }
+
+    #[test]
+    fn action_outcome_failure_shows_error_toast() {
+        let mut model = test_model();
+        model.record_action_outcome(ActionOutcome::Failure {
+            operation: "release".into(),
+            error: "Reservation not found".into(),
+        });
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > 0);
+    }
+
+    #[test]
+    fn action_outcome_replaces_in_flight() {
+        let mut model = test_model();
+        model.record_action_outcome(ActionOutcome::InFlight {
+            operation: "renew".into(),
+        });
+        assert_eq!(model.action_outcomes.len(), 1);
+
+        // Success replaces the InFlight entry.
+        model.record_action_outcome(ActionOutcome::Success {
+            operation: "renew".into(),
+            summary: "TTL extended".into(),
+        });
+        assert_eq!(model.action_outcomes.len(), 1);
+        assert!(matches!(
+            model.action_outcomes[0],
+            ActionOutcome::Success { .. }
+        ));
+    }
+
+    #[test]
+    fn action_outcome_caps_history() {
+        let mut model = test_model();
+        for i in 0..25 {
+            model.record_action_outcome(ActionOutcome::Success {
+                operation: format!("op-{i}"),
+                summary: "done".into(),
+            });
+        }
+        assert!(
+            model.action_outcomes.len() <= 21,
+            "outcome history should be capped"
+        );
+    }
+
+    #[test]
+    fn server_dispatch_records_in_flight() {
+        let mut model = test_model();
+        model.action_outcomes.clear();
+        let _cmd = model.dispatch_execute_operation("acknowledge", "msg:99");
+        assert!(
+            model.action_outcomes.iter().any(|o| matches!(o, ActionOutcome::InFlight { operation } if operation == "acknowledge")),
+            "server-dispatched op should record InFlight outcome"
+        );
     }
 }
