@@ -2958,6 +2958,102 @@ impl AnimationBudget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// FocusGlow — subtle micro-motion cue for list selection changes
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tick-budget for the focus-glow micro-animation.
+const FOCUS_GLOW_TICKS: u8 = 4;
+
+/// Subtle selection-change glow that decays over a few ticks.
+///
+/// When the selected index changes, `on_selection_change()` starts a short
+/// glow animation.  The glow intensity decays from 1.0 to 0.0 over
+/// [`FOCUS_GLOW_TICKS`] ticks using an ease-out curve.  Screens use
+/// [`glow_bg`] to tint the selected row's background during the glow.
+///
+/// Respects reduced-motion: when disabled, all methods return static colors.
+pub struct FocusGlow {
+    /// Last known selected index.
+    last_index: Option<usize>,
+    /// Remaining glow ticks (counts down from `FOCUS_GLOW_TICKS`).
+    ticks_remaining: u8,
+    /// Whether micro-motion is allowed.
+    motion_enabled: bool,
+}
+
+impl FocusGlow {
+    /// Create a new glow tracker (motion on by default).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_index: None,
+            ticks_remaining: 0,
+            motion_enabled: true,
+        }
+    }
+
+    /// Set whether motion is enabled (call on accessibility change).
+    pub fn set_motion_enabled(&mut self, enabled: bool) {
+        self.motion_enabled = enabled;
+        if !enabled {
+            self.ticks_remaining = 0;
+        }
+    }
+
+    /// Notify that the selection may have changed.
+    /// Returns `true` if a glow animation was started.
+    pub fn on_selection_change(&mut self, new_index: Option<usize>) -> bool {
+        let changed = self.last_index != new_index && new_index.is_some();
+        self.last_index = new_index;
+        if changed && self.motion_enabled {
+            self.ticks_remaining = FOCUS_GLOW_TICKS;
+            return true;
+        }
+        false
+    }
+
+    /// Advance animation by one tick.
+    pub fn tick(&mut self) {
+        self.ticks_remaining = self.ticks_remaining.saturating_sub(1);
+    }
+
+    /// Current glow intensity (0.0 = no glow, 1.0 = full glow).
+    /// Uses ease-out for natural decay.
+    #[must_use]
+    pub fn intensity(&self) -> f32 {
+        if self.ticks_remaining == 0 || !self.motion_enabled {
+            return 0.0;
+        }
+        let t = f32::from(self.ticks_remaining) / f32::from(FOCUS_GLOW_TICKS.max(1));
+        // Ease-out quadratic: keeps bright longer, then fades quickly.
+        t * t
+    }
+
+    /// Whether a glow is currently active.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.ticks_remaining > 0 && self.motion_enabled
+    }
+
+    /// Compute the glow-tinted background for the selected row.
+    ///
+    /// Blends `base_bg` toward `glow_color` by the current intensity.
+    /// When frame budget is exhausted, returns `base_bg` unchanged.
+    #[must_use]
+    pub fn glow_bg(
+        &self,
+        base_bg: ftui::PackedRgba,
+        glow_color: ftui::PackedRgba,
+        budget: &AnimationBudget,
+    ) -> ftui::PackedRgba {
+        if !self.is_active() || budget.exhausted() {
+            return base_bg;
+        }
+        crate::tui_theme::lerp_color(base_bg, glow_color, self.intensity() * 0.35)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ChartTransition — eased interpolation for chart value updates (br-3jz52)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -8514,5 +8610,96 @@ mod tests {
             per_iter_us <= 2_000,
             "ambient renderer exceeded budget: {per_iter_us}µs/frame"
         );
+    }
+
+    // ── FocusGlow tests ─────────────────────────────────────────
+
+    #[test]
+    fn focus_glow_starts_inactive() {
+        let glow = FocusGlow::new();
+        assert!(!glow.is_active());
+        assert!((glow.intensity() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn focus_glow_activates_on_selection_change() {
+        let mut glow = FocusGlow::new();
+        assert!(glow.on_selection_change(Some(0)));
+        assert!(glow.is_active());
+        assert!(glow.intensity() > 0.0);
+    }
+
+    #[test]
+    fn focus_glow_no_activate_on_same_index() {
+        let mut glow = FocusGlow::new();
+        glow.on_selection_change(Some(3));
+        // Tick to clear
+        for _ in 0..10 {
+            glow.tick();
+        }
+        assert!(!glow.on_selection_change(Some(3)));
+        assert!(!glow.is_active());
+    }
+
+    #[test]
+    fn focus_glow_decays_over_ticks() {
+        let mut glow = FocusGlow::new();
+        glow.on_selection_change(Some(0));
+        let initial = glow.intensity();
+
+        glow.tick();
+        let after_one = glow.intensity();
+        assert!(after_one < initial, "should decay: {after_one} < {initial}");
+
+        // After all ticks, should be zero
+        for _ in 0..10 {
+            glow.tick();
+        }
+        assert!((glow.intensity() - 0.0).abs() < f32::EPSILON);
+        assert!(!glow.is_active());
+    }
+
+    #[test]
+    fn focus_glow_disabled_when_motion_off() {
+        let mut glow = FocusGlow::new();
+        glow.set_motion_enabled(false);
+        glow.on_selection_change(Some(5));
+        assert!(!glow.is_active());
+        assert!((glow.intensity() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn focus_glow_bg_falls_back_when_budget_exhausted() {
+        let mut glow = FocusGlow::new();
+        glow.on_selection_change(Some(0));
+
+        let base = PackedRgba::rgb(30, 30, 30);
+        let accent = PackedRgba::rgb(200, 100, 255);
+
+        // With budget: should blend toward accent
+        let budget_ok = AnimationBudget::for_60fps();
+        let bg_ok = glow.glow_bg(base, accent, &budget_ok);
+        assert_ne!(bg_ok, base, "should blend when budget OK");
+
+        // With exhausted budget: should return base unchanged
+        let mut budget_bad = AnimationBudget::new(std::time::Duration::ZERO);
+        budget_bad.spend(std::time::Duration::from_millis(1));
+        let bg_bad = glow.glow_bg(base, accent, &budget_bad);
+        assert_eq!(bg_bad, base, "should fall back when budget exhausted");
+    }
+
+    #[test]
+    fn focus_glow_reactivates_on_new_index() {
+        let mut glow = FocusGlow::new();
+        glow.on_selection_change(Some(0));
+        glow.tick();
+        glow.tick();
+
+        // Change to a different index while still glowing
+        assert!(glow.on_selection_change(Some(5)));
+        assert!(glow.is_active());
+        // Should be at full intensity again
+        let intensity = glow.intensity();
+        assert!(intensity > 0.8, "should reset to full: {intensity}");
     }
 }
