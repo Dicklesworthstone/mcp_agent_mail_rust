@@ -1,6 +1,6 @@
 //! Parity tests verifying system/infrastructure error messages match the Python reference.
 //!
-//! These tests verify that the DbError → McpError mapping produces messages,
+//! These tests verify that the `DbError` → `McpError` mapping produces messages,
 //! error types, and recoverable flags matching the Python implementation.
 
 use mcp_agent_mail_db::DbError;
@@ -133,8 +133,10 @@ fn feature_disabled_message_matches_python() {
     // We can't call it directly since it's private, but we can verify the error
     // catalog test covers it.
     let expected = "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.";
-    // Just a compile-time check that the string is correct.
-    assert!(!expected.is_empty());
+    assert_eq!(
+        expected,
+        "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool."
+    );
 }
 
 // -----------------------------------------------------------------------

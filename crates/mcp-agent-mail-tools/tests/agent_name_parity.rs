@@ -51,16 +51,17 @@ fn assert_message_eq(expected: &str, actual: &str, name: &str) {
     );
 }
 
-fn assert_detect(name: &str, expected_category: &str, expected_message: String) {
+fn assert_detect(name: &str, expected_category: &str, expected_message: &str) {
     eprintln!("Testing agent name \"{name}\"...");
     let Some((actual_category, actual_msg)) = detect_agent_name_mistake(name) else {
         panic!("FAIL: \"{name}\" detected as none, expected {expected_category}");
     };
     eprintln!("Detected as {actual_category}: message=\"{actual_msg}\"");
-    if actual_category != expected_category {
-        panic!("FAIL: \"{name}\" detected as {actual_category}, expected {expected_category}");
-    }
-    assert_message_eq(&expected_message, &actual_msg, name);
+    assert_eq!(
+        actual_category, expected_category,
+        "FAIL: \"{name}\" detected as {actual_category}, expected {expected_category}"
+    );
+    assert_message_eq(expected_message, &actual_msg, name);
 }
 
 #[test]
@@ -71,7 +72,7 @@ fn test_program_name_detection() {
              Agent names must be adjective+noun combinations like 'BlueLake' or 'GreenCastle'. \
              Use the 'program' parameter for program names, and omit 'name' to auto-generate a valid agent name."
         );
-        assert_detect(name, "PROGRAM_NAME_AS_AGENT", expected);
+        assert_detect(name, "PROGRAM_NAME_AS_AGENT", &expected);
     }
 }
 
@@ -87,7 +88,7 @@ fn test_model_name_detection() {
              Agent names must be adjective+noun combinations like 'RedStone' or 'PurpleBear'. \
              Use the 'model' parameter for model names, and omit 'name' to auto-generate a valid agent name."
         );
-        assert_detect(&sample, "MODEL_NAME_AS_AGENT", expected);
+        assert_detect(&sample, "MODEL_NAME_AS_AGENT", &expected);
     }
 }
 
@@ -98,7 +99,7 @@ fn test_email_detection() {
         "'{name}' looks like an email address. Agent names are simple identifiers like 'BlueDog', \
          not email addresses. Check the 'to' parameter format."
     );
-    assert_detect(name, "EMAIL_AS_AGENT", expected);
+    assert_detect(name, "EMAIL_AS_AGENT", &expected);
 }
 
 #[test]
@@ -108,7 +109,7 @@ fn test_broadcast_detection() {
             "'{token}' looks like a broadcast attempt. Agent Mail doesn't support broadcasting to all agents. \
              List specific recipient agent names in the 'to' parameter."
         );
-        assert_detect(token, "BROADCAST_ATTEMPT", expected);
+        assert_detect(token, "BROADCAST_ATTEMPT", &expected);
     }
 }
 
@@ -120,7 +121,7 @@ fn test_descriptive_name_detection() {
              adjective+noun combinations like 'WhiteMountain' or 'BrownCreek', NOT descriptive of the agent's task. \
              Omit the 'name' parameter to auto-generate a valid name."
         );
-        assert_detect(name, "DESCRIPTIVE_NAME", expected);
+        assert_detect(name, "DESCRIPTIVE_NAME", &expected);
     }
 }
 
@@ -134,7 +135,7 @@ fn test_unix_username_detection() {
              To find your actual agent name, check the response from register_agent or use \
              resource://agents/{{project_key}} to list all registered agents in this project."
         );
-        assert_detect(name, "UNIX_USERNAME_AS_AGENT", expected);
+        assert_detect(name, "UNIX_USERNAME_AS_AGENT", &expected);
     }
 }
 
@@ -173,11 +174,10 @@ fn test_invalid_format_detection() {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if actual_category != "INVALID_AGENT_NAME" {
-            panic!(
-                "FAIL: \"{invalid}\" detected as {actual_category}, expected INVALID_AGENT_NAME"
-            );
-        }
+        assert_eq!(
+            actual_category, "INVALID_AGENT_NAME",
+            "FAIL: \"{invalid}\" detected as {actual_category}, expected INVALID_AGENT_NAME"
+        );
 
         let expected = format!(
             "Invalid agent name format: '{invalid}'. \

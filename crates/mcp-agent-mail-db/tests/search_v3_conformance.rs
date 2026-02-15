@@ -47,9 +47,7 @@ fn unique_suffix() -> u64 {
 
 fn make_pool() -> (DbPool, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let db_path = dir
-        .path()
-        .join(format!("v3_conf_{}.db", unique_suffix()));
+    let db_path = dir.path().join(format!("v3_conf_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
         max_connections: 4,
@@ -107,16 +105,32 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
             let pid = p.id.unwrap();
 
             let sender = match queries::register_agent(
-                &cx, &pool, pid, "GoldFox", "test", "test",
-                Some("v3-conformance sender"), None,
-            ).await {
+                &cx,
+                &pool,
+                pid,
+                "GoldFox",
+                "test",
+                "test",
+                Some("v3-conformance sender"),
+                None,
+            )
+            .await
+            {
                 Outcome::Ok(a) => a,
                 other => panic!("register sender failed: {other:?}"),
             };
             let recip = match queries::register_agent(
-                &cx, &pool, pid, "SilverWolf", "test", "test",
-                Some("v3-conformance recipient"), None,
-            ).await {
+                &cx,
+                &pool,
+                pid,
+                "SilverWolf",
+                "test",
+                "test",
+                Some("v3-conformance recipient"),
+                None,
+            )
+            .await
+            {
                 Outcome::Ok(a) => a,
                 other => panic!("register recipient failed: {other:?}"),
             };
@@ -136,9 +150,17 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
             let pid = p.id.unwrap();
 
             let sender = match queries::register_agent(
-                &cx, &pool, pid, "BlueLake", "test", "test",
-                Some("v3-conformance beta sender"), None,
-            ).await {
+                &cx,
+                &pool,
+                pid,
+                "BlueLake",
+                "test",
+                "test",
+                Some("v3-conformance beta sender"),
+                None,
+            )
+            .await
+            {
                 Outcome::Ok(a) => a,
                 other => panic!("register beta sender failed: {other:?}"),
             };
@@ -149,15 +171,69 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
 
     // Messages with searchable content
     let messages: &[(&str, &str, &str, bool, Option<&str>)] = &[
-        ("Database migration plan",        "Steps for migrating schema from v2 to v3",               "high",   true,  Some("thread-migration")),
-        ("Weekly sync notes",              "Discussed performance regression in search queries",      "normal", false, None),
-        ("Bug report: null pointer",       "NullPointerException in search indexer on empty query",   "urgent", true,  Some("thread-bugs")),
-        ("Feature request: dark mode",     "Users want dark mode support in the dashboard",           "low",    false, None),
-        ("Security audit findings",        "Found SQL injection vector in legacy search endpoint",    "urgent", true,  Some("thread-security")),
-        ("Performance benchmarks",         "P95 latency improved from 12ms to 3ms after tuning",     "high",   false, None),
-        ("Release notes v4.2",             "Includes search upgrade and cursor pagination fixes",     "normal", false, None),
-        ("Onboarding guide draft",         "New agent onboarding process with walkthrough steps",     "low",    false, None),
-        ("Incident postmortem",            "Root cause: unbounded query expansion caused OOM crash",  "high",   true,  Some("thread-incidents")),
+        (
+            "Database migration plan",
+            "Steps for migrating schema from v2 to v3",
+            "high",
+            true,
+            Some("thread-migration"),
+        ),
+        (
+            "Weekly sync notes",
+            "Discussed performance regression in search queries",
+            "normal",
+            false,
+            None,
+        ),
+        (
+            "Bug report: null pointer",
+            "NullPointerException in search indexer on empty query",
+            "urgent",
+            true,
+            Some("thread-bugs"),
+        ),
+        (
+            "Feature request: dark mode",
+            "Users want dark mode support in the dashboard",
+            "low",
+            false,
+            None,
+        ),
+        (
+            "Security audit findings",
+            "Found SQL injection vector in legacy search endpoint",
+            "urgent",
+            true,
+            Some("thread-security"),
+        ),
+        (
+            "Performance benchmarks",
+            "P95 latency improved from 12ms to 3ms after tuning",
+            "high",
+            false,
+            None,
+        ),
+        (
+            "Release notes v4.2",
+            "Includes search upgrade and cursor pagination fixes",
+            "normal",
+            false,
+            None,
+        ),
+        (
+            "Onboarding guide draft",
+            "New agent onboarding process with walkthrough steps",
+            "low",
+            false,
+            None,
+        ),
+        (
+            "Incident postmortem",
+            "Root cause: unbounded query expansion caused OOM crash",
+            "high",
+            true,
+            Some("thread-incidents"),
+        ),
     ];
 
     for (i, &(subject, body, importance, ack, thread_id)) in messages.iter().enumerate() {
@@ -166,9 +242,11 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
             let pool = pool_c;
             async move {
                 match queries::create_message(
-                    &cx, &pool, project_id, sender_id, subject, body,
-                    thread_id, importance, ack, "[]",
-                ).await {
+                    &cx, &pool, project_id, sender_id, subject, body, thread_id, importance, ack,
+                    "[]",
+                )
+                .await
+                {
                     Outcome::Ok(_) => {}
                     other => panic!("create_message[{i}] failed: {other:?}"),
                 }
@@ -178,8 +256,14 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
 
     // Beta project messages
     let beta_messages: &[(&str, &str)] = &[
-        ("Beta internal note", "This is a beta-only internal document about search features"),
-        ("Beta compatibility check", "Verified backward compat with Python client v3.x"),
+        (
+            "Beta internal note",
+            "This is a beta-only internal document about search features",
+        ),
+        (
+            "Beta compatibility check",
+            "Verified backward compat with Python client v3.x",
+        ),
     ];
     for (i, &(subject, body)) in beta_messages.iter().enumerate() {
         let pool_c = pool.clone();
@@ -187,9 +271,19 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
             let pool = pool_c;
             async move {
                 match queries::create_message(
-                    &cx, &pool, second_project_id, second_sender_id,
-                    subject, body, None, "normal", false, "[]",
-                ).await {
+                    &cx,
+                    &pool,
+                    second_project_id,
+                    second_sender_id,
+                    subject,
+                    body,
+                    None,
+                    "normal",
+                    false,
+                    "[]",
+                )
+                .await
+                {
                     Outcome::Ok(_) => {}
                     other => panic!("create beta msg[{i}] failed: {other:?}"),
                 }
@@ -233,7 +327,10 @@ fn v3_conformance_legacy_result_shape() {
     let elapsed = timer.elapsed().as_micros() as u64;
     trace("legacy_result_shape", "fts5", resp.results.len(), elapsed);
 
-    assert!(!resp.results.is_empty(), "legacy search returned 0 results for 'migration'");
+    assert!(
+        !resp.results.is_empty(),
+        "legacy search returned 0 results for 'migration'"
+    );
 
     for r in &resp.results {
         assert!(r.id > 0, "result id should be > 0, got {}", r.id);
@@ -281,10 +378,16 @@ fn v3_conformance_explain_in_simple_response() {
         }
     });
 
-    assert!(resp.explain.is_some(), "explain should be present when requested");
+    assert!(
+        resp.explain.is_some(),
+        "explain should be present when requested"
+    );
     let explain = resp.explain.unwrap();
     assert!(!explain.sql.is_empty(), "explain.sql should not be empty");
-    assert!(!explain.method.is_empty(), "explain.method should not be empty");
+    assert!(
+        !explain.method.is_empty(),
+        "explain.method should not be empty"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -353,7 +456,12 @@ fn v3_conformance_engine_routing_lexical_degrades() {
         }
     });
 
-    trace("engine_routing_lexical_fallback", "lexical→fts5", resp.results.len(), 0);
+    trace(
+        "engine_routing_lexical_fallback",
+        "lexical→fts5",
+        resp.results.len(),
+        0,
+    );
 
     // Should still return results via FTS5 fallback
     // sql_row_count is usize (always >= 0), so just assert it was populated
@@ -384,10 +492,18 @@ fn v3_conformance_engine_routing_hybrid_degrades() {
         }
     });
 
-    trace("engine_routing_hybrid_fallback", "hybrid→fts5", resp.results.len(), 0);
+    trace(
+        "engine_routing_hybrid_fallback",
+        "hybrid→fts5",
+        resp.results.len(),
+        0,
+    );
 
     // Hybrid without bridge should still return FTS5 results
-    assert!(!resp.results.is_empty(), "hybrid fallback should still find 'migration'");
+    assert!(
+        !resp.results.is_empty(),
+        "hybrid fallback should still find 'migration'"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -524,14 +640,21 @@ fn v3_conformance_audit_summary_counts() {
         }
     });
 
-    trace("audit_summary_counts", "legacy+scope", resp.results.len(), 0);
+    trace(
+        "audit_summary_counts",
+        "legacy+scope",
+        resp.results.len(),
+        0,
+    );
 
     if let Some(audit) = &resp.audit_summary {
         assert_eq!(
             audit.total_before,
             audit.visible_count + audit.denied_count,
             "total_before = visible + denied: {} != {} + {}",
-            audit.total_before, audit.visible_count, audit.denied_count
+            audit.total_before,
+            audit.visible_count,
+            audit.denied_count
         );
         assert_eq!(
             resp.results.len(),
@@ -554,17 +677,20 @@ fn v3_conformance_product_search_basic() {
     let product_id = block_on(|cx| {
         let pool = pool.clone();
         async move {
-            let product = match queries::ensure_product(&cx, &pool, Some("test-v3-product"), None).await {
-                Outcome::Ok(p) => p,
-                other => panic!("ensure_product failed: {other:?}"),
-            };
+            let product =
+                match queries::ensure_product(&cx, &pool, Some("test-v3-product"), None).await {
+                    Outcome::Ok(p) => p,
+                    other => panic!("ensure_product failed: {other:?}"),
+                };
             let pid = product.id.unwrap();
 
             match queries::link_product_to_projects(&cx, &pool, pid, &[corpus.project_id]).await {
                 Outcome::Ok(_) => {}
                 other => panic!("link alpha failed: {other:?}"),
             }
-            match queries::link_product_to_projects(&cx, &pool, pid, &[corpus.second_project_id]).await {
+            match queries::link_product_to_projects(&cx, &pool, pid, &[corpus.second_project_id])
+                .await
+            {
                 Outcome::Ok(_) => {}
                 other => panic!("link beta failed: {other:?}"),
             }
@@ -585,10 +711,16 @@ fn v3_conformance_product_search_basic() {
 
     trace("product_search_basic", "fts5+product", resp.len(), 0);
 
-    assert!(!resp.is_empty(), "product search returned 0 results for 'search'");
+    assert!(
+        !resp.is_empty(),
+        "product search returned 0 results for 'search'"
+    );
 
     for r in &resp {
-        assert!(r.project_id > 0, "product search result should have valid project_id");
+        assert!(
+            r.project_id > 0,
+            "product search result should have valid project_id"
+        );
     }
 }
 
@@ -601,7 +733,14 @@ fn v3_conformance_product_search_cross_project() {
     let product_id = block_on(|cx| {
         let pool = pool.clone();
         async move {
-            let product = match queries::ensure_product(&cx, &pool, Some("test-v3-cross-product"), None).await {
+            let product = match queries::ensure_product(
+                &cx,
+                &pool,
+                Some("test-v3-cross-product"),
+                None,
+            )
+            .await
+            {
                 Outcome::Ok(p) => p,
                 other => panic!("ensure_product failed: {other:?}"),
             };
@@ -611,7 +750,9 @@ fn v3_conformance_product_search_cross_project() {
                 Outcome::Ok(_) => {}
                 other => panic!("link alpha failed: {other:?}"),
             }
-            match queries::link_product_to_projects(&cx, &pool, pid, &[corpus.second_project_id]).await {
+            match queries::link_product_to_projects(&cx, &pool, pid, &[corpus.second_project_id])
+                .await
+            {
                 Outcome::Ok(_) => {}
                 other => panic!("link beta failed: {other:?}"),
             }
@@ -632,7 +773,12 @@ fn v3_conformance_product_search_cross_project() {
         }
     });
 
-    trace("product_search_cross_project", "fts5+product", resp.len(), 0);
+    trace(
+        "product_search_cross_project",
+        "fts5+product",
+        resp.len(),
+        0,
+    );
 
     let project_ids: std::collections::HashSet<i64> = resp.iter().map(|r| r.project_id).collect();
 
@@ -640,7 +786,8 @@ fn v3_conformance_product_search_cross_project() {
     assert!(
         project_ids.len() >= 2,
         "product search should return results from multiple projects, got {} project_ids from {} results",
-        project_ids.len(), resp.len()
+        project_ids.len(),
+        resp.len()
     );
 }
 
@@ -725,7 +872,8 @@ fn v3_conformance_thread_filter() {
         );
     }
     assert_eq!(
-        resp.results.len(), 1,
+        resp.results.len(),
+        1,
         "should find exactly 1 message in thread-migration"
     );
 }
@@ -866,7 +1014,11 @@ fn v3_conformance_combined_facets() {
     trace("combined_facets", "fts5", resp.results.len(), 0);
 
     for r in &resp.results {
-        assert_eq!(r.importance.as_deref(), Some("urgent"), "importance should be urgent");
+        assert_eq!(
+            r.importance.as_deref(),
+            Some("urgent"),
+            "importance should be urgent"
+        );
         assert_eq!(r.ack_required, Some(true), "ack_required should be true");
     }
 }
@@ -902,7 +1054,8 @@ fn v3_conformance_ranking_recency() {
         assert!(
             w[0].id >= w[1].id,
             "recency ranking should produce descending IDs: {} < {}",
-            w[0].id, w[1].id
+            w[0].id,
+            w[1].id
         );
     }
 }
@@ -958,7 +1111,12 @@ fn v3_conformance_project_isolation() {
         }
     });
 
-    trace("project_isolation_alpha", "fts5", resp_alpha.results.len(), 0);
+    trace(
+        "project_isolation_alpha",
+        "fts5",
+        resp_alpha.results.len(),
+        0,
+    );
 
     assert!(
         resp_alpha.results.is_empty(),

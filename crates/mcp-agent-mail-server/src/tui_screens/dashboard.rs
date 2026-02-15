@@ -101,6 +101,43 @@ const ERROR_RATE_WARN: f64 = 0.05;
 const ERROR_RATE_HIGH: f64 = 0.15;
 const RING_FILL_WARN: u8 = 80;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardQuickFilter {
+    All,
+    Messages,
+    Tools,
+    Reservations,
+}
+
+impl DashboardQuickFilter {
+    const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Messages,
+            Self::Messages => Self::Tools,
+            Self::Tools => Self::Reservations,
+            Self::Reservations => Self::All,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Messages => "Messages",
+            Self::Tools => "Tools",
+            Self::Reservations => "Reservations",
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::All => "1",
+            Self::Messages => "2",
+            Self::Tools => "3",
+            Self::Reservations => "4",
+        }
+    }
+}
+
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
         let normalized = value.trim().to_ascii_lowercase();
@@ -147,6 +184,8 @@ pub struct DashboardScreen {
     auto_follow: bool,
     /// Active event kind filters (empty = show all).
     type_filter: HashSet<MailEventKind>,
+    /// Current quick-filter selection for the dashboard `LogViewer`.
+    quick_filter: DashboardQuickFilter,
     /// Verbosity tier controlling minimum severity shown.
     verbosity: VerbosityTier,
     /// Previous `DbStatSnapshot` for delta indicators.
@@ -182,6 +221,8 @@ pub struct DashboardScreen {
     console_log: RefCell<crate::console::LogPane>,
     /// Last consumed console log sequence number.
     console_log_last_seq: u64,
+    /// Dashboard event stream rendered via `LogViewer`.
+    event_log_viewer: RefCell<crate::console::LogPane>,
 }
 
 /// A pre-formatted event log entry.
@@ -273,6 +314,7 @@ impl DashboardScreen {
             scroll_offset: 0,
             auto_follow: true,
             type_filter: HashSet::new(),
+            quick_filter: DashboardQuickFilter::All,
             verbosity: VerbosityTier::default(),
             prev_db_stats: DbStatSnapshot::default(),
             sparkline_data: Vec::with_capacity(60),
@@ -290,6 +332,7 @@ impl DashboardScreen {
             show_log_panel: false,
             console_log: RefCell::new(crate::console::LogPane::new()),
             console_log_last_seq: 0,
+            event_log_viewer: RefCell::new(crate::console::LogPane::new()),
         }
     }
 
@@ -401,10 +444,9 @@ impl DashboardScreen {
         }
     }
 
-    /// Render the event log into the given area (delegates to the free function).
-    // NOTE: render_event_log_panel removed — caller now invokes render_event_log
+    // Render the event log into the given area via the free function.
+    // NOTE: render_event_log_panel removed; caller now invokes render_event_log
     // directly with inline_anomaly_count for narrow-width annotation support.
-
     /// Render the console log panel in the sidebar area.
     fn render_console_log_panel(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
@@ -474,6 +516,30 @@ impl DashboardScreen {
             .at(TerminalClass::UltraWide, PanelConstraint::visible(0.28, 9)),
         )
     }
+
+    fn apply_quick_filter(&mut self, filter: DashboardQuickFilter) {
+        self.quick_filter = filter;
+        self.type_filter.clear();
+        match filter {
+            DashboardQuickFilter::All => {}
+            DashboardQuickFilter::Messages => {
+                self.type_filter.insert(MailEventKind::MessageSent);
+                self.type_filter.insert(MailEventKind::MessageReceived);
+            }
+            DashboardQuickFilter::Tools => {
+                self.type_filter.insert(MailEventKind::ToolCallStart);
+                self.type_filter.insert(MailEventKind::ToolCallEnd);
+            }
+            DashboardQuickFilter::Reservations => {
+                self.type_filter.insert(MailEventKind::ReservationGranted);
+                self.type_filter.insert(MailEventKind::ReservationReleased);
+            }
+        }
+    }
+
+    fn cycle_quick_filter(&mut self) {
+        self.apply_quick_filter(self.quick_filter.next());
+    }
 }
 
 impl Default for DashboardScreen {
@@ -520,9 +586,9 @@ impl MailScreen for DashboardScreen {
                     let visible = self.visible_entries();
                     let idx = visible.len().saturating_sub(1 + self.scroll_offset);
                     if let Some(entry) = visible.get(idx) {
-                        return Cmd::msg(MailScreenMsg::DeepLink(
-                            DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
-                        ));
+                        return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::TimelineAtTime(
+                            entry.timestamp_micros,
+                        )));
                     }
                 }
                 // Cycle verbosity tier
@@ -539,20 +605,12 @@ impl MailScreen for DashboardScreen {
                 }
                 // Toggle type filter
                 KeyCode::Char('t') => {
-                    // Cycle through filter states:
-                    // empty -> ToolCallEnd only -> MessageSent only -> HttpRequest only -> clear
-                    if self.type_filter.is_empty() {
-                        self.type_filter.insert(MailEventKind::ToolCallEnd);
-                    } else if self.type_filter.contains(&MailEventKind::ToolCallEnd) {
-                        self.type_filter.clear();
-                        self.type_filter.insert(MailEventKind::MessageSent);
-                    } else if self.type_filter.contains(&MailEventKind::MessageSent) {
-                        self.type_filter.clear();
-                        self.type_filter.insert(MailEventKind::HttpRequest);
-                    } else {
-                        self.type_filter.clear();
-                    }
+                    self.cycle_quick_filter();
                 }
+                KeyCode::Char('1') => self.apply_quick_filter(DashboardQuickFilter::All),
+                KeyCode::Char('2') => self.apply_quick_filter(DashboardQuickFilter::Messages),
+                KeyCode::Char('3') => self.apply_quick_filter(DashboardQuickFilter::Tools),
+                KeyCode::Char('4') => self.apply_quick_filter(DashboardQuickFilter::Reservations),
                 _ => {}
             },
             // Mouse: scroll wheel moves event log (parity with j/k)
@@ -703,13 +761,12 @@ impl MailScreen for DashboardScreen {
         render_event_log(
             frame,
             comp.primary(),
+            &self.event_log_viewer,
             &self.visible_entries(),
             self.scroll_offset,
             self.auto_follow,
-            &self.type_filter,
+            self.quick_filter,
             self.verbosity,
-            self.pulse_phase,
-            self.reduced_motion,
             inline_anomaly_count,
         );
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
@@ -757,7 +814,11 @@ impl MailScreen for DashboardScreen {
             },
             HelpEntry {
                 key: "t",
-                action: "Cycle type filter",
+                action: "Cycle quick filter",
+            },
+            HelpEntry {
+                key: "1-4",
+                action: "Set filter (All/Msg/Tools/Resv)",
             },
             HelpEntry {
                 key: "G",
@@ -876,10 +937,7 @@ fn render_gradient_title(frame: &mut Frame<'_>, area: Rect, effects_enabled: boo
         return;
     }
 
-    let line = Line::from_spans([Span::styled(
-        title_text,
-        crate::tui_theme::text_accent(&tp),
-    )]);
+    let line = Line::from_spans([Span::styled(title_text, crate::tui_theme::text_accent(&tp))]);
     Paragraph::new(line).render(title_area, frame);
 }
 
@@ -1306,7 +1364,7 @@ const fn trend_for(current: u64, previous: u64) -> MetricTrend {
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(dead_code, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn pulsing_severity_badge(
     severity: EventSeverity,
     pulse_phase: f32,
@@ -1335,92 +1393,24 @@ fn pulsing_severity_badge(
 fn render_event_log(
     frame: &mut Frame<'_>,
     area: Rect,
+    viewer: &RefCell<crate::console::LogPane>,
     entries: &[&EventEntry],
     scroll_offset: usize,
     auto_follow: bool,
-    type_filter: &HashSet<MailEventKind>,
+    quick_filter: DashboardQuickFilter,
     verbosity: VerbosityTier,
-    pulse_phase: f32,
-    reduced_motion: bool,
     inline_anomaly_count: usize,
 ) {
-    let visible_height = area.height.saturating_sub(2) as usize; // -2 for border
-    if visible_height == 0 {
+    if area.height < 3 || area.width < 20 {
         return;
     }
 
-    // Compute viewport slice
     let total = entries.len();
-    let start = if total <= visible_height {
-        0
-    } else if auto_follow || scroll_offset == 0 {
-        total - visible_height
-    } else {
-        total.saturating_sub(visible_height + scroll_offset)
-    };
-    let end = (start + visible_height).min(total);
-    let viewport = &entries[start..end];
-
-    // Focused entry is the one at the bottom of the viewport (most recent in view).
-    let focused_abs_idx = if total == 0 {
-        None
-    } else {
-        Some(total.saturating_sub(1 + scroll_offset))
-    };
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let focus_style = Style::default()
-        .fg(tp.selection_fg)
-        .bg(tp.selection_bg)
-        .bold();
-
-    // Build styled text lines with colored severity badges.
-    //
-    // Salience hierarchy:
-    //   - Error/Warn: summary inherits severity color → immediate attention
-    //   - Info: summary plain → standard prominence
-    //   - Debug/Trace: summary dimmed → background noise
-    let meta_style = crate::tui_theme::text_meta(&tp);
-    let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len());
-    for (view_idx, entry) in viewport.iter().enumerate() {
-        let abs_idx = start + view_idx;
-        let sev = entry.severity;
-        let summary_style = match sev {
-            EventSeverity::Error | EventSeverity::Warn => sev.style(),
-            EventSeverity::Trace => Style::default().fg(tp.text_disabled).dim(),
-            _ => Style::default(),
-        };
-        let mut line = Line::from_spans([
-            Span::styled(format!("{:>6} {} ", entry.seq, entry.timestamp), meta_style),
-            pulsing_severity_badge(sev, pulse_phase, reduced_motion),
-            Span::raw(" "),
-            Span::styled(format!("{}", entry.icon), sev.style()),
-            Span::styled(
-                format!(" {:<10} ", entry.kind.compact_label()),
-                sev.style(),
-            ),
-            Span::styled(entry.summary.to_string(), summary_style),
-        ]);
-        if Some(abs_idx) == focused_abs_idx {
-            line.apply_base_style(focus_style);
-        }
-        text_lines.push(line);
-    }
-    let text = Text::from_lines(text_lines);
+    let end = total.saturating_sub(scroll_offset);
 
     let follow_indicator = if auto_follow { " [FOLLOW]" } else { "" };
     let verbosity_indicator = format!(" [{}]", verbosity.label());
-    let filter_indicator = if type_filter.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " [filter: {}]",
-            type_filter
-                .iter()
-                .map(|k| format!("{k:?}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-    };
+    let filter_indicator = format!(" [filter: {}]", quick_filter.label());
     let anomaly_indicator = if inline_anomaly_count > 0 {
         format!(" [{inline_anomaly_count} anomaly]")
     } else {
@@ -1435,8 +1425,63 @@ fn render_event_log(
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
-    let p = Paragraph::new(text).block(block);
-    p.render(area, frame);
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let controls_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    let viewer_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+
+    let meta_style = crate::tui_theme::text_meta(&tp);
+    let active_style = Style::default()
+        .fg(tp.selection_fg)
+        .bg(tp.selection_bg)
+        .bold();
+    let mut controls = Vec::new();
+    for filter in [
+        DashboardQuickFilter::All,
+        DashboardQuickFilter::Messages,
+        DashboardQuickFilter::Tools,
+        DashboardQuickFilter::Reservations,
+    ] {
+        let label = format!(" [{}:{}] ", filter.key(), filter.label());
+        let span = if quick_filter == filter {
+            Span::styled(label, active_style)
+        } else {
+            Span::styled(label, meta_style)
+        };
+        controls.push(span);
+    }
+    Paragraph::new(Text::from_line(Line::from_spans(controls))).render(controls_area, frame);
+
+    let mut pane = viewer.borrow_mut();
+    pane.clear();
+    pane.push_many(entries.iter().map(|entry| {
+        format!(
+            "{:>6} {} {:<3} {} {:<10} {}",
+            entry.seq,
+            entry.timestamp,
+            entry.severity.badge(),
+            entry.icon,
+            entry.kind.compact_label(),
+            entry.summary
+        )
+    }));
+    pane.scroll_to_bottom();
+    if !auto_follow && scroll_offset > 0 {
+        pane.scroll_up(scroll_offset);
+    }
+    if viewer_area.height > 0 {
+        pane.render(viewer_area, frame);
+    }
 }
 
 /// Render the footer stats bar.
@@ -2350,20 +2395,65 @@ mod tests {
 
         let t = Event::Key(ftui::KeyEvent::new(KeyCode::Char('t')));
 
-        // empty -> ToolCallEnd
-        screen.update(&t, &state);
-        assert!(screen.type_filter.contains(&MailEventKind::ToolCallEnd));
-
-        // ToolCallEnd -> MessageSent
+        // all -> messages
         screen.update(&t, &state);
         assert!(screen.type_filter.contains(&MailEventKind::MessageSent));
+        assert!(screen.type_filter.contains(&MailEventKind::MessageReceived));
 
-        // MessageSent -> HttpRequest
+        // messages -> tools
         screen.update(&t, &state);
-        assert!(screen.type_filter.contains(&MailEventKind::HttpRequest));
+        assert!(screen.type_filter.contains(&MailEventKind::ToolCallStart));
+        assert!(screen.type_filter.contains(&MailEventKind::ToolCallEnd));
 
-        // HttpRequest -> clear
+        // tools -> reservations
         screen.update(&t, &state);
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationGranted)
+        );
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationReleased)
+        );
+
+        // reservations -> all
+        screen.update(&t, &state);
+        assert!(screen.type_filter.is_empty());
+    }
+
+    #[test]
+    fn quick_filter_hotkeys_apply_expected_filters() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('2'))), &state);
+        assert_eq!(screen.quick_filter, DashboardQuickFilter::Messages);
+        assert!(screen.type_filter.contains(&MailEventKind::MessageSent));
+        assert!(screen.type_filter.contains(&MailEventKind::MessageReceived));
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('3'))), &state);
+        assert_eq!(screen.quick_filter, DashboardQuickFilter::Tools);
+        assert!(screen.type_filter.contains(&MailEventKind::ToolCallStart));
+        assert!(screen.type_filter.contains(&MailEventKind::ToolCallEnd));
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('4'))), &state);
+        assert_eq!(screen.quick_filter, DashboardQuickFilter::Reservations);
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationGranted)
+        );
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationReleased)
+        );
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('1'))), &state);
+        assert_eq!(screen.quick_filter, DashboardQuickFilter::All);
         assert!(screen.type_filter.is_empty());
     }
 
@@ -2646,7 +2736,9 @@ mod tests {
     fn kpi_tile_order_puts_operational_metrics_first() {
         // Detailed density gives all 6 tiles.
         // Expected order: Messages, Ack Pend, Agents, Requests, Avg Lat, Uptime
-        let labels = ["Messages", "Ack Pend", "Agents", "Requests", "Avg Lat", "Uptime"];
+        let labels = [
+            "Messages", "Ack Pend", "Agents", "Requests", "Avg Lat", "Uptime",
+        ];
 
         // Verify Messages is first (core flow indicator).
         assert_eq!(labels[0], "Messages");
@@ -2679,7 +2771,7 @@ mod tests {
     #[test]
     fn event_severity_salience_hierarchy() {
         use ftui::style::StyleFlags;
-        let has = |s: Style, f: StyleFlags| s.attrs.map_or(false, |a| a.contains(f));
+        let has = |s: Style, f: StyleFlags| s.attrs.is_some_and(|a| a.contains(f));
 
         // Error and Warn should be bold (high salience).
         assert!(has(EventSeverity::Error.style(), StyleFlags::BOLD));
@@ -2726,14 +2818,20 @@ mod tests {
             10,
         ));
         screen.update(&scroll_down, &state);
-        assert_eq!(screen.scroll_offset, 4, "scroll down should decrease offset");
+        assert_eq!(
+            screen.scroll_offset, 4,
+            "scroll down should decrease offset"
+        );
 
         // Scroll to bottom re-enables auto-follow
         for _ in 0..10 {
             screen.update(&scroll_down, &state);
         }
         assert_eq!(screen.scroll_offset, 0);
-        assert!(screen.auto_follow, "reaching bottom should re-enable auto-follow");
+        assert!(
+            screen.auto_follow,
+            "reaching bottom should re-enable auto-follow"
+        );
     }
 
     // ── Screen logic, density heuristics, and failure paths (br-1xt0m.1.13.8) ──
@@ -2757,7 +2855,11 @@ mod tests {
             TerminalClass::Wide,
             TerminalClass::UltraWide,
         ] {
-            assert_eq!(anomaly_rail_height(tc, 0), 0, "zero anomalies → zero height for {tc:?}");
+            assert_eq!(
+                anomaly_rail_height(tc, 0),
+                0,
+                "zero anomalies → zero height for {tc:?}"
+            );
         }
     }
 
@@ -2792,7 +2894,7 @@ mod tests {
     #[test]
     fn compute_percentile_sorted_data() {
         // 100 values: 1.0, 2.0, ..., 100.0
-        let data: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let data: Vec<f64> = (1..=100).map(f64::from).collect();
         let p = DashboardScreen::compute_percentile(&data);
         assert!((p.p50 - 51.0).abs() < f64::EPSILON);
         assert!((p.p95 - 96.0).abs() < f64::EPSILON);

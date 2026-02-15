@@ -1007,6 +1007,7 @@ impl MailScreen for ThreadExplorerScreen {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         if area.height < 4 || area.width < 20 {
             return;
@@ -1451,7 +1452,7 @@ fn render_filter_bar(
 }
 
 /// Render the thread list panel.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_thread_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1558,11 +1559,7 @@ fn render_thread_list(
                 truncate_str(&thread.participant_names, inner_w.saturating_sub(30))
             }
             ViewLens::Escalation => {
-                let flag = if thread.has_escalation {
-                    "ESC"
-                } else {
-                    "---"
-                };
+                let flag = if thread.has_escalation { "ESC" } else { "---" };
                 format!("{flag}  {:.1}/hr", thread.velocity_msg_per_hr)
             }
         };
@@ -1617,10 +1614,7 @@ fn render_thread_list(
                 let remaining = subj_space.saturating_sub(sender_prefix.len());
                 Line::from_spans([
                     Span::raw(indent),
-                    Span::styled(
-                        sender_prefix,
-                        Style::default().fg(tp.text_secondary),
-                    ),
+                    Span::styled(sender_prefix, Style::default().fg(tp.text_secondary)),
                     Span::styled(
                         truncate_str(&thread.last_subject, remaining),
                         crate::tui_theme::text_hint(&tp),
@@ -1737,7 +1731,11 @@ fn render_thread_detail(
                 crate::tui_theme::text_meta(&tp),
             ),
             Span::styled(
-                format!("  {} \u{2192} {}", iso_compact_time(&t.first_timestamp_iso), iso_compact_time(&t.last_timestamp_iso)),
+                format!(
+                    "  {} \u{2192} {}",
+                    iso_compact_time(&t.first_timestamp_iso),
+                    iso_compact_time(&t.last_timestamp_iso)
+                ),
                 crate::tui_theme::text_hint(&tp),
             ),
         ]));
@@ -1871,10 +1869,7 @@ fn render_thread_detail(
         )));
     }
     if selected_message.importance == "high" {
-        preview_header_spans.push(Span::styled(
-            " [HIGH]",
-            crate::tui_theme::text_warning(&tp),
-        ));
+        preview_header_spans.push(Span::styled(" [HIGH]", crate::tui_theme::text_warning(&tp)));
     } else if selected_message.importance == "urgent" {
         preview_header_spans.push(Span::styled(
             " [URGENT]",
@@ -1882,10 +1877,7 @@ fn render_thread_detail(
         ));
     }
     if selected_message.ack_required {
-        preview_header_spans.push(Span::styled(
-            " @ACK",
-            crate::tui_theme::text_accent(&tp),
-        ));
+        preview_header_spans.push(Span::styled(" @ACK", crate::tui_theme::text_accent(&tp)));
     }
     preview_lines.push(Line::from_spans(preview_header_spans));
     if !selected_message.subject.is_empty() {
@@ -3403,7 +3395,10 @@ mod tests {
         assert!(!tree[0].is_unread, "root should not be unread");
         assert!(!tree[0].is_ack_required, "root should not be ack_required");
         assert!(tree[0].children[0].is_unread, "child should be unread");
-        assert!(tree[0].children[0].is_ack_required, "child should be ack_required");
+        assert!(
+            tree[0].children[0].is_ack_required,
+            "child should be ack_required"
+        );
     }
 
     #[test]
@@ -3524,7 +3519,7 @@ mod tests {
         child.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
 
         let tree = build_thread_tree_items(&[root, child]);
-        let collapsed: HashSet<i64> = [1].into_iter().collect();
+        let collapsed: HashSet<i64> = std::iter::once(1).collect();
         let mut rows = Vec::new();
         flatten_thread_tree_rows(&tree, &collapsed, &mut rows);
 
@@ -3604,10 +3599,7 @@ mod tests {
     }
 
     fn count_descendants(node: &crate::tui_widgets::ThreadTreeItem) -> usize {
-        node.children
-            .iter()
-            .map(|c| 1 + count_descendants(c))
-            .sum()
+        node.children.iter().map(|c| 1 + count_descendants(c)).sum()
     }
 
     #[test]
@@ -3658,10 +3650,7 @@ mod tests {
     #[test]
     fn activity_lens_compact_labels() {
         // Activity lens now uses compact "m" and "a" labels
-        let meta = format!(
-            "{}m  {}a  {:.1}/hr",
-            10, 3, 2.5_f64,
-        );
+        let meta = format!("{}m  {}a  {:.1}/hr", 10, 3, 2.5_f64,);
         assert_eq!(meta, "10m  3a  2.5/hr");
     }
 
@@ -3748,7 +3737,11 @@ mod tests {
 
     #[test]
     fn view_lens_labels_non_empty() {
-        for lens in [ViewLens::Activity, ViewLens::Participants, ViewLens::Escalation] {
+        for lens in [
+            ViewLens::Activity,
+            ViewLens::Participants,
+            ViewLens::Escalation,
+        ] {
             assert!(!lens.label().is_empty(), "label for {lens:?}");
         }
     }

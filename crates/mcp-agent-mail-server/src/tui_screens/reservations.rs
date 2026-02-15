@@ -574,9 +574,9 @@ fn render_ttl_overlays(
         let base_style = if row.selected {
             Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
         } else if row.released {
-            crate::tui_theme::text_disabled(&tp).bg(tp.bg_deep)
+            crate::tui_theme::text_disabled(tp).bg(tp.bg_deep)
         } else {
-            crate::tui_theme::text_primary(&tp).bg(tp.bg_surface)
+            crate::tui_theme::text_primary(tp).bg(tp.bg_surface)
         };
         let gauge_bg = if row.selected {
             tp.status_accent

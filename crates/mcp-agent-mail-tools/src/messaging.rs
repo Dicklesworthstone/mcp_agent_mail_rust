@@ -915,7 +915,11 @@ pub async fn send_message(
     let thread_id = thread_id
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    let _topic = topic;
+    if let Some(topic_value) = topic.as_deref() {
+        tracing::warn!(
+            "send_message received topic='{topic_value}', but topic persistence/filtering is not implemented yet; argument is ignored"
+        );
+    }
 
     // Validate thread_id format if provided
     if let Some(ref tid) = thread_id {
@@ -2005,7 +2009,7 @@ effective_free_bytes={free}"
 /// - `since_ts`: Only messages after this timestamp
 /// - `limit`: Max messages to return (default: 20)
 /// - `include_bodies`: Include full message bodies (default: false)
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
     description = "Retrieve recent messages for an agent without mutating read/ack state.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: filter to messages with this topic tag\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```"
 )]
@@ -2045,7 +2049,11 @@ pub async fn fetch_inbox(
     })?;
     let include_body = include_bodies.unwrap_or(false);
     let urgent = urgent_only.unwrap_or(false);
-    let _topic = topic;
+    if let Some(topic_value) = topic.as_deref() {
+        tracing::warn!(
+            "fetch_inbox received topic='{topic_value}', but topic persistence/filtering is not implemented yet; argument is ignored"
+        );
+    }
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;

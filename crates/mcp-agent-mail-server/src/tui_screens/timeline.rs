@@ -341,6 +341,12 @@ enum DockDragState {
     Dragging,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineViewMode {
+    Timeline,
+    LogViewer,
+}
+
 /// A full TUI screen backed by [`TimelinePane`].
 ///
 /// This provides the "Messages" tab experience: a scrollable
@@ -356,6 +362,10 @@ pub struct TimelineScreen {
     /// Last known content area (updated each view call) for mouse hit-testing.
     /// Uses `Cell` for interior mutability since `view()` takes `&self`.
     last_area: Cell<Rect>,
+    /// Active render mode for `v` toggle (timeline table vs `LogViewer`).
+    view_mode: TimelineViewMode,
+    /// Log viewer pane used when `view_mode == LogViewer`.
+    log_viewer: RefCell<crate::console::LogPane>,
     /// Debounced preference persister (auto-saves dock layout to envfile).
     persister: Option<PreferencePersister>,
 }
@@ -370,6 +380,8 @@ impl TimelineScreen {
             dock: DockLayout::right_40(),
             dock_drag: DockDragState::Idle,
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            view_mode: TimelineViewMode::Timeline,
+            log_viewer: RefCell::new(crate::console::LogPane::new()),
             persister: None,
         }
     }
@@ -384,6 +396,8 @@ impl TimelineScreen {
             dock: prefs.dock,
             dock_drag: DockDragState::Idle,
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            view_mode: TimelineViewMode::Timeline,
+            log_viewer: RefCell::new(crate::console::LogPane::new()),
             persister: Some(PreferencePersister::new(config)),
         }
     }
@@ -431,8 +445,16 @@ impl MailScreen for TimelineScreen {
                     // Follow mode
                     KeyCode::Char('f') => self.pane.toggle_follow(),
 
-                    // Cycle verbosity tier
+                    // Toggle timeline table vs log viewer mode.
                     KeyCode::Char('v') => {
+                        self.view_mode = match self.view_mode {
+                            TimelineViewMode::Timeline => TimelineViewMode::LogViewer,
+                            TimelineViewMode::LogViewer => TimelineViewMode::Timeline,
+                        };
+                    }
+
+                    // Cycle verbosity tier (Shift+V).
+                    KeyCode::Char('V') => {
                         self.pane.verbosity = self.pane.verbosity.next();
                         self.pane.clamp_cursor();
                     }
@@ -548,8 +570,22 @@ impl MailScreen for TimelineScreen {
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         self.last_area.set(area);
         let split = self.dock.split(area);
-        let mut list_state = self.list_state.borrow_mut();
-        render_timeline(frame, split.primary, &self.pane, self.dock, &mut list_state);
+        match self.view_mode {
+            TimelineViewMode::Timeline => {
+                let mut list_state = self.list_state.borrow_mut();
+                render_timeline(frame, split.primary, &self.pane, self.dock, &mut list_state);
+            }
+            TimelineViewMode::LogViewer => {
+                let mut viewer = self.log_viewer.borrow_mut();
+                render_timeline_log_viewer(
+                    frame,
+                    split.primary,
+                    &self.pane,
+                    self.dock,
+                    &mut viewer,
+                );
+            }
+        }
         if let Some(dock_area) = split.dock {
             super::inspector::render_inspector(frame, dock_area, self.pane.selected_event());
         }
@@ -575,6 +611,10 @@ impl MailScreen for TimelineScreen {
             },
             HelpEntry {
                 key: "v",
+                action: "Toggle Timeline/LogViewer",
+            },
+            HelpEntry {
+                key: "V",
                 action: "Cycle verbosity tier",
             },
             HelpEntry {
@@ -816,6 +856,70 @@ fn render_timeline(
     StatefulWidget::render(&list, inner_area, frame, list_state);
 }
 
+fn render_timeline_log_viewer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pane: &TimelinePane,
+    dock: DockLayout,
+    viewer: &mut crate::console::LogPane,
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+
+    let filtered: Vec<TimelineEntry> = pane.filtered_entries().into_iter().cloned().collect();
+    let total = filtered.len();
+    let cursor = pane.cursor.min(total.saturating_sub(1));
+    let pos = if total == 0 {
+        "empty".to_string()
+    } else {
+        format!("{}/{total}", cursor + 1)
+    };
+    let follow_tag = if pane.follow { " [FOLLOW]" } else { "" };
+    let verbosity_tag = format!(" [{}]", pane.verbosity.label());
+    let filter_tag = build_filter_tag(&pane.kind_filter, &pane.source_filter);
+    let dock_tag = if dock.visible {
+        format!(" [{}]", dock.state_label())
+    } else {
+        String::new()
+    };
+    let title =
+        format!("Timeline LogViewer ({pos}){follow_tag}{verbosity_tag}{filter_tag}{dock_tag}",);
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title(&title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.height == 0 {
+        return;
+    }
+
+    viewer.clear();
+    viewer.push_many(filtered.iter().map(|entry| {
+        format!(
+            "{:>6} {} {:<3} [{:<4}] {:<10} {}",
+            entry.seq,
+            entry.display.timestamp,
+            entry.severity.badge(),
+            source_badge(entry.source),
+            entry.display.kind.compact_label(),
+            entry.display.summary
+        )
+    }));
+
+    viewer.scroll_to_bottom();
+    if !pane.follow && total > 0 {
+        let offset = total.saturating_sub(1).saturating_sub(cursor);
+        if offset > 0 {
+            viewer.scroll_up(offset);
+        }
+    }
+    viewer.render(inner, frame);
+}
+
 /// Compute the viewport [start, end) to keep cursor visible.
 /// Note: `VirtualizedList` now handles this internally, but kept for tests.
 #[allow(dead_code)]
@@ -838,10 +942,7 @@ fn build_filter_tag(
 ) -> String {
     let mut parts = Vec::new();
     if !kind_filter.is_empty() {
-        let mut kinds: Vec<_> = kind_filter
-            .iter()
-            .map(|k| k.compact_label())
-            .collect();
+        let mut kinds: Vec<_> = kind_filter.iter().map(|k| k.compact_label()).collect();
         kinds.sort_unstable();
         parts.push(format!("kind:{}", kinds.join(",")));
     }
@@ -1585,12 +1686,12 @@ mod tests {
     }
 
     #[test]
-    fn verbosity_cycles_on_v_key() {
+    fn verbosity_cycles_on_shift_v_key() {
         let mut screen = TimelineScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         assert_eq!(screen.pane.verbosity, VerbosityTier::Standard);
 
-        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('V')));
         screen.update(&key, &state);
         assert_eq!(screen.pane.verbosity, VerbosityTier::Verbose);
 
@@ -1602,6 +1703,49 @@ mod tests {
 
         screen.update(&key, &state);
         assert_eq!(screen.pane.verbosity, VerbosityTier::Standard);
+    }
+
+    #[test]
+    fn v_key_toggles_between_timeline_and_log_viewer_modes() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        assert_eq!(screen.view_mode, TimelineViewMode::Timeline);
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        screen.update(&key, &state);
+        assert_eq!(screen.view_mode, TimelineViewMode::LogViewer);
+
+        screen.update(&key, &state);
+        assert_eq!(screen.view_mode, TimelineViewMode::Timeline);
+    }
+
+    #[test]
+    fn filters_persist_across_v_toggle() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.pane.kind_filter.insert(MailEventKind::HttpRequest);
+        screen.pane.source_filter.insert(EventSource::Http);
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        screen.update(&key, &state);
+        assert_eq!(screen.view_mode, TimelineViewMode::LogViewer);
+        assert!(
+            screen
+                .pane
+                .kind_filter
+                .contains(&MailEventKind::HttpRequest)
+        );
+        assert!(screen.pane.source_filter.contains(&EventSource::Http));
+
+        screen.update(&key, &state);
+        assert_eq!(screen.view_mode, TimelineViewMode::Timeline);
+        assert!(
+            screen
+                .pane
+                .kind_filter
+                .contains(&MailEventKind::HttpRequest)
+        );
+        assert!(screen.pane.source_filter.contains(&EventSource::Http));
     }
 
     #[test]
@@ -2306,10 +2450,7 @@ mod tests {
         let mut sources = HashSet::new();
         sources.insert(EventSource::Tooling);
         let tag2 = build_filter_tag(&HashSet::new(), &sources);
-        assert!(
-            tag2.contains("Tool"),
-            "tag should use source badge: {tag2}"
-        );
+        assert!(tag2.contains("Tool"), "tag should use source badge: {tag2}");
     }
 
     #[test]

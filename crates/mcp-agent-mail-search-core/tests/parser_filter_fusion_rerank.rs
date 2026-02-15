@@ -1,4 +1,8 @@
-#![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
 //! Integration tests for parser, filter, fusion, and rerank math.
 //!
 //! br-2tnl.7.1: Build unit test suite for parser, filters, fusion, and rerank math
@@ -46,10 +50,9 @@ fn sanitize_strips_fts_special_chars() {
         let input = format!("test{s}query");
         let result = sanitize_query(&input);
         match &result {
-            SanitizedQuery::Valid(q) => assert!(
-                !q.contains(s),
-                "special char {s:?} not stripped from: {q}"
-            ),
+            SanitizedQuery::Valid(q) => {
+                assert!(!q.contains(s), "special char {s:?} not stripped from: {q}");
+            }
             SanitizedQuery::Empty => {} // also acceptable
         }
     }
@@ -278,14 +281,17 @@ fn fusion_rrf_score_formula_exact() {
 fn fusion_dual_source_outranks_single() {
     let config = RrfConfig::default();
     let candidates = vec![
-        make_prepared(1, Some(1), None, Some(1.0), None),       // lexical only
+        make_prepared(1, Some(1), None, Some(1.0), None), // lexical only
         make_prepared(2, Some(2), Some(1), Some(0.8), Some(1.0)), // both sources
     ];
     let result = fuse_rrf(&candidates, config, 0, 100);
 
     assert_eq!(result.hits.len(), 2);
     // Doc 2 should rank first (dual source contribution)
-    assert_eq!(result.hits[0].doc_id, 2, "dual-source doc should rank first");
+    assert_eq!(
+        result.hits[0].doc_id, 2,
+        "dual-source doc should rank first"
+    );
     assert!(result.hits[0].rrf_score > result.hits[1].rrf_score);
 }
 
@@ -306,10 +312,7 @@ fn fusion_deterministic_across_runs() {
         assert_eq!(run.hits.len(), baseline.hits.len());
         for (a, b) in baseline.hits.iter().zip(run.hits.iter()) {
             assert_eq!(a.doc_id, b.doc_id, "ordering diverged");
-            assert!(
-                (a.rrf_score - b.rrf_score).abs() < 1e-15,
-                "score diverged"
-            );
+            assert!((a.rrf_score - b.rrf_score).abs() < 1e-15, "score diverged");
         }
     }
 }
@@ -370,8 +373,14 @@ fn fusion_explain_has_source_contributions() {
 
 #[test]
 fn fusion_custom_k_changes_scores() {
-    let low_k = RrfConfig { k: 10.0, ..Default::default() };
-    let high_k = RrfConfig { k: 100.0, ..Default::default() };
+    let low_k = RrfConfig {
+        k: 10.0,
+        ..Default::default()
+    };
+    let high_k = RrfConfig {
+        k: 100.0,
+        ..Default::default()
+    };
     let candidates = vec![make_prepared(1, Some(1), Some(1), Some(1.0), Some(1.0))];
 
     let low = fuse_rrf(&candidates, low_k, 0, 10);
@@ -400,7 +409,10 @@ fn query_class_identifier_patterns() {
 #[test]
 fn query_class_short_keyword() {
     assert_eq!(QueryClass::classify("deploy"), QueryClass::ShortKeyword);
-    assert_eq!(QueryClass::classify("migration plan"), QueryClass::ShortKeyword);
+    assert_eq!(
+        QueryClass::classify("migration plan"),
+        QueryClass::ShortKeyword
+    );
 }
 
 #[test]
@@ -420,7 +432,8 @@ fn query_class_empty() {
 #[test]
 fn budget_hybrid_mode_allocates_both_pools() {
     let config = CandidateBudgetConfig::default();
-    let budget = CandidateBudget::derive(100, CandidateMode::Hybrid, QueryClass::ShortKeyword, config);
+    let budget =
+        CandidateBudget::derive(100, CandidateMode::Hybrid, QueryClass::ShortKeyword, config);
     assert!(budget.lexical_limit > 0, "hybrid should have lexical");
     assert!(budget.semantic_limit > 0, "hybrid should have semantic");
 }
@@ -428,7 +441,12 @@ fn budget_hybrid_mode_allocates_both_pools() {
 #[test]
 fn budget_lexical_fallback_has_zero_semantic() {
     let config = CandidateBudgetConfig::default();
-    let budget = CandidateBudget::derive(100, CandidateMode::LexicalFallback, QueryClass::ShortKeyword, config);
+    let budget = CandidateBudget::derive(
+        100,
+        CandidateMode::LexicalFallback,
+        QueryClass::ShortKeyword,
+        config,
+    );
     assert!(budget.lexical_limit > 0);
     assert_eq!(budget.semantic_limit, 0, "fallback should have 0 semantic");
 }
@@ -438,13 +456,17 @@ fn budget_empty_query_has_zero_semantic() {
     let config = CandidateBudgetConfig::default();
     let budget = CandidateBudget::derive(100, CandidateMode::Hybrid, QueryClass::Empty, config);
     assert!(budget.lexical_limit > 0);
-    assert_eq!(budget.semantic_limit, 0, "empty query should have 0 semantic");
+    assert_eq!(
+        budget.semantic_limit, 0,
+        "empty query should have 0 semantic"
+    );
 }
 
 #[test]
 fn budget_identifier_query_favors_lexical() {
     let config = CandidateBudgetConfig::default();
-    let budget = CandidateBudget::derive(100, CandidateMode::Hybrid, QueryClass::Identifier, config);
+    let budget =
+        CandidateBudget::derive(100, CandidateMode::Hybrid, QueryClass::Identifier, config);
     assert!(
         budget.lexical_limit >= budget.semantic_limit,
         "identifier query should favor lexical: lex={}, sem={}",
@@ -456,7 +478,12 @@ fn budget_identifier_query_favors_lexical() {
 #[test]
 fn budget_natural_language_favors_semantic() {
     let config = CandidateBudgetConfig::default();
-    let budget = CandidateBudget::derive(100, CandidateMode::Hybrid, QueryClass::NaturalLanguage, config);
+    let budget = CandidateBudget::derive(
+        100,
+        CandidateMode::Hybrid,
+        QueryClass::NaturalLanguage,
+        config,
+    );
     assert!(
         budget.semantic_limit >= budget.lexical_limit,
         "NL query should favor semantic: lex={}, sem={}",
@@ -469,7 +496,12 @@ fn budget_natural_language_favors_semantic() {
 fn budget_combined_limit_at_least_requested() {
     let config = CandidateBudgetConfig::default();
     for requested in [1, 10, 50, 100, 500] {
-        let budget = CandidateBudget::derive(requested, CandidateMode::Hybrid, QueryClass::ShortKeyword, config);
+        let budget = CandidateBudget::derive(
+            requested,
+            CandidateMode::Hybrid,
+            QueryClass::ShortKeyword,
+            config,
+        );
         assert!(
             budget.combined_limit >= requested,
             "combined_limit {} < requested {requested}",
@@ -481,8 +513,14 @@ fn budget_combined_limit_at_least_requested() {
 #[test]
 fn budget_derive_with_decision_gives_same_budget() {
     let config = CandidateBudgetConfig::default();
-    let budget = CandidateBudget::derive(50, CandidateMode::Hybrid, QueryClass::ShortKeyword, config);
-    let derivation = CandidateBudget::derive_with_decision(50, CandidateMode::Hybrid, QueryClass::ShortKeyword, config);
+    let budget =
+        CandidateBudget::derive(50, CandidateMode::Hybrid, QueryClass::ShortKeyword, config);
+    let derivation = CandidateBudget::derive_with_decision(
+        50,
+        CandidateMode::Hybrid,
+        QueryClass::ShortKeyword,
+        config,
+    );
     assert_eq!(budget.lexical_limit, derivation.budget.lexical_limit);
     assert_eq!(budget.semantic_limit, derivation.budget.semantic_limit);
     assert_eq!(budget.combined_limit, derivation.budget.combined_limit);
@@ -491,8 +529,17 @@ fn budget_derive_with_decision_gives_same_budget() {
 #[test]
 fn budget_decision_posterior_sums_to_one() {
     let config = CandidateBudgetConfig::default();
-    for mode in [CandidateMode::Hybrid, CandidateMode::Auto, CandidateMode::LexicalFallback] {
-        for class in [QueryClass::Identifier, QueryClass::ShortKeyword, QueryClass::NaturalLanguage, QueryClass::Empty] {
+    for mode in [
+        CandidateMode::Hybrid,
+        CandidateMode::Auto,
+        CandidateMode::LexicalFallback,
+    ] {
+        for class in [
+            QueryClass::Identifier,
+            QueryClass::ShortKeyword,
+            QueryClass::NaturalLanguage,
+            QueryClass::Empty,
+        ] {
             let derivation = CandidateBudget::derive_with_decision(100, mode, class, config);
             let p = &derivation.decision.posterior;
             let sum = p.identifier + p.short_keyword + p.natural_language + p.empty;
@@ -537,8 +584,12 @@ fn prepare_deduplicates_overlapping_hits() {
 
 #[test]
 fn prepare_respects_budget_limits() {
-    let lexical: Vec<CandidateHit> = (1..=100).map(|i| CandidateHit::new(i, 1.0 / i as f64)).collect();
-    let semantic: Vec<CandidateHit> = (101..=200).map(|i| CandidateHit::new(i, 1.0 / i as f64)).collect();
+    let lexical: Vec<CandidateHit> = (1..=100)
+        .map(|i| CandidateHit::new(i, 1.0 / i as f64))
+        .collect();
+    let semantic: Vec<CandidateHit> = (101..=200)
+        .map(|i| CandidateHit::new(i, 1.0 / i as f64))
+        .collect();
     let budget = CandidateBudget {
         lexical_limit: 5,
         semantic_limit: 5,
@@ -546,7 +597,10 @@ fn prepare_respects_budget_limits() {
     };
 
     let prep = prepare_candidates(&lexical, &semantic, budget);
-    assert!(prep.candidates.len() <= 8, "should be capped at combined_limit");
+    assert!(
+        prep.candidates.len() <= 8,
+        "should be capped at combined_limit"
+    );
     assert!(prep.counts.lexical_selected <= 5, "lexical capped at 5");
     assert!(prep.counts.semantic_selected <= 5, "semantic capped at 5");
 }
@@ -648,12 +702,23 @@ fn explain_reason_codes_are_sorted_and_deduped() {
     );
     // reason_codes should be sorted
     for w in hit.reason_codes.windows(2) {
-        assert!(w[0] <= w[1], "reason_codes not sorted: {:?} > {:?}", w[0], w[1]);
+        assert!(
+            w[0] <= w[1],
+            "reason_codes not sorted: {:?} > {:?}",
+            w[0],
+            w[1]
+        );
     }
     // Should include provided codes plus StageNotExecuted for missing stages
     assert!(hit.reason_codes.contains(&ExplainReasonCode::LexicalBm25));
-    assert!(hit.reason_codes.contains(&ExplainReasonCode::RerankPolicyBoost));
-    assert!(hit.reason_codes.contains(&ExplainReasonCode::StageNotExecuted));
+    assert!(
+        hit.reason_codes
+            .contains(&ExplainReasonCode::RerankPolicyBoost)
+    );
+    assert!(
+        hit.reason_codes
+            .contains(&ExplainReasonCode::StageNotExecuted)
+    );
 }
 
 #[test]
@@ -750,12 +815,12 @@ fn explain_report_serde_stable() {
         &config,
     );
 
-    let report = compose_explain_report(SearchMode::Lexical, 50, HashMap::new(), vec![hit], &config);
+    let report =
+        compose_explain_report(SearchMode::Lexical, 50, HashMap::new(), vec![hit], &config);
 
     // Round-trip through JSON
     let json = serde_json::to_string(&report).unwrap();
-    let restored: mcp_agent_mail_search_core::ExplainReport =
-        serde_json::from_str(&json).unwrap();
+    let restored: mcp_agent_mail_search_core::ExplainReport = serde_json::from_str(&json).unwrap();
 
     assert_eq!(restored.mode_used, SearchMode::Lexical);
     assert_eq!(restored.candidates_evaluated, 50);
@@ -799,7 +864,10 @@ fn pipeline_candidates_to_fusion_to_explain() {
     assert_eq!(fusion.hits.len(), 5);
 
     // Doc 2 should rank highest (dual source)
-    assert_eq!(fusion.hits[0].doc_id, 2, "dual-source doc should rank first");
+    assert_eq!(
+        fusion.hits[0].doc_id, 2,
+        "dual-source doc should rank first"
+    );
 
     // Step 3: Compose explain for top hit
     let explain_config = ExplainComposerConfig::default();

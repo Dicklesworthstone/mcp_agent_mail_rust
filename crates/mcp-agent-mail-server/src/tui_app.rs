@@ -579,11 +579,7 @@ impl OverlayLayer {
     pub const fn traps_focus(self) -> bool {
         matches!(
             self,
-            Self::Palette
-                | Self::Modal
-                | Self::ActionMenu
-                | Self::ToastFocus
-                | Self::MacroPlayback
+            Self::Palette | Self::Modal | Self::ActionMenu | Self::ToastFocus | Self::MacroPlayback
         )
     }
 }
@@ -604,20 +600,76 @@ struct CoachHint {
 
 /// Static hint catalog — one hint per screen for first-use friction.
 const COACH_HINTS: &[CoachHint] = &[
-    CoachHint { id: "dashboard:welcome", screen: MailScreenId::Dashboard, message: "Tip: Press ? for help, Ctrl+P for command palette" },
-    CoachHint { id: "messages:search", screen: MailScreenId::Messages, message: "Tip: Press / to filter messages, Enter to view body" },
-    CoachHint { id: "threads:expand", screen: MailScreenId::Threads, message: "Tip: Enter expands a thread, h collapses it" },
-    CoachHint { id: "agents:inbox", screen: MailScreenId::Agents, message: "Tip: Use / to filter agents, s to cycle sort columns" },
-    CoachHint { id: "search:syntax", screen: MailScreenId::Search, message: "Tip: Use quoted phrases and AND/OR operators in search" },
-    CoachHint { id: "reservations:force", screen: MailScreenId::Reservations, message: "Tip: Press f to force-release a stale reservation" },
-    CoachHint { id: "tool_metrics:sort", screen: MailScreenId::ToolMetrics, message: "Tip: Sort columns with Tab, slow calls are highlighted" },
-    CoachHint { id: "system_health:diag", screen: MailScreenId::SystemHealth, message: "Tip: WAL size and pool stats refresh every tick" },
-    CoachHint { id: "timeline:expand", screen: MailScreenId::Timeline, message: "Tip: Enter expands an event, use correlation links to trace" },
-    CoachHint { id: "projects:browse", screen: MailScreenId::Projects, message: "Tip: Use / to filter projects, s to cycle sort columns" },
-    CoachHint { id: "contacts:approve", screen: MailScreenId::Contacts, message: "Tip: Accept or deny pending contact requests inline" },
-    CoachHint { id: "explorer:filter", screen: MailScreenId::Explorer, message: "Tip: Filter by agent, project, or date range" },
-    CoachHint { id: "analytics:volume", screen: MailScreenId::Analytics, message: "Tip: Message volume charts update in real time" },
-    CoachHint { id: "attachments:preview", screen: MailScreenId::Attachments, message: "Tip: Enter previews an attachment, / filters by name" },
+    CoachHint {
+        id: "dashboard:welcome",
+        screen: MailScreenId::Dashboard,
+        message: "Tip: Press ? for help, Ctrl+P for command palette",
+    },
+    CoachHint {
+        id: "messages:search",
+        screen: MailScreenId::Messages,
+        message: "Tip: Press / to filter messages, Enter to view body",
+    },
+    CoachHint {
+        id: "threads:expand",
+        screen: MailScreenId::Threads,
+        message: "Tip: Enter expands a thread, h collapses it",
+    },
+    CoachHint {
+        id: "agents:inbox",
+        screen: MailScreenId::Agents,
+        message: "Tip: Use / to filter agents, s to cycle sort columns",
+    },
+    CoachHint {
+        id: "search:syntax",
+        screen: MailScreenId::Search,
+        message: "Tip: Use quoted phrases and AND/OR operators in search",
+    },
+    CoachHint {
+        id: "reservations:force",
+        screen: MailScreenId::Reservations,
+        message: "Tip: Press f to force-release a stale reservation",
+    },
+    CoachHint {
+        id: "tool_metrics:sort",
+        screen: MailScreenId::ToolMetrics,
+        message: "Tip: Sort columns with Tab, slow calls are highlighted",
+    },
+    CoachHint {
+        id: "system_health:diag",
+        screen: MailScreenId::SystemHealth,
+        message: "Tip: WAL size and pool stats refresh every tick",
+    },
+    CoachHint {
+        id: "timeline:expand",
+        screen: MailScreenId::Timeline,
+        message: "Tip: Enter expands an event, use correlation links to trace",
+    },
+    CoachHint {
+        id: "projects:browse",
+        screen: MailScreenId::Projects,
+        message: "Tip: Use / to filter projects, s to cycle sort columns",
+    },
+    CoachHint {
+        id: "contacts:approve",
+        screen: MailScreenId::Contacts,
+        message: "Tip: Accept or deny pending contact requests inline",
+    },
+    CoachHint {
+        id: "explorer:filter",
+        screen: MailScreenId::Explorer,
+        message: "Tip: Filter by agent, project, or date range",
+    },
+    CoachHint {
+        id: "analytics:volume",
+        screen: MailScreenId::Analytics,
+        message: "Tip: Message volume charts update in real time",
+    },
+    CoachHint {
+        id: "attachments:preview",
+        screen: MailScreenId::Attachments,
+        message: "Tip: Enter previews an attachment, / filters by name",
+    },
 ];
 
 /// Manages one-shot dismissible coach hints, persisted across sessions.
@@ -921,8 +973,7 @@ impl MailAppModel {
         model.palette_usage_stats = crate::tui_persist::load_palette_usage_or_default(&usage_path);
         model.palette_usage_path = Some(usage_path);
         model.appearance_persist_path = Some(config.console_persist_path.clone());
-        let hints_path =
-            crate::tui_persist::dismissed_hints_path(&config.console_persist_path);
+        let hints_path = crate::tui_persist::dismissed_hints_path(&config.console_persist_path);
         model.coach_hints = CoachHintManager::new().with_persist_path(hints_path);
         model.coach_hints.enabled = config.tui_coach_hints_enabled;
         model.toast_severity = ToastSeverityThreshold::from_config(config);
@@ -1038,9 +1089,7 @@ impl MailAppModel {
                 self.apply_deep_link_with_transition(&target);
                 Cmd::none()
             }
-            ActionKind::Execute(operation) => {
-                self.dispatch_execute_operation(&operation, context)
-            }
+            ActionKind::Execute(operation) => self.dispatch_execute_operation(&operation, context),
             ActionKind::ConfirmThenExecute {
                 title,
                 message,
@@ -1087,7 +1136,7 @@ impl MailAppModel {
     fn dispatch_execute_operation(&mut self, operation: &str, context: &str) -> Cmd<MailMsg> {
         let (cmd, arg) = match operation.split_once(':') {
             Some((c, a)) => (c, a),
-            None => (operation.as_ref(), context),
+            None => (operation, context),
         };
 
         match cmd {
@@ -1101,9 +1150,9 @@ impl MailAppModel {
             }
             "view_messages" => {
                 if !arg.is_empty() && arg != context {
-                    self.apply_deep_link_with_transition(
-                        &DeepLinkTarget::ThreadById(arg.to_string()),
-                    );
+                    self.apply_deep_link_with_transition(&DeepLinkTarget::ThreadById(
+                        arg.to_string(),
+                    ));
                 }
                 Cmd::none()
             }
@@ -1114,40 +1163,35 @@ impl MailAppModel {
                 Cmd::none()
             }
             "view_profile" => {
-                self.apply_deep_link_with_transition(
-                    &DeepLinkTarget::AgentByName(arg.to_string()),
-                );
+                self.apply_deep_link_with_transition(&DeepLinkTarget::AgentByName(arg.to_string()));
                 Cmd::none()
             }
 
             // ── Filter operations (screen-local) ─────────────────
             "filter_kind" | "filter_source" => {
                 // Search with the filter value.
-                self.apply_deep_link_with_transition(
-                    &DeepLinkTarget::SearchFocused(arg.to_string()),
-                );
+                self.apply_deep_link_with_transition(&DeepLinkTarget::SearchFocused(
+                    arg.to_string(),
+                ));
                 Cmd::none()
             }
             "search_in" => {
                 let query = format!("thread:{arg}");
-                self.apply_deep_link_with_transition(
-                    &DeepLinkTarget::SearchFocused(query),
-                );
+                self.apply_deep_link_with_transition(&DeepLinkTarget::SearchFocused(query));
                 Cmd::none()
             }
             "compose_to" => {
                 // Navigate to explorer filtered for the agent.
-                self.apply_deep_link_with_transition(
-                    &DeepLinkTarget::ExplorerForAgent(arg.to_string()),
-                );
+                self.apply_deep_link_with_transition(&DeepLinkTarget::ExplorerForAgent(
+                    arg.to_string(),
+                ));
                 Cmd::none()
             }
 
             // ── Server-dispatched operations ──────────────────────
             // These produce an in-flight toast; actual execution is
             // delegated to the screen's update handler via ActionExecute.
-            "acknowledge" | "mark_read" | "renew" | "release"
-            | "force_release" | "summarize"
+            "acknowledge" | "mark_read" | "renew" | "release" | "force_release" | "summarize"
             | "approve_contact" | "deny_contact" | "block_contact" => {
                 let op = operation.to_string();
                 let ctx = context.to_string();
@@ -1186,7 +1230,10 @@ impl MailAppModel {
 
     /// Drain any deferred confirmed action (from modal callback) and dispatch it.
     fn drain_deferred_confirmed_action(&mut self) -> Cmd<MailMsg> {
-        let action = DEFERRED_CONFIRMED_ACTION.lock().ok().and_then(|mut slot| slot.take());
+        let action = DEFERRED_CONFIRMED_ACTION
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
         if let Some((operation, context)) = action {
             return self.dispatch_execute_operation(&operation, &context);
         }
@@ -1216,8 +1263,9 @@ impl MailAppModel {
         if let ActionOutcome::Success { ref operation, .. }
         | ActionOutcome::Failure { ref operation, .. } = outcome
         {
-            self.action_outcomes
-                .retain(|o| !matches!(o, ActionOutcome::InFlight { operation: op } if op == operation));
+            self.action_outcomes.retain(
+                |o| !matches!(o, ActionOutcome::InFlight { operation: op } if op == operation),
+            );
         }
         // Cap outcome history to 20 entries.
         if self.action_outcomes.len() >= 20 {
@@ -2544,18 +2592,14 @@ impl Model for MailAppModel {
                             && k.code == KeyCode::Char('r')
                     ) {
                         self.screen_panics.borrow_mut().remove(&current);
-                        let fresh = ScreenManager::create_screen(
-                            current,
-                            &self.screen_manager.state,
-                        );
+                        let fresh =
+                            ScreenManager::create_screen(current, &self.screen_manager.state);
                         self.screen_manager.set_screen(current, fresh);
                     }
                     Cmd::none()
                 } else if let Some(screen) = self.screen_manager.active_screen_mut() {
                     let state_ref = &self.state;
-                    let result = catch_unwind(AssertUnwindSafe(|| {
-                        screen.update(event, state_ref)
-                    }));
+                    let result = catch_unwind(AssertUnwindSafe(|| screen.update(event, state_ref)));
                     match result {
                         Ok(cmd) => map_screen_cmd(cmd),
                         Err(payload) => {
@@ -2595,6 +2639,7 @@ impl Model for MailAppModel {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame) {
         use crate::tui_chrome;
         use crate::tui_decision::{DiffAction, FrameState};
@@ -2661,16 +2706,18 @@ impl Model for MailAppModel {
         for (i, meta) in crate::tui_screens::MAIL_SCREEN_REGISTRY.iter().enumerate() {
             if let Some(slot) = self.mouse_dispatcher.tab_slot(i) {
                 let tab_rect = Rect::new(slot.0, slot.2, slot.1 - slot.0, 1);
-                frame.register_hit_region(
-                    tab_rect,
-                    crate::tui_hit_regions::tab_hit_id(meta.id),
-                );
+                frame.register_hit_region(tab_rect, crate::tui_hit_regions::tab_hit_id(meta.id));
             }
         }
 
         // 2. Screen content (z=2)
         if self.screen_panics.borrow().contains_key(&active_screen) {
-            let msg = self.screen_panics.borrow().get(&active_screen).cloned().unwrap_or_default();
+            let msg = self
+                .screen_panics
+                .borrow()
+                .get(&active_screen)
+                .cloned()
+                .unwrap_or_default();
             render_screen_error_fallback(active_screen, &msg, chrome.content, frame);
         } else if let Some(screen) = self.screen_manager.active_screen_ref() {
             let result = catch_unwind(AssertUnwindSafe(|| {
@@ -2753,10 +2800,10 @@ impl Model for MailAppModel {
             let screen_tip = self
                 .screen_manager
                 .active_screen_ref()
-                .and_then(|s| s.context_help_tip());
-            let sections =
-                self.keymap
-                    .contextual_help(&screen_bindings, screen_label, screen_tip);
+                .and_then(super::tui_screens::MailScreen::context_help_tip);
+            let sections = self
+                .keymap
+                .contextual_help(&screen_bindings, screen_label, screen_tip);
             tui_chrome::render_help_overlay_sections(&sections, self.help_scroll, frame, area);
         }
     }
@@ -2897,10 +2944,10 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
     for &id in ALL_SCREEN_IDS {
         let meta = screen_meta(id);
         let key_hint = crate::tui_screens::jump_key_label_for_screen(id);
-        let desc = match key_hint {
-            Some(k) => format!("{} [key: {}]", meta.description, k),
-            None => format!("{} [via palette only]", meta.description),
-        };
+        let desc = key_hint.map_or_else(
+            || format!("{} [via palette only]", meta.description),
+            |k| format!("{} [key: {}]", meta.description, k),
+        );
         out.push(
             ActionItem::new(
                 screen_palette_action_id(id),
@@ -3854,9 +3901,7 @@ fn render_screen_transition_overlay(transition: ScreenTransition, area: Rect, fr
             let indicator_w = (f32::from(full_w) * 0.3).round().max(2.0) as u16;
             let travel = full_w.saturating_sub(indicator_w);
             let offset = match transition.direction {
-                TransitionDirection::Forward => {
-                    (f32::from(travel) * eased).round() as u16
-                }
+                TransitionDirection::Forward => (f32::from(travel) * eased).round() as u16,
                 TransitionDirection::Backward => {
                     travel.saturating_sub((f32::from(travel) * eased).round() as u16)
                 }
@@ -3894,12 +3939,7 @@ fn render_screen_transition_overlay(transition: ScreenTransition, area: Rect, fr
             );
             let label_w = display_width(&label) as u16;
             let label_x = area.x + area.width.saturating_sub(label_w) / 2;
-            let label_area = Rect::new(
-                label_x,
-                area.y,
-                label_w.min(area.width),
-                1,
-            );
+            let label_area = Rect::new(label_x, area.y, label_w.min(area.width), 1);
             if label_area.width > 0 {
                 Paragraph::new(label)
                     .style(
@@ -4894,10 +4934,7 @@ mod tests {
                 "screen {id:?} has no jump key and no palette entry"
             );
             // Also verify palette entry exists even if key exists (belt and suspenders).
-            assert!(
-                in_palette,
-                "screen {id:?} missing from command palette"
-            );
+            assert!(in_palette, "screen {id:?} missing from command palette");
         }
     }
 
@@ -5135,8 +5172,7 @@ mod tests {
         assert!(model.accessibility().reduced_motion);
 
         // Check persisted value
-        let contents = std::fs::read_to_string(&config.console_persist_path)
-            .unwrap_or_default();
+        let contents = std::fs::read_to_string(&config.console_persist_path).unwrap_or_default();
         assert!(
             contents.contains("TUI_REDUCED_MOTION=true"),
             "reduced_motion should be persisted; contents: {contents}"
@@ -5151,10 +5187,16 @@ mod tests {
 
         // Both lateral and cross-category transitions should be skipped.
         model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
-        assert!(model.screen_transition.is_none(), "cross-category should be skipped");
+        assert!(
+            model.screen_transition.is_none(),
+            "cross-category should be skipped"
+        );
 
         model.update(MailMsg::SwitchScreen(MailScreenId::Threads));
-        assert!(model.screen_transition.is_none(), "lateral should be skipped");
+        assert!(
+            model.screen_transition.is_none(),
+            "lateral should be skipped"
+        );
     }
 
     #[test]
@@ -7374,32 +7416,17 @@ mod tests {
     }
 
     impl MailScreen for PanickingScreen {
-        fn update(
-            &mut self,
-            _event: &Event,
-            _state: &TuiSharedState,
-        ) -> Cmd<MailScreenMsg> {
-            if self.panic_on_update {
-                panic!("update panic");
-            }
+        fn update(&mut self, _event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+            assert!(!self.panic_on_update, "update panic");
             Cmd::none()
         }
 
-        fn view(
-            &self,
-            _frame: &mut ftui::Frame<'_>,
-            _area: Rect,
-            _state: &TuiSharedState,
-        ) {
-            if self.panic_on_view {
-                panic!("view panic");
-            }
+        fn view(&self, _frame: &mut ftui::Frame<'_>, _area: Rect, _state: &TuiSharedState) {
+            assert!(!self.panic_on_view, "view panic");
         }
 
         fn tick(&mut self, _tick_count: u64, _state: &TuiSharedState) {
-            if self.panic_on_tick {
-                panic!("tick panic");
-            }
+            assert!(!self.panic_on_tick, "tick panic");
         }
 
         fn title(&self) -> &'static str {
@@ -7421,8 +7448,18 @@ mod tests {
         model.view(&mut frame);
 
         // Screen should be recorded as panicked.
-        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
-        let msg = model.screen_panics.borrow().get(&MailScreenId::Messages).cloned().unwrap();
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
+        let msg = model
+            .screen_panics
+            .borrow()
+            .get(&MailScreenId::Messages)
+            .cloned()
+            .unwrap();
         assert_eq!(msg, "view panic");
     }
 
@@ -7444,7 +7481,12 @@ mod tests {
 
         // Should not crash, returns Cmd::None.
         assert!(matches!(cmd, Cmd::None));
-        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
     }
 
     #[test]
@@ -7457,7 +7499,12 @@ mod tests {
         // Tick should catch the panic.
         model.update(MailMsg::Terminal(Event::Tick));
 
-        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
     }
 
     #[test]
@@ -7472,14 +7519,24 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         model.view(&mut frame);
-        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
 
         // Second view should render fallback without re-panicking.
         let mut pool2 = ftui::GraphemePool::new();
         let mut frame2 = Frame::new(80, 24, &mut pool2);
         model.view(&mut frame2);
         // Still panicked — no crash on second render.
-        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
     }
 
     #[test]
@@ -7494,7 +7551,12 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         model.view(&mut frame);
-        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
 
         // Press 'r' to reset.
         let r_key = Event::Key(KeyEvent {
@@ -7505,7 +7567,12 @@ mod tests {
         model.update(MailMsg::Terminal(r_key));
 
         // Screen should be cleared from panics (fresh screen installed).
-        assert!(!model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        assert!(
+            !model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
     }
 
     #[test]
@@ -7522,8 +7589,13 @@ mod tests {
             modifiers: Modifiers::NONE,
             kind: KeyEventKind::Press,
         });
-        model.update(MailMsg::Terminal(x_key.clone()));
-        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        model.update(MailMsg::Terminal(x_key));
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
 
         // Send another key — should be swallowed, no crash.
         let j_key = Event::Key(KeyEvent {
@@ -7547,7 +7619,12 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         model.view(&mut frame);
-        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
 
         // Switch to Dashboard — should work fine.
         model.update(MailMsg::SwitchScreen(MailScreenId::Dashboard));
@@ -7556,7 +7633,12 @@ mod tests {
         let mut frame2 = Frame::new(80, 24, &mut pool2);
         model.view(&mut frame2);
         // Dashboard is not panicked.
-        assert!(!model.screen_panics.borrow().contains_key(&MailScreenId::Dashboard));
+        assert!(
+            !model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Dashboard)
+        );
     }
 
     #[test]
@@ -7625,12 +7707,9 @@ mod tests {
         assert_eq!(model.topmost_overlay(), OverlayLayer::ActionMenu);
 
         // Now open a modal — should take precedence
-        model.modal_manager.show_confirmation(
-            "Test",
-            "Are you sure?",
-            ModalSeverity::Info,
-            |_| {},
-        );
+        model
+            .modal_manager
+            .show_confirmation("Test", "Are you sure?", ModalSeverity::Info, |_| {});
         assert_eq!(model.topmost_overlay(), OverlayLayer::Modal);
     }
 
@@ -7708,7 +7787,10 @@ mod tests {
         let mut mgr = CoachHintManager::new();
         let _ = mgr.on_screen_visit(MailScreenId::Messages);
         let msg = mgr.on_screen_visit(MailScreenId::Messages);
-        assert!(msg.is_none(), "second visit in same session should not show hint");
+        assert!(
+            msg.is_none(),
+            "second visit in same session should not show hint"
+        );
     }
 
     #[test]
@@ -7739,7 +7821,7 @@ mod tests {
     fn coach_hint_all_screens_have_hints() {
         for &screen in ALL_SCREEN_IDS {
             let found = COACH_HINTS.iter().any(|h| h.screen == screen);
-            assert!(found, "missing coach hint for {:?}", screen);
+            assert!(found, "missing coach hint for {screen:?}");
         }
     }
 
@@ -7767,15 +7849,15 @@ mod tests {
             ("messages:search", &["/", "Enter"]),
             ("threads:expand", &["Enter", "h"]),
             ("agents:inbox", &["/", "s"]),
-            ("search:syntax", &[]),                  // syntax tips, no specific key
+            ("search:syntax", &[]), // syntax tips, no specific key
             ("reservations:force", &["f"]),
             ("tool_metrics:sort", &["Tab"]),
-            ("system_health:diag", &[]),             // informational, no specific key
+            ("system_health:diag", &[]), // informational, no specific key
             ("timeline:expand", &["Enter"]),
             ("projects:browse", &["/", "s"]),
-            ("contacts:approve", &[]),               // inline action, no specific key
-            ("explorer:filter", &[]),                // informational
-            ("analytics:volume", &[]),               // informational
+            ("contacts:approve", &[]), // inline action, no specific key
+            ("explorer:filter", &[]),  // informational
+            ("analytics:volume", &[]), // informational
             ("attachments:preview", &["Enter", "/"]),
         ];
 
@@ -7809,16 +7891,11 @@ mod tests {
         for &id in ALL_SCREEN_IDS {
             let screen = ScreenManager::create_screen(id, &state);
             let tip = screen.context_help_tip();
-            assert!(
-                tip.is_some(),
-                "screen {:?} missing context_help_tip()",
-                id
-            );
+            assert!(tip.is_some(), "screen {id:?} missing context_help_tip()");
             let text = tip.unwrap();
             assert!(
                 !text.is_empty(),
-                "screen {:?} has empty context_help_tip()",
-                id
+                "screen {id:?} has empty context_help_tip()"
             );
         }
     }
@@ -7951,7 +8028,9 @@ mod tests {
         );
         assert!(model.modal_manager.is_active(), "modal should be shown");
         // Dismiss for next phase.
-        model.modal_manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
+        model
+            .modal_manager
+            .handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
 
         // ── Phase 2: OK stores the deferred action ───────────────
         clear_deferred();
@@ -7963,7 +8042,9 @@ mod tests {
             },
             "reservation:7",
         );
-        model.modal_manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
+        model
+            .modal_manager
+            .handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
         assert!(!model.modal_manager.is_active());
 
         let stored = read_deferred();
@@ -7981,9 +8062,14 @@ mod tests {
             },
             "ctx",
         );
-        model.modal_manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
+        model
+            .modal_manager
+            .handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
         assert!(!model.modal_manager.is_active());
-        assert!(read_deferred().is_none(), "cancelled confirm should not store");
+        assert!(
+            read_deferred().is_none(),
+            "cancelled confirm should not store"
+        );
 
         // ── Phase 4: Full lifecycle via tick drain ────────────────
         clear_deferred();
@@ -7995,7 +8081,9 @@ mod tests {
             },
             "msg:55",
         );
-        model.modal_manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
+        model
+            .modal_manager
+            .handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
         let cmd = model.drain_deferred_confirmed_action();
         assert!(matches!(cmd, Cmd::Msg(_)), "acknowledge → Cmd::Msg");
         assert!(read_deferred().is_none(), "static should be drained");
@@ -8067,7 +8155,9 @@ mod tests {
         model.action_outcomes.clear();
         let _cmd = model.dispatch_execute_operation("acknowledge", "msg:99");
         assert!(
-            model.action_outcomes.iter().any(|o| matches!(o, ActionOutcome::InFlight { operation } if operation == "acknowledge")),
+            model.action_outcomes.iter().any(
+                |o| matches!(o, ActionOutcome::InFlight { operation } if operation == "acknowledge")
+            ),
             "server-dispatched op should record InFlight outcome"
         );
     }
@@ -8115,10 +8205,8 @@ mod tests {
     #[test]
     fn dispatch_navigate_action_switches_screen() {
         let mut model = test_model();
-        let cmd = model.dispatch_action_menu_selection(
-            ActionKind::Navigate(MailScreenId::Agents),
-            "ctx",
-        );
+        let cmd =
+            model.dispatch_action_menu_selection(ActionKind::Navigate(MailScreenId::Agents), "ctx");
         assert_eq!(model.active_screen(), MailScreenId::Agents);
         assert!(matches!(cmd, Cmd::None));
     }
@@ -8247,9 +8335,13 @@ mod tests {
         assert_eq!(layers.len(), 8);
         // Each has a unique discriminant.
         let mut values: Vec<u8> = layers.iter().map(|l| *l as u8).collect();
-        values.sort();
+        values.sort_unstable();
         values.dedup();
-        assert_eq!(values.len(), 8, "all overlay layers must have unique u8 values");
+        assert_eq!(
+            values.len(),
+            8,
+            "all overlay layers must have unique u8 values"
+        );
     }
 
     #[test]
@@ -8264,11 +8356,7 @@ mod tests {
             OverlayLayer::Modal,
             OverlayLayer::Palette,
         ] {
-            assert!(
-                OverlayLayer::Help > layer,
-                "Help must be > {:?}",
-                layer,
-            );
+            assert!(OverlayLayer::Help > layer, "Help must be > {layer:?}",);
         }
     }
 

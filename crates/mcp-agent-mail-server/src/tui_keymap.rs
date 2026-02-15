@@ -542,14 +542,14 @@ impl KeymapRegistry {
                 .resolved
                 .get(b.action_id)
                 .map_or_else(|| b.label.to_string(), |(l, _, _)| l.clone());
-            let mut action = b.action.to_string();
-
-            if b.action_id == "jump_screen" {
+            let action = if b.action_id == "jump_screen" {
                 if label == JUMP_BINDING_LABEL {
                     label = jump_key_legend();
                 }
-                action = jump_action_description();
-            }
+                jump_action_description()
+            } else {
+                b.action.to_string()
+            };
 
             entries.push((label, action));
         }
@@ -1157,14 +1157,17 @@ mod tests {
         assert_eq!(ovr2.new_label, "Ctrl+Q");
     }
 
-    /// Guard: help_entries always shows the dynamic jump key legend, not the
+    /// Guard: `help_entries` always shows the dynamic jump key legend, not the
     /// hardcoded sentinel, so the hint can never drift from the registry.
     #[test]
     fn help_entries_jump_label_matches_registry() {
         let registry = KeymapRegistry::default();
         let entries = registry.help_entries();
         let jump = entries.iter().find(|(_, a)| a.contains("Jump to screen"));
-        assert!(jump.is_some(), "help_entries must contain a jump-to-screen entry");
+        assert!(
+            jump.is_some(),
+            "help_entries must contain a jump-to-screen entry"
+        );
         let (label, _) = jump.unwrap();
         let expected = crate::tui_screens::jump_key_legend();
         assert_eq!(
@@ -1217,12 +1220,14 @@ mod tests {
             let entries = registry.help_entries();
             assert!(
                 !entries.is_empty(),
-                "{:?} profile should produce non-empty help entries",
-                profile
+                "{profile:?} profile should produce non-empty help entries"
             );
             for (label, action) in &entries {
                 assert!(!label.is_empty(), "{profile:?}: empty label for '{action}'");
-                assert!(!action.is_empty(), "{profile:?}: empty action for '{label}'");
+                assert!(
+                    !action.is_empty(),
+                    "{profile:?}: empty action for '{label}'"
+                );
             }
         }
     }

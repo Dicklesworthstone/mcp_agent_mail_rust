@@ -252,6 +252,7 @@ impl SystemHealthScreen {
     }
 
     /// Render the original text diagnostics view.
+    #[allow(clippy::too_many_lines)]
     fn render_text_view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         let snap = self.snapshot();
         let effects_enabled = state.config_snapshot().tui_effects;
@@ -267,20 +268,25 @@ impl SystemHealthScreen {
         let mut lines: Vec<Line> = Vec::new();
 
         // ── Configuration Section ──
-        lines.push(Line::from_spans([
-            Span::styled("\u{2500}\u{2500} Configuration \u{2500}\u{2500}", section_style),
-        ]));
+        lines.push(Line::from_spans([Span::styled(
+            "\u{2500}\u{2500} Configuration \u{2500}\u{2500}",
+            section_style,
+        )]));
 
         lines.push(Line::from_spans([
             Span::styled("Endpoint:  ", label_style),
-            Span::styled(snap.endpoint.to_string(), value_style),
+            Span::styled(snap.endpoint.clone(), value_style),
         ]));
         lines.push(Line::from_spans([
             Span::styled("Web UI:    ", label_style),
-            Span::styled(snap.web_ui_url.to_string(), value_style),
+            Span::styled(snap.web_ui_url.clone(), value_style),
         ]));
 
-        let auth_text = if snap.auth_enabled { "enabled" } else { "disabled" };
+        let auth_text = if snap.auth_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
         let auth_val_style = if snap.auth_enabled {
             crate::tui_theme::text_success(&tp)
         } else {
@@ -321,12 +327,10 @@ impl SystemHealthScreen {
         lines.push(Line::raw(String::new()));
 
         // ── Connection Diagnostics Section ──
-        lines.push(Line::from_spans([
-            Span::styled(
-                "\u{2500}\u{2500} Connection Diagnostics \u{2500}\u{2500}",
-                section_style,
-            ),
-        ]));
+        lines.push(Line::from_spans([Span::styled(
+            "\u{2500}\u{2500} Connection Diagnostics \u{2500}\u{2500}",
+            section_style,
+        )]));
 
         // TCP probe
         if let Some(err) = &snap.tcp_error {
@@ -334,7 +338,7 @@ impl SystemHealthScreen {
                 Level::Fail,
                 &tp,
                 format!("TCP {}:{}", snap.http_host, snap.http_port),
-                err.to_string(),
+                err.clone(),
             ));
         } else {
             lines.push(level_styled_line(
@@ -352,11 +356,11 @@ impl SystemHealthScreen {
                     Level::Fail,
                     &tp,
                     format!("POST {} ({})", p.path, p.kind.label()),
-                    err.to_string(),
+                    err.clone(),
                 ));
                 continue;
             }
-            let status = p.status.map_or_else(|| "?".into(), |s| format_http_status(s));
+            let status = p.status.map_or_else(|| "?".into(), format_http_status);
             let latency = p.latency_ms.unwrap_or(0);
             let tools_hint = match p.body_has_tools {
                 Some(true) => "tools: yes",
@@ -375,23 +379,21 @@ impl SystemHealthScreen {
         // ── Findings Section ──
         if !snap.lines.is_empty() {
             lines.push(Line::raw(String::new()));
-            lines.push(Line::from_spans([
-                Span::styled(
-                    "\u{2500}\u{2500} Findings \u{2500}\u{2500}",
-                    section_style,
-                ),
-            ]));
+            lines.push(Line::from_spans([Span::styled(
+                "\u{2500}\u{2500} Findings \u{2500}\u{2500}",
+                section_style,
+            )]));
             for line in &snap.lines {
                 lines.push(level_styled_line(
                     line.level,
                     &tp,
                     line.name.to_string(),
-                    line.detail.to_string(),
+                    line.detail.clone(),
                 ));
                 if let Some(fix) = &line.remediation {
                     lines.push(Line::from_spans([
                         Span::styled("       Fix: ", accent_style),
-                        Span::styled(fix.to_string(), hint_style),
+                        Span::styled(fix.clone(), hint_style),
                     ]));
                 }
             }
@@ -419,7 +421,7 @@ impl SystemHealthScreen {
     }
 
     /// Render the widget dashboard view.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn render_dashboard_view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         let snap = self.snapshot();
         let effects_enabled = state.config_snapshot().tui_effects;
@@ -527,8 +529,12 @@ impl SystemHealthScreen {
                 let summary_h = 1_u16.min(content_area.height);
                 let cards_h = content_area.height.saturating_sub(summary_h);
 
-                let summary_area =
-                    Rect::new(content_area.x, content_area.y, content_area.width, summary_h);
+                let summary_area = Rect::new(
+                    content_area.x,
+                    content_area.y,
+                    content_area.width,
+                    summary_h,
+                );
                 let cards_area = Rect::new(
                     content_area.x,
                     content_area.y + summary_h,
@@ -640,7 +646,7 @@ impl SystemHealthScreen {
     }
 
     /// Render diagnostic findings as anomaly cards.
-    #[allow(clippy::unused_self)]
+    #[allow(clippy::too_many_lines, clippy::unused_self)]
     fn render_anomaly_cards(&self, frame: &mut Frame<'_>, area: Rect, snap: &DiagnosticsSnapshot) {
         if area.is_empty() {
             return;
@@ -680,7 +686,7 @@ impl SystemHealthScreen {
 
         // Anomaly-first prioritization: sort by severity (Critical > High > Medium > Low)
         // so the most actionable findings are always visible, even on narrow/short terminals.
-        findings.sort_by(|a, b| severity_priority(b.severity).cmp(&severity_priority(a.severity)));
+        findings.sort_by_key(|f| std::cmp::Reverse(severity_priority(f.severity)));
 
         if findings.is_empty() {
             // All healthy — render a single OK card
@@ -2236,6 +2242,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_closure_for_method_calls)]
     fn level_styled_line_contains_badge_and_detail() {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let line = level_styled_line(Level::Ok, &tp, "TCP check".into(), "5ms".into());
@@ -2265,9 +2272,15 @@ mod tests {
 
     #[test]
     fn severity_priority_orders_critical_first() {
-        assert!(severity_priority(AnomalySeverity::Critical) > severity_priority(AnomalySeverity::High));
-        assert!(severity_priority(AnomalySeverity::High) > severity_priority(AnomalySeverity::Medium));
-        assert!(severity_priority(AnomalySeverity::Medium) > severity_priority(AnomalySeverity::Low));
+        assert!(
+            severity_priority(AnomalySeverity::Critical) > severity_priority(AnomalySeverity::High)
+        );
+        assert!(
+            severity_priority(AnomalySeverity::High) > severity_priority(AnomalySeverity::Medium)
+        );
+        assert!(
+            severity_priority(AnomalySeverity::Medium) > severity_priority(AnomalySeverity::Low)
+        );
     }
 
     #[test]
@@ -2298,9 +2311,15 @@ mod tests {
 
     #[test]
     fn severity_priority_ordering_all_levels() {
-        assert!(severity_priority(AnomalySeverity::Critical) > severity_priority(AnomalySeverity::High));
-        assert!(severity_priority(AnomalySeverity::High) > severity_priority(AnomalySeverity::Medium));
-        assert!(severity_priority(AnomalySeverity::Medium) > severity_priority(AnomalySeverity::Low));
+        assert!(
+            severity_priority(AnomalySeverity::Critical) > severity_priority(AnomalySeverity::High)
+        );
+        assert!(
+            severity_priority(AnomalySeverity::High) > severity_priority(AnomalySeverity::Medium)
+        );
+        assert!(
+            severity_priority(AnomalySeverity::Medium) > severity_priority(AnomalySeverity::Low)
+        );
     }
 
     #[test]

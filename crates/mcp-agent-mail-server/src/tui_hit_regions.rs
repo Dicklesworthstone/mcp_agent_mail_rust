@@ -16,7 +16,7 @@
 
 use ftui_render::frame::HitId;
 
-use crate::tui_screens::{MailScreenId, ScreenCategory, ALL_SCREEN_IDS};
+use crate::tui_screens::{ALL_SCREEN_IDS, MailScreenId, ScreenCategory};
 
 // ──────────────────────────────────────────────────────────────────────
 // Base constants
@@ -240,6 +240,7 @@ pub struct MouseDispatcher {
 
 impl MouseDispatcher {
     /// Create a new dispatcher with empty cached regions.
+    #[must_use]
     pub fn new() -> Self {
         let tab_slots = ALL_SCREEN_IDS
             .iter()
@@ -262,7 +263,14 @@ impl MouseDispatcher {
     /// Record a tab's hit region during tab-bar rendering.
     ///
     /// `index` is the 0-based position in `ALL_SCREEN_IDS`.
-    pub fn record_tab_slot(&self, index: usize, screen: MailScreenId, x_start: u16, x_end: u16, y: u16) {
+    pub fn record_tab_slot(
+        &self,
+        index: usize,
+        screen: MailScreenId,
+        x_start: u16,
+        x_end: u16,
+        y: u16,
+    ) {
         if let Some(slot) = self.tab_slots.get(index) {
             slot.set(TabHitSlot {
                 screen: Some(screen),
@@ -325,12 +333,18 @@ impl MouseDispatcher {
     }
 }
 
+impl Default for MouseDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Check whether a point `(x, y)` falls inside a rectangle.
 ///
 /// Returns `false` for empty (zero-area) rectangles.
 #[inline]
 #[must_use]
-pub fn point_in_rect(rect: Rect, x: u16, y: u16) -> bool {
+pub const fn point_in_rect(rect: Rect, x: u16, y: u16) -> bool {
     !rect.is_empty()
         && x >= rect.x
         && x < rect.x + rect.width
@@ -347,6 +361,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn ranges_do_not_overlap() {
         // Verify non-overlapping: tab < category < pane < overlay < status
         assert!(TAB_HIT_BASE + 100 <= CATEGORY_HIT_BASE);
@@ -359,7 +374,11 @@ mod tests {
     fn tab_round_trip_all_screens() {
         for &id in ALL_SCREEN_IDS {
             let hit = tab_hit_id(id);
-            assert_eq!(screen_from_tab_hit(hit), Some(id), "tab round-trip for {id:?}");
+            assert_eq!(
+                screen_from_tab_hit(hit),
+                Some(id),
+                "tab round-trip for {id:?}"
+            );
         }
     }
 
@@ -367,7 +386,11 @@ mod tests {
     fn pane_round_trip_all_screens() {
         for &id in ALL_SCREEN_IDS {
             let hit = pane_hit_id(id);
-            assert_eq!(screen_from_pane_hit(hit), Some(id), "pane round-trip for {id:?}");
+            assert_eq!(
+                screen_from_pane_hit(hit),
+                Some(id),
+                "pane round-trip for {id:?}"
+            );
         }
     }
 
@@ -375,7 +398,11 @@ mod tests {
     fn category_round_trip() {
         for &cat in ScreenCategory::ALL {
             let hit = category_hit_id(cat);
-            assert_eq!(category_from_hit(hit), Some(cat), "category round-trip for {cat:?}");
+            assert_eq!(
+                category_from_hit(hit),
+                Some(cat),
+                "category round-trip for {cat:?}"
+            );
         }
     }
 
@@ -455,7 +482,10 @@ mod tests {
     #[test]
     fn every_screen_has_distinct_tab_and_pane_ids() {
         let mut tab_ids: Vec<u32> = ALL_SCREEN_IDS.iter().map(|&s| tab_hit_id(s).id()).collect();
-        let mut pane_ids: Vec<u32> = ALL_SCREEN_IDS.iter().map(|&s| pane_hit_id(s).id()).collect();
+        let mut pane_ids: Vec<u32> = ALL_SCREEN_IDS
+            .iter()
+            .map(|&s| pane_hit_id(s).id())
+            .collect();
         tab_ids.sort_unstable();
         tab_ids.dedup();
         pane_ids.sort_unstable();
@@ -486,7 +516,11 @@ mod tests {
             );
         }
 
-        let status_consts = [STATUS_HELP_TOGGLE, STATUS_PALETTE_TOGGLE, STATUS_PERF_TOGGLE];
+        let status_consts = [
+            STATUS_HELP_TOGGLE,
+            STATUS_PALETTE_TOGGLE,
+            STATUS_PERF_TOGGLE,
+        ];
         for &c in &status_consts {
             assert!(
                 matches!(classify_hit(HitId::new(c)), HitLayer::StatusToggle(_)),
@@ -516,10 +550,16 @@ mod tests {
         d.record_tab_slot(1, MailScreenId::Messages, 9, 18, 0);
 
         let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 3, 0);
-        assert_eq!(d.dispatch(&ev), MouseAction::SwitchScreen(MailScreenId::Dashboard));
+        assert_eq!(
+            d.dispatch(&ev),
+            MouseAction::SwitchScreen(MailScreenId::Dashboard)
+        );
 
         let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 12, 0);
-        assert_eq!(d.dispatch(&ev), MouseAction::SwitchScreen(MailScreenId::Messages));
+        assert_eq!(
+            d.dispatch(&ev),
+            MouseAction::SwitchScreen(MailScreenId::Messages)
+        );
     }
 
     #[test]
@@ -623,7 +663,10 @@ mod tests {
         // Overwrite slot 0 with a different screen and region.
         d.record_tab_slot(0, MailScreenId::Messages, 10, 20, 0);
         let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 15, 0);
-        assert_eq!(d.dispatch(&ev), MouseAction::SwitchScreen(MailScreenId::Messages));
+        assert_eq!(
+            d.dispatch(&ev),
+            MouseAction::SwitchScreen(MailScreenId::Messages)
+        );
 
         // Old region should no longer hit.
         let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 3, 0);
@@ -683,7 +726,11 @@ mod tests {
 
     #[test]
     fn status_toggles_have_distinct_hit_ids() {
-        let ids = [STATUS_HELP_TOGGLE, STATUS_PALETTE_TOGGLE, STATUS_PERF_TOGGLE];
+        let ids = [
+            STATUS_HELP_TOGGLE,
+            STATUS_PALETTE_TOGGLE,
+            STATUS_PERF_TOGGLE,
+        ];
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
                 assert_ne!(ids[i], ids[j], "status toggle IDs must be distinct");

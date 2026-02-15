@@ -465,18 +465,18 @@ impl ActionMenuManager {
             }
             KeyCode::Enter => {
                 if let Some(entry) = state.selected_entry() {
-                    if !entry.enabled {
+                    if entry.enabled {
+                        let action = entry.action.clone();
+                        let context = state.context_id().to_string();
+                        self.active = None;
+                        Some(ActionMenuResult::Selected(action, context))
+                    } else {
                         // Disabled: report reason via DisabledAttempt result.
                         let reason = entry
                             .disabled_reason
                             .clone()
                             .unwrap_or_else(|| "Action unavailable".into());
                         Some(ActionMenuResult::DisabledAttempt(reason))
-                    } else {
-                        let action = entry.action.clone();
-                        let context = state.context_id().to_string();
-                        self.active = None;
-                        Some(ActionMenuResult::Selected(action, context))
                     }
                 } else {
                     Some(ActionMenuResult::Consumed)
@@ -925,8 +925,8 @@ mod tests {
 
     #[test]
     fn disabled_entry_builder() {
-        let entry = ActionEntry::new("Release", ActionKind::Dismiss)
-            .disabled("No active reservation");
+        let entry =
+            ActionEntry::new("Release", ActionKind::Dismiss).disabled("No active reservation");
         assert!(!entry.enabled);
         assert_eq!(
             entry.disabled_reason.as_deref(),
@@ -960,8 +960,7 @@ mod tests {
         let result = mgr.handle_event(&enter);
         assert!(
             matches!(result, Some(ActionMenuResult::DisabledAttempt(ref r)) if r == "Not available"),
-            "Enter on disabled should return DisabledAttempt, got {:?}",
-            result,
+            "Enter on disabled should return DisabledAttempt, got {result:?}",
         );
         // Menu should still be open.
         assert!(mgr.is_active());
@@ -969,9 +968,7 @@ mod tests {
 
     #[test]
     fn enabled_entry_allows_selection() {
-        let entries = vec![
-            ActionEntry::new("Go", ActionKind::Execute("go".into())),
-        ];
+        let entries = vec![ActionEntry::new("Go", ActionKind::Execute("go".into()))];
         let mut mgr = ActionMenuManager::new();
         mgr.open(entries, 0, "ctx");
 
@@ -1080,11 +1077,7 @@ mod tests {
     #[test]
     fn non_key_events_consumed_when_active() {
         let mut mgr = ActionMenuManager::new();
-        mgr.open(
-            vec![ActionEntry::new("Go", ActionKind::Dismiss)],
-            0,
-            "ctx",
-        );
+        mgr.open(vec![ActionEntry::new("Go", ActionKind::Dismiss)], 0, "ctx");
 
         // Mouse event should be consumed (not forwarded), menu stays open.
         let mouse = Event::Mouse(ftui::MouseEvent {

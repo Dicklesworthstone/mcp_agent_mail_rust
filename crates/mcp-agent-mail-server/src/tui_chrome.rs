@@ -73,7 +73,7 @@ pub struct ChromeAreas {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Map a screen category to a theme color for the tab key indicator.
-fn category_key_color(
+const fn category_key_color(
     category: crate::tui_screens::ScreenCategory,
     tp: &crate::tui_theme::TuiThemePalette,
 ) -> PackedRgba {
@@ -191,7 +191,10 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
             Span::styled(key_str.as_str(), key_style),
         ];
         if has_label {
-            spans.push(Span::styled(":", Style::default().fg(tp.tab_inactive_fg).bg(bg)));
+            spans.push(Span::styled(
+                ":",
+                Style::default().fg(tp.tab_inactive_fg).bg(bg),
+            ));
             spans.push(label_span);
         }
         spans.push(Span::styled(" ", Style::default().bg(bg)));
@@ -220,10 +223,7 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
 ///
 /// This mirrors the tab-width logic from [`render_tab_bar`] so that
 /// mouse click coordinates can be mapped back to the correct screen.
-pub fn record_tab_hit_slots(
-    area: Rect,
-    dispatcher: &crate::tui_hit_regions::MouseDispatcher,
-) {
+pub fn record_tab_hit_slots(area: Rect, dispatcher: &crate::tui_hit_regions::MouseDispatcher) {
     let available = area.width;
     let ultra_compact = available < 40;
     let compact = available < 60;
@@ -302,7 +302,7 @@ struct StatusSegment {
 /// Segments are grouped into left (always left-aligned), center
 /// (centered between left and right), and right (right-aligned).
 /// Lower-priority segments are dropped until everything fits.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn plan_status_segments(
     state: &TuiSharedState,
     active: MailScreenId,
@@ -335,7 +335,11 @@ fn plan_status_segments(
     let error_count = counters.status_4xx + counters.status_5xx;
     let total = counters.total;
     let ok = counters.status_2xx;
-    let counter_fg = if error_count > 0 { tp.status_warn } else { tp.status_good };
+    let counter_fg = if error_count > 0 {
+        tp.status_warn
+    } else {
+        tp.status_good
+    };
 
     // ── Left segments (always left-aligned) ──
     let mut left = vec![StatusSegment {
@@ -507,12 +511,19 @@ fn plan_status_segments(
     // If both Medium error count and Low full counters survived, drop
     // the Medium error-only duplicate (full counters include it).
     if center.len() > 1
-        && center.iter().any(|s| s.priority == StatusPriority::Low && s.text.contains("req:"))
+        && center
+            .iter()
+            .any(|s| s.priority == StatusPriority::Low && s.text.contains("req:"))
     {
         center.retain(|s| !(s.priority == StatusPriority::Medium && s.text.starts_with("err:")));
     }
 
     (left, center, right)
+}
+
+#[inline]
+fn segment_text_width(text: &str) -> u16 {
+    u16::try_from(text.len()).unwrap_or(u16::MAX)
 }
 
 /// Render the status line into a 1-row area.
@@ -549,16 +560,20 @@ pub fn render_status_line(
     );
 
     // Compute total widths.
-    let left_width: u16 = left.iter().map(|s| s.text.len() as u16).sum();
+    let left_width = left.iter().fold(0u16, |acc, s| {
+        acc.saturating_add(segment_text_width(&s.text))
+    });
     let center_width: u16 = center
         .iter()
         .enumerate()
         .map(|(i, s)| {
             let sep = if i > 0 { 3u16 } else { 0 }; // " | "
-            s.text.len() as u16 + sep
+            segment_text_width(&s.text).saturating_add(sep)
         })
         .sum();
-    let right_width: u16 = right.iter().map(|s| s.text.len() as u16).sum();
+    let right_width = right.iter().fold(0u16, |acc, s| {
+        acc.saturating_add(segment_text_width(&s.text))
+    });
 
     let mut spans: Vec<Span<'_>> = Vec::with_capacity(16);
     let mut effect_overlays: Vec<(u16, u16, StatusEffect, PackedRgba, String)> = Vec::new();
@@ -582,10 +597,7 @@ pub fn render_status_line(
         let gap = area.width - total_fixed;
         let left_pad = gap / 2;
         if left_pad > 0 {
-            spans.push(Span::styled(
-                " ".repeat(left_pad as usize),
-                bg_style,
-            ));
+            spans.push(Span::styled(" ".repeat(left_pad as usize), bg_style));
             cursor_x = cursor_x.saturating_add(left_pad);
         }
     } else if center_width == 0 {
@@ -623,10 +635,7 @@ pub fn render_status_line(
         let gap = area.width - total_fixed;
         let right_pad = gap - gap / 2;
         if right_pad > 0 {
-            spans.push(Span::styled(
-                " ".repeat(right_pad as usize),
-                bg_style,
-            ));
+            spans.push(Span::styled(" ".repeat(right_pad as usize), bg_style));
             cursor_x = cursor_x.saturating_add(right_pad);
         }
     }
@@ -654,9 +663,7 @@ pub fn render_status_line(
             if label.is_empty() {
                 continue;
             }
-            let label_width = u16::try_from(label.len())
-                .unwrap_or(u16::MAX)
-                .min(width);
+            let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX).min(width);
             let effect = match effect {
                 StatusEffect::LivePulse => TextEffect::Pulse {
                     speed: 2.0 / 3.0,
@@ -754,9 +761,8 @@ pub fn render_help_overlay_sections(
         // Optional context description.
         if let Some(ref desc) = section.description {
             if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
-                let desc_para = Paragraph::new(desc.as_str()).style(
-                    Style::default().fg(tp.status_fg).bg(tp.help_bg).italic(),
-                );
+                let desc_para = Paragraph::new(desc.as_str())
+                    .style(Style::default().fg(tp.status_fg).bg(tp.help_bg).italic());
                 desc_para.render(
                     Rect::new(inner.x + 2, inner.y + y_pos, col_width.saturating_sub(1), 1),
                     frame,
@@ -805,10 +811,7 @@ fn render_keybinding_line_themed(
     let pad_len = key_col.saturating_sub(key_len) as usize;
     let padding = " ".repeat(pad_len);
 
-    let keycap_style = Style::default()
-        .fg(tp.help_bg)
-        .bg(tp.help_key_fg)
-        .bold();
+    let keycap_style = Style::default().fg(tp.help_bg).bg(tp.help_key_fg).bold();
 
     let spans = vec![
         Span::styled("  ", Style::default().bg(tp.help_bg)),
@@ -901,7 +904,7 @@ impl ChromePalette {
 /// Width of a single keycap/action chip: ` key ` + ` action` + separator.
 ///
 /// Returns the display width (key padded + action + trailing separator).
-fn chip_width(key: &str, action: &str, is_last: bool) -> usize {
+const fn chip_width(key: &str, action: &str, is_last: bool) -> usize {
     // ` key ` (reverse-video keycap) + ` action` + ` · ` separator (3 if not last)
     let keycap = key.len() + 2; // space + key + space
     let act = 1 + action.len(); // space + action
@@ -925,7 +928,8 @@ pub fn build_key_hints(
 
     for (i, entry) in screen_bindings.iter().take(count).enumerate() {
         let is_last = i + 1 >= count
-            || used + chip_width(entry.key, entry.action, false)
+            || used
+                + chip_width(entry.key, entry.action, false)
                 + chip_width(
                     screen_bindings.get(i + 1).map_or("", |e| e.key),
                     screen_bindings.get(i + 1).map_or("", |e| e.action),
@@ -968,14 +972,9 @@ fn push_keycap_chip_spans<'a>(
 ) {
     use ftui::text::Span;
 
-    let keycap_style = Style::default()
-        .fg(tp.status_bg)
-        .bg(tp.tab_key_fg)
-        .bold();
+    let keycap_style = Style::default().fg(tp.status_bg).bg(tp.tab_key_fg).bold();
     let action_style = Style::default().fg(tp.status_fg).bg(tp.status_bg);
-    let sep_style = Style::default()
-        .fg(tp.tab_inactive_fg)
-        .bg(tp.status_bg);
+    let sep_style = Style::default().fg(tp.tab_inactive_fg).bg(tp.status_bg);
 
     let mut rest = hints;
     while !rest.is_empty() {
@@ -988,10 +987,7 @@ fn push_keycap_chip_spans<'a>(
             if let Some(end) = rest.find('\x02') {
                 // Keycap: ` key ` in reverse-video
                 let key = &rest[..end];
-                spans.push(Span::styled(
-                    format!(" {key} "),
-                    keycap_style,
-                ));
+                spans.push(Span::styled(format!(" {key} "), keycap_style));
                 rest = &rest[end + 1..]; // skip STX
             } else {
                 // Malformed — dump remaining
@@ -1132,8 +1128,14 @@ mod tests {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let hints = build_key_hints(
             &[
-                HelpEntry { key: "j", action: "Down" },
-                HelpEntry { key: "k", action: "Up" },
+                HelpEntry {
+                    key: "j",
+                    action: "Down",
+                },
+                HelpEntry {
+                    key: "k",
+                    action: "Up",
+                },
             ],
             6,
             80,
@@ -1144,7 +1146,10 @@ mod tests {
         assert!(spans.len() >= 4, "expected >= 4 spans, got {}", spans.len());
         // First keycap span should be bold (reverse-video keycap)
         let first_keycap = &spans[0];
-        let attrs = first_keycap.style.and_then(|s| s.attrs).unwrap_or(ftui::style::StyleFlags::NONE);
+        let attrs = first_keycap
+            .style
+            .and_then(|s| s.attrs)
+            .unwrap_or(ftui::style::StyleFlags::NONE);
         assert!(
             attrs.contains(ftui::style::StyleFlags::BOLD),
             "keycap span should be bold"
@@ -1321,7 +1326,7 @@ mod tests {
 
     #[test]
     fn help_entries_synchronized_with_global_bindings() {
-        use crate::tui_keymap::{GLOBAL_BINDINGS, KeymapRegistry, KeymapProfile};
+        use crate::tui_keymap::{GLOBAL_BINDINGS, KeymapProfile, KeymapRegistry};
         let registry = KeymapRegistry::new(KeymapProfile::Default);
         let entries = registry.help_entries();
         // Every GLOBAL_BINDINGS action should appear in help_entries output
@@ -1431,7 +1436,11 @@ mod tests {
                 found += 1;
             }
         }
-        assert_eq!(found, ALL_SCREEN_IDS.len(), "all tabs should have hit slots at width 200");
+        assert_eq!(
+            found,
+            ALL_SCREEN_IDS.len(),
+            "all tabs should have hit slots at width 200"
+        );
     }
 
     #[test]
@@ -1498,7 +1507,10 @@ mod tests {
             120,
         );
         let tags: String = right.iter().map(|s| s.text.as_str()).collect();
-        assert!(tags.contains("[hc]"), "high_contrast should produce [hc] tag, got: {tags}");
+        assert!(
+            tags.contains("[hc]"),
+            "high_contrast should produce [hc] tag, got: {tags}"
+        );
     }
 
     #[test]
@@ -1525,6 +1537,71 @@ mod tests {
         assert!(
             tags.contains("[hc,rm,sr]"),
             "all a11y flags should be combined, got: {tags}"
+        );
+    }
+
+    #[test]
+    fn status_segments_include_live_indicator() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (_, _, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            false,
+            &a11y,
+            &[],
+            false,
+            120,
+        );
+        let right_text: String = right.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            right_text.contains("LIVE"),
+            "expected LIVE indicator in status right segments, got: {right_text}"
+        );
+    }
+
+    #[test]
+    fn status_segments_recording_flag_controls_rec_indicator() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+
+        let (_, _, right_not_recording) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            false,
+            &a11y,
+            &[],
+            false,
+            120,
+        );
+        let right_not_recording_text: String = right_not_recording
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            !right_not_recording_text.contains("REC"),
+            "REC indicator should be absent when not recording: {right_not_recording_text}"
+        );
+
+        let (_, _, right_recording) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            true,
+            false,
+            &a11y,
+            &[],
+            false,
+            120,
+        );
+        let right_recording_text: String =
+            right_recording.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            right_recording_text.contains("REC"),
+            "REC indicator should be present when recording: {right_recording_text}"
         );
     }
 
@@ -1572,7 +1649,11 @@ mod tests {
             false,
             60, // >= 60 → Critical + High
         );
-        let all: Vec<_> = left.iter().chain(center.iter()).chain(right.iter()).collect();
+        let all: Vec<_> = left
+            .iter()
+            .chain(center.iter())
+            .chain(right.iter())
+            .collect();
         // Should have at least one High-priority segment (transport mode).
         assert!(
             all.iter().any(|s| s.priority == StatusPriority::High),
@@ -1600,7 +1681,11 @@ mod tests {
             false,
             80, // >= 80 → Critical + High + Medium
         );
-        let all: Vec<_> = left.iter().chain(center.iter()).chain(right.iter()).collect();
+        let all: Vec<_> = left
+            .iter()
+            .chain(center.iter())
+            .chain(right.iter())
+            .collect();
         assert!(
             all.iter().any(|s| s.priority == StatusPriority::Medium),
             "at 80 cols, Medium-priority segments should be present"
@@ -1633,7 +1718,11 @@ mod tests {
             false,
             100, // >= 100 → all priorities
         );
-        let all: Vec<_> = left.iter().chain(center.iter()).chain(right.iter()).collect();
+        let all: Vec<_> = left
+            .iter()
+            .chain(center.iter())
+            .chain(right.iter())
+            .collect();
         assert!(
             all.iter().any(|s| s.priority == StatusPriority::Low),
             "at 100 cols, Low-priority segments should be present"

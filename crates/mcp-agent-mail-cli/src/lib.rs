@@ -369,7 +369,10 @@ pub enum ContactsCommand {
         /// Agent name.
         #[arg(long = "agent", short = 'a')]
         agent_name: String,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -396,7 +399,10 @@ pub enum BeadsCommand {
         /// Maximum number of issues to show.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -415,7 +421,10 @@ pub enum BeadsCommand {
         /// Maximum number of issues to show.
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -426,7 +435,10 @@ pub enum BeadsCommand {
         /// Path to the project root containing .beads/.
         #[arg(long, short = 'p')]
         path: Option<PathBuf>,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -435,7 +447,10 @@ pub enum BeadsCommand {
         /// Path to the project root containing .beads/.
         #[arg(long, short = 'p')]
         path: Option<PathBuf>,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1374,7 +1389,10 @@ pub enum AgentsCommand {
         /// Attachments policy: auto, inline, file, none.
         #[arg(long, default_value = "auto")]
         attachments_policy: String,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1398,7 +1416,10 @@ pub enum AgentsCommand {
         /// Attachments policy: auto, inline, file, none.
         #[arg(long, default_value = "auto")]
         attachments_policy: String,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1407,7 +1428,10 @@ pub enum AgentsCommand {
         /// Project key (slug or human_key / absolute path).
         #[arg(long = "project", short = 'p')]
         project_key: String,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1418,7 +1442,10 @@ pub enum AgentsCommand {
         project_key: String,
         /// Agent name.
         agent: String,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -4779,8 +4806,10 @@ fn handle_contacts_with_conn(
         ContactsCommand::ListContacts {
             project_key,
             agent_name,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj_rows = conn
                 .query_sync(
                     "SELECT id FROM projects WHERE slug = ?",
@@ -4842,47 +4871,44 @@ fn handle_contacts_with_conn(
                 )
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
-            if json {
-                let mut entries: Vec<serde_json::Value> = Vec::new();
-                for r in &outgoing {
-                    let to: String = r.get_named("to_name").unwrap_or_default();
-                    let status: String = r.get_named("status").unwrap_or_default();
-                    let reason: String = r.get_named("reason").unwrap_or_default();
-                    let updated: i64 = r.get_named("updated_ts").unwrap_or(0);
-                    let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
-                    entries.push(serde_json::json!({
-                        "direction": "outgoing",
-                        "to": to,
-                        "status": status,
-                        "reason": reason,
-                        "updated_ts": mcp_agent_mail_db::timestamps::micros_to_iso(updated),
-                        "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires),
-                    }));
-                }
-                for r in &incoming {
-                    let from: String = r.get_named("from_name").unwrap_or_default();
-                    let status: String = r.get_named("status").unwrap_or_default();
-                    let reason: String = r.get_named("reason").unwrap_or_default();
-                    let updated: i64 = r.get_named("updated_ts").unwrap_or(0);
-                    let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
-                    entries.push(serde_json::json!({
-                        "direction": "incoming",
-                        "from": from,
-                        "status": status,
-                        "reason": reason,
-                        "updated_ts": mcp_agent_mail_db::timestamps::micros_to_iso(updated),
-                        "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires),
-                    }));
-                }
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&entries).unwrap_or_default()
-                );
-            } else {
-                if outgoing.is_empty() && incoming.is_empty() {
-                    output::empty_result(false, "No contacts found.");
-                    return Ok(());
-                }
+            let mut entries: Vec<serde_json::Value> = Vec::new();
+            for r in &outgoing {
+                let to: String = r.get_named("to_name").unwrap_or_default();
+                let status: String = r.get_named("status").unwrap_or_default();
+                let reason: String = r.get_named("reason").unwrap_or_default();
+                let updated: i64 = r.get_named("updated_ts").unwrap_or(0);
+                let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+                entries.push(serde_json::json!({
+                    "direction": "outgoing",
+                    "to": to,
+                    "status": status,
+                    "reason": reason,
+                    "updated_ts": mcp_agent_mail_db::timestamps::micros_to_iso(updated),
+                    "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires),
+                }));
+            }
+            for r in &incoming {
+                let from: String = r.get_named("from_name").unwrap_or_default();
+                let status: String = r.get_named("status").unwrap_or_default();
+                let reason: String = r.get_named("reason").unwrap_or_default();
+                let updated: i64 = r.get_named("updated_ts").unwrap_or(0);
+                let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+                entries.push(serde_json::json!({
+                    "direction": "incoming",
+                    "from": from,
+                    "status": status,
+                    "reason": reason,
+                    "updated_ts": mcp_agent_mail_db::timestamps::micros_to_iso(updated),
+                    "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires),
+                }));
+            }
+
+            if entries.is_empty() {
+                output::emit_empty(fmt, "No contacts found.");
+                return Ok(());
+            }
+
+            output::emit_output(&entries, fmt, || {
                 if !outgoing.is_empty() {
                     output::section("Outgoing contacts:");
                     let mut table = output::CliTable::new(vec!["TO", "STATUS", "REASON"]);
@@ -4905,7 +4931,7 @@ fn handle_contacts_with_conn(
                     }
                     table.render();
                 }
-            }
+            });
             Ok(())
         }
         ContactsCommand::Policy {
@@ -4981,22 +5007,39 @@ fn resolve_beads_db(path: Option<&Path>) -> CliResult<PathBuf> {
 
 fn handle_beads(action: BeadsCommand) -> CliResult<()> {
     match action {
-        BeadsCommand::Ready { path, limit, json } => handle_beads_ready(path, limit, json),
+        BeadsCommand::Ready {
+            path,
+            limit,
+            format,
+            json,
+        } => handle_beads_ready(path, limit, format, json),
         BeadsCommand::List {
             path,
             status,
             priority,
             limit,
+            format,
             json,
-        } => handle_beads_list(path, status, priority, limit, json),
-        BeadsCommand::Show { id, path, json } => handle_beads_show(id, path, json),
-        BeadsCommand::Status { path, json } => handle_beads_status(path, json),
+        } => handle_beads_list(path, status, priority, limit, format, json),
+        BeadsCommand::Show {
+            id,
+            path,
+            format,
+            json,
+        } => handle_beads_show(id, path, format, json),
+        BeadsCommand::Status { path, format, json } => handle_beads_status(path, format, json),
     }
 }
 
-fn handle_beads_ready(path: Option<PathBuf>, limit: usize, json: bool) -> CliResult<()> {
+fn handle_beads_ready(
+    path: Option<PathBuf>,
+    limit: usize,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
     use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let db_path = resolve_beads_db(path.as_deref())?;
     let storage = SqliteStorage::open(&db_path)
         .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
@@ -5009,29 +5052,26 @@ fn handle_beads_ready(path: Option<PathBuf>, limit: usize, json: bool) -> CliRes
         .get_ready_issues(&filters, ReadySortPolicy::Hybrid)
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
-    if json {
-        let items: Vec<serde_json::Value> = issues
-            .iter()
-            .map(|i| {
-                serde_json::json!({
-                    "id": i.id,
-                    "title": i.title,
-                    "status": i.status.as_str(),
-                    "priority": format!("P{}", i.priority.0),
-                    "type": i.issue_type.as_str(),
-                    "labels": i.labels,
-                })
+    let items: Vec<serde_json::Value> = issues
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "id": i.id,
+                "title": i.title,
+                "status": i.status.as_str(),
+                "priority": format!("P{}", i.priority.0),
+                "type": i.issue_type.as_str(),
+                "labels": i.labels,
             })
-            .collect();
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&items).unwrap_or_default()
-        );
-    } else {
-        if issues.is_empty() {
-            ftui_runtime::ftui_println!("No ready issues.");
-            return Ok(());
-        }
+        })
+        .collect();
+
+    if items.is_empty() {
+        output::emit_empty(fmt, "No ready issues.");
+        return Ok(());
+    }
+
+    output::emit_output(&items, fmt, || {
         output::section(&format!("Ready issues ({}):", issues.len()));
         for issue in &issues {
             ftui_runtime::ftui_println!(
@@ -5042,7 +5082,7 @@ fn handle_beads_ready(path: Option<PathBuf>, limit: usize, json: bool) -> CliRes
                 issue.status.as_str(),
             );
         }
-    }
+    });
     Ok(())
 }
 
@@ -5051,11 +5091,13 @@ fn handle_beads_list(
     status: Option<String>,
     priority: Option<u8>,
     limit: usize,
+    format: Option<output::CliOutputFormat>,
     json: bool,
 ) -> CliResult<()> {
     use beads_rust::model::{Priority, Status};
     use beads_rust::storage::{ListFilters, SqliteStorage};
 
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let db_path = resolve_beads_db(path.as_deref())?;
     let storage = SqliteStorage::open(&db_path)
         .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
@@ -5090,29 +5132,26 @@ fn handle_beads_list(
         .list_issues(&filters)
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
-    if json {
-        let items: Vec<serde_json::Value> = issues
-            .iter()
-            .map(|i| {
-                serde_json::json!({
-                    "id": i.id,
-                    "title": i.title,
-                    "status": i.status.as_str(),
-                    "priority": format!("P{}", i.priority.0),
-                    "type": i.issue_type.as_str(),
-                    "labels": i.labels,
-                })
+    let items: Vec<serde_json::Value> = issues
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "id": i.id,
+                "title": i.title,
+                "status": i.status.as_str(),
+                "priority": format!("P{}", i.priority.0),
+                "type": i.issue_type.as_str(),
+                "labels": i.labels,
             })
-            .collect();
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&items).unwrap_or_default()
-        );
-    } else {
-        if issues.is_empty() {
-            ftui_runtime::ftui_println!("No matching issues.");
-            return Ok(());
-        }
+        })
+        .collect();
+
+    if items.is_empty() {
+        output::emit_empty(fmt, "No matching issues.");
+        return Ok(());
+    }
+
+    output::emit_output(&items, fmt, || {
         output::section(&format!("Issues ({}):", issues.len()));
         for issue in &issues {
             ftui_runtime::ftui_println!(
@@ -5123,13 +5162,19 @@ fn handle_beads_list(
                 issue.status.as_str(),
             );
         }
-    }
+    });
     Ok(())
 }
 
-fn handle_beads_show(id: String, path: Option<PathBuf>, json: bool) -> CliResult<()> {
+fn handle_beads_show(
+    id: String,
+    path: Option<PathBuf>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
     use beads_rust::storage::SqliteStorage;
 
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let db_path = resolve_beads_db(path.as_deref())?;
     let storage = SqliteStorage::open(&db_path)
         .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
@@ -5139,12 +5184,7 @@ fn handle_beads_show(id: String, path: Option<PathBuf>, json: bool) -> CliResult
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?
         .ok_or_else(|| CliError::InvalidArgument(format!("issue not found: {id}")))?;
 
-    if json {
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&issue).unwrap_or_default()
-        );
-    } else {
+    output::emit_output(&issue, fmt, || {
         output::section(&format!("{}: {}", issue.id, issue.title));
         output::kv("Status", issue.status.as_str());
         output::kv("Priority", &format!("P{}", issue.priority.0));
@@ -5164,14 +5204,19 @@ fn handle_beads_show(id: String, path: Option<PathBuf>, json: bool) -> CliResult
                 ftui_runtime::ftui_println!("  {} {}", dep.dep_type, dep.depends_on_id);
             }
         }
-    }
+    });
     Ok(())
 }
 
-fn handle_beads_status(path: Option<PathBuf>, json: bool) -> CliResult<()> {
+fn handle_beads_status(
+    path: Option<PathBuf>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
     use beads_rust::model::Status;
     use beads_rust::storage::{ListFilters, SqliteStorage};
 
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let db_path = resolve_beads_db(path.as_deref())?;
     let storage = SqliteStorage::open(&db_path)
         .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
@@ -5203,26 +5248,21 @@ fn handle_beads_status(path: Option<PathBuf>, json: bool) -> CliResult<()> {
     let closed_count = closed.len();
     let total = all.len() + closed_count;
 
-    if json {
-        let result = serde_json::json!({
-            "open": open,
-            "in_progress": in_progress,
-            "blocked": blocked,
-            "closed": closed_count,
-            "total": total,
-        });
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
-    } else {
+    let result = serde_json::json!({
+        "open": open,
+        "in_progress": in_progress,
+        "blocked": blocked,
+        "closed": closed_count,
+        "total": total,
+    });
+    output::emit_output(&result, fmt, || {
         output::section("Beads Status:");
         output::kv("Open", &open.to_string());
         output::kv("In Progress", &in_progress.to_string());
         output::kv("Blocked", &blocked.to_string());
         output::kv("Closed", &closed_count.to_string());
         output::kv("Total", &total.to_string());
-    }
+    });
     Ok(())
 }
 
@@ -7488,8 +7528,10 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             name,
             task,
             attachments_policy,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let program = program.trim().to_string();
             if program.is_empty() {
                 return Err(CliError::InvalidArgument("program cannot be empty".into()));
@@ -7529,7 +7571,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 }
             };
 
-            render_agent_row(&row, json);
+            render_agent_row(&row, fmt);
             Ok(())
         }
 
@@ -7540,8 +7582,10 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             name_hint,
             task,
             attachments_policy,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let program = program.trim().to_string();
             if program.is_empty() {
                 return Err(CliError::InvalidArgument("program cannot be empty".into()));
@@ -7603,11 +7647,16 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 }
             };
 
-            render_agent_row(&row, json);
+            render_agent_row(&row, fmt);
             Ok(())
         }
 
-        AgentsCommand::List { project_key, json } => {
+        AgentsCommand::List {
+            project_key,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let agents =
@@ -7626,40 +7675,36 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                     }
                 };
 
-            if json {
-                let data: Vec<serde_json::Value> = agents.iter().map(agent_row_to_json).collect();
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&data).unwrap_or_default()
-                );
+            let data: Vec<serde_json::Value> = agents.iter().map(agent_row_to_json).collect();
+            if data.is_empty() {
+                output::emit_empty(fmt, "No agents found.");
                 return Ok(());
             }
 
-            if agents.is_empty() {
-                output::empty_result(false, "No agents found.");
-                return Ok(());
-            }
-
-            let mut table =
-                output::CliTable::new(vec!["NAME", "PROGRAM", "MODEL", "TASK", "LAST_ACTIVE"]);
-            for a in &agents {
-                table.add_row(vec![
-                    a.name.clone(),
-                    a.program.clone(),
-                    a.model.clone(),
-                    truncate_str(&a.task_description, 40),
-                    context::format_ts_short(a.last_active_ts),
-                ]);
-            }
-            table.render();
+            output::emit_output(&data, fmt, || {
+                let mut table =
+                    output::CliTable::new(vec!["NAME", "PROGRAM", "MODEL", "TASK", "LAST_ACTIVE"]);
+                for a in &agents {
+                    table.add_row(vec![
+                        a.name.clone(),
+                        a.program.clone(),
+                        a.model.clone(),
+                        truncate_str(&a.task_description, 40),
+                        context::format_ts_short(a.last_active_ts),
+                    ]);
+                }
+                table.render();
+            });
             Ok(())
         }
 
         AgentsCommand::Show {
             project_key,
             agent,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let row = match mcp_agent_mail_db::queries::get_agent(
@@ -7684,23 +7729,18 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 }
             };
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&agent_row_to_json(&row)).unwrap_or_default()
-                );
-                return Ok(());
-            }
-
-            output::section(&format!("Agent: {}", row.name));
-            output::kv("ID", &row.id.unwrap_or(0).to_string());
-            output::kv("Program", &row.program);
-            output::kv("Model", &row.model);
-            output::kv("Task", &row.task_description);
-            output::kv("Attachments", &row.attachments_policy);
-            output::kv("Contact Policy", &row.contact_policy);
-            output::kv("Inception", &context::format_ts(row.inception_ts));
-            output::kv("Last Active", &context::format_ts(row.last_active_ts));
+            let data = agent_row_to_json(&row);
+            output::emit_output(&data, fmt, || {
+                output::section(&format!("Agent: {}", row.name));
+                output::kv("ID", &row.id.unwrap_or(0).to_string());
+                output::kv("Program", &row.program);
+                output::kv("Model", &row.model);
+                output::kv("Task", &row.task_description);
+                output::kv("Attachments", &row.attachments_policy);
+                output::kv("Contact Policy", &row.contact_policy);
+                output::kv("Inception", &context::format_ts(row.inception_ts));
+                output::kv("Last Active", &context::format_ts(row.last_active_ts));
+            });
             Ok(())
         }
 
@@ -7807,13 +7847,9 @@ fn agent_row_to_json(a: &mcp_agent_mail_db::AgentRow) -> serde_json::Value {
     })
 }
 
-fn render_agent_row(row: &mcp_agent_mail_db::AgentRow, json: bool) {
-    if json {
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&agent_row_to_json(row)).unwrap_or_default()
-        );
-    } else {
+fn render_agent_row(row: &mcp_agent_mail_db::AgentRow, format: output::CliOutputFormat) {
+    let payload = agent_row_to_json(row);
+    output::emit_output(&payload, format, || {
         output::success(&format!("Agent: {}", row.name));
         output::kv("ID", &row.id.unwrap_or(0).to_string());
         output::kv("Program", &row.program);
@@ -7822,7 +7858,7 @@ fn render_agent_row(row: &mcp_agent_mail_db::AgentRow, json: bool) {
         output::kv("Attachments", &row.attachments_policy);
         output::kv("Inception", &context::format_ts(row.inception_ts));
         output::kv("Last Active", &context::format_ts(row.last_active_ts));
-    }
+    });
 }
 
 // ── Macro command handler ────────────────────────────────────────────
@@ -13972,7 +14008,7 @@ mod tests {
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_beads_status(Some(dir.path().to_path_buf()), true);
+        let result = handle_beads_status(Some(dir.path().to_path_buf()), None, true);
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "beads status failed: {result:?}");
@@ -13994,7 +14030,7 @@ mod tests {
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_beads_ready(Some(dir.path().to_path_buf()), 20, true);
+        let result = handle_beads_ready(Some(dir.path().to_path_buf()), 20, None, true);
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "beads ready failed: {result:?}");
@@ -15661,11 +15697,13 @@ mod tests {
                     ContactsCommand::ListContacts {
                         project_key,
                         agent_name,
+                        format,
                         json,
                     },
             } => {
                 assert_eq!(project_key, "proj");
                 assert_eq!(agent_name, "BlueLake");
+                assert!(format.is_none());
                 assert!(json);
             }
             other => panic!("expected contacts list, got {other:?}"),
@@ -15678,8 +15716,9 @@ mod tests {
             .unwrap();
         match cli.command.expect("expected command") {
             Commands::Contacts {
-                action: ContactsCommand::ListContacts { json, .. },
+                action: ContactsCommand::ListContacts { format, json, .. },
             } => {
+                assert!(format.is_none());
                 assert!(!json);
             }
             other => panic!("expected contacts list, got {other:?}"),
@@ -15883,6 +15922,7 @@ mod tests {
             ContactsCommand::ListContacts {
                 project_key: "test-proj".to_string(),
                 agent_name: "BlueLake".to_string(),
+                format: None,
                 json: true,
             },
         );
@@ -15911,6 +15951,7 @@ mod tests {
             ContactsCommand::ListContacts {
                 project_key: "test-proj".to_string(),
                 agent_name: "BlueLake".to_string(),
+                format: None,
                 json: false,
             },
         );

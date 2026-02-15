@@ -2109,6 +2109,7 @@ const OVERSEER_PREAMBLE: &str = "---\n\n\
     The human's guidance supersedes all other priorities.\n\n\
     ---\n\n";
 
+#[derive(Debug)]
 struct OverseerPayload {
     recipients: Vec<String>,
     subject: String,
@@ -2321,4 +2322,126 @@ fn render_error(message: &str) -> Result<Option<String>, (u16, String)> {
             message: message.to_string(),
         },
     )
+}
+
+#[cfg(test)]
+mod overseer_form_validation_tests {
+    use super::parse_overseer_body;
+    use serde_json::json;
+
+    fn parse_err_message(body: &str) -> (u16, String) {
+        let (status, payload) = parse_overseer_body(body).expect_err("expected parse error");
+        let msg = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or(payload);
+        (status, msg)
+    }
+
+    #[test]
+    fn parse_overseer_body_success_and_deduplicates_recipients() {
+        let body = json!({
+            "recipients": ["BlueLake", "GreenField", "BlueLake"],
+            "subject": "  Operator notice  ",
+            "body_md": "  Please prioritize this task.  ",
+            "thread_id": "br-123",
+        })
+        .to_string();
+
+        let parsed = parse_overseer_body(&body).expect("valid payload");
+        assert_eq!(parsed.recipients, vec!["BlueLake", "GreenField"]);
+        assert_eq!(parsed.subject, "Operator notice");
+        assert_eq!(parsed.body_md, "Please prioritize this task.");
+        assert_eq!(parsed.thread_id.as_deref(), Some("br-123"));
+    }
+
+    #[test]
+    fn parse_overseer_body_rejects_invalid_json() {
+        let (status, msg) = parse_overseer_body("{not-json").expect_err("invalid json should fail");
+        assert_eq!(status, 400);
+        assert!(msg.contains("Invalid JSON"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn parse_overseer_body_requires_recipients() {
+        let body = json!({
+            "recipients": [],
+            "subject": "hi",
+            "body_md": "body",
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "At least one recipient is required");
+    }
+
+    #[test]
+    fn parse_overseer_body_enforces_recipient_limit() {
+        let recipients: Vec<String> = (0..101).map(|i| format!("Agent{i}")).collect();
+        let body = json!({
+            "recipients": recipients,
+            "subject": "hi",
+            "body_md": "body",
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Too many recipients (maximum 100 agents)");
+    }
+
+    #[test]
+    fn parse_overseer_body_requires_non_empty_subject() {
+        let body = json!({
+            "recipients": ["BlueLake"],
+            "subject": "   ",
+            "body_md": "body",
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Subject is required");
+    }
+
+    #[test]
+    fn parse_overseer_body_enforces_subject_length() {
+        let body = json!({
+            "recipients": ["BlueLake"],
+            "subject": "x".repeat(201),
+            "body_md": "body",
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Subject too long (maximum 200 characters)");
+    }
+
+    #[test]
+    fn parse_overseer_body_requires_non_empty_body() {
+        let body = json!({
+            "recipients": ["BlueLake"],
+            "subject": "hello",
+            "body_md": "   ",
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Message body is required");
+    }
+
+    #[test]
+    fn parse_overseer_body_enforces_body_length() {
+        let body = json!({
+            "recipients": ["BlueLake"],
+            "subject": "hello",
+            "body_md": "x".repeat(50_001),
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Message body too long (maximum 50,000 characters)");
+    }
 }

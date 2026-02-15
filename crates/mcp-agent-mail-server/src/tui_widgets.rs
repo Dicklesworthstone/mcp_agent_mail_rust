@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 use std::cell::RefCell;
+use std::fmt::Write;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
@@ -1839,6 +1840,7 @@ impl AmbientHealthInput {
 
     /// Severity scalar used for critical-fire intensity/tinting.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn severity_score(self) -> f32 {
         let alert_score: f32 = if self.critical_alerts_active {
             1.0
@@ -1964,6 +1966,7 @@ impl AmbientEffectRenderer {
     /// Render ambient background effect into z-layer 0 (background colors only).
     ///
     /// `animation_seconds` should be a monotonic animation clock from the caller.
+    #[allow(clippy::too_many_lines)]
     pub fn render(
         &mut self,
         area: Rect,
@@ -2171,11 +2174,13 @@ impl AmbientEffectRenderer {
         theme_inputs: &ThemeInputs,
         len: usize,
     ) {
-        let mut params = MetaballsParams::default();
-        params.palette = MetaballsPalette::ThemeAccents;
-        params.time_scale = 10.0;
-        params.pulse_speed = 0.65;
-        params.hue_speed = 0.02;
+        let params = MetaballsParams {
+            palette: MetaballsPalette::ThemeAccents,
+            time_scale: 10.0,
+            pulse_speed: 0.65,
+            hue_speed: 0.02,
+            ..MetaballsParams::default()
+        };
         self.metaballs_fx.set_params(params);
         self.metaballs_fx.resize(width, height);
         let ctx = FxContext {
@@ -2191,7 +2196,7 @@ impl AmbientEffectRenderer {
     }
 
     fn composite_halfblock(
-        &mut self,
+        &self,
         area: Rect,
         frame: &mut Frame,
         opacity: f32,
@@ -2322,6 +2327,7 @@ fn build_ambient_theme_inputs(state: AmbientHealthState) -> ThemeInputs {
     )
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn blend_rgb(left: PackedRgba, right: PackedRgba, mix: f32) -> PackedRgba {
     let t = mix.clamp(0.0, 1.0);
     let inv = 1.0 - t;
@@ -2332,6 +2338,7 @@ fn blend_rgb(left: PackedRgba, right: PackedRgba, mix: f32) -> PackedRgba {
     )
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn average_rgb(top: PackedRgba, bottom: PackedRgba) -> PackedRgba {
     PackedRgba::rgb(
         u16::midpoint(u16::from(top.r()), u16::from(bottom.r())) as u8,
@@ -2993,7 +3000,7 @@ impl FocusGlow {
     }
 
     /// Set whether motion is enabled (call on accessibility change).
-    pub fn set_motion_enabled(&mut self, enabled: bool) {
+    pub const fn set_motion_enabled(&mut self, enabled: bool) {
         self.motion_enabled = enabled;
         if !enabled {
             self.ticks_remaining = 0;
@@ -3013,7 +3020,7 @@ impl FocusGlow {
     }
 
     /// Advance animation by one tick.
-    pub fn tick(&mut self) {
+    pub const fn tick(&mut self) {
         self.ticks_remaining = self.ticks_remaining.saturating_sub(1);
     }
 
@@ -3050,6 +3057,12 @@ impl FocusGlow {
             return base_bg;
         }
         crate::tui_theme::lerp_color(base_bg, glow_color, self.intensity() * 0.35)
+    }
+}
+
+impl Default for FocusGlow {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -4750,7 +4763,9 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 }
 
 fn agent_style_color(agent: &str) -> &'static str {
-    let idx = (stable_hash(agent.as_bytes()) as usize) % AGENT_STYLE_PALETTE.len();
+    let palette_len = u64::try_from(AGENT_STYLE_PALETTE.len()).unwrap_or(1);
+    let idx_u64 = stable_hash(agent.as_bytes()) % palette_len;
+    let idx = usize::try_from(idx_u64).unwrap_or(0);
     AGENT_STYLE_PALETTE[idx]
 }
 
@@ -4854,22 +4869,24 @@ pub fn generate_contact_graph_mermaid(
     let mut out = String::from("graph LR\n");
     for agent in &ordered_agents {
         let id = ids.get(agent).expect("agent id should exist");
-        out.push_str(&format!("    {id}[\"{}\"]\n", mermaid_label(agent, 64)));
+        let _ = writeln!(out, "    {id}[\"{}\"]", mermaid_label(agent, 64));
     }
     for ((from, to), count) in counts {
         if let (Some(from_id), Some(to_id)) = (ids.get(&from), ids.get(&to)) {
-            out.push_str(&format!(
-                "    {from_id} -->|{}| {to_id}\n",
+            let _ = writeln!(
+                out,
+                "    {from_id} -->|{}| {to_id}",
                 message_count_label(count)
-            ));
+            );
         }
     }
     for agent in &ordered_agents {
         let id = ids.get(agent).expect("agent id should exist");
-        out.push_str(&format!(
-            "    style {id} fill:{},stroke:{MERMAID_STROKE},stroke-width:1px\n",
+        let _ = writeln!(
+            out,
+            "    style {id} fill:{},stroke:{MERMAID_STROKE},stroke-width:1px",
             agent_style_color(agent)
-        ));
+        );
     }
     out
 }
@@ -4901,21 +4918,21 @@ pub fn generate_thread_flow_mermaid(thread_messages: &[MermaidThreadMessage]) ->
         let id = participant_ids
             .get(participant)
             .expect("participant id should exist");
-        out.push_str(&format!(
-            "    participant {id} as {}\n",
+        let _ = writeln!(
+            out,
+            "    participant {id} as {}",
             mermaid_label(participant, 64)
-        ));
+        );
     }
 
     for message in thread_messages {
-        let from_id = match participant_ids.get(&message.from_agent) {
-            Some(id) => id,
-            None => continue,
+        let Some(from_id) = participant_ids.get(&message.from_agent) else {
+            continue;
         };
         let subject = mermaid_label(&message.subject, 80);
         for recipient in &message.to_agents {
             if let Some(to_id) = participant_ids.get(recipient) {
-                out.push_str(&format!("    {from_id}->>{to_id}: {subject}\n"));
+                let _ = writeln!(out, "    {from_id}->>{to_id}: {subject}");
             }
         }
     }
@@ -4971,19 +4988,21 @@ pub fn generate_system_overview_mermaid(
         let id = project_ids
             .get(&project.slug)
             .expect("project id should exist");
-        out.push_str(&format!(
-            "    {id}[\"Project: {}\"]\n",
+        let _ = writeln!(
+            out,
+            "    {id}[\"Project: {}\"]",
             mermaid_label(&project.slug, 64)
-        ));
+        );
     }
     for agent in &ordered_agents {
         let id = agent_ids
             .get(&(agent.project_slug.clone(), agent.name.clone()))
             .expect("agent id should exist");
-        out.push_str(&format!(
-            "    {id}[\"Agent: {}\"]\n",
+        let _ = writeln!(
+            out,
+            "    {id}[\"Agent: {}\"]",
             mermaid_label(&agent.name, 64)
-        ));
+        );
     }
     for (idx, reservation) in ordered_reservations.iter().enumerate() {
         let reservation_id = format!("RS{idx}");
@@ -4992,20 +5011,21 @@ pub fn generate_system_overview_mermaid(
         } else {
             ""
         };
-        out.push_str(&format!(
-            "    {reservation_id}[\"Res: {}{}\"]\n",
+        let _ = writeln!(
+            out,
+            "    {reservation_id}[\"Res: {}{}\"]",
             mermaid_label(&reservation.path_pattern, 48),
             suffix
-        ));
+        );
         if let Some(project_slug) = reservation.project_slug.as_deref() {
             if let Some(agent_id) =
                 agent_ids.get(&(project_slug.to_string(), reservation.agent_name.clone()))
             {
-                out.push_str(&format!("    {agent_id} --> {reservation_id}\n"));
+                let _ = writeln!(out, "    {agent_id} --> {reservation_id}");
             }
         } else if let Some(ids) = agent_ids_by_name.get(&reservation.agent_name) {
             for agent_id in ids {
-                out.push_str(&format!("    {agent_id} --> {reservation_id}\n"));
+                let _ = writeln!(out, "    {agent_id} --> {reservation_id}");
             }
         }
     }
@@ -5015,17 +5035,18 @@ pub fn generate_system_overview_mermaid(
             .get(&(agent.project_slug.clone(), agent.name.clone()))
             .expect("agent id should exist");
         if let Some(project_id) = project_ids.get(&agent.project_slug) {
-            out.push_str(&format!("    {project_id} --> {agent_id}\n"));
+            let _ = writeln!(out, "    {project_id} --> {agent_id}");
         }
     }
     for agent in &ordered_agents {
         let agent_id = agent_ids
             .get(&(agent.project_slug.clone(), agent.name.clone()))
             .expect("agent id should exist");
-        out.push_str(&format!(
-            "    style {agent_id} fill:{},stroke:{MERMAID_STROKE},stroke-width:1px\n",
+        let _ = writeln!(
+            out,
+            "    style {agent_id} fill:{},stroke:{MERMAID_STROKE},stroke-width:1px",
             agent_style_color(&agent.name)
-        ));
+        );
     }
     out
 }

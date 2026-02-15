@@ -11,6 +11,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
+use mcp_agent_mail_search_core::query::SearchMode;
 use mcp_agent_mail_search_core::results::{
     ExplainComposerConfig, ExplainReasonCode, ExplainStage, ExplainVerbosity, ScoreFactor,
     SearchResults, StageScoreInput, compose_explain_report, compose_hit_explanation,
@@ -19,7 +20,6 @@ use mcp_agent_mail_search_core::results::{
 use mcp_agent_mail_search_core::{
     AppliedFilterHint, DidYouMeanHint, QueryAssistance, parse_query_assistance,
 };
-use mcp_agent_mail_search_core::query::SearchMode;
 
 // ── Section 1: Structured query hint parsing and typo recovery ──────
 
@@ -41,7 +41,11 @@ fn hint_parsing_all_canonical_fields() {
     );
     assert_eq!(qa.query_text, "text");
     assert_eq!(qa.applied_filter_hints.len(), 6);
-    let fields: Vec<&str> = qa.applied_filter_hints.iter().map(|h| h.field.as_str()).collect();
+    let fields: Vec<&str> = qa
+        .applied_filter_hints
+        .iter()
+        .map(|h| h.field.as_str())
+        .collect();
     assert!(fields.contains(&"from"));
     assert!(fields.contains(&"thread"));
     assert!(fields.contains(&"project"));
@@ -56,7 +60,11 @@ fn hint_parsing_all_aliases_resolve_to_canonical() {
         "sender:X frm:Y thread_id:Z thr:W proj:V since:2026 until:2027 priority:high prio:low imp:normal",
     );
     // All aliases should resolve to canonical field names
-    let fields: Vec<&str> = qa.applied_filter_hints.iter().map(|h| h.field.as_str()).collect();
+    let fields: Vec<&str> = qa
+        .applied_filter_hints
+        .iter()
+        .map(|h| h.field.as_str())
+        .collect();
     for f in &fields {
         assert!(
             ["from", "thread", "project", "before", "after", "importance"].contains(f),
@@ -65,7 +73,10 @@ fn hint_parsing_all_aliases_resolve_to_canonical() {
     }
     // sender → from, frm → from
     let from_count = fields.iter().filter(|f| **f == "from").count();
-    assert_eq!(from_count, 2, "expected 2 'from' fields from sender/frm aliases");
+    assert_eq!(
+        from_count, 2,
+        "expected 2 'from' fields from sender/frm aliases"
+    );
 }
 
 #[test]
@@ -93,7 +104,11 @@ fn typo_recovery_multiple_suggestions_ordered_deterministically() {
     }
 
     // Verify correct suggestions
-    let suggestions: Vec<&str> = qa1.did_you_mean.iter().map(|h| h.suggested_field.as_str()).collect();
+    let suggestions: Vec<&str> = qa1
+        .did_you_mean
+        .iter()
+        .map(|h| h.suggested_field.as_str())
+        .collect();
     assert!(suggestions.contains(&"thread"));
     assert!(suggestions.contains(&"importance"));
     assert!(suggestions.contains(&"before"));
@@ -183,7 +198,10 @@ fn zero_result_guidance_assistance_present_for_hints() {
 #[test]
 fn zero_result_guidance_assistance_present_for_typos() {
     let qa = parse_query_assistance("fron:Alice deployment");
-    assert!(!qa.did_you_mean.is_empty(), "typo should produce suggestions");
+    assert!(
+        !qa.did_you_mean.is_empty(),
+        "typo should produce suggestions"
+    );
 }
 
 #[test]
@@ -199,7 +217,10 @@ fn zero_result_determinism_same_input_same_output() {
     for input in inputs {
         let a = parse_query_assistance(input);
         let b = parse_query_assistance(input);
-        assert_eq!(a.query_text, b.query_text, "query_text diverged for: {input}");
+        assert_eq!(
+            a.query_text, b.query_text,
+            "query_text diverged for: {input}"
+        );
         assert_eq!(
             a.applied_filter_hints, b.applied_filter_hints,
             "hints diverged for: {input}"
@@ -228,13 +249,31 @@ fn reason_code_serde_snake_case_stability() {
     // Verify snake_case serialization is stable — this is the wire format
     let test_cases = [
         (ExplainReasonCode::LexicalBm25, "\"lexical_bm25\""),
-        (ExplainReasonCode::LexicalTermCoverage, "\"lexical_term_coverage\""),
+        (
+            ExplainReasonCode::LexicalTermCoverage,
+            "\"lexical_term_coverage\"",
+        ),
         (ExplainReasonCode::SemanticCosine, "\"semantic_cosine\""),
-        (ExplainReasonCode::SemanticNeighborhood, "\"semantic_neighborhood\""),
-        (ExplainReasonCode::FusionWeightedBlend, "\"fusion_weighted_blend\""),
-        (ExplainReasonCode::RerankPolicyBoost, "\"rerank_policy_boost\""),
-        (ExplainReasonCode::RerankPolicyPenalty, "\"rerank_policy_penalty\""),
-        (ExplainReasonCode::StageNotExecuted, "\"stage_not_executed\""),
+        (
+            ExplainReasonCode::SemanticNeighborhood,
+            "\"semantic_neighborhood\"",
+        ),
+        (
+            ExplainReasonCode::FusionWeightedBlend,
+            "\"fusion_weighted_blend\"",
+        ),
+        (
+            ExplainReasonCode::RerankPolicyBoost,
+            "\"rerank_policy_boost\"",
+        ),
+        (
+            ExplainReasonCode::RerankPolicyPenalty,
+            "\"rerank_policy_penalty\"",
+        ),
+        (
+            ExplainReasonCode::StageNotExecuted,
+            "\"stage_not_executed\"",
+        ),
         (ExplainReasonCode::ScopeRedacted, "\"scope_redacted\""),
         (ExplainReasonCode::ScopeDenied, "\"scope_denied\""),
     ];
@@ -261,7 +300,10 @@ fn reason_code_all_have_nonempty_summary() {
     for code in all_codes {
         let summary = code.summary();
         assert!(!summary.is_empty(), "empty summary for {code:?}");
-        assert!(summary.len() > 5, "summary too short for {code:?}: {summary}");
+        assert!(
+            summary.len() > 5,
+            "summary too short for {code:?}: {summary}"
+        );
     }
 }
 
@@ -490,7 +532,10 @@ fn payload_size_guard_serialized_size_bounded() {
 fn explain_report_taxonomy_version_stable() {
     let config = ExplainComposerConfig::default();
     let report = compose_explain_report(SearchMode::Lexical, 0, HashMap::new(), vec![], &config);
-    assert_eq!(report.taxonomy_version, 1, "taxonomy version must stay at 1");
+    assert_eq!(
+        report.taxonomy_version, 1,
+        "taxonomy version must stay at 1"
+    );
 }
 
 #[test]
@@ -527,9 +572,18 @@ fn explain_report_missing_stages_filled_with_not_executed() {
     );
     assert_eq!(hit.stages.len(), 4, "all 4 stages must be present");
     assert_eq!(hit.stages[0].reason_code, ExplainReasonCode::LexicalBm25);
-    assert_eq!(hit.stages[1].reason_code, ExplainReasonCode::StageNotExecuted);
-    assert_eq!(hit.stages[2].reason_code, ExplainReasonCode::StageNotExecuted);
-    assert_eq!(hit.stages[3].reason_code, ExplainReasonCode::StageNotExecuted);
+    assert_eq!(
+        hit.stages[1].reason_code,
+        ExplainReasonCode::StageNotExecuted
+    );
+    assert_eq!(
+        hit.stages[2].reason_code,
+        ExplainReasonCode::StageNotExecuted
+    );
+    assert_eq!(
+        hit.stages[3].reason_code,
+        ExplainReasonCode::StageNotExecuted
+    );
 }
 
 #[test]
@@ -615,7 +669,10 @@ fn redaction_zeroes_scores_and_marks_redacted() {
     redact_hit_explanation(&mut hit, ExplainReasonCode::ScopeRedacted);
 
     // Post-redaction: everything zeroed and redacted
-    assert!((hit.final_score).abs() < f64::EPSILON, "final_score should be 0");
+    assert!(
+        (hit.final_score).abs() < f64::EPSILON,
+        "final_score should be 0"
+    );
     assert_eq!(
         hit.reason_codes,
         vec![ExplainReasonCode::ScopeRedacted],
@@ -635,7 +692,10 @@ fn redaction_zeroes_scores_and_marks_redacted() {
 fn redaction_scope_denied_vs_scope_redacted() {
     let config = ExplainComposerConfig::default();
 
-    for redact_code in [ExplainReasonCode::ScopeRedacted, ExplainReasonCode::ScopeDenied] {
+    for redact_code in [
+        ExplainReasonCode::ScopeRedacted,
+        ExplainReasonCode::ScopeDenied,
+    ] {
         let mut hit = compose_hit_explanation(
             1,
             0.7,
@@ -804,8 +864,14 @@ fn query_assistance_empty_fields_skipped_in_json() {
         did_you_mean: vec![],
     };
     let json = serde_json::to_string(&qa).unwrap();
-    assert!(!json.contains("applied_filter_hints"), "empty vec should be skipped");
-    assert!(!json.contains("did_you_mean"), "empty vec should be skipped");
+    assert!(
+        !json.contains("applied_filter_hints"),
+        "empty vec should be skipped"
+    );
+    assert!(
+        !json.contains("did_you_mean"),
+        "empty vec should be skipped"
+    );
 }
 
 #[test]
@@ -894,7 +960,12 @@ fn reason_code_ordering_total() {
     // Every pair should have a defined ordering
     for i in 0..all_codes.len() {
         for j in (i + 1)..all_codes.len() {
-            assert!(all_codes[i] < all_codes[j], "{:?} should be < {:?}", all_codes[i], all_codes[j]);
+            assert!(
+                all_codes[i] < all_codes[j],
+                "{:?} should be < {:?}",
+                all_codes[i],
+                all_codes[j]
+            );
         }
     }
 }
@@ -905,7 +976,11 @@ fn empty_report_serializes_compactly() {
     let report = compose_explain_report(SearchMode::Lexical, 0, HashMap::new(), vec![], &config);
     let json = serde_json::to_string(&report).unwrap();
     // Empty report should be well under 1KB
-    assert!(json.len() < 1024, "empty report too large: {} bytes", json.len());
+    assert!(
+        json.len() < 1024,
+        "empty report too large: {} bytes",
+        json.len()
+    );
 }
 
 #[test]

@@ -338,7 +338,7 @@ fn test_reply_message_subject_prefix() {
         let reply_id = reply_parsed["deliveries"][0]["payload"]["id"]
             .as_i64()
             .expect("reply message id");
-        let reply2_result = reply_message(
+        let second_reply_result = reply_message(
             &ctx,
             project_key.clone(),
             reply_id,
@@ -352,12 +352,13 @@ fn test_reply_message_subject_prefix() {
         .await
         .expect("second reply should succeed");
 
-        let reply2_parsed: Value = serde_json::from_str(&reply2_result).expect("valid JSON");
-        let reply2_subject = reply2_parsed["deliveries"][0]["payload"]["subject"]
+        let second_reply_parsed: Value =
+            serde_json::from_str(&second_reply_result).expect("valid JSON");
+        let second_reply_subject = second_reply_parsed["deliveries"][0]["payload"]["subject"]
             .as_str()
             .expect("reply2 subject");
         assert_eq!(
-            reply2_subject, "Re: Original subject",
+            second_reply_subject, "Re: Original subject",
             "reply to 'Re: ...' should NOT double-prefix (case-insensitive idempotent)"
         );
     });

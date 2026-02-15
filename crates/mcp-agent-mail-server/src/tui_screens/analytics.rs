@@ -171,8 +171,7 @@ fn render_card_list(
     table_state: &mut TableState,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let header = Row::new(vec!["Sev", "Conf", "Headline"])
-        .style(crate::tui_theme::text_title(&tp));
+    let header = Row::new(vec!["Sev", "Conf", "Headline"]).style(crate::tui_theme::text_title(&tp));
 
     let rows: Vec<Row> = feed
         .cards
@@ -252,10 +251,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     // Likely cause
     if let Some(ref cause) = card.likely_cause {
         lines.push(Line::from_spans(vec![
-            Span::styled(
-                "Likely Cause: ",
-                crate::tui_theme::text_warning(&tp),
-            ),
+            Span::styled("Likely Cause: ", crate::tui_theme::text_warning(&tp)),
             Span::raw(cause),
         ]));
         lines.push(Line::raw(""));

@@ -9,7 +9,7 @@
 //! Layout changes during drag or rapid key-presses are debounced so
 //! the envfile is written at most once per `SAVE_DEBOUNCE` interval.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -150,7 +150,7 @@ pub fn dismissed_hints_path(envfile_path: &Path) -> PathBuf {
 /// or file writing fails.
 pub fn save_dismissed_hints(
     path: &Path,
-    hints: &std::collections::HashSet<String>,
+    hints: &HashSet<String, std::collections::hash_map::RandomState>,
 ) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

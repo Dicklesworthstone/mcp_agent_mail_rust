@@ -5145,11 +5145,20 @@ mod tests {
     fn sanitize_strips_sql_comment_markers() {
         // Double-dash (SQL line comment)
         assert_eq!(sanitize_fts_query("--a"), Some("a".to_string()));
-        assert_eq!(sanitize_fts_query("foo -- bar"), Some("foo bar".to_string()));
+        assert_eq!(
+            sanitize_fts_query("foo -- bar"),
+            Some("foo bar".to_string())
+        );
         assert!(sanitize_fts_query("--").is_none());
         // Block comment markers
-        assert_eq!(sanitize_fts_query("foo /* bar"), Some("foo bar".to_string()));
-        assert_eq!(sanitize_fts_query("foo */ bar"), Some("foo bar".to_string()));
+        assert_eq!(
+            sanitize_fts_query("foo /* bar"),
+            Some("foo bar".to_string())
+        );
+        assert_eq!(
+            sanitize_fts_query("foo */ bar"),
+            Some("foo bar".to_string())
+        );
     }
 
     #[test]

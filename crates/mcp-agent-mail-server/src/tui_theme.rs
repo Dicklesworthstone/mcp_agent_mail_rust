@@ -1134,6 +1134,7 @@ mod tests {
     // ── Semantic typography hierarchy tests ──────────────────────
 
     #[test]
+    #[allow(clippy::items_after_statements)]
     fn typography_hierarchy_has_distinct_strata() {
         let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let tp = TuiThemePalette::current();
@@ -1154,7 +1155,7 @@ mod tests {
 
         // Title should be bold.
         use ftui::style::StyleFlags;
-        let has = |s: &Style, f: StyleFlags| s.attrs.map_or(false, |a| a.contains(f));
+        let has = |s: &Style, f: StyleFlags| s.attrs.is_some_and(|a| a.contains(f));
         assert!(has(&title, StyleFlags::BOLD), "title must be bold");
         assert!(has(&section, StyleFlags::BOLD), "section must be bold");
 
@@ -1163,7 +1164,10 @@ mod tests {
         assert!(has(&disabled, StyleFlags::DIM), "disabled must be dim");
 
         // Primary should NOT be bold.
-        assert!(!has(&primary, StyleFlags::BOLD), "primary should not be bold");
+        assert!(
+            !has(&primary, StyleFlags::BOLD),
+            "primary should not be bold"
+        );
     }
 
     #[test]
@@ -1200,7 +1204,7 @@ mod tests {
     #[test]
     fn semantic_state_helpers_produce_valid_styles() {
         use ftui::style::StyleFlags;
-        let has = |s: &Style, f: StyleFlags| s.attrs.map_or(false, |a| a.contains(f));
+        let has = |s: &Style, f: StyleFlags| s.attrs.is_some_and(|a| a.contains(f));
 
         for &theme_id in &ThemeId::ALL {
             let _guard = ScopedThemeLock::new(theme_id);
@@ -1226,20 +1230,32 @@ mod tests {
                 ("facet_active", &facet_active),
                 ("action_key", &action_key),
             ] {
-                assert!(
-                    s.fg.is_some(),
-                    "{name} missing fg in theme {theme_id:?}"
-                );
+                assert!(s.fg.is_some(), "{name} missing fg in theme {theme_id:?}");
             }
 
             // Bold expectations.
-            assert!(has(&accent, StyleFlags::BOLD), "accent must be bold in {theme_id:?}");
-            assert!(has(&error, StyleFlags::BOLD), "error must be bold in {theme_id:?}");
-            assert!(has(&warning, StyleFlags::BOLD), "warning must be bold in {theme_id:?}");
-            assert!(has(&critical, StyleFlags::BOLD), "critical must be bold in {theme_id:?}");
+            assert!(
+                has(&accent, StyleFlags::BOLD),
+                "accent must be bold in {theme_id:?}"
+            );
+            assert!(
+                has(&error, StyleFlags::BOLD),
+                "error must be bold in {theme_id:?}"
+            );
+            assert!(
+                has(&warning, StyleFlags::BOLD),
+                "warning must be bold in {theme_id:?}"
+            );
+            assert!(
+                has(&critical, StyleFlags::BOLD),
+                "critical must be bold in {theme_id:?}"
+            );
 
             // Success is intentionally NOT bold (lower visual weight).
-            assert!(!has(&success, StyleFlags::BOLD), "success should not be bold in {theme_id:?}");
+            assert!(
+                !has(&success, StyleFlags::BOLD),
+                "success should not be bold in {theme_id:?}"
+            );
         }
     }
 

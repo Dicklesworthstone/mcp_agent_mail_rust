@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "semantic")]
-use crate::fs_bridge::{fs, fs_rrf_fuse, FsRrfConfig, FsScoredResult, FsVectorHit};
+use crate::fs_bridge::{FsRrfConfig, FsScoredResult, FsVectorHit, fs, fs_rrf_fuse};
 use crate::hybrid_candidates::{CandidateSource, PreparedCandidate};
 
 /// Default RRF constant (k).
@@ -450,7 +450,7 @@ pub fn fuse_rrf_default(candidates: &[PreparedCandidate]) -> FusionResult {
 )]
 mod tests {
     use super::*;
-    use crate::hybrid_candidates::{prepare_candidates, CandidateBudget, CandidateHit};
+    use crate::hybrid_candidates::{CandidateBudget, CandidateHit, prepare_candidates};
 
     fn make_candidate(
         doc_id: i64,
@@ -574,10 +574,12 @@ mod tests {
 
         // All lexical docs should pass through
         assert_eq!(result.total_fused, 2);
-        assert!(result
-            .hits
-            .iter()
-            .all(|h| h.explain.semantic_rank.is_none()));
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|h| h.explain.semantic_rank.is_none())
+        );
     }
 
     #[test]

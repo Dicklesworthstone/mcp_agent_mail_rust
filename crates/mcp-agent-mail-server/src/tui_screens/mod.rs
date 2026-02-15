@@ -687,11 +687,7 @@ mod tests {
                 .iter()
                 .filter(|m| m.category == cat)
                 .count();
-            assert!(
-                count > 0,
-                "category {:?} has no screens in the registry",
-                cat
-            );
+            assert!(count > 0, "category {cat:?} has no screens in the registry");
         }
     }
 
@@ -838,11 +834,7 @@ mod tests {
         // Every screen must be reachable by a jump key.
         for (i, &id) in ALL_SCREEN_IDS.iter().enumerate() {
             let key = jump_key_label_for_screen(id);
-            assert!(
-                key.is_some(),
-                "screen {i} ({:?}) has no jump key",
-                id
-            );
+            assert!(key.is_some(), "screen {i} ({id:?}) has no jump key");
         }
     }
 
@@ -879,15 +871,12 @@ mod tests {
 
     #[test]
     fn every_category_represented() {
-        let cats: std::collections::HashSet<_> = MAIL_SCREEN_REGISTRY
-            .iter()
-            .map(|m| m.category)
-            .collect();
+        let cats: std::collections::HashSet<_> =
+            MAIL_SCREEN_REGISTRY.iter().map(|m| m.category).collect();
         for &cat in ScreenCategory::ALL {
             assert!(
                 cats.contains(&cat),
-                "ScreenCategory::{:?} has no assigned screens",
-                cat
+                "ScreenCategory::{cat:?} has no assigned screens"
             );
         }
     }
@@ -909,11 +898,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for &id in ALL_SCREEN_IDS {
             if let Some(key) = jump_key_label_for_screen(id) {
-                assert!(
-                    seen.insert(key),
-                    "duplicate jump key '{key}' for {:?}",
-                    id
-                );
+                assert!(seen.insert(key), "duplicate jump key '{key}' for {id:?}");
             }
         }
     }
@@ -928,8 +913,7 @@ mod tests {
                 assert_eq!(
                     found,
                     Some(id),
-                    "screen_from_jump_key('{ch}') should return {:?}",
-                    id
+                    "screen_from_jump_key('{ch}') should return {id:?}"
                 );
             }
         }

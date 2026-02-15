@@ -6,7 +6,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
@@ -47,6 +47,9 @@ const DEBOUNCE_TICKS: u8 = 0;
 /// Max results to cache.
 const MAX_RESULTS: usize = 1000;
 const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
+const SHIMMER_WINDOW_MICROS: i64 = 500_000;
+const SHIMMER_MAX_ROWS: usize = 5;
+const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
 
 /// Max body preview length in the results list (used for future
 /// inline preview in narrow mode).
@@ -153,6 +156,22 @@ struct MessageEntry {
 
 impl RenderItem for MessageEntry {
     fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        self.render_row(area, frame, selected, None);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
+}
+
+impl MessageEntry {
+    fn render_row(
+        &self,
+        area: Rect,
+        frame: &mut Frame,
+        selected: bool,
+        shimmer_progress: Option<f64>,
+    ) {
         use ftui::widgets::Widget;
         if area.height == 0 || area.width < 10 {
             return;
@@ -245,7 +264,7 @@ impl RenderItem for MessageEntry {
         let remaining = inner_w.saturating_sub(fixed_len);
         let subj = truncate_str(&self.subject, remaining);
 
-        let mut line = Line::from_spans([
+        let mut spans = vec![
             Span::raw(marker),
             Span::styled(format!("{badge:>2}"), badge_style),
             Span::styled(ack_badge, ack_style),
@@ -256,13 +275,54 @@ impl RenderItem for MessageEntry {
             Span::raw(" "),
             Span::styled(format!("{sender:<12}"), sender_style),
             Span::raw(format!(" {project_badge}")),
-            Span::styled(subj.to_string(), Style::default().fg(tp.text_primary)),
-        ]);
+        ];
+        let base_subject_style = Style::default().fg(tp.text_primary);
+        if let Some(progress) = shimmer_progress.filter(|_| !selected) {
+            if let Some((start_char, end_char)) =
+                subject_shimmer_window(&subj, progress, SHIMMER_HIGHLIGHT_WIDTH)
+            {
+                let start_byte = char_index_to_byte_offset(&subj, start_char);
+                let end_byte = char_index_to_byte_offset(&subj, end_char);
+                let prefix = &subj[..start_byte];
+                let highlight = &subj[start_byte..end_byte];
+                let suffix = &subj[end_byte..];
+                if !prefix.is_empty() {
+                    spans.push(Span::styled(prefix.to_string(), base_subject_style));
+                }
+                if !highlight.is_empty() {
+                    spans.push(Span::styled(
+                        highlight.to_string(),
+                        Style::default().fg(tp.selection_indicator).bold(),
+                    ));
+                }
+                if !suffix.is_empty() {
+                    spans.push(Span::styled(suffix.to_string(), base_subject_style));
+                }
+            } else {
+                spans.push(Span::styled(subj, base_subject_style));
+            }
+        } else {
+            spans.push(Span::styled(subj, base_subject_style));
+        }
+        let mut line = Line::from_spans(spans);
         if selected {
             line.apply_base_style(cursor_style);
         }
         let paragraph = Paragraph::new(Text::from_line(line));
         paragraph.render(area, frame);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MessageRenderRow<'a> {
+    entry: &'a MessageEntry,
+    shimmer_progress: Option<f64>,
+}
+
+impl RenderItem for MessageRenderRow<'_> {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        self.entry
+            .render_row(area, frame, selected, self.shimmer_progress);
     }
 
     fn height(&self) -> u16 {
@@ -595,8 +655,7 @@ impl MessageBrowserScreen {
         if !live.is_empty() {
             // Collect DB result IDs for dedup (live events with a positive ID
             // that already appears in DB results are skipped).
-            let db_ids: std::collections::HashSet<i64> =
-                results.iter().map(|r| r.id).collect();
+            let db_ids: std::collections::HashSet<i64> = results.iter().map(|r| r.id).collect();
             for entry in live {
                 if entry.id > 0 && db_ids.contains(&entry.id) {
                     continue;
@@ -610,7 +669,7 @@ impl MessageBrowserScreen {
                 results.push(entry);
             }
             // Re-sort by timestamp descending (newest first)
-            results.sort_by(|a, b| b.timestamp_micros.cmp(&a.timestamp_micros));
+            results.sort_by_key(|r| std::cmp::Reverse(r.timestamp_micros));
         }
 
         self.results = results;
@@ -659,7 +718,14 @@ impl MessageBrowserScreen {
                         thread_id,
                         project,
                         ..
-                    } => (*id, from.as_str(), to, subject.as_str(), thread_id.as_str(), project.as_str()),
+                    } => (
+                        *id,
+                        from.as_str(),
+                        to,
+                        subject.as_str(),
+                        thread_id.as_str(),
+                        project.as_str(),
+                    ),
                     _ => return None,
                 };
 
@@ -1018,6 +1084,8 @@ impl MailScreen for MessageBrowserScreen {
             &self.results,
             &mut list_state,
             results_focused,
+            state.config_snapshot().tui_effects,
+            self.reduced_motion,
         );
         drop(list_state);
 
@@ -1030,7 +1098,6 @@ impl MailScreen for MessageBrowserScreen {
                 !matches!(self.focus, Focus::SearchBar),
             );
         }
-
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -1414,6 +1481,8 @@ fn render_results_list(
     results: &[MessageEntry],
     list_state: &mut VirtualizedListState,
     focused: bool,
+    effects_enabled: bool,
+    reduced_motion: bool,
 ) {
     let title = if results.is_empty() {
         "Results".to_string()
@@ -1438,7 +1507,18 @@ fn render_results_list(
         return;
     }
 
-    let list = VirtualizedList::new(results)
+    let shimmer_progresses =
+        compute_shimmer_progresses(results, effects_enabled && !reduced_motion);
+    let rows: Vec<MessageRenderRow<'_>> = results
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| MessageRenderRow {
+            entry,
+            shimmer_progress: shimmer_progresses[idx],
+        })
+        .collect();
+
+    let list = VirtualizedList::new(rows.as_slice())
         .style(Style::default())
         .highlight_style(
             Style::default()
@@ -1961,6 +2041,73 @@ const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
         && y < area.y.saturating_add(area.height)
 }
 
+fn unix_epoch_micros_now() -> Option<i64> {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_micros();
+    i64::try_from(micros).ok()
+}
+
+fn shimmer_progress_for_timestamp(now_micros: i64, timestamp_micros: i64) -> Option<f64> {
+    if timestamp_micros <= 0 {
+        return None;
+    }
+    let age = now_micros - timestamp_micros;
+    if !(0..=SHIMMER_WINDOW_MICROS).contains(&age) {
+        return None;
+    }
+    Some((age as f64 / SHIMMER_WINDOW_MICROS as f64).clamp(0.0, 1.0))
+}
+
+fn compute_shimmer_progresses(results: &[MessageEntry], effects_enabled: bool) -> Vec<Option<f64>> {
+    let mut progresses = vec![None; results.len()];
+    if !effects_enabled || results.is_empty() {
+        return progresses;
+    }
+    let Some(now_micros) = unix_epoch_micros_now() else {
+        return progresses;
+    };
+    let mut shimmer_count = 0usize;
+    for (idx, entry) in results.iter().enumerate() {
+        if shimmer_count >= SHIMMER_MAX_ROWS {
+            break;
+        }
+        if let Some(progress) = shimmer_progress_for_timestamp(now_micros, entry.timestamp_micros) {
+            progresses[idx] = Some(progress);
+            shimmer_count += 1;
+        }
+    }
+    progresses
+}
+
+fn char_index_to_byte_offset(s: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .nth(char_idx)
+        .map_or(s.len(), |(byte_idx, _)| byte_idx)
+}
+
+fn subject_shimmer_window(
+    subject: &str,
+    progress: f64,
+    width_chars: usize,
+) -> Option<(usize, usize)> {
+    let len_chars = subject.chars().count();
+    if len_chars == 0 {
+        return None;
+    }
+    let clamped = progress.clamp(0.0, 1.0);
+    let center = ((len_chars.saturating_sub(1)) as f64 * clamped).round() as usize;
+    let width = width_chars.max(1).min(len_chars);
+    let half = width / 2;
+    let start = center.saturating_sub(half);
+    let end = (start + width).min(len_chars);
+    Some((start, end))
+}
+
 /// Compute the viewport [start, end) to keep cursor visible.
 /// (Retained for test coverage; `VirtualizedList` handles this internally.)
 #[allow(dead_code)]
@@ -2422,6 +2569,8 @@ mod tests {
             &[],
             &mut list_state,
             true,
+            true,
+            false,
         );
     }
 
@@ -2467,6 +2616,8 @@ mod tests {
             &entries,
             &mut list_state,
             true,
+            true,
+            false,
         );
     }
 
@@ -3065,6 +3216,43 @@ mod tests {
     }
 
     #[test]
+    fn shimmer_progress_returns_none_after_window() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(shimmer_progress_for_timestamp(now, now).is_some());
+        assert!(shimmer_progress_for_timestamp(now, now - SHIMMER_WINDOW_MICROS - 1).is_none());
+        assert!(shimmer_progress_for_timestamp(now, 0).is_none());
+    }
+
+    #[test]
+    fn compute_shimmer_progresses_caps_at_five_rows() {
+        let now = unix_epoch_micros_now().expect("system clock should provide unix micros");
+        let entries: Vec<MessageEntry> = (0..8)
+            .map(|idx| MessageEntry {
+                id: idx as i64 + 1,
+                subject: format!("msg-{idx}"),
+                from_agent: "GoldFox".to_string(),
+                to_agents: "SilverWolf".to_string(),
+                project_slug: "proj".to_string(),
+                thread_id: "thread".to_string(),
+                timestamp_iso: micros_to_iso(now - (idx as i64 * 10_000)),
+                timestamp_micros: now - (idx as i64 * 10_000),
+                body_md: String::new(),
+                importance: "normal".to_string(),
+                ack_required: false,
+                show_project: false,
+            })
+            .collect();
+        let progresses = compute_shimmer_progresses(&entries, true);
+        assert_eq!(
+            progresses.iter().filter(|p| p.is_some()).count(),
+            SHIMMER_MAX_ROWS
+        );
+
+        let disabled = compute_shimmer_progresses(&entries, false);
+        assert!(disabled.iter().all(Option::is_none));
+    }
+
+    #[test]
     fn message_row_hierarchy_semantic_fields() {
         // Verify the MessageEntry struct carries all fields needed for
         // the redesigned row: importance, ack_required, from_agent, id polarity.
@@ -3100,7 +3288,7 @@ mod tests {
         let high = MessageEntry {
             importance: "high".to_string(),
             from_agent: "LongSenderNameHere".to_string(),
-            ..normal.clone()
+            ..normal
         };
         assert_eq!(high.importance, "high");
         // Sender truncation in render is at 12 chars

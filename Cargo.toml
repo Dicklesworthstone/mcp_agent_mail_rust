@@ -49,7 +49,7 @@ ftui-widgets = { path = "../frankentui/crates/ftui-widgets", features = ["debug-
 ftui-harness = { path = "../frankentui/crates/ftui-harness" }
 ftui-render = { path = "../frankentui/crates/ftui-render" }
 beads_rust = { path = "../beads_rust" }
-toon = { path = "../toon_rust" }
+toon = { package = "tru", path = "../toon_rust" }
 
 # Agent detection (tokio-based upstream; declare optional in crates that use it)
 coding-agent-search = { path = "../coding_agent_session_search" }

@@ -405,7 +405,10 @@ impl RenderItem for SearchResultRow {
         spans.push(Span::styled(imp_badge.to_string(), imp_style));
         spans.push(Span::styled(meta_text, meta_style));
 
-        let prefix_len = spans.iter().map(|s| s.as_str().chars().count()).sum::<usize>();
+        let prefix_len = spans
+            .iter()
+            .map(|s| s.as_str().chars().count())
+            .sum::<usize>();
 
         // Title with remaining space
         let title_space = w.saturating_sub(prefix_len);
@@ -2480,11 +2483,7 @@ fn render_facet_rail(
     let w = inner.width as usize;
 
     let facets: &[(FacetSlot, &str, &str)] = &[
-        (
-            FacetSlot::Scope,
-            "Scope",
-            screen.scope_mode.label(),
-        ),
+        (FacetSlot::Scope, "Scope", screen.scope_mode.label()),
         (
             FacetSlot::DocKind,
             "Doc Type",
@@ -2979,11 +2978,11 @@ fn render_detail(
     if let Some(ref agent) = entry.from_agent {
         lines.push(Line::from_spans([
             Span::styled("From:       ".to_string(), label_style),
-            Span::styled(agent.to_string(), accent_style),
+            Span::styled(agent.clone(), accent_style),
         ]));
     }
     if let Some(ref tid) = entry.thread_id {
-        lines.push(styled_field("Thread:     ", tid.to_string()));
+        lines.push(styled_field("Thread:     ", tid.clone()));
     }
     if let Some(ref imp) = entry.importance {
         let imp_style = match imp.as_str() {
@@ -2993,7 +2992,7 @@ fn render_detail(
         };
         lines.push(Line::from_spans([
             Span::styled("Importance: ".to_string(), label_style),
-            Span::styled(imp.to_string(), imp_style),
+            Span::styled(imp.clone(), imp_style),
         ]));
     }
     if let Some(ack) = entry.ack_required {
@@ -4293,7 +4292,10 @@ mod tests {
     #[test]
     fn query_lab_hidden_by_default() {
         let screen = SearchCockpitScreen::new();
-        assert!(!screen.query_lab_visible, "query lab should be hidden by default");
+        assert!(
+            !screen.query_lab_visible,
+            "query lab should be hidden by default"
+        );
     }
 
     #[test]

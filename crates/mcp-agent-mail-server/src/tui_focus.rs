@@ -34,8 +34,10 @@
 //! }
 //! ```
 
-use ftui::Style;
+use ftui::{Style, layout::Rect};
 use ftui_extras::theme;
+
+use crate::tui_screens::{ALL_SCREEN_IDS, MailScreenId};
 
 // ──────────────────────────────────────────────────────────────────────
 // FocusTarget — identifies a focusable element
@@ -88,6 +90,585 @@ impl FocusTarget {
     pub const fn is_modal(self) -> bool {
         matches!(self, Self::ModalContent | Self::ModalActions)
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// FocusGraph — per-screen spatial focus topology
+// ──────────────────────────────────────────────────────────────────────
+
+/// Directional neighbors for a [`FocusNode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FocusNeighbors {
+    /// Closest node above this node.
+    pub up: Option<usize>,
+    /// Closest node below this node.
+    pub down: Option<usize>,
+    /// Closest node to the left of this node.
+    pub left: Option<usize>,
+    /// Closest node to the right of this node.
+    pub right: Option<usize>,
+}
+
+/// A focusable panel node for a screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusNode {
+    /// Stable identifier used across re-renders and layout changes.
+    pub id: &'static str,
+    /// Focus target used by [`FocusManager`].
+    pub target: FocusTarget,
+    /// Rendered panel rectangle.
+    pub rect: Rect,
+    /// Tab traversal order.
+    pub tab_index: usize,
+    /// Spatially derived directional neighbors.
+    pub neighbors: FocusNeighbors,
+}
+
+/// Spatial focus graph for a single screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusGraph {
+    screen: MailScreenId,
+    nodes: Vec<FocusNode>,
+}
+
+impl FocusGraph {
+    /// Build a focus graph for a specific screen and render area.
+    #[must_use]
+    pub fn for_screen(screen: MailScreenId, area: Rect) -> Self {
+        let templates = focus_templates_for_screen(screen);
+        let rects: Vec<Rect> = templates
+            .iter()
+            .map(|template| rect_from_template(area, *template))
+            .collect();
+
+        let mut nodes = Vec::with_capacity(templates.len());
+        for (idx, template) in templates.iter().copied().enumerate() {
+            nodes.push(FocusNode {
+                id: template.id,
+                target: template.target,
+                rect: rects[idx],
+                tab_index: template.tab_index,
+                neighbors: FocusNeighbors {
+                    up: best_neighbor(&rects, idx, Direction::Up),
+                    down: best_neighbor(&rects, idx, Direction::Down),
+                    left: best_neighbor(&rects, idx, Direction::Left),
+                    right: best_neighbor(&rects, idx, Direction::Right),
+                },
+            });
+        }
+
+        Self { screen, nodes }
+    }
+
+    /// The screen this graph belongs to.
+    #[must_use]
+    pub const fn screen(&self) -> MailScreenId {
+        self.screen
+    }
+
+    /// Focus nodes in tab-order declaration order.
+    #[must_use]
+    pub fn nodes(&self) -> &[FocusNode] {
+        &self.nodes
+    }
+
+    /// Lookup node index by focus target.
+    #[must_use]
+    pub fn node_index(&self, target: FocusTarget) -> Option<usize> {
+        self.nodes.iter().position(|node| node.target == target)
+    }
+
+    /// Lookup node by focus target.
+    #[must_use]
+    pub fn node(&self, target: FocusTarget) -> Option<&FocusNode> {
+        self.node_index(target).map(|idx| &self.nodes[idx])
+    }
+}
+
+/// Convenience wrapper for callers that only need the graph.
+#[must_use]
+pub fn focus_graph_for_screen(screen: MailScreenId, area: Rect) -> FocusGraph {
+    FocusGraph::for_screen(screen, area)
+}
+
+/// Tab-focus ring declaration for a screen (stable order, no geometry).
+#[must_use]
+pub fn focus_ring_for_screen(screen: MailScreenId) -> Vec<FocusTarget> {
+    focus_templates_for_screen(screen)
+        .iter()
+        .map(|template| template.target)
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FocusNodeTemplate {
+    id: &'static str,
+    target: FocusTarget,
+    tab_index: usize,
+    x_permille: u16,
+    y_permille: u16,
+    w_permille: u16,
+    h_permille: u16,
+}
+
+const fn tpl(
+    id: &'static str,
+    target: FocusTarget,
+    tab_index: usize,
+    x_permille: u16,
+    y_permille: u16,
+    w_permille: u16,
+    h_permille: u16,
+) -> FocusNodeTemplate {
+    FocusNodeTemplate {
+        id,
+        target,
+        tab_index,
+        x_permille,
+        y_permille,
+        w_permille,
+        h_permille,
+    }
+}
+
+const DASHBOARD_FOCUS: [FocusNodeTemplate; 5] = [
+    tpl(
+        "dashboard.throughput",
+        FocusTarget::Custom(0),
+        0,
+        0,
+        0,
+        650,
+        280,
+    ),
+    tpl(
+        "dashboard.events",
+        FocusTarget::List(0),
+        1,
+        0,
+        280,
+        650,
+        720,
+    ),
+    tpl(
+        "dashboard.metrics",
+        FocusTarget::Custom(1),
+        2,
+        650,
+        0,
+        350,
+        250,
+    ),
+    tpl(
+        "dashboard.heatmap",
+        FocusTarget::Custom(2),
+        3,
+        650,
+        250,
+        350,
+        350,
+    ),
+    tpl(
+        "dashboard.anomalies",
+        FocusTarget::Custom(3),
+        4,
+        650,
+        600,
+        350,
+        400,
+    ),
+];
+
+const MESSAGES_FOCUS: [FocusNodeTemplate; 3] = [
+    tpl(
+        "messages.search",
+        FocusTarget::TextInput(0),
+        0,
+        0,
+        0,
+        1000,
+        120,
+    ),
+    tpl("messages.list", FocusTarget::List(0), 1, 0, 120, 450, 880),
+    tpl(
+        "messages.preview",
+        FocusTarget::DetailPanel,
+        2,
+        450,
+        120,
+        550,
+        880,
+    ),
+];
+
+const THREADS_FOCUS: [FocusNodeTemplate; 2] = [
+    tpl("threads.list", FocusTarget::List(0), 0, 0, 0, 420, 1000),
+    tpl(
+        "threads.detail",
+        FocusTarget::DetailPanel,
+        1,
+        420,
+        0,
+        580,
+        1000,
+    ),
+];
+
+const AGENTS_FOCUS: [FocusNodeTemplate; 2] = [
+    tpl("agents.list", FocusTarget::List(0), 0, 0, 0, 430, 1000),
+    tpl(
+        "agents.detail",
+        FocusTarget::DetailPanel,
+        1,
+        430,
+        0,
+        570,
+        1000,
+    ),
+];
+
+const SEARCH_FOCUS: [FocusNodeTemplate; 3] = [
+    tpl(
+        "search.query",
+        FocusTarget::TextInput(0),
+        0,
+        0,
+        0,
+        1000,
+        140,
+    ),
+    tpl(
+        "search.facets",
+        FocusTarget::FilterRail,
+        1,
+        0,
+        140,
+        260,
+        860,
+    ),
+    tpl(
+        "search.results",
+        FocusTarget::List(0),
+        2,
+        260,
+        140,
+        740,
+        860,
+    ),
+];
+
+const RESERVATIONS_FOCUS: [FocusNodeTemplate; 2] = [
+    tpl(
+        "reservations.list",
+        FocusTarget::List(0),
+        0,
+        0,
+        0,
+        500,
+        1000,
+    ),
+    tpl(
+        "reservations.detail",
+        FocusTarget::DetailPanel,
+        1,
+        500,
+        0,
+        500,
+        1000,
+    ),
+];
+
+const TOOL_METRICS_FOCUS: [FocusNodeTemplate; 3] = [
+    tpl(
+        "tool_metrics.list",
+        FocusTarget::List(0),
+        0,
+        0,
+        0,
+        320,
+        1000,
+    ),
+    tpl(
+        "tool_metrics.chart",
+        FocusTarget::Custom(0),
+        1,
+        320,
+        0,
+        380,
+        500,
+    ),
+    tpl(
+        "tool_metrics.detail",
+        FocusTarget::DetailPanel,
+        2,
+        700,
+        0,
+        300,
+        1000,
+    ),
+];
+
+const SYSTEM_HEALTH_FOCUS: [FocusNodeTemplate; 4] = [
+    tpl(
+        "system_health.probes",
+        FocusTarget::Custom(0),
+        0,
+        0,
+        0,
+        300,
+        500,
+    ),
+    tpl(
+        "system_health.resources",
+        FocusTarget::Custom(1),
+        1,
+        300,
+        0,
+        350,
+        500,
+    ),
+    tpl(
+        "system_health.anomalies",
+        FocusTarget::Custom(2),
+        2,
+        650,
+        0,
+        350,
+        500,
+    ),
+    tpl(
+        "system_health.events",
+        FocusTarget::List(0),
+        3,
+        0,
+        500,
+        1000,
+        500,
+    ),
+];
+
+const TIMELINE_FOCUS: [FocusNodeTemplate; 2] = [
+    tpl("timeline.events", FocusTarget::List(0), 0, 0, 0, 450, 1000),
+    tpl(
+        "timeline.inspector",
+        FocusTarget::DetailPanel,
+        1,
+        450,
+        0,
+        550,
+        1000,
+    ),
+];
+
+const PROJECTS_FOCUS: [FocusNodeTemplate; 2] = [
+    tpl("projects.list", FocusTarget::List(0), 0, 0, 0, 400, 1000),
+    tpl(
+        "projects.detail",
+        FocusTarget::DetailPanel,
+        1,
+        400,
+        0,
+        600,
+        1000,
+    ),
+];
+
+const CONTACTS_FOCUS: [FocusNodeTemplate; 2] = [
+    tpl("contacts.list", FocusTarget::List(0), 0, 0, 0, 420, 1000),
+    tpl(
+        "contacts.detail",
+        FocusTarget::DetailPanel,
+        1,
+        420,
+        0,
+        580,
+        1000,
+    ),
+];
+
+const EXPLORER_FOCUS: [FocusNodeTemplate; 4] = [
+    tpl(
+        "explorer.search",
+        FocusTarget::TextInput(0),
+        0,
+        0,
+        0,
+        1000,
+        140,
+    ),
+    tpl(
+        "explorer.filters",
+        FocusTarget::FilterRail,
+        1,
+        0,
+        140,
+        250,
+        860,
+    ),
+    tpl("explorer.list", FocusTarget::List(0), 2, 250, 140, 450, 860),
+    tpl(
+        "explorer.preview",
+        FocusTarget::DetailPanel,
+        3,
+        700,
+        140,
+        300,
+        860,
+    ),
+];
+
+const ANALYTICS_FOCUS: [FocusNodeTemplate; 4] = [
+    tpl(
+        "analytics.charts",
+        FocusTarget::Custom(0),
+        0,
+        0,
+        0,
+        650,
+        500,
+    ),
+    tpl("analytics.table", FocusTarget::List(0), 1, 0, 500, 650, 500),
+    tpl(
+        "analytics.filters",
+        FocusTarget::FilterRail,
+        2,
+        650,
+        0,
+        350,
+        300,
+    ),
+    tpl(
+        "analytics.summary",
+        FocusTarget::DetailPanel,
+        3,
+        650,
+        300,
+        350,
+        700,
+    ),
+];
+
+const ATTACHMENTS_FOCUS: [FocusNodeTemplate; 2] = [
+    tpl("attachments.list", FocusTarget::List(0), 0, 0, 0, 420, 1000),
+    tpl(
+        "attachments.preview",
+        FocusTarget::DetailPanel,
+        1,
+        420,
+        0,
+        580,
+        1000,
+    ),
+];
+
+const fn focus_templates_for_screen(screen: MailScreenId) -> &'static [FocusNodeTemplate] {
+    match screen {
+        MailScreenId::Dashboard => &DASHBOARD_FOCUS,
+        MailScreenId::Messages => &MESSAGES_FOCUS,
+        MailScreenId::Threads => &THREADS_FOCUS,
+        MailScreenId::Agents => &AGENTS_FOCUS,
+        MailScreenId::Search => &SEARCH_FOCUS,
+        MailScreenId::Reservations => &RESERVATIONS_FOCUS,
+        MailScreenId::ToolMetrics => &TOOL_METRICS_FOCUS,
+        MailScreenId::SystemHealth => &SYSTEM_HEALTH_FOCUS,
+        MailScreenId::Timeline => &TIMELINE_FOCUS,
+        MailScreenId::Projects => &PROJECTS_FOCUS,
+        MailScreenId::Contacts => &CONTACTS_FOCUS,
+        MailScreenId::Explorer => &EXPLORER_FOCUS,
+        MailScreenId::Analytics => &ANALYTICS_FOCUS,
+        MailScreenId::Attachments => &ATTACHMENTS_FOCUS,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+fn scale_permille(total: u16, permille: u16) -> u16 {
+    ((u32::from(total) * u32::from(permille)) / 1_000) as u16
+}
+
+fn rect_from_template(area: Rect, template: FocusNodeTemplate) -> Rect {
+    let total_w = area.width.max(1);
+    let total_h = area.height.max(1);
+
+    let area_x = area.x;
+    let area_y = area.y;
+    let area_right = area_x.saturating_add(total_w);
+    let area_bottom = area_y.saturating_add(total_h);
+
+    let mut x = area_x.saturating_add(scale_permille(total_w, template.x_permille));
+    let mut y = area_y.saturating_add(scale_permille(total_h, template.y_permille));
+
+    if x >= area_right {
+        x = area_right.saturating_sub(1);
+    }
+    if y >= area_bottom {
+        y = area_bottom.saturating_sub(1);
+    }
+
+    let mut width = scale_permille(total_w, template.w_permille).max(1);
+    let mut height = scale_permille(total_h, template.h_permille).max(1);
+
+    if x.saturating_add(width) > area_right {
+        width = area_right.saturating_sub(x).max(1);
+    }
+    if y.saturating_add(height) > area_bottom {
+        height = area_bottom.saturating_sub(y).max(1);
+    }
+
+    Rect::new(x, y, width, height)
+}
+
+fn rect_center(rect: Rect) -> (i32, i32) {
+    let cx = i32::from(rect.x) + i32::from(rect.width.saturating_sub(1)) / 2;
+    let cy = i32::from(rect.y) + i32::from(rect.height.saturating_sub(1)) / 2;
+    (cx, cy)
+}
+
+fn best_neighbor(rects: &[Rect], source_idx: usize, direction: Direction) -> Option<usize> {
+    if source_idx >= rects.len() {
+        return None;
+    }
+    let (sx, sy) = rect_center(rects[source_idx]);
+    let mut best: Option<(i64, usize)> = None;
+
+    for (idx, rect) in rects.iter().enumerate() {
+        if idx == source_idx {
+            continue;
+        }
+        let (tx, ty) = rect_center(*rect);
+        let dx = tx - sx;
+        let dy = ty - sy;
+
+        let in_direction = match direction {
+            Direction::Up => dy < 0,
+            Direction::Down => dy > 0,
+            Direction::Left => dx < 0,
+            Direction::Right => dx > 0,
+        };
+        if !in_direction {
+            continue;
+        }
+
+        let (primary, secondary) = match direction {
+            Direction::Up | Direction::Down => (dy.unsigned_abs(), dx.unsigned_abs()),
+            Direction::Left | Direction::Right => (dx.unsigned_abs(), dy.unsigned_abs()),
+        };
+        let score = i64::from(primary) * 4_096 + i64::from(secondary);
+
+        match best {
+            None => best = Some((score, idx)),
+            Some((best_score, _)) if score < best_score => best = Some((score, idx)),
+            _ => {}
+        }
+    }
+
+    best.map(|(_, idx)| idx)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -737,5 +1318,98 @@ mod tests {
 
         fm.focus(FocusTarget::List(0));
         assert!(!fm.consumes_text_input());
+    }
+
+    #[test]
+    fn focus_graph_defined_for_all_screens() {
+        for &screen in ALL_SCREEN_IDS {
+            let graph = FocusGraph::for_screen(screen, Rect::new(0, 0, 120, 40));
+            assert!(
+                !graph.nodes().is_empty(),
+                "screen {screen:?} should define at least one focus node"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_graph_node_ids_stable_across_resizes() {
+        for &screen in ALL_SCREEN_IDS {
+            let compact = FocusGraph::for_screen(screen, Rect::new(0, 0, 90, 28));
+            let wide = FocusGraph::for_screen(screen, Rect::new(0, 0, 210, 64));
+
+            let compact_ids: Vec<&str> = compact.nodes().iter().map(|node| node.id).collect();
+            let wide_ids: Vec<&str> = wide.nodes().iter().map(|node| node.id).collect();
+            assert_eq!(
+                compact_ids, wide_ids,
+                "screen {screen:?} should keep stable node IDs across layout changes"
+            );
+
+            let compact_targets: Vec<FocusTarget> =
+                compact.nodes().iter().map(|node| node.target).collect();
+            let wide_targets: Vec<FocusTarget> =
+                wide.nodes().iter().map(|node| node.target).collect();
+            assert_eq!(
+                compact_targets, wide_targets,
+                "screen {screen:?} should keep stable focus targets across layout changes"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_graph_messages_neighbors_match_spatial_layout() {
+        let graph = FocusGraph::for_screen(MailScreenId::Messages, Rect::new(0, 0, 120, 40));
+        let list_idx = graph
+            .node_index(FocusTarget::List(0))
+            .expect("messages list node should exist");
+        let detail_idx = graph
+            .node_index(FocusTarget::DetailPanel)
+            .expect("messages detail node should exist");
+
+        assert_eq!(graph.nodes()[list_idx].neighbors.right, Some(detail_idx));
+        assert_eq!(graph.nodes()[detail_idx].neighbors.left, Some(list_idx));
+    }
+
+    #[test]
+    fn focus_graph_tab_indices_are_dense_and_unique() {
+        for &screen in ALL_SCREEN_IDS {
+            let graph = FocusGraph::for_screen(screen, Rect::new(0, 0, 100, 32));
+            let mut tab_indices: Vec<usize> =
+                graph.nodes().iter().map(|node| node.tab_index).collect();
+            tab_indices.sort_unstable();
+            let expected: Vec<usize> = (0..graph.nodes().len()).collect();
+            assert_eq!(
+                tab_indices, expected,
+                "screen {screen:?} should expose contiguous tab order"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_graph_rects_are_inside_area() {
+        let area = Rect::new(3, 7, 140, 44);
+        for &screen in ALL_SCREEN_IDS {
+            let graph = FocusGraph::for_screen(screen, area);
+            for node in graph.nodes() {
+                let node_right = u32::from(node.rect.x) + u32::from(node.rect.width);
+                let node_bottom = u32::from(node.rect.y) + u32::from(node.rect.height);
+                let area_right = u32::from(area.x) + u32::from(area.width.max(1));
+                let area_bottom = u32::from(area.y) + u32::from(area.height.max(1));
+
+                assert!(node.rect.x >= area.x);
+                assert!(node.rect.y >= area.y);
+                assert!(node.rect.width >= 1);
+                assert!(node.rect.height >= 1);
+                assert!(
+                    node_right <= area_right,
+                    "screen {screen:?} node {} exceeds right bound",
+                    node.id
+                );
+                assert!(
+                    node_bottom <= area_bottom,
+                    "screen {screen:?} node {} exceeds bottom bound",
+                    node.id
+                );
+            }
+        }
     }
 }

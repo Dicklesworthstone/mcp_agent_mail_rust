@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::document::DocKind;
 use crate::error::{SearchError, SearchResult};
 use crate::fs_bridge::map_fs_error;
-use frankensearch::core::filter::SearchFilter;
 use frankensearch::VectorIndex as FsVectorIndex;
+use frankensearch::core::filter::SearchFilter;
 
 // ────────────────────────────────────────────────────────────────────
 // Types
