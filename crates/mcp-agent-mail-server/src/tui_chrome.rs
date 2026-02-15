@@ -377,18 +377,20 @@ pub fn render_status_line(
 // Help overlay
 // ──────────────────────────────────────────────────────────────────────
 
-/// Global keybindings shown in every help overlay.
-const GLOBAL_KEYBINDINGS: &[(&str, &str)] = &[
-    ("1-8", "Jump to screen"),
-    ("Tab", "Next screen"),
-    ("Shift+Tab", "Previous screen"),
-    ("m", "Toggle MCP/API mode"),
-    ("Ctrl+P / :", "Command palette"),
-    ("T", "Cycle theme"),
-    ("?", "Toggle help"),
-    ("q", "Quit"),
-    ("Esc", "Dismiss overlay"),
-];
+/// Build the global keybindings list with a registry-derived jump-key legend.
+fn global_keybindings() -> Vec<(String, &'static str)> {
+    vec![
+        (crate::tui_screens::jump_key_legend(), "Jump to screen"),
+        ("Tab".to_string(), "Next screen"),
+        ("Shift+Tab".to_string(), "Previous screen"),
+        ("m".to_string(), "Toggle MCP/API mode"),
+        ("Ctrl+P / :".to_string(), "Command palette"),
+        ("T".to_string(), "Cycle theme"),
+        ("?".to_string(), "Toggle help"),
+        ("q".to_string(), "Quit"),
+        ("Esc".to_string(), "Dismiss overlay"),
+    ]
+}
 
 /// Render the help overlay centered on the terminal.
 pub fn render_help_overlay(
@@ -440,7 +442,8 @@ pub fn render_help_overlay(
     }
 
     // Global keybindings
-    for &(key, action) in GLOBAL_KEYBINDINGS {
+    let global_bindings = global_keybindings();
+    for (key, action) in &global_bindings {
         if y_offset >= inner.height {
             break;
         }
@@ -982,10 +985,32 @@ mod tests {
 
     #[test]
     fn global_keybindings_complete() {
-        assert!(GLOBAL_KEYBINDINGS.len() >= 5);
-        for &(key, action) in GLOBAL_KEYBINDINGS {
-            assert!(!key.is_empty());
-            assert!(!action.is_empty());
+        let bindings = global_keybindings();
+        assert!(bindings.len() >= 5);
+        for (key, action) in &bindings {
+            assert!(!key.is_empty(), "empty key in global keybindings");
+            assert!(!action.is_empty(), "empty action in global keybindings");
+        }
+    }
+
+    #[test]
+    fn global_keybindings_jump_key_matches_registry() {
+        let bindings = global_keybindings();
+        let jump_entry = &bindings[0];
+        assert_eq!(jump_entry.1, "Jump to screen");
+        // The jump key legend must include all screen jump keys.
+        let legend = &jump_entry.0;
+        assert!(
+            legend.contains("1-9"),
+            "jump key legend should contain '1-9', got: {legend}"
+        );
+        // With 14 screens, we expect shifted symbols for screens 11-14.
+        let screen_count = crate::tui_screens::ALL_SCREEN_IDS.len();
+        if screen_count > 10 {
+            assert!(
+                legend.contains('!'),
+                "with {screen_count} screens, legend should contain '!' for screen 11, got: {legend}"
+            );
         }
     }
 

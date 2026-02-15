@@ -30,6 +30,9 @@ pub struct GlobalBinding {
     pub text_suppressible: bool,
 }
 
+/// Sentinel label for the jump-to-screen binding.  `help_entries()` replaces
+/// this with the dynamic `jump_key_legend()` value so that the displayed hint
+/// always matches the registry screen count.
 const JUMP_BINDING_LABEL: &str = "1-9,0";
 
 /// All global keybindings in display order.
@@ -1134,5 +1137,21 @@ mod tests {
         let ovr2: BindingOverride = serde_json::from_str(&json).unwrap();
         assert_eq!(ovr2.action_id, "quit");
         assert_eq!(ovr2.new_label, "Ctrl+Q");
+    }
+
+    /// Guard: help_entries always shows the dynamic jump key legend, not the
+    /// hardcoded sentinel, so the hint can never drift from the registry.
+    #[test]
+    fn help_entries_jump_label_matches_registry() {
+        let registry = KeymapRegistry::default();
+        let entries = registry.help_entries();
+        let jump = entries.iter().find(|(_, a)| a.contains("Jump to screen"));
+        assert!(jump.is_some(), "help_entries must contain a jump-to-screen entry");
+        let (label, _) = jump.unwrap();
+        let expected = crate::tui_screens::jump_key_legend();
+        assert_eq!(
+            label, &expected,
+            "jump key label in help_entries should be dynamic ({expected}), got: {label}"
+        );
     }
 }
