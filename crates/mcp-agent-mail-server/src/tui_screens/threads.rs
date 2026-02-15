@@ -1012,16 +1012,19 @@ impl MailScreen for ThreadExplorerScreen {
             return;
         }
 
-        // Filter bar (1 row if editing or has filter text, 0 otherwise)
-        let has_filter = self.filter_editing || !self.filter_text.is_empty();
-        let filter_height: u16 = u16::from(has_filter);
+        // Filter bar (always visible: hint when collapsed, input when active)
+        let has_filter = !self.filter_text.is_empty();
+        let filter_height: u16 = 1;
         let content_height = area.height.saturating_sub(filter_height);
 
-        // Render filter bar
-        if has_filter {
-            let filter_area = Rect::new(area.x, area.y, area.width, filter_height);
-            render_filter_bar(frame, filter_area, &self.filter_text, self.filter_editing);
-        }
+        let filter_area = Rect::new(area.x, area.y, area.width, filter_height);
+        render_filter_bar(
+            frame,
+            filter_area,
+            &self.filter_text,
+            self.filter_editing,
+            has_filter,
+        );
 
         let content_area = Rect::new(area.x, area.y + filter_height, area.width, content_height);
 
@@ -1181,11 +1184,11 @@ impl MailScreen for ThreadExplorerScreen {
             },
             HelpEntry {
                 key: "s",
-                action: "Cycle sort mode",
+                action: "Sort: Recent/Velocity/Participants/Escalation",
             },
             HelpEntry {
                 key: "v",
-                action: "Cycle view lens",
+                action: "Lens: Activity/Participants/Escalation",
             },
         ]
     }
@@ -1417,11 +1420,34 @@ fn fetch_thread_messages(conn: &DbConn, thread_id: &str, limit: usize) -> Vec<Th
 // ──────────────────────────────────────────────────────────────────────
 
 /// Render the filter bar.
-fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, text: &str, editing: bool) {
-    let cursor = if editing { "_" } else { "" };
-    let line = format!(" Filter: {text}{cursor}");
-    let p = Paragraph::new(line);
-    p.render(area, frame);
+fn render_filter_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    text: &str,
+    editing: bool,
+    has_filter: bool,
+) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    if !has_filter && !editing {
+        // Collapsed state: show discoverable hint
+        let line = Line::from_spans([
+            Span::raw(" "),
+            Span::styled("/", crate::tui_theme::text_action_key(&tp)),
+            Span::styled(" Filter threads", crate::tui_theme::text_hint(&tp)),
+        ]);
+        Paragraph::new(Text::from_line(line)).render(area, frame);
+    } else {
+        // Active state
+        let cursor = if editing { "_" } else { "" };
+        let line = Line::from_spans([
+            Span::styled(" Filter: ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                format!("{text}{cursor}"),
+                Style::default().fg(tp.text_primary),
+            ),
+        ]);
+        Paragraph::new(Text::from_line(line)).render(area, frame);
+    }
 }
 
 /// Render the thread list panel.
@@ -1439,13 +1465,14 @@ fn render_thread_list(
     let focus_tag = if focused { "" } else { " (inactive)" };
     let escalated = threads.iter().filter(|t| t.has_escalation).count();
     let esc_tag = if escalated > 0 {
-        format!("  {escalated} escalated")
+        format!("  {escalated} esc")
     } else {
         String::new()
     };
     let title = format!(
-        "Threads ({} total){esc_tag}  Lens:{} Sort:{}{focus_tag}",
+        "Threads ({}){}  [v]{}  [s]{}{focus_tag}",
         threads.len(),
+        esc_tag,
         view_lens.label(),
         sort_mode.label(),
     );
@@ -1476,14 +1503,32 @@ fn render_thread_list(
     let viewport = &threads[start..end];
 
     let inner_w = inner.width as usize;
-    let mut lines = Vec::with_capacity(viewport.len());
+    let show_subject = visible_height > viewport.len() * 2 || viewport.len() <= 5;
+    let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len() * 2);
     for (view_idx, thread) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
-        let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
+        let is_selected = abs_idx == cursor_clamped;
+        let marker = if is_selected { ">" } else { " " };
+
         let esc_badge = if thread.has_escalation {
-            if urgent_pulse_on { "!" } else { "·" }
+            if urgent_pulse_on { "!" } else { "\u{00b7}" }
         } else {
             " "
+        };
+        let esc_style = if thread.has_escalation {
+            crate::tui_theme::text_warning(&tp)
+        } else {
+            Style::default()
+        };
+
+        // Unread badge
+        let unread_span = if thread.unread_count > 0 {
+            Span::styled(
+                format!(" {}", thread.unread_count),
+                crate::tui_theme::text_accent(&tp),
+            )
+        } else {
+            Span::raw("")
         };
 
         // Compact timestamp (HH:MM from ISO string)
@@ -1494,16 +1539,19 @@ fn render_thread_list(
         };
 
         // Project tag (shortened)
-        let proj_tag = if thread.project_slug.is_empty() {
-            String::new()
+        let proj_span = if thread.project_slug.is_empty() {
+            Span::raw("")
         } else {
-            format!("[{}] ", truncate_str(&thread.project_slug, 12))
+            Span::styled(
+                format!("[{}] ", truncate_str(&thread.project_slug, 12)),
+                crate::tui_theme::text_meta(&tp),
+            )
         };
 
         // Lens-specific metadata
         let meta = match view_lens {
             ViewLens::Activity => format!(
-                "{} msgs, {} agents, {:.1}/hr",
+                "{}m  {}a  {:.1}/hr",
                 thread.message_count, thread.participant_count, thread.velocity_msg_per_hr,
             ),
             ViewLens::Participants => {
@@ -1511,45 +1559,79 @@ fn render_thread_list(
             }
             ViewLens::Escalation => {
                 let flag = if thread.has_escalation {
-                    "ESCALATED"
+                    "ESC"
                 } else {
-                    "normal"
+                    "---"
                 };
-                format!("{flag}  {:.1} msg/hr", thread.velocity_msg_per_hr)
+                format!("{flag}  {:.1}/hr", thread.velocity_msg_per_hr)
             }
         };
 
-        let prefix = format!("{marker}{esc_badge}{time_short} {proj_tag}");
-        let meta_len = meta.len() + 2; // " [...]"
-        let id_space = inner_w.saturating_sub(prefix.len() + meta_len);
+        // Build spans for the primary line
+        let prefix_len = 1 + 1 + 5 + 1; // marker + esc + time + space
+        let meta_len = meta.len() + 2; // " meta"
+        let id_space = inner_w.saturating_sub(prefix_len + meta_len);
         let thread_id_display = truncate_str(&thread.thread_id, id_space);
 
-        let line = if inner_w > prefix.len() + id_space + meta_len {
-            format!("{prefix}{thread_id_display:<id_space$} [{meta}]")
+        let cursor_style = if is_selected {
+            Style::default()
+                .fg(tp.selection_fg)
+                .bg(tp.selection_bg)
+                .bold()
         } else {
-            format!("{prefix}{thread_id_display}")
+            Style::default()
         };
-        lines.push(line);
+
+        let mut primary = Line::from_spans([
+            Span::raw(marker),
+            Span::styled(esc_badge, esc_style),
+            Span::styled(time_short, crate::tui_theme::text_meta(&tp)),
+            Span::raw(" "),
+            proj_span,
+            Span::styled(
+                format!("{thread_id_display:<id_space$}"),
+                Style::default().fg(tp.text_primary),
+            ),
+            Span::styled(format!(" {meta}"), crate::tui_theme::text_meta(&tp)),
+            unread_span,
+        ]);
+        if is_selected {
+            primary.apply_base_style(cursor_style);
+        }
+        text_lines.push(primary);
 
         // Second line: last subject (if there's room)
-        if visible_height > viewport.len() * 2 || viewport.len() <= 5 {
+        if show_subject {
             let indent = "    ";
             let subj_space = inner_w.saturating_sub(indent.len());
             let subj_line = if thread.last_sender.is_empty() {
-                format!("{indent}{}", truncate_str(&thread.last_subject, subj_space))
+                Line::from_spans([
+                    Span::raw(indent),
+                    Span::styled(
+                        truncate_str(&thread.last_subject, subj_space),
+                        crate::tui_theme::text_hint(&tp),
+                    ),
+                ])
             } else {
                 let sender_prefix = format!("{}: ", thread.last_sender);
                 let remaining = subj_space.saturating_sub(sender_prefix.len());
-                format!(
-                    "{indent}{sender_prefix}{}",
-                    truncate_str(&thread.last_subject, remaining)
-                )
+                Line::from_spans([
+                    Span::raw(indent),
+                    Span::styled(
+                        sender_prefix,
+                        Style::default().fg(tp.text_secondary),
+                    ),
+                    Span::styled(
+                        truncate_str(&thread.last_subject, remaining),
+                        crate::tui_theme::text_hint(&tp),
+                    ),
+                ])
             };
-            lines.push(subj_line);
+            text_lines.push(subj_line);
         }
     }
 
-    let text = lines.join("\n");
+    let text = Text::from_lines(text_lines);
     let p = Paragraph::new(text);
     p.render(inner, frame);
 }
@@ -3473,5 +3555,60 @@ mod tests {
             .iter()
             .map(|c| 1 + count_descendants(c))
             .sum()
+    }
+
+    #[test]
+    fn filter_bar_always_visible_with_hint() {
+        // Filter bar should occupy 1 row even when collapsed (showing hint)
+        let screen = ThreadExplorerScreen::new();
+        assert!(screen.filter_text.is_empty());
+        assert!(!screen.filter_editing);
+        // The view now always allocates 1 row for the filter bar,
+        // so content_height = area.height - 1
+    }
+
+    #[test]
+    fn thread_row_shows_unread_badge() {
+        let thread = ThreadSummary {
+            thread_id: "t-1".to_string(),
+            message_count: 5,
+            participant_count: 2,
+            last_subject: "Hello".to_string(),
+            last_sender: "GoldHawk".to_string(),
+            last_timestamp_micros: 0,
+            last_timestamp_iso: "2026-02-15T12:00:00".to_string(),
+            first_timestamp_iso: "2026-02-15T11:00:00".to_string(),
+            has_escalation: false,
+            velocity_msg_per_hr: 1.0,
+            participant_names: "GoldHawk, SilverFox".to_string(),
+            unread_count: 3,
+            project_slug: String::new(),
+        };
+        // Unread count > 0 should be surfaced in the row
+        assert_eq!(thread.unread_count, 3);
+        assert!(!thread.has_escalation);
+    }
+
+    #[test]
+    fn title_format_shows_keybind_hints() {
+        // Title format now includes [v] and [s] keybind hints
+        let title = format!(
+            "Threads ({})  [v]{}  [s]{}",
+            42,
+            ViewLens::Activity.label(),
+            SortMode::LastActivity.label(),
+        );
+        assert!(title.contains("[v]Activity"));
+        assert!(title.contains("[s]Recent"));
+    }
+
+    #[test]
+    fn activity_lens_compact_labels() {
+        // Activity lens now uses compact "m" and "a" labels
+        let meta = format!(
+            "{}m  {}a  {:.1}/hr",
+            10, 3, 2.5_f64,
+        );
+        assert_eq!(meta, "10m  3a  2.5/hr");
     }
 }
