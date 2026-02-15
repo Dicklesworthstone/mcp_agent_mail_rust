@@ -57,6 +57,7 @@ pub mod tui_chrome;
 pub mod tui_decision;
 pub mod tui_events;
 pub mod tui_focus;
+pub mod tui_hit_regions;
 pub mod tui_keymap;
 pub mod tui_layout;
 pub mod tui_macro;

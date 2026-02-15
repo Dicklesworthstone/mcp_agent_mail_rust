@@ -1,0 +1,348 @@
+//! Canonical hit-region IDs and layer classification for mouse dispatch.
+//!
+//! Hit IDs are partitioned into non-overlapping ranges by UI layer.  The
+//! [`classify_hit`] function maps any [`HitId`] to its [`HitLayer`],
+//! enabling priority-based routing (overlay > status > tab > category > pane).
+//!
+//! Range allocations (100-slot ranges, expandable):
+//!
+//! | Layer      | Base   | End    | Usage                            |
+//! |------------|--------|--------|----------------------------------|
+//! | Tab bar    | 1 000  | 1 099  | One ID per screen tab            |
+//! | Category   | 2 000  | 2 099  | One ID per [`ScreenCategory`]    |
+//! | Pane       | 4 000  | 4 099  | Content area per screen          |
+//! | Overlay    | 5 000  | 5 099  | Help, palette, perf HUD, etc.    |
+//! | Status bar | 6 000  | 6 099  | Status line toggle buttons       |
+
+use ftui_render::frame::HitId;
+
+use crate::tui_screens::{MailScreenId, ScreenCategory, ALL_SCREEN_IDS};
+
+// ──────────────────────────────────────────────────────────────────────
+// Base constants
+// ──────────────────────────────────────────────────────────────────────
+
+/// Base hit ID for tab-bar entries.  Tab for screen at display index `i`
+/// has `HitId(TAB_HIT_BASE + i)` (0-indexed).
+pub const TAB_HIT_BASE: u32 = 1_000;
+
+/// Base hit ID for category tabs (ordered by [`ScreenCategory::ALL`]).
+pub const CATEGORY_HIT_BASE: u32 = 2_000;
+
+/// Base hit ID for screen pane content areas.
+pub const PANE_HIT_BASE: u32 = 4_000;
+
+/// Base hit ID for overlay elements.
+pub const OVERLAY_HIT_BASE: u32 = 5_000;
+
+/// Base hit ID for status bar toggles.
+pub const STATUS_HIT_BASE: u32 = 6_000;
+
+// ── Overlay sub-ranges ───────────────────────────────────────────────
+
+/// Close button / dismiss area of the help overlay.
+pub const OVERLAY_HELP_CLOSE: u32 = OVERLAY_HIT_BASE;
+/// Scrollable content of the help overlay.
+pub const OVERLAY_HELP_CONTENT: u32 = OVERLAY_HIT_BASE + 1;
+/// Command palette overlay.
+pub const OVERLAY_PALETTE: u32 = OVERLAY_HIT_BASE + 10;
+/// Performance HUD overlay.
+pub const OVERLAY_PERF_HUD: u32 = OVERLAY_HIT_BASE + 20;
+/// Action menu overlay.
+pub const OVERLAY_ACTION_MENU: u32 = OVERLAY_HIT_BASE + 30;
+/// Toast / notification overlay.
+pub const OVERLAY_TOAST: u32 = OVERLAY_HIT_BASE + 40;
+
+// ── Status bar sub-ranges ────────────────────────────────────────────
+
+/// Help toggle in the status bar.
+pub const STATUS_HELP_TOGGLE: u32 = STATUS_HIT_BASE;
+/// Palette toggle in the status bar.
+pub const STATUS_PALETTE_TOGGLE: u32 = STATUS_HIT_BASE + 1;
+/// Perf HUD toggle in the status bar.
+pub const STATUS_PERF_TOGGLE: u32 = STATUS_HIT_BASE + 2;
+
+// ──────────────────────────────────────────────────────────────────────
+// HitLayer — layer classification enum
+// ──────────────────────────────────────────────────────────────────────
+
+/// Dispatch layer for a hit region.
+///
+/// Variants are ordered from highest to lowest routing priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitLayer {
+    /// Overlay element (help, palette, perf HUD, action menu, toast).
+    Overlay(u32),
+    /// Status bar toggle button.
+    StatusToggle(u32),
+    /// Tab bar entry — resolves to a screen.
+    Tab(MailScreenId),
+    /// Category tab — resolves to a screen category.
+    Category(ScreenCategory),
+    /// Screen pane content area.
+    Pane(MailScreenId),
+    /// Unknown hit ID — forward to screen for local handling.
+    Unknown,
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Classification
+// ──────────────────────────────────────────────────────────────────────
+
+/// Classify a hit ID into its dispatch layer.
+///
+/// Layers are checked in priority order (overlay first, pane last).
+#[must_use]
+pub fn classify_hit(id: HitId) -> HitLayer {
+    let raw = id.id();
+
+    // Overlay (highest priority)
+    if (OVERLAY_HIT_BASE..STATUS_HIT_BASE).contains(&raw) {
+        return HitLayer::Overlay(raw);
+    }
+
+    // Status bar toggles
+    if (STATUS_HIT_BASE..STATUS_HIT_BASE + 100).contains(&raw) {
+        return HitLayer::StatusToggle(raw);
+    }
+
+    // Tab bar
+    if let Some(screen) = screen_from_tab_hit(id) {
+        return HitLayer::Tab(screen);
+    }
+
+    // Category tabs
+    if let Some(cat) = category_from_hit(id) {
+        return HitLayer::Category(cat);
+    }
+
+    // Pane content
+    if let Some(screen) = screen_from_pane_hit(id) {
+        return HitLayer::Pane(screen);
+    }
+
+    HitLayer::Unknown
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Conversion helpers: MailScreenId ↔ HitId
+// ──────────────────────────────────────────────────────────────────────
+
+/// Create a tab-bar hit ID for a screen.
+#[inline]
+#[must_use]
+pub fn tab_hit_id(screen: MailScreenId) -> HitId {
+    #[allow(clippy::cast_possible_truncation)]
+    HitId::new(TAB_HIT_BASE + screen.index() as u32)
+}
+
+/// Create a pane hit ID for a screen.
+#[inline]
+#[must_use]
+pub fn pane_hit_id(screen: MailScreenId) -> HitId {
+    #[allow(clippy::cast_possible_truncation)]
+    HitId::new(PANE_HIT_BASE + screen.index() as u32)
+}
+
+/// Create a category-tab hit ID.
+#[inline]
+#[must_use]
+pub fn category_hit_id(cat: ScreenCategory) -> HitId {
+    let idx = ScreenCategory::ALL
+        .iter()
+        .position(|&c| c == cat)
+        .unwrap_or(0);
+    #[allow(clippy::cast_possible_truncation)]
+    HitId::new(CATEGORY_HIT_BASE + idx as u32)
+}
+
+/// Resolve a tab-bar hit ID back to the screen it belongs to.
+#[must_use]
+pub fn screen_from_tab_hit(id: HitId) -> Option<MailScreenId> {
+    let raw = id.id();
+    if raw < TAB_HIT_BASE {
+        return None;
+    }
+    let idx = (raw - TAB_HIT_BASE) as usize;
+    ALL_SCREEN_IDS.get(idx).copied()
+}
+
+/// Resolve a pane hit ID back to the screen it belongs to.
+#[must_use]
+pub fn screen_from_pane_hit(id: HitId) -> Option<MailScreenId> {
+    let raw = id.id();
+    if !(PANE_HIT_BASE..OVERLAY_HIT_BASE).contains(&raw) {
+        return None;
+    }
+    let idx = (raw - PANE_HIT_BASE) as usize;
+    ALL_SCREEN_IDS.get(idx).copied()
+}
+
+/// Resolve a category-tab hit ID back to its category.
+#[must_use]
+pub fn category_from_hit(id: HitId) -> Option<ScreenCategory> {
+    let raw = id.id();
+    if !(CATEGORY_HIT_BASE..PANE_HIT_BASE).contains(&raw) {
+        return None;
+    }
+    let idx = (raw - CATEGORY_HIT_BASE) as usize;
+    ScreenCategory::ALL.get(idx).copied()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges_do_not_overlap() {
+        // Verify non-overlapping: tab < category < pane < overlay < status
+        assert!(TAB_HIT_BASE + 100 <= CATEGORY_HIT_BASE);
+        assert!(CATEGORY_HIT_BASE + 100 <= PANE_HIT_BASE);
+        assert!(PANE_HIT_BASE + 100 <= OVERLAY_HIT_BASE);
+        assert!(OVERLAY_HIT_BASE + 100 <= STATUS_HIT_BASE);
+    }
+
+    #[test]
+    fn tab_round_trip_all_screens() {
+        for &id in ALL_SCREEN_IDS {
+            let hit = tab_hit_id(id);
+            assert_eq!(screen_from_tab_hit(hit), Some(id), "tab round-trip for {id:?}");
+        }
+    }
+
+    #[test]
+    fn pane_round_trip_all_screens() {
+        for &id in ALL_SCREEN_IDS {
+            let hit = pane_hit_id(id);
+            assert_eq!(screen_from_pane_hit(hit), Some(id), "pane round-trip for {id:?}");
+        }
+    }
+
+    #[test]
+    fn category_round_trip() {
+        for &cat in ScreenCategory::ALL {
+            let hit = category_hit_id(cat);
+            assert_eq!(category_from_hit(hit), Some(cat), "category round-trip for {cat:?}");
+        }
+    }
+
+    #[test]
+    fn classify_tab_hit() {
+        let hit = tab_hit_id(MailScreenId::Dashboard);
+        assert_eq!(classify_hit(hit), HitLayer::Tab(MailScreenId::Dashboard));
+    }
+
+    #[test]
+    fn classify_pane_hit() {
+        let hit = pane_hit_id(MailScreenId::Messages);
+        assert_eq!(classify_hit(hit), HitLayer::Pane(MailScreenId::Messages));
+    }
+
+    #[test]
+    fn classify_category_hit() {
+        let hit = category_hit_id(ScreenCategory::Communication);
+        assert_eq!(
+            classify_hit(hit),
+            HitLayer::Category(ScreenCategory::Communication)
+        );
+    }
+
+    #[test]
+    fn classify_overlay_hit() {
+        let hit = HitId::new(OVERLAY_HELP_CLOSE);
+        assert_eq!(classify_hit(hit), HitLayer::Overlay(OVERLAY_HELP_CLOSE));
+
+        let hit = HitId::new(OVERLAY_PALETTE);
+        assert_eq!(classify_hit(hit), HitLayer::Overlay(OVERLAY_PALETTE));
+    }
+
+    #[test]
+    fn classify_status_hit() {
+        let hit = HitId::new(STATUS_HELP_TOGGLE);
+        assert_eq!(
+            classify_hit(hit),
+            HitLayer::StatusToggle(STATUS_HELP_TOGGLE)
+        );
+    }
+
+    #[test]
+    fn classify_unknown_hit() {
+        assert_eq!(classify_hit(HitId::new(0)), HitLayer::Unknown);
+        assert_eq!(classify_hit(HitId::new(999)), HitLayer::Unknown);
+        assert_eq!(classify_hit(HitId::new(7000)), HitLayer::Unknown);
+    }
+
+    #[test]
+    fn overlay_takes_priority_over_pane_range() {
+        // Overlay range (5000+) is checked before pane range (4000+),
+        // so overlay IDs never get misclassified as panes.
+        let hit = HitId::new(OVERLAY_HIT_BASE);
+        assert!(matches!(classify_hit(hit), HitLayer::Overlay(_)));
+    }
+
+    #[test]
+    fn out_of_range_tab_returns_none() {
+        // Index beyond the screen count
+        let hit = HitId::new(TAB_HIT_BASE + 99);
+        assert_eq!(screen_from_tab_hit(hit), None);
+    }
+
+    #[test]
+    fn out_of_range_pane_returns_none() {
+        let hit = HitId::new(PANE_HIT_BASE + 99);
+        assert_eq!(screen_from_pane_hit(hit), None);
+    }
+
+    #[test]
+    fn out_of_range_category_returns_none() {
+        let hit = HitId::new(CATEGORY_HIT_BASE + 99);
+        assert_eq!(category_from_hit(hit), None);
+    }
+
+    #[test]
+    fn every_screen_has_distinct_tab_and_pane_ids() {
+        let mut tab_ids: Vec<u32> = ALL_SCREEN_IDS.iter().map(|&s| tab_hit_id(s).id()).collect();
+        let mut pane_ids: Vec<u32> = ALL_SCREEN_IDS.iter().map(|&s| pane_hit_id(s).id()).collect();
+        tab_ids.sort_unstable();
+        tab_ids.dedup();
+        pane_ids.sort_unstable();
+        pane_ids.dedup();
+        assert_eq!(tab_ids.len(), ALL_SCREEN_IDS.len(), "tab IDs not unique");
+        assert_eq!(pane_ids.len(), ALL_SCREEN_IDS.len(), "pane IDs not unique");
+        // No overlap between tab and pane ranges
+        for t in &tab_ids {
+            assert!(!pane_ids.contains(t), "tab/pane ID collision at {t}");
+        }
+    }
+
+    #[test]
+    fn classify_covers_all_allocated_sub_ranges() {
+        // Verify that each named overlay constant classifies correctly.
+        let overlay_consts = [
+            OVERLAY_HELP_CLOSE,
+            OVERLAY_HELP_CONTENT,
+            OVERLAY_PALETTE,
+            OVERLAY_PERF_HUD,
+            OVERLAY_ACTION_MENU,
+            OVERLAY_TOAST,
+        ];
+        for &c in &overlay_consts {
+            assert!(
+                matches!(classify_hit(HitId::new(c)), HitLayer::Overlay(_)),
+                "constant {c} not classified as Overlay"
+            );
+        }
+
+        let status_consts = [STATUS_HELP_TOGGLE, STATUS_PALETTE_TOGGLE, STATUS_PERF_TOGGLE];
+        for &c in &status_consts {
+            assert!(
+                matches!(classify_hit(HitId::new(c)), HitLayer::StatusToggle(_)),
+                "constant {c} not classified as StatusToggle"
+            );
+        }
+    }
+}

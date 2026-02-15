@@ -21,6 +21,7 @@ ammonia.workspace = true
 include_dir.workspace = true
 ftui.workspace = true
 ftui-extras.workspace = true
+ftui-render.workspace = true
 ftui-runtime = { workspace = true, features = ["stdio-capture"] }
 ftui-widgets.workspace = true
 fastmcp.workspace = true
@@ -42,7 +43,6 @@ criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 ftui-harness.workspace = true
-ftui-render.workspace = true
 sqlmodel-sqlite.workspace = true
 
 [[bench]]
