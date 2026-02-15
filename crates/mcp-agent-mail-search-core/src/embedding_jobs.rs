@@ -939,14 +939,8 @@ mod tests {
     impl FlakyBatchEmbedder {
         fn new(dimension: usize, fail_batches: usize) -> Self {
             Self {
-                info: ModelInfo::new(
-                    "flaky-fast",
-                    "Flaky Fast",
-                    ModelTier::Fast,
-                    dimension,
-                    4096,
-                )
-                .with_available(true),
+                info: ModelInfo::new("flaky-fast", "Flaky Fast", ModelTier::Fast, dimension, 4096)
+                    .with_available(true),
                 fail_batches_remaining: AtomicUsize::new(fail_batches),
             }
         }

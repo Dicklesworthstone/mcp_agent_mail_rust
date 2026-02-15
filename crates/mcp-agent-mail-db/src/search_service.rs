@@ -231,11 +231,15 @@ impl SemanticBridge {
     /// Create a new semantic bridge with the given configuration.
     #[must_use]
     pub fn new(config: VectorIndexConfig) -> Self {
+        Self::new_with_embedder(config, Arc::new(AutoInitSemanticEmbedder::new()))
+    }
+
+    #[must_use]
+    fn new_with_embedder(config: VectorIndexConfig, embedder: Arc<dyn Embedder>) -> Self {
         let index = Arc::new(RwLock::new(VectorIndex::new(config)));
         let registry = Arc::new(RwLock::new(ModelRegistry::new(RegistryConfig::default())));
         let job_config = EmbeddingJobConfig::default();
         let queue = Arc::new(EmbeddingQueue::with_config(job_config.clone()));
-        let embedder: Arc<dyn Embedder> = Arc::new(AutoInitSemanticEmbedder::new());
         let runner = Arc::new(EmbeddingJobRunner::new(
             job_config,
             queue.clone(),
@@ -412,6 +416,17 @@ pub struct SemanticIndexingSnapshot {
 }
 
 #[cfg(feature = "hybrid")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticIndexingHealth {
+    pub queue: QueueStats,
+    pub metrics: JobMetricsSnapshot,
+}
+
+#[cfg(not(feature = "hybrid"))]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SemanticIndexingHealth {}
+
+#[cfg(feature = "hybrid")]
 fn get_or_init_semantic_bridge() -> Option<Arc<SemanticBridge>> {
     // Use OnceLock::get_or_init for atomic, race-free initialization.
     // Only one SemanticBridge is created even under concurrent access.
@@ -557,6 +572,22 @@ pub fn semantic_indexing_snapshot() -> Option<SemanticIndexingSnapshot> {
 #[cfg(not(feature = "hybrid"))]
 #[must_use]
 pub const fn semantic_indexing_snapshot() -> Option<()> {
+    None
+}
+
+/// Snapshot current semantic indexing queue + metrics in a stable health format.
+#[cfg(feature = "hybrid")]
+#[must_use]
+pub fn semantic_indexing_health() -> Option<SemanticIndexingHealth> {
+    semantic_indexing_snapshot().map(|snapshot| SemanticIndexingHealth {
+        queue: snapshot.queue,
+        metrics: snapshot.metrics,
+    })
+}
+
+#[cfg(not(feature = "hybrid"))]
+#[must_use]
+pub const fn semantic_indexing_health() -> Option<SemanticIndexingHealth> {
     None
 }
 
@@ -1482,6 +1513,8 @@ mod tests {
     use super::*;
     use crate::search_planner::SearchCursor;
     use mcp_agent_mail_core::metrics::global_metrics;
+    #[cfg(feature = "hybrid")]
+    use std::time::Duration;
 
     #[test]
     fn plan_param_conversion() {
@@ -1733,6 +1766,91 @@ mod tests {
             semantic_indexing_snapshot().expect("semantic indexing bridge should be initialized");
         assert!(snapshot.queue.total_enqueued >= 1);
         assert!(snapshot.queue.total_deduped >= 1);
+        let health =
+            semantic_indexing_health().expect("semantic indexing health snapshot should exist");
+        assert!(health.queue.total_enqueued >= 1);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[derive(Debug)]
+    struct FixedSemanticTestEmbedder {
+        info: ModelInfo,
+    }
+
+    #[cfg(feature = "hybrid")]
+    impl FixedSemanticTestEmbedder {
+        fn new(dimension: usize) -> Self {
+            Self {
+                info: ModelInfo::new(
+                    "fixed-semantic-test",
+                    "Fixed Semantic Test",
+                    ModelTier::Fast,
+                    dimension,
+                    4096,
+                )
+                .with_available(true),
+            }
+        }
+    }
+
+    #[cfg(feature = "hybrid")]
+    impl Embedder for FixedSemanticTestEmbedder {
+        fn embed(&self, text: &str) -> SearchResult<EmbeddingResult> {
+            Ok(EmbeddingResult::new(
+                vec![0.42_f32; self.info.dimension],
+                self.info.id.clone(),
+                ModelTier::Fast,
+                Duration::from_millis(1),
+                mcp_agent_mail_search_core::canonical::content_hash(text),
+            ))
+        }
+
+        fn model_info(&self) -> &ModelInfo {
+            &self.info
+        }
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_bridge_pipeline_runs_enqueue_process_and_index_search() {
+        let bridge = SemanticBridge::new_with_embedder(
+            VectorIndexConfig {
+                dimension: 4,
+                ..Default::default()
+            },
+            Arc::new(FixedSemanticTestEmbedder::new(4)),
+        );
+
+        assert!(bridge.enqueue_document(
+            7001,
+            SearchDocKind::Message,
+            Some(77),
+            "Bridge Subject",
+            "Bridge Body"
+        ));
+        let before = bridge.queue_stats();
+        assert_eq!(before.pending_count, 1);
+
+        let processed = bridge.refresh_worker.run_cycle();
+        assert_eq!(processed, 1);
+
+        let after = bridge.queue_stats();
+        assert_eq!(after.pending_count, 0);
+        assert_eq!(after.retry_count, 0);
+
+        let metrics = bridge.metrics_snapshot();
+        assert_eq!(metrics.total_succeeded, 1);
+        assert_eq!(metrics.total_retryable, 0);
+        assert_eq!(metrics.total_failed, 0);
+
+        let hits = bridge
+            .index()
+            .search(&vec![0.42_f32; 4], 8, None)
+            .expect("vector index search should succeed");
+        assert!(
+            hits.iter().any(|hit| hit.doc_id == 7001),
+            "indexed document should be retrievable from vector index"
+        );
     }
 
     #[cfg(feature = "hybrid")]
