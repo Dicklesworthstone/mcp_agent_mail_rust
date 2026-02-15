@@ -188,8 +188,8 @@ impl AckFilter {
     const fn label(self) -> &'static str {
         match self {
             Self::Any => "Any",
-            Self::Required => "Ack",
-            Self::NotRequired => "No Ack",
+            Self::Required => "Required",
+            Self::NotRequired => "Not Required",
         }
     }
 
@@ -236,9 +236,9 @@ enum FieldScope {
 impl FieldScope {
     const fn label(self) -> &'static str {
         match self {
-            Self::SubjectAndBody => "Both",
-            Self::SubjectOnly => "Subject",
-            Self::BodyOnly => "Body",
+            Self::SubjectAndBody => "Subject+Body",
+            Self::SubjectOnly => "Subject Only",
+            Self::BodyOnly => "Body Only",
         }
     }
 
@@ -2389,7 +2389,7 @@ fn render_query_bar(
         let chips = format!(
             "{}  scope:{}  type:{}  sort:{}  terms:{}",
             meter,
-            screen.scope_mode.as_str(),
+            screen.scope_mode.label(),
             screen.doc_kind_filter.label(),
             screen.sort_direction.label(),
             screen.highlight_terms.len()
@@ -2474,32 +2474,32 @@ fn render_facet_rail(
     let facets: &[(FacetSlot, &str, &str)] = &[
         (
             FacetSlot::Scope,
-            "\u{25ce} Scope",
-            screen.scope_mode.as_str(),
+            "Scope",
+            screen.scope_mode.label(),
         ),
         (
             FacetSlot::DocKind,
-            "\u{25a7} Type",
+            "Doc Type",
             screen.doc_kind_filter.label(),
         ),
         (
             FacetSlot::Importance,
-            "\u{26a1} Imp.",
+            "Importance",
             screen.importance_filter.label(),
         ),
         (
             FacetSlot::AckStatus,
-            "\u{2713} Ack",
+            "Ack Required",
             screen.ack_filter.label(),
         ),
         (
             FacetSlot::SortOrder,
-            "\u{21f5} Sort",
+            "Sort Order",
             screen.sort_direction.label(),
         ),
         (
             FacetSlot::FieldScope,
-            "\u{25f3} Field",
+            "Search Field",
             screen.field_scope.label(),
         ),
     ];
@@ -4279,5 +4279,32 @@ mod tests {
         let l_key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('L')));
         screen.update(&l_key, &state);
         assert!(screen.query_lab_visible);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // br-1xt0m.1.10.2: Explicit labels — no abbreviations or cryptic symbols
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn facet_labels_are_explicit_no_abbreviations() {
+        // FieldScope labels should be self-descriptive
+        assert_eq!(FieldScope::SubjectAndBody.label(), "Subject+Body");
+        assert_eq!(FieldScope::SubjectOnly.label(), "Subject Only");
+        assert_eq!(FieldScope::BodyOnly.label(), "Body Only");
+    }
+
+    #[test]
+    fn ack_filter_labels_are_explicit() {
+        assert_eq!(AckFilter::Any.label(), "Any");
+        assert_eq!(AckFilter::Required.label(), "Required");
+        assert_eq!(AckFilter::NotRequired.label(), "Not Required");
+    }
+
+    #[test]
+    fn scope_mode_label_is_capitalized() {
+        use mcp_agent_mail_db::search_recipes::ScopeMode;
+        assert_eq!(ScopeMode::Global.label(), "Global");
+        assert_eq!(ScopeMode::Project.label(), "Project");
+        assert_eq!(ScopeMode::Product.label(), "Product");
     }
 }
