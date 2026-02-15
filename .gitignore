@@ -66,6 +66,12 @@ test_logs/
 # Agent coordination config
 .agent-mail.yaml
 
+# Compiler crash reports
+rustc-ice-*.txt
+
+# Codex build artifacts
+target-codex*/
+
 # Beads history snapshots
 .beads/.br_history/
 .claude/settings.local.json
