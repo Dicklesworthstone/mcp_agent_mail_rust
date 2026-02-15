@@ -64,7 +64,8 @@ const fn anomaly_rail_height(tc: TerminalClass, anomaly_count: usize) -> u16 {
         return 0;
     }
     match tc {
-        TerminalClass::Tiny | TerminalClass::Compact => 0,
+        TerminalClass::Tiny => 0,
+        TerminalClass::Compact => 3, // show 1 card, condensed
         _ => 4,
     }
 }
@@ -401,20 +402,8 @@ impl DashboardScreen {
     }
 
     /// Render the event log into the given area (delegates to the free function).
-    fn render_event_log_panel(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
-        let _ = state; // used for future deep-link context
-        render_event_log(
-            frame,
-            area,
-            &self.visible_entries(),
-            self.scroll_offset,
-            self.auto_follow,
-            &self.type_filter,
-            self.verbosity,
-            self.pulse_phase,
-            self.reduced_motion,
-        );
-    }
+    // NOTE: render_event_log_panel removed — caller now invokes render_event_log
+    // directly with inline_anomaly_count for narrow-width annotation support.
 
     /// Render the console log panel in the sidebar area.
     fn render_console_log_panel(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -689,7 +678,25 @@ impl MailScreen for DashboardScreen {
         // Main: event log + optional trend panel + recent message markdown preview + console log.
         let layout = Self::main_content_layout(self.show_trend_panel, self.show_log_panel);
         let comp = layout.compute(main_area);
-        self.render_event_log_panel(frame, comp.primary(), state);
+        // When the anomaly rail is hidden (Tiny), inject an inline annotation
+        // so the operator still sees anomaly presence.
+        let inline_anomaly_count = if anomaly_h == 0 {
+            self.anomalies.len()
+        } else {
+            0
+        };
+        render_event_log(
+            frame,
+            comp.primary(),
+            &self.visible_entries(),
+            self.scroll_offset,
+            self.auto_follow,
+            &self.type_filter,
+            self.verbosity,
+            self.pulse_phase,
+            self.reduced_motion,
+            inline_anomaly_count,
+        );
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
             render_trend_panel(
                 frame,
@@ -960,8 +967,9 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
     if anomalies.is_empty() || area.width == 0 || area.height == 0 {
         return;
     }
-    // Show up to 3 anomalies side by side.
-    let visible = anomalies.len().min(3);
+    // Adaptive card count: 1 on narrow terminals, up to 3 on wide.
+    let max_cards = if area.width < 80 { 1 } else { 3 };
+    let visible = anomalies.len().min(max_cards);
     #[allow(clippy::cast_possible_truncation)]
     let card_w = area.width / visible as u16;
     for (i, anomaly) in anomalies.iter().take(visible).enumerate() {
@@ -1315,6 +1323,7 @@ fn render_event_log(
     verbosity: VerbosityTier,
     pulse_phase: f32,
     reduced_motion: bool,
+    inline_anomaly_count: usize,
 ) {
     let visible_height = area.height.saturating_sub(2) as usize; // -2 for border
     if visible_height == 0 {
@@ -1393,8 +1402,14 @@ fn render_event_log(
                 .join(",")
         )
     };
-    let title =
-        format!("Events ({end}/{total}){follow_indicator}{verbosity_indicator}{filter_indicator}",);
+    let anomaly_indicator = if inline_anomaly_count > 0 {
+        format!(" [{inline_anomaly_count} anomaly]")
+    } else {
+        String::new()
+    };
+    let title = format!(
+        "Events ({end}/{total}){follow_indicator}{verbosity_indicator}{filter_indicator}{anomaly_indicator}",
+    );
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
@@ -1430,7 +1445,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
     let fill = ring_stats.fill_pct();
     let bp_indicator = if fill >= 80 { " [BP]" } else { "" };
     let footer = format!(
-        " Req:{} Avg:{}ms 2xx:{} 4xx:{} 5xx:{} | Events:{}/{} ({}%) {} {}",
+        " Req:{} Avg:{}ms 2xx:{} 4xx:{} 5xx:{}   Events:{}/{} ({}%) {} {}",
         counters.total,
         avg_ms,
         counters.status_2xx,
@@ -1757,7 +1772,7 @@ mod tests {
         assert_eq!(summary_band_height(TerminalClass::UltraWide), 3);
 
         assert_eq!(anomaly_rail_height(TerminalClass::Tiny, 2), 0);
-        assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 0);
+        assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 3);
         assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 4);
         assert_eq!(anomaly_rail_height(TerminalClass::Wide, 2), 4);
         assert_eq!(anomaly_rail_height(TerminalClass::UltraWide, 2), 4);
@@ -2631,6 +2646,16 @@ mod tests {
     }
 
     // ── Event salience tests ────────────────────────────────────
+
+    #[test]
+    fn anomaly_rail_shows_on_compact_terminals() {
+        // Compact terminals should show anomalies (condensed) rather than hiding them.
+        assert!(anomaly_rail_height(TerminalClass::Compact, 1) > 0);
+        // Tiny still hides them.
+        assert_eq!(anomaly_rail_height(TerminalClass::Tiny, 1), 0);
+        // No anomalies = no rail regardless of terminal class.
+        assert_eq!(anomaly_rail_height(TerminalClass::Normal, 0), 0);
+    }
 
     #[test]
     fn event_severity_salience_hierarchy() {
