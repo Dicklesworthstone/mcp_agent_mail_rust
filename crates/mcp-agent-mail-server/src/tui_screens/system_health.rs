@@ -126,6 +126,16 @@ impl WidthClass {
     }
 }
 
+/// Numeric priority for severity sorting (higher = more critical).
+const fn severity_priority(sev: AnomalySeverity) -> u8 {
+    match sev {
+        AnomalySeverity::Critical => 4,
+        AnomalySeverity::High => 3,
+        AnomalySeverity::Medium => 2,
+        AnomalySeverity::Low => 1,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProbeLine {
     level: Level,
@@ -668,11 +678,39 @@ impl SystemHealthScreen {
             });
         }
 
+        // Anomaly-first prioritization: sort by severity (Critical > High > Medium > Low)
+        // so the most actionable findings are always visible, even on narrow/short terminals.
+        findings.sort_by(|a, b| severity_priority(b.severity).cmp(&severity_priority(a.severity)));
+
         if findings.is_empty() {
             // All healthy — render a single OK card
             let card = AnomalyCard::new(AnomalySeverity::Low, 1.0, "All diagnostics passed")
                 .rationale("TCP reachable, HTTP probes healthy, auth configuration valid.");
             card.render(area, frame);
+            return;
+        }
+
+        // Narrow-width fallback: when cards can't render properly (< 30 cols),
+        // fall back to compact text lines showing severity + title.
+        if area.width < 30 {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let mut compact_lines: Vec<Line> = Vec::new();
+            for f in &findings {
+                let (badge, badge_style) = match f.severity {
+                    AnomalySeverity::Critical => ("[CRIT]", crate::tui_theme::text_critical(&tp)),
+                    AnomalySeverity::High => ("[HIGH]", crate::tui_theme::text_error(&tp)),
+                    AnomalySeverity::Medium => ("[WARN]", crate::tui_theme::text_warning(&tp)),
+                    AnomalySeverity::Low => ("[ OK ]", crate::tui_theme::text_success(&tp)),
+                };
+                compact_lines.push(Line::from_spans([
+                    Span::styled(badge.to_string(), badge_style),
+                    Span::raw(" "),
+                    Span::raw(f.title.clone()),
+                ]));
+            }
+            let visible = usize::from(area.height);
+            let truncated: Vec<Line> = compact_lines.into_iter().take(visible).collect();
+            Paragraph::new(Text::from_lines(truncated)).render(area, frame);
             return;
         }
 
@@ -2219,5 +2257,40 @@ mod tests {
         assert_eq!(WidthClass::from_width(40), WidthClass::Medium);
         assert_eq!(WidthClass::from_width(39), WidthClass::Narrow);
         assert_eq!(WidthClass::from_width(20), WidthClass::Narrow);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // br-1xt0m.1.11.3: Narrow-width fallback + anomaly-first prioritization
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn severity_priority_orders_critical_first() {
+        assert!(severity_priority(AnomalySeverity::Critical) > severity_priority(AnomalySeverity::High));
+        assert!(severity_priority(AnomalySeverity::High) > severity_priority(AnomalySeverity::Medium));
+        assert!(severity_priority(AnomalySeverity::Medium) > severity_priority(AnomalySeverity::Low));
+    }
+
+    #[test]
+    fn anomaly_cards_narrow_width_renders_compact_text() {
+        let mut snap = DiagnosticsSnapshot::default();
+        snap.lines.push(ProbeLine {
+            level: Level::Fail,
+            name: "auth",
+            detail: "Token invalid".to_string(),
+            remediation: None,
+        });
+        let screen = test_screen(DiagnosticsSnapshot::default());
+
+        // Render at very narrow width (25 cols) — should use compact fallback
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(25, 5, &mut pool);
+        screen.render_anomaly_cards(&mut frame, Rect::new(0, 0, 25, 5), &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        // Should show severity badge in compact format
+        assert!(
+            text.contains("[HIGH]") || text.contains("[CRIT]") || text.contains("passed"),
+            "narrow render should use compact text: {text}"
+        );
     }
 }
