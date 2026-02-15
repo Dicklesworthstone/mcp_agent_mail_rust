@@ -4426,4 +4426,60 @@ mod tests {
         assert!(text.contains("Title:"), "detail text: {text}");
         assert!(text.contains("Test subject"), "detail text: {text}");
     }
+
+    // ── Screen logic, density heuristics, and failure paths (br-1xt0m.1.13.8) ──
+
+    #[test]
+    fn facet_slot_next_round_trips() {
+        let start = FacetSlot::Scope;
+        let mut slot = start;
+        for _ in 0..6 {
+            slot = slot.next();
+        }
+        assert_eq!(slot, start, "6 next() calls should round-trip");
+    }
+
+    #[test]
+    fn facet_slot_prev_round_trips() {
+        let start = FacetSlot::Scope;
+        let mut slot = start;
+        for _ in 0..6 {
+            slot = slot.prev();
+        }
+        assert_eq!(slot, start, "6 prev() calls should round-trip");
+    }
+
+    #[test]
+    fn facet_slot_next_prev_inverse() {
+        for slot in [
+            FacetSlot::Scope,
+            FacetSlot::DocKind,
+            FacetSlot::Importance,
+            FacetSlot::AckStatus,
+            FacetSlot::SortOrder,
+            FacetSlot::FieldScope,
+        ] {
+            assert_eq!(slot.next().prev(), slot, "next().prev() for {slot:?}");
+            assert_eq!(slot.prev().next(), slot, "prev().next() for {slot:?}");
+        }
+    }
+
+    #[test]
+    fn focus_starts_at_result_list() {
+        let screen = SearchCockpitScreen::new();
+        assert_eq!(screen.focus, Focus::ResultList);
+    }
+
+    #[test]
+    fn dock_drag_starts_idle() {
+        let screen = SearchCockpitScreen::new();
+        assert_eq!(screen.dock_drag, DockDragState::Idle);
+    }
+
+    #[test]
+    fn query_help_and_lab_hidden_by_default() {
+        let screen = SearchCockpitScreen::new();
+        assert!(!screen.query_help_visible);
+        assert!(!screen.query_lab_visible);
+    }
 }

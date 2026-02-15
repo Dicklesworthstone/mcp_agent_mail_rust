@@ -2293,4 +2293,51 @@ mod tests {
             "narrow render should use compact text: {text}"
         );
     }
+
+    // ── Screen logic, density heuristics, and failure paths (br-1xt0m.1.13.8) ──
+
+    #[test]
+    fn severity_priority_ordering_all_levels() {
+        assert!(severity_priority(AnomalySeverity::Critical) > severity_priority(AnomalySeverity::High));
+        assert!(severity_priority(AnomalySeverity::High) > severity_priority(AnomalySeverity::Medium));
+        assert!(severity_priority(AnomalySeverity::Medium) > severity_priority(AnomalySeverity::Low));
+    }
+
+    #[test]
+    fn severity_priority_values_distinct() {
+        let values = [
+            severity_priority(AnomalySeverity::Critical),
+            severity_priority(AnomalySeverity::High),
+            severity_priority(AnomalySeverity::Medium),
+            severity_priority(AnomalySeverity::Low),
+        ];
+        for i in 0..values.len() {
+            for j in (i + 1)..values.len() {
+                assert_ne!(values[i], values[j], "priority values must be distinct");
+            }
+        }
+    }
+
+    #[test]
+    fn width_class_boundary_values() {
+        // Exact boundary at 80.
+        assert_eq!(WidthClass::from_width(80), WidthClass::Wide);
+        assert_eq!(WidthClass::from_width(79), WidthClass::Medium);
+        // Exact boundary at 40.
+        assert_eq!(WidthClass::from_width(40), WidthClass::Medium);
+        assert_eq!(WidthClass::from_width(39), WidthClass::Narrow);
+        // Extremes.
+        assert_eq!(WidthClass::from_width(0), WidthClass::Narrow);
+        assert_eq!(WidthClass::from_width(u16::MAX), WidthClass::Wide);
+    }
+
+    #[test]
+    fn level_default_is_ok() {
+        assert_eq!(Level::default(), Level::Ok);
+    }
+
+    #[test]
+    fn probe_auth_kind_default_is_unauth() {
+        assert_eq!(ProbeAuthKind::default(), ProbeAuthKind::Unauth);
+    }
 }

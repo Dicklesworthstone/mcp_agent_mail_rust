@@ -2333,4 +2333,90 @@ mod tests {
         assert!(text.contains("HTTP"), "row text: {text}");
         assert!(text.contains("ERR"), "row text: {text}");
     }
+
+    // ── Screen logic, density heuristics, and failure paths (br-1xt0m.1.13.8) ──
+
+    #[test]
+    fn verbosity_tier_cycle_round_trips() {
+        let start = VerbosityTier::default();
+        let mut tier = start;
+        for _ in 0..4 {
+            tier = tier.next();
+        }
+        assert_eq!(tier, start, "4 next() should round-trip");
+    }
+
+    #[test]
+    fn verbosity_includes_severity_correctness() {
+        // Standard includes Info, Warn, Error; excludes Debug, Trace.
+        assert!(VerbosityTier::Standard.includes(EventSeverity::Info));
+        assert!(VerbosityTier::Standard.includes(EventSeverity::Warn));
+        assert!(VerbosityTier::Standard.includes(EventSeverity::Error));
+        assert!(!VerbosityTier::Standard.includes(EventSeverity::Debug));
+        assert!(!VerbosityTier::Standard.includes(EventSeverity::Trace));
+
+        // Minimal: only Warn + Error.
+        assert!(!VerbosityTier::Minimal.includes(EventSeverity::Info));
+        assert!(VerbosityTier::Minimal.includes(EventSeverity::Warn));
+
+        // All: everything passes.
+        assert!(VerbosityTier::All.includes(EventSeverity::Trace));
+    }
+
+    #[test]
+    fn clear_filters_resets_verbosity_to_standard() {
+        let mut pane = TimelinePane::new();
+        pane.verbosity = VerbosityTier::Minimal;
+        pane.kind_filter.insert(MailEventKind::MessageSent);
+        pane.source_filter.insert(EventSource::Http);
+        pane.clear_filters();
+        assert!(pane.kind_filter.is_empty());
+        assert!(pane.source_filter.is_empty());
+        assert_eq!(pane.verbosity, VerbosityTier::Standard);
+    }
+
+    #[test]
+    fn toggle_kind_filter_add_and_remove() {
+        let mut pane = TimelinePane::new();
+        assert!(pane.kind_filter.is_empty());
+        pane.toggle_kind_filter(MailEventKind::MessageSent);
+        assert!(pane.kind_filter.contains(&MailEventKind::MessageSent));
+        pane.toggle_kind_filter(MailEventKind::MessageSent);
+        assert!(!pane.kind_filter.contains(&MailEventKind::MessageSent));
+    }
+
+    #[test]
+    fn toggle_source_filter_add_and_remove() {
+        let mut pane = TimelinePane::new();
+        pane.toggle_source_filter(EventSource::Http);
+        assert!(pane.source_filter.contains(&EventSource::Http));
+        pane.toggle_source_filter(EventSource::Http);
+        assert!(!pane.source_filter.contains(&EventSource::Http));
+    }
+
+    #[test]
+    fn cursor_up_multi_step_saturates() {
+        let mut pane = TimelinePane::new();
+        pane.cursor = 3;
+        pane.cursor_up(10);
+        assert_eq!(pane.cursor, 0, "saturating_sub should clamp to 0");
+    }
+
+    #[test]
+    fn jump_to_time_on_empty_is_noop() {
+        let mut pane = TimelinePane::new();
+        pane.follow = true;
+        pane.jump_to_time(1_000_000);
+        // With no entries, follow stays unchanged (function returns early).
+        assert!(pane.follow);
+    }
+
+    #[test]
+    fn new_pane_defaults() {
+        let pane = TimelinePane::new();
+        assert_eq!(pane.verbosity, VerbosityTier::Standard);
+        assert!(!pane.follow());
+        assert_eq!(pane.cursor(), 0);
+        assert_eq!(pane.total_ingested, 0);
+    }
 }

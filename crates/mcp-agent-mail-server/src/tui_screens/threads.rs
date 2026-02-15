@@ -3711,4 +3711,146 @@ mod tests {
             "missing styled subject line: {text}"
         );
     }
+
+    // ── Screen logic, density heuristics, and failure paths (br-1xt0m.1.13.8) ──
+
+    #[test]
+    fn sort_mode_cycle_round_trips() {
+        let start = SortMode::LastActivity;
+        let mut mode = start;
+        for _ in 0..4 {
+            mode = mode.next();
+        }
+        assert_eq!(mode, start, "4 cycles should round-trip to start");
+    }
+
+    #[test]
+    fn sort_mode_labels_non_empty() {
+        for mode in [
+            SortMode::LastActivity,
+            SortMode::Velocity,
+            SortMode::ParticipantCount,
+            SortMode::EscalationFirst,
+        ] {
+            assert!(!mode.label().is_empty(), "label for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn view_lens_cycle_round_trips() {
+        let start = ViewLens::Activity;
+        let mut lens = start;
+        for _ in 0..3 {
+            lens = lens.next();
+        }
+        assert_eq!(lens, start, "3 cycles should round-trip");
+    }
+
+    #[test]
+    fn view_lens_labels_non_empty() {
+        for lens in [ViewLens::Activity, ViewLens::Participants, ViewLens::Escalation] {
+            assert!(!lens.label().is_empty(), "label for {lens:?}");
+        }
+    }
+
+    #[test]
+    fn apply_sort_escalation_first_prioritizes_escalated() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads = vec![
+            ThreadSummary {
+                thread_id: "normal".into(),
+                has_escalation: false,
+                last_timestamp_micros: 200,
+                ..stub_thread_summary()
+            },
+            ThreadSummary {
+                thread_id: "escalated".into(),
+                has_escalation: true,
+                last_timestamp_micros: 100,
+                ..stub_thread_summary()
+            },
+        ];
+        screen.sort_mode = SortMode::EscalationFirst;
+        screen.apply_sort();
+        assert_eq!(screen.threads[0].thread_id, "escalated");
+        assert_eq!(screen.threads[1].thread_id, "normal");
+    }
+
+    #[test]
+    fn apply_sort_velocity_orders_highest_first() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads = vec![
+            ThreadSummary {
+                thread_id: "slow".into(),
+                velocity_msg_per_hr: 1.0,
+                ..stub_thread_summary()
+            },
+            ThreadSummary {
+                thread_id: "fast".into(),
+                velocity_msg_per_hr: 10.0,
+                ..stub_thread_summary()
+            },
+        ];
+        screen.sort_mode = SortMode::Velocity;
+        screen.apply_sort();
+        assert_eq!(screen.threads[0].thread_id, "fast");
+    }
+
+    #[test]
+    fn apply_sort_participant_count_orders_most_first() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads = vec![
+            ThreadSummary {
+                thread_id: "few".into(),
+                participant_count: 2,
+                ..stub_thread_summary()
+            },
+            ThreadSummary {
+                thread_id: "many".into(),
+                participant_count: 8,
+                ..stub_thread_summary()
+            },
+        ];
+        screen.sort_mode = SortMode::ParticipantCount;
+        screen.apply_sort();
+        assert_eq!(screen.threads[0].thread_id, "many");
+    }
+
+    #[test]
+    fn apply_sort_last_activity_orders_newest_first() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads = vec![
+            ThreadSummary {
+                thread_id: "old".into(),
+                last_timestamp_micros: 100,
+                ..stub_thread_summary()
+            },
+            ThreadSummary {
+                thread_id: "new".into(),
+                last_timestamp_micros: 999,
+                ..stub_thread_summary()
+            },
+        ];
+        screen.sort_mode = SortMode::LastActivity;
+        screen.apply_sort();
+        assert_eq!(screen.threads[0].thread_id, "new");
+    }
+
+    fn stub_thread_summary() -> ThreadSummary {
+        ThreadSummary {
+            thread_id: String::new(),
+            message_count: 1,
+            participant_count: 1,
+            last_subject: "subject".into(),
+            last_sender: "agent".into(),
+            last_timestamp_micros: 0,
+            last_timestamp_iso: String::new(),
+            project_slug: "proj".into(),
+            has_escalation: false,
+            velocity_msg_per_hr: 0.0,
+            participant_names: String::new(),
+            first_timestamp_iso: String::new(),
+            unread_count: 0,
+        }
+    }
 }

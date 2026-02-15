@@ -2735,4 +2735,80 @@ mod tests {
         assert_eq!(screen.scroll_offset, 0);
         assert!(screen.auto_follow, "reaching bottom should re-enable auto-follow");
     }
+
+    // ── Screen logic, density heuristics, and failure paths (br-1xt0m.1.13.8) ──
+
+    #[test]
+    fn trend_for_up_down_flat() {
+        assert_eq!(trend_for(10, 5), MetricTrend::Up);
+        assert_eq!(trend_for(5, 10), MetricTrend::Down);
+        assert_eq!(trend_for(5, 5), MetricTrend::Flat);
+        assert_eq!(trend_for(0, 0), MetricTrend::Flat);
+        assert_eq!(trend_for(1, 0), MetricTrend::Up);
+        assert_eq!(trend_for(0, 1), MetricTrend::Down);
+    }
+
+    #[test]
+    fn anomaly_rail_height_zero_when_no_anomalies() {
+        for tc in [
+            TerminalClass::Tiny,
+            TerminalClass::Compact,
+            TerminalClass::Normal,
+            TerminalClass::Wide,
+            TerminalClass::UltraWide,
+        ] {
+            assert_eq!(anomaly_rail_height(tc, 0), 0, "zero anomalies → zero height for {tc:?}");
+        }
+    }
+
+    #[test]
+    fn anomaly_rail_height_hidden_on_tiny() {
+        assert_eq!(anomaly_rail_height(TerminalClass::Tiny, 3), 0);
+    }
+
+    #[test]
+    fn anomaly_rail_height_compact_vs_normal() {
+        assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 3);
+        assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 4);
+        assert_eq!(anomaly_rail_height(TerminalClass::Wide, 1), 4);
+    }
+
+    #[test]
+    fn compute_percentile_empty_returns_zeros() {
+        let p = DashboardScreen::compute_percentile(&[]);
+        assert!((p.p50 - 0.0).abs() < f64::EPSILON);
+        assert!((p.p95 - 0.0).abs() < f64::EPSILON);
+        assert!((p.p99 - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_percentile_single_value() {
+        let p = DashboardScreen::compute_percentile(&[42.0]);
+        assert!((p.p50 - 42.0).abs() < f64::EPSILON);
+        assert!((p.p95 - 42.0).abs() < f64::EPSILON);
+        assert!((p.p99 - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_percentile_sorted_data() {
+        // 100 values: 1.0, 2.0, ..., 100.0
+        let data: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let p = DashboardScreen::compute_percentile(&data);
+        assert!((p.p50 - 51.0).abs() < f64::EPSILON);
+        assert!((p.p95 - 96.0).abs() < f64::EPSILON);
+        assert!((p.p99 - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn footer_bar_hidden_on_tiny() {
+        assert_eq!(footer_bar_height(TerminalClass::Tiny), 0);
+        assert_eq!(footer_bar_height(TerminalClass::Compact), 1);
+        assert_eq!(footer_bar_height(TerminalClass::Normal), 1);
+    }
+
+    #[test]
+    fn title_band_hidden_on_tiny() {
+        assert_eq!(title_band_height(TerminalClass::Tiny), 0);
+        assert_eq!(title_band_height(TerminalClass::Compact), 1);
+    }
 }
