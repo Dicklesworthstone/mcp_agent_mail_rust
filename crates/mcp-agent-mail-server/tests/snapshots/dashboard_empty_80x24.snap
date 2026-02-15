@@ -1,5 +1,6 @@
-Uptime          Requests        Avg Lat         Messages        Agents          
-0s ─            0 ─             0ms ─           0 ─             0 ─             
+                              Agent Mail Dashboard                              
+Messages        Ack Pend        Agents          Requests        Avg Lat         
+0 ─             0 ─             0 ─             0 ─             0ms ─           
                                                                                 
                                                                                 
                                                                                 
@@ -20,5 +21,4 @@ Uptime          Requests        Avg Lat         Messages        Agents
                                                                                 
                                                                                 
                                                                                 
-                                                                                
- Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0 | Events:0/10000 (0%) Drops:0                  
+ Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                  

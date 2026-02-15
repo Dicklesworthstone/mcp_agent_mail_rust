@@ -1,22 +1,14 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │ 8:System Health ┃ 9:Timeline │ 10:Projects ┃ 11:Contacts │      
-                                                                        → Comm • Search                                                                         
+── Configuration ──                                                                                                                                  PROBING... 
+Endpoint:                                                                                                                                                       
+Web UI:                                                                                                                                                         
+Auth:      disabled (token: false, len: 0)                                                                                                                      
+Checked:   (never)                                                                                                                                              
+Uptime:    0s                                                                                                                                                   
                                                                                                                                                                 
+── Connection Diagnostics ──                                                                                                                                    
+  [OK] TCP :0  0ms                                                                                                                                              
                                                                                                                                                                 
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-  Scope                       No results found.                                                              Select a result to view details.                   
-  [Global]                                                                                                                                                      
-  Doc Type                                                                                                                                                      
-  [Messages]                                                                                                                                                    
-  Importance                                                                                                                                                    
-  [Any]                                                                                                                                                         
-  Ack Required                                                                                                                                                  
-  [Any]                                                                                                                                                         
-  Sort Order                                                                                                                                                    
-  [Newest]                                                                                                                                                      
-  Search Field                                                                                                                                                  
-  [Subject+Body]                                                                                                                                                
+r Refresh  v Dashboard                                                                                                                                          
                                                                                                                                                                 
                                                                                                                                                                 
                                                                                                                                                                 
@@ -44,5 +36,13 @@
                                                                                                                                                                 
                                                                                                                                                                 
                                                                                                                                                                 
-f:facets  L:query lab  mous…                                                                                                                                    
- Search api up:0m00s                         req:0 ok:0 err:0 avg:0ms |  /  Focus query bar ·  f  Focus facet rail                          ? Cyberpunk Aurora  
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                

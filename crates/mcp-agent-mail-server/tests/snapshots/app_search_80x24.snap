@@ -1,24 +1,24 @@
- 1:Dashboard  2:Messages  3:Threads  4:Agents  5:Search  6:Reservations         
-Search across messages, agents, projects... (/ to focus)                        
-Route: /search                                                                  
+ 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
+                                → Comm • Search                                 
                                                                                 
                                                                                 
-  Scope           No results found.           Select a result to view details.  
-  [global]                                                                      
-  Type                                                                          
+                                                                                
+                                                                                
+                                                                                
+  Scope           No results found.                     Select a result to view 
+  [Global]                                                                      
+  Doc Type                                                                      
   [Messages]                                                                    
-  Imp.                                                                          
+  Importance                                                                    
   [Any]                                                                         
-  Ack                                                                           
+  Ack Required                                                                  
   [Any]                                                                         
-  Sort                                                                          
+  Sort Order                                                                    
   [Newest]                                                                      
-  Field                                                                         
-  [Both]                                                                        
+  Search Field                                                                  
+  [Subject+Body]                                                                
                                                                                 
                                                                                 
                                                                                 
-                                                                                
-                                                                                
-f:facets                                                                        
- Search | mode:api up:0m00s           req:0 ok:0 err:0 avg:0ms          ? help  
+f:facets  L:que…                                                                
+ Search api up:0m00s                                                          ? 

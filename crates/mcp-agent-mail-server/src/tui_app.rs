@@ -8225,4 +8225,122 @@ mod tests {
         assert!(!model.state.is_shutdown_requested());
         assert!(!matches!(cmd, Cmd::Quit));
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Overlay stack + semantic hierarchy snapshot matrix (br-1xt0m.1.13.9)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn overlay_layer_count_is_eight() {
+        // Verify all 8 layers exist (None through Help).
+        let layers = [
+            OverlayLayer::None,
+            OverlayLayer::Toasts,
+            OverlayLayer::ToastFocus,
+            OverlayLayer::ActionMenu,
+            OverlayLayer::MacroPlayback,
+            OverlayLayer::Modal,
+            OverlayLayer::Palette,
+            OverlayLayer::Help,
+        ];
+        assert_eq!(layers.len(), 8);
+        // Each has a unique discriminant.
+        let mut values: Vec<u8> = layers.iter().map(|l| *l as u8).collect();
+        values.sort();
+        values.dedup();
+        assert_eq!(values.len(), 8, "all overlay layers must have unique u8 values");
+    }
+
+    #[test]
+    fn help_is_topmost_z_order() {
+        // Help (z=7) must be higher than all other layers.
+        for layer in [
+            OverlayLayer::None,
+            OverlayLayer::Toasts,
+            OverlayLayer::ToastFocus,
+            OverlayLayer::ActionMenu,
+            OverlayLayer::MacroPlayback,
+            OverlayLayer::Modal,
+            OverlayLayer::Palette,
+        ] {
+            assert!(
+                OverlayLayer::Help > layer,
+                "Help must be > {:?}",
+                layer,
+            );
+        }
+    }
+
+    #[test]
+    fn palette_above_modal_above_action_menu() {
+        // Verify full z-order chain: Help > Palette > Modal > MacroPlayback > ActionMenu > ToastFocus > Toasts > None
+        assert!(OverlayLayer::Help > OverlayLayer::Palette);
+        assert!(OverlayLayer::Palette > OverlayLayer::Modal);
+        assert!(OverlayLayer::Modal > OverlayLayer::MacroPlayback);
+        assert!(OverlayLayer::MacroPlayback > OverlayLayer::ActionMenu);
+        assert!(OverlayLayer::ActionMenu > OverlayLayer::ToastFocus);
+        assert!(OverlayLayer::ToastFocus > OverlayLayer::Toasts);
+        assert!(OverlayLayer::Toasts > OverlayLayer::None);
+    }
+
+    #[test]
+    fn topmost_overlay_escalation_chain() {
+        let mut model = test_model();
+
+        // Start: None
+        assert_eq!(model.topmost_overlay(), OverlayLayer::None);
+
+        // Open help → Help
+        model.help_visible = true;
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Help);
+
+        // Close help, open toast focus → ToastFocus
+        model.help_visible = false;
+        model.notifications.notify(
+            ftui_widgets::Toast::new("test")
+                .icon(ftui_widgets::ToastIcon::Info)
+                .duration(Duration::from_secs(60)),
+        );
+        model.toast_focus_index = Some(0);
+        assert_eq!(model.topmost_overlay(), OverlayLayer::ToastFocus);
+
+        // Clear toast focus → back to None
+        model.toast_focus_index = None;
+    }
+
+    #[test]
+    fn screen_switching_does_not_alter_overlay_state() {
+        let mut model = test_model();
+        model.help_visible = true;
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Help);
+
+        // Switch screen — help should remain open.
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        assert!(model.help_visible);
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Help);
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Search));
+        assert!(model.help_visible);
+    }
+
+    #[test]
+    fn all_screens_render_without_panic_at_four_widths() {
+        use crate::tui_screens::ALL_SCREEN_IDS;
+
+        let widths: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 40), (160, 48)];
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        for &id in ALL_SCREEN_IDS {
+            let mut model = MailAppModel::new(Arc::clone(&state));
+            model.update(MailMsg::SwitchScreen(id));
+
+            for (w, h) in widths {
+                let mut pool = ftui::GraphemePool::new();
+                let mut frame = ftui::Frame::new(w, h, &mut pool);
+                model.view(&mut frame);
+                // No panic = pass.
+            }
+        }
+    }
 }

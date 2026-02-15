@@ -1,5 +1,17 @@
  1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │ 8:System Health ┃       
-                                                  → Ops • Reservations                                                  
+                                                  Agent Mail Dashboard                                                  
+Messages            Ack Pend            Agents              Requests            Avg Lat             Uptime              
+0 ─                 0 ─                 0 ─                 0 ─                 0ms ─               0s ─                
+                                                                                                                        
+                                                                              Awaiting data...                          
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                              Awaiting data...                          
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -14,6 +26,7 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
+No message traffic yet. Recent sent/received metadata appears here.                                                     
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -23,18 +36,5 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
- Reservations api up:0m00s          req:0 ok:0 err:0 avg:0ms |  j/k  Navigate reservations           ? Cyberpunk Aurora 
+ Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                                                          
+ Dashboard api up:0m00s              req:0 ok:0 err:0 avg:0ms |  j/k  Scroll event log               ? Cyberpunk Aurora 

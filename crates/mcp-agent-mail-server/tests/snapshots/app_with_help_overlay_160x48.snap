@@ -1,0 +1,48 @@
+ 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │ 8:System Health ┃ 9:Timeline │ 10:Projects ┃ 11:Contacts │      
+                                                                      Agent Mail Dashboard                                                                      
+Messages                  Ack Pend                  Agents                    Requests                  Avg Lat                   Uptime                        
+0 ─                       0 ─                       0 ─                       0 ─                       0ms ─                     0s ─                          
+                                                                                                                                                                
+                                                                                                        Awaiting data...                                        
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                            ╭ Keyboard Shortcuts (j/k to scroll) (Esc to close) ───────────────────╮                                            
+                                            │ Dashboard                                                            │                                            
+                                            │  Overview of projects, agents, and live request counters.            │                                            
+                                            │    j/k        Scroll event log                                       │                                            
+                                            │    Enter      Timeline at event                                      │                                            
+                                            │    f          Toggle auto-follow                                     │                                            
+                                            │    v          Cycle verbosity tier                        Awaiting da│a...                                        
+                                            │    t          Cycle type filter                                      │                                            
+                                            │    G          Jump to bottom                                         │                                            
+                                            │    g          Jump to top                                            │                                            
+                                            │    p          Toggle trend panel                                     │                                            
+                                            │    l          Toggle console log                                     │                                            
+                                            │    Mouse      Wheel scroll event log                                 │                                            
+                                            │ Global (Default)                                                     │                                            
+                                            │    1-9,0,!,@,#,$ Jump to screen (direct keys for all screens)        │                                            
+                                            │    Tab        Next screen                                            │                                            
+                                            │    Shift+Tab  Previous screen                                        │                                            
+                                            │    m          Toggle MCP/API mode                                    │                                            
+                                            │    Ctrl+P     Command palette                                        │                                            
+                                            │    :          Command palette                                        │                                            
+                                            │    T          Cycle theme                                            │                                            
+                                            │    ?          Toggle help                                            │                                            
+                                            │    q          Quit                                                   │                                            
+                                            │    Esc        Dismiss overlay                                        │                                            
+No message traffic yet. Recent sent/received│mNavigate • Overviewe.                                                │                                            
+                                            │                                                                      │                                            
+                                            │                                                                      │                                            
+                                            ╰──────────────────────────────────────────────────────────────────────╯                                            
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+ Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                                                                                                  
+ Dashboard api up:0m00s                   req:0 ok:0 err:0 avg:0ms |  j/k  Scroll event log ·  Enter  Timeline at event                   [?] Cyberpunk Aurora  

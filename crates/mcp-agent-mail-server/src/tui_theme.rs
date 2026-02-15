@@ -1263,4 +1263,69 @@ mod tests {
         // Critical and high should use different base colors.
         assert_ne!(crit.fg, low.fg, "critical and low should differ");
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Semantic color hierarchy validation (br-1xt0m.1.13.9)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn semantic_color_hierarchy_warn_distinct_from_good() {
+        for &id in &ThemeId::ALL {
+            let _guard = ScopedThemeLock::new(id);
+            let p = TuiThemePalette::for_theme(id);
+            assert_ne!(
+                p.status_good, p.status_warn,
+                "theme {id:?}: status_good and status_warn must differ"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_color_hierarchy_accent_distinct_from_fg() {
+        for &id in &ThemeId::ALL {
+            let _guard = ScopedThemeLock::new(id);
+            let p = TuiThemePalette::for_theme(id);
+            assert_ne!(
+                p.status_accent, p.status_fg,
+                "theme {id:?}: status_accent and status_fg must differ"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_color_hierarchy_sparkline_lo_hi_distinct() {
+        for &id in &ThemeId::ALL {
+            let _guard = ScopedThemeLock::new(id);
+            let p = TuiThemePalette::for_theme(id);
+            assert_ne!(
+                p.sparkline_lo, p.sparkline_hi,
+                "theme {id:?}: sparkline_lo and sparkline_hi must differ"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_color_hierarchy_active_tab_readable() {
+        for &id in &ThemeId::ALL {
+            let _guard = ScopedThemeLock::new(id);
+            let p = TuiThemePalette::for_theme(id);
+            // Active tab FG should differ from BG to be readable.
+            assert_ne!(
+                p.tab_active_fg, p.tab_active_bg,
+                "theme {id:?}: active tab FG and BG must differ"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_color_hierarchy_help_key_distinct_from_help_fg() {
+        for &id in &ThemeId::ALL {
+            let _guard = ScopedThemeLock::new(id);
+            let p = TuiThemePalette::for_theme(id);
+            assert_ne!(
+                p.help_key_fg, p.help_fg,
+                "theme {id:?}: help_key_fg and help_fg must differ for visual hierarchy"
+            );
+        }
+    }
 }

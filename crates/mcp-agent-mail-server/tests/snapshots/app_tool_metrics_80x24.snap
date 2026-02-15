@@ -1,6 +1,5 @@
- 1:Dashboard  2:Messages  3:Threads  4:Agents  5:Search  6:Reservations         
- 0 tools | 0 calls | 0 errors | avg 0ms | Sort: Calls▼ | v=dashboard            
-Tool Name          │Calls    │Errors   │Err%    │Avg(ms)  │Trend                
+ 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
+                              → Sys • Tool Metrics                              
                                                                                 
                                                                                 
                                                                                 
@@ -21,4 +20,5 @@ Tool Name          │Calls    │Errors   │Err%    │Avg(ms)  │Trend
                                                                                 
                                                                                 
                                                                                 
- Tool Metrics | mode:api up:0m00s        req:0 ok:0 err:0 avg:0ms       ? help  
+                                                                                
+ Tool Metrics api up:0m00s                                                    ? 

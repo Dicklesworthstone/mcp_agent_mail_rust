@@ -1441,6 +1441,230 @@ mod tests {
         );
     }
 
+    // ── Width matrix: status segment visibility at breakpoints (br-1xt0m.1.13.9) ──
+
+    #[test]
+    fn status_segments_at_50_cols_critical_only() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (left, center, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            50, // < 60 → Critical only
+        );
+        // Only Critical segments survive.
+        for seg in left.iter().chain(center.iter()).chain(right.iter()) {
+            assert_eq!(
+                seg.priority,
+                StatusPriority::Critical,
+                "at 50 cols, only Critical segments should survive, got {:?}: '{}'",
+                seg.priority,
+                seg.text
+            );
+        }
+    }
+
+    #[test]
+    fn status_segments_at_60_cols_includes_high() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (left, center, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            60, // >= 60 → Critical + High
+        );
+        let all: Vec<_> = left.iter().chain(center.iter()).chain(right.iter()).collect();
+        // Should have at least one High-priority segment (transport mode).
+        assert!(
+            all.iter().any(|s| s.priority == StatusPriority::High),
+            "at 60 cols, High-priority segments should be present"
+        );
+        // No Medium or Low.
+        assert!(
+            all.iter().all(|s| s.priority <= StatusPriority::High),
+            "at 60 cols, only Critical + High segments should survive"
+        );
+    }
+
+    #[test]
+    fn status_segments_at_80_cols_includes_medium() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (left, center, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            80, // >= 80 → Critical + High + Medium
+        );
+        let all: Vec<_> = left.iter().chain(center.iter()).chain(right.iter()).collect();
+        assert!(
+            all.iter().any(|s| s.priority == StatusPriority::Medium),
+            "at 80 cols, Medium-priority segments should be present"
+        );
+        // Uptime is Medium priority on left side.
+        let left_text: String = left.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            left_text.contains("up:"),
+            "at 80 cols, uptime segment (Medium) should appear in left: {left_text}"
+        );
+        // No Low-priority segments.
+        assert!(
+            all.iter().all(|s| s.priority <= StatusPriority::Medium),
+            "at 80 cols, Low segments should be dropped"
+        );
+    }
+
+    #[test]
+    fn status_segments_at_100_cols_includes_low() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (left, center, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            100, // >= 100 → all priorities
+        );
+        let all: Vec<_> = left.iter().chain(center.iter()).chain(right.iter()).collect();
+        assert!(
+            all.iter().any(|s| s.priority == StatusPriority::Low),
+            "at 100 cols, Low-priority segments should be present"
+        );
+        // Full counters (Low) should appear in center.
+        let center_text: String = center.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            center_text.contains("req:"),
+            "at 100 cols, full counter string (Low) should appear: {center_text}"
+        );
+    }
+
+    #[test]
+    fn status_segments_at_120_cols_has_theme_name() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (_, _, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            120,
+        );
+        let theme = crate::tui_theme::current_theme_name();
+        let right_text: String = right.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            right_text.contains(theme),
+            "at 120 cols, theme name '{theme}' in right: {right_text}"
+        );
+    }
+
+    #[test]
+    fn status_segments_at_160_cols_same_as_100() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (left_100, center_100, right_100) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            100,
+        );
+        let (left_160, center_160, right_160) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            160,
+        );
+        // Same segment count — 160 doesn't add more segments than 100.
+        assert_eq!(
+            left_100.len(),
+            left_160.len(),
+            "left segment count should be same at 100 and 160 cols"
+        );
+        assert_eq!(
+            center_100.len(),
+            center_160.len(),
+            "center segment count should be same at 100 and 160 cols"
+        );
+        assert_eq!(
+            right_100.len(),
+            right_160.len(),
+            "right segment count should be same at 100 and 160 cols"
+        );
+    }
+
+    // ── Help overlay sizing matrix (br-1xt0m.1.13.9) ──
+
+    #[test]
+    fn help_overlay_sizing_80x24() {
+        // 80*60% = 48 → clamped to [36,72] = 48
+        // 24*60% = 14 → clamped to [10,28] = 14
+        let w = (u32::from(80u16) * 60 / 100).clamp(36, 72) as u16;
+        let h = (u32::from(24u16) * 60 / 100).clamp(10, 28) as u16;
+        assert_eq!(w, 48, "overlay width at 80 cols");
+        assert_eq!(h, 14, "overlay height at 24 rows");
+    }
+
+    #[test]
+    fn help_overlay_sizing_100x30() {
+        let w = (u32::from(100u16) * 60 / 100).clamp(36, 72) as u16;
+        let h = (u32::from(30u16) * 60 / 100).clamp(10, 28) as u16;
+        assert_eq!(w, 60, "overlay width at 100 cols");
+        assert_eq!(h, 18, "overlay height at 30 rows");
+    }
+
+    #[test]
+    fn help_overlay_sizing_120x40() {
+        let w = (u32::from(120u16) * 60 / 100).clamp(36, 72) as u16;
+        let h = (u32::from(40u16) * 60 / 100).clamp(10, 28) as u16;
+        assert_eq!(w, 72, "overlay width at 120 cols");
+        assert_eq!(h, 24, "overlay height at 40 rows");
+    }
+
+    #[test]
+    fn help_overlay_sizing_160x48() {
+        let w = (u32::from(160u16) * 60 / 100).clamp(36, 72) as u16;
+        let h = (u32::from(48u16) * 60 / 100).clamp(10, 28) as u16;
+        assert_eq!(w, 72, "overlay width at 160 cols (clamped max)");
+        assert_eq!(h, 28, "overlay height at 48 rows (clamped max)");
+    }
+
+    #[test]
+    fn help_overlay_sizing_40x12_minimum() {
+        let w = (u32::from(40u16) * 60 / 100).clamp(36, 72) as u16;
+        let h = (u32::from(12u16) * 60 / 100).clamp(10, 28) as u16;
+        // 40*60% = 24, clamped to 36 (min).
+        // But also clamped by area: min(36, 40-2) = 36.
+        assert_eq!(w, 36, "overlay width at 40 cols (clamped min)");
+        // 12*60% = 7, clamped to 10 (min). Also min(10, 12-2) = 10.
+        assert_eq!(h, 10, "overlay height at 12 rows (clamped min)");
+    }
+
     #[test]
     fn status_segments_theme_name_at_wide_width() {
         let config = mcp_agent_mail_core::Config::default();

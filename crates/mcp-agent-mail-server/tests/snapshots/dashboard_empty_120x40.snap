@@ -1,5 +1,6 @@
-Uptime              Requests            Avg Lat             Messages            Agents              Ack Pend            
-0s ─                0 ─                 0ms ─               0 ─                 0 ─                 0 ─                 
+                                                  Agent Mail Dashboard                                                  
+Messages            Ack Pend            Agents              Requests            Avg Lat             Uptime              
+0 ─                 0 ─                 0 ─                 0 ─                 0ms ─               0s ─                
                                                                                                                         
                                                                               Awaiting data...                          
                                                                                                                         
@@ -10,10 +11,9 @@ Uptime              Requests            Avg Lat             Messages            
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
                                                                               Awaiting data...                          
+                                                                                                                        
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -37,4 +37,4 @@ No message traffic yet. Recent sent/received metadata appears here.
                                                                                                                         
                                                                                                                         
                                                                                                                         
- Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0 | Events:0/10000 (0%) Drops:0                                                          
+ Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                                                          

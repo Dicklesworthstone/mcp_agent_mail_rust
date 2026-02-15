@@ -1,6 +1,5 @@
- 1:Dashboard  2:Messages  3:Threads  4:Agents  5:Search  6:Reservations         
-0 agents | Sort: Active ▼                                                       
-Name               │Program        │Model          │Last Active    │Msgs        
+ 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
+                                 → Ops • Agents                                 
                                                                                 
                                                                                 
                                                                                 
@@ -21,4 +20,5 @@ Name               │Program        │Model          │Last Active    │Msgs
                                                                                 
                                                                                 
                                                                                 
- Agents | mode:api up:0m00s           req:0 ok:0 err:0 avg:0ms          ? help  
+                                                                                
+ Agents api up:0m00s                                                          ? 

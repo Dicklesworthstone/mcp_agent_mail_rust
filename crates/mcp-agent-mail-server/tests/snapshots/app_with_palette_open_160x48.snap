@@ -1,26 +1,27 @@
- 1:Dashboard  2:Messages  3:Threads  4:Agents  5:Search  6:Reservations  7:Tool Metrics  8:System Health  9:Timeline  10:Projects  11:Contacts  12:Explorer     
-Uptime                    Requests                  Avg Lat                   Messages                  Agents                    Ack Pend                      
-0s ─                      0 ─                       0ms ─                     0 ─                       0 ─                       0 ─                           
+ 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │ 8:System Health ┃ 9:Timeline │ 10:Projects ┃ 11:Contacts │      
+                                                                      Agent Mail Dashboard                                                                      
+Messages                  Ack Pend                  Agents                    Requests                  Avg Lat                   Uptime                        
+0 ─                       0 ─                       0 ─                       0 ─                       0ms ─                     0s ─                          
                                                                                                                                                                 
                                                                                                         Awaiting data...                                        
-                                                                                                                                                                
                                                                                                                                                                 
                                                                                                                                                                 
                                 ┌────────────────────────────────────── Command Palette ───────────────────────────────────────┐                                
                                 │>Type to search...                                                                            │                                
                                 │> [App] Quit  Exit AgentMailTUI (requests shutdown)                                           │                                
                                 │  [Appearance] Cycle Theme  Switch to the next color theme (T)                                │                                
-                                │  [Operations] Go to Agents  Agent roster with status and activity                            │                                
+                                │  [Operations] Go to Agents  Agent roster with status and activity [key: 4]                   │                                
                                 │  [Communication] Go to Search  Unified search across messages, agents, and projects with fac…│                                
                                 │  [Layout] Reset Layout  Reset dock layout to factory defaults (Right 40%)                    │                                
                                 │  [Macros] Record Macro  Start recording a new operator macro                                 │                                
-                                │  [Communication] Go to Threads  Thread explorer with conversation view                       │                                
+                                │  [Communication] Go to Threads  Thread explorer with conversation view [key: 3]              │                                
                                 │  [Layout] Export Layout  Save current dock layout to layout.json                             │                                
                                 │  [Layout] Import Layout  Load dock layout from layout.json                                   │                                
-                                │  [Communication] Go to Messages  Search and browse messages with detail panel                │                                
-                                │  [Navigate] Go to Timeline  Chronological event timeline with cursor + inspector             │                                
-                                │  [Navigate] Go to Projects  Project browser with per-project stats and detail                │                                
+                                │  [Communication] Go to Messages  Search and browse messages with detail panel [key: 2]       │                                
+                                │  [Navigate] Go to Timeline  Chronological event timeline with cursor + inspector [key: 9]    │                                
+                                │  [Navigate] Go to Projects  Project browser with per-project stats and detail [key: 0]       │                                
                                 └──────────────────────────────────────────────────────────────────────────────────────────────┘                                
+                                                                                                                                                                
                                                                                                                                                                 
                                                                                                                                                                 
                                                                                                                                                                 
@@ -43,6 +44,5 @@ No message traffic yet. Recent sent/received metadata appears here.
                                                                                                                                                                 
                                                                                                                                                                 
                                                                                                                                                                 
-                                                                                                                                                                
- Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0 | Events:0/10000 (0%) Drops:0                                                                                                  
- Dashboard | mode:api up:0m00s            req:0 ok:0 err:0 avg:0ms | [j/k] Scroll event log [Enter] Timeline at event [f] Toggle auto-follow            ? help  
+ Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                                                                                                  
+ Dashboard api up:0m00s                    req:0 ok:0 err:0 avg:0ms |  j/k  Scroll event log ·  Enter  Timeline at event                    ? Cyberpunk Aurora  

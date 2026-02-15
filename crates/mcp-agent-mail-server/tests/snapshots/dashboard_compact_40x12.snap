@@ -1,5 +1,6 @@
-Up           Req          Msg           
-0s ─         0 ─          0 ─           
+          Agent Mail Dashboard          
+Msg          Agents       Req           
+0 ─          0 ─          0 ─           
                                         
                                         
                                         
@@ -8,5 +9,4 @@ Up           Req          Msg
                                         
                                         
                                         
-                                        
- Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0 | Event
+ Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Event

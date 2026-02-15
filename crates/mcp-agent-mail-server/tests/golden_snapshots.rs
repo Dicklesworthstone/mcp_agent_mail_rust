@@ -350,3 +350,340 @@ fn app_messages_160x48() {
 fn app_search_160x48() {
     snapshot_app(160, 48, MailScreenId::Search, "app_search_160x48");
 }
+
+// ===========================================================================
+// Snapshot Matrix — Width, Overlay, and Semantic Hierarchy (br-1xt0m.1.13.9)
+// ===========================================================================
+//
+// These tests cover the 4-width matrix (80/100/120/160) for chrome/status,
+// help overlay sizing, overlay stack precedence, high-density screen states,
+// and semantic color token validation.
+
+use mcp_agent_mail_server::tui_screens::timeline::TimelineScreen;
+
+// ---------------------------------------------------------------------------
+// Chrome/Status/Help at 80/100/120/160 columns
+// ---------------------------------------------------------------------------
+
+/// Status bar at 80 columns: Critical + High + Medium segments visible.
+#[test]
+fn app_dashboard_80x24_status_segments() {
+    use ftui_runtime::Model;
+    use mcp_agent_mail_server::tui_app::MailAppModel;
+
+    let config = Config::default();
+    let state = TuiSharedState::new(&config);
+    let model = MailAppModel::new(Arc::clone(&state));
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(80, 24, &mut pool);
+    model.view(&mut frame);
+    let text = buffer_to_text(&frame.buffer);
+
+    // At 80 cols: Critical segments (screen title + help hint) + High + Medium
+    // Screen title "Dashboard" must be present (Critical)
+    assert!(
+        text.contains("Dashboard"),
+        "80-col: screen title must be present (Critical): {text}"
+    );
+    // Help hint '?' must be present (Critical)
+    assert!(
+        text.contains('?'),
+        "80-col: help hint must be present (Critical): {text}"
+    );
+}
+
+/// Status bar at 100 columns: All segments including Low (counters, theme).
+#[test]
+fn app_dashboard_100x30_full_segments() {
+    snapshot_app(100, 30, MailScreenId::Dashboard, "app_dashboard_100x30");
+}
+
+/// Status bar at 120 columns: Wide terminal shows everything.
+#[test]
+fn app_dashboard_120x40_full() {
+    snapshot_app(120, 40, MailScreenId::Dashboard, "app_dashboard_120x40");
+}
+
+/// Status bar at 160 columns: Ultra-wide, all segments with room to spare.
+#[test]
+fn app_messages_100x30() {
+    snapshot_app(100, 30, MailScreenId::Messages, "app_messages_100x30");
+}
+
+#[test]
+fn app_search_100x30() {
+    snapshot_app(100, 30, MailScreenId::Search, "app_search_100x30");
+}
+
+// ---------------------------------------------------------------------------
+// Help overlay sizing matrix
+// ---------------------------------------------------------------------------
+
+/// Help overlay at 80x24: 60% → 48w clamped to 36-72, 14h clamped to 10-28.
+#[test]
+fn app_with_help_overlay_80x24() {
+    use ftui_runtime::Model;
+    use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
+
+    let config = Config::default();
+    let state = TuiSharedState::new(&config);
+    let mut model = MailAppModel::new(Arc::clone(&state));
+    model.update(MailMsg::ToggleHelp);
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(80, 24, &mut pool);
+    model.view(&mut frame);
+    assert_snapshot!("app_with_help_overlay_80x24", &frame.buffer);
+}
+
+/// Help overlay at 120x40: larger overlay with more scroll room.
+#[test]
+fn app_with_help_overlay_120x40() {
+    use ftui_runtime::Model;
+    use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
+
+    let config = Config::default();
+    let state = TuiSharedState::new(&config);
+    let mut model = MailAppModel::new(Arc::clone(&state));
+    model.update(MailMsg::ToggleHelp);
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(120, 40, &mut pool);
+    model.view(&mut frame);
+    assert_snapshot!("app_with_help_overlay_120x40", &frame.buffer);
+}
+
+/// Help overlay at 160x48: wide but height-clamped at 28 rows.
+#[test]
+fn app_with_help_overlay_160x48() {
+    use ftui_runtime::Model;
+    use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
+
+    let config = Config::default();
+    let state = TuiSharedState::new(&config);
+    let mut model = MailAppModel::new(Arc::clone(&state));
+    model.update(MailMsg::ToggleHelp);
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(160, 48, &mut pool);
+    model.view(&mut frame);
+    assert_snapshot!("app_with_help_overlay_160x48", &frame.buffer);
+}
+
+// ---------------------------------------------------------------------------
+// Overlay stack precedence: Help renders above palette above base
+// ---------------------------------------------------------------------------
+
+/// Both palette and help open: help (z=7) should render on top.
+#[test]
+fn app_help_over_palette_precedence_80x24() {
+    use ftui_runtime::Model;
+    use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
+
+    let config = Config::default();
+    let state = TuiSharedState::new(&config);
+    let mut model = MailAppModel::new(Arc::clone(&state));
+
+    // Open palette first (Ctrl+P), then help (?).
+    let ctrl_p =
+        Event::Key(ftui::KeyEvent::new(KeyCode::Char('p')).with_modifiers(Modifiers::CTRL));
+    model.update(MailMsg::Terminal(ctrl_p));
+
+    // Open help overlay on top.
+    model.update(MailMsg::ToggleHelp);
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(80, 24, &mut pool);
+    model.view(&mut frame);
+
+    let text = buffer_to_text(&frame.buffer);
+    // Help overlay title should be visible (topmost overlay)
+    assert!(
+        text.contains("Keyboard Shortcuts") || text.contains("Esc to close"),
+        "help overlay should be visible on top of palette: {text}"
+    );
+
+    assert_snapshot!("app_help_over_palette_80x24", &frame.buffer);
+}
+
+// ---------------------------------------------------------------------------
+// High-density screen states — 4-width matrix for key screens
+// ---------------------------------------------------------------------------
+
+// Messages screen at all 4 widths
+#[test]
+fn messages_width_matrix_80() {
+    let state = test_state();
+    let screen = MessageBrowserScreen::new();
+    snapshot_screen(&screen, &state, 80, 24, "messages_width_80x24");
+}
+
+#[test]
+fn messages_width_matrix_100() {
+    let state = test_state();
+    let screen = MessageBrowserScreen::new();
+    snapshot_screen(&screen, &state, 100, 30, "messages_width_100x30");
+}
+
+#[test]
+fn messages_width_matrix_120() {
+    let state = test_state();
+    let screen = MessageBrowserScreen::new();
+    snapshot_screen(&screen, &state, 120, 40, "messages_width_120x40");
+}
+
+#[test]
+fn messages_width_matrix_160() {
+    let state = test_state();
+    let screen = MessageBrowserScreen::new();
+    snapshot_screen(&screen, &state, 160, 48, "messages_width_160x48");
+}
+
+// Threads screen at all 4 widths
+#[test]
+fn threads_width_matrix_80() {
+    let state = test_state();
+    let screen = ThreadExplorerScreen::new();
+    snapshot_screen(&screen, &state, 80, 24, "threads_width_80x24");
+}
+
+#[test]
+fn threads_width_matrix_100() {
+    let state = test_state();
+    let screen = ThreadExplorerScreen::new();
+    snapshot_screen(&screen, &state, 100, 30, "threads_width_100x30");
+}
+
+#[test]
+fn threads_width_matrix_120() {
+    let state = test_state();
+    let screen = ThreadExplorerScreen::new();
+    snapshot_screen(&screen, &state, 120, 40, "threads_width_120x40");
+}
+
+#[test]
+fn threads_width_matrix_160() {
+    let state = test_state();
+    let screen = ThreadExplorerScreen::new();
+    snapshot_screen(&screen, &state, 160, 48, "threads_width_160x48");
+}
+
+// Search screen at all 4 widths
+#[test]
+fn search_width_matrix_80() {
+    let state = test_state();
+    let screen = SearchCockpitScreen::new();
+    snapshot_screen(&screen, &state, 80, 24, "search_width_80x24");
+}
+
+#[test]
+fn search_width_matrix_100() {
+    let state = test_state();
+    let screen = SearchCockpitScreen::new();
+    snapshot_screen(&screen, &state, 100, 30, "search_width_100x30");
+}
+
+#[test]
+fn search_width_matrix_120() {
+    let state = test_state();
+    let screen = SearchCockpitScreen::new();
+    snapshot_screen(&screen, &state, 120, 40, "search_width_120x40");
+}
+
+#[test]
+fn search_width_matrix_160() {
+    let state = test_state();
+    let screen = SearchCockpitScreen::new();
+    snapshot_screen(&screen, &state, 160, 48, "search_width_160x48");
+}
+
+// Timeline screen at all 4 widths
+#[test]
+fn timeline_width_matrix_80() {
+    let state = test_state();
+    let screen = TimelineScreen::new();
+    snapshot_screen(&screen, &state, 80, 24, "timeline_width_80x24");
+}
+
+#[test]
+fn timeline_width_matrix_100() {
+    let state = test_state();
+    let screen = TimelineScreen::new();
+    snapshot_screen(&screen, &state, 100, 30, "timeline_width_100x30");
+}
+
+#[test]
+fn timeline_width_matrix_120() {
+    let state = test_state();
+    let screen = TimelineScreen::new();
+    snapshot_screen(&screen, &state, 120, 40, "timeline_width_120x40");
+}
+
+#[test]
+fn timeline_width_matrix_160() {
+    let state = test_state();
+    let screen = TimelineScreen::new();
+    snapshot_screen(&screen, &state, 160, 48, "timeline_width_160x48");
+}
+
+// SystemHealth screen at all 4 widths
+#[test]
+fn system_health_width_matrix_80() {
+    let state = test_state();
+    let screen = SystemHealthScreen::new(Arc::clone(&state));
+    snapshot_screen(&screen, &state, 80, 24, "system_health_width_80x24");
+}
+
+#[test]
+fn system_health_width_matrix_100() {
+    let state = test_state();
+    let screen = SystemHealthScreen::new(Arc::clone(&state));
+    snapshot_screen(&screen, &state, 100, 30, "system_health_width_100x30");
+}
+
+#[test]
+fn system_health_width_matrix_120() {
+    let state = test_state();
+    let screen = SystemHealthScreen::new(Arc::clone(&state));
+    snapshot_screen(&screen, &state, 120, 40, "system_health_width_120x40");
+}
+
+#[test]
+fn system_health_width_matrix_160() {
+    let state = test_state();
+    let screen = SystemHealthScreen::new(Arc::clone(&state));
+    snapshot_screen(&screen, &state, 160, 48, "system_health_width_160x48");
+}
+
+// ---------------------------------------------------------------------------
+// Narrow terminal: minimum viable rendering (no panics)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_narrow_30x10() {
+    let state = test_state();
+    let screen = SearchCockpitScreen::new();
+    snapshot_screen(&screen, &state, 30, 10, "search_narrow_30x10");
+}
+
+#[test]
+fn system_health_narrow_30x10() {
+    let state = test_state();
+    let screen = SystemHealthScreen::new(Arc::clone(&state));
+    snapshot_screen(&screen, &state, 30, 10, "system_health_narrow_30x10");
+}
+
+#[test]
+fn timeline_narrow_30x10() {
+    let state = test_state();
+    let screen = TimelineScreen::new();
+    snapshot_screen(&screen, &state, 30, 10, "timeline_narrow_30x10");
+}
+
+#[test]
+fn threads_narrow_30x10() {
+    let state = test_state();
+    let screen = ThreadExplorerScreen::new();
+    snapshot_screen(&screen, &state, 30, 10, "threads_narrow_30x10");
+}
