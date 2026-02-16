@@ -13,7 +13,7 @@
 //! can be developed and tested independently of `tui_app.rs`.
 
 use ftui::layout::Rect;
-use ftui::{Cell, Frame, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, PackedRgba};
+use ftui::{Cell, Frame, KeyCode, KeyEvent, KeyEventKind, Modifiers, PackedRgba};
 
 use crate::tui_bridge::TuiSharedState;
 
@@ -179,7 +179,7 @@ pub enum RecipientKind {
 impl RecipientKind {
     /// Cycle to the next kind.
     #[must_use]
-    pub fn cycle(self) -> Self {
+    pub const fn cycle(self) -> Self {
         match self {
             Self::To => Self::Cc,
             Self::Cc => Self::Bcc,
@@ -241,7 +241,7 @@ pub struct ComposeState {
 impl ComposeState {
     /// Create a new empty compose state.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             active_field: ComposeField::Recipients,
             recipients: Vec::new(),
@@ -457,7 +457,7 @@ impl ComposeState {
         // Global keybindings (work in any field)
         match (key.code, key.modifiers) {
             // Ctrl+Enter: send
-            (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
+            (KeyCode::Enter, m) if m.contains(Modifiers::CTRL) => {
                 return ComposeAction::Send;
             }
             // Escape: close
@@ -469,12 +469,12 @@ impl ComposeState {
                 };
             }
             // Tab: next field
-            (KeyCode::Tab, m) if !m.contains(KeyModifiers::SHIFT) => {
+            (KeyCode::Tab, m) if !m.contains(Modifiers::SHIFT) => {
                 self.active_field = self.active_field.next();
                 return ComposeAction::Consumed;
             }
             // Shift+Tab: prev field
-            (KeyCode::BackTab, _) | (KeyCode::Tab, _) => {
+            (KeyCode::BackTab | KeyCode::Tab, _) => {
                 self.active_field = self.active_field.prev();
                 return ComposeAction::Consumed;
             }
@@ -509,20 +509,20 @@ impl ComposeState {
             KeyCode::Char(' ') => {
                 self.toggle_recipient();
             }
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('t') if key.modifiers.contains(Modifiers::CTRL) => {
                 self.cycle_recipient_kind();
             }
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('a') if key.modifiers.contains(Modifiers::CTRL) => {
                 self.select_all_recipients();
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('d') if key.modifiers.contains(Modifiers::CTRL) => {
                 self.clear_all_recipients();
             }
             KeyCode::Backspace => {
                 self.recipient_filter.pop();
                 self.recipient_cursor = 0;
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c) if !key.modifiers.contains(Modifiers::CTRL) => {
                 self.recipient_filter.push(c);
                 self.recipient_cursor = 0;
             }
@@ -565,7 +565,7 @@ impl ComposeState {
                     self.dirty = true;
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c) if !key.modifiers.contains(Modifiers::CTRL) => {
                 let max = match target {
                     TextTarget::Subject => MAX_SUBJECT_LEN,
                     TextTarget::ThreadId => 200,
@@ -636,14 +636,14 @@ impl ComposeState {
                 }
             }
             KeyCode::Down => {
-                let lines = self.body_lines();
-                if self.body_cursor_line + 1 < lines.len() {
+                let line_count = self.body.split('\n').count();
+                if self.body_cursor_line + 1 < line_count {
                     self.body_cursor_line += 1;
-                    let line_len = lines.get(self.body_cursor_line).map_or(0, |l| l.len());
+                    let line_len = self.body.split('\n').nth(self.body_cursor_line).map_or(0, str::len);
                     self.body_cursor_col = self.body_cursor_col.min(line_len);
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c) if !key.modifiers.contains(Modifiers::CTRL) => {
                 if self.body.len() < MAX_BODY_LEN {
                     let offset = self.body_offset();
                     self.body.insert(offset, c);
@@ -734,9 +734,10 @@ impl<'a> ComposePanel<'a> {
 
     /// Calculate the overlay area (70% width, 80% height, centered).
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn overlay_area(terminal: Rect) -> Rect {
-        let width = ((terminal.width as u32 * 70) / 100) as u16;
-        let height = ((terminal.height as u32 * 80) / 100) as u16;
+        let width = ((u32::from(terminal.width) * 70) / 100) as u16;
+        let height = ((u32::from(terminal.height) * 80) / 100) as u16;
         let width = width.max(40).min(terminal.width);
         let height = height.max(15).min(terminal.height);
         let x = (terminal.width.saturating_sub(width)) / 2;
@@ -1074,6 +1075,7 @@ impl<'a> ComposePanel<'a> {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn set_border_cell(&self, x: u16, y: u16, frame: &mut Frame<'_>) {
         let mut cell = Cell::from_char(' ');
         cell.fg = COMPOSE_BORDER;
@@ -1081,13 +1083,15 @@ impl<'a> ComposePanel<'a> {
         frame.buffer.set_fast(x, y, cell);
     }
 
+    #[allow(clippy::unused_self)]
     fn set_cursor_cell(&self, x: u16, y: u16, frame: &mut Frame<'_>) {
-        let mut cell = frame.buffer.get(x, y).clone();
+        let mut cell = frame.buffer.get(x, y).copied().unwrap_or_else(|| Cell::from_char(' '));
         cell.bg = COMPOSE_ACTIVE_BORDER;
         cell.fg = PackedRgba::rgb(0, 0, 0);
         frame.buffer.set_fast(x, y, cell);
     }
 
+    #[allow(clippy::too_many_arguments, clippy::unused_self)]
     fn draw_text(
         &self,
         x: u16,
@@ -1111,6 +1115,7 @@ impl<'a> ComposePanel<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments, clippy::unused_self, clippy::cast_possible_truncation)]
     fn draw_bordered_line(
         &self,
         x: u16,
@@ -1154,6 +1159,7 @@ impl<'a> ComposePanel<'a> {
         frame.buffer.set_fast(right.saturating_sub(1), y, cell);
     }
 
+    #[allow(clippy::unused_self, clippy::cast_possible_truncation)]
     fn draw_horizontal_border(
         &self,
         x: u16,
@@ -1184,21 +1190,11 @@ mod tests {
     }
 
     fn make_key_ctrl(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: Default::default(),
-        }
+        KeyEvent::new(code).with_modifiers(Modifiers::CTRL)
     }
 
     fn make_key_shift(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::SHIFT,
-            kind: KeyEventKind::Press,
-            state: Default::default(),
-        }
+        KeyEvent::new(code).with_modifiers(Modifiers::SHIFT)
     }
 
     fn state_with_agents(names: &[&str]) -> ComposeState {
