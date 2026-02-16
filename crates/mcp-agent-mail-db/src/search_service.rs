@@ -531,12 +531,7 @@ where
 {
     for phase in phases {
         match phase {
-            SearchPhase::Initial { results, .. } => {
-                if !results.is_empty() {
-                    return Some(results);
-                }
-            }
-            SearchPhase::Refined { results, .. } => {
+            SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
                 if !results.is_empty() {
                     return Some(results);
                 }
@@ -966,6 +961,7 @@ fn get_or_init_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
 /// Uses the two-tier bridge when available. When unavailable, callers
 /// deterministically degrade to lexical-only candidate orchestration.
 #[cfg(feature = "hybrid")]
+#[allow(dead_code)]
 fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
     // Use atomic get_or_init pattern to avoid race condition on initialization.
     // Only one TwoTierBridge instance is ever created under concurrent access.
