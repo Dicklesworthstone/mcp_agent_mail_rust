@@ -1983,19 +1983,54 @@ fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {
 }
 
 fn parse_dotenv_value(raw: &str) -> String {
-    if raw.is_empty() {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return String::new();
     }
-    let trimmed = raw.trim();
-    if let Some(stripped) = trimmed.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-        return unescape_double_quotes(stripped);
+
+    // Handle double quotes with escapes
+    if trimmed.starts_with('"') {
+        let mut chars = trimmed.char_indices().skip(1);
+        let mut escaped = false;
+        let mut closing_idx = None;
+        while let Some((i, c)) = chars.next() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                closing_idx = Some(i);
+                break;
+            }
+        }
+        if let Some(end) = closing_idx {
+            let remainder = &trimmed[end + 1..];
+            let rem_trim = remainder.trim_start();
+            if rem_trim.is_empty() || rem_trim.starts_with('#') {
+                return unescape_double_quotes(&trimmed[1..end]);
+            }
+        }
     }
-    if let Some(stripped) = trimmed
-        .strip_prefix('\'')
-        .and_then(|v| v.strip_suffix('\''))
-    {
-        return stripped.to_string();
+
+    // Handle single quotes (no escapes)
+    if trimmed.starts_with('\'') {
+        let mut chars = trimmed.char_indices().skip(1);
+        let mut closing_idx = None;
+        while let Some((i, c)) = chars.next() {
+            if c == '\'' {
+                closing_idx = Some(i);
+                break;
+            }
+        }
+        if let Some(end) = closing_idx {
+            let remainder = &trimmed[end + 1..];
+            let rem_trim = remainder.trim_start();
+            if rem_trim.is_empty() || rem_trim.starts_with('#') {
+                return trimmed[1..end].to_string();
+            }
+        }
     }
+
     strip_inline_comment(trimmed).to_string()
 }
 

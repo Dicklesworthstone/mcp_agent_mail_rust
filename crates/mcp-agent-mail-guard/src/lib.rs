@@ -291,9 +291,9 @@ fn render_guard_plugin_script(
 
 import json
 import os
+import re
 import subprocess
 import sys
-from fnmatch import fnmatch
 
 PROJECT = {project_json}
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
@@ -382,6 +382,18 @@ def get_active_reservations():
     except Exception:
         return []
 
+def glob_match(path, pattern):
+    """Simple shell-style glob matching (similar to Rust implementation)."""
+    # Escape regex specials, then replace shell wildcards.
+    # *  -> [^/]* (non-recursive match)
+    # ** -> .*    (recursive match)
+    # ?  -> .     (single char)
+    regex = re.escape(pattern)
+    regex = regex.replace(r'\*\*', '.*')
+    regex = regex.replace(r'\*', '[^/]*')
+    regex = regex.replace(r'\?', '.')
+    return re.fullmatch(regex, path) is not None
+
 def check_conflicts(staged, reservations):
     """Check if any staged files conflict with active reservations."""
     conflicts = []
@@ -392,18 +404,22 @@ def check_conflicts(staged, reservations):
             if holder == AGENT_NAME:
                 continue  # Skip our own reservations
             
-            # Symmetric glob matching (fnmatch handles * and ? and [seq])
-            if fnmatch(f, pattern) or fnmatch(pattern, f):
+            # Symmetric glob matching
+            if glob_match(f, pattern) or glob_match(pattern, f):
                 conflicts.append((f, pattern, holder))
                 break
             
             # Directory prefix matching for non-glob patterns
-            # e.g. pattern "src" should match "src/main.rs"
-            # But "src/file" should NOT match "src/file.bak" unless pattern was "src/file*"
             has_glob = any(c in pattern for c in "*?[")
-            if not has_glob and f.startswith(pattern + "/"):
-                conflicts.append((f, pattern, holder))
-                break
+            if not has_glob:
+                # Normal prefix check: file is inside reserved dir
+                if f.startswith(pattern + "/"):
+                    conflicts.append((f, pattern, holder))
+                    break
+                # Reverse check: pattern is inside touched file (e.g. dir replaced by file)
+                if pattern.startswith(f + "/"):
+                    conflicts.append((f, pattern, holder))
+                    break
     return conflicts
 
 def main():
@@ -789,6 +805,7 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
 }
 
 /// Check if a pattern contains glob markers.
+#[cfg(test)]
 fn contains_glob(pattern: &str) -> bool {
     pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
 }
@@ -820,22 +837,6 @@ fn paths_conflict(path: &str, pattern: &str) -> bool {
     }
 
     // Symmetric fnmatch matching
-    if contains_glob(path) || contains_glob(pattern) {
-        return fnmatch_simple(path, pattern) || fnmatch_simple(pattern, path);
-    }
-
-    // For non-glob patterns, check prefix (directory match)
-    if !contains_glob(pattern) && !contains_glob(path) {
-        // pattern "app/api" should match "app/api/users.py"
-        if path.starts_with(pattern) && path.as_bytes().get(pattern.len()) == Some(&b'/') {
-            return true;
-        }
-        // reverse: path "app/api" should match pattern "app/api/users.py"
-        if pattern.starts_with(path) && pattern.as_bytes().get(path.len()) == Some(&b'/') {
-            return true;
-        }
-    }
-
     fnmatch_simple(path, pattern) || fnmatch_simple(pattern, path)
 }
 

@@ -355,7 +355,7 @@ pub async fn file_reservation_paths(
 
         if conflict_refs.is_empty() && !self_conflict {
             paths_to_grant.push(path);
-            granted_patterns.insert(path.to_string());
+            granted_patterns.insert(path.clone());
         } else if !conflict_refs.is_empty() {
             // Deterministic ordering keeps API output stable across runs
             // even when the index scans hash buckets in different orders.

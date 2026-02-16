@@ -528,6 +528,33 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
 }
 
 fn wbq_execute_op(op: &WriteOp) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        match wbq_execute_op_inner(op) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= 3 {
+                    return Err(e);
+                }
+                match &e {
+                    StorageError::Io(_)
+                    | StorageError::LockContention { .. }
+                    | StorageError::GitIndexLock { .. }
+                    | StorageError::LockTimeout(_) => {
+                        tracing::warn!(
+                            "[wbq-drain] op failed (attempt {attempts}/3): {e}, retrying..."
+                        );
+                        std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
+                    }
+                    _ => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+fn wbq_execute_op_inner(op: &WriteOp) -> Result<()> {
     match op {
         WriteOp::MessageBundle {
             project_slug,
@@ -2579,14 +2606,17 @@ fn commit_paths_lockfree(
     let base_tree = parent.as_ref().and_then(|p| p.tree().ok());
 
     // Create blob objects for each file
-    let mut updates: Vec<(String, git2::Oid)> = Vec::new();
+    let mut updates: Vec<(String, Option<git2::Oid>)> = Vec::new();
     for path in rel_paths {
         let path = validate_repo_relative_path("lockfree commit path", path)?;
         let full = workdir.join(path);
         if full.exists() {
             let content = fs::read(&full)?;
             let blob_oid = repo.blob(&content)?;
-            updates.push((path.to_string(), blob_oid));
+            updates.push((path.to_string(), Some(blob_oid)));
+        } else {
+            // File does not exist, so we record a deletion (None OID)
+            updates.push((path.to_string(), None));
         }
     }
 
@@ -2627,11 +2657,11 @@ fn commit_paths_lockfree(
 fn build_tree_with_updates(
     repo: &Repository,
     base: Option<&git2::Tree<'_>>,
-    updates: &[(String, git2::Oid)],
+    updates: &[(String, Option<git2::Oid>)],
 ) -> Result<git2::Oid> {
     // Group updates by first path component
-    let mut direct_entries: Vec<(&str, git2::Oid)> = Vec::new();
-    let mut by_prefix: HashMap<String, Vec<(String, git2::Oid)>> = HashMap::new();
+    let mut direct_entries: Vec<(&str, Option<git2::Oid>)> = Vec::new();
+    let mut by_prefix: HashMap<String, Vec<(String, Option<git2::Oid>)>> = HashMap::new();
 
     for (path, oid) in updates {
         if let Some(slash_idx) = path.find('/') {
@@ -2649,8 +2679,12 @@ fn build_tree_with_updates(
     let mut builder = repo.treebuilder(base)?;
 
     // Insert direct file entries (blob mode 0o100644)
-    for (name, oid) in &direct_entries {
-        builder.insert(name, *oid, 0o100_644)?;
+    for (name, oid_opt) in &direct_entries {
+        if let Some(oid) = oid_opt {
+            builder.insert(name, *oid, 0o100_644)?;
+        } else {
+            let _ = builder.remove(name);
+        }
     }
 
     // Recurse for subdirectory entries (tree mode 0o040000)
@@ -5817,12 +5851,21 @@ fn commit_paths(
         let path = validate_repo_relative_path("commit path", path)?;
         // git2 expects forward-slash paths on all platforms
         let p = Path::new(path);
-        // Only add if the file exists on disk
         let full = repo.workdir().ok_or(StorageError::NotInitialized)?.join(p);
+
         if full.exists() {
             index.add_path(p)?;
-            any_added = true;
+        } else {
+            // File doesn't exist on disk, remove it from the index (deletion/move)
+            // Ignore error if the path wasn't in the index to begin with (idempotency)
+            if let Err(e) = index.remove_path(p) {
+                // Ignore "path not in index" errors, but propagate others
+                if e.code() != git2::ErrorCode::NotFound {
+                    return Err(e.into());
+                }
+            }
         }
+        any_added = true;
     }
 
     if !any_added {

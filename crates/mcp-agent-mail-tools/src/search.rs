@@ -725,9 +725,19 @@ pub async fn search_messages(
         ..Default::default()
     };
 
+    let search_options = mcp_agent_mail_db::search_service::SearchOptions {
+        track_telemetry: true,
+        ..Default::default()
+    };
+
     let planner_response = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::search_service::execute_search_simple(ctx.cx(), &pool, &search_query)
-            .await,
+        mcp_agent_mail_db::search_service::execute_search(
+            ctx.cx(),
+            &pool,
+            &search_query,
+            &search_options,
+        )
+        .await,
     )?;
 
     // Map planner SearchResult → tool SearchResult (legacy format)
@@ -736,16 +746,19 @@ pub async fn search_messages(
         .results
         .into_iter()
         .skip(offset_val)
-        .map(|r| SearchResult {
-            id: r.id,
-            subject: r.title,
-            importance: r.importance.unwrap_or_default(),
-            ack_required: i32::from(r.ack_required.unwrap_or(false)),
-            created_ts: r.created_ts.map(micros_to_iso),
-            thread_id: r.thread_id,
-            from: r.from_agent.unwrap_or_default(),
-            reason_codes: r.reason_codes,
-            score_factors: r.score_factors,
+        .map(|scoped| {
+            let r = scoped.result;
+            SearchResult {
+                id: r.id,
+                subject: r.title,
+                importance: r.importance.unwrap_or_default(),
+                ack_required: i32::from(r.ack_required.unwrap_or(false)),
+                created_ts: r.created_ts.map(micros_to_iso),
+                thread_id: r.thread_id,
+                from: r.from_agent.unwrap_or_default(),
+                reason_codes: r.reason_codes,
+                score_factors: r.score_factors,
+            }
         })
         .collect();
 

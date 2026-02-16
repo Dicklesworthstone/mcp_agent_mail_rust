@@ -265,8 +265,8 @@ pub mod tool_util {
         let m = a_bytes.len();
         let n = b_bytes.len();
         // Use DP for LCS length
-        let mut prev = vec![0u16; n + 1];
-        let mut curr = vec![0u16; n + 1];
+        let mut prev = vec![0usize; n + 1];
+        let mut curr = vec![0usize; n + 1];
         for i in 1..=m {
             for j in 1..=n {
                 curr[j] = if a_bytes[i - 1] == b_bytes[j - 1] {
@@ -278,7 +278,7 @@ pub mod tool_util {
             std::mem::swap(&mut prev, &mut curr);
             curr.fill(0);
         }
-        let lcs_len = f64::from(prev[n]);
+        let lcs_len = prev[n] as f64;
         let Ok(total_u32) = u32::try_from(total) else {
             return 0.0;
         };
