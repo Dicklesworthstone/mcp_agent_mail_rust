@@ -9,6 +9,7 @@
 use fastmcp::prelude::*;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::messaging::{
     enqueue_agent_semantic_index, enqueue_message_semantic_index, try_write_message_archive,
@@ -442,14 +443,24 @@ pub async fn list_contacts(
         mcp_agent_mail_db::queries::list_contacts(ctx.cx(), &pool, project_id, agent_id).await,
     )?;
 
-    // Resolve referenced agents to names
-    let mut agent_names: HashMap<i64, String> = HashMap::with_capacity(outgoing_rows.len());
+    // Resolve referenced agents to names (batch)
+    let mut b_agent_ids: SmallVec<[i64; 32]> = SmallVec::with_capacity(outgoing_rows.len());
     for r in &outgoing_rows {
-        if let std::collections::hash_map::Entry::Vacant(e) = agent_names.entry(r.b_agent_id) {
-            if let Ok(row) = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, r.b_agent_id).await,
-            ) {
-                e.insert(row.name);
+        b_agent_ids.push(r.b_agent_id);
+    }
+    b_agent_ids.sort_unstable();
+    b_agent_ids.dedup();
+
+    let mut agent_names: HashMap<i64, String> = HashMap::with_capacity(b_agent_ids.len());
+    if !b_agent_ids.is_empty() {
+        if let Ok(rows) = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_agents_by_ids(ctx.cx(), &pool, &b_agent_ids).await,
+        ) {
+            for row in rows {
+                // Safe unwrap: row.id is primary key, guaranteed to be Some(id)
+                if let Some(id) = row.id {
+                    agent_names.insert(id, row.name);
+                }
             }
         }
     }

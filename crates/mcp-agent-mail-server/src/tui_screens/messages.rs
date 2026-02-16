@@ -1791,11 +1791,12 @@ fn search_messages_fts(
     project_filter: Option<&str>,
     show_project: bool,
 ) -> (Vec<MessageEntry>, usize, SearchMethod) {
-    // Sanitize the FTS query
-    let sanitized = sanitize_fts_query(query);
-    if sanitized.is_empty() {
+    // Use the robust sanitizer from the DB crate
+    let sanitized = mcp_agent_mail_db::queries::sanitize_fts_query(query);
+    if sanitized.is_none() {
         return (Vec::new(), 0, SearchMethod::LikeFallback);
     }
+    let fts_query = sanitized.unwrap();
 
     // Build project filter for SQL
     let project_condition = project_filter.map_or_else(String::new, |slug| {
@@ -1815,14 +1816,57 @@ fn search_messages_fts(
          JOIN projects p ON p.id = m.project_id \
          LEFT JOIN message_recipients mr ON mr.message_id = m.id \
          LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-         WHERE fts_messages MATCH '{sanitized}' {project_condition} \
+         WHERE fts_messages MATCH ? {project_condition} \
          GROUP BY m.id \
          ORDER BY rank \
          LIMIT {limit}"
     );
 
     // Try FTS first, fall back to LIKE
-    let results = query_messages(conn, &sql, show_project);
+    // Use parameter for the match expression
+    use mcp_agent_mail_db::sqlmodel_core::Value;
+    let params = vec![Value::Text(fts_query)];
+
+    let rows_result = conn.query_sync(&sql, &params);
+    let results = if let Ok(rows) = rows_result {
+        rows.into_iter()
+            .filter_map(|row| {
+                let created_ts = row.get_named::<i64>("created_ts").ok()?;
+                Some(MessageEntry {
+                    id: row.get_named::<i64>("id").ok()?,
+                    subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                    from_agent: row
+                        .get_named::<String>("sender_name")
+                        .ok()
+                        .unwrap_or_default(),
+                    to_agents: row
+                        .get_named::<String>("to_agents")
+                        .ok()
+                        .unwrap_or_default(),
+                    project_slug: row
+                        .get_named::<String>("project_slug")
+                        .ok()
+                        .unwrap_or_default(),
+                    thread_id: row
+                        .get_named::<String>("thread_id")
+                        .ok()
+                        .unwrap_or_default(),
+                    timestamp_iso: micros_to_iso(created_ts),
+                    timestamp_micros: created_ts,
+                    body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
+                    importance: row
+                        .get_named::<String>("importance")
+                        .ok()
+                        .unwrap_or_else(|| "normal".to_string()),
+                    ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
+                    show_project,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     if !results.is_empty() {
         let total = results.len();
         return (results, total, SearchMethod::Fts);
@@ -1926,29 +1970,6 @@ fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
         .and_then(|row| row.get_named::<i64>("c").ok())
         .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(0)
-}
-
-/// Sanitize an FTS5 query to prevent syntax errors.
-///
-/// Removes FTS5 operators and wraps tokens in double quotes.
-fn sanitize_fts_query(query: &str) -> String {
-    let mut tokens = Vec::new();
-    for word in query.split_whitespace() {
-        // Skip FTS5 operators
-        let w = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
-        if w.is_empty()
-            || w.eq_ignore_ascii_case("AND")
-            || w.eq_ignore_ascii_case("OR")
-            || w.eq_ignore_ascii_case("NOT")
-            || w.eq_ignore_ascii_case("NEAR")
-        {
-            continue;
-        }
-        // Quote the token
-        let escaped = w.replace('"', "");
-        tokens.push(format!("\"{escaped}\""));
-    }
-    tokens.join(" ")
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -3142,6 +3163,10 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use tempfile::tempdir;
+
+    fn sanitize_fts_query(query: &str) -> String {
+        mcp_agent_mail_db::queries::sanitize_fts_query(query).unwrap_or_default()
+    }
 
     // ── Construction ────────────────────────────────────────────────
 

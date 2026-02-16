@@ -1230,6 +1230,54 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
     }
 }
 
+/// Get multiple agents by ID.
+pub async fn get_agents_by_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_ids: &[i64],
+) -> Outcome<Vec<AgentRow>, DbError> {
+    if agent_ids.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let placeholders = placeholders(agent_ids.len());
+    let sql = format!(
+        "SELECT id, project_id, name, program, model, task_description, \
+         inception_ts, last_active_ts, attachments_policy, contact_policy \
+         FROM agents WHERE id IN ({placeholders})"
+    );
+
+    let capped_ids = &agent_ids[..agent_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
+    let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len());
+    for id in capped_ids {
+        params.push(Value::BigInt(*id));
+    }
+
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let agent = decode_agent_row_indexed(&row);
+                crate::cache::read_cache().put_agent(&agent);
+                out.push(agent);
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// List agents for a project
 pub async fn list_agents(
     cx: &Cx,

@@ -134,12 +134,15 @@ fn run_cleanup_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), S
         total_released += expired_ids.len();
 
         // Phase 2: detect and release stale.
-        let stale_count = detect_and_release_stale(config, pool, &cx, *pid).unwrap_or(0);
-        total_released += stale_count;
+        let stale_ids = detect_and_release_stale(config, pool, &cx, *pid).unwrap_or_default();
+        total_released += stale_ids.len();
 
         // Write archive artifacts for released reservations.
         if !expired_ids.is_empty() {
             let _ = write_cleanup_artifacts(config, pool, &cx, *pid, &expired_ids);
+        }
+        if !stale_ids.is_empty() {
+            let _ = write_cleanup_artifacts(config, pool, &cx, *pid, &stale_ids);
         }
     }
 
@@ -178,7 +181,7 @@ fn detect_and_release_stale(
         reservations.iter().filter(|r| r.expires_ts > now).collect();
 
     if active.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let mut stale_ids = Vec::new();
@@ -775,7 +778,7 @@ mod tests {
 
         let released =
             detect_and_release_stale(&config, &pool, &cx, project_id).expect("stale pass");
-        assert_eq!(released, 0);
+        assert!(released.is_empty());
 
         let rows = match fastmcp_core::block_on(async {
             queries::list_file_reservations(&cx, &pool, project_id, false).await
@@ -805,7 +808,8 @@ mod tests {
 
         let released =
             detect_and_release_stale(&config, &pool, &cx, project_id).expect("stale pass");
-        assert_eq!(released, 1);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0], reservation_id);
 
         let rows = match fastmcp_core::block_on(async {
             queries::list_file_reservations(&cx, &pool, project_id, false).await
