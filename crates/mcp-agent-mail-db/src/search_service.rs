@@ -23,7 +23,7 @@ use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
 
-use asupersync::{Cx, Outcome};
+use asupersync::{Budget, Cx, Outcome, Time};
 #[cfg(feature = "hybrid")]
 use half::f16;
 use mcp_agent_mail_search_core::{
@@ -751,7 +751,7 @@ impl TwoTierBridge {
             return Vec::new();
         }
 
-        let remaining_ms = cx.budget().remaining_cost().unwrap_or(u64::MAX);
+        let remaining_ms = request_budget_remaining_ms(cx).unwrap_or(u64::MAX);
         let fast_first_budget_ms = two_tier_fast_first_budget_ms();
         let prefer_fast_first = remaining_ms <= fast_first_budget_ms;
 
@@ -1007,6 +1007,116 @@ const DEFAULT_RERANK_MODEL_NAME: &str = "flashrank";
 const AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS_ENV: &str = "AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS";
 #[cfg(feature = "hybrid")]
 const DEFAULT_TWO_TIER_FAST_FIRST_BUDGET_MS: u64 = 150;
+const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_ENABLED_ENV: &str =
+    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_ENABLED";
+const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS_ENV: &str =
+    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS";
+const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS_ENV: &str =
+    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS";
+const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS_ENV: &str =
+    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS";
+const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS_ENV: &str =
+    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS";
+const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR_ENV: &str =
+    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR";
+const DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_MS: u64 = 250;
+const DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS: u64 = 120;
+const DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS: u32 = 70;
+const DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS: u32 = 40;
+const DEFAULT_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HybridBudgetGovernorTier {
+    Unlimited,
+    Normal,
+    Tight,
+    Critical,
+}
+
+impl HybridBudgetGovernorTier {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unlimited => "unlimited",
+            Self::Normal => "normal",
+            Self::Tight => "tight",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HybridBudgetGovernorConfig {
+    enabled: bool,
+    tight_ms: u64,
+    critical_ms: u64,
+    tight_scale_bps: u32,
+    critical_scale_bps: u32,
+    result_floor: usize,
+}
+
+impl Default for HybridBudgetGovernorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tight_ms: DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_MS,
+            critical_ms: DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS,
+            tight_scale_bps: DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS,
+            critical_scale_bps: DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS,
+            result_floor: DEFAULT_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HybridBudgetGovernorState {
+    remaining_budget_ms: Option<u64>,
+    tier: HybridBudgetGovernorTier,
+    rerank_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HybridExecutionPlan {
+    derivation: CandidateBudgetDerivation,
+    governor: HybridBudgetGovernorState,
+}
+
+fn wall_clock_now_time() -> Time {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let nanos_u64 = u64::try_from(nanos).unwrap_or(u64::MAX);
+    Time::from_nanos(nanos_u64)
+}
+
+fn saturating_duration_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn deadline_remaining_budget_ms(budget: Budget) -> Option<u64> {
+    if budget.deadline.is_none() {
+        return None;
+    }
+    let now = wall_clock_now_time();
+    Some(
+        budget
+            .remaining_time(now)
+            .map_or(0, saturating_duration_millis),
+    )
+}
+
+fn request_budget_remaining_ms(cx: &Cx) -> Option<u64> {
+    let budget = cx.budget();
+    let deadline_remaining_ms = deadline_remaining_budget_ms(budget);
+    let cost_remaining_ms = budget.remaining_cost();
+
+    match (deadline_remaining_ms, cost_remaining_ms) {
+        (Some(deadline), Some(cost)) => Some(deadline.min(cost)),
+        (Some(deadline), None) => Some(deadline),
+        (None, Some(cost)) => Some(cost),
+        (None, None) => None,
+    }
+}
 
 #[cfg(feature = "hybrid")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1068,7 +1178,6 @@ struct HybridRerankAudit {
     applied_count: usize,
 }
 
-#[cfg(feature = "hybrid")]
 fn parse_env_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -1077,7 +1186,6 @@ fn parse_env_bool(value: &str) -> Option<bool> {
     }
 }
 
-#[cfg(feature = "hybrid")]
 fn env_bool(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
@@ -1085,11 +1193,18 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-#[cfg(feature = "hybrid")]
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(default)
         .clamp(min, max)
 }
@@ -1110,6 +1225,165 @@ fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+fn hybrid_budget_governor_config_from_env() -> HybridBudgetGovernorConfig {
+    let defaults = HybridBudgetGovernorConfig::default();
+    let tight_ms = env_u64(
+        AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS_ENV,
+        defaults.tight_ms,
+        1,
+        60_000,
+    );
+    let critical_ms = env_u64(
+        AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS_ENV,
+        defaults.critical_ms,
+        1,
+        tight_ms,
+    );
+
+    HybridBudgetGovernorConfig {
+        enabled: env_bool(
+            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_ENABLED_ENV,
+            defaults.enabled,
+        ),
+        tight_ms,
+        critical_ms,
+        tight_scale_bps: env_u32(
+            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS_ENV,
+            defaults.tight_scale_bps,
+            1,
+            100,
+        ),
+        critical_scale_bps: env_u32(
+            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS_ENV,
+            defaults.critical_scale_bps,
+            1,
+            100,
+        ),
+        result_floor: env_usize(
+            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR_ENV,
+            defaults.result_floor,
+            1,
+            200,
+        ),
+    }
+}
+
+const fn classify_hybrid_budget_tier(
+    remaining_budget_ms: Option<u64>,
+    config: HybridBudgetGovernorConfig,
+) -> HybridBudgetGovernorTier {
+    match remaining_budget_ms {
+        None => HybridBudgetGovernorTier::Unlimited,
+        Some(remaining) if remaining <= config.critical_ms => HybridBudgetGovernorTier::Critical,
+        Some(remaining) if remaining <= config.tight_ms => HybridBudgetGovernorTier::Tight,
+        Some(_) => HybridBudgetGovernorTier::Normal,
+    }
+}
+
+fn scale_limit_by_bps(limit: usize, scale_bps: u32) -> usize {
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    let scaled = limit_u64.saturating_mul(u64::from(scale_bps)).div_ceil(100);
+    usize::try_from(scaled).unwrap_or(usize::MAX).max(1)
+}
+
+fn apply_hybrid_budget_governor(
+    requested_limit: usize,
+    base_budget: CandidateBudget,
+    remaining_budget_ms: Option<u64>,
+    config: HybridBudgetGovernorConfig,
+) -> (CandidateBudget, HybridBudgetGovernorState) {
+    let tier = classify_hybrid_budget_tier(remaining_budget_ms, config);
+    if !config.enabled {
+        return (
+            base_budget,
+            HybridBudgetGovernorState {
+                remaining_budget_ms,
+                tier,
+                rerank_enabled: true,
+            },
+        );
+    }
+
+    let result_floor = requested_limit.clamp(1, config.result_floor);
+    let (budget, rerank_enabled) = match tier {
+        HybridBudgetGovernorTier::Unlimited | HybridBudgetGovernorTier::Normal => {
+            (base_budget, true)
+        }
+        HybridBudgetGovernorTier::Tight => {
+            let lexical_limit =
+                scale_limit_by_bps(base_budget.lexical_limit, config.tight_scale_bps).max(result_floor);
+            let semantic_limit = if base_budget.semantic_limit == 0 {
+                0
+            } else {
+                scale_limit_by_bps(base_budget.semantic_limit, config.tight_scale_bps).max(1)
+            };
+            let combined_limit = base_budget
+                .combined_limit
+                .min(lexical_limit.saturating_add(semantic_limit))
+                .max(lexical_limit.max(result_floor));
+            (
+                CandidateBudget {
+                    lexical_limit,
+                    semantic_limit,
+                    combined_limit,
+                },
+                false,
+            )
+        }
+        HybridBudgetGovernorTier::Critical => {
+            let lexical_limit = scale_limit_by_bps(base_budget.lexical_limit, config.critical_scale_bps)
+                .max(result_floor);
+            let combined_limit = lexical_limit.max(result_floor);
+            (
+                CandidateBudget {
+                    lexical_limit,
+                    semantic_limit: 0,
+                    combined_limit,
+                },
+                false,
+            )
+        }
+    };
+
+    (
+        budget,
+        HybridBudgetGovernorState {
+            remaining_budget_ms,
+            tier,
+            rerank_enabled,
+        },
+    )
+}
+
+fn derive_hybrid_execution_plan(cx: &Cx, query: &SearchQuery, engine: SearchEngine) -> HybridExecutionPlan {
+    let requested_limit = query.effective_limit();
+    let mode = match engine {
+        SearchEngine::Hybrid => CandidateMode::Hybrid,
+        SearchEngine::Auto => CandidateMode::Auto,
+        _ => CandidateMode::LexicalFallback,
+    };
+    let query_class = QueryClass::classify(&query.text);
+    let mut derivation = CandidateBudget::derive_with_decision(
+        requested_limit,
+        mode,
+        query_class,
+        CandidateBudgetConfig::default(),
+    );
+    let governor_config = hybrid_budget_governor_config_from_env();
+    let remaining_budget_ms = request_budget_remaining_ms(cx);
+    let (governed_budget, governor) = apply_hybrid_budget_governor(
+        requested_limit,
+        derivation.budget,
+        remaining_budget_ms,
+        governor_config,
+    );
+    derivation.budget = governed_budget;
+    HybridExecutionPlan {
+        derivation,
+        governor,
+    }
 }
 
 #[cfg(feature = "hybrid")]
@@ -1372,23 +1646,12 @@ async fn maybe_apply_hybrid_rerank(
 
 fn orchestrate_hybrid_results(
     query: &SearchQuery,
-    engine: SearchEngine,
+    derivation: &CandidateBudgetDerivation,
+    governor: HybridBudgetGovernorState,
     lexical_results: Vec<SearchResult>,
     semantic_results: Vec<SearchResult>,
 ) -> Vec<SearchResult> {
     let requested_limit = query.effective_limit();
-    let mode = match engine {
-        SearchEngine::Hybrid => CandidateMode::Hybrid,
-        SearchEngine::Auto => CandidateMode::Auto,
-        _ => CandidateMode::LexicalFallback,
-    };
-    let query_class = QueryClass::classify(&query.text);
-    let derivation = CandidateBudget::derive_with_decision(
-        requested_limit,
-        mode,
-        query_class,
-        CandidateBudgetConfig::default(),
-    );
     let budget = derivation.budget;
 
     let lexical_hits = lexical_results
@@ -1429,11 +1692,14 @@ fn orchestrate_hybrid_results(
     tracing::debug!(
         target: "search.metrics",
         query = %query.text,
-        mode = ?mode,
-        query_class = ?query_class,
+        mode = ?derivation.decision.mode,
+        query_class = ?derivation.decision.query_class,
         decision_action = ?derivation.decision.chosen_action,
         decision_expected_loss = derivation.decision.chosen_expected_loss,
         decision_confidence = decision_confidence(&derivation.decision),
+        governor_tier = governor.tier.as_str(),
+        governor_remaining_budget_ms = governor.remaining_budget_ms.unwrap_or(u64::MAX),
+        governor_rerank_enabled = governor.rerank_enabled,
         lexical_considered = prepared.counts.lexical_considered,
         semantic_considered = prepared.counts.semantic_considered,
         lexical_selected = prepared.counts.lexical_selected,
@@ -1442,22 +1708,50 @@ fn orchestrate_hybrid_results(
         duplicates_removed = prepared.counts.duplicates_removed,
         "hybrid candidate orchestration completed"
     );
-    emit_hybrid_budget_evidence(query, mode, &derivation, &prepared.counts);
+    emit_hybrid_budget_evidence(query, derivation, &prepared.counts, governor);
 
     merged
+}
+
+#[cfg(feature = "hybrid")]
+fn rerank_skip_audit_for_governor(
+    governor: HybridBudgetGovernorState,
+    candidate_count: usize,
+) -> HybridRerankAudit {
+    HybridRerankAudit {
+        enabled: false,
+        attempted: false,
+        outcome: format!("skipped_by_budget_governor_{}", governor.tier.as_str()),
+        candidate_count,
+        top_k: 0,
+        min_candidates: 0,
+        blend_policy: None,
+        blend_weight: None,
+        applied_count: 0,
+    }
 }
 
 async fn orchestrate_hybrid_results_with_optional_rerank(
     cx: &Cx,
     query: &SearchQuery,
-    engine: SearchEngine,
+    plan: &HybridExecutionPlan,
     lexical_results: Vec<SearchResult>,
     semantic_results: Vec<SearchResult>,
 ) -> (Vec<SearchResult>, Option<HybridRerankAudit>) {
-    let mut merged = orchestrate_hybrid_results(query, engine, lexical_results, semantic_results);
+    let mut merged = orchestrate_hybrid_results(
+        query,
+        &plan.derivation,
+        plan.governor,
+        lexical_results,
+        semantic_results,
+    );
 
     #[cfg(feature = "hybrid")]
-    let rerank_audit = Some(maybe_apply_hybrid_rerank(cx, query, merged.as_mut_slice()).await);
+    let rerank_audit = Some(if plan.governor.rerank_enabled {
+        maybe_apply_hybrid_rerank(cx, query, merged.as_mut_slice()).await
+    } else {
+        rerank_skip_audit_for_governor(plan.governor, merged.len())
+    });
     #[cfg(not(feature = "hybrid"))]
     let rerank_audit = None;
 
@@ -1530,9 +1824,9 @@ const fn mode_label(mode: CandidateMode) -> &'static str {
 
 fn emit_hybrid_budget_evidence(
     query: &SearchQuery,
-    mode: CandidateMode,
     derivation: &CandidateBudgetDerivation,
     counts: &CandidateStageCounts,
+    governor: HybridBudgetGovernorState,
 ) {
     let confidence = decision_confidence(&derivation.decision);
     let action_label = match derivation.decision.chosen_action {
@@ -1541,6 +1835,7 @@ fn emit_hybrid_budget_evidence(
         mcp_agent_mail_search_core::CandidateBudgetAction::SemanticDominant => "semantic_dominant",
         mcp_agent_mail_search_core::CandidateBudgetAction::LexicalOnly => "lexical_only",
     };
+    let mode = derivation.decision.mode;
     let decision_id = format!(
         "search.hybrid_budget:{}:{}:{}",
         chrono::Utc::now().timestamp_micros(),
@@ -1561,6 +1856,11 @@ fn emit_hybrid_budget_evidence(
             "posterior": derivation.decision.posterior,
             "action_losses": derivation.decision.action_losses,
             "counts": counts,
+            "governor": {
+                "tier": governor.tier.as_str(),
+                "remaining_budget_ms": governor.remaining_budget_ms,
+                "rerank_enabled": governor.rerank_enabled,
+            },
         }),
     );
     entry.expected_loss = Some(derivation.decision.chosen_expected_loss);
@@ -1703,19 +2003,27 @@ pub async fn execute_search(
     // 3) deterministic dedupe + merge prep (mode-aware budgets)
     // 4) optional rerank refinement with graceful fallback.
     if matches!(engine, SearchEngine::Hybrid | SearchEngine::Auto) {
-        if let Some(lexical_results) = try_tantivy_search(query) {
+        let plan = derive_hybrid_execution_plan(cx, query, engine);
+        let mut lexical_query = query.clone();
+        lexical_query.limit = Some(plan.derivation.budget.lexical_limit);
+
+        if let Some(lexical_results) = try_tantivy_search(&lexical_query) {
             // Two-tier semantic candidates are optional; missing bridge degrades
             // to lexical-only while preserving deterministic fusion behavior.
             #[cfg(feature = "hybrid")]
-            let semantic_results =
-                try_two_tier_search_with_cx(cx, query, query.effective_limit()).unwrap_or_default();
+            let semantic_results = if plan.derivation.budget.semantic_limit == 0 {
+                Vec::new()
+            } else {
+                try_two_tier_search_with_cx(cx, query, plan.derivation.budget.semantic_limit)
+                    .unwrap_or_default()
+            };
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
 
             let (raw_results, rerank_audit) = orchestrate_hybrid_results_with_optional_rerank(
                 cx,
                 query,
-                engine,
+                &plan,
                 lexical_results,
                 semantic_results,
             )
@@ -2217,9 +2525,23 @@ mod tests {
         }
     }
 
+    fn passthrough_governor() -> HybridBudgetGovernorState {
+        HybridBudgetGovernorState {
+            remaining_budget_ms: None,
+            tier: HybridBudgetGovernorTier::Unlimited,
+            rerank_enabled: true,
+        }
+    }
+
     #[test]
     fn hybrid_orchestration_keeps_lexical_ordering_deterministic() {
         let query = SearchQuery::messages("incident rollback plan", 1);
+        let derivation = CandidateBudget::derive_with_decision(
+            query.effective_limit(),
+            CandidateMode::Hybrid,
+            QueryClass::classify(&query.text),
+            CandidateBudgetConfig::default(),
+        );
         let lexical = vec![
             result_with_score(10, 0.9),
             result_with_score(20, 0.8),
@@ -2231,7 +2553,13 @@ mod tests {
             result_with_score(30, 0.6),
         ];
 
-        let merged = orchestrate_hybrid_results(&query, SearchEngine::Hybrid, lexical, semantic);
+        let merged = orchestrate_hybrid_results(
+            &query,
+            &derivation,
+            passthrough_governor(),
+            lexical,
+            semantic,
+        );
         let ids = merged.iter().map(|result| result.id).collect::<Vec<_>>();
         assert_eq!(ids, vec![10, 20, 40, 30]);
     }
@@ -2240,13 +2568,25 @@ mod tests {
     fn hybrid_orchestration_respects_requested_limit() {
         let mut query = SearchQuery::messages("search", 1);
         query.limit = Some(2);
+        let derivation = CandidateBudget::derive_with_decision(
+            query.effective_limit(),
+            CandidateMode::Hybrid,
+            QueryClass::classify(&query.text),
+            CandidateBudgetConfig::default(),
+        );
         let lexical = vec![
             result_with_score(1, 0.9),
             result_with_score(2, 0.8),
             result_with_score(3, 0.7),
         ];
 
-        let merged = orchestrate_hybrid_results(&query, SearchEngine::Hybrid, lexical, Vec::new());
+        let merged = orchestrate_hybrid_results(
+            &query,
+            &derivation,
+            passthrough_governor(),
+            lexical,
+            Vec::new(),
+        );
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, 1);
         assert_eq!(merged[1].id, 2);
