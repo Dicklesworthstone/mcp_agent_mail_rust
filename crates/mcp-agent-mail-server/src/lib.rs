@@ -204,6 +204,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
 
         let qt_before = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
         let start = Instant::now();
+        let call_arguments = arguments.clone();
         let out = self.inner.call(ctx, arguments);
         let elapsed = start.elapsed();
         let latency_us =
@@ -223,6 +224,17 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         let result_preview = result_preview_from_mcpresult(&out);
         let (queries, query_time_ms, per_table) = query_delta(&qt_before, &qt_after);
+        if let Ok(contents) = &out {
+            for event in derive_domain_events_from_tool_contents(
+                self.tool_name,
+                Some(&call_arguments),
+                contents,
+                project.as_deref(),
+                agent.as_deref(),
+            ) {
+                emit_tui_event(event);
+            }
+        }
         emit_tui_event(tui_events::MailEvent::tool_call_end(
             self.tool_name,
             duration_ms,
@@ -269,6 +281,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
 
         let qt_before = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
         let start = Instant::now();
+        let call_arguments = arguments.clone();
         Box::pin(async move {
             let out = self.inner.call_async(ctx, arguments).await;
             let is_error = !matches!(out, fastmcp_core::Outcome::Ok(_));
@@ -289,6 +302,17 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
             let result_preview = result_preview_from_outcome(&out);
             let (queries, query_time_ms, per_table) = query_delta(&qt_before, &qt_after);
+            if let fastmcp_core::Outcome::Ok(contents) = &out {
+                for event in derive_domain_events_from_tool_contents(
+                    self.tool_name,
+                    Some(&call_arguments),
+                    contents,
+                    project.as_deref(),
+                    agent.as_deref(),
+                ) {
+                    emit_tui_event(event);
+                }
+            }
             emit_tui_event(tui_events::MailEvent::tool_call_end(
                 self.tool_name,
                 duration_ms,
@@ -4655,6 +4679,30 @@ fn derive_domain_events_from_tool_result(
     let payload =
         parse_call_tool_result_payload(call_result).unwrap_or_else(|| call_result.clone());
     derive_domain_events_from_tool_payload(tool_name, call_args, &payload, project_hint, agent_hint)
+}
+
+fn derive_domain_events_from_tool_contents(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    contents: &[Content],
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) -> Vec<tui_events::MailEvent> {
+    for content in contents {
+        let Content::Text { text } = content else {
+            continue;
+        };
+        if let Some(payload) = parse_text_payload_json(text) {
+            return derive_domain_events_from_tool_payload(
+                tool_name,
+                call_args,
+                &payload,
+                project_hint,
+                agent_hint,
+            );
+        }
+    }
+    Vec::new()
 }
 
 fn log_tool_query_stats(
@@ -12226,6 +12274,52 @@ mod tests {
             }
             other => panic!("expected MessageSent event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn derive_domain_events_from_tool_contents_payload() {
+        let payload = serde_json::json!({
+            "deliveries": [{
+                "project": "alpha",
+                "payload": {
+                    "id": 45,
+                    "from": "RedFox",
+                    "to": ["BlueLake"],
+                    "subject": "From contents",
+                    "thread_id": "br-45"
+                }
+            }],
+            "count": 1
+        });
+        let contents = vec![Content::Text {
+            text: payload.to_string(),
+        }];
+
+        let events = derive_domain_events_from_tool_contents(
+            "send_message",
+            None,
+            &contents,
+            None,
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageSent { id, subject, .. } => {
+                assert_eq!(*id, 45);
+                assert_eq!(subject, "From contents");
+            }
+            other => panic!("expected MessageSent event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_tool_contents_non_json_is_empty() {
+        let contents = vec![Content::Text {
+            text: "not-json".to_string(),
+        }];
+        let events =
+            derive_domain_events_from_tool_contents("send_message", None, &contents, None, None);
+        assert!(events.is_empty());
     }
 
     #[test]

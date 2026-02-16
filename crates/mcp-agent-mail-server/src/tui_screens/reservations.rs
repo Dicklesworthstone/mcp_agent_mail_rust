@@ -54,17 +54,21 @@ struct TtlOverlayRow {
 }
 
 impl ActiveReservation {
-    /// Remaining seconds until expiry, capped at 0.
+    /// Remaining seconds until expiry at `now_micros`, capped at 0.
     #[allow(clippy::cast_sign_loss)]
-    fn remaining_secs(&self) -> u64 {
-        let now = chrono::Utc::now().timestamp_micros();
+    fn remaining_secs_at(&self, now_micros: i64) -> u64 {
         let expires_micros = self.granted_ts.saturating_add(
             i64::try_from(self.ttl_s)
                 .unwrap_or(i64::MAX)
                 .saturating_mul(1_000_000),
         );
-        let remaining = (expires_micros - now) / 1_000_000;
+        let remaining = (expires_micros - now_micros) / 1_000_000;
         if remaining < 0 { 0 } else { remaining as u64 }
+    }
+
+    /// Remaining seconds until expiry, capped at 0.
+    fn remaining_secs(&self) -> u64 {
+        self.remaining_secs_at(chrono::Utc::now().timestamp_micros())
     }
 
     /// Progress ratio (1.0 = full TTL remaining, 0.0 = expired).
@@ -337,21 +341,25 @@ impl ReservationsScreen {
 
     fn rebuild_sorted(&mut self) {
         let show_released = self.show_released;
+        let now_micros = chrono::Utc::now().timestamp_micros();
         let mut entries: Vec<(&String, &ActiveReservation)> = self
             .reservations
             .iter()
             .filter(|(_, r)| show_released || !r.released)
             .collect();
 
-        entries.sort_by(|(_, a), (_, b)| {
+        entries.sort_by(|(ka, a), (kb, b)| {
             let cmp = match self.sort_col {
                 COL_AGENT => a.agent.to_lowercase().cmp(&b.agent.to_lowercase()),
                 COL_PATH => a.path_pattern.cmp(&b.path_pattern),
                 COL_EXCLUSIVE => a.exclusive.cmp(&b.exclusive),
-                COL_TTL => a.remaining_secs().cmp(&b.remaining_secs()),
+                COL_TTL => a
+                    .remaining_secs_at(now_micros)
+                    .cmp(&b.remaining_secs_at(now_micros)),
                 COL_PROJECT => a.project.to_lowercase().cmp(&b.project.to_lowercase()),
                 _ => std::cmp::Ordering::Equal,
             };
+            let cmp = cmp.then_with(|| ka.cmp(kb));
             if self.sort_asc { cmp } else { cmp.reverse() }
         });
 
@@ -656,7 +664,7 @@ impl MailScreen for ReservationsScreen {
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);
         self.last_render_offset.set(ts.offset);
-        render_ttl_overlays(frame, table_area, &ttl_overlay_rows, &tp);
+        render_ttl_overlays(frame, table_area, &ttl_overlay_rows, ts.offset, &tp);
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -729,6 +737,19 @@ const fn compute_table_widths(total_width: u16) -> [u16; 5] {
     [c0, c1, c2, c3, c4]
 }
 
+fn ttl_overlay_window_bounds(
+    total_rows: usize,
+    render_offset: usize,
+    max_visible: usize,
+) -> (usize, usize) {
+    if total_rows == 0 || max_visible == 0 {
+        return (0, 0);
+    }
+    let start = render_offset.min(total_rows);
+    let end = start.saturating_add(max_visible).min(total_rows);
+    (start, end)
+}
+
 fn ttl_fill_color(
     ratio: f64,
     released: bool,
@@ -749,6 +770,7 @@ fn render_ttl_overlays(
     frame: &mut Frame<'_>,
     table_area: Rect,
     rows: &[TtlOverlayRow],
+    render_offset: usize,
     tp: &crate::tui_theme::TuiThemePalette,
 ) {
     if rows.is_empty() || table_area.width < 8 || table_area.height < 4 {
@@ -778,7 +800,8 @@ fn render_ttl_overlays(
 
     let first_row_y = inner.y.saturating_add(1);
     let max_visible = usize::from(inner.height.saturating_sub(1));
-    for (idx, row) in rows.iter().take(max_visible).enumerate() {
+    let (start, end) = ttl_overlay_window_bounds(rows.len(), render_offset, max_visible);
+    for (idx, row) in rows[start..end].iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let y = first_row_y.saturating_add(idx as u16);
         if y >= inner.bottom() {
@@ -1228,10 +1251,53 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_sorted_ttl_ties_are_stable_by_key() {
+        let mut screen = ReservationsScreen::new();
+        screen.sort_col = COL_TTL;
+        screen.sort_asc = true;
+
+        // Equal TTL/granted timestamps force tie-breaking to key order.
+        for path in ["z/**", "a/**", "m/**"] {
+            let key = reservation_key("proj", "BlueLake", path);
+            screen.reservations.insert(
+                key,
+                ActiveReservation {
+                    reservation_id: None,
+                    agent: "BlueLake".into(),
+                    path_pattern: path.into(),
+                    exclusive: true,
+                    granted_ts: 1_000_000,
+                    ttl_s: 600,
+                    project: "proj".into(),
+                    released: false,
+                },
+            );
+        }
+
+        screen.rebuild_sorted();
+        let mut expected = vec![
+            reservation_key("proj", "BlueLake", "a/**"),
+            reservation_key("proj", "BlueLake", "m/**"),
+            reservation_key("proj", "BlueLake", "z/**"),
+        ];
+        expected.sort();
+        assert_eq!(screen.sorted_keys, expected);
+    }
+
+    #[test]
     fn table_widths_cover_full_inner_width() {
         let widths = compute_table_widths(97);
         assert_eq!(widths.iter().copied().sum::<u16>(), 97);
         assert_eq!(widths[COL_TTL], 29);
+    }
+
+    #[test]
+    fn ttl_overlay_window_bounds_respects_offset_and_capacity() {
+        assert_eq!(ttl_overlay_window_bounds(0, 0, 4), (0, 0));
+        assert_eq!(ttl_overlay_window_bounds(10, 0, 3), (0, 3));
+        assert_eq!(ttl_overlay_window_bounds(10, 4, 3), (4, 7));
+        assert_eq!(ttl_overlay_window_bounds(10, 9, 3), (9, 10));
+        assert_eq!(ttl_overlay_window_bounds(10, 42, 3), (10, 10));
     }
 
     #[test]
