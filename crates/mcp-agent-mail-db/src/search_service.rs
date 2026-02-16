@@ -36,8 +36,9 @@ use mcp_agent_mail_search_core::{
     DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
     EmbeddingRequest, EmbeddingResult, FsScoredResult, HashEmbedder, JobMetricsSnapshot, ModelInfo,
     ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult,
-    SearchPhase, TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter,
-    VectorIndex, VectorIndexConfig, fs, get_two_tier_context,
+    SearchPhase, TwoTierAlertConfig, TwoTierAvailability, TwoTierConfig, TwoTierEntry,
+    TwoTierIndex, TwoTierMetrics, TwoTierMetricsSnapshot, VectorFilter, VectorIndex,
+    VectorIndexConfig, fs, get_two_tier_context,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
@@ -546,6 +547,7 @@ pub struct TwoTierIndexingHealth {
     pub quality_coverage_percent: f32,
     pub fast_dimension: usize,
     pub quality_dimension: usize,
+    pub metrics: TwoTierMetricsSnapshot,
 }
 
 #[cfg(not(feature = "hybrid"))]
@@ -745,7 +747,7 @@ where
         ..TwoTierSearchTelemetry::default()
     };
 
-    for phase in phases {
+    if let Some(phase) = phases.into_iter().next() {
         match phase {
             SearchPhase::Initial {
                 results,
@@ -885,6 +887,7 @@ fn build_two_tier_indexing_health(bridge: &TwoTierBridge) -> TwoTierIndexingHeal
     let quality_coverage_ratio = index.quality_coverage();
     let quality_coverage_percent = quality_coverage_ratio * 100.0;
     drop(index);
+    let metrics = bridge.metrics();
 
     TwoTierIndexingHealth {
         availability: bridge.availability().to_string(),
@@ -894,6 +897,7 @@ fn build_two_tier_indexing_health(bridge: &TwoTierBridge) -> TwoTierIndexingHeal
         quality_coverage_percent,
         fast_dimension: bridge.config.fast_dimension,
         quality_dimension: bridge.config.quality_dimension,
+        metrics,
     }
 }
 
@@ -911,6 +915,20 @@ pub const fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
     None
 }
 
+/// Snapshot current two-tier metrics.
+#[cfg(feature = "hybrid")]
+#[must_use]
+pub fn two_tier_metrics_snapshot() -> Option<TwoTierMetricsSnapshot> {
+    let bridge = get_or_init_two_tier_bridge()?;
+    Some(bridge.metrics())
+}
+
+#[cfg(not(feature = "hybrid"))]
+#[must_use]
+pub const fn two_tier_metrics_snapshot() -> Option<()> {
+    None
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Two-Tier Semantic Bridge (auto-initialized, no manual setup)
 // ────────────────────────────────────────────────────────────────────
@@ -919,6 +937,20 @@ pub const fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
 static TWO_TIER_BRIDGE: OnceLock<Option<Arc<TwoTierBridge>>> = OnceLock::new();
 #[cfg(feature = "hybrid")]
 static HYBRID_RERANKER: OnceLock<Option<Arc<fs::FlashRankReranker>>> = OnceLock::new();
+#[cfg(feature = "hybrid")]
+static FAST_ONLY_SEARCH_HINT_EMITTED: OnceLock<()> = OnceLock::new();
+
+#[cfg(feature = "hybrid")]
+fn emit_fast_only_search_hint_once(latency_ms: u64) {
+    if FAST_ONLY_SEARCH_HINT_EMITTED.set(()).is_ok() {
+        tracing::info!(
+            target: "search.two_tier",
+            latency_ms,
+            tip = "Install quality model via `pip install fastembed && python -c \"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')\"`",
+            "Search completed in fast-only mode (quality embedder unavailable)"
+        );
+    }
+}
 
 /// Bridge to the two-tier progressive semantic search system.
 ///
@@ -933,6 +965,8 @@ pub struct TwoTierBridge {
     index: RwLock<TwoTierIndex>,
     /// Configuration (derived from auto-detected embedders).
     config: TwoTierConfig,
+    /// Rolling observability metrics for two-tier search behavior.
+    metrics: Arc<Mutex<TwoTierMetrics>>,
 }
 
 #[cfg(feature = "hybrid")]
@@ -946,8 +980,13 @@ impl TwoTierBridge {
         let ctx = get_two_tier_context();
         let config = ctx.config().clone();
         let index = ctx.create_index();
+        let mut collector = TwoTierMetrics::default();
+        collector.record_init(ctx.init_metrics().clone());
+        collector.record_index(index.metrics());
+        let metrics = Arc::new(Mutex::new(collector));
 
         tracing::info!(
+            target: "search.two_tier",
             availability = %ctx.availability(),
             fast_model = ?ctx.fast_info().map(|i| &i.id),
             quality_model = ?ctx.quality_info().map(|i| &i.id),
@@ -957,6 +996,7 @@ impl TwoTierBridge {
         Self {
             index: RwLock::new(index),
             config,
+            metrics,
         }
     }
 
@@ -968,6 +1008,32 @@ impl TwoTierBridge {
     /// Get a mutable reference to the index (for writes).
     pub fn index_mut(&self) -> std::sync::RwLockWriteGuard<'_, TwoTierIndex> {
         self.index.write().expect("two-tier index lock poisoned")
+    }
+
+    fn update_index_metrics(&self) {
+        let index_metrics = self.index().metrics();
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.record_index(index_metrics);
+        }
+    }
+
+    fn evaluate_alerts(&self) {
+        if let Ok(metrics) = self.metrics.lock() {
+            let _ = metrics.check_alerts(&TwoTierAlertConfig::default());
+        }
+    }
+
+    /// Snapshot current two-tier metrics.
+    #[must_use]
+    pub fn metrics(&self) -> TwoTierMetricsSnapshot {
+        self.update_index_metrics();
+        let snapshot = self
+            .metrics
+            .lock()
+            .map(|metrics| metrics.snapshot())
+            .unwrap_or_default();
+        self.evaluate_alerts();
+        snapshot
     }
 
     /// Check if two-tier search is available (at least fast embedder).
@@ -1064,6 +1130,7 @@ impl TwoTierBridge {
             let index = self.index();
             ctx.create_searcher(&index)
                 .map_or((None, false), |searcher| {
+                    let searcher = searcher.with_metrics_recorder(Arc::clone(&self.metrics));
                     (
                         if force_fast_only {
                             select_initial_two_tier_results(searcher.search(&query.text, limit))
@@ -1081,6 +1148,10 @@ impl TwoTierBridge {
             if force_fast_only {
                 selected.telemetry.fast_only_mode = true;
             }
+            if ctx.availability() == TwoTierAvailability::FastOnly {
+                emit_fast_only_search_hint_once(selected.telemetry.initial_latency_ms.unwrap_or(0));
+            }
+            self.evaluate_alerts();
             return TwoTierSearchOutcome {
                 results: scored_results_to_search_results(selected.results),
                 telemetry: selected.telemetry,
@@ -1125,6 +1196,10 @@ impl TwoTierBridge {
                 Some(fallback_start.elapsed().as_millis() as u64);
         }
         fallback_telemetry.was_refined = false;
+        if ctx.availability() == TwoTierAvailability::FastOnly {
+            emit_fast_only_search_hint_once(fallback_telemetry.initial_latency_ms.unwrap_or(0));
+        }
+        self.evaluate_alerts();
 
         TwoTierSearchOutcome {
             results: scored_results_to_search_results(hits),
@@ -1204,6 +1279,9 @@ impl TwoTierBridge {
         index
             .add_entry(entry)
             .map_err(|e| format!("two-tier index add_entry failed: {e}"))?;
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.record_index(index.metrics());
+        }
         drop(index);
 
         Ok(())
@@ -1214,16 +1292,16 @@ impl TwoTierBridge {
     /// The fallback intentionally keeps `has_quality=false`; this vector only preserves
     /// index-shape invariants and avoids storing all-zero quality rows.
     fn synthesize_quality_fallback(fast_embedding: &[f32], quality_dimension: usize) -> Vec<f32> {
+        const OFFSETS: [f32; 8] = [
+            1.0e-4, 2.0e-4, 3.0e-4, 4.0e-4, 5.0e-4, 6.0e-4, 7.0e-4, 8.0e-4,
+        ];
+
         if quality_dimension == 0 {
             return Vec::new();
         }
         if fast_embedding.is_empty() {
             return vec![1.0e-4; quality_dimension];
         }
-
-        const OFFSETS: [f32; 8] = [
-            1.0e-4, 2.0e-4, 3.0e-4, 4.0e-4, 5.0e-4, 6.0e-4, 7.0e-4, 8.0e-4,
-        ];
 
         let mut fallback = Vec::with_capacity(quality_dimension);
         for i in 0..quality_dimension {
@@ -3839,9 +3917,13 @@ mod tests {
     #[cfg(feature = "hybrid")]
     fn two_tier_test_bridge() -> Arc<TwoTierBridge> {
         let config = mcp_agent_mail_search_core::TwoTierConfig::default();
+        let index = mcp_agent_mail_search_core::TwoTierIndex::new(&config);
+        let mut metrics = TwoTierMetrics::default();
+        metrics.record_index(index.metrics());
         Arc::new(TwoTierBridge {
-            index: std::sync::RwLock::new(mcp_agent_mail_search_core::TwoTierIndex::new(&config)),
+            index: std::sync::RwLock::new(index),
             config,
+            metrics: Arc::new(Mutex::new(metrics)),
         })
     }
 

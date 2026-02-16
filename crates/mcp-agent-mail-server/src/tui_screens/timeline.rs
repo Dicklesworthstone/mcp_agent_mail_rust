@@ -549,6 +549,7 @@ enum TimelineViewMode {
     Events,
     Commits,
     Combined,
+    #[allow(dead_code)] // Will be constructed via keybinding in a future bead.
     LogViewer,
 }
 

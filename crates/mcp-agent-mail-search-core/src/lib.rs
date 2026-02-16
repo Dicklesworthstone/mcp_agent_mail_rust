@@ -60,6 +60,9 @@ pub mod auto_init;
 #[cfg(feature = "semantic")]
 pub mod fs_bridge;
 
+#[cfg(feature = "semantic")]
+pub mod metrics;
+
 // Re-export key types
 pub use canonical::{
     CanonPolicy, canonicalize, canonicalize_and_hash, content_hash, strip_markdown,
@@ -161,6 +164,13 @@ pub use fastembed::{
 pub use auto_init::{
     EmbedderInfo as TwoTierEmbedderInfo, TwoTierAvailability, TwoTierContext, get_two_tier_context,
     is_full_two_tier_available, is_two_tier_available,
+};
+
+#[cfg(feature = "semantic")]
+pub use metrics::{
+    REQUIRED_TWO_TIER_SPANS, TwoTierAggregatedMetrics, TwoTierAlertConfig, TwoTierAlertState,
+    TwoTierIndexMetrics, TwoTierInitMetrics, TwoTierMetrics, TwoTierMetricsSnapshot,
+    TwoTierSearchMetrics,
 };
 
 // frankensearch bridge — re-export conversion utilities and frankensearch types

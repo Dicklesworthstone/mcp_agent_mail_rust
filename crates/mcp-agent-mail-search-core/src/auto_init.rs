@@ -34,16 +34,21 @@
 //! }
 //! ```
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::SearchResult;
 use crate::fastembed::{FastEmbedEmbedder, get_quality_embedder};
 use crate::fs_bridge::{FsEmbedderStack, SyncEmbedderAdapter};
+use crate::metrics::TwoTierInitMetrics;
 use crate::model2vec::{Model2VecEmbedder, get_fast_embedder};
 use crate::two_tier::{TwoTierConfig, TwoTierEmbedder, TwoTierIndex, TwoTierSearcher};
 
 /// Availability status for two-tier search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TwoTierAvailability {
     /// Both fast and quality embedders are available.
     Full,
@@ -80,6 +85,8 @@ pub struct TwoTierContext {
     fast_info: Option<EmbedderInfo>,
     /// Quality embedder info (if available).
     quality_info: Option<EmbedderInfo>,
+    /// Initialization timing and mode metrics.
+    init_metrics: TwoTierInitMetrics,
 }
 
 /// Basic embedder information.
@@ -94,8 +101,22 @@ pub struct EmbedderInfo {
 impl TwoTierContext {
     /// Initialize the context, detecting available embedders.
     fn init() -> Self {
-        let has_fast = get_fast_embedder().is_some();
-        let has_quality = get_quality_embedder().is_some();
+        let _init_span = tracing::info_span!("two_tier.init").entered();
+
+        let init_attempts = next_init_attempt();
+        let init_timestamp = chrono::Utc::now().timestamp();
+
+        let fast_start = Instant::now();
+        let fast_embedder = get_fast_embedder();
+        #[allow(clippy::cast_possible_truncation)]
+        let fast_embedder_load_ms = fast_start.elapsed().as_millis() as u64;
+        let has_fast = fast_embedder.is_some();
+
+        let quality_start = Instant::now();
+        let quality_embedder = get_quality_embedder();
+        #[allow(clippy::cast_possible_truncation)]
+        let quality_embedder_load_ms = quality_start.elapsed().as_millis() as u64;
+        let has_quality = quality_embedder.is_some();
 
         let availability = match (has_fast, has_quality) {
             (true, true) => TwoTierAvailability::Full,
@@ -104,12 +125,12 @@ impl TwoTierContext {
             (false, false) => TwoTierAvailability::None,
         };
 
-        let fast_info = get_fast_embedder().map(|e| EmbedderInfo {
+        let fast_info = fast_embedder.map(|e| EmbedderInfo {
             id: e.id().to_string(),
             dimension: e.dimension(),
         });
 
-        let quality_info = get_quality_embedder().map(|e| EmbedderInfo {
+        let quality_info = quality_embedder.map(|e| EmbedderInfo {
             id: e.id().to_string(),
             dimension: e.dimension(),
         });
@@ -121,18 +142,67 @@ impl TwoTierContext {
             ..TwoTierConfig::default()
         };
 
+        let init_metrics = TwoTierInitMetrics {
+            init_timestamp,
+            fast_embedder_load_ms,
+            quality_embedder_load_ms,
+            availability,
+            init_attempts,
+        };
+
         tracing::info!(
+            target: "search.two_tier",
             availability = %availability,
+            init_attempts,
+            fast_embedder_load_ms,
+            quality_embedder_load_ms,
             fast = ?fast_info.as_ref().map(|i| &i.id),
             quality = ?quality_info.as_ref().map(|i| &i.id),
             "Two-tier search context initialized"
         );
+        match availability {
+            TwoTierAvailability::Full => {
+                tracing::info!(
+                    target: "search.two_tier",
+                    fast_model = ?fast_info.as_ref().map(|i| &i.id),
+                    quality_model = ?quality_info.as_ref().map(|i| &i.id),
+                    fast_embedder_load_ms,
+                    quality_embedder_load_ms,
+                    "Two-tier search initialized: full mode (fast + quality refinement)"
+                );
+            }
+            TwoTierAvailability::FastOnly => {
+                tracing::warn!(
+                    target: "search.two_tier",
+                    fast_model = ?fast_info.as_ref().map(|i| &i.id),
+                    fast_embedder_load_ms,
+                    quality_embedder_load_ms,
+                    install_hint = "pip install fastembed && python -c \"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')\"",
+                    "Two-tier search initialized in FAST-ONLY mode; install MiniLM-L6-v2 to enable quality refinement"
+                );
+            }
+            TwoTierAvailability::QualityOnly => {
+                tracing::warn!(
+                    target: "search.two_tier",
+                    quality_model = ?quality_info.as_ref().map(|i| &i.id),
+                    quality_embedder_load_ms,
+                    "Two-tier search initialized in QUALITY-ONLY mode (fast embedder unavailable)"
+                );
+            }
+            TwoTierAvailability::None => {
+                tracing::warn!(
+                    target: "search.two_tier",
+                    "Two-tier search unavailable; falling back to lexical-only search"
+                );
+            }
+        }
 
         Self {
             availability,
             config,
             fast_info,
             quality_info,
+            init_metrics,
         }
     }
 
@@ -170,6 +240,12 @@ impl TwoTierContext {
     #[must_use]
     pub const fn quality_info(&self) -> Option<&EmbedderInfo> {
         self.quality_info.as_ref()
+    }
+
+    /// Get initialization timing and availability metrics.
+    #[must_use]
+    pub const fn init_metrics(&self) -> &TwoTierInitMetrics {
+        &self.init_metrics
     }
 
     /// Create a new `TwoTierIndex` with this context's configuration.
@@ -311,6 +387,18 @@ impl TwoTierEmbedder for QualityEmbedderWrapper {
 
 /// Global two-tier search context.
 static CONTEXT: OnceLock<TwoTierContext> = OnceLock::new();
+static INIT_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+fn next_init_attempt() -> u32 {
+    let mut current = INIT_ATTEMPTS.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match INIT_ATTEMPTS.compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Get the global two-tier search context.
 ///
@@ -488,6 +576,14 @@ mod tests {
         let ctx = get_two_tier_context();
         let debug = format!("{ctx:?}");
         assert!(debug.contains("TwoTierContext"));
+    }
+
+    #[test]
+    fn context_init_metrics_populated() {
+        let ctx = get_two_tier_context();
+        let metrics = ctx.init_metrics();
+        assert!(metrics.init_attempts >= 1);
+        assert!(metrics.init_timestamp > 0);
     }
 
     // ── Convenience functions ──

@@ -2174,8 +2174,14 @@ e2e_write_server_log_stats() {
     local line_count=0 error_count=0 warn_count=0
     if [ -f "${_E2E_SERVER_LOG}" ]; then
         line_count="$(wc -l < "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
-        error_count="$(grep -ci 'error\|ERROR' "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
-        warn_count="$(grep -ci 'warn\|WARN' "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
+        error_count="$(grep -ci 'error\|ERROR' "$_E2E_SERVER_LOG" 2>/dev/null || true)"
+        warn_count="$(grep -ci 'warn\|WARN' "$_E2E_SERVER_LOG" 2>/dev/null || true)"
+        if [ -z "${error_count}" ]; then
+            error_count="0"
+        fi
+        if [ -z "${warn_count}" ]; then
+            warn_count="0"
+        fi
     fi
 
     # Build per-case line counts JSON
