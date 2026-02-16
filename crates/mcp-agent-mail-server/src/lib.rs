@@ -45,6 +45,7 @@ pub mod tui_action_menu;
 pub mod tui_app;
 pub mod tui_bridge;
 pub mod tui_chrome;
+pub mod tui_compose;
 #[allow(
     clippy::doc_markdown,
     clippy::map_unwrap_or,
