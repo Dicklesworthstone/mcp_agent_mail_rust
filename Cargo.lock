@@ -2426,6 +2426,7 @@ dependencies = [
  "ftui-text",
  "ftui-widgets",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

@@ -87,15 +87,26 @@ http_request() {
     local url="$3"
     shift 3
 
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local case_headers_file="${case_dir}/headers.txt"
+    local case_body_file="${case_dir}/response.txt"
+    local case_status_file="${case_dir}/status.txt"
+    local case_timing_file="${case_dir}/timing.txt"
+    local case_curl_stderr_file="${case_dir}/curl_stderr.txt"
+
     local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    mkdir -p "${case_dir}"
+    e2e_mark_case_start "${case_id}"
 
     local args=(
         -sS
-        -D "${headers_file}"
-        -o "${body_file}"
+        -D "${case_headers_file}"
+        -o "${case_body_file}"
         -w "%{http_code}"
         -X "${method}"
         "${url}"
@@ -107,12 +118,24 @@ http_request() {
     e2e_save_artifact "${case_id}_curl_args.txt" "$(printf "curl -X %q %q %s\n" "${method}" "${url}" "$(printf "%q " "$@")")"
 
     set +e
+    local start_ns end_ns elapsed_ms
+    start_ns="$(date +%s%N)"
     local status
-    status="$(curl "${args[@]}" 2>"${curl_stderr_file}")"
+    status="$(curl "${args[@]}" 2>"${case_curl_stderr_file}")"
     local rc=$?
     set -e
+    end_ns="$(date +%s%N)"
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 
-    echo "${status}" > "${status_file}"
+    echo "${status}" > "${case_status_file}"
+    echo "${elapsed_ms}" > "${case_timing_file}"
+
+    cp "${case_headers_file}" "${headers_file}" 2>/dev/null || true
+    cp "${case_body_file}" "${body_file}" 2>/dev/null || true
+    cp "${case_status_file}" "${status_file}" 2>/dev/null || true
+    cp "${case_timing_file}" "${timing_file}" 2>/dev/null || true
+    cp "${case_curl_stderr_file}" "${curl_stderr_file}" 2>/dev/null || true
+
     if [ "$rc" -ne 0 ]; then
         e2e_fatal "${case_id}: curl failed rc=${rc}"
     fi

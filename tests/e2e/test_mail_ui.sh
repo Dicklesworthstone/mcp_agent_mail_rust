@@ -259,137 +259,86 @@ else:
 http_get() {
     local case_id="$1"
     local url="$2"
-
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
-
-    local start_ns end_ns elapsed_ms
-    start_ns="$(date +%s%N)"
-    set +e
-    local status
-    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
-        -H "authorization: Bearer ${TOKEN}" \
-        "${url}" 2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-    end_ns="$(date +%s%N)"
-    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
-
-    echo "${status}" > "${status_file}"
-    append_network_trace \
-        "${case_id}" "http_get" "GET" "${url}" "${status}" "200" "bearer_valid" "${rc}" "${elapsed_ms}" \
-        "${headers_file}" "${body_file}" "${curl_stderr_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fail "${case_id}: curl failed rc=${rc}"
-        return 1
-    fi
-    if [ "${status}" != "200" ]; then
-        e2e_fail "${case_id}: unexpected HTTP status ${status}"
-        return 1
-    fi
-    return 0
+    http_get_capture "${case_id}" "${url}" "200" "bearer_valid" "authorization: Bearer ${TOKEN}"
 }
 
 http_get_expect_status() {
     local case_id="$1"
     local url="$2"
     local expected_status="$3"
-
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
-
-    local start_ns end_ns elapsed_ms
-    start_ns="$(date +%s%N)"
-    set +e
-    local status
-    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
-        -H "authorization: Bearer ${TOKEN}" \
-        "${url}" 2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-    end_ns="$(date +%s%N)"
-    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
-
-    echo "${status}" > "${status_file}"
-    append_network_trace \
-        "${case_id}" "http_get" "GET" "${url}" "${status}" "${expected_status}" "bearer_valid" "${rc}" "${elapsed_ms}" \
-        "${headers_file}" "${body_file}" "${curl_stderr_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fail "${case_id}: curl failed rc=${rc}"
-        return 1
-    fi
-    if [ "${status}" != "${expected_status}" ]; then
-        e2e_fail "${case_id}: unexpected HTTP status ${status} (expected ${expected_status})"
-        return 1
-    fi
-    return 0
+    http_get_capture "${case_id}" "${url}" "${expected_status}" "bearer_valid" "authorization: Bearer ${TOKEN}"
 }
 
 http_get_expect_status_no_auth() {
     local case_id="$1"
     local url="$2"
     local expected_status="$3"
-
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
-
-    local start_ns end_ns elapsed_ms
-    start_ns="$(date +%s%N)"
-    set +e
-    local status
-    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
-        "${url}" 2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-    end_ns="$(date +%s%N)"
-    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
-
-    echo "${status}" > "${status_file}"
-    append_network_trace \
-        "${case_id}" "http_get" "GET" "${url}" "${status}" "${expected_status}" "none" "${rc}" "${elapsed_ms}" \
-        "${headers_file}" "${body_file}" "${curl_stderr_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fail "${case_id}: curl failed rc=${rc}"
-        return 1
-    fi
-    if [ "${status}" != "${expected_status}" ]; then
-        e2e_fail "${case_id}: unexpected HTTP status ${status} (expected ${expected_status})"
-        return 1
-    fi
-    return 0
+    http_get_capture "${case_id}" "${url}" "${expected_status}" "none"
 }
 
 http_get_expect_status_invalid_token() {
     local case_id="$1"
     local url="$2"
     local expected_status="$3"
+    http_get_capture "${case_id}" "${url}" "${expected_status}" "bearer_invalid" "authorization: Bearer invalid-token"
+}
+
+http_get_capture() {
+    local case_id="$1"
+    local url="$2"
+    local expected_status="$3"
+    local auth_mode="$4"
+    local auth_header="${5:-}"
+
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local case_headers_file="${case_dir}/headers.txt"
+    local case_body_file="${case_dir}/response.txt"
+    local case_status_file="${case_dir}/status.txt"
+    local case_timing_file="${case_dir}/timing.txt"
+    local case_curl_stderr_file="${case_dir}/curl_stderr.txt"
 
     local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    mkdir -p "${case_dir}"
+    e2e_mark_case_start "${case_id}"
+
+    local args=(
+        -sS
+        -D "${case_headers_file}"
+        -o "${case_body_file}"
+        -w "%{http_code}"
+        -X GET
+        "${url}"
+    )
+    if [ -n "${auth_header}" ]; then
+        args+=(-H "${auth_header}")
+    fi
 
     local start_ns end_ns elapsed_ms
     start_ns="$(date +%s%N)"
     set +e
     local status
-    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
-        -H "authorization: Bearer invalid-token" \
-        "${url}" 2>"${curl_stderr_file}")"
+    status="$(curl "${args[@]}" 2>"${case_curl_stderr_file}")"
     local rc=$?
     set -e
     end_ns="$(date +%s%N)"
     elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 
-    echo "${status}" > "${status_file}"
+    echo "${status}" > "${case_status_file}"
+    echo "${elapsed_ms}" > "${case_timing_file}"
+
+    cp "${case_headers_file}" "${headers_file}" 2>/dev/null || true
+    cp "${case_body_file}" "${body_file}" 2>/dev/null || true
+    cp "${case_status_file}" "${status_file}" 2>/dev/null || true
+    cp "${case_timing_file}" "${timing_file}" 2>/dev/null || true
+    cp "${case_curl_stderr_file}" "${curl_stderr_file}" 2>/dev/null || true
+
     append_network_trace \
-        "${case_id}" "http_get" "GET" "${url}" "${status}" "${expected_status}" "bearer_invalid" "${rc}" "${elapsed_ms}" \
+        "${case_id}" "http_get" "GET" "${url}" "${status}" "${expected_status}" "${auth_mode}" "${rc}" "${elapsed_ms}" \
         "${headers_file}" "${body_file}" "${curl_stderr_file}"
     if [ "$rc" -ne 0 ]; then
         e2e_fail "${case_id}: curl failed rc=${rc}"

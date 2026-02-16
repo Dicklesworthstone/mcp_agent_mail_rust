@@ -226,6 +226,8 @@ http_call_json() {
     local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
     mkdir -p "${case_dir}"
 
+    e2e_mark_case_start "${case_id}"
+
     local request_file="${case_dir}/request.json"
     local response_file="${case_dir}/response.json"
     local headers_file="${case_dir}/headers.txt"

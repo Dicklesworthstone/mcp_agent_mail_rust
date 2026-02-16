@@ -216,6 +216,8 @@ pub struct TwoTierIndex {
     project_ids: Vec<Option<i64>>,
     /// Whether each document has a real quality embedding (not zero-filled).
     has_quality_flags: Vec<bool>,
+    /// Cached count of documents with real quality embeddings.
+    quality_doc_count: usize,
     /// Configuration.
     config: TwoTierConfig,
 }
@@ -250,6 +252,7 @@ impl TwoTierIndex {
             doc_kinds: Vec::new(),
             project_ids: Vec::new(),
             has_quality_flags: Vec::new(),
+            quality_doc_count: 0,
             config: config.clone(),
         }
     }
@@ -286,6 +289,7 @@ impl TwoTierIndex {
                 doc_kinds: Vec::new(),
                 project_ids: Vec::new(),
                 has_quality_flags: Vec::new(),
+                quality_doc_count: 0,
                 config: config.clone(),
             });
         }
@@ -336,6 +340,7 @@ impl TwoTierIndex {
             project_ids.push(project_id);
             has_quality_flags.push(has_quality_flag);
         }
+        let quality_doc_count = has_quality_flags.iter().filter(|&&v| v).count();
 
         Ok(Self {
             metadata: TwoTierMetadata {
@@ -354,6 +359,7 @@ impl TwoTierIndex {
             doc_kinds,
             project_ids,
             has_quality_flags,
+            quality_doc_count,
             config: config.clone(),
         })
     }
@@ -385,7 +391,7 @@ impl TwoTierIndex {
     /// Get the count of documents with quality embeddings.
     #[must_use]
     pub fn quality_count(&self) -> usize {
-        self.has_quality_flags.iter().filter(|&&v| v).count()
+        self.quality_doc_count
     }
 
     /// Get quality embedding coverage as a ratio (0.0 to 1.0).
@@ -444,6 +450,7 @@ impl TwoTierIndex {
                 if let Some(emb) = self.quality_embedding(idx) {
                     if is_zero_vector_f16(emb) {
                         self.has_quality_flags[idx] = false;
+                        self.quality_doc_count = self.quality_doc_count.saturating_sub(1);
                         count += 1;
                     }
                 }
@@ -547,7 +554,26 @@ impl TwoTierIndex {
             return Vec::new();
         }
 
-        let mut heap = BinaryHeap::with_capacity(k + 1);
+        let limit = k.min(self.metadata.doc_count);
+        if limit == 1 {
+            let mut best: Option<ScoredEntry> = None;
+            for (idx, embedding) in self
+                .fast_embeddings
+                .chunks_exact(dim)
+                .take(self.metadata.doc_count)
+                .enumerate()
+            {
+                let entry = ScoredEntry {
+                    score: dot_product_f16_simd(embedding, query_vec),
+                    idx,
+                };
+                if best.is_none_or(|current| entry > current) {
+                    best = Some(entry);
+                }
+            }
+            return best.map_or_else(Vec::new, |entry| vec![self.scored_entry_to_result(entry)]);
+        }
+        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
 
         for (idx, embedding) in self
             .fast_embeddings
@@ -557,24 +583,14 @@ impl TwoTierIndex {
         {
             let score = dot_product_f16_simd(embedding, query_vec);
             heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
-            if heap.len() > k {
+            if heap.len() > limit {
                 heap.pop();
             }
         }
 
         heap.into_sorted_vec()
             .into_iter()
-            .map(|std::cmp::Reverse(entry)| ScoredResult {
-                idx: entry.idx,
-                doc_id: self.doc_ids[entry.idx],
-                doc_kind: self
-                    .doc_kinds
-                    .get(entry.idx)
-                    .copied()
-                    .unwrap_or(crate::document::DocKind::Message),
-                project_id: self.project_ids.get(entry.idx).copied().flatten(),
-                score: entry.score,
-            })
+            .map(|std::cmp::Reverse(entry)| self.scored_entry_to_result(entry))
             .collect()
     }
 
@@ -597,7 +613,32 @@ impl TwoTierIndex {
             return Vec::new();
         }
 
-        let mut heap = BinaryHeap::with_capacity(k + 1);
+        let limit = k.min(self.quality_count());
+        if limit == 0 {
+            return Vec::new();
+        }
+        if limit == 1 {
+            let mut best: Option<ScoredEntry> = None;
+            for (idx, (embedding, has_quality)) in self
+                .quality_embeddings
+                .chunks_exact(dim)
+                .zip(self.has_quality_flags.iter().copied())
+                .enumerate()
+            {
+                if !has_quality {
+                    continue;
+                }
+                let entry = ScoredEntry {
+                    score: dot_product_f16_simd(embedding, query_vec),
+                    idx,
+                };
+                if best.is_none_or(|current| entry > current) {
+                    best = Some(entry);
+                }
+            }
+            return best.map_or_else(Vec::new, |entry| vec![self.scored_entry_to_result(entry)]);
+        }
+        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
 
         for (idx, (embedding, has_quality)) in self
             .quality_embeddings
@@ -610,24 +651,14 @@ impl TwoTierIndex {
             }
             let score = dot_product_f16_simd(embedding, query_vec);
             heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
-            if heap.len() > k {
+            if heap.len() > limit {
                 heap.pop();
             }
         }
 
         heap.into_sorted_vec()
             .into_iter()
-            .map(|std::cmp::Reverse(entry)| ScoredResult {
-                idx: entry.idx,
-                doc_id: self.doc_ids[entry.idx],
-                doc_kind: self
-                    .doc_kinds
-                    .get(entry.idx)
-                    .copied()
-                    .unwrap_or(crate::document::DocKind::Message),
-                project_id: self.project_ids.get(entry.idx).copied().flatten(),
-                score: entry.score,
-            })
+            .map(|std::cmp::Reverse(entry)| self.scored_entry_to_result(entry))
             .collect()
     }
 
@@ -698,9 +729,27 @@ impl TwoTierIndex {
         self.doc_kinds.push(doc_kind);
         self.project_ids.push(project_id);
         self.has_quality_flags.push(has_quality_flag);
+        if has_quality_flag {
+            self.quality_doc_count += 1;
+        }
         self.metadata.doc_count += 1;
 
         Ok(())
+    }
+
+    #[inline]
+    fn scored_entry_to_result(&self, entry: ScoredEntry) -> ScoredResult {
+        ScoredResult {
+            idx: entry.idx,
+            doc_id: self.doc_ids[entry.idx],
+            doc_kind: self
+                .doc_kinds
+                .get(entry.idx)
+                .copied()
+                .unwrap_or(crate::document::DocKind::Message),
+            project_id: self.project_ids.get(entry.idx).copied().flatten(),
+            score: entry.score,
+        }
     }
 }
 
@@ -1583,10 +1632,12 @@ mod tests {
         index.doc_kinds.push(crate::document::DocKind::Message);
         index.project_ids.push(Some(1));
         index.has_quality_flags.push(true); // Incorrectly marked as having quality
+        index.quality_doc_count = 1;
         index.metadata.doc_count = 1;
 
         // Before migration: incorrectly marked
         assert!(index.has_quality_flags[0]);
+        assert_eq!(index.quality_count(), 1);
 
         // Run migration
         let migrated = index.migrate_zero_quality_to_no_quality();
@@ -1594,6 +1645,7 @@ mod tests {
 
         // After migration: correctly marked
         assert!(!index.has_quality(0));
+        assert_eq!(index.quality_count(), 0);
     }
 
     #[test]
@@ -2539,6 +2591,86 @@ mod tests {
             .unwrap();
         let results = index.search_fast(&[1.0, 0.0, 0.0, 0.0], 0);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_fast_k_larger_than_doc_count_returns_all_docs() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 10,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(2.0), f16::from_f32(0.0)],
+                quality_embedding: vec![f16::from_f32(0.0), f16::from_f32(0.0)],
+                has_quality: false,
+            })
+            .unwrap();
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 20,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
+                quality_embedding: vec![f16::from_f32(0.0), f16::from_f32(0.0)],
+                has_quality: false,
+            })
+            .unwrap();
+
+        let results = index.search_fast(&[1.0, 0.0], 100);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc_id, 10);
+        assert_eq!(results[1].doc_id, 20);
+    }
+
+    #[test]
+    fn search_quality_k_larger_than_quality_count_returns_quality_docs_only() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 100,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(0.0), f16::from_f32(0.0)],
+                quality_embedding: vec![f16::from_f32(2.0), f16::from_f32(0.0)],
+                has_quality: true,
+            })
+            .unwrap();
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 200,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(0.0), f16::from_f32(0.0)],
+                quality_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
+                has_quality: true,
+            })
+            .unwrap();
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 300,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(0.0), f16::from_f32(0.0)],
+                quality_embedding: vec![f16::from_f32(0.0), f16::from_f32(0.0)],
+                has_quality: false,
+            })
+            .unwrap();
+
+        let results = index.search_quality(&[1.0, 0.0], 100);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc_id, 100);
+        assert_eq!(results[1].doc_id, 200);
     }
 
     #[test]

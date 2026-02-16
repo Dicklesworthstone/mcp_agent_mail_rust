@@ -61,7 +61,8 @@
                   "warning": false
                 }
               },
-              "semantic_indexing": null
+              "semantic_indexing": null,
+              "two_tier_indexing": null
             }
           },
           "normalize": {
@@ -96,7 +97,8 @@
               "/queues/commit_coalescer/latency_p95_ms",
               "/queues/commit_coalescer/latency_p99_ms",
               "/queues/commit_coalescer/over_80_for_s",
-              "/queues/commit_coalescer/warning"
+              "/queues/commit_coalescer/warning",
+              "/two_tier_indexing"
             ]
           }
         }
@@ -2773,7 +2775,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -2928,7 +2930,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -3056,7 +3058,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -3126,8 +3128,8 @@
                   "tools": [
                     {
                       "name": "search_messages",
-                      "summary": "Run FTS5 queries across subject/body text to locate relevant threads.",
-                      "use_when": "Triage or gathering context before editing.",
+                      "summary": "Run full-text search with structured filters and degraded-mode diagnostics.",
+                      "use_when": "Triage context quickly, then branch on explain/diagnostics when degraded fallback appears.",
                       "related": [
                         "fetch_inbox",
                         "summarize_thread"
@@ -3138,8 +3140,12 @@
                       ],
                       "usage_examples": [
                         {
-                          "hint": "FTS",
-                          "sample": "search_messages(project_key='backend', query='\"build plan\" AND users', limit=20)"
+                          "hint": "Filtered recency search",
+                          "sample": "search_messages(project_key='backend', query='migration', ranking='recency', sender='BlueLake', importance='high,urgent', date_from='2026-02-01', date_to='2026-02-15', limit=50)"
+                        },
+                        {
+                          "hint": "Explain + diagnostics",
+                          "sample": "search_messages(project_key='backend', query='\"build plan\" AND users', explain=true, limit=20)"
                         }
                       ],
                       "capabilities": [
@@ -3517,7 +3523,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -3672,7 +3678,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -3800,7 +3806,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -3870,8 +3876,8 @@
                   "tools": [
                     {
                       "name": "search_messages",
-                      "summary": "Run FTS5 queries across subject/body text to locate relevant threads.",
-                      "use_when": "Triage or gathering context before editing.",
+                      "summary": "Run full-text search with structured filters and degraded-mode diagnostics.",
+                      "use_when": "Triage context quickly, then branch on explain/diagnostics when degraded fallback appears.",
                       "related": [
                         "fetch_inbox",
                         "summarize_thread"
@@ -3882,8 +3888,12 @@
                       ],
                       "usage_examples": [
                         {
-                          "hint": "FTS",
-                          "sample": "search_messages(project_key='backend', query='\"build plan\" AND users', limit=20)"
+                          "hint": "Filtered recency search",
+                          "sample": "search_messages(project_key='backend', query='migration', ranking='recency', sender='BlueLake', importance='high,urgent', date_from='2026-02-01', date_to='2026-02-15', limit=50)"
+                        },
+                        {
+                          "hint": "Explain + diagnostics",
+                          "sample": "search_messages(project_key='backend', query='\"build plan\" AND users', explain=true, limit=20)"
                         }
                       ],
                       "capabilities": [

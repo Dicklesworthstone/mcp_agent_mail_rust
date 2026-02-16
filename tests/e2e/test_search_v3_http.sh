@@ -113,23 +113,29 @@ stop_server() {
 http_post() {
     local case_id="$1" url="$2" payload="$3"
     shift 3
-    local headers=(-H "Content-Type: application/json")
-    for h in "$@"; do headers+=(-H "$h"); done
 
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local request_file="${E2E_ARTIFACT_DIR}/${case_id}_request.json"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
     local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    e2e_mark_case_start "${case_id}"
+    if ! e2e_rpc_call_raw "${case_id}" "${url}" "${payload}" "$@"; then
+        :
+    fi
+
+    cp "${case_dir}/request.json" "${request_file}" 2>/dev/null || e2e_save_artifact "${case_id}_request.json" "${payload}"
+    cp "${case_dir}/headers.txt" "${headers_file}" 2>/dev/null || true
+    cp "${case_dir}/response.json" "${body_file}" 2>/dev/null || true
+    cp "${case_dir}/status.txt" "${status_file}" 2>/dev/null || true
+    cp "${case_dir}/timing.txt" "${timing_file}" 2>/dev/null || true
+    cp "${case_dir}/curl_stderr.txt" "${curl_stderr_file}" 2>/dev/null || true
 
     local status
-    status="$(curl -sS \
-        -D "${headers_file}" \
-        -o "${body_file}" \
-        -w "%{http_code}" \
-        -X POST \
-        "${headers[@]}" \
-        -d "${payload}" \
-        "${url}" 2>/dev/null)"
-    echo "${status}" > "${status_file}"
+    status="$(cat "${status_file}" 2>/dev/null || echo "")"
     echo "${status}"
 }
 

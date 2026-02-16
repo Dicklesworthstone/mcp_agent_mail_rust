@@ -7,7 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,6 +29,7 @@ use ftui::{
     Event, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, PackedRgba, Style,
 };
 use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
+use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
 use mcp_agent_mail_db::sqlmodel_core::Value;
@@ -94,6 +95,37 @@ pub enum ActionOutcome {
     Success { operation: String, summary: String },
     /// Operation failed with an error.
     Failure { operation: String, error: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Html,
+    Svg,
+    Text,
+}
+
+impl ExportFormat {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Html => "html",
+            Self::Svg => "svg",
+            Self::Text => "txt",
+        }
+    }
+
+    fn render(self, snapshot: &FrameExportSnapshot) -> String {
+        match self {
+            Self::Html => HtmlExporter::default().export(&snapshot.buffer, &snapshot.pool),
+            Self::Svg => SvgExporter::default().export(&snapshot.buffer, &snapshot.pool),
+            Self::Text => TextExporter::plain().export(&snapshot.buffer, &snapshot.pool),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FrameExportSnapshot {
+    buffer: ftui::Buffer,
+    pool: ftui::GraphemePool,
 }
 
 /// Semantic transition kind inferred from source/destination screen categories.
@@ -278,6 +310,36 @@ fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_sep = false;
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+
+    out.trim_matches('_').to_string()
+}
+
+fn resolve_export_dir_from_sources(
+    env_export_dir: Option<&str>,
+    home_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = env_export_dir.map(str::trim).filter(|v| !v.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = home_dir {
+        return home.join(".mcp_agent_mail").join("exports");
+    }
+    PathBuf::from(".mcp_agent_mail").join("exports")
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -919,6 +981,8 @@ pub struct MailAppModel {
     modal_manager: ModalManager,
     /// Action menu for contextual per-item actions.
     action_menu: ActionMenuManager,
+    /// Export format menu state (`Ctrl+E` to open, `Esc` to close).
+    export_menu_open: bool,
     /// Global focus tracker used for cross-panel spatial navigation.
     focus_manager: FocusManager,
     /// Per-screen last-focused target used for focus memory across switches.
@@ -948,6 +1012,8 @@ pub struct MailAppModel {
     clipboard: Clipboard,
     /// Internal clipboard fallback when terminal clipboard is unavailable.
     internal_clipboard: Option<String>,
+    /// Last fully rendered frame snapshot used for screen export.
+    last_export_snapshot: RefCell<Option<FrameExportSnapshot>>,
     /// Last armed quit confirmation timestamp.
     quit_confirm_armed_at: Option<Instant>,
     /// Input source that armed quit confirmation.
@@ -1021,6 +1087,7 @@ impl MailAppModel {
             toast_focus_index: None,
             modal_manager: ModalManager::new(),
             action_menu: ActionMenuManager::new(),
+            export_menu_open: false,
             focus_manager,
             focus_memory,
             last_content_area: RefCell::new(Rect::new(0, 0, 1, 1)),
@@ -1035,6 +1102,7 @@ impl MailAppModel {
             action_outcomes: Vec::new(),
             clipboard: Clipboard::auto(ftui::TerminalCapabilities::detect()),
             internal_clipboard: None,
+            last_export_snapshot: RefCell::new(None),
             quit_confirm_armed_at: None,
             quit_confirm_source: None,
             compose_state: None,
@@ -1444,6 +1512,89 @@ impl MailAppModel {
                 .icon(icon)
                 .duration(Duration::from_secs(duration)),
         );
+    }
+
+    fn open_export_menu(&mut self) {
+        self.help_visible = false;
+        self.help_scroll = 0;
+        self.export_menu_open = true;
+    }
+
+    fn handle_export_menu_key(&mut self, key: &ftui::KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        match key.code {
+            KeyCode::Escape => {
+                self.export_menu_open = false;
+            }
+            KeyCode::Char('h' | 'H') => {
+                self.export_menu_open = false;
+                self.export_current_snapshot(ExportFormat::Html);
+            }
+            KeyCode::Char('s' | 'S') => {
+                self.export_menu_open = false;
+                self.export_current_snapshot(ExportFormat::Svg);
+            }
+            KeyCode::Char('t' | 'T') => {
+                self.export_menu_open = false;
+                self.export_current_snapshot(ExportFormat::Text);
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_export_dir(&self) -> PathBuf {
+        let env_export = std::env::var("AM_EXPORT_DIR").ok();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        resolve_export_dir_from_sources(env_export.as_deref(), home.as_deref())
+    }
+
+    fn export_snapshot_to_dir(
+        &self,
+        format: ExportFormat,
+        export_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let snapshot = self
+            .last_export_snapshot
+            .borrow()
+            .clone()
+            .ok_or_else(|| "no rendered frame available yet".to_string())?;
+
+        std::fs::create_dir_all(export_dir)
+            .map_err(|e| format!("failed to create export directory: {e}"))?;
+
+        let screen_label = screen_meta(self.screen_manager.active_screen()).short_label;
+        let mut screen_slug = sanitize_filename_component(screen_label);
+        if screen_slug.is_empty() {
+            screen_slug = "screen".to_string();
+        }
+        let timestamp = now_micros();
+        let file_name = format!("am_export_{screen_slug}_{timestamp}.{}", format.extension());
+        let path = export_dir.join(file_name);
+        let rendered = format.render(&snapshot);
+        std::fs::write(&path, rendered).map_err(|e| format!("failed to write export file: {e}"))?;
+        Ok(path)
+    }
+
+    fn export_current_snapshot(&mut self, format: ExportFormat) {
+        let export_dir = self.resolve_export_dir();
+        match self.export_snapshot_to_dir(format, &export_dir) {
+            Ok(path) => {
+                self.notifications.notify(
+                    Toast::new(format!("Exported to {}", path.display()))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(4)),
+                );
+            }
+            Err(error) => {
+                self.notifications.notify(
+                    Toast::new(format!("Export failed: {error}"))
+                        .icon(ToastIcon::Error)
+                        .duration(Duration::from_secs(4)),
+                );
+            }
+        }
     }
 
     /// Route an `Execute` operation to the appropriate handler.
@@ -2224,7 +2375,10 @@ impl MailAppModel {
     }
 
     /// Dispatch a composed message for sending via the server control channel.
-    fn dispatch_compose_send(&mut self, envelope: crate::tui_compose::ComposeEnvelope) -> Cmd<MailMsg> {
+    fn dispatch_compose_send(
+        &mut self,
+        envelope: crate::tui_compose::ComposeEnvelope,
+    ) -> Cmd<MailMsg> {
         let recipients = envelope.to.join(", ");
         if self
             .state
@@ -2929,6 +3083,14 @@ impl Model for MailAppModel {
                     return Cmd::none();
                 }
 
+                // Export format menu (Ctrl+E, traps all while open).
+                if self.export_menu_open {
+                    if let Event::Key(key) = event {
+                        self.handle_export_menu_key(key);
+                    }
+                    return Cmd::none();
+                }
+
                 // Overlay focus trapping: topmost-first precedence.
                 // See `OverlayLayer` for the formal z-order contract.
                 //
@@ -3154,6 +3316,13 @@ impl Model for MailAppModel {
                             && matches!(key.code, KeyCode::Char('p'));
                         if (is_ctrl_p || matches!(key.code, KeyCode::Char(':'))) && !text_mode {
                             self.open_palette();
+                            return Cmd::none();
+                        }
+                        // Ctrl+E: open export format menu.
+                        let is_ctrl_e = key.modifiers.contains(Modifiers::CTRL)
+                            && matches!(key.code, KeyCode::Char('e' | 'E'));
+                        if is_ctrl_e && !text_mode {
+                            self.open_export_menu();
                             return Cmd::none();
                         }
                         // Ctrl+N: open compose overlay.
@@ -3558,7 +3727,12 @@ impl Model for MailAppModel {
                 .unwrap_or(u64::MAX);
         }
 
-        // 4c. Modal dialogs (z=4.5, between toasts and command palette)
+        // 4c. Export menu (z=4.4, between action menu and modal)
+        if self.export_menu_open {
+            render_export_format_menu(area, frame);
+        }
+
+        // 4d. Modal dialogs (z=4.5, between toasts and command palette)
         if self.modal_manager.is_active() {
             let modal_started = Instant::now();
             self.modal_manager.render(area, frame);
@@ -3569,7 +3743,7 @@ impl Model for MailAppModel {
                 .unwrap_or(u64::MAX);
         }
 
-        // 4d. Compose overlay (z=4.7, between modal and palette)
+        // 4e. Compose overlay (z=4.7, between modal and palette)
         if let Some(ref compose) = self.compose_state {
             ComposePanel::new(compose).render(area, frame, &self.state);
         }
@@ -3665,6 +3839,14 @@ impl Model for MailAppModel {
                 self.inspector_show_properties,
             );
         }
+
+        // Keep an exportable snapshot of the last fully rendered frame.
+        self.last_export_snapshot
+            .borrow_mut()
+            .replace(FrameExportSnapshot {
+                buffer: frame.buffer.clone(),
+                pool: frame.pool.clone(),
+            });
     }
 }
 
@@ -4910,6 +5092,50 @@ fn render_message_drag_ghost(state: &TuiSharedState, area: Rect, frame: &mut Fra
         .render(ghost_area, frame);
 }
 
+fn render_export_format_menu(area: Rect, frame: &mut Frame) {
+    if area.width < 24 || area.height < 6 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    Paragraph::new("")
+        .style(Style::default().bg(tp.bg_overlay))
+        .render(area, frame);
+
+    let menu_width = area.width.saturating_sub(4).min(52);
+    let menu_height = 6_u16.min(area.height.saturating_sub(2));
+    let menu_x = area.x + area.width.saturating_sub(menu_width) / 2;
+    let menu_y = area.y + area.height.saturating_sub(menu_height) / 2;
+    let menu = Rect::new(menu_x, menu_y, menu_width, menu_height);
+
+    if menu.width < 6 || menu.height < 4 {
+        return;
+    }
+
+    Paragraph::new("")
+        .style(Style::default().bg(tp.panel_bg))
+        .render(menu, frame);
+
+    render_panel_focus_outline(menu, frame);
+
+    let title_area = Rect::new(menu.x + 2, menu.y + 1, menu.width.saturating_sub(4), 1);
+    Paragraph::new("Export screen snapshot")
+        .style(Style::default().fg(tp.status_accent).bg(tp.panel_bg).bold())
+        .render(title_area, frame);
+
+    let options_area = Rect::new(menu.x + 2, menu.y + 2, menu.width.saturating_sub(4), 1);
+    Paragraph::new("[h] HTML   [s] SVG   [t] Text")
+        .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
+        .render(options_area, frame);
+
+    if menu.height >= 5 {
+        let hint_area = Rect::new(menu.x + 2, menu.y + 4, menu.width.saturating_sub(4), 1);
+        Paragraph::new("Esc to cancel")
+            .style(Style::default().fg(tp.text_muted).bg(tp.panel_bg))
+            .render(hint_area, frame);
+    }
+}
+
 /// Draw a focused-panel outline using the theme's focused border color.
 fn render_panel_focus_outline(area: Rect, frame: &mut Frame) {
     if area.width < 2 || area.height < 2 {
@@ -5490,6 +5716,86 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_e_opens_export_menu() {
+        let mut model = test_model();
+        assert!(!model.export_menu_open);
+        let event = Event::Key(
+            ftui::KeyEvent::new(KeyCode::Char('e')).with_modifiers(ftui::Modifiers::CTRL),
+        );
+        let _ = model.update(MailMsg::Terminal(event));
+        assert!(model.export_menu_open);
+    }
+
+    #[test]
+    fn export_menu_escape_closes() {
+        let mut model = test_model();
+        model.open_export_menu();
+        assert!(model.export_menu_open);
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        let _ = model.update(MailMsg::Terminal(esc));
+        assert!(!model.export_menu_open);
+    }
+
+    #[test]
+    fn export_menu_h_key_closes_when_no_snapshot() {
+        let mut model = test_model();
+        model.open_export_menu();
+        assert!(model.export_menu_open);
+        let h = Event::Key(ftui::KeyEvent::new(KeyCode::Char('h')));
+        let _ = model.update(MailMsg::Terminal(h));
+        assert!(!model.export_menu_open);
+    }
+
+    #[test]
+    fn export_snapshot_to_dir_writes_html_svg_and_text() {
+        let model = test_model();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 30, &mut pool);
+        model.view(&mut frame);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let html = model
+            .export_snapshot_to_dir(ExportFormat::Html, tmp.path())
+            .expect("html export path");
+        let svg = model
+            .export_snapshot_to_dir(ExportFormat::Svg, tmp.path())
+            .expect("svg export path");
+        let text = model
+            .export_snapshot_to_dir(ExportFormat::Text, tmp.path())
+            .expect("text export path");
+
+        assert_eq!(html.extension().and_then(|v| v.to_str()), Some("html"));
+        assert_eq!(svg.extension().and_then(|v| v.to_str()), Some("svg"));
+        assert_eq!(text.extension().and_then(|v| v.to_str()), Some("txt"));
+
+        let html_body = std::fs::read_to_string(&html).expect("read html export");
+        assert!(
+            html_body.contains("<pre"),
+            "html export should contain <pre>"
+        );
+
+        let svg_body = std::fs::read_to_string(&svg).expect("read svg export");
+        assert!(svg_body.contains("<svg"), "svg export should contain <svg>");
+
+        let text_body = std::fs::read_to_string(&text).expect("read text export");
+        assert!(
+            !text_body.contains('\u{001b}'),
+            "plain text export should not include ANSI escapes"
+        );
+    }
+
+    #[test]
+    fn resolve_export_dir_prefers_env_and_falls_back_to_home() {
+        let home = PathBuf::from("/tmp/fake-home");
+        let from_env =
+            resolve_export_dir_from_sources(Some("/tmp/custom-export"), Some(home.as_path()));
+        assert_eq!(from_env, PathBuf::from("/tmp/custom-export"));
+
+        let from_home = resolve_export_dir_from_sources(None, Some(home.as_path()));
+        assert_eq!(from_home, home.join(".mcp_agent_mail").join("exports"));
+    }
+
+    #[test]
     fn deep_link_timeline_switches_to_timeline() {
         use crate::tui_screens::DeepLinkTarget;
         let mut model = test_model();
@@ -5537,7 +5843,8 @@ mod tests {
     fn ctrl_n_opens_compose_overlay() {
         let mut model = test_model();
         assert!(model.compose_state.is_none());
-        let event = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let event =
+            Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
         let _ = model.update(MailMsg::Terminal(event));
         assert!(model.compose_state.is_some());
         assert_eq!(model.topmost_overlay(), OverlayLayer::Compose);
@@ -5552,7 +5859,8 @@ mod tests {
     fn compose_escape_closes_overlay() {
         let mut model = test_model();
         // Open compose
-        let open = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let open =
+            Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
         let _ = model.update(MailMsg::Terminal(open));
         assert!(model.compose_state.is_some());
 
@@ -5572,7 +5880,8 @@ mod tests {
     #[test]
     fn compose_does_not_open_twice() {
         let mut model = test_model();
-        let open = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let open =
+            Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
         let _ = model.update(MailMsg::Terminal(open.clone()));
         assert!(model.compose_state.is_some());
         // Type something into subject to mark state as modified.
@@ -5590,7 +5899,8 @@ mod tests {
         let mut model = test_model();
         let initial_screen = model.active_screen();
         // Open compose
-        let open = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let open =
+            Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
         let _ = model.update(MailMsg::Terminal(open));
         // Press Tab — should be trapped by compose, not switch screens.
         let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
@@ -6800,7 +7110,9 @@ mod tests {
 
     #[test]
     fn palette_db_cache_respects_ttl() {
-        let _serial = PALETTE_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = PALETTE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Reset global cache to avoid test-order dependence.
         let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
         if let Ok(mut guard) = cache.lock() {
@@ -6851,7 +7163,9 @@ mod tests {
 
     #[test]
     fn palette_db_cache_invalidates_when_bridge_snapshot_changes() {
-        let _serial = PALETTE_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = PALETTE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Reset global cache to avoid test-order dependence.
         let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
         if let Ok(mut guard) = cache.lock() {

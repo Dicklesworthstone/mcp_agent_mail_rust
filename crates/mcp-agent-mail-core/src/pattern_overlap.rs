@@ -1,4 +1,4 @@
-use globset::{Glob, GlobMatcher};
+use globset::{Glob, GlobBuilder, GlobMatcher};
 
 fn normalize_pattern(pattern: &str) -> String {
     let mut normalized = pattern.trim().replace('\\', "/");
@@ -22,7 +22,11 @@ pub fn has_glob_meta(s: &str) -> bool {
 impl CompiledPattern {
     pub fn new(raw: &str) -> Self {
         let norm = normalize_pattern(raw);
-        let matcher = Glob::new(&norm).ok().map(|g| g.compile_matcher());
+        let matcher = GlobBuilder::new(&norm)
+            .literal_separator(true)
+            .build()
+            .ok()
+            .map(|g| g.compile_matcher());
         Self { norm, matcher }
     }
 

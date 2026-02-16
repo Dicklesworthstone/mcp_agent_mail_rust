@@ -113,6 +113,13 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
              Consider using a more specific pattern."
         ));
     }
+    // 3. Absolute paths (single leading slash, not UNC paths like //network)
+    if p.starts_with('/') && !p.starts_with("//") {
+        return Some(format!(
+            "Pattern '{p}' looks like an absolute path. \
+             Reservations should use project-relative paths like 'src/module.py'."
+        ));
+    }
 
     None
 }
