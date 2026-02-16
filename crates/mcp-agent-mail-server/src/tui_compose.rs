@@ -613,8 +613,7 @@ impl ComposeState {
                 } else if self.body_cursor_line > 0 {
                     self.body_cursor_line -= 1;
                     let lines = self.body_lines();
-                    self.body_cursor_col =
-                        lines.get(self.body_cursor_line).map_or(0, |l| l.len());
+                    self.body_cursor_col = lines.get(self.body_cursor_line).map_or(0, |l| l.len());
                 }
             }
             KeyCode::Right => {
@@ -639,7 +638,11 @@ impl ComposeState {
                 let line_count = self.body.split('\n').count();
                 if self.body_cursor_line + 1 < line_count {
                     self.body_cursor_line += 1;
-                    let line_len = self.body.split('\n').nth(self.body_cursor_line).map_or(0, str::len);
+                    let line_len = self
+                        .body
+                        .split('\n')
+                        .nth(self.body_cursor_line)
+                        .map_or(0, str::len);
                     self.body_cursor_col = self.body_cursor_col.min(line_len);
                 }
             }
@@ -714,6 +717,77 @@ pub enum ComposeAction {
     Close,
     /// User wants to close but has unsaved changes — show confirmation.
     ConfirmClose,
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ComposeEnvelope — validated send payload
+// ──────────────────────────────────────────────────────────────────────
+
+/// Validated message payload ready for dispatch via `send_message`.
+///
+/// Built from a validated [`ComposeState`] via [`ComposeState::build_envelope`].
+/// The caller (typically `tui_app`) passes this to the async send path.
+#[derive(Debug, Clone)]
+pub struct ComposeEnvelope {
+    /// Sender agent name (always [`OVERSEER_AGENT_NAME`]).
+    pub sender_name: String,
+    /// Primary recipients (To).
+    pub to: Vec<String>,
+    /// Carbon-copy recipients.
+    pub cc: Vec<String>,
+    /// Blind carbon-copy recipients.
+    pub bcc: Vec<String>,
+    /// Message subject line.
+    pub subject: String,
+    /// Markdown body.
+    pub body_md: String,
+    /// Importance level (`"low"`, `"normal"`, `"high"`, `"urgent"`).
+    pub importance: String,
+    /// Optional thread ID for threading.
+    pub thread_id: Option<String>,
+}
+
+impl ComposeState {
+    /// Validate the form and build a [`ComposeEnvelope`] ready for dispatch.
+    ///
+    /// Returns `Err(message)` if validation fails. On success the envelope
+    /// captures all fields needed by `send_message` in the tools layer.
+    pub fn build_envelope(&mut self) -> Result<ComposeEnvelope, String> {
+        self.validate()?;
+
+        let to: Vec<String> = self
+            .to_recipients()
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let cc: Vec<String> = self
+            .cc_recipients()
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let bcc: Vec<String> = self
+            .bcc_recipients()
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+
+        let thread_id = if self.thread_id.trim().is_empty() {
+            None
+        } else {
+            Some(self.thread_id.trim().to_owned())
+        };
+
+        Ok(ComposeEnvelope {
+            sender_name: OVERSEER_AGENT_NAME.to_owned(),
+            to,
+            cc,
+            bcc,
+            subject: self.subject.clone(),
+            body_md: self.body.clone(),
+            importance: self.importance.as_str().to_owned(),
+            thread_id,
+        })
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -798,7 +872,15 @@ impl<'a> ComposePanel<'a> {
             // Label + selected count
             let selected_count = self.state.recipients.iter().filter(|r| r.selected).count();
             let label = format!("To ({selected_count} selected):");
-            self.draw_text(inner.x, y, &label, label_color, COMPOSE_BG, inner.right(), frame);
+            self.draw_text(
+                inner.x,
+                y,
+                &label,
+                label_color,
+                COMPOSE_BG,
+                inner.right(),
+                frame,
+            );
             y += 1;
 
             // Filter bar (when active)
@@ -813,7 +895,15 @@ impl<'a> ComposePanel<'a> {
                 } else {
                     COMPOSE_VALUE_FG
                 };
-                self.draw_text(inner.x, y, filter_display, filter_color, COMPOSE_BG, inner.right(), frame);
+                self.draw_text(
+                    inner.x,
+                    y,
+                    filter_display,
+                    filter_color,
+                    COMPOSE_BG,
+                    inner.right(),
+                    frame,
+                );
                 y += 1;
             }
 
@@ -847,7 +937,15 @@ impl<'a> ComposePanel<'a> {
 
             if filtered.len() > max_rows && y < max_y {
                 let more = format!("  ... +{} more", filtered.len() - max_rows);
-                self.draw_text(inner.x, y, &more, COMPOSE_HINT_FG, COMPOSE_BG, inner.right(), frame);
+                self.draw_text(
+                    inner.x,
+                    y,
+                    &more,
+                    COMPOSE_HINT_FG,
+                    COMPOSE_BG,
+                    inner.right(),
+                    frame,
+                );
                 y += 1;
             }
 
@@ -867,7 +965,15 @@ impl<'a> ComposePanel<'a> {
                 self.state.subject.len(),
                 MAX_SUBJECT_LEN
             );
-            self.draw_text(inner.x, y, &counter, label_color, COMPOSE_BG, inner.right(), frame);
+            self.draw_text(
+                inner.x,
+                y,
+                &counter,
+                label_color,
+                COMPOSE_BG,
+                inner.right(),
+                frame,
+            );
             y += 1;
 
             if y < max_y {
@@ -913,7 +1019,15 @@ impl<'a> ComposePanel<'a> {
                 COMPOSE_LABEL_FG
             };
             let body_label = format!("Body ({} chars):", self.state.body.len());
-            self.draw_text(inner.x, y, &body_label, label_color, COMPOSE_BG, inner.right(), frame);
+            self.draw_text(
+                inner.x,
+                y,
+                &body_label,
+                label_color,
+                COMPOSE_BG,
+                inner.right(),
+                frame,
+            );
             y += 1;
 
             // Body area: use remaining space minus 4 lines (for importance, thread, hints, error)
@@ -951,9 +1065,7 @@ impl<'a> ComposePanel<'a> {
                 );
 
                 // Cursor in body
-                if is_active
-                    && line_idx == self.state.body_cursor_line
-                {
+                if is_active && line_idx == self.state.body_cursor_line {
                     let cursor_x = inner.x + 1 + self.state.body_cursor_col as u16;
                     if cursor_x < inner.right() - 1 {
                         self.set_cursor_cell(cursor_x, y, frame);
@@ -991,15 +1103,39 @@ impl<'a> ComposePanel<'a> {
             } else {
                 COMPOSE_LABEL_FG
             };
-            self.draw_text(inner.x, y, "Importance: ", label_color, COMPOSE_BG, inner.right(), frame);
+            self.draw_text(
+                inner.x,
+                y,
+                "Importance: ",
+                label_color,
+                COMPOSE_BG,
+                inner.right(),
+                frame,
+            );
             let imp_x = inner.x + 12;
             let imp_display = self.state.importance.display();
             let imp_color = self.state.importance.color();
-            self.draw_text(imp_x, y, imp_display, imp_color, COMPOSE_BG, inner.right(), frame);
+            self.draw_text(
+                imp_x,
+                y,
+                imp_display,
+                imp_color,
+                COMPOSE_BG,
+                inner.right(),
+                frame,
+            );
             if is_active {
                 let hint = "  (Space/Enter to cycle)";
                 let hint_x = imp_x + imp_display.len() as u16;
-                self.draw_text(hint_x, y, hint, COMPOSE_HINT_FG, COMPOSE_BG, inner.right(), frame);
+                self.draw_text(
+                    hint_x,
+                    y,
+                    hint,
+                    COMPOSE_HINT_FG,
+                    COMPOSE_BG,
+                    inner.right(),
+                    frame,
+                );
             }
             y += 1;
         }
@@ -1012,7 +1148,15 @@ impl<'a> ComposePanel<'a> {
             } else {
                 COMPOSE_LABEL_FG
             };
-            self.draw_text(inner.x, y, "Thread ID (optional): ", label_color, COMPOSE_BG, inner.right(), frame);
+            self.draw_text(
+                inner.x,
+                y,
+                "Thread ID (optional): ",
+                label_color,
+                COMPOSE_BG,
+                inner.right(),
+                frame,
+            );
             y += 1;
 
             if y < max_y {
@@ -1049,12 +1193,36 @@ impl<'a> ComposePanel<'a> {
         // ── Error / hints ──────────────────────────────────────
         if y < max_y {
             if let Some(err) = &self.state.error {
-                self.draw_text(inner.x, y, err, COMPOSE_ERROR_FG, COMPOSE_BG, inner.right(), frame);
+                self.draw_text(
+                    inner.x,
+                    y,
+                    err,
+                    COMPOSE_ERROR_FG,
+                    COMPOSE_BG,
+                    inner.right(),
+                    frame,
+                );
             } else if self.state.sending {
-                self.draw_text(inner.x, y, "Sending...", COMPOSE_HINT_FG, COMPOSE_BG, inner.right(), frame);
+                self.draw_text(
+                    inner.x,
+                    y,
+                    "Sending...",
+                    COMPOSE_HINT_FG,
+                    COMPOSE_BG,
+                    inner.right(),
+                    frame,
+                );
             } else {
                 let hint = "Tab: next field | Ctrl+Enter: send | Esc: cancel";
-                self.draw_text(inner.x, y, hint, COMPOSE_HINT_FG, COMPOSE_BG, inner.right(), frame);
+                self.draw_text(
+                    inner.x,
+                    y,
+                    hint,
+                    COMPOSE_HINT_FG,
+                    COMPOSE_BG,
+                    inner.right(),
+                    frame,
+                );
             }
         }
     }
@@ -1085,7 +1253,11 @@ impl<'a> ComposePanel<'a> {
 
     #[allow(clippy::unused_self)]
     fn set_cursor_cell(&self, x: u16, y: u16, frame: &mut Frame<'_>) {
-        let mut cell = frame.buffer.get(x, y).copied().unwrap_or_else(|| Cell::from_char(' '));
+        let mut cell = frame
+            .buffer
+            .get(x, y)
+            .copied()
+            .unwrap_or_else(|| Cell::from_char(' '));
         cell.bg = COMPOSE_ACTIVE_BORDER;
         cell.fg = PackedRgba::rgb(0, 0, 0);
         frame.buffer.set_fast(x, y, cell);
@@ -1115,7 +1287,11 @@ impl<'a> ComposePanel<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments, clippy::unused_self, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::unused_self,
+        clippy::cast_possible_truncation
+    )]
     fn draw_bordered_line(
         &self,
         x: u16,
@@ -1308,7 +1484,12 @@ mod tests {
         s.recipients[1].kind = RecipientKind::Cc;
 
         // Re-set with different order
-        s.set_available_agents(vec!["Green".into(), "Blue".into(), "Red".into(), "Gold".into()]);
+        s.set_available_agents(vec![
+            "Green".into(),
+            "Blue".into(),
+            "Red".into(),
+            "Gold".into(),
+        ]);
         assert_eq!(s.recipients.len(), 4);
         let blue = s.recipients.iter().find(|r| r.name == "Blue").unwrap();
         assert!(blue.selected);
@@ -1716,5 +1897,76 @@ mod tests {
         s.subject.clear();
         s.body = "y".into();
         assert!(s.has_unsaved_changes());
+    }
+
+    // ── ComposeEnvelope tests ─────────────────────────────────────────
+
+    #[test]
+    fn envelope_from_valid_state() {
+        let mut s = state_with_agents(&["RedLake", "BluePeak"]);
+        s.recipients[0].selected = true;
+        s.subject = "Test subject".into();
+        s.body = "Hello world".into();
+        s.importance = Importance::High;
+        s.thread_id = "br-123".into();
+
+        let env = s.build_envelope().unwrap();
+        assert_eq!(env.sender_name, OVERSEER_AGENT_NAME);
+        assert_eq!(env.to, vec!["RedLake"]);
+        assert!(env.cc.is_empty());
+        assert!(env.bcc.is_empty());
+        assert_eq!(env.subject, "Test subject");
+        assert_eq!(env.body_md, "Hello world");
+        assert_eq!(env.importance, "high");
+        assert_eq!(env.thread_id, Some("br-123".to_owned()));
+    }
+
+    #[test]
+    fn envelope_fails_without_recipient() {
+        let mut s = state_with_agents(&["RedLake"]);
+        s.subject = "Test".into();
+        s.body = "Body".into();
+        assert!(s.build_envelope().is_err());
+    }
+
+    #[test]
+    fn envelope_cc_and_bcc_routing() {
+        let mut s = state_with_agents(&["RedLake", "BluePeak", "GoldFox"]);
+        s.recipients[0].selected = true;
+        s.recipients[0].kind = RecipientKind::To;
+        s.recipients[1].selected = true;
+        s.recipients[1].kind = RecipientKind::Cc;
+        s.recipients[2].selected = true;
+        s.recipients[2].kind = RecipientKind::Bcc;
+        s.subject = "Routed".into();
+        s.body = "Body".into();
+
+        let env = s.build_envelope().unwrap();
+        assert_eq!(env.to, vec!["RedLake"]);
+        assert_eq!(env.cc, vec!["BluePeak"]);
+        assert_eq!(env.bcc, vec!["GoldFox"]);
+    }
+
+    #[test]
+    fn envelope_empty_thread_id_becomes_none() {
+        let mut s = state_with_agents(&["RedLake"]);
+        s.recipients[0].selected = true;
+        s.subject = "Test".into();
+        s.body = "Body".into();
+        s.thread_id = "   ".into();
+
+        let env = s.build_envelope().unwrap();
+        assert!(env.thread_id.is_none());
+    }
+
+    #[test]
+    fn envelope_importance_defaults_to_normal() {
+        let mut s = state_with_agents(&["RedLake"]);
+        s.recipients[0].selected = true;
+        s.subject = "Test".into();
+        s.body = "Body".into();
+
+        let env = s.build_envelope().unwrap();
+        assert_eq!(env.importance, "normal");
     }
 }
