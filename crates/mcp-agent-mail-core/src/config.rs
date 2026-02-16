@@ -1990,10 +1990,10 @@ fn parse_dotenv_value(raw: &str) -> String {
 
     // Handle double quotes with escapes
     if trimmed.starts_with('"') {
-        let mut chars = trimmed.char_indices().skip(1);
+        let chars = trimmed.char_indices().skip(1);
         let mut escaped = false;
         let mut closing_idx = None;
-        while let Some((i, c)) = chars.next() {
+        for (i, c) in chars {
             if escaped {
                 escaped = false;
             } else if c == '\\' {
@@ -2014,9 +2014,9 @@ fn parse_dotenv_value(raw: &str) -> String {
 
     // Handle single quotes (no escapes)
     if trimmed.starts_with('\'') {
-        let mut chars = trimmed.char_indices().skip(1);
+        let chars = trimmed.char_indices().skip(1);
         let mut closing_idx = None;
-        while let Some((i, c)) = chars.next() {
+        for (i, c) in chars {
             if c == '\'' {
                 closing_idx = Some(i);
                 break;

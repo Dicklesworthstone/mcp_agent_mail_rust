@@ -435,9 +435,13 @@ e2e_case_banner "Timeout probe and post-timeout recovery"
 TIMEOUT_CASE_ID="timeout_probe"
 TIMEOUT_CASE_DIR="${E2E_ARTIFACT_DIR}/${TIMEOUT_CASE_ID}"
 mkdir -p "${TIMEOUT_CASE_DIR}"
+e2e_mark_case_start "${TIMEOUT_CASE_ID}"
 TIMEOUT_ARGS="$(make_args_json "${PROJECT_KEY}" "timeout probe query" "auto" "10")"
 cat > "${TIMEOUT_CASE_DIR}/request.json" <<EOF
 {"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"search_messages","arguments":${TIMEOUT_ARGS}}}
+EOF
+cat > "${TIMEOUT_CASE_DIR}/curl_args.txt" <<EOF
+curl --max-time 0.001 -X POST "${E2E_SERVER_URL}" -H "content-type: application/json" --data "@${TIMEOUT_CASE_DIR}/request.json"
 EOF
 
 set +e

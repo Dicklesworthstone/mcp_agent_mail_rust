@@ -15,11 +15,13 @@ pub struct CompiledPattern {
 }
 
 /// Returns `true` if the string contains glob metacharacters (`*`, `?`, `[`, `{`).
+#[must_use]
 pub fn has_glob_meta(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
 }
 
 impl CompiledPattern {
+    #[must_use]
     pub fn new(raw: &str) -> Self {
         let norm = normalize_pattern(raw);
         let matcher = GlobBuilder::new(&norm)
@@ -31,11 +33,13 @@ impl CompiledPattern {
     }
 
     /// Returns the normalized pattern string.
+    #[must_use]
     pub fn normalized(&self) -> &str {
         &self.norm
     }
 
     /// Returns `true` if the normalized pattern contains glob metacharacters.
+    #[must_use]
     pub fn is_glob(&self) -> bool {
         has_glob_meta(&self.norm)
     }
@@ -43,6 +47,7 @@ impl CompiledPattern {
     /// Returns the first literal segment if it doesn't contain glob chars.
     ///
     /// E.g. `"src/api/*.rs"` → `Some("src")`, `"*.rs"` → `None`.
+    #[must_use]
     pub fn first_literal_segment(&self) -> Option<&str> {
         let seg = self.norm.split('/').next().unwrap_or("");
         if seg.is_empty() || has_glob_meta(seg) {
@@ -55,10 +60,12 @@ impl CompiledPattern {
     /// Returns `true` if the glob matcher matches the given path string.
     ///
     /// Returns `false` if the pattern couldn't be compiled.
+    #[must_use]
     pub fn matches(&self, path: &str) -> bool {
         self.matcher.as_ref().is_some_and(|m| m.is_match(path))
     }
 
+    #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
         if self.norm == other.norm {
             return true;
@@ -137,18 +144,12 @@ fn segment_pair_overlaps(s1: &str, s2: &str) -> bool {
 
     if g1 {
         // s1 glob, s2 literal
-        return match Glob::new(s1) {
-            Ok(g) => g.compile_matcher().is_match(s2),
-            Err(_) => false, // Invalid glob treated as non-matching
-        };
+        return Glob::new(s1).is_ok_and(|g| g.compile_matcher().is_match(s2));
     }
 
     if g2 {
         // s2 glob, s1 literal
-        return match Glob::new(s2) {
-            Ok(g) => g.compile_matcher().is_match(s1),
-            Err(_) => false,
-        };
+        return Glob::new(s2).is_ok_and(|g| g.compile_matcher().is_match(s1));
     }
 
     // Both literal, unequal

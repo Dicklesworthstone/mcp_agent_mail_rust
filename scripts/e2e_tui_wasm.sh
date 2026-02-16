@@ -234,7 +234,16 @@ http_call_json() {
     local timing_file="${case_dir}/timing.txt"
     local status_file="${case_dir}/status.txt"
     local curl_stderr_file="${case_dir}/curl_stderr.txt"
+    local curl_args_file="${case_dir}/curl_args.txt"
     local repro_file="${case_dir}/repro_command.sh"
+
+    local request_flat="${E2E_ARTIFACT_DIR}/${case_id}_request.json"
+    local response_flat="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
+    local headers_flat="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local timing_flat="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
+    local status_flat="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local curl_stderr_flat="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+    local curl_args_flat="${E2E_ARTIFACT_DIR}/${case_id}_curl_args.txt"
 
     printf '{"method":"%s","url":"%s","body":"%s"}\n' \
         "${method}" \
@@ -262,6 +271,14 @@ http_call_json() {
         shift
     done
 
+    {
+        printf "curl"
+        for arg in "${curl_args[@]}"; do
+            printf " %q" "${arg}"
+        done
+        printf "\n"
+    } > "${curl_args_file}"
+
     local timing_line curl_rc status_code
     set +e
     timing_line="$(curl "${curl_args[@]}" 2>"${curl_stderr_file}")"
@@ -271,6 +288,14 @@ http_call_json() {
     printf '%s\n' "${timing_line}" > "${timing_file}"
     status_code="${timing_line%% *}"
     printf '%s\n' "${status_code}" > "${status_file}"
+
+    cp "${request_file}" "${request_flat}" 2>/dev/null || true
+    cp "${response_file}" "${response_flat}" 2>/dev/null || true
+    cp "${headers_file}" "${headers_flat}" 2>/dev/null || true
+    cp "${timing_file}" "${timing_flat}" 2>/dev/null || true
+    cp "${status_file}" "${status_flat}" 2>/dev/null || true
+    cp "${curl_stderr_file}" "${curl_stderr_flat}" 2>/dev/null || true
+    cp "${curl_args_file}" "${curl_args_flat}" 2>/dev/null || true
 
     HTTP_LAST_CASE_DIR="${case_dir}"
     HTTP_LAST_STATUS="${status_code}"

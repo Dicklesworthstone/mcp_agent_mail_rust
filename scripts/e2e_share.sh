@@ -117,6 +117,64 @@ for path in sorted(paths):
 PY
 }
 
+HTTP_LAST_STATUS=""
+HTTP_LAST_CASE_DIR=""
+HTTP_LAST_RESPONSE_FILE=""
+
+http_get_capture() {
+    local case_id="$1"
+    local url="$2"
+    local body_out_file="${3:-}"
+
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local case_headers_file="${case_dir}/headers.txt"
+    local case_body_file="${case_dir}/response.txt"
+    local case_status_file="${case_dir}/status.txt"
+    local case_timing_file="${case_dir}/timing.txt"
+    local case_curl_stderr_file="${case_dir}/curl_stderr.txt"
+
+    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    mkdir -p "${case_dir}"
+    e2e_mark_case_start "${case_id}"
+
+    local start_ns end_ns elapsed_ms
+    start_ns="$(date +%s%N)"
+    set +e
+    local status
+    status="$(curl -sS -D "${case_headers_file}" -o "${case_body_file}" -w "%{http_code}" "${url}" 2>"${case_curl_stderr_file}")"
+    local rc=$?
+    set -e
+    end_ns="$(date +%s%N)"
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    if [ "${rc}" -ne 0 ]; then
+        status="000"
+    fi
+
+    echo "${status}" > "${case_status_file}"
+    echo "${elapsed_ms}" > "${case_timing_file}"
+
+    cp "${case_headers_file}" "${headers_file}" 2>/dev/null || true
+    cp "${case_body_file}" "${body_file}" 2>/dev/null || true
+    cp "${case_status_file}" "${status_file}" 2>/dev/null || true
+    cp "${case_timing_file}" "${timing_file}" 2>/dev/null || true
+    cp "${case_curl_stderr_file}" "${curl_stderr_file}" 2>/dev/null || true
+
+    if [ -n "${body_out_file}" ]; then
+        cp "${case_body_file}" "${body_out_file}" 2>/dev/null || true
+        HTTP_LAST_RESPONSE_FILE="${body_out_file}"
+    else
+        HTTP_LAST_RESPONSE_FILE="${case_body_file}"
+    fi
+    HTTP_LAST_STATUS="${status}"
+    HTTP_LAST_CASE_DIR="${case_dir}"
+}
+
 # ---------------------------------------------------------------------------
 # Seed a realistic mailbox
 # ---------------------------------------------------------------------------
@@ -765,7 +823,8 @@ if e2e_wait_port 127.0.0.1 "${PREVIEW_PORT}" 5; then
     e2e_pass "preview server started on port ${PREVIEW_PORT}"
 
     # Check that we can fetch the index page
-    PREVIEW_RESP="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PREVIEW_PORT}/" 2>/dev/null || echo "000")"
+    http_get_capture "case_15_preview_index" "http://127.0.0.1:${PREVIEW_PORT}/"
+    PREVIEW_RESP="${HTTP_LAST_STATUS}"
     if [ "${PREVIEW_RESP}" = "200" ]; then
         e2e_pass "preview serves index.html (HTTP 200)"
     else
@@ -792,14 +851,18 @@ python3 -m http.server "${CF_PORT}" --bind 127.0.0.1 --directory "${BUNDLE1}" >"
 CF_PID=$!
 
 if e2e_wait_port 127.0.0.1 "${CF_PORT}" 5; then
-    CF_INDEX_STATUS="$(curl -sS -o "${E2E_ARTIFACT_DIR}/case_16_cf_index_body.html" -w "%{http_code}" "http://127.0.0.1:${CF_PORT}/viewer/index.html" 2>/dev/null || echo "000")"
+    http_get_capture "case_16_cf_index" "http://127.0.0.1:${CF_PORT}/viewer/index.html" "${E2E_ARTIFACT_DIR}/case_16_cf_index_body.html"
+    CF_INDEX_STATUS="${HTTP_LAST_STATUS}"
     e2e_assert_eq "CF smoke: index.html returns 200" "200" "${CF_INDEX_STATUS}"
 
     CF_ASSET_PROBE="${E2E_ARTIFACT_DIR}/case_16_cf_asset_probe.txt"
     : >"${CF_ASSET_PROBE}"
+    CF_ASSET_IDX=0
     while IFS= read -r rel; do
         [ -z "${rel}" ] && continue
-        local_status="$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${CF_PORT}/${rel}" 2>/dev/null || echo "000")"
+        CF_ASSET_IDX=$((CF_ASSET_IDX + 1))
+        http_get_capture "case_16_cf_asset_${CF_ASSET_IDX}" "http://127.0.0.1:${CF_PORT}/${rel}"
+        local_status="${HTTP_LAST_STATUS}"
         printf "%s %s\n" "${local_status}" "${rel}" >>"${CF_ASSET_PROBE}"
         if [ "${rel##*/}" = "viewer.js" ] && [ "${local_status}" != "200" ]; then
             e2e_pass "CF optional asset absent: ${rel} (status=${local_status})"
@@ -826,17 +889,22 @@ python3 -m http.server "${GH_PORT}" --bind 127.0.0.1 --directory "${GH_ROOT}" >"
 GH_PID=$!
 
 if e2e_wait_port 127.0.0.1 "${GH_PORT}" 5; then
-    GH_INDEX_STATUS="$(curl -sS -o "${E2E_ARTIFACT_DIR}/case_16_gh_index_body.html" -w "%{http_code}" "http://127.0.0.1:${GH_PORT}/repo/index.html" 2>/dev/null || echo "000")"
+    http_get_capture "case_16_gh_index" "http://127.0.0.1:${GH_PORT}/repo/index.html" "${E2E_ARTIFACT_DIR}/case_16_gh_index_body.html"
+    GH_INDEX_STATUS="${HTTP_LAST_STATUS}"
     e2e_assert_eq "GH smoke: /repo/index.html returns 200" "200" "${GH_INDEX_STATUS}"
 
-    GH_VIEWER_STATUS="$(curl -sS -o "${E2E_ARTIFACT_DIR}/case_16_gh_viewer_body.html" -w "%{http_code}" "http://127.0.0.1:${GH_PORT}/repo/viewer/index.html" 2>/dev/null || echo "000")"
+    http_get_capture "case_16_gh_viewer" "http://127.0.0.1:${GH_PORT}/repo/viewer/index.html" "${E2E_ARTIFACT_DIR}/case_16_gh_viewer_body.html"
+    GH_VIEWER_STATUS="${HTTP_LAST_STATUS}"
     e2e_assert_eq "GH smoke: /repo/viewer/index.html returns 200" "200" "${GH_VIEWER_STATUS}"
 
     GH_ASSET_PROBE="${E2E_ARTIFACT_DIR}/case_16_gh_asset_probe.txt"
     : >"${GH_ASSET_PROBE}"
+    GH_ASSET_IDX=0
     while IFS= read -r rel; do
         [ -z "${rel}" ] && continue
-        local_status="$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${GH_PORT}/repo/${rel}" 2>/dev/null || echo "000")"
+        GH_ASSET_IDX=$((GH_ASSET_IDX + 1))
+        http_get_capture "case_16_gh_asset_${GH_ASSET_IDX}" "http://127.0.0.1:${GH_PORT}/repo/${rel}"
+        local_status="${HTTP_LAST_STATUS}"
         printf "%s %s\n" "${local_status}" "${rel}" >>"${GH_ASSET_PROBE}"
         if [ "${rel}" = "viewer/viewer.js" ] && [ "${local_status}" != "200" ]; then
             e2e_pass "GH optional asset absent: /repo/${rel} (status=${local_status})"
