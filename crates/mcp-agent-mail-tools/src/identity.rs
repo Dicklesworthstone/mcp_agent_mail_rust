@@ -100,6 +100,8 @@ pub struct HealthCheckResponse {
     pub integrity: Option<IntegrityHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_indexing: Option<mcp_agent_mail_db::search_service::SemanticIndexingHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub two_tier_indexing: Option<mcp_agent_mail_db::search_service::TwoTierIndexingHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +388,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             }
         },
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
+        two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),
     };
 
     serde_json::to_string(&response)
@@ -979,6 +982,7 @@ mod tests {
             disk: None,
             integrity: None,
             semantic_indexing: None,
+            two_tier_indexing: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -1272,6 +1276,7 @@ mod tests {
             disk: None,
             integrity: None,
             semantic_indexing: None,
+            two_tier_indexing: None,
         };
         let json_str = serde_json::to_string(&r).unwrap();
         assert!(!json_str.contains("pool_utilization"));
@@ -1279,6 +1284,7 @@ mod tests {
         assert!(!json_str.contains("disk"));
         assert!(!json_str.contains("integrity"));
         assert!(!json_str.contains("semantic_indexing"));
+        assert!(!json_str.contains("two_tier_indexing"));
     }
 
     #[test]

@@ -1261,7 +1261,7 @@ impl MarkdownRenderable for ThreadData {
         _actions: &[String],
     ) -> String {
         let mut md = format!(
-            "## Thread: {} — {}\n**Messages**: {} | **Participants**: {} | **Last activity**: {}\n\n---\n\n",
+            "# Thread: {} — {}\n**Messages**: {} | **Participants**: {} | **Last activity**: {}\n\n---\n\n",
             self.thread_id,
             self.subject,
             self.message_count,

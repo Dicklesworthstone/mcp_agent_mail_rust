@@ -536,6 +536,22 @@ pub struct SemanticIndexingHealth {
     pub metrics: JobMetricsSnapshot,
 }
 
+#[cfg(feature = "hybrid")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwoTierIndexingHealth {
+    pub availability: String,
+    pub total_docs: usize,
+    pub quality_doc_count: usize,
+    pub quality_coverage_ratio: f32,
+    pub quality_coverage_percent: f32,
+    pub fast_dimension: usize,
+    pub quality_dimension: usize,
+}
+
+#[cfg(not(feature = "hybrid"))]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TwoTierIndexingHealth {}
+
 #[cfg(not(feature = "hybrid"))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SemanticIndexingHealth {}
@@ -764,6 +780,40 @@ pub const fn semantic_indexing_health() -> Option<SemanticIndexingHealth> {
     None
 }
 
+#[cfg(feature = "hybrid")]
+fn build_two_tier_indexing_health(bridge: &TwoTierBridge) -> TwoTierIndexingHealth {
+    let index = bridge.index();
+    let total_docs = index.len();
+    let quality_doc_count = index.quality_count();
+    let quality_coverage_ratio = index.quality_coverage();
+    let quality_coverage_percent = quality_coverage_ratio * 100.0;
+    drop(index);
+
+    TwoTierIndexingHealth {
+        availability: bridge.availability().to_string(),
+        total_docs,
+        quality_doc_count,
+        quality_coverage_ratio,
+        quality_coverage_percent,
+        fast_dimension: bridge.config.fast_dimension,
+        quality_dimension: bridge.config.quality_dimension,
+    }
+}
+
+/// Snapshot current two-tier index health, including quality coverage.
+#[cfg(feature = "hybrid")]
+#[must_use]
+pub fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
+    let bridge = get_or_init_two_tier_bridge()?;
+    Some(build_two_tier_indexing_health(&bridge))
+}
+
+#[cfg(not(feature = "hybrid"))]
+#[must_use]
+pub const fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
+    None
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Two-Tier Semantic Bridge (auto-initialized, no manual setup)
 // ────────────────────────────────────────────────────────────────────
@@ -974,13 +1024,23 @@ impl TwoTierBridge {
 
         let doc_id = u64::try_from(doc_id).map_err(|_| "doc_id overflow".to_string())?;
 
+        let has_quality = quality_embedding.is_some();
+        let quality_embedding = quality_embedding.unwrap_or_else(|| {
+            tracing::debug!(
+                target: "search.semantic",
+                doc_id,
+                reason_code = "missing_quality_embedding",
+                fallback = "deterministic_fast_projection",
+                "quality embedding unavailable; using deterministic fallback vector"
+            );
+            Self::synthesize_quality_fallback(&fast_embedding, self.config.quality_dimension)
+        });
+
         let fast_embedding_f16 = fast_embedding
             .into_iter()
             .map(f16::from_f32)
             .collect::<Vec<_>>();
-        let has_quality = quality_embedding.is_some();
         let quality_embedding_f16 = quality_embedding
-            .unwrap_or_else(|| vec![0.0; self.config.quality_dimension])
             .into_iter()
             .map(f16::from_f32)
             .collect::<Vec<_>>();
@@ -1009,6 +1069,35 @@ impl TwoTierBridge {
         drop(index);
 
         Ok(())
+    }
+
+    /// Build a deterministic non-zero fallback vector when quality embeddings are unavailable.
+    ///
+    /// The fallback intentionally keeps `has_quality=false`; this vector only preserves
+    /// index-shape invariants and avoids storing all-zero quality rows.
+    fn synthesize_quality_fallback(fast_embedding: &[f32], quality_dimension: usize) -> Vec<f32> {
+        if quality_dimension == 0 {
+            return Vec::new();
+        }
+        if fast_embedding.is_empty() {
+            return vec![1.0e-4; quality_dimension];
+        }
+
+        const OFFSETS: [f32; 8] = [
+            1.0e-4, 2.0e-4, 3.0e-4, 4.0e-4, 5.0e-4, 6.0e-4, 7.0e-4, 8.0e-4,
+        ];
+
+        let mut fallback = Vec::with_capacity(quality_dimension);
+        for i in 0..quality_dimension {
+            let base = fast_embedding[i % fast_embedding.len()];
+            let offset = OFFSETS[(i / fast_embedding.len()) % OFFSETS.len()];
+            fallback.push(if base.abs() < f32::EPSILON {
+                offset
+            } else {
+                base + offset
+            });
+        }
+        fallback
     }
 }
 
@@ -3147,6 +3236,32 @@ mod tests {
     }
 
     #[cfg(feature = "hybrid")]
+    #[test]
+    fn deterministic_quality_fallback_is_stable_and_non_zero() {
+        let fast = vec![0.0_f32, 0.25, -0.5];
+        let first = TwoTierBridge::synthesize_quality_fallback(&fast, 9);
+        let second = TwoTierBridge::synthesize_quality_fallback(&fast, 9);
+
+        assert_eq!(first, second, "fallback vector must be deterministic");
+        assert_eq!(first.len(), 9);
+        assert!(
+            first.iter().any(|v| v.abs() > f32::EPSILON),
+            "fallback vector should not be all-zero"
+        );
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn deterministic_quality_fallback_handles_empty_inputs() {
+        let fallback = TwoTierBridge::synthesize_quality_fallback(&[], 4);
+        assert_eq!(fallback.len(), 4);
+        assert!(fallback.iter().all(|v| v.abs() > f32::EPSILON));
+
+        let empty = TwoTierBridge::synthesize_quality_fallback(&[1.0, 2.0], 0);
+        assert!(empty.is_empty());
+    }
+
+    #[cfg(feature = "hybrid")]
     #[allow(clippy::cast_possible_truncation)]
     fn make_scored(doc_id: u64, score: f32) -> ScoredResult {
         ScoredResult {
@@ -3389,6 +3504,45 @@ mod tests {
         let query = SearchQuery::messages("auto-init semantic bridge", 1);
         let _ = try_two_tier_search(&query, query.effective_limit());
         assert!(get_two_tier_bridge().is_some());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn two_tier_indexing_health_reports_quality_coverage() {
+        let bridge = two_tier_test_bridge();
+        let config = bridge.config.clone();
+        {
+            let mut index = bridge.index_mut();
+            index
+                .add_entry(TwoTierEntry {
+                    doc_id: 7001,
+                    doc_kind: SearchDocKind::Message,
+                    project_id: Some(77),
+                    fast_embedding: vec![half::f16::from_f32(0.01); config.fast_dimension],
+                    quality_embedding: vec![half::f16::from_f32(0.02); config.quality_dimension],
+                    has_quality: true,
+                })
+                .expect("quality entry should be accepted");
+            index
+                .add_entry(TwoTierEntry {
+                    doc_id: 7002,
+                    doc_kind: SearchDocKind::Message,
+                    project_id: Some(77),
+                    fast_embedding: vec![half::f16::from_f32(0.01); config.fast_dimension],
+                    quality_embedding: vec![half::f16::from_f32(0.02); config.quality_dimension],
+                    has_quality: false,
+                })
+                .expect("no-quality entry should be accepted");
+        }
+
+        let health = build_two_tier_indexing_health(&bridge);
+        assert_eq!(health.total_docs, 2);
+        assert_eq!(health.quality_doc_count, 1);
+        assert!((health.quality_coverage_ratio - 0.5).abs() < 0.001);
+        assert!((health.quality_coverage_percent - 50.0).abs() < 0.001);
+        assert_eq!(health.fast_dimension, config.fast_dimension);
+        assert_eq!(health.quality_dimension, config.quality_dimension);
+        assert!(!health.availability.is_empty());
     }
 
     #[cfg(feature = "hybrid")]

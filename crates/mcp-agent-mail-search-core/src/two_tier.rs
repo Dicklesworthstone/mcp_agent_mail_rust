@@ -571,6 +571,9 @@ impl TwoTierIndex {
         let mut heap = BinaryHeap::with_capacity(k + 1);
 
         for idx in 0..self.metadata.doc_count {
+            if !self.has_quality(idx) {
+                continue;
+            }
             if let Some(embedding) = self.quality_embedding(idx) {
                 let score = dot_product_f16_simd(embedding, query_vec);
                 heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
@@ -602,6 +605,9 @@ impl TwoTierIndex {
         indices
             .iter()
             .map(|&idx| {
+                if !self.has_quality(idx) {
+                    return 0.0;
+                }
                 self.quality_embedding(idx)
                     .map_or(0.0, |emb| dot_product_f16_simd(emb, query_vec))
             })
@@ -2239,5 +2245,79 @@ mod tests {
         for &s in &scores {
             assert!(s.abs() < f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn quality_scores_ignore_docs_without_quality_embeddings() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: None,
+                fast_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
+                quality_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
+                has_quality: true,
+            })
+            .expect("entry with quality should be accepted");
+
+        // This row has a non-zero quality vector but is explicitly marked as no-quality.
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 2,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: None,
+                fast_embedding: vec![f16::from_f32(0.0), f16::from_f32(1.0)],
+                quality_embedding: vec![f16::from_f32(50.0), f16::from_f32(50.0)],
+                has_quality: false,
+            })
+            .expect("entry without quality should be accepted");
+
+        let scores = index.quality_scores_for_indices(&[1.0, 0.0], &[0, 1]);
+        assert_eq!(scores.len(), 2);
+        assert!(scores[0] > 0.9);
+        assert!(scores[1].abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn quality_search_skips_docs_without_quality_embeddings() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 10,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: None,
+                fast_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
+                quality_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
+                has_quality: true,
+            })
+            .expect("quality entry should be accepted");
+
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 11,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: None,
+                fast_embedding: vec![f16::from_f32(0.0), f16::from_f32(1.0)],
+                quality_embedding: vec![f16::from_f32(100.0), f16::from_f32(100.0)],
+                has_quality: false,
+            })
+            .expect("no-quality entry should be accepted");
+
+        let results = index.search_quality(&[1.0, 0.0], 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, 10);
     }
 }
