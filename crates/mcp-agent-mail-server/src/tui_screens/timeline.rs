@@ -280,6 +280,66 @@ impl RenderItem for CombinedTimelineRow {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct CommitTimelineStats {
+    total_commits: usize,
+    unique_authors: usize,
+    active_projects: usize,
+    message_commits: usize,
+    reservation_commits: usize,
+    churn_insertions: usize,
+    churn_deletions: usize,
+    refresh_errors: usize,
+}
+
+impl CommitTimelineStats {
+    fn from_entries(entries: &[CommitTimelineEntry], refresh_errors: usize) -> Self {
+        let mut authors = HashSet::new();
+        let mut projects = HashSet::new();
+        let mut message_commits = 0usize;
+        let mut reservation_commits = 0usize;
+
+        for entry in entries {
+            authors.insert(entry.author.clone());
+            projects.insert(entry.project_slug.clone());
+            match entry.commit_type.as_str() {
+                "message" => message_commits += 1,
+                "file_reservation" => reservation_commits += 1,
+                _ => {}
+            }
+        }
+
+        Self {
+            total_commits: entries.len(),
+            unique_authors: authors.len(),
+            active_projects: projects.len(),
+            message_commits,
+            reservation_commits,
+            churn_insertions: 0,
+            churn_deletions: 0,
+            refresh_errors,
+        }
+    }
+
+    fn summary_line(&self) -> String {
+        let mut summary = format!(
+            "Stats commits:{} authors:{} projects:{} +{} -{} msg:{} resv:{}",
+            self.total_commits,
+            self.unique_authors,
+            self.active_projects,
+            self.churn_insertions,
+            self.churn_deletions,
+            self.message_commits,
+            self.reservation_commits
+        );
+        if self.refresh_errors > 0 {
+            summary.push_str(" errs:");
+            summary.push_str(&self.refresh_errors.to_string());
+        }
+        summary
+    }
+}
+
 impl TimelinePane {
     /// Create a new empty timeline pane.
     #[must_use]
@@ -516,6 +576,8 @@ pub struct TimelineScreen {
     view_mode: TimelineViewMode,
     /// Cached commit timeline rows for commit/combined views.
     commit_entries: Vec<CommitTimelineEntry>,
+    /// Aggregated commit diagnostics and summary counters.
+    commit_stats: CommitTimelineStats,
     /// Last tick when commit rows were refreshed from storage.
     last_commit_refresh_tick: u64,
     /// Log viewer pane used when `view_mode == LogViewer`.
@@ -536,6 +598,7 @@ impl TimelineScreen {
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
             view_mode: TimelineViewMode::Events,
             commit_entries: Vec::new(),
+            commit_stats: CommitTimelineStats::default(),
             last_commit_refresh_tick: 0,
             log_viewer: RefCell::new(crate::console::LogPane::new()),
             persister: None,
@@ -554,6 +617,7 @@ impl TimelineScreen {
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
             view_mode: TimelineViewMode::Events,
             commit_entries: Vec::new(),
+            commit_stats: CommitTimelineStats::default(),
             last_commit_refresh_tick: 0,
             log_viewer: RefCell::new(crate::console::LogPane::new()),
             persister: Some(PreferencePersister::new(config)),
@@ -620,6 +684,7 @@ impl TimelineScreen {
         let cfg = state.config_snapshot();
         if cfg.storage_root.is_empty() {
             self.commit_entries.clear();
+            self.commit_stats = CommitTimelineStats::default();
             self.clamp_cursor_for_mode();
             return;
         }
@@ -630,20 +695,29 @@ impl TimelineScreen {
         project_slugs.dedup();
         if project_slugs.is_empty() {
             self.commit_entries.clear();
+            self.commit_stats = CommitTimelineStats::default();
             self.clamp_cursor_for_mode();
             return;
         }
 
         let root = Path::new(&cfg.storage_root);
         let mut commits = Vec::new();
+        let mut refresh_errors = 0usize;
         for slug in project_slugs {
-            if let Ok(rows) =
-                mcp_agent_mail_storage::get_timeline_commits(root, &slug, COMMIT_LIMIT_PER_PROJECT)
-            {
-                commits.extend(
-                    rows.into_iter()
-                        .map(|entry| CommitTimelineEntry::from_storage(slug.clone(), entry)),
-                );
+            match mcp_agent_mail_storage::get_timeline_commits(
+                root,
+                &slug,
+                COMMIT_LIMIT_PER_PROJECT,
+            ) {
+                Ok(rows) => {
+                    commits.extend(
+                        rows.into_iter()
+                            .map(|entry| CommitTimelineEntry::from_storage(slug.clone(), entry)),
+                    );
+                }
+                Err(_) => {
+                    refresh_errors = refresh_errors.saturating_add(1);
+                }
             }
         }
 
@@ -653,7 +727,20 @@ impl TimelineScreen {
             commits.drain(..keep_from);
         }
 
+        let mut commit_stats = CommitTimelineStats::from_entries(&commits, refresh_errors);
+        let churn_limit = commits.len().max(COMMIT_LIMIT_PER_PROJECT);
+        match mcp_agent_mail_storage::get_recent_commits_extended(root, churn_limit) {
+            Ok(churn_rows) => {
+                commit_stats.churn_insertions = churn_rows.iter().map(|c| c.insertions).sum();
+                commit_stats.churn_deletions = churn_rows.iter().map(|c| c.deletions).sum();
+            }
+            Err(_) => {
+                commit_stats.refresh_errors = commit_stats.refresh_errors.saturating_add(1);
+            }
+        }
+
         self.commit_entries = commits;
+        self.commit_stats = commit_stats;
         if self.pane.follow {
             self.cursor_end();
         } else {
@@ -904,6 +991,7 @@ impl MailScreen for TimelineScreen {
                     frame,
                     split.primary,
                     &self.commit_entries,
+                    &self.commit_stats,
                     self.pane.cursor,
                     self.pane.follow,
                     self.dock,
@@ -921,6 +1009,7 @@ impl MailScreen for TimelineScreen {
                     frame,
                     split.primary,
                     &rows,
+                    &self.commit_stats,
                     self.pane.cursor,
                     self.pane.follow,
                     self.dock,
@@ -1250,6 +1339,7 @@ fn render_commit_timeline(
     frame: &mut Frame<'_>,
     area: Rect,
     commits: &[CommitTimelineEntry],
+    stats: &CommitTimelineStats,
     cursor: usize,
     follow: bool,
     dock: DockLayout,
@@ -1271,14 +1361,24 @@ fn render_commit_timeline(
         String::new()
     };
     let title = format!("Timeline Commits ({pos}){follow_tag}{dock_tag}");
+    let summary = stats.summary_line();
 
-    render_virtualized_rows(frame, area, commits, cursor, &title, list_state);
+    render_virtualized_rows(
+        frame,
+        area,
+        commits,
+        cursor,
+        &title,
+        Some(&summary),
+        list_state,
+    );
 }
 
 fn render_combined_timeline(
     frame: &mut Frame<'_>,
     area: Rect,
     rows: &[CombinedTimelineRow],
+    stats: &CommitTimelineStats,
     cursor: usize,
     follow: bool,
     dock: DockLayout,
@@ -1300,8 +1400,17 @@ fn render_combined_timeline(
         String::new()
     };
     let title = format!("Timeline Combined ({pos}){follow_tag}{dock_tag}");
+    let summary = stats.summary_line();
 
-    render_virtualized_rows(frame, area, rows, cursor, &title, list_state);
+    render_virtualized_rows(
+        frame,
+        area,
+        rows,
+        cursor,
+        &title,
+        Some(&summary),
+        list_state,
+    );
 }
 
 fn render_virtualized_rows<T: RenderItem>(
@@ -1310,6 +1419,7 @@ fn render_virtualized_rows<T: RenderItem>(
     rows: &[T],
     cursor: usize,
     title: &str,
+    summary_line: Option<&str>,
     list_state: &mut VirtualizedListState,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -1320,7 +1430,27 @@ fn render_virtualized_rows<T: RenderItem>(
     let inner_area = block.inner(area);
     block.render(area, frame);
 
-    if inner_area.height == 0 {
+    let mut list_area = inner_area;
+    if let Some(summary) = summary_line.filter(|line| !line.is_empty()) {
+        if inner_area.height == 0 {
+            return;
+        }
+        let summary_area = Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
+        let summary_style = crate::tui_theme::text_meta(&tp);
+        Paragraph::new(Text::from_line(Line::from(Span::styled(
+            summary,
+            summary_style,
+        ))))
+        .render(summary_area, frame);
+        list_area = Rect::new(
+            inner_area.x,
+            inner_area.y.saturating_add(1),
+            inner_area.width,
+            inner_area.height.saturating_sub(1),
+        );
+    }
+
+    if list_area.height == 0 {
         return;
     }
 
@@ -1339,7 +1469,7 @@ fn render_virtualized_rows<T: RenderItem>(
                 .bold(),
         )
         .show_scrollbar(true);
-    StatefulWidget::render(&list, inner_area, frame, list_state);
+    StatefulWidget::render(&list, list_area, frame, list_state);
 }
 
 fn unix_epoch_micros_now() -> Option<i64> {
@@ -1574,6 +1704,25 @@ mod tests {
             severity: event.severity(),
             raw: event,
         });
+    }
+
+    fn make_commit_entry(
+        project_slug: &str,
+        author: &str,
+        commit_type: &str,
+        timestamp_micros: i64,
+    ) -> CommitTimelineEntry {
+        CommitTimelineEntry {
+            project_slug: project_slug.to_string(),
+            short_sha: "deadbeef".to_string(),
+            timestamp_micros,
+            timestamp_label: "00:00:02.000".to_string(),
+            subject: "mail: test".to_string(),
+            commit_type: commit_type.to_string(),
+            sender: Some(author.to_string()),
+            recipients: vec!["SilentOwl".to_string()],
+            author: author.to_string(),
+        }
     }
 
     fn seed_log_filter_fixture(pane: &mut TimelinePane) {
@@ -2367,6 +2516,51 @@ mod tests {
     }
 
     #[test]
+    fn commit_stats_aggregate_projects_authors_and_types() {
+        let entries = vec![
+            make_commit_entry("alpha", "BluePuma", "message", 1_000_000),
+            make_commit_entry("beta", "BluePuma", "chore", 2_000_000),
+            make_commit_entry("beta", "SilentOwl", "file_reservation", 3_000_000),
+        ];
+        let stats = CommitTimelineStats::from_entries(&entries, 2);
+
+        assert_eq!(stats.total_commits, 3);
+        assert_eq!(stats.unique_authors, 2);
+        assert_eq!(stats.active_projects, 2);
+        assert_eq!(stats.message_commits, 1);
+        assert_eq!(stats.reservation_commits, 1);
+        assert_eq!(stats.refresh_errors, 2);
+        assert_eq!(stats.churn_insertions, 0);
+        assert_eq!(stats.churn_deletions, 0);
+    }
+
+    #[test]
+    fn commit_stats_summary_line_includes_churn_and_errors() {
+        let mut stats = CommitTimelineStats {
+            total_commits: 9,
+            unique_authors: 3,
+            active_projects: 2,
+            message_commits: 7,
+            reservation_commits: 1,
+            churn_insertions: 42,
+            churn_deletions: 17,
+            refresh_errors: 1,
+        };
+        let line = stats.summary_line();
+        assert!(line.contains("commits:9"));
+        assert!(line.contains("authors:3"));
+        assert!(line.contains("projects:2"));
+        assert!(line.contains("+42 -17"));
+        assert!(line.contains("msg:7"));
+        assert!(line.contains("resv:1"));
+        assert!(line.contains("errs:1"));
+
+        stats.refresh_errors = 0;
+        let no_err_line = stats.summary_line();
+        assert!(!no_err_line.contains("errs:"));
+    }
+
+    #[test]
     fn combined_rows_sort_by_timestamp_across_event_and_commit_streams() {
         let mut screen = TimelineScreen::new();
         screen.pane.verbosity = VerbosityTier::All;
@@ -2380,17 +2574,9 @@ mod tests {
             3,
             MailEvent::http_request("GET", "/third", 200, 1, "127.0.0.1"),
         );
-        screen.commit_entries.push(CommitTimelineEntry {
-            project_slug: "proj".to_string(),
-            short_sha: "deadbeef".to_string(),
-            timestamp_micros: 2_000_000,
-            timestamp_label: "00:00:02.000".to_string(),
-            subject: "mail: test".to_string(),
-            commit_type: "message".to_string(),
-            sender: Some("BluePuma".to_string()),
-            recipients: vec!["SilentOwl".to_string()],
-            author: "BluePuma".to_string(),
-        });
+        screen
+            .commit_entries
+            .push(make_commit_entry("proj", "BluePuma", "message", 2_000_000));
 
         let rows = screen.combined_rows();
         assert_eq!(rows.len(), 3);
@@ -2403,21 +2589,16 @@ mod tests {
     fn enter_on_commit_view_navigates_to_archive_browser() {
         let mut screen = TimelineScreen::new();
         screen.view_mode = TimelineViewMode::Commits;
-        screen.commit_entries.push(CommitTimelineEntry {
-            project_slug: "proj".to_string(),
-            short_sha: "deadbeef".to_string(),
-            timestamp_micros: 2_000_000,
-            timestamp_label: "00:00:02.000".to_string(),
-            subject: "mail: test".to_string(),
-            commit_type: "message".to_string(),
-            sender: Some("BluePuma".to_string()),
-            recipients: vec!["SilentOwl".to_string()],
-            author: "BluePuma".to_string(),
-        });
+        screen
+            .commit_entries
+            .push(make_commit_entry("proj", "BluePuma", "message", 2_000_000));
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let cmd = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
         assert!(
-            matches!(cmd, Cmd::Msg(MailScreenMsg::Navigate(MailScreenId::ArchiveBrowser))),
+            matches!(
+                cmd,
+                Cmd::Msg(MailScreenMsg::Navigate(MailScreenId::ArchiveBrowser))
+            ),
             "Expected Navigate to ArchiveBrowser"
         );
     }

@@ -702,6 +702,11 @@ const COACH_HINTS: &[CoachHint] = &[
         screen: MailScreenId::Attachments,
         message: "Tip: Enter previews an attachment, / filters by name",
     },
+    CoachHint {
+        id: "archive_browser:navigate",
+        screen: MailScreenId::ArchiveBrowser,
+        message: "Tip: Navigate with j/k, Enter to expand dirs or preview files, Tab to switch panes",
+    },
 ];
 
 /// Manages one-shot dismissible coach hints, persisted across sessions.
@@ -8835,6 +8840,50 @@ mod tests {
         ))));
         assert!(!model.inspector.is_active());
         assert_ne!(model.topmost_overlay(), OverlayLayer::Inspector);
+    }
+
+    #[test]
+    fn inspector_widget_tree_reflects_current_screen_panels() {
+        let mut model = test_model_with_debug(true);
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        let area = Rect::new(0, 0, 120, 40);
+        let chrome = crate::tui_chrome::chrome_layout(area);
+        crate::tui_chrome::record_tab_hit_slots(chrome.tab_bar, &model.mouse_dispatcher);
+
+        let tree = model.build_inspector_widget_tree(
+            area,
+            chrome,
+            MailScreenId::Messages,
+            11,
+            22,
+            33,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        let child_names: Vec<&str> = tree.children.iter().map(|child| child.name.as_str()).collect();
+        let expected_screen_name = format!(
+            "Screen {}",
+            crate::tui_screens::screen_meta(MailScreenId::Messages).short_label
+        );
+
+        assert!(child_names.contains(&"TabBar"));
+        assert!(child_names.iter().any(|name| *name == expected_screen_name));
+        assert!(child_names.contains(&"StatusLine"));
+        assert!(child_names.contains(&"InspectorOverlay"));
+
+        let tab_bar = tree
+            .children
+            .iter()
+            .find(|child| child.name == "TabBar")
+            .expect("tab bar should be present");
+        assert!(
+            !tab_bar.children.is_empty(),
+            "tab bar should expose tab children in inspector tree"
+        );
     }
 
     // ── Coach hint tests ─────────────────────────────────────────

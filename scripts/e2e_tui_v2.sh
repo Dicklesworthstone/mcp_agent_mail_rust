@@ -16,6 +16,7 @@
 #   8. Search field scope filtering
 #   9. Notification queue severity config
 #   10. Reservation expiry warning
+#   11. Contacts graph data path (links + directional message flow)
 #
 # Artifacts:
 #   tests/artifacts/tui_v2/<timestamp>/*
@@ -799,7 +800,10 @@ e2e_save_artifact "case8_search_body.json" "$search_body"
 
 if mcp_ok "$search_body"; then
     search_body_text="$(extract_text "$search_body")"
-    e2e_assert_contains "search finds body-specific term" "$search_body_text" "UniqueBodyABC789"
+    # search_messages results include envelope metadata, not body excerpts; verify the
+    # body-targeted query resolves to the expected message/thread.
+    e2e_assert_contains "search resolves body-specific query to expected message" "$search_body_text" "Regular Subject"
+    e2e_assert_contains "search resolves body-specific query to expected thread" "$search_body_text" "scope-test-2"
     e2e_pass "body search scope works"
 else
     search_body_text="$(extract_text "$search_body")"
@@ -862,7 +866,11 @@ if mcp_ok "$short_reserve"; then
     e2e_assert_contains "short reservation granted" "$reserve_exp_text" "granted"
 
     # Verify reservation appears with expiry time
-    e2e_assert_contains "reservation has expiry timestamp" "$reserve_exp_text" "expires_at"
+    if echo "$reserve_exp_text" | grep -qE "expires_(at|ts)"; then
+        e2e_pass "reservation has expiry timestamp"
+    else
+        e2e_fail "reservation missing expiry timestamp field"
+    fi
     e2e_pass "expiry warning infrastructure present"
 else
     reserve_exp_text="$(extract_text "$short_reserve")"
@@ -903,6 +911,204 @@ if mcp_ok "$short_reserve"; then
 fi
 
 fi
+fi
+
+# ---------------------------------------------------------------------------
+# Case 11: Contacts graph data path (links + directional flow)
+# ---------------------------------------------------------------------------
+e2e_case_banner "test_contacts_graph_data_path"
+
+if case_requires_lookup "test_contacts_graph_data_path"; then
+
+GRAPH_PROJECT="${WORK}/contacts_graph_project"
+mkdir -p "${GRAPH_PROJECT}"
+GRAPH_A="RedHawk"
+GRAPH_B="BlueFalcon"
+GRAPH_C="GreenEagle"
+
+case11_setup="$(mcp_call ensure_project "{\"human_key\": \"${GRAPH_PROJECT}\"}" "case11_setup_project")"
+e2e_save_artifact "case11_setup_project.json" "$case11_setup"
+if mcp_ok "$case11_setup"; then
+    e2e_pass "contacts-graph: project ensured"
+else
+    e2e_fail "contacts-graph: ensure_project failed"
+fi
+
+for agent_name in "$GRAPH_A" "$GRAPH_B" "$GRAPH_C"; do
+    case11_reg="$(mcp_call register_agent "{
+        \"project_key\": \"${GRAPH_PROJECT}\",
+        \"name\": \"${agent_name}\",
+        \"program\": \"e2e-test\",
+        \"model\": \"test\",
+        \"task_description\": \"Contacts graph dataset seed\"
+    }" "case11_register_${agent_name}")"
+    e2e_save_artifact "case11_register_${agent_name}.json" "$case11_reg"
+    if mcp_ok "$case11_reg"; then
+        e2e_pass "contacts-graph: registered ${agent_name}"
+    else
+        e2e_fail "contacts-graph: register_agent failed for ${agent_name}"
+    fi
+done
+
+for agent_name in "$GRAPH_A" "$GRAPH_B" "$GRAPH_C"; do
+    case11_policy="$(mcp_call set_contact_policy "{
+        \"project_key\": \"${GRAPH_PROJECT}\",
+        \"agent_name\": \"${agent_name}\",
+        \"policy\": \"open\"
+    }" "case11_policy_${agent_name}")"
+    e2e_save_artifact "case11_policy_${agent_name}.json" "$case11_policy"
+    if mcp_ok "$case11_policy"; then
+        e2e_pass "contacts-graph: contact policy open for ${agent_name}"
+    else
+        e2e_fail "contacts-graph: set_contact_policy failed for ${agent_name}"
+    fi
+done
+
+# Graph A <-> Graph B approved link
+case11_req_ab="$(mcp_call request_contact "{
+    \"project_key\": \"${GRAPH_PROJECT}\",
+    \"from_agent\": \"${GRAPH_A}\",
+    \"to_agent\": \"${GRAPH_B}\",
+    \"reason\": \"graph-data-approved\"
+}" "case11_request_contact_ab")"
+e2e_save_artifact "case11_request_contact_ab.json" "$case11_req_ab"
+if mcp_ok "$case11_req_ab"; then
+    e2e_pass "contacts-graph: request_contact A->B created"
+else
+    e2e_fail "contacts-graph: request_contact A->B failed"
+fi
+
+case11_resp_ab="$(mcp_call respond_contact "{
+    \"project_key\": \"${GRAPH_PROJECT}\",
+    \"to_agent\": \"${GRAPH_B}\",
+    \"from_agent\": \"${GRAPH_A}\",
+    \"accept\": true
+}" "case11_respond_contact_ab")"
+e2e_save_artifact "case11_respond_contact_ab.json" "$case11_resp_ab"
+if mcp_ok "$case11_resp_ab"; then
+    e2e_pass "contacts-graph: respond_contact A<->B approved"
+else
+    e2e_fail "contacts-graph: respond_contact A<->B failed"
+fi
+
+# Graph A -> Graph C pending link
+case11_req_ac="$(mcp_call request_contact "{
+    \"project_key\": \"${GRAPH_PROJECT}\",
+    \"from_agent\": \"${GRAPH_A}\",
+    \"to_agent\": \"${GRAPH_C}\",
+    \"reason\": \"graph-data-pending\"
+}" "case11_request_contact_ac")"
+e2e_save_artifact "case11_request_contact_ac.json" "$case11_req_ac"
+if mcp_ok "$case11_req_ac"; then
+    e2e_pass "contacts-graph: request_contact A->C created (pending path)"
+else
+    e2e_fail "contacts-graph: request_contact A->C failed"
+fi
+
+# Directional flow seed for graph edge weighting.
+case11_send_flow() {
+    local sender="$1"
+    local recipient="$2"
+    local subject="$3"
+    local case_id="$4"
+    local artifact_name="$5"
+    local send_json=""
+    local send_result=""
+
+    send_json="$(printf '{"project_key":"%s","sender_name":"%s","to":["%s"],"subject":"%s","body_md":"contacts graph flow seed","thread_id":"contacts-graph-flow"}' \
+        "${GRAPH_PROJECT}" "${sender}" "${recipient}" "${subject}")"
+    send_result="$(mcp_call send_message "${send_json}" "${case_id}")"
+    e2e_save_artifact "${artifact_name}" "${send_result}"
+
+    if mcp_ok "${send_result}"; then
+        e2e_pass "contacts-graph: seeded ${subject}"
+    else
+        e2e_fail "contacts-graph: send failed for ${subject}"
+    fi
+}
+
+case11_send_flow "${GRAPH_A}" "${GRAPH_B}" "GraphFlow AB #1" "case11_send_graphflow_ab_1" "case11_send_graphflow_ab_1.json"
+case11_send_flow "${GRAPH_A}" "${GRAPH_B}" "GraphFlow AB #2" "case11_send_graphflow_ab_2" "case11_send_graphflow_ab_2.json"
+case11_send_flow "${GRAPH_B}" "${GRAPH_A}" "GraphFlow BA #1" "case11_send_graphflow_ba_1" "case11_send_graphflow_ba_1.json"
+case11_send_flow "${GRAPH_A}" "${GRAPH_C}" "GraphFlow AC #1" "case11_send_graphflow_ac_1" "case11_send_graphflow_ac_1.json"
+
+case11_contacts_a="$(mcp_call list_contacts "{
+    \"project_key\": \"${GRAPH_PROJECT}\",
+    \"agent_name\": \"${GRAPH_A}\"
+}" "case11_list_contacts_a")"
+e2e_save_artifact "case11_list_contacts_a.json" "$case11_contacts_a"
+if mcp_ok "$case11_contacts_a"; then
+    contacts_a_text="$(extract_text "$case11_contacts_a")"
+    e2e_assert_contains "contacts-graph: list_contacts(A) includes B" "$contacts_a_text" "$GRAPH_B"
+    e2e_assert_contains "contacts-graph: list_contacts(A) includes C" "$contacts_a_text" "$GRAPH_C"
+    e2e_pass "contacts-graph: list_contacts populated"
+else
+    e2e_fail "contacts-graph: list_contacts(A) failed"
+fi
+
+for target in "$GRAPH_A" "$GRAPH_B" "$GRAPH_C"; do
+    inbox_case="case11_fetch_inbox_${target}"
+    inbox_json="$(mcp_call "fetch_inbox" "{
+        \"project_key\": \"${GRAPH_PROJECT}\",
+        \"agent_name\": \"${target}\",
+        \"limit\": 20
+    }" "${inbox_case}")"
+    e2e_save_artifact "${inbox_case}.json" "$inbox_json"
+    if ! mcp_ok "$inbox_json"; then
+        e2e_fail "contacts-graph: fetch_inbox failed for ${target}"
+        continue
+    fi
+
+    inbox_text="$(extract_text "$inbox_json")"
+    case "$target" in
+        "$GRAPH_B")
+            ab_count="$(echo "$inbox_text" | python3 -c '
+import json,sys
+d=json.loads(sys.stdin.read())
+if isinstance(d, list):
+    msgs = d
+elif isinstance(d, dict):
+    msgs = d.get("messages", [])
+else:
+    msgs = []
+print(sum(1 for m in msgs if "GraphFlow AB" in (m.get("subject",""))))
+' 2>/dev/null || echo 0)"
+            if [ "${ab_count:-0}" -ge 2 ] 2>/dev/null; then
+                e2e_pass "contacts-graph: GraphFlow AB appears >=2 in ${GRAPH_B} inbox"
+            else
+                e2e_fail "contacts-graph: expected >=2 AB messages in ${GRAPH_B} inbox, got ${ab_count:-0}"
+            fi
+            ;;
+        "$GRAPH_A")
+            e2e_assert_contains "contacts-graph: GraphFlow BA visible in ${GRAPH_A} inbox" "$inbox_text" "GraphFlow BA #1"
+            ;;
+        "$GRAPH_C")
+            e2e_assert_contains "contacts-graph: GraphFlow AC visible in ${GRAPH_C} inbox" "$inbox_text" "GraphFlow AC #1"
+            ;;
+    esac
+done
+
+case11_search="$(mcp_call search_messages "{
+    \"project_key\": \"${GRAPH_PROJECT}\",
+    \"query\": \"GraphFlow\",
+    \"limit\": 20
+}" "case11_search_graphflow")"
+e2e_save_artifact "case11_search_graphflow.json" "$case11_search"
+if mcp_ok "$case11_search"; then
+    search11_text="$(extract_text "$case11_search")"
+    e2e_assert_contains "contacts-graph: search includes AB flow" "$search11_text" "GraphFlow AB"
+    e2e_assert_contains "contacts-graph: search includes BA flow" "$search11_text" "GraphFlow BA"
+    e2e_assert_contains "contacts-graph: search includes AC flow" "$search11_text" "GraphFlow AC"
+    e2e_pass "contacts-graph: directional flow dataset queryable"
+else
+    search11_text="$(extract_text "$case11_search")"
+    if echo "$search11_text" | grep -qi "fts_messages"; then
+        e2e_skip "contacts-graph search skipped (fts_messages table not initialized in fresh DB)"
+    else
+        e2e_fail "contacts-graph: search_messages failed unexpectedly"
+    fi
+fi
+
 fi
 
 # ---------------------------------------------------------------------------

@@ -3766,7 +3766,14 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         let cache = RefCell::new(None);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0, true, &cache);
+        render_detail_panel(
+            &mut frame,
+            Rect::new(40, 0, 40, 20),
+            Some(&msg),
+            0,
+            true,
+            &cache,
+        );
     }
 
     #[test]
@@ -3791,7 +3798,14 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         let cache = RefCell::new(None);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 10, true, &cache);
+        render_detail_panel(
+            &mut frame,
+            Rect::new(40, 0, 40, 20),
+            Some(&msg),
+            10,
+            true,
+            &cache,
+        );
     }
 
     #[test]
@@ -3813,7 +3827,14 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         let cache = RefCell::new(None);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0, true, &cache);
+        render_detail_panel(
+            &mut frame,
+            Rect::new(40, 0, 40, 20),
+            Some(&msg),
+            0,
+            true,
+            &cache,
+        );
     }
 
     #[test]

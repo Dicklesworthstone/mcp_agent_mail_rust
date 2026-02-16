@@ -1614,7 +1614,7 @@ mod tests {
     #[test]
     fn tab_count_matches_screens() {
         assert_eq!(MAIL_SCREEN_REGISTRY.len(), ALL_SCREEN_IDS.len());
-        assert_eq!(MAIL_SCREEN_REGISTRY.len(), 14);
+        assert_eq!(MAIL_SCREEN_REGISTRY.len(), 15);
     }
 
     #[test]
@@ -1691,7 +1691,7 @@ mod tests {
     #[test]
     fn tab_hit_slots_cover_all_visible_tabs_normal_width() {
         let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
-        let area = Rect::new(0, 0, 200, 1); // Wide enough for all tabs
+        let area = Rect::new(0, 0, 240, 1); // Wide enough for all 15 tabs
         record_tab_hit_slots(area, &dispatcher);
         let mut found = 0;
         for i in 0..ALL_SCREEN_IDS.len() {

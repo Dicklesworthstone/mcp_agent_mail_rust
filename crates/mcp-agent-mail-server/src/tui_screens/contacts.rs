@@ -7,19 +7,19 @@ use std::time::{Duration, Instant};
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
+use ftui::widgets::StatefulWidget;
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::widgets::StatefulWidget;
-use ftui::widgets::Widget;
 use ftui::{Buffer, Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPolicy};
 use ftui_extras::{mermaid_layout, mermaid_render};
 use ftui_runtime::program::Cmd;
 
-use crate::tui_action_menu::{contacts_actions, ActionEntry};
+use crate::tui_action_menu::{ActionEntry, contacts_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{ContactSummary, MailEvent};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -193,11 +193,7 @@ impl ContactsScreen {
                 COL_UPDATED => a.updated_ts.cmp(&b.updated_ts),
                 _ => std::cmp::Ordering::Equal,
             };
-            if self.sort_asc {
-                cmp
-            } else {
-                cmp.reverse()
-            }
+            if self.sort_asc { cmp } else { cmp.reverse() }
         });
 
         self.contacts = rows;
@@ -1400,10 +1396,12 @@ mod tests {
             "project",
         ));
         screen.rebuild_from_state(&state);
-        assert!(screen
-            .graph_nodes
-            .iter()
-            .any(|(name, _, _)| name == "OnlyInEvents"));
+        assert!(
+            screen
+                .graph_nodes
+                .iter()
+                .any(|(name, _, _)| name == "OnlyInEvents")
+        );
     }
 
     #[test]
