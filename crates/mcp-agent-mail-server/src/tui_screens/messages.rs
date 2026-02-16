@@ -30,6 +30,7 @@ use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListStat
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_action_menu::{ActionEntry, messages_actions};
@@ -1784,6 +1785,7 @@ fn fetch_recent_messages(
 ///
 /// If `project_filter` is Some, only search within that project (Local mode).
 /// Otherwise, search across all projects (Global mode).
+#[allow(clippy::too_many_lines)]
 fn search_messages_fts(
     conn: &DbConn,
     query: &str,
@@ -1824,48 +1826,48 @@ fn search_messages_fts(
 
     // Try FTS first, fall back to LIKE
     // Use parameter for the match expression
-    use mcp_agent_mail_db::sqlmodel_core::Value;
     let params = vec![Value::Text(fts_query)];
 
     let rows_result = conn.query_sync(&sql, &params);
-    let results = if let Ok(rows) = rows_result {
-        rows.into_iter()
-            .filter_map(|row| {
-                let created_ts = row.get_named::<i64>("created_ts").ok()?;
-                Some(MessageEntry {
-                    id: row.get_named::<i64>("id").ok()?,
-                    subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
-                    from_agent: row
-                        .get_named::<String>("sender_name")
-                        .ok()
-                        .unwrap_or_default(),
-                    to_agents: row
-                        .get_named::<String>("to_agents")
-                        .ok()
-                        .unwrap_or_default(),
-                    project_slug: row
-                        .get_named::<String>("project_slug")
-                        .ok()
-                        .unwrap_or_default(),
-                    thread_id: row
-                        .get_named::<String>("thread_id")
-                        .ok()
-                        .unwrap_or_default(),
-                    timestamp_iso: micros_to_iso(created_ts),
-                    timestamp_micros: created_ts,
-                    body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
-                    importance: row
-                        .get_named::<String>("importance")
-                        .ok()
-                        .unwrap_or_else(|| "normal".to_string()),
-                    ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
-                    show_project,
+    let results = rows_result.map_or_else(
+        |_| Vec::new(),
+        |rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let created_ts = row.get_named::<i64>("created_ts").ok()?;
+                    Some(MessageEntry {
+                        id: row.get_named::<i64>("id").ok()?,
+                        subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                        from_agent: row
+                            .get_named::<String>("sender_name")
+                            .ok()
+                            .unwrap_or_default(),
+                        to_agents: row
+                            .get_named::<String>("to_agents")
+                            .ok()
+                            .unwrap_or_default(),
+                        project_slug: row
+                            .get_named::<String>("project_slug")
+                            .ok()
+                            .unwrap_or_default(),
+                        thread_id: row
+                            .get_named::<String>("thread_id")
+                            .ok()
+                            .unwrap_or_default(),
+                        timestamp_iso: micros_to_iso(created_ts),
+                        timestamp_micros: created_ts,
+                        body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
+                        importance: row
+                            .get_named::<String>("importance")
+                            .ok()
+                            .unwrap_or_else(|| "normal".to_string()),
+                        ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
+                        show_project,
+                    })
                 })
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+                .collect()
+        },
+    );
 
     if !results.is_empty() {
         let total = results.len();
