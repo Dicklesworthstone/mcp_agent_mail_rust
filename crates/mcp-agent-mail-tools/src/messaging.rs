@@ -1688,7 +1688,7 @@ effective_free_bytes={free}"
             "from": &sender_name,
             "to": &resolved_to,
             "cc": &resolved_cc_recipients,
-            "bcc": &resolved_bcc_recipients,
+            // BCC stripped for privacy (matches email behavior)
             "subject": &message.subject,
             "created": micros_to_iso(message.created_ts),
             "thread_id": &message.thread_id,
@@ -2022,7 +2022,7 @@ effective_free_bytes={free}"
             "from": &sender_name,
             "to": &resolved_to,
             "cc": &resolved_cc_recipients,
-            "bcc": &resolved_bcc_recipients,
+            // BCC stripped for privacy
             "subject": &reply.subject,
             "created": micros_to_iso(reply.created_ts),
             "thread_id": &thread_id,
