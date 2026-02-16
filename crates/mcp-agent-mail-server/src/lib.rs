@@ -7724,6 +7724,213 @@ mod tests {
     }
 
     #[test]
+    fn http_error_status_maps_transport_error_to_internal_server_error() {
+        use fastmcp_transport::TransportError;
+        use fastmcp_transport::http::{HttpError, HttpStatus};
+        assert_eq!(
+            http_error_status(&HttpError::Transport(TransportError::Io(
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")
+            ))),
+            HttpStatus::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    // ---- HTTP dispatch error path tests (br-3h13.5.1) ----
+
+    #[test]
+    fn http_get_unknown_path_returns_404_not_found() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/nonexistent/path", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 404);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Not Found");
+    }
+
+    #[test]
+    fn http_post_unknown_path_returns_404_not_found() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let mut req = make_request(Http1Method::Post, "/random/endpoint", &[]);
+        req.body = b"{}".to_vec();
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 404);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Not Found");
+    }
+
+    #[test]
+    fn http_bearer_auth_wrong_secret_returns_401() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("correct-secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 5678));
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", "Bearer wrong-secret")],
+            Some(peer),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 1_i64))
+            .expect("serialize json-rpc");
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Unauthorized");
+    }
+
+    #[test]
+    fn http_bearer_auth_missing_bearer_prefix_returns_401() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("my-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 5678));
+        // Send the raw token without "Bearer " prefix.
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", "my-token")],
+            Some(peer),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 1_i64))
+            .expect("serialize json-rpc");
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Unauthorized");
+    }
+
+    #[test]
+    fn http_post_health_endpoint_returns_405() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Post, "/health", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 405);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Method Not Allowed");
+    }
+
+    #[test]
+    fn http_post_healthz_endpoint_returns_405() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Post, "/healthz", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 405);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Method Not Allowed");
+    }
+
+    #[test]
+    fn http_get_well_known_oauth_returns_metadata() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/.well-known/oauth-authorization-server",
+            &[],
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["mcp_oauth"], false);
+    }
+
+    #[test]
+    fn http_post_well_known_oauth_returns_405() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Post,
+            "/.well-known/oauth-authorization-server",
+            &[],
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 405);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Method Not Allowed");
+    }
+
+    #[test]
+    fn http_websocket_upgrade_on_ws_state_returns_501() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/mail/ws-state",
+            &[("Connection", "Upgrade"), ("Upgrade", "websocket")],
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 501);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("WebSocket upgrade is not supported"),
+            "unexpected 501 detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn http_options_bypasses_bearer_auth() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            http_cors_origins: vec!["*".to_string()],
+            http_cors_allow_methods: vec!["*".to_string()],
+            http_cors_allow_headers: vec!["*".to_string()],
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 5678));
+        // OPTIONS request without any auth header — should NOT get 401.
+        let req = make_request_with_peer_addr(
+            Http1Method::Options,
+            "/api",
+            &[
+                ("Origin", "http://example.com"),
+                ("Access-Control-Request-Method", "POST"),
+            ],
+            Some(peer),
+        );
+        let resp = block_on(state.handle(req));
+        assert!(
+            resp.status != 401,
+            "OPTIONS preflight must not require bearer auth, got {}",
+            resp.status
+        );
+        assert!(
+            resp.status == 200 || resp.status == 204,
+            "expected 200 or 204 for OPTIONS preflight, got {}",
+            resp.status
+        );
+    }
+
+    #[test]
+    fn http_post_ws_input_without_tui_returns_503() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let mut req = make_request(Http1Method::Post, "/mail/ws-input", &[]);
+        req.body = br#"{"type":"Input","data":{"kind":"Key","key":"j","modifiers":0}}"#.to_vec();
+        let resp = block_on(state.handle(req));
+        // When TUI state is not active, /mail/ws-input returns 503.
+        assert_eq!(resp.status, 503);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("TUI state is not active"),
+            "unexpected 503 detail: {detail}"
+        );
+    }
+
+    #[test]
     fn rate_limit_identity_prefers_jwt_sub() {
         let req = make_request_with_peer_addr(
             Http1Method::Post,
