@@ -83,14 +83,12 @@ impl DiversityConfig {
     /// Load diversity config from environment variables, falling back to defaults.
     #[must_use]
     pub fn from_env() -> Self {
-        let enabled = std::env::var(DIVERSITY_ENABLED_ENV)
-            .ok()
-            .map_or(true, |v| {
-                !matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no"
-                )
-            });
+        let enabled = std::env::var(DIVERSITY_ENABLED_ENV).ok().is_none_or(|v| {
+            !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        });
 
         let max_per_thread = std::env::var(DIVERSITY_MAX_PER_THREAD_ENV)
             .ok()
