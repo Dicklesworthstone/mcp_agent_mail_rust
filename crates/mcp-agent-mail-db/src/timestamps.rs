@@ -170,6 +170,7 @@ pub fn iso_to_micros(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn skew_test_guard() -> MutexGuard<'static, ()> {

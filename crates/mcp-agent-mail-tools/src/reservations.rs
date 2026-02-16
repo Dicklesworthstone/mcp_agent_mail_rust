@@ -1526,7 +1526,7 @@ mod tests {
 
     #[test]
     fn glob_patterns_recognized() {
-        use crate::pattern_overlap::has_glob_meta;
+        use mcp_agent_mail_core::pattern_overlap::has_glob_meta;
         assert!(has_glob_meta("src/**/*.rs"));
         assert!(has_glob_meta("*.txt"));
         assert!(has_glob_meta("file?.rs"));
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[test]
     fn literal_paths_not_glob() {
-        use crate::pattern_overlap::has_glob_meta;
+        use mcp_agent_mail_core::pattern_overlap::has_glob_meta;
         assert!(!has_glob_meta("src/main.rs"));
         assert!(!has_glob_meta("Cargo.toml"));
         assert!(!has_glob_meta("README.md"));

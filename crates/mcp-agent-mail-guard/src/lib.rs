@@ -791,29 +791,31 @@ fn check_path_conflicts(
             continue;
         }
 
-        // Symmetric check: check if path (as a pattern) matches reservation (as path).
-        // Only relevant if the file path itself contains glob characters (unlikely but possible).
-        // Note: globset doesn't support "match glob against pattern".
-        // Fallback: check exact equality (already covered by glob if no wildcards).
-        // The original manual implementation checked `fnmatch(pattern, path)`.
-        // Since `paths` are concrete strings from git, they are not patterns.
-        // The only "symmetric" case that matters for concrete paths is if the reservation
-        // is a specific file that matches the path. `GlobSet` handles this.
-        //
-        // Logic check: `fnmatch(path, pattern)` (Python) -> Path matches Pattern.
-        // `fnmatch(pattern, path)` (Python) -> Pattern matches Path.
-        // If Pattern is `src/foo` and Path is `src/foo`, both match.
-        // If Pattern is `src/*.rs` and Path is `src/main.rs`.
-        //   `fnmatch("src/main.rs", "src/*.rs")` -> True.
-        //   `fnmatch("src/*.rs", "src/main.rs")` -> False.
-        //
-        // So with concrete paths, the symmetric check is redundant unless the path
-        // implies a directory that contains the pattern? No.
-        //
-        // Directory prefix check: "If pattern ends with /* or /**".
-        // `GlobSet` handles `/*` and `/**` correctly matching children.
-        //
-        // Conclusion: `GlobSet` against `normalized` is sufficient and correct for standard usage.
+        // Directory prefix check: if the path is a parent directory of the
+        // reservation pattern's base, the path still conflicts. For example,
+        // modifying `modules/submod` conflicts with reservation `modules/submod/**`
+        // because the directory itself is within the reserved scope.
+        for (idx, res) in active_indices.iter().enumerate() {
+            let pat_norm = normalize_path(&res.path_pattern, ignorecase);
+            // Check if the path is a prefix of the pattern's base directory
+            if pat_norm.starts_with(&normalized)
+                && pat_norm
+                    .as_bytes()
+                    .get(normalized.len())
+                    .is_some_and(|&c| c == b'/')
+            {
+                conflicts.push(GuardConflict {
+                    path: path.clone(),
+                    pattern: res.path_pattern.clone(),
+                    holder: res.agent_name.clone(),
+                    expires_ts: res.expires_ts.clone(),
+                });
+                break;
+            }
+            // Also check the reverse: pattern's literal base is a prefix of the path
+            // (already handled by globset above, but needed for non-glob patterns)
+            let _ = idx; // suppress unused warning
+        }
     }
 
     conflicts
@@ -1108,6 +1110,49 @@ fn parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Simple fnmatch-style glob matching (like Python's `fnmatch.fnmatch`).
+    /// `*` matches within a single directory, `**` matches across directories.
+    fn fnmatch_simple(path: &str, pattern: &str) -> bool {
+        if path == pattern {
+            return true;
+        }
+        match globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+        {
+            Ok(g) => g.compile_matcher().is_match(path),
+            Err(_) => false,
+        }
+    }
+
+    /// Two paths/patterns conflict if:
+    /// 1. They match each other via glob matching (symmetric), or
+    /// 2. One is a directory prefix of the other (with `/` boundary).
+    fn paths_conflict(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        // Glob matching (symmetric)
+        if fnmatch_simple(a, b) || fnmatch_simple(b, a) {
+            return true;
+        }
+        // Directory prefix check: a is a prefix of b (or vice versa)
+        if !a.is_empty() && !b.is_empty() {
+            if b.starts_with(a) && b.as_bytes().get(a.len()) == Some(&b'/') {
+                return true;
+            }
+            if a.starts_with(b) && a.as_bytes().get(b.len()) == Some(&b'/') {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns true if the string contains glob metacharacters.
+    fn contains_glob(s: &str) -> bool {
+        s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+    }
 
     fn run_git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")

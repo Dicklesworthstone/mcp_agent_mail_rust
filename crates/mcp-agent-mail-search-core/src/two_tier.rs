@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::error::{SearchError, SearchResult};
+use crate::metrics::{TwoTierIndexMetrics, TwoTierMetrics, TwoTierSearchMetrics};
 
 // ────────────────────────────────────────────────────────────────────
 // Configuration
@@ -391,6 +392,19 @@ impl TwoTierIndex {
         }
     }
 
+    /// Build index observability metrics.
+    #[must_use]
+    pub fn metrics(&self) -> TwoTierIndexMetrics {
+        let fast_memory_bytes = self.fast_embeddings.len() * std::mem::size_of::<f16>();
+        let quality_memory_bytes = self.quality_embeddings.len() * std::mem::size_of::<f16>();
+        TwoTierIndexMetrics::from_counts(
+            self.metadata.doc_count,
+            self.quality_count(),
+            fast_memory_bytes,
+            quality_memory_bytes,
+        )
+    }
+
     /// Detect documents with zero-vector quality embeddings.
     ///
     /// Returns document IDs that have `has_quality=true` but actually contain
@@ -509,6 +523,8 @@ impl TwoTierIndex {
     /// Search using fast embeddings only.
     #[must_use]
     pub fn search_fast(&self, query_vec: &[f32], k: usize) -> Vec<ScoredResult> {
+        let _span =
+            tracing::debug_span!("two_tier.search_fast", query_len = query_vec.len(), k).entered();
         if self.is_empty() || k == 0 {
             return Vec::new();
         }
@@ -554,6 +570,8 @@ impl TwoTierIndex {
     /// Search using quality embeddings only.
     #[must_use]
     pub fn search_quality(&self, query_vec: &[f32], k: usize) -> Vec<ScoredResult> {
+        let _span = tracing::debug_span!("two_tier.search_quality", query_len = query_vec.len(), k)
+            .entered();
         if self.is_empty() || k == 0 {
             return Vec::new();
         }
@@ -747,6 +765,7 @@ pub struct TwoTierSearcher<'a> {
     fast_embedder: Arc<dyn TwoTierEmbedder>,
     quality_embedder: Option<Arc<dyn TwoTierEmbedder>>,
     config: TwoTierConfig,
+    metrics_recorder: Option<Arc<std::sync::Mutex<TwoTierMetrics>>>,
 }
 
 impl<'a> TwoTierSearcher<'a> {
@@ -762,7 +781,18 @@ impl<'a> TwoTierSearcher<'a> {
             fast_embedder,
             quality_embedder,
             config,
+            metrics_recorder: None,
         }
+    }
+
+    /// Attach a shared metrics recorder.
+    #[must_use]
+    pub fn with_metrics_recorder(
+        mut self,
+        metrics_recorder: Arc<std::sync::Mutex<TwoTierMetrics>>,
+    ) -> Self {
+        self.metrics_recorder = Some(metrics_recorder);
+        self
     }
 
     /// Perform two-tier progressive search.
@@ -771,7 +801,12 @@ impl<'a> TwoTierSearcher<'a> {
     /// 1. Initial results from fast embeddings
     /// 2. Refined results from quality embeddings (if available)
     pub fn search(&self, query: &str, k: usize) -> impl Iterator<Item = SearchPhase> + '_ {
-        TwoTierSearchIter::new(self, query.to_string(), k)
+        TwoTierSearchIter::new(
+            self,
+            query.to_string(),
+            k,
+            self.metrics_recorder.as_ref().map(Arc::clone),
+        )
     }
 
     /// Perform fast-only search.
@@ -818,27 +853,51 @@ struct TwoTierSearchIter<'a> {
     k: usize,
     phase: u8,
     fast_results: Option<Vec<ScoredResult>>,
+    fast_order: Vec<u64>,
+    metrics_recorder: Option<Arc<std::sync::Mutex<TwoTierMetrics>>>,
+    search_metrics: TwoTierSearchMetrics,
+    search_span: tracing::Span,
 }
 
 impl<'a> TwoTierSearchIter<'a> {
     #[allow(clippy::missing_const_for_fn)]
-    fn new(searcher: &'a TwoTierSearcher<'a>, query: String, k: usize) -> Self {
+    fn new(
+        searcher: &'a TwoTierSearcher<'a>,
+        query: String,
+        k: usize,
+        metrics_recorder: Option<Arc<std::sync::Mutex<TwoTierMetrics>>>,
+    ) -> Self {
+        let query_len = query.len();
         Self {
             searcher,
+            search_metrics: TwoTierSearchMetrics::for_query(&query),
+            search_span: tracing::info_span!("two_tier.search", query_len, limit = k),
             query,
             k,
             phase: 0,
             fast_results: None,
+            fast_order: Vec::new(),
+            metrics_recorder,
         }
     }
 
-    fn build_refined_results(&self, query_vec: &[f32]) -> Vec<ScoredResult> {
+    fn build_refined_results(&mut self, query_vec: &[f32]) -> Vec<ScoredResult> {
         let Some(fast_results) = self.fast_results.as_ref() else {
             // If no fast candidates are available, fall back to full quality search.
-            return self.searcher.index.search_quality(query_vec, self.k);
+            let _score_span =
+                tracing::debug_span!("two_tier.score_quality", candidates = 0).entered();
+            let score_start = Instant::now();
+            let results = self.searcher.index.search_quality(query_vec, self.k);
+            self.search_metrics.quality_score_us =
+                u64::try_from(score_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.search_metrics.refined_count = results.len();
+            self.search_metrics.was_refined = true;
+            return results;
         };
 
         if fast_results.is_empty() {
+            self.search_metrics.refined_count = 0;
+            self.search_metrics.was_refined = true;
             return Vec::new();
         }
 
@@ -852,6 +911,8 @@ impl<'a> TwoTierSearchIter<'a> {
         if refinement_limit == 0 {
             let mut passthrough = fast_results.clone();
             passthrough.truncate(self.k);
+            self.search_metrics.refined_count = 0;
+            self.search_metrics.was_refined = false;
             return passthrough;
         }
 
@@ -861,13 +922,20 @@ impl<'a> TwoTierSearchIter<'a> {
             .map(|sr| sr.idx)
             .collect();
 
+        let _score_span =
+            tracing::debug_span!("two_tier.score_quality", candidates = candidates.len()).entered();
+        let score_start = Instant::now();
         let quality_scores = self
             .searcher
             .index
             .quality_scores_for_indices(query_vec, &candidates);
+        self.search_metrics.quality_score_us =
+            u64::try_from(score_start.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         // Blend scores, but only for docs with quality embeddings.
         // Docs without quality use fast score only.
+        let _blend_span = tracing::debug_span!("two_tier.blend", refinement_limit).entered();
+        let blend_start = Instant::now();
         let weight = self.searcher.config.quality_weight;
         let mut blended: Vec<ScoredResult> = fast_results
             .iter()
@@ -890,17 +958,34 @@ impl<'a> TwoTierSearchIter<'a> {
                 }
             })
             .collect();
+        self.search_metrics.blend_us =
+            u64::try_from(blend_start.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         // Leave documents outside the refinement budget untouched.
         blended.extend(fast_results.iter().skip(refinement_limit).cloned());
 
         // Re-sort by blended score.
+        let _rerank_span =
+            tracing::debug_span!("two_tier.rerank", candidates = blended.len()).entered();
         blended.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         blended.truncate(self.k);
+        let refined_order = blended.iter().map(|hit| hit.doc_id).collect::<Vec<_>>();
+        let compare_len = self.fast_order.len().min(refined_order.len()).min(self.k);
+        self.search_metrics.ranking_changed = compare_len > 0
+            && self
+                .fast_order
+                .iter()
+                .take(compare_len)
+                .ne(refined_order.iter().take(compare_len));
+        self.search_metrics.refined_count = refined_order.len();
+        self.search_metrics.was_refined = true;
         blended
     }
 
-    fn run_refinement_phase(&self) -> SearchPhase {
+    fn run_refinement_phase(&mut self) -> SearchPhase {
+        {
+            let _search_guard = self.search_span.enter();
+        }
         let Some(quality_embedder) = &self.searcher.quality_embedder else {
             return SearchPhase::RefinementFailed {
                 error: "quality embedder unavailable".to_string(),
@@ -908,9 +993,15 @@ impl<'a> TwoTierSearchIter<'a> {
         };
 
         let start = Instant::now();
+        let embed_span =
+            tracing::debug_span!("two_tier.embed_quality", query_len = self.query.len()).entered();
+        let embed_start = Instant::now();
 
         match quality_embedder.embed(&self.query) {
             Ok(query_vec) => {
+                self.search_metrics.quality_embed_us =
+                    u64::try_from(embed_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                drop(embed_span);
                 let results = self.build_refined_results(&query_vec);
                 #[allow(clippy::cast_possible_truncation)]
                 let latency_ms = start.elapsed().as_millis() as u64;
@@ -919,9 +1010,13 @@ impl<'a> TwoTierSearchIter<'a> {
                     latency_ms,
                 }
             }
-            Err(e) => SearchPhase::RefinementFailed {
-                error: e.to_string(),
-            },
+            Err(e) => {
+                self.search_metrics.quality_embed_us =
+                    u64::try_from(embed_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                SearchPhase::RefinementFailed {
+                    error: e.to_string(),
+                }
+            }
         }
     }
 }
@@ -929,16 +1024,33 @@ impl<'a> TwoTierSearchIter<'a> {
 impl Iterator for TwoTierSearchIter<'_> {
     type Item = SearchPhase;
 
+    #[allow(clippy::used_underscore_binding)]
     fn next(&mut self) -> Option<Self::Item> {
         match self.phase {
             0 => {
                 // Phase 1: Fast search
                 self.phase = 1;
                 let start = Instant::now();
+                let _search_guard = self.search_span.enter();
+                let _embed_fast_span =
+                    tracing::debug_span!("two_tier.embed_fast", query_len = self.query.len())
+                        .entered();
+                let fast_embed_start = Instant::now();
 
                 match self.searcher.fast_embedder.embed(&self.query) {
                     Ok(query_vec) => {
+                        self.search_metrics.fast_embed_us =
+                            u64::try_from(fast_embed_start.elapsed().as_micros())
+                                .unwrap_or(u64::MAX);
+                        let _search_fast_span =
+                            tracing::debug_span!("two_tier.search_fast", limit = self.k).entered();
+                        let fast_search_start = Instant::now();
                         let results = self.searcher.index.search_fast(&query_vec, self.k);
+                        self.search_metrics.fast_search_us =
+                            u64::try_from(fast_search_start.elapsed().as_micros())
+                                .unwrap_or(u64::MAX);
+                        self.search_metrics.fast_candidate_count = results.len();
+                        self.fast_order = results.iter().map(|hit| hit.doc_id).collect();
                         #[allow(clippy::cast_possible_truncation)]
                         let latency_ms = start.elapsed().as_millis() as u64;
                         self.fast_results = Some(results.clone());
@@ -955,6 +1067,8 @@ impl Iterator for TwoTierSearchIter<'_> {
                         // In quality-only mode, do not emit initial results.
                         if self.searcher.config.quality_only {
                             self.phase = 2;
+                            drop(_embed_fast_span);
+                            drop(_search_guard);
                             return Some(self.run_refinement_phase());
                         }
 
@@ -964,10 +1078,15 @@ impl Iterator for TwoTierSearchIter<'_> {
                         })
                     }
                     Err(e) => {
+                        self.search_metrics.fast_embed_us =
+                            u64::try_from(fast_embed_start.elapsed().as_micros())
+                                .unwrap_or(u64::MAX);
                         warn!(error = %e, "Fast embedding failed");
 
                         if self.searcher.config.quality_only {
                             self.phase = 2;
+                            drop(_embed_fast_span);
+                            drop(_search_guard);
                             return Some(self.run_refinement_phase());
                         }
 
@@ -986,6 +1105,31 @@ impl Iterator for TwoTierSearchIter<'_> {
     }
 }
 
+impl Drop for TwoTierSearchIter<'_> {
+    fn drop(&mut self) {
+        let Some(recorder) = self.metrics_recorder.as_ref() else {
+            return;
+        };
+
+        let should_record = self.search_metrics.fast_embed_us > 0
+            || self.search_metrics.fast_search_us > 0
+            || self.search_metrics.quality_embed_us > 0
+            || self.search_metrics.quality_score_us > 0
+            || self.search_metrics.blend_us > 0
+            || self.search_metrics.fast_candidate_count > 0
+            || self.search_metrics.refined_count > 0;
+        if !should_record {
+            return;
+        }
+
+        if let Ok(mut metrics) = recorder.lock() {
+            metrics.record_search(self.search_metrics.clone());
+        } else {
+            warn!("two-tier metrics recorder lock poisoned");
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────
@@ -993,7 +1137,7 @@ impl Iterator for TwoTierSearchIter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[allow(clippy::cast_precision_loss)]
     fn make_test_entries(count: usize, config: &TwoTierConfig) -> Vec<TwoTierEntry> {
@@ -1059,6 +1203,40 @@ mod tests {
 
     fn doc_ids(results: &[ScoredResult]) -> Vec<u64> {
         results.iter().map(|hit| hit.doc_id).collect()
+    }
+
+    #[test]
+    fn two_tier_search_records_metrics_when_recorder_attached() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
+                quality_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
+                has_quality: true,
+            })
+            .expect("entry should be accepted");
+
+        let recorder = Arc::new(Mutex::new(TwoTierMetrics::default()));
+        let searcher = TwoTierSearcher::new(
+            &index,
+            Arc::new(StubEmbedder::new("fast", vec![1.0, 0.0])),
+            Some(Arc::new(StubEmbedder::new("quality", vec![1.0, 0.0]))),
+            config,
+        )
+        .with_metrics_recorder(Arc::clone(&recorder));
+
+        let _ = searcher.search("hello", 1).collect::<Vec<_>>();
+        let snapshot = recorder.lock().expect("metrics lock poisoned").snapshot();
+        assert_eq!(snapshot.aggregated.total_searches, 1);
+        assert!(snapshot.search.is_some());
     }
 
     #[test]
