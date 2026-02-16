@@ -77,7 +77,11 @@ pub use envelope::{
 pub use error::{SearchError, SearchResult};
 pub use index_layout::{IndexCheckpoint, IndexLayout, IndexScope, SchemaField, SchemaHash};
 pub use query::{DateRange, ImportanceFilter, SearchFilter, SearchMode, SearchQuery};
-pub use results::{ExplainReport, HighlightRange, SearchHit, SearchResults};
+pub use results::{
+    ExplainComposerConfig, ExplainReasonCode, ExplainReport, ExplainStage, ExplainVerbosity,
+    HighlightRange, HitExplanation, ScoreFactor, SearchHit, SearchResults, StageExplanation,
+    StageScoreInput, compose_explain_report, compose_hit_explanation,
+};
 pub use updater::{IncrementalUpdater, UpdaterConfig, UpdaterStats, deduplicate_changes};
 
 pub use cache::{

@@ -545,23 +545,27 @@ impl ContactsScreen {
         let source = generate_contact_graph_mermaid(&self.contacts, &events);
         let source_hash = stable_hash(source.as_bytes());
 
-        let cache_is_fresh = {
+        let (has_cache, source_changed, size_changed) = {
             let cache = self.mermaid_cache.borrow();
-            cache.as_ref().is_some_and(|cached| {
-                cached.source_hash == source_hash
-                    && cached.width == inner.width
-                    && cached.height == inner.height
+            cache.as_ref().map_or((false, true, true), |cached| {
+                (
+                    true,
+                    cached.source_hash != source_hash,
+                    cached.width != inner.width || cached.height != inner.height,
+                )
             })
         };
+        let cache_is_fresh = has_cache && !source_changed && !size_changed;
 
-        let has_cache = self.mermaid_cache.borrow().is_some();
         let can_refresh = self
             .mermaid_last_render_at
             .borrow()
             .as_ref()
             .is_none_or(|last| last.elapsed() >= MERMAID_RENDER_DEBOUNCE);
 
-        if !cache_is_fresh && (can_refresh || !has_cache) {
+        // Refresh immediately when source/size changes; debounce only protects
+        // against redundant refresh attempts for unchanged content.
+        if !cache_is_fresh && (!has_cache || source_changed || size_changed || can_refresh) {
             let buffer = render_mermaid_source_to_buffer(&source, inner.width, inner.height);
             *self.mermaid_cache.borrow_mut() = Some(MermaidPanelCache {
                 source_hash,
@@ -1002,6 +1006,49 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(100, 24, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
+    }
+
+    #[test]
+    fn mermaid_cache_refreshes_immediately_when_source_changes() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.show_mermaid_panel = true;
+        screen.contacts.push(ContactSummary {
+            from_agent: "Alpha".to_string(),
+            to_agent: "Beta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        });
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
+        let first_hash = screen
+            .mermaid_cache
+            .borrow()
+            .as_ref()
+            .map(|cached| cached.source_hash)
+            .expect("first render should populate cache");
+
+        screen.contacts.push(ContactSummary {
+            from_agent: "Gamma".to_string(),
+            to_agent: "Delta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        });
+        *screen.mermaid_last_render_at.borrow_mut() = Some(Instant::now());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
+        let second_hash = screen
+            .mermaid_cache
+            .borrow()
+            .as_ref()
+            .map(|cached| cached.source_hash)
+            .expect("second render should keep cache");
+
+        assert_ne!(first_hash, second_hash);
     }
 
     // ── truncate_str UTF-8 safety ────────────────────────────────────

@@ -54,12 +54,20 @@ const QUERY_HINT_FIELDS: &[&str] = &["from", "thread", "project", "before", "aft
 /// Structured hint aliases mapped to canonical field names.
 const QUERY_HINT_ALIASES: &[(&str, &str)] = &[
     ("sender", "from"),
+    ("from_agent", "from"),
+    ("sender_name", "from"),
     ("frm", "from"),
     ("thread_id", "thread"),
     ("thr", "thread"),
     ("proj", "project"),
+    ("project_key", "project"),
+    ("project_slug", "project"),
     ("since", "after"),
+    ("date_start", "after"),
+    ("date_from", "after"),
     ("until", "before"),
+    ("date_end", "before"),
+    ("date_to", "before"),
     ("priority", "importance"),
     ("prio", "importance"),
     ("imp", "importance"),
@@ -141,6 +149,59 @@ fn normalize_hint_value(value: &str) -> String {
         trimmed
     };
     maybe_unquoted.trim().to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintTimeBoundary {
+    StartInclusive,
+    EndInclusive,
+}
+
+fn normalize_datetime_hint(value: &str, boundary: HintTimeBoundary) -> Option<String> {
+    let parse_to_utc = |dt: chrono::DateTime<chrono::FixedOffset>| {
+        dt.with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    };
+
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(parse_to_utc(dt));
+    }
+
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
+    {
+        return Some(
+            naive
+                .and_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        );
+    }
+
+    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    let day_start = date.and_hms_micro_opt(0, 0, 0, 0)?;
+    let normalized = match boundary {
+        HintTimeBoundary::StartInclusive => day_start,
+        HintTimeBoundary::EndInclusive => {
+            day_start + chrono::TimeDelta::try_days(1)? - chrono::TimeDelta::microseconds(1)
+        }
+    };
+    Some(
+        normalized
+            .and_utc()
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+    )
+}
+
+fn normalize_hint_value_for_field(field: &str, value: String) -> String {
+    match field {
+        "after" => {
+            normalize_datetime_hint(&value, HintTimeBoundary::StartInclusive).unwrap_or(value)
+        }
+        "before" => {
+            normalize_datetime_hint(&value, HintTimeBoundary::EndInclusive).unwrap_or(value)
+        }
+        _ => value,
+    }
 }
 
 fn normalize_hint_field(field: &str) -> Option<&'static str> {
@@ -238,9 +299,10 @@ pub fn parse_query_assistance(raw_query: &str) -> QueryAssistance {
         }
 
         if let Some(canonical) = normalize_hint_field(field) {
+            let normalized_value = normalize_hint_value_for_field(canonical, value);
             applied_filter_hints.push(AppliedFilterHint {
                 field: canonical.to_string(),
-                value,
+                value: normalized_value,
             });
             continue;
         }
@@ -888,9 +950,46 @@ mod tests {
                 },
                 AppliedFilterHint {
                     field: "after".to_string(),
-                    value: "2026-02-01".to_string()
+                    value: "2026-02-01T00:00:00.000000Z".to_string()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parse_query_assistance_supports_extended_aliases() {
+        let assistance = parse_query_assistance(
+            "from_agent:BlueLake project_key:backend-api date_to:2026-02-01",
+        );
+        assert!(assistance.query_text.is_empty());
+        assert_eq!(
+            assistance.applied_filter_hints,
+            vec![
+                AppliedFilterHint {
+                    field: "from".to_string(),
+                    value: "BlueLake".to_string()
+                },
+                AppliedFilterHint {
+                    field: "project".to_string(),
+                    value: "backend-api".to_string()
+                },
+                AppliedFilterHint {
+                    field: "before".to_string(),
+                    value: "2026-02-01T23:59:59.999999Z".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_assistance_normalizes_timezone_to_utc() {
+        let assistance = parse_query_assistance("before:2026-02-01T00:30:00+02:00");
+        assert!(assistance.query_text.is_empty());
+        assert_eq!(assistance.applied_filter_hints.len(), 1);
+        assert_eq!(assistance.applied_filter_hints[0].field, "before");
+        assert_eq!(
+            assistance.applied_filter_hints[0].value,
+            "2026-01-31T22:30:00.000000Z"
         );
     }
 

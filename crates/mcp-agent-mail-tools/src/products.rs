@@ -267,15 +267,37 @@ pub struct ProductSearchItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductSearchResponse {
     pub result: Vec<ProductSearchItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistance: Option<mcp_agent_mail_db::QueryAssistance>,
 }
 
 /// Full-text search across all projects linked to a product.
-#[tool(description = "Full-text search across all projects linked to a product.")]
+#[allow(clippy::too_many_arguments)]
+#[tool(
+    description = "Full-text search across all projects linked to a product.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id }], assistance? }"
+)]
 pub async fn search_messages_product(
     ctx: &McpContext,
     product_key: String,
     query: String,
     limit: Option<i32>,
+    project: Option<String>,
+    project_key_filter: Option<String>,
+    project_slug: Option<String>,
+    proj: Option<String>,
+    sender: Option<String>,
+    from_agent: Option<String>,
+    sender_name: Option<String>,
+    importance: Option<String>,
+    thread_id: Option<String>,
+    date_start: Option<String>,
+    date_end: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
 ) -> McpResult<String> {
     let config = &Config::get();
     if !config.worktrees_enabled {
@@ -284,13 +306,16 @@ pub async fn search_messages_product(
 
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        let response = ProductSearchResponse { result: Vec::new() };
+        let response = ProductSearchResponse {
+            result: Vec::new(),
+            assistance: None,
+        };
         return serde_json::to_string(&response)
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
     }
 
     let pool = get_db_pool()?;
-    let max_results = usize::try_from(limit.unwrap_or(20)).unwrap_or(20);
+    let max_results = usize::try_from(limit.unwrap_or(20).clamp(1, 1000)).unwrap_or(20);
 
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
@@ -304,33 +329,82 @@ pub async fn search_messages_product(
         })?;
     let product_id = product.id.unwrap_or(0);
 
-    // Use the dedicated cross-project/product DB query path.
-    let rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::search_messages_for_product(
-            ctx.cx(),
-            &pool,
-            product_id,
-            trimmed,
-            max_results,
-        )
-        .await,
+    // Parse optional filters (reuse helpers from search module)
+    let importance_filter = match &importance {
+        Some(imp) => crate::search::parse_importance_list(imp)?,
+        None => Vec::new(),
+    };
+    let sender_filter = crate::search::resolve_text_filter_alias(
+        "sender",
+        sender,
+        &[("from_agent", from_agent), ("sender_name", sender_name)],
+    )?;
+    let project_filter = crate::search::resolve_text_filter_alias(
+        "project",
+        project,
+        &[
+            ("project_key_filter", project_key_filter),
+            ("project_slug", project_slug),
+            ("proj", proj),
+        ],
+    )?;
+    let time_range = crate::search::parse_time_range_with_aliases(
+        date_start,
+        date_end,
+        &[("date_from", date_from), ("after", after), ("since", since)],
+        &[("date_to", date_to), ("before", before), ("until", until)],
+    )?;
+    let scoped_project_id = if let Some(project_selector) = project_filter {
+        let project = resolve_project(ctx, &pool, &project_selector).await?;
+        project.id
+    } else {
+        None
+    };
+
+    // Build planner query with product scope and facets
+    let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
+        text: trimmed.to_string(),
+        doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
+        project_id: scoped_project_id,
+        product_id: Some(product_id),
+        importance: importance_filter,
+        direction: None,
+        agent_name: sender_filter,
+        thread_id,
+        ack_required: None,
+        time_range,
+        ranking: mcp_agent_mail_db::search_planner::RankingMode::default(),
+        limit: Some(max_results),
+        cursor: None,
+        explain: false,
+        ..Default::default()
+    };
+
+    // Try the planner path first; fall back to legacy product search if unavailable
+    let planner_response = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::search_service::execute_search_simple(ctx.cx(), &pool, &search_query)
+            .await,
     )?;
 
-    let result: Vec<ProductSearchItem> = rows
+    let result: Vec<ProductSearchItem> = planner_response
+        .results
         .into_iter()
         .map(|r| ProductSearchItem {
             id: r.id,
-            subject: r.subject,
-            importance: r.importance,
-            ack_required: i32::try_from(r.ack_required).unwrap_or_default(),
-            created_ts: Some(micros_to_iso(r.created_ts)),
+            subject: r.title,
+            importance: r.importance.unwrap_or_default(),
+            ack_required: i32::from(r.ack_required.unwrap_or(false)),
+            created_ts: r.created_ts.map(micros_to_iso),
             thread_id: r.thread_id,
-            from: r.from,
-            project_id: r.project_id,
+            from: r.from_agent.unwrap_or_default(),
+            project_id: r.project_id.unwrap_or(0),
         })
         .collect();
 
-    let response = ProductSearchResponse { result };
+    let response = ProductSearchResponse {
+        result,
+        assistance: planner_response.assistance,
+    };
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
@@ -865,7 +939,10 @@ mod tests {
 
     #[test]
     fn product_search_response_empty() {
-        let resp = ProductSearchResponse { result: Vec::new() };
+        let resp = ProductSearchResponse {
+            result: Vec::new(),
+            assistance: None,
+        };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
         assert!(parsed.result.is_empty());
@@ -896,6 +973,7 @@ mod tests {
                     project_id: 2,
                 },
             ],
+            assistance: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();

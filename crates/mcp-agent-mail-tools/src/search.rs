@@ -26,6 +26,12 @@ pub struct SearchResult {
     pub created_ts: Option<String>,
     pub thread_id: Option<String>,
     pub from: String,
+    /// Concise reason codes explaining why this result ranked here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    /// Top score factors with contributions (present when explain=true).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub score_factors: Vec<mcp_agent_mail_db::search_planner::ScoreFactorSummary>,
 }
 
 /// Search response wrapper
@@ -34,6 +40,10 @@ pub struct SearchResponse {
     pub result: Vec<SearchResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistance: Option<mcp_agent_mail_db::QueryAssistance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<mcp_agent_mail_db::search_planner::QueryExplain>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Mention count entry
@@ -260,6 +270,205 @@ pub(crate) fn summarize_messages(
     }
 }
 
+/// Parse a search mode string, returning a helpful error for invalid values.
+pub(crate) fn parse_search_mode(
+    mode_str: &str,
+) -> Result<mcp_agent_mail_db::search_planner::RankingMode, McpError> {
+    match mode_str.to_ascii_lowercase().as_str() {
+        "relevance" | "bm25" => Ok(mcp_agent_mail_db::search_planner::RankingMode::Relevance),
+        "recency" | "recent" => Ok(mcp_agent_mail_db::search_planner::RankingMode::Recency),
+        _ => Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Invalid ranking value: \"{mode_str}\". Valid values: \"relevance\", \"recency\"."
+            ),
+            true,
+            json!({
+                "field": "ranking",
+                "provided": mode_str,
+                "valid_values": ["relevance", "recency"]
+            }),
+        )),
+    }
+}
+
+/// Parse importance filter values (comma-separated).
+pub(crate) fn parse_importance_list(
+    raw: &str,
+) -> Result<Vec<mcp_agent_mail_db::search_planner::Importance>, McpError> {
+    let mut result = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match mcp_agent_mail_db::search_planner::Importance::parse(token) {
+            Some(imp) => result.push(imp),
+            None => {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Invalid importance value: \"{token}\". Valid values: \"low\", \"normal\", \"high\", \"urgent\"."
+                    ),
+                    true,
+                    json!({
+                        "field": "importance",
+                        "provided": token,
+                        "valid_values": ["low", "normal", "high", "urgent"]
+                    }),
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeBoundary {
+    StartInclusive,
+    EndInclusive,
+}
+
+fn non_empty_trimmed(value: Option<String>) -> Option<String> {
+    value.and_then(|candidate| {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn alias_conflict_error(
+    canonical_field: &str,
+    first_name: &str,
+    first_value: &str,
+    second_name: &str,
+    second_value: &str,
+) -> McpError {
+    legacy_tool_error(
+        "INVALID_ARGUMENT",
+        format!(
+            "Conflicting {canonical_field} values: {first_name}=\"{first_value}\" and {second_name}=\"{second_value}\"."
+        ),
+        true,
+        json!({
+            "field": canonical_field,
+            "first": { "name": first_name, "value": first_value },
+            "second": { "name": second_name, "value": second_value }
+        }),
+    )
+}
+
+pub(crate) fn resolve_text_filter_alias(
+    canonical_field: &'static str,
+    canonical_value: Option<String>,
+    alias_values: &[(&'static str, Option<String>)],
+) -> Result<Option<String>, McpError> {
+    let mut chosen: Option<(&'static str, String)> =
+        non_empty_trimmed(canonical_value).map(|value| (canonical_field, value));
+
+    for (alias_name, alias_value) in alias_values {
+        let Some(alias_value) = non_empty_trimmed(alias_value.clone()) else {
+            continue;
+        };
+        if let Some((chosen_name, chosen_value)) = &chosen {
+            if !chosen_value.eq_ignore_ascii_case(&alias_value) {
+                return Err(alias_conflict_error(
+                    canonical_field,
+                    chosen_name,
+                    chosen_value,
+                    alias_name,
+                    &alias_value,
+                ));
+            }
+            continue;
+        }
+        chosen = Some((*alias_name, alias_value));
+    }
+
+    Ok(chosen.map(|(_, value)| value))
+}
+
+fn resolve_time_bound_alias(
+    canonical_field: &'static str,
+    canonical_value: Option<String>,
+    alias_values: &[(&'static str, Option<String>)],
+    boundary: TimeBoundary,
+) -> Result<Option<i64>, McpError> {
+    let mut chosen: Option<(&'static str, String, i64)> = None;
+
+    let mut candidates = Vec::with_capacity(alias_values.len() + 1);
+    candidates.push((canonical_field, canonical_value));
+    candidates.extend(
+        alias_values
+            .iter()
+            .map(|(name, value)| (*name, value.clone())),
+    );
+
+    for (name, raw_value) in candidates {
+        let Some(value) = non_empty_trimmed(raw_value) else {
+            continue;
+        };
+        let micros = parse_iso_to_micros_with_boundary(&value, name, boundary)?;
+        if let Some((chosen_name, chosen_value, chosen_micros)) = &chosen {
+            if *chosen_micros != micros {
+                return Err(alias_conflict_error(
+                    canonical_field,
+                    chosen_name,
+                    chosen_value,
+                    name,
+                    &value,
+                ));
+            }
+            continue;
+        }
+        chosen = Some((name, value, micros));
+    }
+
+    Ok(chosen.map(|(_, _, micros)| micros))
+}
+
+pub(crate) fn parse_time_range_with_aliases(
+    date_start: Option<String>,
+    date_end: Option<String>,
+    start_aliases: &[(&'static str, Option<String>)],
+    end_aliases: &[(&'static str, Option<String>)],
+) -> Result<mcp_agent_mail_db::search_planner::TimeRange, McpError> {
+    let min_ts = resolve_time_bound_alias(
+        "date_start",
+        date_start,
+        start_aliases,
+        TimeBoundary::StartInclusive,
+    )?;
+    let max_ts = resolve_time_bound_alias(
+        "date_end",
+        date_end,
+        end_aliases,
+        TimeBoundary::EndInclusive,
+    )?;
+
+    if let (Some(start), Some(end)) = (min_ts, max_ts) {
+        if start > end {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                "Invalid date range: date_start must be less than or equal to date_end.",
+                true,
+                json!({
+                    "field": "date_range",
+                    "date_start_micros": start,
+                    "date_end_micros": end
+                }),
+            ));
+        }
+    }
+
+    Ok(mcp_agent_mail_db::search_planner::TimeRange { min_ts, max_ts })
+}
+
 /// Full-text search over message subjects and bodies.
 ///
 /// Supports FTS5 syntax:
@@ -271,20 +480,49 @@ pub(crate) fn summarize_messages(
 /// - `project_key`: Project identifier
 /// - `query`: FTS5 query string
 /// - `limit`: Max results (default: 20)
+/// - `offset`: Pagination offset (default: 0)
+/// - `ranking`: Ranking mode: "relevance" (default) or "recency"
+/// - `sender`: Filter by sender agent name (`from_agent` and `sender_name` are aliases)
+/// - `importance`: Filter by importance: "low", "normal", "high", "urgent" (comma-separated)
+/// - `thread_id`: Filter by thread ID
+/// - `date_start`: Filter messages created at/after this ISO-8601 timestamp
+/// - `date_end`: Filter messages created at/before this ISO-8601 timestamp
+/// - `date_from`, `after`, `since`: Aliases of `date_start`
+/// - `date_to`, `before`, `until`: Aliases of `date_end`
+/// - `explain`: Include query plan explain metadata (default: false)
 ///
 /// # Returns
 /// List of matching message summaries
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 #[tool(
-    description = "Full-text search over subject and body for a project.\n\nTips\n----\n- SQLite FTS5 syntax supported: phrases (\"build plan\"), prefix (mig*), boolean (plan AND users)\n- Results are ordered by bm25 score (best matches first)\n- Limit defaults to 20; raise for broad queries\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return.\n\nReturns\n-------\nlist[dict]\n    Each entry: { id, subject, importance, ack_required, created_ts, thread_id, from }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"10\",\"method\":\"tools/call\",\"params\":{\"name\":\"search_messages\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"query\":\"\"build plan\" AND users\", \"limit\": 50\n}}}\n```"
+    description = "Full-text search over subject and body for a project.\n\nTips\n----\n- SQLite FTS5 syntax supported: phrases (\"build plan\"), prefix (mig*), boolean (plan AND users)\n- Results are ordered by bm25 score (best matches first) unless ranking=\"recency\"\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (BM25, default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, explain?, next_cursor? }\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
 )]
 pub async fn search_messages(
     ctx: &McpContext,
     project_key: String,
     query: String,
     limit: Option<i32>,
+    offset: Option<i32>,
+    ranking: Option<String>,
+    sender: Option<String>,
+    from_agent: Option<String>,
+    sender_name: Option<String>,
+    importance: Option<String>,
+    thread_id: Option<String>,
+    date_start: Option<String>,
+    date_end: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    explain: Option<bool>,
 ) -> McpResult<String> {
     let max_results_raw = limit.unwrap_or(20).clamp(1, 1000);
     let max_results = max_results_raw.unsigned_abs() as usize;
+    let offset_val = offset.unwrap_or(0).max(0).unsigned_abs() as usize;
+    let want_explain = explain.unwrap_or(false);
 
     // Legacy parity: empty query returns an empty result set (no DB call).
     let trimmed = query.trim();
@@ -292,21 +530,60 @@ pub async fn search_messages(
         let response = SearchResponse {
             result: Vec::new(),
             assistance: None,
+            explain: None,
+            next_cursor: None,
         };
         return serde_json::to_string(&response)
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }
 
+    // Parse optional ranking mode
+    let ranking_mode = match &ranking {
+        Some(r) => parse_search_mode(r)?,
+        None => mcp_agent_mail_db::search_planner::RankingMode::default(),
+    };
+
+    // Parse optional importance filter
+    let importance_filter = match &importance {
+        Some(imp) => parse_importance_list(imp)?,
+        None => Vec::new(),
+    };
+
+    let sender_filter = resolve_text_filter_alias(
+        "sender",
+        sender,
+        &[("from_agent", from_agent), ("sender_name", sender_name)],
+    )?;
+
+    // Parse optional date range timestamps (ISO-8601 → microseconds)
+    let time_range = parse_time_range_with_aliases(
+        date_start,
+        date_end,
+        &[("date_from", date_from), ("after", after), ("since", since)],
+        &[("date_to", date_to), ("before", before), ("until", until)],
+    )?;
+
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    // Build a SearchQuery and execute via the unified search service
-    let search_query =
-        mcp_agent_mail_db::search_planner::SearchQuery::messages(trimmed, project_id);
+    // Build a SearchQuery with all facets
     let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
+        text: trimmed.to_string(),
+        doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
+        project_id: Some(project_id),
+        product_id: None,
+        importance: importance_filter,
+        direction: None,
+        agent_name: sender_filter,
+        thread_id,
+        ack_required: None,
+        time_range,
+        ranking: ranking_mode,
         limit: Some(max_results),
-        ..search_query
+        cursor: None,
+        explain: want_explain,
+        ..Default::default()
     };
 
     let planner_response = db_outcome_to_mcp_result(
@@ -315,9 +592,11 @@ pub async fn search_messages(
     )?;
 
     // Map planner SearchResult → tool SearchResult (legacy format)
+    // Apply offset manually (planner doesn't support offset for simple search)
     let results: Vec<SearchResult> = planner_response
         .results
         .into_iter()
+        .skip(offset_val)
         .map(|r| SearchResult {
             id: r.id,
             subject: r.title,
@@ -326,23 +605,125 @@ pub async fn search_messages(
             created_ts: r.created_ts.map(micros_to_iso),
             thread_id: r.thread_id,
             from: r.from_agent.unwrap_or_default(),
+            reason_codes: r.reason_codes,
+            score_factors: r.score_factors,
         })
         .collect();
 
     tracing::debug!(
-        "Searched messages in project {} for '{}' (limit: {}, found: {})",
+        "Searched messages in project {} for '{}' (limit: {}, offset: {}, ranking: {:?}, found: {})",
         project_key,
         trimmed,
         max_results,
+        offset_val,
+        ranking_mode,
         results.len()
     );
 
     let response = SearchResponse {
         result: results,
         assistance: planner_response.assistance,
+        explain: planner_response.explain,
+        next_cursor: planner_response.next_cursor,
     };
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Parse ISO-8601 date strings into a `TimeRange` (microsecond timestamps).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn parse_time_range(
+    date_start: Option<&str>,
+    date_end: Option<&str>,
+) -> Result<mcp_agent_mail_db::search_planner::TimeRange, McpError> {
+    parse_time_range_with_aliases(
+        date_start.map(ToString::to_string),
+        date_end.map(ToString::to_string),
+        &[],
+        &[],
+    )
+}
+
+/// Parse an ISO-8601 timestamp string to microseconds since epoch.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn parse_iso_to_micros(s: &str, field: &str) -> Result<i64, McpError> {
+    parse_iso_to_micros_with_boundary(s, field, TimeBoundary::StartInclusive)
+}
+
+fn parse_iso_to_micros_with_boundary(
+    s: &str,
+    field: &str,
+    boundary: TimeBoundary,
+) -> Result<i64, McpError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!("Invalid {field} timestamp: empty value."),
+            true,
+            json!({
+                "field": field,
+                "provided": s
+            }),
+        ));
+    }
+
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(ts.timestamp_micros());
+    }
+
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S"))
+    {
+        return Ok(naive.and_utc().timestamp_micros());
+    }
+
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let start_micros = date
+            .and_hms_micro_opt(0, 0, 0, 0)
+            .map(|naive| naive.and_utc().timestamp_micros())
+            .ok_or_else(|| {
+                legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!("Invalid {field} timestamp: \"{s}\"."),
+                    true,
+                    json!({
+                        "field": field,
+                        "provided": s
+                    }),
+                )
+            })?;
+
+        return match boundary {
+            TimeBoundary::StartInclusive => Ok(start_micros),
+            TimeBoundary::EndInclusive => {
+                start_micros.checked_add(MICROS_PER_DAY - 1).ok_or_else(|| {
+                    legacy_tool_error(
+                        "INVALID_ARGUMENT",
+                        format!("Invalid {field} timestamp: \"{s}\"."),
+                        true,
+                        json!({
+                            "field": field,
+                            "provided": s
+                        }),
+                    )
+                })
+            }
+        };
+    }
+
+    Err(legacy_tool_error(
+        "INVALID_ARGUMENT",
+        format!(
+            "Invalid {field} timestamp: \"{s}\". Use ISO-8601 format (e.g. \"2025-01-15T00:00:00Z\")."
+        ),
+        true,
+        json!({
+            "field": field,
+            "provided": s,
+            "expected_format": "ISO-8601 (e.g. 2025-01-15T00:00:00Z or 2025-01-15)"
+        }),
+    ))
 }
 
 /// Extract participants, key points, and action items for threads.
@@ -700,9 +1081,13 @@ mod tests {
         let resp = SearchResponse {
             result: Vec::new(),
             assistance: None,
+            explain: None,
+            next_cursor: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize search response");
         assert!(!json.contains("assistance"));
+        assert!(!json.contains("explain"));
+        assert!(!json.contains("next_cursor"));
     }
 
     #[test]
@@ -714,10 +1099,136 @@ mod tests {
                 applied_filter_hints: Vec::new(),
                 did_you_mean: Vec::new(),
             }),
+            explain: None,
+            next_cursor: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize assisted search response");
         assert!(json.contains("assistance"));
         assert!(json.contains("thread:br-123"));
+    }
+
+    #[test]
+    fn parse_search_mode_valid_values() {
+        assert!(parse_search_mode("relevance").is_ok());
+        assert!(parse_search_mode("recency").is_ok());
+        assert!(parse_search_mode("bm25").is_ok());
+        assert!(parse_search_mode("recent").is_ok());
+        assert!(parse_search_mode("RELEVANCE").is_ok());
+    }
+
+    #[test]
+    fn parse_search_mode_invalid_value() {
+        let err = parse_search_mode("invalid");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_importance_list_valid() {
+        let result = parse_importance_list("high,urgent").unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn parse_importance_list_single() {
+        let result = parse_importance_list("low").unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_importance_list_empty() {
+        let result = parse_importance_list("").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_importance_list_invalid() {
+        let err = parse_importance_list("critical");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_time_range_valid_rfc3339() {
+        let range = parse_time_range(Some("2025-01-15T00:00:00Z"), None).unwrap();
+        assert!(range.min_ts.is_some());
+        assert!(range.max_ts.is_none());
+    }
+
+    #[test]
+    fn parse_time_range_both_bounds() {
+        let range =
+            parse_time_range(Some("2025-01-01T00:00:00Z"), Some("2025-12-31T23:59:59Z")).unwrap();
+        assert!(range.min_ts.is_some());
+        assert!(range.max_ts.is_some());
+        assert!(range.min_ts.unwrap() < range.max_ts.unwrap());
+    }
+
+    #[test]
+    fn parse_time_range_none() {
+        let range = parse_time_range(None, None).unwrap();
+        assert!(range.is_empty());
+    }
+
+    #[test]
+    fn parse_time_range_invalid_format() {
+        let err = parse_time_range(Some("not-a-date"), None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_time_range_date_only_end_is_full_day_inclusive() {
+        let range = parse_time_range(None, Some("2025-01-15")).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2025-01-15T23:59:59.999999Z")
+            .expect("valid timestamp")
+            .timestamp_micros();
+        assert_eq!(range.max_ts, Some(expected));
+    }
+
+    #[test]
+    fn parse_time_range_aliases_are_supported() {
+        let range = parse_time_range_with_aliases(
+            None,
+            None,
+            &[("since", Some("2025-01-15".to_string()))],
+            &[("until", Some("2025-01-16".to_string()))],
+        )
+        .unwrap();
+        assert!(range.min_ts.is_some());
+        assert!(range.max_ts.is_some());
+        assert!(range.min_ts.unwrap() < range.max_ts.unwrap());
+    }
+
+    #[test]
+    fn parse_time_range_alias_conflict_is_rejected() {
+        let err = parse_time_range_with_aliases(
+            Some("2025-01-15T00:00:00Z".to_string()),
+            None,
+            &[("since", Some("2025-01-16T00:00:00Z".to_string()))],
+            &[],
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn resolve_text_filter_alias_allows_equivalent_casing() {
+        let sender = resolve_text_filter_alias(
+            "sender",
+            Some("BlueLake".to_string()),
+            &[("from_agent", Some("bluelake".to_string()))],
+        )
+        .unwrap();
+        assert_eq!(sender.as_deref(), Some("BlueLake"));
+    }
+
+    #[test]
+    fn parse_iso_to_micros_rfc3339() {
+        let micros = parse_iso_to_micros("2025-01-15T12:30:00Z", "test").unwrap();
+        assert!(micros > 0);
+    }
+
+    #[test]
+    fn parse_iso_to_micros_invalid() {
+        let err = parse_iso_to_micros("garbage", "test");
+        assert!(err.is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -898,6 +1409,8 @@ mod tests {
             created_ts: Some("2025-01-01T00:00:00Z".to_string()),
             thread_id: Some("thread-123".to_string()),
             from: "Alice".to_string(),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("\"id\":42"));
@@ -918,10 +1431,40 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from: "Bob".to_string(),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("\"created_ts\":null"));
         assert!(json.contains("\"thread_id\":null"));
+        // Empty vecs should be omitted via skip_serializing_if
+        assert!(!json.contains("reason_codes"));
+        assert!(!json.contains("score_factors"));
+    }
+
+    #[test]
+    fn search_result_explain_fields_present_when_populated() {
+        use mcp_agent_mail_db::search_planner::ScoreFactorSummary;
+        let result = SearchResult {
+            id: 7,
+            subject: "Explain test".to_string(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: None,
+            thread_id: None,
+            from: "Alice".to_string(),
+            reason_codes: vec!["LexicalBm25".to_string(), "FusionWeightedBlend".to_string()],
+            score_factors: vec![ScoreFactorSummary {
+                key: "bm25".to_string(),
+                contribution: 0.72,
+                summary: "Strong BM25 match on query terms".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"reason_codes\":[\"LexicalBm25\""));
+        assert!(json.contains("\"score_factors\":[{"));
+        assert!(json.contains("\"key\":\"bm25\""));
+        assert!(json.contains("\"contribution\":0.72"));
     }
 
     // -----------------------------------------------------------------------

@@ -639,6 +639,8 @@ mod tests {
             created_ts: Some(1_000_000),
             thread_id: Some("thread-1".to_string()),
             from_agent: Some(from_agent.to_string()),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
         }
@@ -657,6 +659,8 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
         }
@@ -710,6 +714,8 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
         };

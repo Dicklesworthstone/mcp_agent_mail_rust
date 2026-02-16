@@ -410,6 +410,17 @@ pub struct SearchResult {
     pub thread_id: Option<String>,
     pub from_agent: Option<String>,
 
+    // ── Explain metadata (only populated when explain=true) ──────
+    /// Concise reason codes explaining why this result ranked here.
+    /// Machine-stable identifiers (e.g. `lexical_bm25`, `semantic_cosine`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+
+    /// Top score factors with contributions, sorted by abs magnitude.
+    /// Each entry: { key, contribution, summary }.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub score_factors: Vec<ScoreFactorSummary>,
+
     // ── Redaction metadata ────────────────────────────────────────
     /// Whether any fields in this result were redacted.
     #[serde(default)]
@@ -417,6 +428,18 @@ pub struct SearchResult {
     /// Human-readable reason for redaction (displayed to user).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redaction_reason: Option<String>,
+}
+
+/// Concise score factor summary for per-result explain output.
+/// Designed to be small and safe for JSON response payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreFactorSummary {
+    /// Stable key (e.g. `bm25`, `term_coverage`, `cosine`).
+    pub key: String,
+    /// Numeric contribution to this result's score.
+    pub contribution: f64,
+    /// Human-readable one-line summary.
+    pub summary: String,
 }
 
 /// Response from the search planner, including results and pagination info.
@@ -1530,6 +1553,8 @@ mod tests {
             created_ts: Some(1000),
             thread_id: Some("t1".to_string()),
             from_agent: Some("Blue".to_string()),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
         };
@@ -1710,6 +1735,8 @@ mod tests {
             created_ts: Some(1000),
             thread_id: Some("t1".to_string()),
             from_agent: Some("BlueLake".to_string()),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
         }

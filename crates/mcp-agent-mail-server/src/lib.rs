@@ -713,6 +713,29 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         .build()
 }
 
+fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
+    match mcp_agent_mail_storage::heal_archive_locks(config) {
+        Ok(report) => {
+            if !report.locks_removed.is_empty() || !report.metadata_removed.is_empty() {
+                tracing::info!(
+                    "[startup-heal] removed {} stale lock files and {} orphan lock metadata files (scanned={})",
+                    report.locks_removed.len(),
+                    report.metadata_removed.len(),
+                    report.locks_scanned
+                );
+            } else {
+                tracing::debug!(
+                    "[startup-heal] lock scan complete (scanned={}, removed=0)",
+                    report.locks_scanned
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!("[startup-heal] lock scan failed: {err}");
+        }
+    }
+}
+
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -722,6 +745,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
+    heal_storage_lock_artifacts(config);
     disk_monitor::start(config);
     mcp_agent_mail_storage::wbq_start();
     build_server(config).run_stdio();
@@ -744,6 +768,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
+    heal_storage_lock_artifacts(config);
     mcp_agent_mail_storage::wbq_start();
     cleanup::start(config);
     ack_ttl::start(config);
@@ -821,6 +846,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     }
 
     // ── 2. Background workers (same as run_http) ────────────────────
+    heal_storage_lock_artifacts(config);
     mcp_agent_mail_storage::wbq_start();
     cleanup::start(config);
     ack_ttl::start(config);
@@ -850,6 +876,26 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 
     // ── 6. TUI on main thread ───────────────────────────────────────
     let tui_result = run_tui_main_thread(&tui_state, config);
+    let detach_headless = tui_result.is_ok() && tui_state.take_headless_detach_requested();
+
+    if detach_headless {
+        // TUI detached intentionally: keep HTTP server running headless.
+        set_tui_state_handle(None);
+        db_poller.stop();
+
+        let supervisor_result = supervisor_thread
+            .join()
+            .map_err(|_| std::io::Error::other("HTTP supervisor thread panicked"))?;
+
+        retention::shutdown();
+        tool_metrics::shutdown();
+        ack_ttl::shutdown();
+        cleanup::shutdown();
+        disk_monitor::shutdown();
+        mcp_agent_mail_storage::wbq_shutdown();
+
+        return supervisor_result;
+    }
 
     // ── 7. Graceful shutdown ────────────────────────────────────────
     tui_state.request_shutdown();

@@ -393,14 +393,11 @@ pub fn render_tool_call_end(
         for (tbl, cnt) in per_table.iter().take(5) {
             let cnt_str = cnt.to_string();
             let name_max = w.saturating_sub(cnt_str.len() + 4); // 2 leading + 1 space + 1 trailing
-            let name = if tbl.len() > name_max {
-                &tbl[..name_max]
-            } else {
-                tbl.as_str()
-            };
-            let gap = w.saturating_sub(name.len() + cnt_str.len() + 3);
+            let name = truncate_with_suffix(tbl, name_max, "");
+            let name_len = name.chars().count();
+            let gap = w.saturating_sub(name_len + cnt_str.len() + 3);
             let row = format!("  {name}{}{warning}{cnt_str}{RESET}", " ".repeat(gap));
-            let row_vis = name.len() + cnt_str.len() + gap + 2;
+            let row_vis = name_len + cnt_str.len() + gap + 2;
             let pad = w.saturating_sub(row_vis);
             lines.push(format!(
                 "{color}\u{2502}{row}{}{color}\u{2502}{RESET}",

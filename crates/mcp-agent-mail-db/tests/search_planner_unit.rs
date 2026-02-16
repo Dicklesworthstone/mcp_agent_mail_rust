@@ -47,6 +47,8 @@ fn make_result(id: i64, project_id: i64) -> SearchResult {
         created_ts: Some(1_700_000_000_000_000),
         thread_id: Some(format!("thread-{id}")),
         from_agent: Some("BlueLake".to_string()),
+        reason_codes: Vec::new(),
+        score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
     }

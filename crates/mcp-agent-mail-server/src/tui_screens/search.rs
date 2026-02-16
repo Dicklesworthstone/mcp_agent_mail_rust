@@ -306,6 +306,79 @@ impl SortDirection {
     }
 }
 
+/// Search V3 mode selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SearchModeFilter {
+    /// Engine picks the best mode based on query characteristics.
+    #[default]
+    Auto,
+    /// Full-text lexical search (FTS5/Tantivy BM25).
+    Lexical,
+    /// Vector similarity search (embeddings).
+    Semantic,
+    /// Two-tier fusion: lexical + semantic reranking.
+    Hybrid,
+}
+
+impl SearchModeFilter {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Lexical => "Lexical",
+            Self::Semantic => "Semantic",
+            Self::Hybrid => "Hybrid",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Lexical,
+            Self::Lexical => Self::Semantic,
+            Self::Semantic => Self::Hybrid,
+            Self::Hybrid => Self::Auto,
+        }
+    }
+
+    const fn prev(self) -> Self {
+        match self {
+            Self::Auto => Self::Hybrid,
+            Self::Lexical => Self::Auto,
+            Self::Semantic => Self::Lexical,
+            Self::Hybrid => Self::Semantic,
+        }
+    }
+}
+
+/// Toggle for explain metadata in search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ExplainToggle {
+    /// Do not include explain data (default).
+    #[default]
+    Off,
+    /// Include reason codes and score factors.
+    On,
+}
+
+impl ExplainToggle {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::On => "On",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::On,
+            Self::On => Self::Off,
+        }
+    }
+
+    const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Search result entry
 // ──────────────────────────────────────────────────────────────────────
@@ -325,6 +398,10 @@ struct ResultEntry {
     thread_id: Option<String>,
     from_agent: Option<String>,
     project_id: Option<i64>,
+    /// Explain reason codes (populated when explain=on).
+    reason_codes: Vec<String>,
+    /// Score factor summaries (populated when explain=on).
+    score_factors: Vec<mcp_agent_mail_db::search_planner::ScoreFactorSummary>,
 }
 
 /// Wrapper for `VirtualizedList` rendering of search results.
@@ -693,6 +770,8 @@ enum FacetSlot {
     AckStatus,
     SortOrder,
     FieldScope,
+    SearchMode,
+    Explain,
 }
 
 impl FacetSlot {
@@ -703,18 +782,22 @@ impl FacetSlot {
             Self::Importance => Self::AckStatus,
             Self::AckStatus => Self::SortOrder,
             Self::SortOrder => Self::FieldScope,
-            Self::FieldScope => Self::Scope,
+            Self::FieldScope => Self::SearchMode,
+            Self::SearchMode => Self::Explain,
+            Self::Explain => Self::Scope,
         }
     }
 
     const fn prev(self) -> Self {
         match self {
-            Self::Scope => Self::FieldScope,
+            Self::Scope => Self::Explain,
             Self::DocKind => Self::Scope,
             Self::Importance => Self::DocKind,
             Self::AckStatus => Self::Importance,
             Self::SortOrder => Self::AckStatus,
             Self::FieldScope => Self::SortOrder,
+            Self::SearchMode => Self::FieldScope,
+            Self::Explain => Self::SearchMode,
         }
     }
 }
@@ -736,6 +819,8 @@ pub struct SearchCockpitScreen {
     ack_filter: AckFilter,
     sort_direction: SortDirection,
     field_scope: FieldScope,
+    search_mode: SearchModeFilter,
+    explain_toggle: ExplainToggle,
     thread_filter: Option<String>,
     highlight_terms: Vec<QueryTerm>,
 
@@ -806,6 +891,8 @@ impl SearchCockpitScreen {
             ack_filter: AckFilter::Any,
             sort_direction: SortDirection::NewestFirst,
             field_scope: FieldScope::default(),
+            search_mode: SearchModeFilter::default(),
+            explain_toggle: ExplainToggle::default(),
             thread_filter: None,
             highlight_terms: Vec::new(),
             results: Vec::new(),
@@ -1017,6 +1104,7 @@ impl SearchCockpitScreen {
             text: scoped_query,
             doc_kind: DocKind::Message,
             limit: Some(MAX_RESULTS),
+            explain: self.explain_toggle.is_on(),
             ..Default::default()
         };
         query.ranking = match self.sort_direction {
@@ -1151,6 +1239,8 @@ impl SearchCockpitScreen {
             FacetSlot::AckStatus => self.ack_filter = self.ack_filter.next(),
             FacetSlot::SortOrder => self.sort_direction = self.sort_direction.next(),
             FacetSlot::FieldScope => self.field_scope = self.field_scope.next(),
+            FacetSlot::SearchMode => self.search_mode = self.search_mode.next(),
+            FacetSlot::Explain => self.explain_toggle = self.explain_toggle.next(),
         }
         self.search_dirty = true;
         self.debounce_remaining = 0;
@@ -1164,6 +1254,8 @@ impl SearchCockpitScreen {
         self.ack_filter = AckFilter::Any;
         self.sort_direction = SortDirection::NewestFirst;
         self.field_scope = FieldScope::default();
+        self.search_mode = SearchModeFilter::default();
+        self.explain_toggle = ExplainToggle::default();
         self.thread_filter = None;
         self.search_dirty = true;
         self.debounce_remaining = 0;
@@ -1526,7 +1618,7 @@ impl Default for SearchCockpitScreen {
 
 impl MailScreen for SearchCockpitScreen {
     #[allow(clippy::too_many_lines)]
-    fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+    fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         match event {
             Event::Mouse(mouse) => {
                 if self.query_help_visible {
@@ -1733,6 +1825,8 @@ impl MailScreen for SearchCockpitScreen {
                                 self.sort_direction = self.sort_direction.next();
                             }
                             FacetSlot::FieldScope => self.field_scope = self.field_scope.prev(),
+                            FacetSlot::SearchMode => self.search_mode = self.search_mode.prev(),
+                            FacetSlot::Explain => self.explain_toggle = self.explain_toggle.next(),
                         }
                         self.search_dirty = true;
                         self.debounce_remaining = 0;
@@ -1855,6 +1949,7 @@ impl MailScreen for SearchCockpitScreen {
                     KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
                         self.query_input.clear();
                         self.reset_facets();
+                        self.execute_search(state);
                     }
                     _ => {}
                 },
@@ -2193,6 +2288,8 @@ fn query_message_rows(
                         thread_id: row.get_named("thread_id").ok(),
                         from_agent: row.get_named("from_name").ok(),
                         project_id: row.get_named("project_id").ok(),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
                     })
                 })
                 .collect()
@@ -2222,6 +2319,8 @@ fn query_agent_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultEnt
                         thread_id: None,
                         from_agent: None,
                         project_id: row.get_named("project_id").ok(),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
                     })
                 })
                 .collect()
@@ -2251,6 +2350,8 @@ fn query_project_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultE
                         thread_id: None,
                         from_agent: None,
                         project_id: Some(id),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
                     })
                 })
                 .collect()
@@ -2533,6 +2634,11 @@ fn render_facet_rail(
             screen.doc_kind_filter.label(),
         ),
         (
+            FacetSlot::SearchMode,
+            "Search Mode",
+            screen.search_mode.label(),
+        ),
+        (
             FacetSlot::Importance,
             "Importance",
             screen.importance_filter.label(),
@@ -2552,6 +2658,7 @@ fn render_facet_rail(
             "Search Field",
             screen.field_scope.label(),
         ),
+        (FacetSlot::Explain, "Explain", screen.explain_toggle.label()),
     ];
 
     for (i, &(slot, label, value)) in facets.iter().enumerate() {
@@ -2595,9 +2702,9 @@ fn render_facet_rail(
         }
     }
 
-    // Thread filter indicator
+    // Thread filter indicator (after 8 facets x 2 rows each = 16)
     if let Some(ref tid) = screen.thread_filter {
-        let y = inner.y + 10;
+        let y = inner.y + 16;
         if y + 1 < inner.y + inner.height {
             let thread_text = format!("  Thread: {}", truncate_str(tid, w.saturating_sub(10)));
             let thread_area = Rect::new(inner.x, y, inner.width, 1);
@@ -2613,7 +2720,7 @@ fn render_facet_rail(
 
     // Help hint at bottom
     let help_y = inner.y + inner.height - 1;
-    if help_y > inner.y + 11 {
+    if help_y > inner.y + 17 {
         let hint = if in_rail {
             "Enter:toggle  wheel:facet  r:reset  L:lab"
         } else {
@@ -2627,11 +2734,11 @@ fn render_facet_rail(
 }
 
 fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitScreen) {
-    if inner.height < 13 || inner.width < 14 {
+    if inner.height < 19 || inner.width < 14 {
         return;
     }
 
-    let top = inner.y.saturating_add(12);
+    let top = inner.y.saturating_add(18);
     let available_h = inner
         .y
         .saturating_add(inner.height)
@@ -3059,6 +3166,32 @@ fn render_detail(
         lines.push(styled_field("Score:      ", format!("{score:.3}")));
     }
 
+    // Explain section: reason codes and score factors (when populated).
+    if !entry.reason_codes.is_empty() {
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::styled(
+            "\u{2500}\u{2500}\u{2500} Explain \u{2500}\u{2500}\u{2500}".to_string(),
+            label_style,
+        ));
+        lines.push(styled_field("Reasons:    ", entry.reason_codes.join(", ")));
+        for sf in &entry.score_factors {
+            let sign = if sf.contribution >= 0.0 { "+" } else { "" };
+            lines.push(Line::from_spans([
+                Span::styled("  ".to_string(), label_style),
+                Span::styled(
+                    format!("{}{:.3}", sign, sf.contribution),
+                    if sf.contribution >= 0.0 {
+                        accent_style
+                    } else {
+                        value_style
+                    },
+                ),
+                Span::styled(format!(" {} ", sf.key), label_style),
+                Span::styled(sf.summary.clone(), value_style),
+            ]));
+        }
+    }
+
     // Markdown preview section (messages with full body) or plain preview fallback.
     lines.push(Line::raw(String::new()));
     if let Some(ref body) = entry.full_body {
@@ -3373,6 +3506,10 @@ mod tests {
         s = s.next();
         assert_eq!(s, FacetSlot::FieldScope);
         s = s.next();
+        assert_eq!(s, FacetSlot::SearchMode);
+        s = s.next();
+        assert_eq!(s, FacetSlot::Explain);
+        s = s.next();
         assert_eq!(s, FacetSlot::Scope);
     }
 
@@ -3381,6 +3518,10 @@ mod tests {
         let mut s = FacetSlot::DocKind;
         s = s.prev();
         assert_eq!(s, FacetSlot::Scope);
+        s = s.prev();
+        assert_eq!(s, FacetSlot::Explain);
+        s = s.prev();
+        assert_eq!(s, FacetSlot::SearchMode);
         s = s.prev();
         assert_eq!(s, FacetSlot::FieldScope);
         s = s.prev();
@@ -3527,6 +3668,43 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_clears_query_and_refreshes_results_immediately() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::ResultList;
+        screen.query_input.set_value("urgent");
+        screen.results.push(ResultEntry {
+            id: 1,
+            doc_kind: DocKind::Message,
+            title: "stale result".to_string(),
+            body_preview: String::new(),
+            full_body: None,
+            score: None,
+            importance: None,
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            project_id: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+        });
+        screen.search_dirty = true;
+
+        let clear = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('c'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::CTRL,
+        });
+        let _ = screen.update(&clear, &state);
+
+        assert_eq!(screen.query_input.value(), "");
+        assert!(screen.results.is_empty());
+        assert!(!screen.search_dirty);
+    }
+
+    #[test]
     fn toggle_active_facet_doc_kind() {
         let mut screen = SearchCockpitScreen::new();
         screen.active_facet = FacetSlot::DocKind;
@@ -3669,7 +3847,7 @@ mod tests {
         s = s.prev();
         assert_eq!(s, FacetSlot::Scope);
         s = s.prev();
-        assert_eq!(s, FacetSlot::FieldScope);
+        assert_eq!(s, FacetSlot::Explain);
     }
 
     #[test]
@@ -3692,6 +3870,43 @@ mod tests {
         assert_eq!(fs, FieldScope::SubjectOnly);
         fs = fs.prev();
         assert_eq!(fs, FieldScope::SubjectAndBody);
+    }
+
+    #[test]
+    fn search_mode_filter_cycles() {
+        let mut m = SearchModeFilter::Auto;
+        m = m.next();
+        assert_eq!(m, SearchModeFilter::Lexical);
+        m = m.next();
+        assert_eq!(m, SearchModeFilter::Semantic);
+        m = m.next();
+        assert_eq!(m, SearchModeFilter::Hybrid);
+        m = m.next();
+        assert_eq!(m, SearchModeFilter::Auto);
+    }
+
+    #[test]
+    fn search_mode_filter_prev_cycles() {
+        let mut m = SearchModeFilter::Auto;
+        m = m.prev();
+        assert_eq!(m, SearchModeFilter::Hybrid);
+        m = m.prev();
+        assert_eq!(m, SearchModeFilter::Semantic);
+        m = m.prev();
+        assert_eq!(m, SearchModeFilter::Lexical);
+        m = m.prev();
+        assert_eq!(m, SearchModeFilter::Auto);
+    }
+
+    #[test]
+    fn explain_toggle_cycles() {
+        let mut e = ExplainToggle::Off;
+        assert!(!e.is_on());
+        e = e.next();
+        assert_eq!(e, ExplainToggle::On);
+        assert!(e.is_on());
+        e = e.next();
+        assert_eq!(e, ExplainToggle::Off);
     }
 
     #[test]
@@ -4074,6 +4289,8 @@ mod tests {
             thread_id: Some("test-thread".to_string()),
             from_agent: Some("GoldFox".to_string()),
             project_id: Some(1),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
         }
     }
 
@@ -4091,6 +4308,8 @@ mod tests {
             thread_id: None,
             from_agent: None,
             project_id: Some(1),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
         }
     }
 
@@ -4463,6 +4682,8 @@ mod tests {
             thread_id: None,
             from_agent: None,
             project_id: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
         };
         let row = SearchResultRow {
             entry,
@@ -4527,20 +4748,20 @@ mod tests {
     fn facet_slot_next_round_trips() {
         let start = FacetSlot::Scope;
         let mut slot = start;
-        for _ in 0..6 {
+        for _ in 0..8 {
             slot = slot.next();
         }
-        assert_eq!(slot, start, "6 next() calls should round-trip");
+        assert_eq!(slot, start, "8 next() calls should round-trip");
     }
 
     #[test]
     fn facet_slot_prev_round_trips() {
         let start = FacetSlot::Scope;
         let mut slot = start;
-        for _ in 0..6 {
+        for _ in 0..8 {
             slot = slot.prev();
         }
-        assert_eq!(slot, start, "6 prev() calls should round-trip");
+        assert_eq!(slot, start, "8 prev() calls should round-trip");
     }
 
     #[test]
@@ -4552,6 +4773,8 @@ mod tests {
             FacetSlot::AckStatus,
             FacetSlot::SortOrder,
             FacetSlot::FieldScope,
+            FacetSlot::SearchMode,
+            FacetSlot::Explain,
         ] {
             assert_eq!(slot.next().prev(), slot, "next().prev() for {slot:?}");
             assert_eq!(slot.prev().next(), slot, "prev().next() for {slot:?}");

@@ -4662,16 +4662,26 @@ impl Widget for EvidenceLedgerWidget<'_> {
 
             // Truncate decision_point to fit
             let dp_width = 22;
-            let dp: String = if entry.decision_point.len() > dp_width {
-                format!("{}...", &entry.decision_point[..dp_width - 3])
+            let dp: String = if entry.decision_point.chars().count() > dp_width {
+                let head: String = entry
+                    .decision_point
+                    .chars()
+                    .take(dp_width.saturating_sub(3))
+                    .collect();
+                format!("{head}...")
             } else {
                 format!("{:<dp_width$}", entry.decision_point)
             };
 
             // Truncate action
             let act_width = 14;
-            let act: String = if entry.action.len() > act_width {
-                format!("{}...", &entry.action[..act_width - 3])
+            let act: String = if entry.action.chars().count() > act_width {
+                let head: String = entry
+                    .action
+                    .chars()
+                    .take(act_width.saturating_sub(3))
+                    .collect();
+                format!("{head}...")
             } else {
                 format!("{:<act_width$}", entry.action)
             };
@@ -7946,6 +7956,25 @@ mod tests {
         assert!(
             !output.contains("coalesce.outcome"),
             "third entry should be hidden due to max_visible=2"
+        );
+    }
+
+    #[test]
+    fn evidence_widget_unicode_truncation_no_panic() {
+        let entries = vec![EvidenceLedgerRow {
+            seq: 1,
+            ts_micros: 1_700_000_000_000_000,
+            decision_point: "session.review.pass—超長パス名",
+            action: "acknowledge—完了",
+            confidence: 0.99,
+            correct: Some(true),
+        }];
+        let widget = EvidenceLedgerWidget::new(&entries);
+        let output = render_widget(&widget, 80, 8);
+        assert!(output.contains("Seq"), "header should render");
+        assert!(
+            output.contains("..."),
+            "long unicode text should be truncated"
         );
     }
 

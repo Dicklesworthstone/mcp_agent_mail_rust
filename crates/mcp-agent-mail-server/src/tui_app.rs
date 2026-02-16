@@ -63,6 +63,14 @@ const SCREEN_TRANSITION_TICKS: u8 = 4;
 const TOAST_ENTRANCE_TICKS: u8 = 4;
 const TOAST_EXIT_TICKS: u8 = 3;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitConfirmSource {
+    Escape,
+    CtrlC,
+}
 
 /// Deferred action from a confirmed modal callback.
 ///
@@ -909,6 +917,10 @@ pub struct MailAppModel {
     clipboard: Clipboard,
     /// Internal clipboard fallback when terminal clipboard is unavailable.
     internal_clipboard: Option<String>,
+    /// Last armed quit confirmation timestamp.
+    quit_confirm_armed_at: Option<Instant>,
+    /// Input source that armed quit confirmation.
+    quit_confirm_source: Option<QuitConfirmSource>,
 }
 
 impl MailAppModel {
@@ -982,6 +994,8 @@ impl MailAppModel {
             action_outcomes: Vec::new(),
             clipboard: Clipboard::auto(ftui::TerminalCapabilities::detect()),
             internal_clipboard: None,
+            quit_confirm_armed_at: None,
+            quit_confirm_source: None,
         }
     }
 
@@ -1282,7 +1296,7 @@ impl MailAppModel {
     /// internal fallbacks. Shows a toast with a preview of the copied content.
     fn copy_to_clipboard(&mut self, text: &str) {
         let preview: String = text.chars().take(40).collect();
-        let truncated = if text.len() > 40 {
+        let truncated = if text.chars().count() > 40 {
             format!("{preview}...")
         } else {
             preview
@@ -1679,6 +1693,53 @@ impl MailAppModel {
         self.persist_appearance_settings();
     }
 
+    const fn clear_quit_confirmation(&mut self) {
+        self.quit_confirm_armed_at = None;
+        self.quit_confirm_source = None;
+    }
+
+    fn arm_quit_confirmation(&mut self, source: QuitConfirmSource) {
+        self.quit_confirm_armed_at = Some(Instant::now());
+        self.quit_confirm_source = Some(source);
+        let message = match source {
+            QuitConfirmSource::Escape => {
+                "Press Esc again to quit. Ctrl-D detaches TUI and keeps server running."
+            }
+            QuitConfirmSource::CtrlC => "Press Ctrl-C again to quit. Ctrl-D detaches TUI only.",
+        };
+        self.notifications.notify(
+            self.apply_toast_policy(
+                Toast::new(message)
+                    .icon(ToastIcon::Warning)
+                    .duration(Duration::from_secs(QUIT_CONFIRM_TOAST_SECS)),
+            ),
+        );
+    }
+
+    fn handle_quit_confirmation_input(&mut self, source: QuitConfirmSource) -> Cmd<MailMsg> {
+        let now = Instant::now();
+        let confirmed = self.quit_confirm_source == Some(source)
+            && self
+                .quit_confirm_armed_at
+                .is_some_and(|armed| now.duration_since(armed) <= QUIT_CONFIRM_WINDOW);
+        if confirmed {
+            self.clear_quit_confirmation();
+            self.flush_before_shutdown();
+            self.state.request_shutdown();
+            Cmd::quit()
+        } else {
+            self.arm_quit_confirmation(source);
+            Cmd::none()
+        }
+    }
+
+    fn detach_tui_headless(&mut self) -> Cmd<MailMsg> {
+        self.clear_quit_confirmation();
+        self.flush_before_shutdown();
+        self.state.request_headless_detach();
+        Cmd::quit()
+    }
+
     fn toast_dismiss_secs(&self, icon: ToastIcon) -> u64 {
         match icon {
             ToastIcon::Warning => self.toast_warn_dismiss_secs,
@@ -1875,6 +1936,9 @@ impl MailAppModel {
                 self.flush_before_shutdown();
                 self.state.request_shutdown();
                 return Cmd::quit();
+            }
+            palette_action_ids::APP_DETACH => {
+                return self.detach_tui_headless();
             }
             palette_action_ids::TRANSPORT_TOGGLE => {
                 let _ = self
@@ -2732,8 +2796,30 @@ impl Model for MailAppModel {
                             }
                             return Cmd::none();
                         }
+
+                        let is_escape = matches!(key.code, KeyCode::Escape);
+                        let is_ctrl_c = key.modifiers.contains(Modifiers::CTRL)
+                            && matches!(key.code, KeyCode::Char('c' | 'C'));
+                        let is_ctrl_d = key.modifiers.contains(Modifiers::CTRL)
+                            && matches!(key.code, KeyCode::Char('d' | 'D'));
+
+                        if !(is_escape || is_ctrl_c) {
+                            self.clear_quit_confirmation();
+                        }
+
+                        if is_ctrl_d {
+                            return self.detach_tui_headless();
+                        }
+                        if is_escape && !text_mode {
+                            return self.handle_quit_confirmation_input(QuitConfirmSource::Escape);
+                        }
+                        if is_ctrl_c {
+                            return self.handle_quit_confirmation_input(QuitConfirmSource::CtrlC);
+                        }
+
                         match key.code {
                             KeyCode::Char('q') if !text_mode => {
+                                self.clear_quit_confirmation();
                                 self.flush_before_shutdown();
                                 self.state.request_shutdown();
                                 return Cmd::quit();
@@ -2862,6 +2948,7 @@ impl Model for MailAppModel {
                 Cmd::none()
             }
             MailMsg::Quit => {
+                self.clear_quit_confirmation();
                 self.flush_before_shutdown();
                 self.state.request_shutdown();
                 Cmd::quit()
@@ -2967,8 +3054,10 @@ impl Model for MailAppModel {
                 self.screen_panics.borrow_mut().insert(active_screen, msg);
             }
         }
-        if let Some(focused_rect) = self.focused_panel_rect(chrome.content) {
-            render_panel_focus_outline(focused_rect, frame);
+        if active_screen != MailScreenId::Dashboard {
+            if let Some(focused_rect) = self.focused_panel_rect(chrome.content) {
+                render_panel_focus_outline(focused_rect, frame);
+            }
         }
 
         // Register pane hit region for the active screen's content area.
@@ -3084,6 +3173,7 @@ fn map_screen_cmd(cmd: Cmd<MailScreenMsg>) -> Cmd<MailMsg> {
 mod palette_action_ids {
     pub const APP_TOGGLE_HELP: &str = "app:toggle_help";
     pub const APP_QUIT: &str = "app:quit";
+    pub const APP_DETACH: &str = "app:detach_headless";
 
     pub const TRANSPORT_TOGGLE: &str = "transport:toggle";
     pub const TRANSPORT_SET_MCP: &str = "transport:set_mcp";
@@ -3322,6 +3412,12 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
         ActionItem::new(palette_action_ids::APP_QUIT, "Quit")
             .with_description("Exit AgentMailTUI (requests shutdown)")
             .with_tags(&["quit", "exit"])
+            .with_category("App"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::APP_DETACH, "Detach TUI (Headless)")
+            .with_description("Exit AgentMailTUI but keep HTTP server running headless")
+            .with_tags(&["detach", "headless", "server"])
             .with_category("App"),
     );
 
@@ -3985,6 +4081,7 @@ fn palette_action_label(id: &str) -> String {
     match id {
         palette_action_ids::APP_TOGGLE_HELP => "Toggle Help".into(),
         palette_action_ids::APP_QUIT => "Quit".into(),
+        palette_action_ids::APP_DETACH => "Detach TUI (Headless)".into(),
         palette_action_ids::TRANSPORT_TOGGLE => "Toggle Transport".into(),
         palette_action_ids::THEME_CYCLE => "Cycle Theme".into(),
         palette_action_ids::THEME_CYBERPUNK => "Theme: Cyberpunk Aurora".into(),
@@ -4027,11 +4124,8 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             )
         }
         MailEvent::MessageReceived { from, subject, .. } => {
-            let truncated = if subject.len() > 40 {
-                format!("{}…", &subject[..39])
-            } else {
-                subject.clone()
-            };
+            // Unicode-safe truncation (avoids byte-index panics on non-ASCII subjects).
+            let truncated = truncate_subject(subject, 40);
             (
                 ToastIcon::Info,
                 Toast::new(format!("{from}: {truncated}"))
@@ -5233,6 +5327,44 @@ mod tests {
     }
 
     #[test]
+    fn escape_requires_confirmation_then_quits() {
+        let mut model = test_model();
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+
+        let first = model.update(MailMsg::Terminal(esc.clone()));
+        assert!(!model.state.is_shutdown_requested());
+        assert!(matches!(first, Cmd::None));
+
+        let second = model.update(MailMsg::Terminal(esc));
+        assert!(model.state.is_shutdown_requested());
+        assert!(matches!(second, Cmd::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_requires_confirmation_then_quits() {
+        let mut model = test_model();
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL));
+
+        let first = model.update(MailMsg::Terminal(ctrl_c.clone()));
+        assert!(!model.state.is_shutdown_requested());
+        assert!(matches!(first, Cmd::None));
+
+        let second = model.update(MailMsg::Terminal(ctrl_c));
+        assert!(model.state.is_shutdown_requested());
+        assert!(matches!(second, Cmd::Quit));
+    }
+
+    #[test]
+    fn ctrl_d_detaches_tui_without_shutdown() {
+        let mut model = test_model();
+        let ctrl_d = Event::Key(KeyEvent::new(KeyCode::Char('d')).with_modifiers(Modifiers::CTRL));
+        let cmd = model.update(MailMsg::Terminal(ctrl_d));
+        assert!(!model.state.is_shutdown_requested());
+        assert!(model.state.is_headless_detach_requested());
+        assert!(matches!(cmd, Cmd::Quit));
+    }
+
+    #[test]
     fn question_mark_toggles_help() {
         let mut model = test_model();
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('?')));
@@ -5425,6 +5557,7 @@ mod tests {
             );
         }
         assert!(ids.contains(&palette_action_ids::APP_QUIT));
+        assert!(ids.contains(&palette_action_ids::APP_DETACH));
         assert!(ids.contains(&palette_action_ids::APP_TOGGLE_HELP));
     }
 
@@ -5473,6 +5606,15 @@ mod tests {
         let mut model = test_model();
         let cmd = model.dispatch_palette_action(palette_action_ids::APP_QUIT);
         assert!(model.state.is_shutdown_requested());
+        assert!(matches!(cmd, Cmd::Quit));
+    }
+
+    #[test]
+    fn dispatch_palette_detach_does_not_request_shutdown() {
+        let mut model = test_model();
+        let cmd = model.dispatch_palette_action(palette_action_ids::APP_DETACH);
+        assert!(!model.state.is_shutdown_requested());
+        assert!(model.state.is_headless_detach_requested());
         assert!(matches!(cmd, Cmd::Quit));
     }
 
@@ -6927,6 +7069,16 @@ mod tests {
         // The message inside the toast should be truncated
         assert!(toast.content.message.len() < 60);
         assert!(toast.content.message.contains('…'));
+    }
+
+    #[test]
+    fn toast_message_received_unicode_subject_never_panics() {
+        let subject =
+            "[review] Session 16 code review pass — 1 bug fixed, ~3,500 lines reviewed clean";
+        let event = MailEvent::message_received(1, "BlueLake", vec![], subject, "t1", "proj");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
+        assert!(toast.content.message.starts_with("BlueLake: "));
+        assert!(toast.content.message.contains('—'));
     }
 
     #[test]

@@ -375,8 +375,7 @@ impl ReservationsScreen {
             Ok(conn) => conn,
             Err(err) => {
                 self.fallback_issue = Some(format!(
-                    "Unable to open DB for reservations fallback ({}): {err}",
-                    path
+                    "Unable to open DB for reservations fallback ({path}): {err}",
                 ));
                 return false;
             }
@@ -798,6 +797,10 @@ impl MailScreen for ReservationsScreen {
                 action: "Toggle show released",
             },
             HelpEntry {
+                key: ".",
+                action: "Open actions (renew/release/force-release)",
+            },
+            HelpEntry {
                 key: "Mouse",
                 action: "Wheel/Click navigate rows",
             },
@@ -805,7 +808,7 @@ impl MailScreen for ReservationsScreen {
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("File reservations held by agents. Force-release stale locks with f.")
+        Some("File reservations held by agents. Use . then f to force-release stale locks.")
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
@@ -1025,8 +1028,10 @@ mod tests {
 
     #[test]
     fn tick_sets_fallback_issue_when_snapshot_rows_are_missing_for_memory_url() {
-        let mut cfg = Config::default();
-        cfg.database_url = "sqlite:///:memory:".to_string();
+        let cfg = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Config::default()
+        };
         let state = TuiSharedState::new(&cfg);
         state.update_db_stats(DbStatSnapshot {
             file_reservations: 1,
@@ -1049,8 +1054,10 @@ mod tests {
 
     #[test]
     fn empty_view_includes_fallback_issue_context_when_rows_mismatch() {
-        let mut cfg = Config::default();
-        cfg.database_url = "sqlite:///:memory:".to_string();
+        let cfg = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Config::default()
+        };
         let state = TuiSharedState::new(&cfg);
         state.update_db_stats(DbStatSnapshot {
             file_reservations: 1,
@@ -1069,7 +1076,7 @@ mod tests {
             "missing mismatch warning text: {text}"
         );
         assert!(
-            text.contains("file-backed DATABASE_URL"),
+            text.contains("DB snapshots are"),
             "missing fallback context text: {text}"
         );
     }
@@ -1116,6 +1123,11 @@ mod tests {
         let bindings = screen.keybindings();
         assert!(bindings.len() >= 3);
         assert!(bindings.iter().any(|b| b.key == "x"));
+        assert!(bindings.iter().any(|b| b.key == "."));
+        assert_eq!(
+            screen.context_help_tip(),
+            Some("File reservations held by agents. Use . then f to force-release stale locks.")
+        );
     }
 
     #[test]

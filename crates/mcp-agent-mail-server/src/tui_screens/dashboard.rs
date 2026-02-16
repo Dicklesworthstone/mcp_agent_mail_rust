@@ -443,6 +443,7 @@ impl DashboardScreen {
         self.trim_event_log();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest_db_delta_events(&mut self, state: &TuiSharedState) {
         let Some(snapshot) = state.db_stats_snapshot() else {
             return;
@@ -460,8 +461,7 @@ impl DashboardScreen {
                 if snapshot.messages > 0 {
                     let mut summary = format!("DB baseline: {} total messages", snapshot.messages);
                     if let Some(hint) = top_message_project_hint(&snapshot) {
-                        summary.push_str(" · ");
-                        summary.push_str(&hint);
+                        summary = format!("{hint} · {summary}");
                     }
                     let synthetic = MailEvent::message_received(
                         i64::try_from(snapshot.messages).unwrap_or(i64::MAX),
@@ -511,8 +511,7 @@ impl DashboardScreen {
                 format!("DB observed {delta} new messages")
             };
             if let Some(hint) = top_message_project_hint(&snapshot) {
-                summary.push_str(" · ");
-                summary.push_str(&hint);
+                summary = format!("{hint} · {summary}");
             }
             let synthetic = MailEvent::message_received(
                 i64::try_from(snapshot.messages).unwrap_or(i64::MAX),
@@ -1157,7 +1156,7 @@ impl MailScreen for DashboardScreen {
             },
             HelpEntry {
                 key: "Esc",
-                action: "Exit/clear live search",
+                action: "Dismiss overlay / quit confirm",
             },
             HelpEntry {
                 key: "f",
@@ -1391,28 +1390,107 @@ fn split_top(area: Rect, top_h: u16) -> (Rect, Rect) {
     (top, bottom)
 }
 
-fn split_left(area: Rect, left_w: u16) -> (Rect, Rect) {
-    let left_w = left_w.min(area.width);
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn split_width_ratio_with_gap(area: Rect, left_ratio: f32, gap: u16) -> (Rect, Rect) {
+    let gap = gap.min(area.width.saturating_sub(1));
+    let available = area.width.saturating_sub(gap);
+    let left_w = (f32::from(available) * left_ratio).round() as u16;
+    let left_w = left_w.min(available);
     let left = Rect::new(area.x, area.y, left_w, area.height);
     let right = Rect::new(
-        area.x.saturating_add(left_w),
+        area.x.saturating_add(left_w).saturating_add(gap),
         area.y,
-        area.width.saturating_sub(left_w),
+        available.saturating_sub(left_w),
         area.height,
     );
     (left, right)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn split_width_ratio(area: Rect, left_ratio: f32) -> (Rect, Rect) {
-    let left_w = (f32::from(area.width) * left_ratio).round() as u16;
-    split_left(area, left_w)
+fn split_height_ratio_with_gap(area: Rect, top_ratio: f32, gap: u16) -> (Rect, Rect) {
+    let gap = gap.min(area.height.saturating_sub(1));
+    let available = area.height.saturating_sub(gap);
+    let top_h = (f32::from(available) * top_ratio).round() as u16;
+    let top_h = top_h.min(available);
+    let top = Rect::new(area.x, area.y, area.width, top_h);
+    let bottom = Rect::new(
+        area.x,
+        area.y.saturating_add(top_h).saturating_add(gap),
+        area.width,
+        available.saturating_sub(top_h),
+    );
+    (top, bottom)
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn split_height_ratio(area: Rect, top_ratio: f32) -> (Rect, Rect) {
-    let top_h = (f32::from(area.height) * top_ratio).round() as u16;
-    split_top(area, top_h)
+fn dense_columns_for_width(width: u16, min_col_width: u16, max_cols: usize) -> usize {
+    if width == 0 || max_cols == 0 {
+        return 1;
+    }
+    let min_col = min_col_width.max(1);
+    let mut cols = 1usize;
+    while cols < max_cols {
+        let next = cols + 1;
+        let next_u16 = u16::try_from(next).unwrap_or(u16::MAX);
+        let needed = min_col
+            .saturating_mul(next_u16)
+            .saturating_add(next_u16.saturating_sub(1));
+        if needed > width {
+            break;
+        }
+        cols = next;
+    }
+    cols.max(1)
+}
+
+fn render_lines_with_columns(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: &[Line],
+    min_col_width: u16,
+    max_cols: usize,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let rows = usize::from(area.height);
+    if rows == 0 || lines.is_empty() {
+        return;
+    }
+    let cols_by_width = dense_columns_for_width(area.width, min_col_width, max_cols);
+    if cols_by_width <= 1 || lines.len() <= rows {
+        Paragraph::new(Text::from_lines(lines.to_vec())).render(area, frame);
+        return;
+    }
+    let cols_needed = lines.len().div_ceil(rows);
+    let cols = cols_by_width.min(cols_needed).max(1);
+    if cols <= 1 {
+        Paragraph::new(Text::from_lines(lines.to_vec())).render(area, frame);
+        return;
+    }
+    let cols_u16 = u16::try_from(cols).unwrap_or(1).max(1);
+    let total_gap = cols_u16.saturating_sub(1);
+    let available_width = area.width.saturating_sub(total_gap);
+    let base_width = available_width.checked_div(cols_u16).unwrap_or(area.width);
+    let mut x = area.x;
+    for col_idx in 0..cols {
+        let col = u16::try_from(col_idx).unwrap_or(u16::MAX);
+        let width = if col_idx == cols - 1 {
+            let used = base_width
+                .saturating_mul(col)
+                .saturating_add(col.min(total_gap));
+            available_width.saturating_sub(used)
+        } else {
+            base_width
+        };
+        let rect = Rect::new(x, area.y, width, area.height);
+        let start = col_idx.saturating_mul(rows);
+        let end = start.saturating_add(rows).min(lines.len());
+        if start >= end {
+            break;
+        }
+        Paragraph::new(Text::from_lines(lines[start..end].to_vec())).render(rect, frame);
+        x = x.saturating_add(width).saturating_add(1);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1859,13 +1937,13 @@ fn render_insight_rail(
     }
 
     if is_supergrid_insight_area(remaining) {
-        let (col_a, rest) = split_width_ratio(remaining, 0.25);
-        let (col_b, rest) = split_width_ratio(rest, 1.0 / 3.0);
-        let (col_c, col_d) = split_width_ratio(rest, 0.5);
-        let (a_top, a_bottom) = split_height_ratio(col_a, 0.5);
-        let (b_top, b_bottom) = split_height_ratio(col_b, 0.5);
-        let (c_top, c_bottom) = split_height_ratio(col_c, 0.5);
-        let (d_top, d_bottom) = split_height_ratio(col_d, 0.5);
+        let (col_a, rest) = split_width_ratio_with_gap(remaining, 0.25, 1);
+        let (col_b, rest) = split_width_ratio_with_gap(rest, 1.0 / 3.0, 1);
+        let (col_c, col_d) = split_width_ratio_with_gap(rest, 0.5, 1);
+        let (a_top, a_bottom) = split_height_ratio_with_gap(col_a, 0.5, 1);
+        let (b_top, b_bottom) = split_height_ratio_with_gap(col_b, 0.5, 1);
+        let (c_top, c_bottom) = split_height_ratio_with_gap(col_c, 0.5, 1);
+        let (d_top, d_bottom) = split_height_ratio_with_gap(col_d, 0.5, 1);
 
         render_agents_snapshot_panel(frame, a_top, &db_snapshot.agents_list, query_text);
         render_contacts_snapshot_panel(frame, a_bottom, &db_snapshot.contacts_list, query_text);
@@ -1898,11 +1976,11 @@ fn render_insight_rail(
     if remaining.width >= ULTRAWIDE_INSIGHT_MIN_WIDTH
         && remaining.height >= ULTRAWIDE_INSIGHT_MIN_HEIGHT
     {
-        let (col_a, rest) = split_width_ratio(remaining, 0.34);
-        let (col_b, col_c) = split_width_ratio(rest, 0.5);
-        let (a_top, a_bottom) = split_height_ratio(col_a, 0.5);
-        let (b_top, b_bottom) = split_height_ratio(col_b, 0.5);
-        let (c_top, c_bottom) = split_height_ratio(col_c, 0.5);
+        let (col_a, rest) = split_width_ratio_with_gap(remaining, 0.34, 1);
+        let (col_b, col_c) = split_width_ratio_with_gap(rest, 0.5, 1);
+        let (a_top, a_bottom) = split_height_ratio_with_gap(col_a, 0.5, 1);
+        let (b_top, b_bottom) = split_height_ratio_with_gap(col_b, 0.5, 1);
+        let (c_top, c_bottom) = split_height_ratio_with_gap(col_c, 0.5, 1);
 
         render_agents_snapshot_panel(frame, a_top, &db_snapshot.agents_list, query_text);
         render_contacts_snapshot_panel(frame, a_bottom, &db_snapshot.contacts_list, query_text);
@@ -1926,7 +2004,7 @@ fn render_insight_rail(
     }
 
     if remaining.width < 50 || remaining.height < 12 {
-        let (top, bottom) = split_height_ratio(remaining, 0.5);
+        let (top, bottom) = split_height_ratio_with_gap(remaining, 0.5, 1);
         render_agents_snapshot_panel(frame, top, &db_snapshot.agents_list, query_text);
         render_reservation_watch_panel(
             frame,
@@ -1937,9 +2015,9 @@ fn render_insight_rail(
         return;
     }
 
-    let (top_row, bottom_row) = split_height_ratio(remaining, 0.5);
-    let (top_left, top_right) = split_width_ratio(top_row, 0.54);
-    let (bottom_left, bottom_right) = split_width_ratio(bottom_row, 0.54);
+    let (top_row, bottom_row) = split_height_ratio_with_gap(remaining, 0.5, 1);
+    let (top_left, top_right) = split_width_ratio_with_gap(top_row, 0.54, 1);
+    let (bottom_left, bottom_right) = split_width_ratio_with_gap(bottom_row, 0.54, 1);
 
     render_agents_snapshot_panel(frame, top_left, &db_snapshot.agents_list, query_text);
     render_projects_snapshot_panel(frame, top_right, &db_snapshot.projects_list, query_text);
@@ -1972,18 +2050,18 @@ fn render_bottom_rail(
     }
 
     if is_megagrid_bottom_area(area) {
-        let (preview_col, rest) = split_width_ratio(area, 0.30);
-        let (query_col, rest) = split_width_ratio(rest, 0.29);
-        let (activity_col, metrics_col) = split_width_ratio(rest, 0.40);
+        let (preview_col, rest) = split_width_ratio_with_gap(area, 0.30, 1);
+        let (query_col, rest) = split_width_ratio_with_gap(rest, 0.29, 1);
+        let (activity_col, metrics_col) = split_width_ratio_with_gap(rest, 0.40, 1);
 
         render_recent_message_preview_panel(frame, preview_col, preview);
         render_query_matches_panel(frame, query_col, query_text, db_snapshot, entries);
         render_recent_activity_panel(frame, activity_col, entries, query_text);
 
         if metrics_col.height >= 10 {
-            let (metrics_top, metrics_bottom) = split_height_ratio(metrics_col, 0.5);
-            let (top_left, top_right) = split_width_ratio(metrics_top, 0.5);
-            let (bottom_left, bottom_right) = split_width_ratio(metrics_bottom, 0.5);
+            let (metrics_top, metrics_bottom) = split_height_ratio_with_gap(metrics_col, 0.5, 1);
+            let (top_left, top_right) = split_width_ratio_with_gap(metrics_top, 0.5, 1);
+            let (bottom_left, bottom_right) = split_width_ratio_with_gap(metrics_bottom, 0.5, 1);
             render_event_mix_panel(frame, top_left, entries, query_text);
             render_message_flow_panel(frame, top_right, entries, query_text);
             render_tool_latency_panel(frame, bottom_left, entries, query_text);
@@ -1994,7 +2072,7 @@ fn render_bottom_rail(
                 query_text,
             );
         } else {
-            let (left, right) = split_width_ratio(metrics_col, 0.5);
+            let (left, right) = split_width_ratio_with_gap(metrics_col, 0.5, 1);
             render_event_mix_panel(frame, left, entries, query_text);
             render_message_flow_panel(frame, right, entries, query_text);
         }
@@ -2002,17 +2080,17 @@ fn render_bottom_rail(
     }
 
     if is_supergrid_bottom_area(area) {
-        let (left, rest) = split_width_ratio(area, 0.34);
-        let (middle, rest) = split_width_ratio(rest, 0.33);
-        let (right, aux) = split_width_ratio(rest, 0.5);
+        let (left, rest) = split_width_ratio_with_gap(area, 0.34, 1);
+        let (middle, rest) = split_width_ratio_with_gap(rest, 0.33, 1);
+        let (right, aux) = split_width_ratio_with_gap(rest, 0.5, 1);
         render_recent_message_preview_panel(frame, left, preview);
         render_query_matches_panel(frame, middle, query_text, db_snapshot, entries);
         render_recent_activity_panel(frame, right, entries, query_text);
 
         if aux.height >= 14 {
-            let (aux_top, aux_bottom) = split_height_ratio(aux, 0.5);
-            let (top_left, top_right) = split_width_ratio(aux_top, 0.5);
-            let (bottom_left, bottom_right) = split_width_ratio(aux_bottom, 0.5);
+            let (aux_top, aux_bottom) = split_height_ratio_with_gap(aux, 0.5, 1);
+            let (top_left, top_right) = split_width_ratio_with_gap(aux_top, 0.5, 1);
+            let (bottom_left, bottom_right) = split_width_ratio_with_gap(aux_bottom, 0.5, 1);
             render_event_mix_panel(frame, top_left, entries, query_text);
             render_message_flow_panel(frame, top_right, entries, query_text);
             render_tool_latency_panel(frame, bottom_left, entries, query_text);
@@ -2023,7 +2101,7 @@ fn render_bottom_rail(
                 query_text,
             );
         } else if aux.height >= 10 {
-            let (aux_top, aux_bottom) = split_height_ratio(aux, 0.5);
+            let (aux_top, aux_bottom) = split_height_ratio_with_gap(aux, 0.5, 1);
             render_event_mix_panel(frame, aux_top, entries, query_text);
             render_message_flow_panel(frame, aux_bottom, entries, query_text);
         } else {
@@ -2033,8 +2111,8 @@ fn render_bottom_rail(
     }
 
     if area.width >= ULTRAWIDE_BOTTOM_MIN_WIDTH && area.height >= ULTRAWIDE_BOTTOM_MIN_HEIGHT {
-        let (left, rest) = split_width_ratio(area, 0.5);
-        let (middle, right) = split_width_ratio(rest, 0.5);
+        let (left, rest) = split_width_ratio_with_gap(area, 0.5, 1);
+        let (middle, right) = split_width_ratio_with_gap(rest, 0.5, 1);
         render_recent_message_preview_panel(frame, left, preview);
         render_query_matches_panel(frame, middle, query_text, db_snapshot, entries);
         render_recent_activity_panel(frame, right, entries, query_text);
@@ -2050,7 +2128,7 @@ fn render_bottom_rail(
         return;
     }
 
-    let (left, right) = split_width_ratio(area, 0.62);
+    let (left, right) = split_width_ratio_with_gap(area, 0.62, 1);
     render_recent_message_preview_panel(frame, left, preview);
     render_query_matches_panel(frame, right, query_text, db_snapshot, entries);
 }
@@ -2112,7 +2190,15 @@ fn render_agents_snapshot_panel(
     }
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let mut lines = Vec::new();
     if content_rows >= 2 {
         lines.push(Line::from_spans([
@@ -2124,7 +2210,10 @@ fn render_agents_snapshot_panel(
             Span::styled("●<60s ●<5m ○>=5m", crate::tui_theme::text_meta(&tp)),
         ]));
     }
-    let list_budget = content_rows.saturating_sub(lines.len());
+    let dense_cols = dense_columns_for_width(content_area.width, 44, 2);
+    let list_budget = content_rows
+        .saturating_mul(dense_cols)
+        .saturating_sub(lines.len());
     for agent in rows.iter().take(list_budget) {
         let (marker, color) = agent_status_marker(agent.last_active_ts, now);
         let age = format_relative_micros(agent.last_active_ts, now);
@@ -2144,7 +2233,7 @@ fn render_agents_snapshot_panel(
             Span::styled(age, crate::tui_theme::text_meta(&tp)),
         ]));
     }
-    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+    render_lines_with_columns(frame, content_area, &lines, 44, 2);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "sorted by most recently active");
     }
@@ -2209,7 +2298,15 @@ fn render_contacts_snapshot_panel(
     }
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let now = unix_epoch_micros_now().unwrap_or_default();
     let mut lines = Vec::new();
     if content_rows >= 2 {
@@ -2226,7 +2323,10 @@ fn render_contacts_snapshot_panel(
         ]));
     }
 
-    let list_budget = content_rows.saturating_sub(lines.len());
+    let dense_cols = dense_columns_for_width(content_area.width, 40, 2);
+    let list_budget = content_rows
+        .saturating_mul(dense_cols)
+        .saturating_sub(lines.len());
     for contact in rows.iter().take(list_budget) {
         let age = format_relative_micros(contact.updated_ts, now);
         let status_color = if contact.status.eq_ignore_ascii_case("pending") {
@@ -2256,11 +2356,7 @@ fn render_contacts_snapshot_panel(
         ]));
     }
 
-    let visible = lines
-        .into_iter()
-        .take(usize::from(inner.height))
-        .collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    render_lines_with_columns(frame, content_area, &lines, 40, 2);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "pending links need respond_contact");
     }
@@ -2321,7 +2417,15 @@ fn render_projects_snapshot_panel(
         .sum::<u64>();
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let mut lines = Vec::new();
     if content_rows >= 2 {
         lines.push(Line::from_spans([
@@ -2336,7 +2440,10 @@ fn render_projects_snapshot_panel(
             ),
         ]));
     }
-    let list_budget = content_rows.saturating_sub(lines.len());
+    let dense_cols = dense_columns_for_width(content_area.width, 44, 2);
+    let list_budget = content_rows
+        .saturating_mul(dense_cols)
+        .saturating_sub(lines.len());
     for project in rows.iter().take(list_budget) {
         lines.push(Line::from_spans([
             Span::styled(
@@ -2353,7 +2460,7 @@ fn render_projects_snapshot_panel(
             ),
         ]));
     }
-    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+    render_lines_with_columns(frame, content_area, &lines, 44, 2);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "sorted by message volume, then agents");
     }
@@ -2408,7 +2515,15 @@ fn render_project_load_panel(
     }
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let mut lines = Vec::new();
     let total_score = rows.iter().map(|(_, score)| *score).sum::<u64>();
     let max_score = rows.first().map_or(1, |(_, score)| (*score).max(1));
@@ -2427,7 +2542,10 @@ fn render_project_load_panel(
         ]));
     }
 
-    let list_budget = content_rows.saturating_sub(lines.len());
+    let dense_cols = dense_columns_for_width(content_area.width, 44, 2);
+    let list_budget = content_rows
+        .saturating_mul(dense_cols)
+        .saturating_sub(lines.len());
     for (project, score) in rows.iter().take(list_budget) {
         let bar = ratio_bar(*score, max_score, 8);
         lines.push(Line::from_spans([
@@ -2448,11 +2566,7 @@ fn render_project_load_panel(
         ]));
     }
 
-    let visible = lines
-        .into_iter()
-        .take(usize::from(inner.height))
-        .collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    render_lines_with_columns(frame, content_area, &lines, 44, 2);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "L=msg + (2*agents) + (3*reservations)");
     }
@@ -2545,8 +2659,10 @@ fn render_reservation_watch_panel(
         return;
     }
     let path_budget = usize::from(inner.width.saturating_sub(34)).max(8);
+    let dense_cols = dense_columns_for_width(list_area.width, 34, 2);
+    let row_budget = usize::from(list_area.height).saturating_mul(dense_cols);
     let mut lines = Vec::new();
-    for reservation in rows.iter().take(usize::from(list_area.height)) {
+    for reservation in rows.iter().take(row_budget) {
         let remaining = reservation_remaining_seconds(reservation, now);
         let urgency = if remaining == 0 {
             ("✖", tp.severity_error)
@@ -2589,7 +2705,7 @@ fn render_reservation_watch_panel(
             ),
         ]));
     }
-    Paragraph::new(Text::from_lines(lines)).render(list_area, frame);
+    render_lines_with_columns(frame, list_area, &lines, 34, 2);
     if hint_rows == 1 {
         render_panel_hint_line(
             frame,
@@ -2674,7 +2790,15 @@ fn render_reservation_ttl_buckets_panel(
     let filtered_u64 = u64::try_from(filtered.len()).unwrap_or(u64::MAX).max(1);
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let mut lines = Vec::new();
     if content_rows >= 1 {
         lines.push(Line::from_spans([Span::styled(
@@ -2732,8 +2856,15 @@ fn render_reservation_ttl_buckets_panel(
         }
     }
 
-    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    render_lines_with_columns(frame, content_area, &lines, 44, 2);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "exclusive reservations should be short-lived");
     }
@@ -2774,7 +2905,15 @@ fn render_signal_panel(
     }
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let mut lines = Vec::new();
     lines.push(Line::from_spans([
         Span::styled("contacts ", crate::tui_theme::text_meta(&tp)),
@@ -2863,8 +3002,15 @@ fn render_signal_panel(
         )]));
     }
 
-    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    render_lines_with_columns(frame, content_area, &lines, 40, 2);
     if hint_rows == 1 {
         render_panel_hint_line(
             frame,
@@ -2874,6 +3020,7 @@ fn render_signal_panel(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_event_mix_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2944,7 +3091,15 @@ fn render_event_mix_panel(
     top_kinds.sort_by_key(|pair| std::cmp::Reverse(pair.1));
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let mut lines = Vec::new();
     if content_rows >= 1 {
         lines.push(Line::from_spans([Span::styled(
@@ -2981,8 +3136,15 @@ fn render_event_mix_panel(
         }
     }
 
-    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    render_lines_with_columns(frame, content_area, &lines, 44, 2);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "mix reflects current query + quick filter");
     }
@@ -3097,7 +3259,15 @@ fn render_tool_latency_panel(
         .max(1);
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let mut lines = Vec::new();
     if content_rows >= 1 {
         lines.push(Line::from_spans([Span::styled(
@@ -3109,7 +3279,10 @@ fn render_tool_latency_panel(
         )]));
     }
 
-    let list_budget = content_rows.saturating_sub(lines.len());
+    let dense_cols = dense_columns_for_width(content_area.width, 48, 2);
+    let list_budget = content_rows
+        .saturating_mul(dense_cols)
+        .saturating_sub(lines.len());
     for stats in rows.iter().take(list_budget) {
         let calls_u64 = u64::try_from(stats.calls).unwrap_or(0);
         let latency_color = if stats.p95_ms >= TOOL_LATENCY_HIGH_MS {
@@ -3147,8 +3320,7 @@ fn render_tool_latency_panel(
         ]));
     }
 
-    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    render_lines_with_columns(frame, content_area, &lines, 48, 2);
     if hint_rows == 1 {
         render_panel_hint_line(
             frame,
@@ -3158,6 +3330,7 @@ fn render_tool_latency_panel(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_recent_activity_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3194,7 +3367,15 @@ fn render_recent_activity_panel(
     }
 
     let hint_rows = usize::from(inner.height >= 5);
-    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let content_rows = usize::from(content_area.height);
     let mut lines = Vec::new();
     let warn_count = filtered
         .iter()
@@ -3219,10 +3400,21 @@ fn render_recent_activity_panel(
             Style::default().fg(tp.text_primary).bold(),
         )]));
     }
-    let list_budget = content_rows.saturating_sub(lines.len());
-    let kind_width = if inner.width >= 48 { 10usize } else { 7usize };
+    let dense_cols = dense_columns_for_width(content_area.width, 40, 2);
+    let cols_u16 = u16::try_from(dense_cols).unwrap_or(1).max(1);
+    let total_gap = cols_u16.saturating_sub(1);
+    let column_width = content_area
+        .width
+        .saturating_sub(total_gap)
+        .checked_div(cols_u16)
+        .unwrap_or(content_area.width)
+        .max(1);
+    let list_budget = content_rows
+        .saturating_mul(dense_cols)
+        .saturating_sub(lines.len());
+    let kind_width = if column_width >= 48 { 10usize } else { 7usize };
     let summary_width =
-        usize::from(inner.width).saturating_sub(20usize.saturating_add(kind_width).max(1));
+        usize::from(column_width).saturating_sub(20usize.saturating_add(kind_width).max(1));
     for entry in filtered.iter().take(list_budget) {
         lines.push(Line::from_spans([
             Span::styled(entry.timestamp.clone(), crate::tui_theme::text_meta(&tp)),
@@ -3251,13 +3443,13 @@ fn render_recent_activity_panel(
         )]));
     }
 
-    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    render_lines_with_columns(frame, content_area, &lines, 40, 2);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "icon color reflects event severity");
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_message_flow_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4042,10 +4234,15 @@ fn render_event_log(
         event_log_window_bounds(total, scroll_offset, usize::from(viewer_area.height));
     let window_entries = &entries[window_start..window_end];
     let shimmer_progresses = dashboard_shimmer_progresses(window_entries, effects_enabled);
+    if viewer_area.width == 0 {
+        return;
+    }
+
+    let line_width_budget = usize::from(viewer_area.width);
     let mut pane = viewer.borrow_mut();
     pane.clear();
     pane.push_many(window_entries.iter().enumerate().map(|(idx, entry)| {
-        let line = format!(
+        let raw_line = format!(
             "{:>6} {} {:<3} {} {:<10} {}",
             entry.seq,
             entry.timestamp,
@@ -4054,6 +4251,7 @@ fn render_event_log(
             entry.kind.compact_label(),
             entry.summary
         );
+        let line = truncate(&raw_line, line_width_budget).to_string();
         shimmer_progresses.get(idx).and_then(|p| *p).map_or_else(
             || line.clone(),
             |progress| shimmerize_plain_text(&line, progress, SHIMMER_HIGHLIGHT_WIDTH),
@@ -4068,7 +4266,8 @@ fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
         return 0;
     }
     if available_height == 1 {
-        return 1;
+        // Preserve one line for the event viewer on cramped layouts.
+        return 0;
     }
     let total_chars = [
         DashboardQuickFilter::All,
@@ -4084,9 +4283,12 @@ fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
     let estimated_lines = total_chars.saturating_add(width_usize.saturating_sub(1)) / width_usize;
     let estimated_lines = estimated_lines.max(1);
     let max_controls = available_height.saturating_sub(1);
+    if max_controls == 0 {
+        return 0;
+    }
     u16::try_from(estimated_lines)
         .unwrap_or(u16::MAX)
-        .min(max_controls.max(1))
+        .min(max_controls)
 }
 
 fn event_log_window_bounds(
@@ -4722,7 +4924,7 @@ mod tests {
 
     #[test]
     fn quick_filter_controls_height_preserves_viewer_space() {
-        assert_eq!(quick_filter_controls_height(8, 1), 1);
+        assert_eq!(quick_filter_controls_height(8, 1), 0);
         assert_eq!(quick_filter_controls_height(8, 2), 1);
         assert_eq!(quick_filter_controls_height(8, 3), 2);
     }

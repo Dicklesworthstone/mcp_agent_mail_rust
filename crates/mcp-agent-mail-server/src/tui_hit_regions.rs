@@ -62,8 +62,8 @@ pub const STATUS_PALETTE_TOGGLE: u32 = STATUS_HIT_BASE + 1;
 /// Perf HUD toggle in the status bar.
 pub const STATUS_PERF_TOGGLE: u32 = STATUS_HIT_BASE + 2;
 
-const STATUS_HELP_ZONE_WIDTH: u16 = 14;
-const STATUS_PALETTE_ZONE_WIDTH: u16 = 18;
+const STATUS_HELP_ZONE_WIDTH: u16 = 4;
+const STATUS_PALETTE_ZONE_WIDTH: u16 = 6;
 
 // ──────────────────────────────────────────────────────────────────────
 // HitLayer — layer classification enum
@@ -297,8 +297,8 @@ impl MouseDispatcher {
     /// Priority order (highest first):
     /// 1. Tab bar clicks → `SwitchScreen`
     /// 2. Status line clicks:
-    ///    - Right palette zone → `OpenPalette`
-    ///    - Right-adjacent help zone → `ToggleHelp`
+    ///    - Rightmost help zone → `ToggleHelp`
+    ///    - Right-adjacent palette zone → `OpenPalette`
     ///    - Center region → `Forward`
     /// 3. Everything else → `Forward` to active screen
     ///
@@ -328,22 +328,22 @@ impl MouseDispatcher {
         let status_area = self.status_line_area.get();
         if point_in_rect(status_area, mx, my) {
             let rel_x = mx.saturating_sub(status_area.x);
-            let mut palette_zone = STATUS_PALETTE_ZONE_WIDTH.min(status_area.width);
-            let mut help_zone =
-                STATUS_HELP_ZONE_WIDTH.min(status_area.width.saturating_sub(palette_zone));
-            if help_zone == 0 && status_area.width > 1 {
+            let mut help_zone = STATUS_HELP_ZONE_WIDTH.min(status_area.width);
+            let mut palette_zone =
+                STATUS_PALETTE_ZONE_WIDTH.min(status_area.width.saturating_sub(help_zone));
+            if palette_zone == 0 && status_area.width > 1 {
                 // On ultra-narrow status bars, split the line so both actions
                 // remain reachable.
                 help_zone = status_area.width / 2;
                 palette_zone = status_area.width.saturating_sub(help_zone);
             }
-            let palette_start = status_area.width.saturating_sub(palette_zone);
-            if rel_x >= palette_start {
-                return MouseAction::OpenPalette;
-            }
-            let help_start = palette_start.saturating_sub(help_zone);
+            let help_start = status_area.width.saturating_sub(help_zone);
             if rel_x >= help_start {
                 return MouseAction::ToggleHelp;
+            }
+            let palette_start = help_start.saturating_sub(palette_zone);
+            if rel_x >= palette_start {
+                return MouseAction::OpenPalette;
             }
 
             return MouseAction::Forward;
@@ -597,7 +597,7 @@ mod tests {
     fn dispatcher_status_line_click_toggles_help() {
         let d = MouseDispatcher::new();
         d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
-        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 52, 24);
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 79, 24);
         assert_eq!(d.dispatch(&ev), MouseAction::ToggleHelp);
     }
 
@@ -605,7 +605,7 @@ mod tests {
     fn dispatcher_status_right_side_opens_palette() {
         let d = MouseDispatcher::new();
         d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
-        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 78, 24);
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 75, 24);
         assert_eq!(d.dispatch(&ev), MouseAction::OpenPalette);
     }
 
@@ -622,10 +622,10 @@ mod tests {
         let d = MouseDispatcher::new();
         d.update_chrome_areas(Rect::new(0, 0, 10, 1), Rect::new(0, 24, 10, 1));
 
-        let help = make_mouse(MouseEventKind::Down(MouseButton::Left), 1, 24);
+        let help = make_mouse(MouseEventKind::Down(MouseButton::Left), 9, 24);
         assert_eq!(d.dispatch(&help), MouseAction::ToggleHelp);
 
-        let palette = make_mouse(MouseEventKind::Down(MouseButton::Left), 9, 24);
+        let palette = make_mouse(MouseEventKind::Down(MouseButton::Left), 5, 24);
         assert_eq!(d.dispatch(&palette), MouseAction::OpenPalette);
     }
 

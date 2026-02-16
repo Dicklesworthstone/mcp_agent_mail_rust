@@ -236,21 +236,15 @@ impl MessageEntry {
         };
         let time_style = crate::tui_theme::text_meta(&tp);
 
-        // Sender (truncated to 12 chars)
-        let sender = if self.from_agent.len() > 12 {
-            &self.from_agent[..12]
-        } else {
-            &self.from_agent
-        };
+        // Sender (truncated to 12 chars, Unicode-safe).
+        let sender_end = char_index_to_byte_offset(&self.from_agent, 12);
+        let sender = &self.from_agent[..sender_end];
         let sender_style = Style::default().fg(tp.text_secondary);
 
         // Project badge (only in Global mode)
         let project_badge = if self.show_project && !self.project_slug.is_empty() {
-            let slug = if self.project_slug.len() > 8 {
-                &self.project_slug[..8]
-            } else {
-                &self.project_slug
-            };
+            let slug_end = char_index_to_byte_offset(&self.project_slug, 8);
+            let slug = &self.project_slug[..slug_end];
             format!("[{slug:>8}] ")
         } else {
             String::new()
@@ -266,9 +260,9 @@ impl MessageEntry {
             + 1  // space
             + 8  // time
             + 1  // space
-            + sender.len()
+            + sender.chars().count()
             + 1  // space
-            + project_badge.len();
+            + project_badge.chars().count();
         let remaining = inner_w.saturating_sub(fixed_len);
         let subj = truncate_str(&self.subject, remaining);
 
@@ -3666,6 +3660,37 @@ mod tests {
                 show_project: false,
             },
         ];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        let mut list_state = VirtualizedListState::default();
+        list_state.select(Some(0));
+        render_results_list(
+            &mut frame,
+            Rect::new(0, 0, 40, 20),
+            &entries,
+            &mut list_state,
+            true,
+            true,
+            false,
+        );
+    }
+
+    #[test]
+    fn render_results_with_unicode_sender_and_project_no_panic() {
+        let entries = vec![MessageEntry {
+            id: 1,
+            subject: "[review] Session 16 code review pass — fixed".to_string(),
+            from_agent: "Ágent🚀Name—Wide".to_string(),
+            to_agents: "Team".to_string(),
+            project_slug: "proj—超長slug".to_string(),
+            thread_id: "thread-1".to_string(),
+            timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
+            timestamp_micros: 0,
+            body_md: "Hello world".to_string(),
+            importance: "high".to_string(),
+            ack_required: true,
+            show_project: true,
+        }];
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         let mut list_state = VirtualizedListState::default();

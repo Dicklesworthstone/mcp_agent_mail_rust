@@ -366,6 +366,8 @@ impl SemanticBridge {
                 created_ts: None,
                 thread_id: None,
                 from_agent: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
                 redacted: false,
                 redaction_reason: None,
             })
@@ -485,6 +487,8 @@ fn scored_results_to_search_results(hits: Vec<ScoredResult>) -> Vec<SearchResult
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
         })
@@ -1083,8 +1087,7 @@ struct HybridExecutionPlan {
 fn wall_clock_now_time() -> Time {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_nanos());
     let nanos_u64 = u64::try_from(nanos).unwrap_or(u64::MAX);
     Time::from_nanos(nanos_u64)
 }
@@ -1094,9 +1097,7 @@ fn saturating_duration_millis(duration: std::time::Duration) -> u64 {
 }
 
 fn deadline_remaining_budget_ms(budget: Budget) -> Option<u64> {
-    if budget.deadline.is_none() {
-        return None;
-    }
+    budget.deadline?;
     let now = wall_clock_now_time();
     Some(
         budget
@@ -1313,7 +1314,8 @@ fn apply_hybrid_budget_governor(
         }
         HybridBudgetGovernorTier::Tight => {
             let lexical_limit =
-                scale_limit_by_bps(base_budget.lexical_limit, config.tight_scale_bps).max(result_floor);
+                scale_limit_by_bps(base_budget.lexical_limit, config.tight_scale_bps)
+                    .max(result_floor);
             let semantic_limit = if base_budget.semantic_limit == 0 {
                 0
             } else {
@@ -1333,8 +1335,9 @@ fn apply_hybrid_budget_governor(
             )
         }
         HybridBudgetGovernorTier::Critical => {
-            let lexical_limit = scale_limit_by_bps(base_budget.lexical_limit, config.critical_scale_bps)
-                .max(result_floor);
+            let lexical_limit =
+                scale_limit_by_bps(base_budget.lexical_limit, config.critical_scale_bps)
+                    .max(result_floor);
             let combined_limit = lexical_limit.max(result_floor);
             (
                 CandidateBudget {
@@ -1357,7 +1360,11 @@ fn apply_hybrid_budget_governor(
     )
 }
 
-fn derive_hybrid_execution_plan(cx: &Cx, query: &SearchQuery, engine: SearchEngine) -> HybridExecutionPlan {
+fn derive_hybrid_execution_plan(
+    cx: &Cx,
+    query: &SearchQuery,
+    engine: SearchEngine,
+) -> HybridExecutionPlan {
     let requested_limit = query.effective_limit();
     let mode = match engine {
         SearchEngine::Hybrid => CandidateMode::Hybrid,
@@ -2349,6 +2356,8 @@ fn map_message_row(row: &SqlRow) -> Option<SearchResult> {
         created_ts,
         thread_id,
         from_agent,
+        reason_codes: Vec::new(),
+        score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
     })
@@ -2373,6 +2382,8 @@ fn map_agent_row(row: &SqlRow) -> Option<SearchResult> {
         created_ts: None,
         thread_id: None,
         from_agent: None,
+        reason_codes: Vec::new(),
+        score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
     })
@@ -2396,6 +2407,8 @@ fn map_project_row(row: &SqlRow) -> Option<SearchResult> {
         created_ts: None,
         thread_id: None,
         from_agent: None,
+        reason_codes: Vec::new(),
+        score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
     })
@@ -2463,6 +2476,8 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
         }];
@@ -2485,6 +2500,8 @@ mod tests {
                 created_ts: None,
                 thread_id: None,
                 from_agent: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
                 redacted: false,
                 redaction_reason: None,
             })
@@ -2520,6 +2537,8 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
         }
@@ -2590,6 +2609,53 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, 1);
         assert_eq!(merged[1].id, 2);
+    }
+
+    #[test]
+    fn request_budget_remaining_ms_uses_cost_quota_without_deadline() {
+        let cx = Cx::for_request_with_budget(Budget::new().with_cost_quota(87));
+        assert_eq!(request_budget_remaining_ms(&cx), Some(87));
+    }
+
+    #[test]
+    fn request_budget_remaining_ms_reports_expired_deadline_as_zero() {
+        let cx = Cx::for_request_with_budget(Budget::new().with_deadline(Time::ZERO));
+        assert_eq!(request_budget_remaining_ms(&cx), Some(0));
+    }
+
+    #[test]
+    fn hybrid_budget_governor_critical_disables_semantic_and_rerank() {
+        let base = CandidateBudget {
+            lexical_limit: 120,
+            semantic_limit: 80,
+            combined_limit: 200,
+        };
+        let config = HybridBudgetGovernorConfig::default();
+        let (budget, governor) = apply_hybrid_budget_governor(50, base, Some(100), config);
+
+        assert_eq!(governor.tier, HybridBudgetGovernorTier::Critical);
+        assert!(!governor.rerank_enabled);
+        assert_eq!(budget.semantic_limit, 0);
+        assert!(budget.lexical_limit >= 10);
+        assert!(budget.lexical_limit <= base.lexical_limit);
+        assert_eq!(budget.combined_limit, budget.lexical_limit);
+    }
+
+    #[test]
+    fn hybrid_budget_governor_tight_scales_limits_deterministically() {
+        let base = CandidateBudget {
+            lexical_limit: 120,
+            semantic_limit: 80,
+            combined_limit: 200,
+        };
+        let config = HybridBudgetGovernorConfig::default();
+        let (budget, governor) = apply_hybrid_budget_governor(50, base, Some(200), config);
+
+        assert_eq!(governor.tier, HybridBudgetGovernorTier::Tight);
+        assert!(!governor.rerank_enabled);
+        assert_eq!(budget.lexical_limit, 84);
+        assert_eq!(budget.semantic_limit, 56);
+        assert_eq!(budget.combined_limit, 140);
     }
 
     #[cfg(feature = "hybrid")]

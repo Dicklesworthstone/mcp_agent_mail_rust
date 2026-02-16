@@ -141,6 +141,7 @@ pub struct TuiSharedState {
     latency_total_ms: AtomicU64,
     started_at: Instant,
     shutdown: AtomicBool,
+    detach_headless: AtomicBool,
     config_snapshot: Mutex<ConfigSnapshot>,
     db_stats: Mutex<DbStatSnapshot>,
     sparkline_data: Mutex<VecDeque<f64>>,
@@ -168,6 +169,7 @@ impl TuiSharedState {
             latency_total_ms: AtomicU64::new(0),
             started_at: Instant::now(),
             shutdown: AtomicBool::new(false),
+            detach_headless: AtomicBool::new(false),
             config_snapshot: Mutex::new(ConfigSnapshot::from_config(config)),
             db_stats: Mutex::new(DbStatSnapshot::default()),
             sparkline_data: Mutex::new(VecDeque::with_capacity(REQUEST_SPARKLINE_CAPACITY)),
@@ -250,6 +252,20 @@ impl TuiSharedState {
     #[must_use]
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    pub fn request_headless_detach(&self) {
+        self.detach_headless.store(true, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn is_headless_detach_requested(&self) -> bool {
+        self.detach_headless.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn take_headless_detach_requested(&self) -> bool {
+        self.detach_headless.swap(false, Ordering::Relaxed)
     }
 
     #[must_use]
@@ -485,6 +501,17 @@ mod tests {
         assert!(!state.is_shutdown_requested());
         state.request_shutdown();
         assert!(state.is_shutdown_requested());
+    }
+
+    #[test]
+    fn headless_detach_signal_propagates() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(!state.is_headless_detach_requested());
+        state.request_headless_detach();
+        assert!(state.is_headless_detach_requested());
+        assert!(state.take_headless_detach_requested());
+        assert!(!state.is_headless_detach_requested());
     }
 
     #[test]

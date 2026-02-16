@@ -301,9 +301,17 @@ enum StatusEffect {
     RecordingPulse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusRole {
+    Normal,
+    PaletteToggle,
+    HelpToggle,
+}
+
 /// A semantic segment of the status bar.
 struct StatusSegment {
     priority: StatusPriority,
+    role: StatusRole,
     text: String,
     fg: PackedRgba,
     bold: bool,
@@ -364,9 +372,20 @@ fn prune_status_segments_to_fit(
             continue;
         }
 
-        // Preserve the help affordance when possible and peel other critical
-        // tags first (e.g. LIVE on ultra-narrow terminals).
+        // Preserve help/palette affordances when possible and peel other
+        // critical tags first (e.g. LIVE on ultra-narrow terminals).
         if right.len() > 1 {
+            if let Some(idx) = right.iter().rposition(|seg| seg.role == StatusRole::Normal) {
+                right.remove(idx);
+                continue;
+            }
+            if let Some(idx) = right
+                .iter()
+                .rposition(|seg| seg.role == StatusRole::PaletteToggle)
+            {
+                right.remove(idx);
+                continue;
+            }
             right.pop();
             continue;
         }
@@ -421,6 +440,7 @@ fn plan_status_segments(
     // ── Left segments (always left-aligned) ──
     let mut left = vec![StatusSegment {
         priority: StatusPriority::Critical,
+        role: StatusRole::Normal,
         text: format!(" {}", meta.title),
         fg: tp.status_accent,
         bold: true,
@@ -430,6 +450,7 @@ fn plan_status_segments(
     // Transport mode (High priority)
     left.push(StatusSegment {
         priority: StatusPriority::High,
+        role: StatusRole::Normal,
         text: format!(" {transport_mode}"),
         fg: tp.status_fg,
         bold: false,
@@ -439,6 +460,7 @@ fn plan_status_segments(
     // Uptime (Medium priority)
     left.push(StatusSegment {
         priority: StatusPriority::Medium,
+        role: StatusRole::Normal,
         text: format!(" up:{uptime_str}"),
         fg: tp.status_fg,
         bold: false,
@@ -452,6 +474,7 @@ fn plan_status_segments(
     if error_count > 0 {
         center.push(StatusSegment {
             priority: StatusPriority::Medium,
+            role: StatusRole::Normal,
             text: format!("err:{error_count}"),
             fg: tp.status_warn,
             bold: true,
@@ -462,6 +485,7 @@ fn plan_status_segments(
     // Full counter string at Low priority
     center.push(StatusSegment {
         priority: StatusPriority::Low,
+        role: StatusRole::Normal,
         text: format!("req:{total} ok:{ok} err:{error_count} avg:{avg_latency}ms"),
         fg: counter_fg,
         bold: false,
@@ -475,6 +499,7 @@ fn plan_status_segments(
         if !hints.is_empty() {
             center.push(StatusSegment {
                 priority: StatusPriority::Low,
+                role: StatusRole::Normal,
                 text: hints,
                 fg: tp.status_fg,
                 bold: false,
@@ -484,17 +509,13 @@ fn plan_status_segments(
     }
 
     // ── Right segments (right-aligned) ──
+    let palette_hint = "[^P]";
     let help_hint = if help_visible { "[?]" } else { "?" };
-    let mut right = vec![StatusSegment {
-        priority: StatusPriority::Critical,
-        text: format!("{help_hint} "),
-        fg: tp.tab_key_fg,
-        bold: false,
-        effect: StatusEffect::None,
-    }];
+    let mut right = Vec::new();
 
     right.push(StatusSegment {
         priority: StatusPriority::Critical,
+        role: StatusRole::Normal,
         text: "LIVE ".to_string(),
         fg: tp.status_good,
         bold: true,
@@ -504,6 +525,7 @@ fn plan_status_segments(
     if recording_active {
         right.push(StatusSegment {
             priority: StatusPriority::High,
+            role: StatusRole::Normal,
             text: "REC ".to_string(),
             fg: tp.status_warn,
             bold: true,
@@ -515,6 +537,7 @@ fn plan_status_segments(
     if toast_muted {
         right.push(StatusSegment {
             priority: StatusPriority::High,
+            role: StatusRole::Normal,
             text: "[muted] ".to_string(),
             fg: tp.status_warn,
             bold: false,
@@ -526,6 +549,7 @@ fn plan_status_segments(
     if !state.config_snapshot().tui_effects {
         right.push(StatusSegment {
             priority: StatusPriority::High,
+            role: StatusRole::Normal,
             text: "[fx off] ".to_string(),
             fg: tp.status_warn,
             bold: false,
@@ -549,6 +573,7 @@ fn plan_status_segments(
             let label = format!("[{}] ", tags.join(","));
             right.push(StatusSegment {
                 priority: StatusPriority::Medium,
+                role: StatusRole::Normal,
                 text: label,
                 fg: tp.status_fg,
                 bold: false,
@@ -562,12 +587,30 @@ fn plan_status_segments(
         let theme = crate::tui_theme::current_theme_name();
         right.push(StatusSegment {
             priority: StatusPriority::Low,
+            role: StatusRole::Normal,
             text: format!("{theme} "),
             fg: tp.status_fg,
             bold: false,
             effect: StatusEffect::None,
         });
     }
+
+    right.push(StatusSegment {
+        priority: StatusPriority::Critical,
+        role: StatusRole::PaletteToggle,
+        text: format!("{palette_hint} "),
+        fg: tp.tab_key_fg,
+        bold: false,
+        effect: StatusEffect::None,
+    });
+    right.push(StatusSegment {
+        priority: StatusPriority::Critical,
+        role: StatusRole::HelpToggle,
+        text: format!("{help_hint} "),
+        fg: tp.tab_key_fg,
+        bold: false,
+        effect: StatusEffect::None,
+    });
 
     // If both Medium error count and Low full counters survived, drop
     // the Medium error-only duplicate (full counters include it).
@@ -1645,6 +1688,37 @@ mod tests {
         assert!(
             right_text.contains("LIVE"),
             "expected LIVE indicator in status right segments, got: {right_text}"
+        );
+    }
+
+    #[test]
+    fn status_segments_include_palette_and_help_hints() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (_, _, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            false,
+            &a11y,
+            &[],
+            false,
+            120,
+        );
+        let right_text: String = right.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            right_text.contains("[^P]"),
+            "expected palette hint in status segments: {right_text}"
+        );
+        assert!(
+            right_text.contains('?'),
+            "expected help hint in status segments: {right_text}"
+        );
+        let last_text = right.last().map(|s| s.text.trim()).unwrap_or_default();
+        assert!(
+            last_text == "?" || last_text == "[?]",
+            "expected help hint to be rightmost, got: {last_text}"
         );
     }
 

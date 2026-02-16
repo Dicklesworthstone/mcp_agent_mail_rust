@@ -92,8 +92,18 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
         text_suppressible: true,
     },
     GlobalBinding {
+        label: "Ctrl+C",
+        action: "Quit (press twice)",
+        text_suppressible: false,
+    },
+    GlobalBinding {
+        label: "Ctrl+D",
+        action: "Detach TUI (headless)",
+        text_suppressible: false,
+    },
+    GlobalBinding {
         label: "Esc",
-        action: "Dismiss overlay",
+        action: "Dismiss overlay / Quit (press twice)",
         text_suppressible: false,
     },
 ];
@@ -293,7 +303,14 @@ fn vim_profile_bindings() -> Vec<ProfileBinding> {
         pb("toggle_help", "?", "Toggle help", true),
         pb("clipboard_yank", "y", "Copy to clipboard", true),
         pb("quit", "q", "Quit", true),
-        pb("dismiss", "Esc", "Dismiss overlay", false),
+        pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
+        pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
+        pb(
+            "dismiss",
+            "Esc",
+            "Dismiss overlay / Quit (press twice)",
+            false,
+        ),
         // Vim-specific navigation additions
         pb("scroll_down", "j", "Scroll down", true),
         pb("scroll_up", "k", "Scroll up", true),
@@ -313,7 +330,14 @@ fn emacs_profile_bindings() -> Vec<ProfileBinding> {
         pb("cycle_theme", "T", "Cycle theme", true),
         pb("toggle_help", "?", "Toggle help", true),
         pb("quit", "q", "Quit", true),
-        pb("dismiss", "Esc", "Dismiss overlay / Cancel", false),
+        pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
+        pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
+        pb(
+            "dismiss",
+            "Esc",
+            "Dismiss overlay / Quit (press twice)",
+            false,
+        ),
         // Emacs-specific bindings
         pb("scroll_down", "Ctrl+N", "Next line", false),
         pb("scroll_up", "Ctrl+P_nav", "Previous line", false),
@@ -327,7 +351,14 @@ fn minimal_profile_bindings() -> Vec<ProfileBinding> {
         pb("prev_screen", "Shift+Tab", "Previous screen", false),
         pb("command_palette", "Ctrl+P", "Command palette", false),
         pb("toggle_help", "?", "Toggle help", true),
-        pb("dismiss", "Esc", "Dismiss overlay", false),
+        pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
+        pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
+        pb(
+            "dismiss",
+            "Esc",
+            "Dismiss overlay / Quit (press twice)",
+            false,
+        ),
     ]
 }
 
@@ -358,6 +389,8 @@ fn action_id_for_label(label: &str) -> &'static str {
         "?" => "toggle_help",
         "y" => "clipboard_yank",
         "q" => "quit",
+        "Ctrl+C" => "quit_ctrl",
+        "Ctrl+D" => "detach_tui",
         "Esc" => "dismiss",
         _ => "unknown",
     }

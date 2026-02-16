@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2405,7 +2406,8 @@ fn write_lock_owner(repo_root: &Path) {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let content = format!("{pid}\n{ts}\n");
+    let start_ticks = process_start_ticks(pid).unwrap_or(0);
+    let content = format!("{pid}\n{ts}\n{start_ticks}\n");
     let _ = fs::write(&owner_path, content);
 }
 
@@ -2432,6 +2434,29 @@ fn is_pid_alive(pid: u32) -> bool {
     pid_alive(pid)
 }
 
+#[cfg(target_os = "linux")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close_paren = stat.rfind(')')?;
+    let rest = stat.get(close_paren + 2..)?;
+    // Fields after `comm` begin at field 3 (`state`), so starttime (field 22)
+    // is offset 19 in this tail segment.
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+fn lock_file_age_seconds(lock_path: &Path) -> Option<f64> {
+    fs::metadata(lock_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs_f64())
+}
+
 /// Try to clean up a stale .git/index.lock file with PID-aware safety.
 ///
 /// Before removing a lock:
@@ -2449,10 +2474,43 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
     // Check PID-based ownership first
     let owner_path = repo_root.join(".git").join("index.lock.owner");
     if let Ok(content) = fs::read_to_string(&owner_path) {
-        if let Some(pid_str) = content.lines().next() {
+        let mut lines = content.lines();
+        if let Some(pid_str) = lines.next() {
             if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                let owner_start_ticks = lines
+                    .nth(1)
+                    .and_then(|line| line.trim().parse::<u64>().ok())
+                    .filter(|ticks| *ticks > 0);
                 if is_pid_alive(pid) {
-                    // Lock holder is still alive — don't remove!
+                    // If PID was recycled, the owner start-ticks will mismatch.
+                    // That means the lock is stale even though the PID exists now.
+                    if let Some(expected_ticks) = owner_start_ticks {
+                        if let Some(actual_ticks) = process_start_ticks(pid) {
+                            if actual_ticks != expected_ticks {
+                                tracing::info!(
+                                    "[git-lock] index.lock owner PID {pid} reused (start ticks mismatch), removing stale lock"
+                                );
+                                let _ = fs::remove_file(&lock_path);
+                                let _ = fs::remove_file(&owner_path);
+                                return true;
+                            }
+                        }
+                    }
+
+                    // Legacy owner files (without start ticks) can stick forever on
+                    // PID reuse. If the lock is old enough, treat as stale.
+                    if owner_start_ticks.is_none()
+                        && lock_file_age_seconds(&lock_path)
+                            .is_some_and(|age| age > max_age_seconds)
+                    {
+                        tracing::info!(
+                            "[git-lock] legacy owner format with alive PID {pid} and stale age, removing lock"
+                        );
+                        let _ = fs::remove_file(&lock_path);
+                        let _ = fs::remove_file(&owner_path);
+                        return true;
+                    }
+
                     tracing::debug!("[git-lock] index.lock held by alive PID {pid}, not removing");
                     return false;
                 }
@@ -2466,11 +2524,7 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
     }
 
     // No owner file or unparseable — fall back to age-based removal
-    let age = fs::metadata(&lock_path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .map(|d| d.as_secs_f64());
+    let age = lock_file_age_seconds(&lock_path);
 
     if let Some(age) = age {
         if age > max_age_seconds {
@@ -5641,11 +5695,16 @@ fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<()>
 /// Best-effort cleanup of staged/index state after a failed commit attempt.
 fn try_restore_index_to_head(repo: &Repository) -> Result<()> {
     if let Some(workdir) = repo.workdir() {
+        // Heal stale lock artifacts before trying external git index sync.
+        let _ = try_clean_stale_git_lock(workdir, 300.0);
         match std::process::Command::new("git")
             .arg("-C")
             .arg(workdir)
             .arg("read-tree")
             .arg("HEAD")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
         {
             Ok(status) if status.success() => return Ok(()),
@@ -9358,7 +9417,11 @@ mod tests {
 
         let content = fs::read_to_string(&owner_path).unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
-        assert_eq!(lines.len(), 2, "owner file should have PID and timestamp");
+        assert_eq!(
+            lines.len(),
+            3,
+            "owner file should have PID, timestamp, and process start ticks"
+        );
 
         let pid: u32 = lines[0].parse().unwrap();
         assert_eq!(
@@ -9369,6 +9432,7 @@ mod tests {
 
         let ts: u64 = lines[1].parse().unwrap();
         assert!(ts > 0, "timestamp should be non-zero");
+        let _start_ticks: u64 = lines[2].parse().unwrap();
 
         // Remove owner file
         remove_lock_owner(&archive.repo_root);
@@ -9413,6 +9477,30 @@ mod tests {
         // Stale lock cleanup SHOULD remove the lock (PID is dead)
         let removed = try_clean_stale_git_lock(&archive.repo_root, 0.0);
         assert!(removed, "should remove lock owned by dead PID");
+        assert!(!lock_path.exists(), "lock file should be removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_lock_cleanup_removes_reused_pid_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "reused-pid").unwrap();
+
+        let lock_path = archive.repo_root.join(".git/index.lock");
+        fs::write(&lock_path, "fake lock").unwrap();
+
+        let owner_path = archive.repo_root.join(".git/index.lock.owner");
+        let pid = std::process::id();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let fake_start_ticks = process_start_ticks(pid).unwrap_or(1).saturating_add(1);
+        fs::write(&owner_path, format!("{pid}\n{now}\n{fake_start_ticks}\n")).unwrap();
+
+        let removed = try_clean_stale_git_lock(&archive.repo_root, 300.0);
+        assert!(removed, "should remove lock when PID start ticks mismatch");
         assert!(!lock_path.exists(), "lock file should be removed");
     }
 

@@ -269,6 +269,8 @@ fn convert_results(results: &SearchResults, doc_kind: DocKind) -> Vec<PlannerRes
                 from_agent,
                 redacted: false,
                 redaction_reason: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
             }
         })
         .collect()
