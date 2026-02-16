@@ -2014,6 +2014,7 @@ dependencies = [
  "frankensearch-fusion",
  "frankensearch-index",
  "frankensearch-lexical",
+ "frankensearch-rerank",
  "tracing",
 ]
 
@@ -2087,6 +2088,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tantivy 0.22.1",
+ "tracing",
+]
+
+[[package]]
+name = "frankensearch-rerank"
+version = "0.1.0"
+dependencies = [
+ "asupersync",
+ "dirs 6.0.0",
+ "frankensearch-core",
+ "ort",
+ "serde",
+ "tokenizers 0.21.4",
  "tracing",
 ]
 
@@ -5283,6 +5297,7 @@ version = "2.0.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52afb44b6b0cffa9bf45e4d37e5a4935b0334a51570658e279e9e3e6cf324aa5"
 dependencies = [
+ "half",
  "ndarray",
  "ort-sys",
  "tracing",

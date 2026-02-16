@@ -1190,7 +1190,7 @@ fn ratio_bar(value: u64, max: u64, cells: usize) -> String {
     if cells == 0 {
         return String::new();
     }
-    let filled = if max == 0 {
+    let filled_raw = if max == 0 {
         0usize
     } else {
         let numerator = u128::from(value).saturating_mul(u128::try_from(cells).unwrap_or(0));
@@ -1199,6 +1199,11 @@ fn ratio_bar(value: u64, max: u64, cells: usize) -> String {
             .unwrap_or(cells)
             .min(cells)
     };
+    let filled = if value > 0 && filled_raw == 0 {
+        1usize.min(cells)
+    } else {
+        filled_raw
+    };
     let mut out = String::with_capacity(cells);
     for idx in 0..cells {
         out.push(if idx < filled { '█' } else { '░' });
@@ -1206,7 +1211,6 @@ fn ratio_bar(value: u64, max: u64, cells: usize) -> String {
     out
 }
 
-#[allow(dead_code)]
 fn format_sample_with_overflow(samples: &[String], total: usize) -> String {
     if total == 0 || samples.is_empty() {
         return "none".to_string();
@@ -1233,6 +1237,17 @@ fn format_relative_micros(timestamp_micros: i64, now_micros: i64) -> String {
         return format!("{}h", secs / 3600);
     }
     format!("{}d", secs / 86_400)
+}
+
+fn render_panel_hint_line(frame: &mut Frame<'_>, inner: Rect, hint: &str) {
+    if inner.width < 8 || inner.height < 2 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+    Paragraph::new(truncate(hint, usize::from(hint_area.width)))
+        .style(crate::tui_theme::text_meta(&tp))
+        .render(hint_area, frame);
 }
 
 const fn is_supergrid_insight_area(area: Rect) -> bool {
@@ -1835,17 +1850,6 @@ fn render_agents_snapshot_panel(
     if area.width < 18 || area.height < 3 {
         return;
     }
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Agents")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let query_terms = parse_query_terms(query_text);
     let mut rows: Vec<&AgentSummary> = agents
         .iter()
@@ -1855,6 +1859,37 @@ fn render_agents_snapshot_panel(
         .collect();
     rows.sort_by_key(|agent| std::cmp::Reverse(agent.last_active_ts));
 
+    let now = unix_epoch_micros_now().unwrap_or_default();
+    let mut active = 0usize;
+    let mut idle = 0usize;
+    let mut stale = 0usize;
+    for agent in &rows {
+        if agent.last_active_ts <= 0 {
+            stale += 1;
+            continue;
+        }
+        let elapsed = now.saturating_sub(agent.last_active_ts);
+        if elapsed < AGENT_ACTIVE_THRESHOLD_MICROS {
+            active += 1;
+        } else if elapsed < AGENT_IDLE_THRESHOLD_MICROS {
+            idle += 1;
+        } else {
+            stale += 1;
+        }
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Agents · {}", rows.len());
+    let block = Block::default()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
     if rows.is_empty() {
         Paragraph::new("No matching agents")
             .style(crate::tui_theme::text_meta(&tp))
@@ -1862,9 +1897,24 @@ fn render_agents_snapshot_panel(
         return;
     }
 
-    let now = unix_epoch_micros_now().unwrap_or_default();
+    let hint_rows = if inner.height >= 5 { 1usize } else { 0usize };
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
-    for agent in rows.iter().take(usize::from(inner.height)) {
+    if content_rows >= 2 {
+        lines.push(Line::from_spans([
+            Span::styled(
+                format!("active:{active} idle:{idle} stale:{stale}"),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                "●<60s ●<5m ○>=5m",
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+    let list_budget = content_rows.saturating_sub(lines.len());
+    for agent in rows.iter().take(list_budget) {
         let (marker, color) = agent_status_marker(agent.last_active_ts, now);
         let age = format_relative_micros(agent.last_active_ts, now);
         lines.push(Line::from_spans([
@@ -1884,6 +1934,9 @@ fn render_agents_snapshot_panel(
         ]));
     }
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "sorted by most recently active");
+    }
 }
 
 fn render_contacts_snapshot_panel(
@@ -1895,17 +1948,6 @@ fn render_contacts_snapshot_panel(
     if area.width < 18 || area.height < 3 {
         return;
     }
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Contacts")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let query_terms = parse_query_terms(query_text);
     let mut rows: Vec<&ContactSummary> = contacts
         .iter()
@@ -1935,25 +1977,53 @@ fn render_contacts_snapshot_panel(
         .filter(|contact| contact.status.eq_ignore_ascii_case("accepted"))
         .count();
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Contacts · {} (p:{pending})", rows.len());
+    let block = Block::default()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if rows.is_empty() {
+        Paragraph::new("No matching contacts")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let hint_rows = if inner.height >= 5 { 1usize } else { 0usize };
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let now = unix_epoch_micros_now().unwrap_or_default();
     let mut lines = Vec::new();
-    lines.push(Line::from_spans([
-        Span::styled(
-            format!("pending:{pending} active:{accepted}"),
-            Style::default().fg(tp.text_primary).bold(),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!("total:{}", rows.len()),
-            crate::tui_theme::text_meta(&tp),
-        ),
-    ]));
+    if content_rows >= 2 {
+        lines.push(Line::from_spans([
+            Span::styled(
+                format!("pending:{pending} active:{accepted}"),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("total:{}", rows.len()),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
 
-    for contact in rows
-        .iter()
-        .take(usize::from(inner.height).saturating_sub(1))
-    {
+    let list_budget = content_rows.saturating_sub(lines.len());
+    for contact in rows.iter().take(list_budget) {
         let age = format_relative_micros(contact.updated_ts, now);
+        let status_color = if contact.status.eq_ignore_ascii_case("pending") {
+            tp.severity_warn
+        } else if contact.status.eq_ignore_ascii_case("accepted") {
+            tp.severity_ok
+        } else {
+            tp.text_muted
+        };
         lines.push(Line::from_spans([
             Span::styled(
                 truncate(&contact.from_agent, 10),
@@ -1967,7 +2037,7 @@ fn render_contacts_snapshot_panel(
             Span::raw(" "),
             Span::styled(
                 truncate(&contact.status, 7),
-                crate::tui_theme::text_meta(&tp),
+                Style::default().fg(status_color),
             ),
             Span::raw(" "),
             Span::styled(age, crate::tui_theme::text_meta(&tp)),
@@ -1979,6 +2049,9 @@ fn render_contacts_snapshot_panel(
         .take(usize::from(inner.height))
         .collect::<Vec<_>>();
     Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "pending links need respond_contact");
+    }
 }
 
 fn render_projects_snapshot_panel(
@@ -1990,17 +2063,6 @@ fn render_projects_snapshot_panel(
     if area.width < 18 || area.height < 3 {
         return;
     }
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Projects")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let query_terms = parse_query_terms(query_text);
     let mut rows: Vec<&ProjectSummary> = projects
         .iter()
@@ -2017,6 +2079,18 @@ fn render_projects_snapshot_panel(
             .then_with(|| b.agent_count.cmp(&a.agent_count))
     });
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Projects · {}", rows.len());
+    let block = Block::default()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
     if rows.is_empty() {
         Paragraph::new("No matching projects")
             .style(crate::tui_theme::text_meta(&tp))
@@ -2024,8 +2098,33 @@ fn render_projects_snapshot_panel(
         return;
     }
 
+    let total_messages = rows.iter().map(|project| project.message_count).sum::<u64>();
+    let total_agents = rows.iter().map(|project| project.agent_count).sum::<u64>();
+    let total_reservations = rows
+        .iter()
+        .map(|project| project.reservation_count)
+        .sum::<u64>();
+
+    let hint_rows = if inner.height >= 5 { 1usize } else { 0usize };
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
-    for project in rows.iter().take(usize::from(inner.height)) {
+    if content_rows >= 2 {
+        lines.push(Line::from_spans([
+            Span::styled(
+                format!(
+                    "msg:{total_messages} ag:{total_agents} res:{total_reservations}"
+                ),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("shown:{}", rows.len()),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+    let list_budget = content_rows.saturating_sub(lines.len());
+    for project in rows.iter().take(list_budget) {
         lines.push(Line::from_spans([
             Span::styled(
                 truncate(&project.slug, 16),
@@ -2042,6 +2141,9 @@ fn render_projects_snapshot_panel(
         ]));
     }
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "sorted by message volume, then agents");
+    }
 }
 
 fn render_project_load_panel(
@@ -2051,17 +2153,6 @@ fn render_project_load_panel(
     query_text: &str,
 ) {
     if area.width < 20 || area.height < 3 {
-        return;
-    }
-
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Project Load")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
         return;
     }
 
@@ -2084,6 +2175,18 @@ fn render_project_load_panel(
         .collect();
     rows.sort_by_key(|pair| std::cmp::Reverse(pair.1));
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Project Load · {}", rows.len());
+    let block = Block::default()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
     if rows.is_empty() {
         Paragraph::new("No matching projects")
             .style(crate::tui_theme::text_meta(&tp))
@@ -2091,26 +2194,28 @@ fn render_project_load_panel(
         return;
     }
 
+    let hint_rows = if inner.height >= 5 { 1usize } else { 0usize };
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
     let total_score = rows.iter().map(|(_, score)| *score).sum::<u64>();
     let max_score = rows.first().map_or(1, |(_, score)| (*score).max(1));
-    lines.push(Line::from_spans([
-        Span::styled("score ", crate::tui_theme::text_meta(&tp)),
-        Span::styled(
-            format!("{total_score}"),
-            Style::default().fg(tp.metric_requests).bold(),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!("projects:{}", rows.len()),
-            crate::tui_theme::text_meta(&tp),
-        ),
-    ]));
+    if content_rows >= 2 {
+        lines.push(Line::from_spans([
+            Span::styled("score ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                format!("{total_score}"),
+                Style::default().fg(tp.metric_requests).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("projects:{}", rows.len()),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
 
-    for (project, score) in rows
-        .iter()
-        .take(usize::from(inner.height).saturating_sub(1))
-    {
+    let list_budget = content_rows.saturating_sub(lines.len());
+    for (project, score) in rows.iter().take(list_budget) {
         let bar = ratio_bar(*score, max_score, 8);
         lines.push(Line::from_spans([
             Span::styled(
@@ -2135,6 +2240,9 @@ fn render_project_load_panel(
         .take(usize::from(inner.height))
         .collect::<Vec<_>>();
     Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "L=msg + (2*agents) + (3*reservations)");
+    }
 }
 
 fn render_reservation_watch_panel(

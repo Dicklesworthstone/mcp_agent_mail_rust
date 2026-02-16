@@ -4639,6 +4639,87 @@ fn derive_agent_registered_domain_events(
     )]
 }
 
+fn derive_macro_start_session_domain_events(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    let mut events = Vec::new();
+    if let Some(file_reservations) = payload.get("file_reservations") {
+        events.extend(derive_reservation_granted_domain_events(
+            call_args,
+            file_reservations,
+            ctx,
+        ));
+    }
+    if let Some(inbox) = payload.get("inbox") {
+        let fallback_project = payload
+            .get("project")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|project| {
+                project
+                    .get("slug")
+                    .or_else(|| project.get("human_key"))
+                    .and_then(serde_json::Value::as_str)
+            });
+        events.extend(derive_fetch_inbox_domain_events(
+            inbox,
+            ctx,
+            fallback_project,
+        ));
+    }
+    events
+}
+
+fn derive_macro_prepare_thread_domain_events(
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    let Some(inbox) = payload.get("inbox") else {
+        return Vec::new();
+    };
+    let fallback_project = payload
+        .get("project")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|project| {
+            project
+                .get("slug")
+                .or_else(|| project.get("human_key"))
+                .and_then(serde_json::Value::as_str)
+        });
+    derive_fetch_inbox_domain_events(inbox, ctx, fallback_project)
+}
+
+fn derive_macro_file_reservation_cycle_domain_events(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    let mut events = Vec::new();
+    if let Some(file_reservations) = payload.get("file_reservations") {
+        events.extend(derive_reservation_granted_domain_events(
+            call_args,
+            file_reservations,
+            ctx,
+        ));
+    }
+    if let Some(released) = payload.get("released") {
+        events.extend(derive_release_domain_events(call_args, released, ctx));
+    }
+    events
+}
+
+fn derive_macro_contact_handshake_domain_events(
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    payload
+        .get("welcome_message")
+        .map_or_else(Vec::new, |welcome| {
+            derive_message_domain_events(welcome, ctx)
+        })
+}
+
 fn derive_domain_events_from_tool_payload(
     tool_name: &str,
     call_args: Option<&serde_json::Value>,
@@ -4665,6 +4746,12 @@ fn derive_domain_events_from_tool_payload(
         "register_agent" | "create_agent_identity" => {
             derive_agent_registered_domain_events(payload, &ctx)
         }
+        "macro_start_session" => derive_macro_start_session_domain_events(call_args, payload, &ctx),
+        "macro_prepare_thread" => derive_macro_prepare_thread_domain_events(payload, &ctx),
+        "macro_file_reservation_cycle" => {
+            derive_macro_file_reservation_cycle_domain_events(call_args, payload, &ctx)
+        }
+        "macro_contact_handshake" => derive_macro_contact_handshake_domain_events(payload, &ctx),
         _ => Vec::new(),
     }
 }
@@ -12581,6 +12668,176 @@ mod tests {
                 assert_eq!(project, "product:prod-xyz");
             }
             other => panic!("expected MessageReceived event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_macro_start_session_payload() {
+        let payload = serde_json::json!({
+            "project": {"slug": "proj-alpha", "human_key": "/data/projects/proj-alpha"},
+            "agent": {"name": "BlueLake", "program": "codex-cli", "model": "gpt5"},
+            "file_reservations": {
+                "granted": [{
+                    "id": 7,
+                    "path_pattern": "src/**",
+                    "exclusive": true,
+                    "expires_ts": "2026-01-01T00:00:00Z"
+                }],
+                "conflicts": []
+            },
+            "inbox": [{
+                "id": 3001,
+                "from": "GreenPeak",
+                "subject": "Session ready",
+                "thread_id": "br-3001"
+            }]
+        });
+        let call_args = serde_json::json!({
+            "human_key": "/data/projects/proj-alpha",
+            "agent_name": "BlueLake",
+            "paths": ["src/**"],
+            "ttl_seconds": 900,
+            "exclusive": true
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "macro_start_session",
+            Some(&call_args),
+            &payload,
+            None,
+            None,
+        );
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, tui_events::MailEvent::ReservationGranted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, tui_events::MailEvent::MessageReceived { .. }))
+        );
+    }
+
+    #[test]
+    fn derive_domain_events_from_macro_file_reservation_cycle_payload() {
+        let payload = serde_json::json!({
+            "file_reservations": {
+                "granted": [{
+                    "id": 8,
+                    "path_pattern": "src/**",
+                    "exclusive": false,
+                    "expires_ts": "2026-01-01T00:00:00Z"
+                }],
+                "conflicts": []
+            },
+            "released": {
+                "released": 1,
+                "released_at": "2026-01-01T00:00:00Z"
+            }
+        });
+        let call_args = serde_json::json!({
+            "project_key": "/data/projects/proj-alpha",
+            "agent_name": "BlueLake",
+            "paths": ["src/**"],
+            "ttl_seconds": 600,
+            "exclusive": false
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "macro_file_reservation_cycle",
+            Some(&call_args),
+            &payload,
+            None,
+            None,
+        );
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, tui_events::MailEvent::ReservationGranted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, tui_events::MailEvent::ReservationReleased { .. }))
+        );
+    }
+
+    #[test]
+    fn derive_domain_events_from_macro_prepare_thread_payload() {
+        let payload = serde_json::json!({
+            "project": {"slug": "proj-alpha", "human_key": "/data/projects/proj-alpha"},
+            "thread": {"thread_id": "br-5001"},
+            "inbox": [{
+                "id": 5001,
+                "from": "GreenPeak",
+                "subject": "Thread context",
+                "thread_id": "br-5001"
+            }]
+        });
+        let call_args = serde_json::json!({
+            "project_key": "/data/projects/proj-alpha",
+            "agent_name": "BlueLake"
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "macro_prepare_thread",
+            Some(&call_args),
+            &payload,
+            None,
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageReceived { id, subject, .. } => {
+                assert_eq!(*id, 5001);
+                assert_eq!(subject, "Thread context");
+            }
+            other => panic!("expected MessageReceived event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_macro_contact_handshake_welcome_message() {
+        let payload = serde_json::json!({
+            "request": {"status": "pending"},
+            "response": {"status": "approved"},
+            "welcome_message": {
+                "deliveries": [{
+                    "project": "proj-alpha",
+                    "payload": {
+                        "id": 4001,
+                        "from": "BlueLake",
+                        "to": ["RedStone"],
+                        "subject": "Welcome",
+                        "thread_id": "br-4001"
+                    }
+                }],
+                "count": 1
+            }
+        });
+        let call_args = serde_json::json!({
+            "project_key": "/data/projects/proj-alpha",
+            "requester": "BlueLake",
+            "target": "RedStone"
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "macro_contact_handshake",
+            Some(&call_args),
+            &payload,
+            None,
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageSent { id, subject, .. } => {
+                assert_eq!(*id, 4001);
+                assert_eq!(subject, "Welcome");
+            }
+            other => panic!("expected MessageSent event, got {other:?}"),
         }
     }
 

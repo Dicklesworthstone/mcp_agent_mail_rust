@@ -34,14 +34,18 @@ use mcp_agent_mail_search_core::{
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
     DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
-    EmbeddingRequest, EmbeddingResult, HashEmbedder, JobMetricsSnapshot, ModelInfo, ModelRegistry,
-    ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult, SearchPhase,
-    TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex,
-    VectorIndexConfig, get_two_tier_context,
+    EmbeddingRequest, EmbeddingResult, FsScoredResult, HashEmbedder, JobMetricsSnapshot,
+    ModelInfo, ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig,
+    ScoredResult, SearchPhase, TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex,
+    VectorFilter, VectorIndex, VectorIndexConfig, fs, get_two_tier_context,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
+#[cfg(feature = "hybrid")]
+use std::collections::BTreeMap;
+#[cfg(feature = "hybrid")]
+use std::path::PathBuf;
 #[cfg(feature = "hybrid")]
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 // ────────────────────────────────────────────────────────────────────
@@ -630,6 +634,8 @@ pub const fn semantic_indexing_health() -> Option<SemanticIndexingHealth> {
 
 #[cfg(feature = "hybrid")]
 static TWO_TIER_BRIDGE: OnceLock<Option<Arc<TwoTierBridge>>> = OnceLock::new();
+#[cfg(feature = "hybrid")]
+static HYBRID_RERANKER: OnceLock<Option<Arc<fs::FlashRankReranker>>> = OnceLock::new();
 
 /// Bridge to the two-tier progressive semantic search system.
 ///
@@ -909,6 +915,312 @@ fn try_two_tier_search_with_cx(
     try_two_tier_search(query, limit)
 }
 
+#[cfg(feature = "hybrid")]
+const AM_SEARCH_RERANK_ENABLED_ENV: &str = "AM_SEARCH_RERANK_ENABLED";
+#[cfg(feature = "hybrid")]
+const AM_SEARCH_RERANK_TOP_K_ENV: &str = "AM_SEARCH_RERANK_TOP_K";
+#[cfg(feature = "hybrid")]
+const AM_SEARCH_RERANK_MIN_CANDIDATES_ENV: &str = "AM_SEARCH_RERANK_MIN_CANDIDATES";
+#[cfg(feature = "hybrid")]
+const AM_SEARCH_RERANK_BLEND_POLICY_ENV: &str = "AM_SEARCH_RERANK_BLEND_POLICY";
+#[cfg(feature = "hybrid")]
+const AM_SEARCH_RERANK_BLEND_WEIGHT_ENV: &str = "AM_SEARCH_RERANK_BLEND_WEIGHT";
+#[cfg(feature = "hybrid")]
+const AM_SEARCH_RERANK_MODEL_DIR_ENV: &str = "AM_SEARCH_RERANK_MODEL_DIR";
+#[cfg(feature = "hybrid")]
+const FRANKENSEARCH_MODEL_DIR_ENV: &str = "FRANKENSEARCH_MODEL_DIR";
+#[cfg(feature = "hybrid")]
+const DEFAULT_RERANK_MODEL_NAME: &str = "flashrank";
+
+#[cfg(feature = "hybrid")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RerankBlendPolicy {
+    Weighted,
+    Replace,
+}
+
+#[cfg(feature = "hybrid")]
+impl RerankBlendPolicy {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "replace" | "rerank_only" | "rerank-only" => Self::Replace,
+            _ => Self::Weighted,
+        }
+    }
+}
+
+#[cfg(feature = "hybrid")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HybridRerankConfig {
+    enabled: bool,
+    top_k: usize,
+    min_candidates: usize,
+    blend_policy: RerankBlendPolicy,
+    blend_weight: f64,
+}
+
+#[cfg(feature = "hybrid")]
+impl Default for HybridRerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            top_k: 100,
+            min_candidates: 5,
+            blend_policy: RerankBlendPolicy::Weighted,
+            blend_weight: 0.35,
+        }
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_env_bool(&value))
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "hybrid")]
+fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+#[cfg(feature = "hybrid")]
+fn env_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+#[cfg(feature = "hybrid")]
+fn hybrid_rerank_config_from_env() -> HybridRerankConfig {
+    let default = HybridRerankConfig::default();
+    let blend_policy = std::env::var(AM_SEARCH_RERANK_BLEND_POLICY_ENV)
+        .ok()
+        .map_or(default.blend_policy, |value| {
+            RerankBlendPolicy::parse(&value)
+        });
+
+    HybridRerankConfig {
+        enabled: env_bool(AM_SEARCH_RERANK_ENABLED_ENV, default.enabled),
+        top_k: env_usize(AM_SEARCH_RERANK_TOP_K_ENV, default.top_k, 1, 500),
+        min_candidates: env_usize(
+            AM_SEARCH_RERANK_MIN_CANDIDATES_ENV,
+            default.min_candidates,
+            1,
+            500,
+        ),
+        blend_policy,
+        blend_weight: env_f64(
+            AM_SEARCH_RERANK_BLEND_WEIGHT_ENV,
+            default.blend_weight,
+            0.0,
+            1.0,
+        ),
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn resolve_rerank_model_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(AM_SEARCH_RERANK_MODEL_DIR_ENV) {
+        return Some(PathBuf::from(path));
+    }
+
+    std::env::var(FRANKENSEARCH_MODEL_DIR_ENV)
+        .ok()
+        .map(|path| PathBuf::from(path).join(DEFAULT_RERANK_MODEL_NAME))
+}
+
+#[cfg(feature = "hybrid")]
+fn get_or_init_hybrid_reranker() -> Option<Arc<fs::FlashRankReranker>> {
+    HYBRID_RERANKER
+        .get_or_init(|| {
+            let Some(model_dir) = resolve_rerank_model_dir() else {
+                tracing::debug!(
+                    target: "search.metrics",
+                    "rerank model dir not configured; skipping reranker init"
+                );
+                return None;
+            };
+
+            match fs::FlashRankReranker::load(&model_dir) {
+                Ok(reranker) => Some(Arc::new(reranker)),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "search.metrics",
+                        model_dir = %model_dir.display(),
+                        error = %error,
+                        "failed to initialize reranker; degrading to fusion-only"
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+#[cfg(feature = "hybrid")]
+fn blend_rerank_score(
+    baseline_score: f64,
+    rerank_score: f64,
+    policy: RerankBlendPolicy,
+    weight: f64,
+) -> f64 {
+    match policy {
+        RerankBlendPolicy::Replace => rerank_score,
+        RerankBlendPolicy::Weighted => {
+            let w = weight.clamp(0.0, 1.0);
+            (1.0 - w).mul_add(baseline_score, w * rerank_score)
+        }
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn apply_rerank_scores_and_sort(
+    merged: &mut Vec<SearchResult>,
+    rerank_scores: &BTreeMap<i64, f64>,
+    policy: RerankBlendPolicy,
+    weight: f64,
+) -> usize {
+    let mut applied = 0usize;
+    for result in merged.iter_mut() {
+        let Some(&rerank_score) = rerank_scores.get(&result.id) else {
+            continue;
+        };
+        let baseline = result.score.unwrap_or(0.0);
+        result.score = Some(blend_rerank_score(baseline, rerank_score, policy, weight));
+        applied = applied.saturating_add(1);
+    }
+
+    merged.sort_by(|left, right| {
+        right
+            .score
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(&left.score.unwrap_or(f64::NEG_INFINITY))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    applied
+}
+
+#[cfg(feature = "hybrid")]
+async fn maybe_apply_hybrid_rerank(cx: &Cx, query: &SearchQuery, merged: &mut Vec<SearchResult>) {
+    let config = hybrid_rerank_config_from_env();
+    if !config.enabled {
+        return;
+    }
+    if merged.len() < config.min_candidates {
+        tracing::debug!(
+            target: "search.metrics",
+            candidate_count = merged.len(),
+            min_candidates = config.min_candidates,
+            "skipping rerank due to insufficient candidates"
+        );
+        return;
+    }
+
+    let Some(reranker) = get_or_init_hybrid_reranker() else {
+        return;
+    };
+
+    let top_k = config.top_k.min(merged.len());
+    let min_candidates = config.min_candidates.min(top_k.max(1));
+
+    let text_by_doc = merged
+        .iter()
+        .map(|result| {
+            let text = if result.body.is_empty() {
+                result.title.clone()
+            } else {
+                format!("{}\n\n{}", result.title, result.body)
+            };
+            (result.id.to_string(), text)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    #[allow(clippy::cast_possible_truncation)]
+    let mut fs_candidates = merged
+        .iter()
+        .map(|result| FsScoredResult {
+            doc_id: result.id.to_string(),
+            score: result.score.unwrap_or(0.0) as f32,
+            source: fs::core::types::ScoreSource::Hybrid,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: result.score.map(|score| score as f32),
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        })
+        .collect::<Vec<_>>();
+
+    let rerank_outcome = fs::rerank_step(
+        cx,
+        reranker.as_ref(),
+        &query.text,
+        &mut fs_candidates,
+        |doc_id| text_by_doc.get(doc_id).cloned(),
+        top_k,
+        min_candidates,
+    )
+    .await;
+
+    if let Err(error) = rerank_outcome {
+        tracing::warn!(
+            target: "search.metrics",
+            error = %error,
+            "rerank step failed; degrading to fusion-only ranking"
+        );
+        return;
+    }
+
+    let rerank_scores = fs_candidates
+        .iter()
+        .filter_map(|candidate| {
+            let score = candidate.rerank_score?;
+            let doc_id = candidate.doc_id.parse::<i64>().ok()?;
+            Some((doc_id, f64::from(score)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if rerank_scores.is_empty() {
+        tracing::debug!(
+            target: "search.metrics",
+            "rerank step produced no scores; preserving fusion order"
+        );
+        return;
+    }
+
+    let applied = apply_rerank_scores_and_sort(
+        merged,
+        &rerank_scores,
+        config.blend_policy,
+        config.blend_weight,
+    );
+    tracing::debug!(
+        target: "search.metrics",
+        applied_count = applied,
+        top_k,
+        min_candidates,
+        blend_weight = config.blend_weight,
+        blend_policy = ?config.blend_policy,
+        "hybrid rerank applied"
+    );
+}
+
 fn orchestrate_hybrid_results(
     query: &SearchQuery,
     engine: SearchEngine,
@@ -982,6 +1294,21 @@ fn orchestrate_hybrid_results(
         "hybrid candidate orchestration completed"
     );
     emit_hybrid_budget_evidence(query, mode, &derivation, &prepared.counts);
+
+    merged
+}
+
+async fn orchestrate_hybrid_results_with_optional_rerank(
+    cx: &Cx,
+    query: &SearchQuery,
+    engine: SearchEngine,
+    lexical_results: Vec<SearchResult>,
+    semantic_results: Vec<SearchResult>,
+) -> Vec<SearchResult> {
+    let mut merged = orchestrate_hybrid_results(query, engine, lexical_results, semantic_results);
+
+    #[cfg(feature = "hybrid")]
+    maybe_apply_hybrid_rerank(cx, query, &mut merged).await;
 
     merged
 }
@@ -1184,8 +1511,14 @@ pub async fn execute_search(
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
 
-            let raw_results =
-                orchestrate_hybrid_results(query, engine, lexical_results, semantic_results);
+            let raw_results = orchestrate_hybrid_results_with_optional_rerank(
+                cx,
+                query,
+                engine,
+                lexical_results,
+                semantic_results,
+            )
+            .await;
             let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
             if options.track_telemetry {
                 record_query("search_service_hybrid_candidates", latency_us);

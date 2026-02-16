@@ -97,8 +97,8 @@ walkdir = "2"
 tantivy = "0.25"
 indexmap = "2"
 
-# frankensearch: two-tier hybrid search engine
-frankensearch = { path = "../frankensearch/frankensearch", features = ["hybrid"] }
+# frankensearch: two-tier hybrid search engine + optional cross-encoder rerank
+frankensearch = { path = "../frankensearch/frankensearch", features = ["hybrid", "rerank"] }
 frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
 frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
 frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
