@@ -1200,8 +1200,8 @@ fn dispatch_compose_envelope(
     tui_state: &tui_bridge::TuiSharedState,
     envelope: tui_compose::ComposeEnvelope,
 ) {
-    use mcp_agent_mail_db::timestamps::now_micros;
     use mcp_agent_mail_db::sqlmodel_core::Value;
+    use mcp_agent_mail_db::timestamps::now_micros;
 
     let conn = match tui_poller::open_sync_connection_pub(database_url) {
         Some(c) => c,
@@ -1264,11 +1264,7 @@ fn dispatch_compose_envelope(
     }
 
     // 3. Insert the message.
-    let thread_id = envelope
-        .thread_id
-        .as_deref()
-        .unwrap_or("")
-        .to_string();
+    let thread_id = envelope.thread_id.as_deref().unwrap_or("").to_string();
     let importance = &envelope.importance;
     let _ = conn.execute_sync(
         "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, topic, created_ts) \
@@ -1336,7 +1332,12 @@ fn dispatch_compose_envelope(
     }
 
     // 6. Push a MessageSent event to the TUI.
-    let recipient_names: Vec<String> = envelope.to.iter().chain(envelope.cc.iter()).cloned().collect();
+    let recipient_names: Vec<String> = envelope
+        .to
+        .iter()
+        .chain(envelope.cc.iter())
+        .cloned()
+        .collect();
     let thread_str = envelope.thread_id.as_deref().unwrap_or("");
     let _ = tui_state.push_event(tui_events::MailEvent::message_sent(
         msg_id,

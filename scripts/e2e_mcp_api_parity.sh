@@ -101,6 +101,67 @@ stop_server() {
     fi
 }
 
+http_request() {
+    local case_id="$1"
+    local method="$2"
+    local url="$3"
+    shift 3
+
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local case_headers_file="${case_dir}/headers.txt"
+    local case_body_file="${case_dir}/response.txt"
+    local case_status_file="${case_dir}/status.txt"
+    local case_timing_file="${case_dir}/timing.txt"
+    local case_curl_stderr_file="${case_dir}/curl_stderr.txt"
+
+    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    mkdir -p "${case_dir}"
+    e2e_mark_case_start "${case_id}"
+
+    local args=(
+        -sS
+        -D "${case_headers_file}"
+        -o "${case_body_file}"
+        -w "%{http_code}"
+        -X "${method}"
+        "${url}"
+    )
+    for h in "$@"; do
+        args+=(-H "$h")
+    done
+
+    e2e_save_artifact "${case_id}_curl_args.txt" "$(printf "curl -X %q %q %s\n" "${method}" "${url}" "$(printf "%q " "$@")")"
+
+    local start_ns end_ns elapsed_ms
+    start_ns="$(date +%s%N)"
+    set +e
+    local status
+    status="$(curl "${args[@]}" 2>"${case_curl_stderr_file}")"
+    local rc=$?
+    set -e
+    end_ns="$(date +%s%N)"
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    echo "${status}" > "${case_status_file}"
+    echo "${elapsed_ms}" > "${case_timing_file}"
+
+    cp "${case_headers_file}" "${headers_file}" 2>/dev/null || true
+    cp "${case_body_file}" "${body_file}" 2>/dev/null || true
+    cp "${case_status_file}" "${status_file}" 2>/dev/null || true
+    cp "${case_timing_file}" "${timing_file}" 2>/dev/null || true
+    cp "${case_curl_stderr_file}" "${curl_stderr_file}" 2>/dev/null || true
+
+    if [ "${rc}" -ne 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
 http_post_json() {
     local case_id="$1"
     local url="$2"
@@ -639,23 +700,17 @@ PID7="$(start_server "health_test" "${PORT7}" "${DB7}" "${STORAGE7}" "${BIN}" "H
 e2e_wait_port 127.0.0.1 "${PORT7}" 10 || { stop_server "${PID7}"; e2e_fatal "health test server failed"; }
 
 # /health/liveness
-set +e
-LIVE_BODY="$(curl -sS "http://127.0.0.1:${PORT7}/health/liveness" 2>/dev/null)"
-LIVE_RC=$?
-set -e
-if [ "$LIVE_RC" -eq 0 ]; then
-    e2e_assert_contains "liveness has alive" "${LIVE_BODY}" "alive"
+if http_request "c7_health_liveness" "GET" "http://127.0.0.1:${PORT7}/health/liveness"; then
+    e2e_assert_eq "liveness HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/c7_health_liveness_status.txt")"
+    e2e_assert_contains "liveness has alive" "$(cat "${E2E_ARTIFACT_DIR}/c7_health_liveness_body.txt" 2>/dev/null || true)" "alive"
 else
     e2e_fail "liveness curl failed"
 fi
 
 # /health/readiness
-set +e
-READY_BODY="$(curl -sS "http://127.0.0.1:${PORT7}/health/readiness" 2>/dev/null)"
-READY_RC=$?
-set -e
-if [ "$READY_RC" -eq 0 ]; then
-    e2e_assert_contains "readiness has ready" "${READY_BODY}" "ready"
+if http_request "c7_health_readiness" "GET" "http://127.0.0.1:${PORT7}/health/readiness"; then
+    e2e_assert_eq "readiness HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/c7_health_readiness_status.txt")"
+    e2e_assert_contains "readiness has ready" "$(cat "${E2E_ARTIFACT_DIR}/c7_health_readiness_body.txt" 2>/dev/null || true)" "ready"
 else
     e2e_fail "readiness curl failed"
 fi

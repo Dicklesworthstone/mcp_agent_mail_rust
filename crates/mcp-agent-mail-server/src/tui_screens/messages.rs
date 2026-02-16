@@ -33,11 +33,11 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
-use crate::tui_action_menu::{ActionEntry, messages_actions};
+use crate::tui_action_menu::{ActionEntry, messages_actions, messages_batch_actions};
 use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_layout::DockLayout;
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -172,6 +172,7 @@ impl RenderItem for MessageEntry {
             None,
             MessageDropZoneState::None,
             false,
+            false,
         );
     }
 
@@ -190,6 +191,7 @@ impl MessageEntry {
         shimmer_progress: Option<f64>,
         drop_zone: MessageDropZoneState,
         keyboard_marked: bool,
+        batch_selected: bool,
     ) {
         use ftui::widgets::Widget;
         if area.height == 0 || area.width < 10 {
@@ -203,6 +205,12 @@ impl MessageEntry {
             crate::tui_theme::SELECTION_PREFIX
         } else {
             crate::tui_theme::SELECTION_PREFIX_EMPTY
+        };
+        let batch_marker = if batch_selected { "[x]" } else { "[ ]" };
+        let batch_marker_style = if batch_selected {
+            Style::default().fg(tp.selection_indicator).bold()
+        } else {
+            crate::tui_theme::text_meta(&tp)
         };
         let cursor_style = Style::default()
             .fg(tp.selection_fg)
@@ -265,6 +273,8 @@ impl MessageEntry {
         // Calculate how much space remains for subject
         // Format: marker + badge(2) + ack(1) + space + id(6) + space + time(8) + space + sender(<=12) + space + project + subject
         let fixed_len = marker.len()
+            + batch_marker.chars().count()
+            + 1 // spacer
             + 2  // badge
             + 1  // ack
             + 1  // space
@@ -280,6 +290,8 @@ impl MessageEntry {
         let subj = truncate_str(&self.subject, remaining);
 
         let mut spans = vec![
+            Span::styled(batch_marker, batch_marker_style),
+            Span::raw(" "),
             Span::raw(marker),
             Span::styled(format!("{badge:>2}"), badge_style),
             Span::styled(ack_badge, ack_style),
@@ -355,6 +367,7 @@ struct MessageRenderRow<'a> {
     shimmer_progress: Option<f64>,
     drop_zone: MessageDropZoneState,
     keyboard_marked: bool,
+    batch_selected: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -373,6 +386,7 @@ impl RenderItem for MessageRenderRow<'_> {
             self.shimmer_progress,
             self.drop_zone,
             self.keyboard_marked,
+            self.batch_selected,
         );
     }
 
@@ -717,6 +731,8 @@ pub struct MessageBrowserScreen {
     focus: Focus,
     /// `VirtualizedList` state for efficient rendering.
     list_state: RefCell<VirtualizedListState>,
+    /// Multi-selection state for batch actions.
+    selected_message_ids: SelectionState<i64>,
     /// Last search term that was actually executed.
     last_search: String,
     /// Ticks remaining before executing a search after input changes.
@@ -778,6 +794,7 @@ impl MessageBrowserScreen {
             detail_scroll: 0,
             focus: Focus::ResultList,
             list_state: RefCell::new(VirtualizedListState::default()),
+            selected_message_ids: SelectionState::new(),
             last_search: String::new(),
             debounce_remaining: 0,
             search_dirty: true, // Initial load
@@ -1292,6 +1309,43 @@ impl MessageBrowserScreen {
         self.results.get(self.cursor)
     }
 
+    fn selected_message_ids_sorted(&self) -> Vec<i64> {
+        let mut ids = self.selected_message_ids.selected_items();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn prune_selection_to_visible(&mut self) {
+        let visible_ids: std::collections::HashSet<i64> =
+            self.results.iter().map(|e| e.id).collect();
+        self.selected_message_ids
+            .retain(|message_id| visible_ids.contains(message_id));
+    }
+
+    fn clear_message_selection(&mut self) {
+        self.selected_message_ids.clear();
+    }
+
+    fn toggle_selection_for_cursor(&mut self) {
+        if let Some(entry) = self.selected_result_entry() {
+            self.selected_message_ids.toggle(entry.id);
+        }
+    }
+
+    fn select_all_visible_messages(&mut self) {
+        self.selected_message_ids
+            .select_all(self.results.iter().map(|entry| entry.id));
+    }
+
+    fn extend_visual_selection_to_cursor(&mut self) {
+        if !self.selected_message_ids.visual_mode() {
+            return;
+        }
+        if let Some(entry) = self.selected_result_entry() {
+            self.selected_message_ids.select(entry.id);
+        }
+    }
+
     fn mark_selected_result_for_keyboard_move(&self, state: &TuiSharedState) {
         let Some(entry) = self.selected_result_entry() else {
             return;
@@ -1452,6 +1506,7 @@ impl MessageBrowserScreen {
         }
 
         self.results = results;
+        self.prune_selection_to_visible();
         self.total_results = total.saturating_add(live_added);
 
         // Clamp cursor
@@ -1580,6 +1635,7 @@ impl MailScreen for MessageBrowserScreen {
                             self.focus = Focus::ResultList;
                             self.search_input.set_focused(false);
                             self.set_cursor_from_results_click(mouse.y);
+                            self.extend_visual_selection_to_cursor();
                             if let Some(idx) = self.result_index_at_y(mouse.y) {
                                 self.begin_pending_message_drag_for_result(idx, mouse.x, mouse.y);
                             }
@@ -1621,6 +1677,7 @@ impl MailScreen for MessageBrowserScreen {
                         {
                             self.cursor = (self.cursor + 1).min(self.results.len() - 1);
                             self.detail_scroll = 0;
+                            self.extend_visual_selection_to_cursor();
                             return Cmd::None;
                         }
                     }
@@ -1641,6 +1698,7 @@ impl MailScreen for MessageBrowserScreen {
                         if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y) {
                             self.cursor = self.cursor.saturating_sub(1);
                             self.detail_scroll = 0;
+                            self.extend_visual_selection_to_cursor();
                             return Cmd::None;
                         }
                     }
@@ -1688,21 +1746,25 @@ impl MailScreen for MessageBrowserScreen {
                         if !self.results.is_empty() {
                             self.cursor = (self.cursor + 1).min(self.results.len() - 1);
                             self.detail_scroll = 0;
+                            self.extend_visual_selection_to_cursor();
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.cursor = self.cursor.saturating_sub(1);
                         self.detail_scroll = 0;
+                        self.extend_visual_selection_to_cursor();
                     }
                     KeyCode::Char('G') | KeyCode::End => {
                         if !self.results.is_empty() {
                             self.cursor = self.results.len() - 1;
                             self.detail_scroll = 0;
+                            self.extend_visual_selection_to_cursor();
                         }
                     }
                     KeyCode::Home => {
                         self.cursor = 0;
                         self.detail_scroll = 0;
+                        self.extend_visual_selection_to_cursor();
                     }
                     // Toggle inbox mode (Local/Global)
                     KeyCode::Char('g') => {
@@ -1714,11 +1776,33 @@ impl MailScreen for MessageBrowserScreen {
                         if !self.results.is_empty() {
                             self.cursor = (self.cursor + 20).min(self.results.len() - 1);
                             self.detail_scroll = 0;
+                            self.extend_visual_selection_to_cursor();
                         }
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
                         self.cursor = self.cursor.saturating_sub(20);
                         self.detail_scroll = 0;
+                        self.extend_visual_selection_to_cursor();
+                    }
+                    // Multi-select controls
+                    KeyCode::Char(' ') => {
+                        self.toggle_selection_for_cursor();
+                        return Cmd::None;
+                    }
+                    KeyCode::Char('v') if !key.modifiers.contains(Modifiers::CTRL) => {
+                        let enabled = self.selected_message_ids.toggle_visual_mode();
+                        if enabled {
+                            self.extend_visual_selection_to_cursor();
+                        }
+                        return Cmd::None;
+                    }
+                    KeyCode::Char('A') => {
+                        self.select_all_visible_messages();
+                        return Cmd::None;
+                    }
+                    KeyCode::Char('C') if !key.modifiers.contains(Modifiers::CTRL) => {
+                        self.clear_message_selection();
+                        return Cmd::None;
                     }
                     // Detail scroll
                     KeyCode::Char('J') => self.scroll_detail_by(1),
@@ -1932,6 +2016,7 @@ impl MailScreen for MessageBrowserScreen {
             self.reduced_motion,
             drop_visual,
             keyboard_marked_message_id,
+            &self.selected_message_ids,
         );
         drop(list_state);
 
@@ -1960,6 +2045,14 @@ impl MailScreen for MessageBrowserScreen {
             HelpEntry {
                 key: "j/k",
                 action: "Navigate results",
+            },
+            HelpEntry {
+                key: "Space / v",
+                action: "Toggle selection / visual select mode",
+            },
+            HelpEntry {
+                key: "A / C",
+                action: "Select all visible / clear selection",
             },
             HelpEntry {
                 key: "d/u",
@@ -2017,7 +2110,9 @@ impl MailScreen for MessageBrowserScreen {
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("Browse and triage messages. Use c to compose, / to filter, Enter to jump timeline.")
+        Some(
+            "Browse and triage messages. Space/v/A/C manage multi-select; c composes; Enter jumps timeline.",
+        )
     }
 
     fn consumes_text_input(&self) -> bool {
@@ -2026,19 +2121,35 @@ impl MailScreen for MessageBrowserScreen {
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
         let message = self.results.get(self.cursor)?;
+        let selected_ids = self.selected_message_ids_sorted();
 
-        let thread_id = if message.thread_id.is_empty() {
-            None
+        let actions = if selected_ids.len() > 1 {
+            messages_batch_actions(selected_ids.len())
         } else {
-            Some(message.thread_id.as_str())
-        };
+            let thread_id = if message.thread_id.is_empty() {
+                None
+            } else {
+                Some(message.thread_id.as_str())
+            };
 
-        let actions = messages_actions(message.id, thread_id, &message.from_agent);
+            messages_actions(message.id, thread_id, &message.from_agent)
+        };
 
         // Anchor row is cursor position + header offset
         #[allow(clippy::cast_possible_truncation)]
         let anchor_row = (self.cursor as u16).saturating_add(3);
-        let context_id = message.id.to_string();
+        let context_id = if selected_ids.len() > 1 {
+            format!(
+                "batch:{}",
+                selected_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        } else {
+            message.id.to_string()
+        };
 
         Some((actions, anchor_row, context_id))
     }
@@ -2384,9 +2495,13 @@ fn render_results_list(
     reduced_motion: bool,
     drop_visual: Option<MessageDropVisual<'_>>,
     keyboard_marked_message_id: Option<i64>,
+    selected_message_ids: &SelectionState<i64>,
 ) {
+    let selected_count = selected_message_ids.len();
     let title = if results.is_empty() {
         "Results".to_string()
+    } else if selected_count > 0 {
+        format!("Results ({}) · selected {selected_count}", results.len())
     } else {
         format!("Results ({})", results.len())
     };
@@ -2444,6 +2559,7 @@ fn render_results_list(
                 }
             }),
             keyboard_marked: keyboard_marked_message_id == Some(entry.id),
+            batch_selected: selected_message_ids.contains(&entry.id),
         })
         .collect();
 
@@ -4197,6 +4313,7 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         let mut list_state = VirtualizedListState::default();
+        let selection = SelectionState::new();
         render_results_list(
             &mut frame,
             Rect::new(0, 0, 40, 20),
@@ -4207,6 +4324,7 @@ mod tests {
             false,
             None,
             None,
+            &selection,
         );
     }
 
@@ -4246,6 +4364,7 @@ mod tests {
         let mut frame = Frame::new(80, 24, &mut pool);
         let mut list_state = VirtualizedListState::default();
         list_state.select(Some(0));
+        let selection = SelectionState::new();
         render_results_list(
             &mut frame,
             Rect::new(0, 0, 40, 20),
@@ -4256,6 +4375,7 @@ mod tests {
             false,
             None,
             None,
+            &selection,
         );
     }
 
@@ -4279,6 +4399,7 @@ mod tests {
         let mut frame = Frame::new(80, 24, &mut pool);
         let mut list_state = VirtualizedListState::default();
         list_state.select(Some(0));
+        let selection = SelectionState::new();
         render_results_list(
             &mut frame,
             Rect::new(0, 0, 40, 20),
@@ -4289,6 +4410,7 @@ mod tests {
             false,
             None,
             None,
+            &selection,
         );
     }
 
@@ -4892,6 +5014,90 @@ mod tests {
             bindings
                 .iter()
                 .any(|b| b.key == "g" && b.action.contains("Local/Global"))
+        );
+    }
+
+    #[test]
+    fn space_toggles_message_selection() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(1, "thread-a", "One"));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let space = Event::Key(ftui::KeyEvent::new(KeyCode::Char(' ')));
+        let _ = screen.update(&space, &state);
+        assert!(screen.selected_message_ids.contains(&1));
+
+        let _ = screen.update(&space, &state);
+        assert!(!screen.selected_message_ids.contains(&1));
+    }
+
+    #[test]
+    fn shift_a_and_shift_c_manage_bulk_selection() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(1, "thread-a", "One"));
+        screen
+            .results
+            .push(test_message_entry(2, "thread-b", "Two"));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let select_all = Event::Key(ftui::KeyEvent::new(KeyCode::Char('A')));
+        let _ = screen.update(&select_all, &state);
+        assert_eq!(screen.selected_message_ids.len(), 2);
+
+        let clear = Event::Key(ftui::KeyEvent::new(KeyCode::Char('C')));
+        let _ = screen.update(&clear, &state);
+        assert!(screen.selected_message_ids.is_empty());
+    }
+
+    #[test]
+    fn visual_mode_extends_selection_when_cursor_moves() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(1, "thread-a", "One"));
+        screen
+            .results
+            .push(test_message_entry(2, "thread-b", "Two"));
+        screen
+            .results
+            .push(test_message_entry(3, "thread-c", "Three"));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let visual = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        let _ = screen.update(&visual, &state);
+        assert!(screen.selected_message_ids.contains(&1));
+        assert!(screen.selected_message_ids.visual_mode());
+
+        let down = Event::Key(ftui::KeyEvent::new(KeyCode::Char('j')));
+        let _ = screen.update(&down, &state);
+        assert!(screen.selected_message_ids.contains(&2));
+    }
+
+    #[test]
+    fn contextual_actions_switch_to_batch_when_multi_selected() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(11, "thread-a", "One"));
+        screen
+            .results
+            .push(test_message_entry(22, "thread-b", "Two"));
+        screen.selected_message_ids.select(11);
+        screen.selected_message_ids.select(22);
+
+        let (actions, _anchor, context_id) = screen
+            .contextual_actions()
+            .expect("batch contextual actions");
+        assert!(context_id.starts_with("batch:"));
+        assert!(
+            actions
+                .iter()
+                .any(|entry| entry.label.starts_with("Acknowledge selected")),
+            "batch action menu should include acknowledge selected"
         );
     }
 

@@ -558,6 +558,32 @@ pub fn messages_actions(
     actions
 }
 
+/// Build batch actions for the Messages screen when multiple messages are selected.
+#[must_use]
+pub fn messages_batch_actions(selected_count: usize) -> Vec<ActionEntry> {
+    let count = selected_count.max(1);
+    vec![
+        ActionEntry::new(
+            format!("Acknowledge selected ({count})"),
+            ActionKind::Execute("batch_acknowledge".into()),
+        )
+        .with_keybinding("a")
+        .with_description("Acknowledge all selected messages"),
+        ActionEntry::new(
+            format!("Mark read selected ({count})"),
+            ActionKind::Execute("batch_mark_read".into()),
+        )
+        .with_keybinding("r")
+        .with_description("Mark all selected messages as read"),
+        ActionEntry::new(
+            format!("Mark unread selected ({count})"),
+            ActionKind::Execute("batch_mark_unread".into()),
+        )
+        .with_keybinding("u")
+        .with_description("Mark all selected messages as unread"),
+    ]
+}
+
 /// Build actions for the Reservations screen.
 #[must_use]
 pub fn reservations_actions(
@@ -1131,6 +1157,24 @@ mod tests {
         // Should still have other actions.
         assert!(actions.iter().any(|a| a.label == "View body"));
         assert!(actions.iter().any(|a| a.label == "Jump to sender"));
+    }
+
+    #[test]
+    fn messages_batch_actions_include_expected_operations() {
+        let actions = messages_batch_actions(3);
+        assert_eq!(actions.len(), 3);
+
+        let ops: Vec<String> = actions
+            .iter()
+            .filter_map(|entry| match &entry.action {
+                ActionKind::Execute(op) => Some(op.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(ops.iter().any(|op| op == "batch_acknowledge"));
+        assert!(ops.iter().any(|op| op == "batch_mark_read"));
+        assert!(ops.iter().any(|op| op == "batch_mark_unread"));
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub mod tool_metrics;
 
 use ftui::layout::Rect;
 use ftui_runtime::program::Cmd;
+use std::collections::HashSet;
+use std::hash::Hash;
 
 use crate::tui_action_menu::ActionEntry;
 use crate::tui_bridge::TuiSharedState;
@@ -193,6 +195,114 @@ impl MailScreenId {
 pub struct HelpEntry {
     pub key: &'static str,
     pub action: &'static str,
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// SelectionState — reusable multi-selection helper
+// ──────────────────────────────────────────────────────────────────────
+
+/// Reusable selection state for list/table based screens.
+#[derive(Debug, Clone)]
+pub struct SelectionState<T>
+where
+    T: Eq + Hash + Clone,
+{
+    selected: HashSet<T>,
+    visual_mode: bool,
+}
+
+impl<T> Default for SelectionState<T>
+where
+    T: Eq + Hash + Clone,
+{
+    fn default() -> Self {
+        Self {
+            selected: HashSet::new(),
+            visual_mode: false,
+        }
+    }
+}
+
+impl<T> SelectionState<T>
+where
+    T: Eq + Hash + Clone,
+{
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.selected.clear();
+        self.visual_mode = false;
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.selected.len()
+    }
+
+    #[must_use]
+    pub fn contains(&self, value: &T) -> bool {
+        self.selected.contains(value)
+    }
+
+    pub fn select(&mut self, value: T) {
+        self.selected.insert(value);
+    }
+
+    pub fn deselect(&mut self, value: &T) {
+        self.selected.remove(value);
+    }
+
+    /// Toggle selection membership for `value`. Returns true if selected after toggle.
+    pub fn toggle(&mut self, value: T) -> bool {
+        if self.selected.contains(&value) {
+            self.selected.remove(&value);
+            false
+        } else {
+            self.selected.insert(value);
+            true
+        }
+    }
+
+    pub fn select_all<I>(&mut self, values: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        self.selected.extend(values);
+    }
+
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.selected.retain(|value| keep(value));
+    }
+
+    #[must_use]
+    pub fn selected_items(&self) -> Vec<T> {
+        self.selected.iter().cloned().collect()
+    }
+
+    #[must_use]
+    pub const fn visual_mode(&self) -> bool {
+        self.visual_mode
+    }
+
+    pub fn set_visual_mode(&mut self, enabled: bool) {
+        self.visual_mode = enabled;
+    }
+
+    pub fn toggle_visual_mode(&mut self) -> bool {
+        self.visual_mode = !self.visual_mode;
+        self.visual_mode
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -579,6 +689,43 @@ impl MailScreen for PlaceholderScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn selection_state_toggle_and_clear() {
+        let mut state = SelectionState::new();
+        assert!(state.is_empty());
+        assert!(state.toggle("msg-1"));
+        assert!(state.contains(&"msg-1"));
+        assert!(!state.toggle("msg-1"));
+        assert!(!state.contains(&"msg-1"));
+        state.select("msg-2");
+        state.select("msg-3");
+        assert_eq!(state.len(), 2);
+        state.clear();
+        assert!(state.is_empty());
+        assert!(!state.visual_mode());
+    }
+
+    #[test]
+    fn selection_state_select_all_and_retain() {
+        let mut state = SelectionState::new();
+        state.select_all(vec![1_i64, 2, 3, 4]);
+        assert_eq!(state.len(), 4);
+        state.retain(|id| *id % 2 == 0);
+        let selected: HashSet<i64> = state.selected_items().into_iter().collect();
+        assert_eq!(selected, HashSet::from([2, 4]));
+    }
+
+    #[test]
+    fn selection_state_visual_mode_toggle() {
+        let mut state = SelectionState::<i64>::new();
+        assert!(!state.visual_mode());
+        assert!(state.toggle_visual_mode());
+        assert!(state.visual_mode());
+        state.set_visual_mode(false);
+        assert!(!state.visual_mode());
+    }
 
     #[test]
     fn all_screen_ids_in_registry() {
