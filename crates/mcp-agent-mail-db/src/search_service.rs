@@ -12,32 +12,32 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    plan_search, DocKind, PlanMethod, PlanParam, SearchCursor, SearchQuery, SearchResponse,
-    SearchResult,
+    DocKind, PlanMethod, PlanParam, SearchCursor, SearchQuery, SearchResponse, SearchResult,
+    plan_search,
 };
 use crate::search_scope::{
-    apply_scope, RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult,
+    RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
 };
 use crate::tracking::record_query;
 use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
-use mcp_agent_mail_core::{append_evidence_entry_if_configured, EvidenceLedgerEntry};
+use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
 
 use asupersync::{Cx, Outcome};
 #[cfg(feature = "hybrid")]
 use half::f16;
+use mcp_agent_mail_search_core::{
+    CandidateBudget, CandidateBudgetConfig, CandidateBudgetDecision, CandidateBudgetDerivation,
+    CandidateHit, CandidateMode, CandidateStageCounts, QueryAssistance, QueryClass,
+    parse_query_assistance, prepare_candidates,
+};
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
-    fs, get_two_tier_context, DocKind as SearchDocKind, Embedder, EmbeddingJobConfig,
-    EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest, EmbeddingResult, FsScoredResult,
-    HashEmbedder, JobMetricsSnapshot, ModelInfo, ModelRegistry, ModelTier, QueueStats,
-    RefreshWorkerConfig, RegistryConfig, ScoredResult, SearchPhase, TwoTierAvailability,
-    TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex, VectorIndexConfig,
-};
-use mcp_agent_mail_search_core::{
-    parse_query_assistance, prepare_candidates, CandidateBudget, CandidateBudgetConfig,
-    CandidateBudgetDecision, CandidateBudgetDerivation, CandidateHit, CandidateMode,
-    CandidateStageCounts, QueryAssistance, QueryClass,
+    DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
+    EmbeddingRequest, EmbeddingResult, FsScoredResult, HashEmbedder, JobMetricsSnapshot, ModelInfo,
+    ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult,
+    SearchPhase, TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter,
+    VectorIndex, VectorIndexConfig, fs, get_two_tier_context,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
@@ -2333,18 +2333,24 @@ mod tests {
         let explain = build_v3_query_explain(&query, SearchEngine::Hybrid, Some(&rerank_audit));
         assert_eq!(explain.method, "hybrid_v3");
         assert_eq!(explain.facet_count, explain.facets_applied.len());
-        assert!(explain
-            .facets_applied
-            .iter()
-            .any(|facet| facet == "engine:hybrid"));
-        assert!(explain
-            .facets_applied
-            .iter()
-            .any(|facet| facet == "rerank_outcome:applied"));
-        assert!(explain
-            .facets_applied
-            .iter()
-            .any(|facet| facet == "rerank_applied_count:9"));
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "engine:hybrid")
+        );
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "rerank_outcome:applied")
+        );
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "rerank_applied_count:9")
+        );
     }
 
     #[test]

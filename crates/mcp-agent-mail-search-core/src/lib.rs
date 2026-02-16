@@ -25,6 +25,7 @@ pub mod results;
 pub mod updater;
 
 pub mod cache;
+pub mod diversity;
 pub mod filter_compiler;
 pub mod fusion;
 pub mod hybrid_candidates;
@@ -84,6 +85,11 @@ pub use cache::{
     CacheMetrics, DEFAULT_CACHE_MAX_ENTRIES, DEFAULT_CACHE_TTL_SECONDS, InvalidationEvent,
     InvalidationTrigger, QueryCache, QueryCacheKey, WarmResource, WarmState, WarmStatus,
     WarmWorker, WarmWorkerConfig,
+};
+pub use diversity::{
+    DIVERSITY_ENABLED_ENV, DIVERSITY_MAX_PER_SENDER_ENV, DIVERSITY_MAX_PER_THREAD_ENV,
+    DIVERSITY_SCORE_TOLERANCE_ENV, DIVERSITY_WINDOW_SIZE_ENV, DiversityConfig, DiversityMeta,
+    DiversityResult, diversify,
 };
 #[cfg(feature = "tantivy-engine")]
 pub use filter_compiler::{CompiledFilters, compile_filters};

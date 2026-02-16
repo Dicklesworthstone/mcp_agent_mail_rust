@@ -7,13 +7,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ftui::Style;
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::Widget;
-use ftui::Style;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_extras::canvas::{Canvas, Mode, Painter};
 use ftui_extras::charts::{LineChart, Series};
@@ -23,8 +23,8 @@ use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{
-    format_event_timestamp, AgentSummary, ContactSummary, DbStatSnapshot, EventLogEntry,
-    EventSeverity, MailEvent, MailEventKind, ProjectSummary, ReservationSnapshot, VerbosityTier,
+    AgentSummary, ContactSummary, DbStatSnapshot, EventLogEntry, EventSeverity, MailEvent,
+    MailEventKind, ProjectSummary, ReservationSnapshot, VerbosityTier, format_event_timestamp,
 };
 use crate::tui_layout::{
     DensityHint, PanelConstraint, PanelPolicy, PanelSlot, ReactiveLayout, SplitAxis, TerminalClass,
@@ -4149,9 +4149,11 @@ mod tests {
             shimmer.iter().filter(|p| p.is_some()).count(),
             SHIMMER_MAX_ROWS
         );
-        assert!(dashboard_shimmer_progresses(&refs, false)
-            .iter()
-            .all(Option::is_none));
+        assert!(
+            dashboard_shimmer_progresses(&refs, false)
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     #[test]
@@ -4257,7 +4259,7 @@ mod tests {
         // "café" — 'é' is 2 bytes (0xC3 0xA9); byte offsets: c=0, a=1, f=2, é=3..4
         assert_eq!(truncate("café", 4), "caf"); // byte 4 is mid-'é', backs up to 3
         assert_eq!(truncate("café", 5), "café"); // all 5 bytes fit
-                                                 // Emoji: '🎉' is 4 bytes; "hi🎉bye" = h(0) i(1) 🎉(2..5) b(6) y(7) e(8)
+        // Emoji: '🎉' is 4 bytes; "hi🎉bye" = h(0) i(1) 🎉(2..5) b(6) y(7) e(8)
         assert_eq!(truncate("hi🎉bye", 3), "hi"); // byte 3 mid-emoji, backs up to 2
         assert_eq!(truncate("hi🎉bye", 6), "hi🎉"); // byte 6 = start of 'b'
     }
@@ -4744,18 +4746,22 @@ mod tests {
             .iter()
             .find(|entry| entry.kind == MailEventKind::MessageReceived)
             .expect("expected synthetic baseline message entry");
-        assert!(baseline_message
-            .summary
-            .contains("DB baseline: 7 total messages"));
+        assert!(
+            baseline_message
+                .summary
+                .contains("DB baseline: 7 total messages")
+        );
 
         let baseline_reservations = screen
             .event_log
             .iter()
             .find(|entry| entry.kind == MailEventKind::ReservationGranted)
             .expect("expected synthetic baseline reservation entry");
-        assert!(baseline_reservations
-            .summary
-            .contains("active reservations currently held"));
+        assert!(
+            baseline_reservations
+                .summary
+                .contains("active reservations currently held")
+        );
     }
 
     #[test]
@@ -5294,12 +5300,16 @@ mod tests {
 
         // tools -> reservations
         screen.update(&t, &state);
-        assert!(screen
-            .type_filter
-            .contains(&MailEventKind::ReservationGranted));
-        assert!(screen
-            .type_filter
-            .contains(&MailEventKind::ReservationReleased));
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationGranted)
+        );
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationReleased)
+        );
 
         // reservations -> all
         screen.update(&t, &state);
@@ -5324,12 +5334,16 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('4'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::Reservations);
-        assert!(screen
-            .type_filter
-            .contains(&MailEventKind::ReservationGranted));
-        assert!(screen
-            .type_filter
-            .contains(&MailEventKind::ReservationReleased));
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationGranted)
+        );
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationReleased)
+        );
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('1'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::All);
