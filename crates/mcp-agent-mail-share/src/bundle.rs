@@ -554,6 +554,9 @@ fn resolve_attachment_path(
     let candidate = root.join(path);
     let canonical = candidate.canonicalize().ok()?;
     if !canonical.starts_with(&root) {
+        if allow_absolute_paths {
+            return Some(canonical);
+        }
         return None;
     }
     Some(canonical)

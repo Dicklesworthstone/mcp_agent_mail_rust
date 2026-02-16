@@ -402,9 +402,18 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("[br-42] Start: file reservation conflict in storage layer", Highly),
-                ("[br-42] Progress: guard fnmatch fixed, tests passing", Highly),
-                ("[br-42] Completed: reservation conflict resolution merged", Highly),
+                (
+                    "[br-42] Start: file reservation conflict in storage layer",
+                    Highly,
+                ),
+                (
+                    "[br-42] Progress: guard fnmatch fixed, tests passing",
+                    Highly,
+                ),
+                (
+                    "[br-42] Completed: reservation conflict resolution merged",
+                    Highly,
+                ),
             ],
             min_ndcg5: 0.8,
             min_mrr: 1.0,
@@ -421,8 +430,14 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("v3 migration: converting TEXT timestamps to i64 microseconds", Highly),
-                ("Re: v3 migration: timestamp edge cases for pre-1970 dates", Highly),
+                (
+                    "v3 migration: converting TEXT timestamps to i64 microseconds",
+                    Highly,
+                ),
+                (
+                    "Re: v3 migration: timestamp edge cases for pre-1970 dates",
+                    Highly,
+                ),
             ],
             min_ndcg5: 1.0,
             min_mrr: 1.0,
@@ -439,9 +454,18 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("[br-42] Start: file reservation conflict in storage layer", Highly),
-                ("[br-42] Progress: guard fnmatch fixed, tests passing", Highly),
-                ("[br-42] Completed: reservation conflict resolution merged", Highly),
+                (
+                    "[br-42] Start: file reservation conflict in storage layer",
+                    Highly,
+                ),
+                (
+                    "[br-42] Progress: guard fnmatch fixed, tests passing",
+                    Highly,
+                ),
+                (
+                    "[br-42] Completed: reservation conflict resolution merged",
+                    Highly,
+                ),
                 ("Security audit: path traversal in thread_id", Relevant),
                 ("Out of office: vacation next week", Marginal),
             ],
@@ -460,12 +484,27 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("[br-99] Start: SQLite WAL checkpoint tuning for concurrent writes", Highly),
+                (
+                    "[br-99] Start: SQLite WAL checkpoint tuning for concurrent writes",
+                    Highly,
+                ),
                 ("[br-99] Progress: WAL checkpoint tuning benchmarks", Highly),
-                ("[br-99] Completed: WAL tuning deployed with monitoring", Highly),
-                ("Re: Performance regression in message delivery pipeline", Relevant),
-                ("E2E test suite expansion: 44 share assertions added", Relevant),
-                ("write-behind cache coherency issue under concurrent load", Relevant),
+                (
+                    "[br-99] Completed: WAL tuning deployed with monitoring",
+                    Highly,
+                ),
+                (
+                    "Re: Performance regression in message delivery pipeline",
+                    Relevant,
+                ),
+                (
+                    "E2E test suite expansion: 44 share assertions added",
+                    Relevant,
+                ),
+                (
+                    "write-behind cache coherency issue under concurrent load",
+                    Relevant,
+                ),
             ],
             min_ndcg5: 0.5,
             min_mrr: 1.0,
@@ -482,9 +521,15 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("[br-99] Start: SQLite WAL checkpoint tuning for concurrent writes", Highly),
+                (
+                    "[br-99] Start: SQLite WAL checkpoint tuning for concurrent writes",
+                    Highly,
+                ),
                 ("[br-99] Progress: WAL checkpoint tuning benchmarks", Highly),
-                ("[br-99] Completed: WAL tuning deployed with monitoring", Relevant),
+                (
+                    "[br-99] Completed: WAL tuning deployed with monitoring",
+                    Relevant,
+                ),
             ],
             min_ndcg5: 0.7,
             min_mrr: 1.0,
@@ -519,8 +564,14 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("Performance regression in message delivery pipeline", Highly),
-                ("Re: Performance regression in message delivery pipeline", Highly),
+                (
+                    "Performance regression in message delivery pipeline",
+                    Highly,
+                ),
+                (
+                    "Re: Performance regression in message delivery pipeline",
+                    Highly,
+                ),
             ],
             min_ndcg5: 0.5,
             min_mrr: 0.5,
@@ -537,8 +588,14 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("Search V3 architecture proposal: Tantivy + semantic embeddings", Highly),
-                ("Re: Search V3: benchmark results for hybrid vs lexical-only", Highly),
+                (
+                    "Search V3 architecture proposal: Tantivy + semantic embeddings",
+                    Highly,
+                ),
+                (
+                    "Re: Search V3: benchmark results for hybrid vs lexical-only",
+                    Highly,
+                ),
             ],
             min_ndcg5: 0.5,
             min_mrr: 0.5,
@@ -555,7 +612,10 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("Performance regression in message delivery pipeline", Highly),
+                (
+                    "Performance regression in message delivery pipeline",
+                    Highly,
+                ),
                 ("Security audit: path traversal in thread_id", Highly),
             ],
             min_ndcg5: 0.9,
@@ -572,9 +632,7 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             thread_id: None,
             use_time_range: false,
             ranking: RankingMode::Relevance,
-            judgments: vec![
-                ("Circuit breaker implementation for database pool", Highly),
-            ],
+            judgments: vec![("Circuit breaker implementation for database pool", Highly)],
             min_ndcg5: 0.8,
             min_mrr: 1.0,
             min_p3: 0.33,
@@ -590,7 +648,7 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: true,
             ranking: RankingMode::Recency,
             judgments: vec![], // recency doesn't judge relevance — just checks ordering
-            min_ndcg5: 1.0,   // vacuously true
+            min_ndcg5: 1.0,    // vacuously true
             min_mrr: 0.0,
             min_p3: 0.0,
             min_r5: 1.0,
@@ -604,9 +662,7 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             thread_id: None,
             use_time_range: false,
             ranking: RankingMode::Relevance,
-            judgments: vec![
-                ("conformance test results: all 23 tools passing", Highly),
-            ],
+            judgments: vec![("conformance test results: all 23 tools passing", Highly)],
             min_ndcg5: 0.8,
             min_mrr: 1.0,
             min_p3: 0.33,
@@ -637,9 +693,18 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             use_time_range: false,
             ranking: RankingMode::Relevance,
             judgments: vec![
-                ("[br-42] Progress: guard fnmatch fixed, tests passing", Highly),
-                ("[br-42] Start: file reservation conflict in storage layer", Relevant),
-                ("[br-42] Completed: reservation conflict resolution merged", Relevant),
+                (
+                    "[br-42] Progress: guard fnmatch fixed, tests passing",
+                    Highly,
+                ),
+                (
+                    "[br-42] Start: file reservation conflict in storage layer",
+                    Relevant,
+                ),
+                (
+                    "[br-42] Completed: reservation conflict resolution merged",
+                    Relevant,
+                ),
             ],
             min_ndcg5: 0.5,
             min_mrr: 1.0,
@@ -655,9 +720,10 @@ fn queries_v2() -> Vec<BenchmarkQuery> {
             thread_id: None,
             use_time_range: false,
             ranking: RankingMode::Relevance,
-            judgments: vec![
-                ("write-behind cache coherency issue under concurrent load", Highly),
-            ],
+            judgments: vec![(
+                "write-behind cache coherency issue under concurrent load",
+                Highly,
+            )],
             min_ndcg5: 0.6,
             min_mrr: 1.0,
             min_p3: 0.33,
@@ -700,14 +766,13 @@ fn seed_corpus() -> SeededCorpus {
 
             let mut agent_map = HashMap::new();
             for name in &sender_names {
-                let agent = match queries::register_agent(
-                    &cx, &p, pid, name, "bench", "test", None, None,
-                )
-                .await
-                {
-                    Outcome::Ok(r) => r,
-                    other => panic!("register_agent({name}) failed: {other:?}"),
-                };
+                let agent =
+                    match queries::register_agent(&cx, &p, pid, name, "bench", "test", None, None)
+                        .await
+                    {
+                        Outcome::Ok(r) => r,
+                        other => panic!("register_agent({name}) failed: {other:?}"),
+                    };
                 agent_map.insert(name.to_string(), agent.id.unwrap());
             }
 
@@ -838,7 +903,10 @@ fn evaluate_query_with_engine(
     let response = block_on(move |cx| async move {
         match execute_search(&cx, &p, &query, &opts).await {
             Outcome::Ok(resp) => resp,
-            other => panic!("search({engine_label}) failed for '{}': {other:?}", bq.label),
+            other => panic!(
+                "search({engine_label}) failed for '{}': {other:?}",
+                bq.label
+            ),
         }
     });
 
@@ -863,10 +931,8 @@ fn score_response(
     engine_label: &str,
     method: &str,
 ) -> QueryMetrics {
-    let titles: Vec<(String, Option<f64>)> = results
-        .iter()
-        .map(|r| (r.title.clone(), r.score))
-        .collect();
+    let titles: Vec<(String, Option<f64>)> =
+        results.iter().map(|r| (r.title.clone(), r.score)).collect();
     score_titles(bq, &titles, engine_label, method)
 }
 
@@ -945,7 +1011,11 @@ fn generate_json_report(all_metrics: &[QueryMetrics]) -> String {
     let _ = writeln!(
         json,
         "  \"total_queries\": {},",
-        all_metrics.iter().map(|m| m.label).collect::<std::collections::HashSet<_>>().len()
+        all_metrics
+            .iter()
+            .map(|m| m.label)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
     );
     let _ = writeln!(
         json,
@@ -1127,8 +1197,7 @@ fn relevance_benchmark_mode_stratified() {
 
     for (engine, engine_label) in &engines {
         for bq in &queries {
-            let metrics =
-                evaluate_query_with_engine(&corpus, bq, engine.clone(), engine_label);
+            let metrics = evaluate_query_with_engine(&corpus, bq, engine.clone(), engine_label);
 
             if !metrics.pass {
                 let mut fail_msg = format!("[{}/{}] FAIL:", engine_label, bq.label);
@@ -1228,9 +1297,7 @@ fn relevance_regression_gate() {
 
     let mut gate_failures = Vec::new();
     if mean_ndcg5 < MIN_MEAN_NDCG5 {
-        gate_failures.push(format!(
-            "mean_NDCG@5 {mean_ndcg5:.3} < {MIN_MEAN_NDCG5:.3}"
-        ));
+        gate_failures.push(format!("mean_NDCG@5 {mean_ndcg5:.3} < {MIN_MEAN_NDCG5:.3}"));
     }
     if mean_mrr < MIN_MEAN_MRR {
         gate_failures.push(format!("mean_MRR {mean_mrr:.3} < {MIN_MEAN_MRR:.3}"));
@@ -1242,16 +1309,11 @@ fn relevance_regression_gate() {
         gate_failures.push(format!("mean_R@5 {mean_r5:.3} < {MIN_MEAN_R5:.3}"));
     }
     if pass_rate < MIN_PASS_RATE {
-        gate_failures.push(format!(
-            "pass_rate {pass_rate:.3} < {MIN_PASS_RATE:.3}"
-        ));
+        gate_failures.push(format!("pass_rate {pass_rate:.3} < {MIN_PASS_RATE:.3}"));
     }
 
     if !gate_failures.is_empty() {
-        panic!(
-            "Regression gate FAILED:\n{}",
-            gate_failures.join("\n")
-        );
+        panic!("Regression gate FAILED:\n{}", gate_failures.join("\n"));
     }
 }
 
@@ -1294,7 +1356,10 @@ fn metric_ndcg_perfect() {
     let ranked = vec![3.0, 2.0, 1.0, 0.0];
     let ideal = vec![3.0, 2.0, 1.0, 0.0];
     let score = ndcg_at_k(&ranked, &ideal, 4);
-    assert!((score - 1.0).abs() < 1e-9, "perfect NDCG should be 1.0, got {score}");
+    assert!(
+        (score - 1.0).abs() < 1e-9,
+        "perfect NDCG should be 1.0, got {score}"
+    );
 }
 
 #[test]

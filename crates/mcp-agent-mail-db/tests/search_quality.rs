@@ -16,19 +16,27 @@
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
+use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::search_planner::{DocKind, Importance, RankingMode, SearchQuery};
-use mcp_agent_mail_db::search_service::execute_search_simple;
+use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
+use mcp_agent_mail_db::search_v3;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tantivy::doc;
 
 // ────────────────────────────────────────────────────────────────────
 // Test infrastructure
 // ────────────────────────────────────────────────────────────────────
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+const BR_BEAD_ID: &str = "br-2tnl.7.4";
+const CORPUS_VERSION: &str = "1.0.0";
+const QUERY_SET_VERSION: &str = "1.0.0";
 
 fn unique_suffix() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -163,13 +171,123 @@ fn recall_at_k(ranked_relevances: &[f64], total_relevant: usize, k: usize) -> f6
 /// Quality report for a single query.
 #[derive(Debug)]
 struct QueryReport {
+    mode: SearchQualityMode,
     label: &'static str,
     ndcg5: f64,
     mrr: f64,
     precision3: f64,
     recall5: f64,
     result_count: usize,
+    method: String,
+    rerank_outcome: Option<String>,
+    top_results: Vec<String>,
     ranking_explanation: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SearchQualityMode {
+    Legacy,
+    Lexical,
+    Semantic,
+    Hybrid,
+    HybridRerank,
+}
+
+impl SearchQualityMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+            Self::HybridRerank => "hybrid_rerank",
+        }
+    }
+
+    const fn engine(self) -> SearchEngine {
+        match self {
+            Self::Legacy => SearchEngine::Legacy,
+            Self::Lexical => SearchEngine::Lexical,
+            Self::Semantic => SearchEngine::Semantic,
+            Self::Hybrid | Self::HybridRerank => SearchEngine::Hybrid,
+        }
+    }
+
+    const fn threshold_multiplier(self) -> f64 {
+        match self {
+            Self::Legacy => 1.0,
+            Self::Lexical | Self::Hybrid => 0.8,
+            Self::Semantic => 0.7,
+            Self::HybridRerank => 0.75,
+        }
+    }
+
+    const fn aggregate_min_ndcg5(self) -> f64 {
+        match self {
+            Self::Legacy => 0.60,
+            Self::Lexical | Self::Hybrid => 0.45,
+            Self::Semantic | Self::HybridRerank => 0.40,
+        }
+    }
+
+    const fn aggregate_min_mrr(self) -> f64 {
+        match self {
+            Self::Legacy => 0.55,
+            Self::Lexical | Self::Hybrid => 0.40,
+            Self::Semantic | Self::HybridRerank => 0.35,
+        }
+    }
+
+    const fn aggregate_min_recall5(self) -> f64 {
+        match self {
+            Self::Legacy => 0.50,
+            Self::Lexical | Self::Hybrid => 0.35,
+            Self::Semantic | Self::HybridRerank => 0.30,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct QueryModeArtifact {
+    mode: SearchQualityMode,
+    requested_engine: String,
+    query_label: &'static str,
+    query_text: &'static str,
+    ndcg5: f64,
+    mrr: f64,
+    precision3: f64,
+    recall5: f64,
+    result_count: usize,
+    min_ndcg5: f64,
+    min_precision3: f64,
+    method: String,
+    rerank_outcome: Option<String>,
+    top_results: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModeAggregateArtifact {
+    mode: SearchQualityMode,
+    requested_engine: String,
+    queries: usize,
+    mean_ndcg5: f64,
+    mean_mrr: f64,
+    mean_precision3: f64,
+    mean_recall5: f64,
+    min_ndcg5_threshold: f64,
+    min_mrr_threshold: f64,
+    min_recall5_threshold: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchQualityArtifact {
+    generated_at: String,
+    bead: &'static str,
+    corpus_version: &'static str,
+    query_set_version: &'static str,
+    mode_reports: Vec<QueryModeArtifact>,
+    mode_aggregates: Vec<ModeAggregateArtifact>,
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -662,6 +780,64 @@ struct SeededCorpus {
     _dir: tempfile::TempDir,
 }
 
+fn ensure_v3_tantivy_index(corpus: &SeededCorpus) {
+    let index_dir = std::env::temp_dir().join(format!(
+        "am_search_quality_v3_index_{}_{}",
+        unique_suffix(),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&index_dir).expect("create Tantivy index directory");
+    search_v3::init_bridge(Path::new(&index_dir)).expect("init Tantivy bridge");
+
+    let bridge = search_v3::get_bridge().expect("Tantivy bridge initialized");
+    let handles = bridge.handles();
+    let project_id = u64::try_from(corpus.project_id).expect("project_id should be non-negative");
+    let mut writer = bridge
+        .index()
+        .writer(64_000_000)
+        .expect("create Tantivy writer");
+
+    let base_ts = mcp_agent_mail_db::now_micros();
+    for (idx, msg) in corpus_v1().iter().enumerate() {
+        let row_id = *corpus
+            .message_ids
+            .get(msg.subject)
+            .unwrap_or_else(|| panic!("missing seeded id for subject: {}", msg.subject));
+        let doc_id = u64::try_from(row_id).expect("message id should be non-negative");
+        let created_ts = base_ts + i64::try_from(idx).expect("idx fits i64");
+
+        writer
+            .add_document(doc!(
+                handles.id => doc_id,
+                handles.doc_kind => "message",
+                handles.subject => msg.subject,
+                handles.body => msg.body,
+                handles.sender => msg.sender_name,
+                handles.project_slug => "bench-search-quality",
+                handles.project_id => project_id,
+                handles.thread_id => msg.thread_id.unwrap_or(""),
+                handles.importance => msg.importance,
+                handles.created_ts => created_ts
+            ))
+            .expect("add Tantivy benchmark doc");
+    }
+
+    writer.commit().expect("commit Tantivy benchmark index");
+}
+
+fn facet_value(
+    explain: Option<&mcp_agent_mail_db::search_planner::QueryExplain>,
+    facet_key: &str,
+) -> Option<String> {
+    explain.and_then(|meta| {
+        meta.facets_applied.iter().find_map(|facet| {
+            facet
+                .strip_prefix(&format!("{facet_key}:"))
+                .map(str::to_string)
+        })
+    })
+}
+
 fn seed_corpus() -> SeededCorpus {
     let (pool, dir) = make_pool();
     let corpus = corpus_v1();
@@ -747,13 +923,23 @@ fn seed_corpus() -> SeededCorpus {
 // Query execution + evaluation
 // ────────────────────────────────────────────────────────────────────
 
-fn evaluate_query(corpus: &SeededCorpus, bq: &BenchmarkQuery) -> QueryReport {
+type QueryEvalOutput = (
+    Vec<String>,
+    Option<mcp_agent_mail_db::search_planner::QueryExplain>,
+    Vec<(String, Option<f64>)>,
+);
+
+fn evaluate_query_with_mode(
+    corpus: &SeededCorpus,
+    bq: &BenchmarkQuery,
+    mode: SearchQualityMode,
+) -> QueryReport {
     let p = corpus.pool.clone();
     let pid = corpus.project_id;
     let text = bq.text.to_string();
     let importance = bq.importance.clone();
 
-    let results = block_on(move |cx| async move {
+    let (ranked_titles, explain_meta, scored_rows): QueryEvalOutput = block_on(move |cx| async move {
         let mut query = SearchQuery {
             text,
             doc_kind: DocKind::Message,
@@ -764,12 +950,42 @@ fn evaluate_query(corpus: &SeededCorpus, bq: &BenchmarkQuery) -> QueryReport {
             ranking: RankingMode::Relevance,
             ..SearchQuery::default()
         };
-        // Ensure we get enough results for evaluation.
         query.limit = Some(20);
 
-        match execute_search_simple(&cx, &p, &query).await {
-            Outcome::Ok(resp) => resp,
-            other => panic!("search failed for '{}': {other:?}", bq.label),
+        if mode == SearchQualityMode::Legacy {
+            let resp = match execute_search_simple(&cx, &p, &query).await {
+                Outcome::Ok(resp) => resp,
+                other => panic!("search failed for '{}': {other:?}", bq.label),
+            };
+            let titles = resp.results.iter().map(|r| r.title.clone()).collect();
+            let rows = resp
+                .results
+                .iter()
+                .map(|r| (r.title.clone(), r.score))
+                .collect();
+            (titles, resp.explain, rows)
+        } else {
+            let opts = SearchOptions {
+                scope_ctx: None,
+                redaction_policy: None,
+                track_telemetry: false,
+                search_engine: Some(mode.engine()),
+            };
+            let resp = match execute_search(&cx, &p, &query, &opts).await {
+                Outcome::Ok(resp) => resp,
+                other => panic!("v3 search failed for '{}': {other:?}", bq.label),
+            };
+            let titles = resp
+                .results
+                .iter()
+                .map(|r| r.result.title.clone())
+                .collect::<Vec<_>>();
+            let rows = resp
+                .results
+                .iter()
+                .map(|r| (r.result.title.clone(), r.result.score))
+                .collect::<Vec<_>>();
+            (titles, resp.explain, rows)
         }
     });
 
@@ -777,12 +993,11 @@ fn evaluate_query(corpus: &SeededCorpus, bq: &BenchmarkQuery) -> QueryReport {
     let judgment_map: HashMap<&str, Relevance> = bq.judgments.iter().copied().collect();
 
     // Map result titles to relevance scores.
-    let ranked_relevances: Vec<f64> = results
-        .results
+    let ranked_relevances: Vec<f64> = ranked_titles
         .iter()
         .map(|r| {
             judgment_map
-                .get(r.title.as_str())
+                .get(r.as_str())
                 .copied()
                 .unwrap_or(Relevance::NotRelevant)
                 .gain()
@@ -806,44 +1021,61 @@ fn evaluate_query(corpus: &SeededCorpus, bq: &BenchmarkQuery) -> QueryReport {
 
     // Build explanation.
     let mut explanation = format!(
-        "Query: '{}'\nResults returned: {}\n",
+        "Mode: {} (requested engine: {})\nQuery: '{}'\nResults returned: {}\n",
+        mode.label(),
+        mode.engine(),
         bq.text,
-        results.results.len()
+        ranked_titles.len()
     );
 
-    if let Some(ref explain) = results.explain {
+    if let Some(ref explain) = explain_meta {
         let _ = writeln!(explanation, "Method: {:?}", explain.method);
         if let Some(ref normalized) = explain.normalized_query {
             let _ = writeln!(explanation, "Normalized: {normalized}");
         }
+        if let Some(rerank_outcome) = facet_value(Some(explain), "rerank_outcome") {
+            let _ = writeln!(explanation, "Rerank outcome: {rerank_outcome}");
+        }
     }
 
     explanation.push_str("Ranking:\n");
-    for (i, r) in results.results.iter().take(5).enumerate() {
+    for (i, (title, score)) in scored_rows.iter().take(5).enumerate() {
         let rel = judgment_map
-            .get(r.title.as_str())
+            .get(title.as_str())
             .copied()
             .unwrap_or(Relevance::NotRelevant);
-        let score_str = r
-            .score
-            .map_or_else(|| "n/a".to_owned(), |s| format!("{s:.4}"));
+        let score_str = score.map_or_else(|| "n/a".to_owned(), |s| format!("{s:.4}"));
         let _ = writeln!(
             explanation,
             "  #{}: [score={score_str}] [rel={rel:?}] {}",
             i + 1,
-            r.title
+            title
         );
     }
 
     QueryReport {
+        mode,
         label: bq.label,
         ndcg5,
         mrr: mrr_val,
         precision3,
         recall5,
-        result_count: results.results.len(),
+        result_count: ranked_titles.len(),
+        method: explain_meta
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |meta| meta.method.clone()),
+        rerank_outcome: facet_value(explain_meta.as_ref(), "rerank_outcome"),
+        top_results: scored_rows
+            .iter()
+            .take(5)
+            .map(|(title, _)| title.clone())
+            .collect(),
         ranking_explanation: explanation,
     }
+}
+
+fn evaluate_query(corpus: &SeededCorpus, bq: &BenchmarkQuery) -> QueryReport {
+    evaluate_query_with_mode(corpus, bq, SearchQualityMode::Legacy)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -909,6 +1141,158 @@ fn search_quality_benchmark_full() {
              See ranking explanations above for debugging.",
             failures.len(),
             queries.len()
+        );
+    }
+}
+
+fn save_search_quality_artifact(artifact: &SearchQualityArtifact) {
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("repo root")
+        .join(format!(
+            "tests/artifacts/search_quality/{ts}_{}",
+            std::process::id()
+        ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("report.json");
+    let json = serde_json::to_string_pretty(artifact).unwrap_or_default();
+    let _ = std::fs::write(&path, json);
+    eprintln!("search quality artifact: {}", path.display());
+}
+
+/// Multi-mode quality harness for Search V3 gates.
+///
+/// Produces machine-readable per-query/per-mode metrics and validates baseline
+/// quality floors for lexical/semantic/hybrid (plus hybrid+rerkank diagnostics).
+#[test]
+fn search_quality_multimode_harness() {
+    let corpus = seed_corpus();
+    ensure_v3_tantivy_index(&corpus);
+    let queries = queries_v1();
+    let modes = [
+        SearchQualityMode::Legacy,
+        SearchQualityMode::Lexical,
+        SearchQualityMode::Semantic,
+        SearchQualityMode::Hybrid,
+        SearchQualityMode::HybridRerank,
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut mode_reports: Vec<QueryModeArtifact> = Vec::new();
+    let mut mode_aggregates: Vec<ModeAggregateArtifact> = Vec::new();
+
+    for mode in modes {
+        let mut reports_for_mode = Vec::new();
+
+        for query in &queries {
+            let report = evaluate_query_with_mode(&corpus, query, mode);
+            let scaled_ndcg5 = (query.min_ndcg5 * mode.threshold_multiplier()).clamp(0.0, 1.0);
+            let scaled_p3 = (query.min_precision3 * mode.threshold_multiplier()).clamp(0.0, 1.0);
+
+            if report.ndcg5 < scaled_ndcg5 {
+                failures.push(format!(
+                    "[{}/{}] NDCG@5={:.3} < {:.3}\n{}",
+                    mode.label(),
+                    query.label,
+                    report.ndcg5,
+                    scaled_ndcg5,
+                    report.ranking_explanation
+                ));
+            }
+            if report.precision3 < scaled_p3 {
+                failures.push(format!(
+                    "[{}/{}] P@3={:.3} < {:.3}\n{}",
+                    mode.label(),
+                    query.label,
+                    report.precision3,
+                    scaled_p3,
+                    report.ranking_explanation
+                ));
+            }
+
+            mode_reports.push(QueryModeArtifact {
+                mode: report.mode,
+                requested_engine: mode.engine().to_string(),
+                query_label: query.label,
+                query_text: query.text,
+                ndcg5: report.ndcg5,
+                mrr: report.mrr,
+                precision3: report.precision3,
+                recall5: report.recall5,
+                result_count: report.result_count,
+                min_ndcg5: scaled_ndcg5,
+                min_precision3: scaled_p3,
+                method: report.method.clone(),
+                rerank_outcome: report.rerank_outcome.clone(),
+                top_results: report.top_results.clone(),
+            });
+
+            reports_for_mode.push(report);
+        }
+
+        let divisor = reports_for_mode.len().max(1) as f64;
+        let mean_ndcg5 = reports_for_mode.iter().map(|r| r.ndcg5).sum::<f64>() / divisor;
+        let mean_mrr = reports_for_mode.iter().map(|r| r.mrr).sum::<f64>() / divisor;
+        let mean_precision3 = reports_for_mode.iter().map(|r| r.precision3).sum::<f64>() / divisor;
+        let mean_recall5 = reports_for_mode.iter().map(|r| r.recall5).sum::<f64>() / divisor;
+
+        if mean_ndcg5 < mode.aggregate_min_ndcg5() {
+            failures.push(format!(
+                "[{}] mean_NDCG@5={:.3} < {:.3}",
+                mode.label(),
+                mean_ndcg5,
+                mode.aggregate_min_ndcg5()
+            ));
+        }
+        if mean_mrr < mode.aggregate_min_mrr() {
+            failures.push(format!(
+                "[{}] mean_MRR={:.3} < {:.3}",
+                mode.label(),
+                mean_mrr,
+                mode.aggregate_min_mrr()
+            ));
+        }
+        if mean_recall5 < mode.aggregate_min_recall5() {
+            failures.push(format!(
+                "[{}] mean_Recall@5={:.3} < {:.3}",
+                mode.label(),
+                mean_recall5,
+                mode.aggregate_min_recall5()
+            ));
+        }
+
+        mode_aggregates.push(ModeAggregateArtifact {
+            mode,
+            requested_engine: mode.engine().to_string(),
+            queries: reports_for_mode.len(),
+            mean_ndcg5,
+            mean_mrr,
+            mean_precision3,
+            mean_recall5,
+            min_ndcg5_threshold: mode.aggregate_min_ndcg5(),
+            min_mrr_threshold: mode.aggregate_min_mrr(),
+            min_recall5_threshold: mode.aggregate_min_recall5(),
+        });
+    }
+
+    let artifact = SearchQualityArtifact {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        bead: BR_BEAD_ID,
+        corpus_version: CORPUS_VERSION,
+        query_set_version: QUERY_SET_VERSION,
+        mode_reports,
+        mode_aggregates,
+    };
+    save_search_quality_artifact(&artifact);
+
+    if !failures.is_empty() {
+        let joined = failures.join("\n\n");
+        panic!(
+            "search quality multimode regressions ({}):\n{}",
+            failures.len(),
+            joined
         );
     }
 }
