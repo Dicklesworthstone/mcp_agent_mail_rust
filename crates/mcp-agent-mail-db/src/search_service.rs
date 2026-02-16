@@ -2080,7 +2080,9 @@ pub async fn execute_search(
     options: &SearchOptions,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
-    let engine = options.search_engine.unwrap_or_default();
+    let engine = options
+        .search_engine
+        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
     let assistance = query_assistance_payload(query);
 
     // ── Tantivy-only fast path ──────────────────────────────────────

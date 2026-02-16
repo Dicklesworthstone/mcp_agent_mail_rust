@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use crate::pattern_overlap::CompiledPattern;
+use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
 /// Metadata from a reservation row needed for conflict reporting.
 #[derive(Debug, Clone)]

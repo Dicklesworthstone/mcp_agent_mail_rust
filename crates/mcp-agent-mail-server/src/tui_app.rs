@@ -13,11 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ftui::Frame;
 use ftui::layout::Rect;
+use ftui::render::frame::HitId;
 use ftui::text::display_width;
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
 use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
+use ftui::widgets::inspector::{InspectorState, WidgetInfo};
 use ftui::widgets::modal::{Dialog, DialogResult, DialogState};
 use ftui::widgets::notification_queue::NotificationStack;
 use ftui::widgets::paragraph::Paragraph;
@@ -45,8 +47,8 @@ use crate::tui_screens::{
     timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
-/// How often the TUI ticks (100 ms ≈ 10 fps).
-const TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the TUI ticks (16 ms ≈ 60 fps).
+const TICK_INTERVAL: Duration = Duration::from_millis(16);
 
 const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
@@ -60,8 +62,8 @@ const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
 const PALETTE_DB_CACHE_TTL_MICROS: i64 = 5 * 1_000_000;
 const PALETTE_USAGE_HALF_LIFE_MICROS: i64 = 60 * 60 * 1_000_000;
 const SCREEN_TRANSITION_TICKS: u8 = 4;
-const TOAST_ENTRANCE_TICKS: u8 = 4;
-const TOAST_EXIT_TICKS: u8 = 3;
+const TOAST_ENTRANCE_TICKS: u8 = 20;
+const TOAST_EXIT_TICKS: u8 = 15;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
@@ -582,6 +584,8 @@ pub enum OverlayLayer {
     Palette = 6,
     /// Help overlay (z=6, topmost render). Traps Esc/j/k only.
     Help = 7,
+    /// Debug inspector overlay (z=7, topmost). Traps keyboard/mouse.
+    Inspector = 8,
 }
 
 impl OverlayLayer {
@@ -591,9 +595,24 @@ impl OverlayLayer {
     pub const fn traps_focus(self) -> bool {
         matches!(
             self,
-            Self::Palette | Self::Modal | Self::ActionMenu | Self::ToastFocus | Self::MacroPlayback
+            Self::Palette
+                | Self::Modal
+                | Self::ActionMenu
+                | Self::ToastFocus
+                | Self::MacroPlayback
+                | Self::Inspector
         )
     }
+}
+
+#[derive(Debug, Clone)]
+struct InspectorTreeRow {
+    label: String,
+    name: String,
+    depth: u8,
+    area: Rect,
+    hit_id: Option<HitId>,
+    render_time_us: Option<u64>,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -921,6 +940,14 @@ pub struct MailAppModel {
     quit_confirm_armed_at: Option<Instant>,
     /// Input source that armed quit confirmation.
     quit_confirm_source: Option<QuitConfirmSource>,
+    /// Global widget-tree inspector state (debug-only; gated by `AM_TUI_DEBUG`).
+    inspector: InspectorState,
+    /// Flattened inspector tree size from the most recent frame.
+    inspector_last_tree_len: Cell<usize>,
+    /// Current tree cursor for inspector navigation.
+    inspector_selected_index: usize,
+    /// Whether the inspector properties panel is visible.
+    inspector_show_properties: bool,
 }
 
 impl MailAppModel {
@@ -996,6 +1023,10 @@ impl MailAppModel {
             internal_clipboard: None,
             quit_confirm_armed_at: None,
             quit_confirm_source: None,
+            inspector: InspectorState::new(),
+            inspector_last_tree_len: Cell::new(0),
+            inspector_selected_index: 0,
+            inspector_show_properties: false,
         }
     }
 
@@ -1791,6 +1822,169 @@ impl MailAppModel {
         self.palette_usage_dirty = true;
     }
 
+    fn inspector_enabled(&self) -> bool {
+        self.state.config_snapshot().tui_debug
+    }
+
+    fn toggle_inspector(&mut self) {
+        if !self.inspector_enabled() {
+            return;
+        }
+        self.inspector.toggle();
+        if self.inspector.is_active() {
+            self.inspector_selected_index = 0;
+            self.inspector_show_properties = false;
+        }
+    }
+
+    fn is_inspector_toggle_key(key: &ftui::KeyEvent) -> bool {
+        matches!(key.code, KeyCode::F(12))
+            || (matches!(key.code, KeyCode::Char('i' | 'I'))
+                && key.modifiers.contains(Modifiers::CTRL)
+                && key.modifiers.contains(Modifiers::SHIFT))
+    }
+
+    fn move_inspector_selection(&mut self, delta: isize) {
+        let len = self.inspector_last_tree_len.get();
+        if len == 0 {
+            self.inspector_selected_index = 0;
+            return;
+        }
+        let current = self.inspector_selected_index.min(len - 1) as isize;
+        let max = (len - 1) as isize;
+        let next = (current + delta).clamp(0, max);
+        self.inspector_selected_index = usize::try_from(next).unwrap_or(0);
+    }
+
+    fn handle_inspector_event(&mut self, event: &Event) -> bool {
+        if !self.inspector.is_active() {
+            return false;
+        }
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                match key.code {
+                    KeyCode::Escape | KeyCode::F(12) => {
+                        self.inspector.toggle();
+                    }
+                    KeyCode::Up | KeyCode::Left => {
+                        self.move_inspector_selection(-1);
+                    }
+                    KeyCode::Down | KeyCode::Right => {
+                        self.move_inspector_selection(1);
+                    }
+                    KeyCode::Enter => {
+                        self.inspector_show_properties = !self.inspector_show_properties;
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Event::Mouse(_) => true,
+            _ => false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_inspector_widget_tree(
+        &self,
+        area: Rect,
+        chrome: crate::tui_chrome::ChromeAreas,
+        active_screen: MailScreenId,
+        tab_render_us: u64,
+        content_render_us: u64,
+        status_render_us: u64,
+        toast_render_us: u64,
+        action_menu_render_us: u64,
+        modal_render_us: u64,
+        palette_render_us: u64,
+        help_render_us: u64,
+    ) -> WidgetInfo {
+        let mut root = WidgetInfo::new("MailApp", area).with_depth(0);
+        root.render_time_us = Some(
+            tab_render_us
+                .saturating_add(content_render_us)
+                .saturating_add(status_render_us)
+                .saturating_add(toast_render_us)
+                .saturating_add(action_menu_render_us)
+                .saturating_add(modal_render_us)
+                .saturating_add(palette_render_us)
+                .saturating_add(help_render_us),
+        );
+
+        let mut tab_bar = WidgetInfo::new("TabBar", chrome.tab_bar).with_depth(1);
+        tab_bar.render_time_us = Some(tab_render_us);
+        for (i, meta) in crate::tui_screens::MAIL_SCREEN_REGISTRY.iter().enumerate() {
+            if let Some(slot) = self.mouse_dispatcher.tab_slot(i) {
+                let width = slot.1.saturating_sub(slot.0);
+                if width == 0 {
+                    continue;
+                }
+                let tab_rect = Rect::new(slot.0, slot.2, width, 1);
+                let child = WidgetInfo::new(format!("Tab {}", meta.short_label), tab_rect)
+                    .with_depth(2)
+                    .with_hit_id(crate::tui_hit_regions::tab_hit_id(meta.id));
+                tab_bar.add_child(child);
+            }
+        }
+        root.add_child(tab_bar);
+
+        let mut content = WidgetInfo::new(
+            format!(
+                "Screen {}",
+                crate::tui_screens::screen_meta(active_screen).short_label
+            ),
+            chrome.content,
+        )
+        .with_depth(1)
+        .with_hit_id(crate::tui_hit_regions::pane_hit_id(active_screen));
+        content.render_time_us = Some(content_render_us);
+        root.add_child(content);
+
+        let mut status = WidgetInfo::new("StatusLine", chrome.status_line).with_depth(1);
+        status.render_time_us = Some(status_render_us);
+        root.add_child(status);
+
+        if self.notifications.visible_count() > 0 {
+            let mut toasts = WidgetInfo::new("Toasts", area).with_depth(1);
+            toasts.render_time_us = Some(toast_render_us);
+            root.add_child(toasts);
+        }
+
+        if self.action_menu.is_active() {
+            let mut action_menu = WidgetInfo::new("ActionMenu", area).with_depth(1);
+            action_menu.render_time_us = Some(action_menu_render_us);
+            root.add_child(action_menu);
+        }
+
+        if self.modal_manager.is_active() {
+            let mut modal = WidgetInfo::new("Modal", area).with_depth(1);
+            modal.render_time_us = Some(modal_render_us);
+            root.add_child(modal);
+        }
+
+        if self.command_palette.is_visible() {
+            let mut palette = WidgetInfo::new("CommandPalette", area).with_depth(1);
+            palette.render_time_us = Some(palette_render_us);
+            root.add_child(palette);
+        }
+
+        if self.help_visible {
+            let mut help =
+                WidgetInfo::new("HelpOverlay", crate::tui_chrome::help_overlay_rect(area))
+                    .with_depth(1);
+            help.render_time_us = Some(help_render_us);
+            root.add_child(help);
+        }
+
+        let inspector_overlay = WidgetInfo::new(
+            "InspectorOverlay",
+            crate::tui_chrome::inspector_overlay_rect(area),
+        )
+        .with_depth(1);
+        root.add_child(inspector_overlay);
+        root
+    }
+
     // ── Overlay stack query ──────────────────────────────────────
 
     /// Returns the topmost active overlay in the stack.
@@ -1801,6 +1995,9 @@ impl MailAppModel {
     #[must_use]
     pub fn topmost_overlay(&self) -> OverlayLayer {
         // Check in *event-routing* order (highest precedence first).
+        if self.inspector.is_active() {
+            return OverlayLayer::Inspector;
+        }
         if self.command_palette.is_visible() {
             return OverlayLayer::Palette;
         }
@@ -2568,6 +2765,19 @@ impl Model for MailAppModel {
                     self.resize_detected.set(true);
                 }
 
+                if let Event::Key(key) = event {
+                    if key.kind == KeyEventKind::Press && Self::is_inspector_toggle_key(key) {
+                        if self.inspector_enabled() {
+                            self.toggle_inspector();
+                        }
+                        return Cmd::none();
+                    }
+                }
+
+                if self.handle_inspector_event(event) {
+                    return Cmd::none();
+                }
+
                 // Overlay focus trapping: topmost-first precedence.
                 // See `OverlayLayer` for the formal z-order contract.
                 //
@@ -2966,10 +3176,9 @@ impl Model for MailAppModel {
         // positive when on schedule and drops toward 0 only when frames are
         // arriving significantly late (2× the expected interval or more).
         //
-        // BUG FIX: The original code used a 16ms (60fps) target, but the TUI
-        // ticks at 100ms (10fps). Every frame had budget=0, triggering the
-        // Bayesian "degraded" state and deferring (skipping) nearly every
-        // frame — producing blank/flashing screens.
+        // Note: TICK_INTERVAL is set to 16ms (60fps) to ensure smooth animations
+        // and responsive input handling. The Bayesian diff strategy uses this
+        // budget to decide whether to skip frames under load.
         let tick_budget_ms = TICK_INTERVAL.as_secs_f64() * 1000.0;
         let now = Instant::now();
         let budget_remaining_ms = self.last_view_instant.get().map_or(tick_budget_ms, |prev| {
@@ -3020,9 +3229,24 @@ impl Model for MailAppModel {
         self.mouse_dispatcher
             .update_chrome_areas(chrome.tab_bar, chrome.status_line);
 
+        let mut tab_render_us = 0_u64;
+        let mut content_render_us = 0_u64;
+        let mut status_render_us = 0_u64;
+        let mut toast_render_us = 0_u64;
+        let mut action_menu_render_us = 0_u64;
+        let mut modal_render_us = 0_u64;
+        let mut palette_render_us = 0_u64;
+        let mut help_render_us = 0_u64;
+
         // 1. Tab bar (z=1)
         let effects_enabled = self.state.config_snapshot().tui_effects;
+        let tab_started = Instant::now();
         tui_chrome::render_tab_bar(active_screen, effects_enabled, frame, chrome.tab_bar);
+        tab_render_us = tab_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
 
         // Record per-tab hit slots for mouse dispatch.
         tui_chrome::record_tab_hit_slots(chrome.tab_bar, &self.mouse_dispatcher);
@@ -3036,6 +3260,7 @@ impl Model for MailAppModel {
         }
 
         // 2. Screen content (z=2)
+        let content_started = Instant::now();
         if self.screen_panics.borrow().contains_key(&active_screen) {
             let msg = self
                 .screen_panics
@@ -3054,6 +3279,11 @@ impl Model for MailAppModel {
                 self.screen_panics.borrow_mut().insert(active_screen, msg);
             }
         }
+        content_render_us = content_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
         if active_screen != MailScreenId::Dashboard {
             if let Some(focused_rect) = self.focused_panel_rect(chrome.content) {
                 render_panel_focus_outline(focused_rect, frame);
@@ -3076,6 +3306,7 @@ impl Model for MailAppModel {
             .unwrap_or_default();
 
         // 3. Status line (z=3)
+        let status_started = Instant::now();
         tui_chrome::render_status_line(
             &self.state,
             active_screen,
@@ -3087,8 +3318,14 @@ impl Model for MailAppModel {
             frame,
             chrome.status_line,
         );
+        status_render_us = status_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
 
         // 4. Toast notifications (z=4, overlay)
+        let toast_started = Instant::now();
         let reduced_motion = toast_reduced_motion_enabled(&self.accessibility);
         if reduced_motion {
             NotificationStack::new(&self.notifications)
@@ -3108,24 +3345,48 @@ impl Model for MailAppModel {
                 frame,
             );
         }
+        toast_render_us = toast_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
 
         // 4b. Action menu (z=4.3, contextual per-item actions)
         if self.action_menu.is_active() {
+            let action_menu_started = Instant::now();
             self.action_menu.render(area, frame);
+            action_menu_render_us = action_menu_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
         }
 
         // 4c. Modal dialogs (z=4.5, between toasts and command palette)
         if self.modal_manager.is_active() {
+            let modal_started = Instant::now();
             self.modal_manager.render(area, frame);
+            modal_render_us = modal_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
         }
 
         // 5. Command palette (z=5, modal)
         if self.command_palette.is_visible() {
+            let palette_started = Instant::now();
             self.command_palette.render(area, frame);
+            palette_render_us = palette_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
         }
 
         // 6. Help overlay (z=6, topmost)
         if self.help_visible {
+            let help_started = Instant::now();
             let screen_label = crate::tui_screens::screen_meta(active_screen).title;
             let screen_tip = self
                 .screen_manager
@@ -3135,6 +3396,73 @@ impl Model for MailAppModel {
                 .keymap
                 .contextual_help(&screen_bindings, screen_label, screen_tip);
             tui_chrome::render_help_overlay_sections(&sections, self.help_scroll, frame, area);
+            help_render_us = help_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
+        }
+
+        // 7. Debug inspector overlay (z=7, topmost; gated by AM_TUI_DEBUG)
+        if self.inspector.is_active() {
+            let tree = self.build_inspector_widget_tree(
+                area,
+                chrome,
+                active_screen,
+                tab_render_us,
+                content_render_us,
+                status_render_us,
+                toast_render_us,
+                action_menu_render_us,
+                modal_render_us,
+                palette_render_us,
+                help_render_us,
+            );
+            let mut rows = Vec::new();
+            flatten_inspector_rows(&tree, &mut rows);
+            self.inspector_last_tree_len.set(rows.len());
+
+            let selected_idx = if rows.is_empty() {
+                0
+            } else {
+                self.inspector_selected_index
+                    .min(rows.len().saturating_sub(1))
+            };
+            let selected_row = rows.get(selected_idx);
+            let selected_area = selected_row.map(|row| row.area);
+            let tree_lines = rows.iter().map(|row| row.label.clone()).collect::<Vec<_>>();
+
+            let properties = selected_row.map_or_else(Vec::new, |row| {
+                let mut props = vec![
+                    format!("Name: {}", row.name),
+                    format!("Depth: {}", row.depth),
+                    format!(
+                        "Rect: x={} y={} w={} h={}",
+                        row.area.x, row.area.y, row.area.width, row.area.height
+                    ),
+                ];
+                if let Some(hit_id) = row.hit_id {
+                    props.push(format!("HitId: {}", hit_id.id()));
+                } else {
+                    props.push("HitId: (none)".to_string());
+                }
+                if let Some(render_us) = row.render_time_us {
+                    props.push(format!("Render: {render_us}us"));
+                } else {
+                    props.push("Render: (n/a)".to_string());
+                }
+                props
+            });
+
+            tui_chrome::render_inspector_overlay(
+                frame,
+                area,
+                &tree_lines,
+                selected_idx,
+                selected_area,
+                &properties,
+                self.inspector_show_properties,
+            );
         }
     }
 }
@@ -3163,6 +3491,33 @@ fn map_screen_cmd(cmd: Cmd<MailScreenMsg>) -> Cmd<MailMsg> {
         Cmd::RestoreState => Cmd::restore_state(),
         Cmd::SetMouseCapture(b) => Cmd::set_mouse_capture(b),
         Cmd::Task(spec, f) => Cmd::Task(spec, Box::new(move || MailMsg::Screen(f()))),
+    }
+}
+
+fn flatten_inspector_rows(widget: &WidgetInfo, rows: &mut Vec<InspectorTreeRow>) {
+    let name = if widget.name.is_empty() {
+        "<unnamed>".to_string()
+    } else {
+        widget.name.clone()
+    };
+    let indent = "  ".repeat(widget.depth as usize);
+    let mut label = format!(
+        "{indent}{name} (x={} y={} w={} h={})",
+        widget.area.x, widget.area.y, widget.area.width, widget.area.height
+    );
+    if let Some(render_us) = widget.render_time_us {
+        label.push_str(&format!(" [{render_us}us]"));
+    }
+    rows.push(InspectorTreeRow {
+        label,
+        name,
+        depth: widget.depth,
+        area: widget.area,
+        hit_id: widget.hit_id,
+        render_time_us: widget.render_time_us,
+    });
+    for child in &widget.children {
+        flatten_inspector_rows(child, rows);
     }
 }
 
@@ -4688,6 +5043,15 @@ mod tests {
 
     fn test_model() -> MailAppModel {
         let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        MailAppModel::new(state)
+    }
+
+    fn test_model_with_debug(debug: bool) -> MailAppModel {
+        let config = Config {
+            tui_debug: debug,
+            ..Config::default()
+        };
         let state = TuiSharedState::new(&config);
         MailAppModel::new(state)
     }
@@ -8342,6 +8706,7 @@ mod tests {
     fn overlay_layer_ordering_matches_event_routing() {
         // The Ord implementation should match the event-routing precedence:
         // higher value = higher z-order in event routing.
+        assert!(OverlayLayer::Inspector > OverlayLayer::Palette);
         assert!(OverlayLayer::Palette > OverlayLayer::Modal);
         assert!(OverlayLayer::Modal > OverlayLayer::ActionMenu);
         assert!(OverlayLayer::ActionMenu > OverlayLayer::ToastFocus);
@@ -8351,6 +8716,7 @@ mod tests {
 
     #[test]
     fn overlay_layer_focus_trapping_contract() {
+        assert!(OverlayLayer::Inspector.traps_focus());
         assert!(OverlayLayer::Palette.traps_focus());
         assert!(OverlayLayer::Modal.traps_focus());
         assert!(OverlayLayer::ActionMenu.traps_focus());
@@ -8413,6 +8779,56 @@ mod tests {
         model.update(backtab);
         assert_eq!(model.screen_manager.active_screen(), before);
         assert!(model.help_visible);
+    }
+
+    #[test]
+    fn f12_is_noop_when_debug_disabled() {
+        let mut model = test_model_with_debug(false);
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::F(12)))));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(!model.inspector.is_active());
+        assert_eq!(model.topmost_overlay(), OverlayLayer::None);
+    }
+
+    #[test]
+    fn f12_toggles_inspector_when_debug_enabled() {
+        let mut model = test_model_with_debug(true);
+        assert!(!model.inspector.is_active());
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::F(12)))));
+        assert!(model.inspector.is_active());
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Inspector);
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::F(12)))));
+        assert!(!model.inspector.is_active());
+    }
+
+    #[test]
+    fn inspector_arrows_move_selection_enter_toggles_props_escape_dismisses() {
+        let mut model = test_model_with_debug(true);
+        model.inspector_last_tree_len.set(3);
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::F(12)))));
+        assert!(model.inspector.is_active());
+        assert_eq!(model.inspector_selected_index, 0);
+        assert!(!model.inspector_show_properties);
+
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Down))));
+        assert_eq!(model.inspector_selected_index, 1);
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Right))));
+        assert_eq!(model.inspector_selected_index, 2);
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Down))));
+        assert_eq!(model.inspector_selected_index, 2, "selection clamps at end");
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Up))));
+        assert_eq!(model.inspector_selected_index, 1);
+
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Enter))));
+        assert!(model.inspector_show_properties);
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Enter))));
+        assert!(!model.inspector_show_properties);
+
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Escape,
+        ))));
+        assert!(!model.inspector.is_active());
+        assert_ne!(model.topmost_overlay(), OverlayLayer::Inspector);
     }
 
     // ── Coach hint tests ─────────────────────────────────────────
@@ -8809,7 +9225,7 @@ mod tests {
 
     #[test]
     fn overlay_layer_ordering_values_increase() {
-        // OverlayLayer discriminants must increase from None to Help.
+        // OverlayLayer discriminants must increase from None to Inspector.
         let layers = [
             OverlayLayer::None,
             OverlayLayer::Toasts,
@@ -8819,6 +9235,7 @@ mod tests {
             OverlayLayer::Modal,
             OverlayLayer::Palette,
             OverlayLayer::Help,
+            OverlayLayer::Inspector,
         ];
         for i in 1..layers.len() {
             assert!(
@@ -8833,6 +9250,7 @@ mod tests {
     #[test]
     fn overlay_layer_focus_trapping_contracts() {
         // Layers that should trap focus (consume all events).
+        assert!(OverlayLayer::Inspector.traps_focus());
         assert!(OverlayLayer::Palette.traps_focus());
         assert!(OverlayLayer::Modal.traps_focus());
         assert!(OverlayLayer::ActionMenu.traps_focus());
@@ -8963,8 +9381,8 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────
 
     #[test]
-    fn overlay_layer_count_is_eight() {
-        // Verify all 8 layers exist (None through Help).
+    fn overlay_layer_count_is_nine() {
+        // Verify all layers exist (None through Inspector).
         let layers = [
             OverlayLayer::None,
             OverlayLayer::Toasts,
@@ -8974,22 +9392,23 @@ mod tests {
             OverlayLayer::Modal,
             OverlayLayer::Palette,
             OverlayLayer::Help,
+            OverlayLayer::Inspector,
         ];
-        assert_eq!(layers.len(), 8);
+        assert_eq!(layers.len(), 9);
         // Each has a unique discriminant.
         let mut values: Vec<u8> = layers.iter().map(|l| *l as u8).collect();
         values.sort_unstable();
         values.dedup();
         assert_eq!(
             values.len(),
-            8,
+            9,
             "all overlay layers must have unique u8 values"
         );
     }
 
     #[test]
-    fn help_is_topmost_z_order() {
-        // Help (z=7) must be higher than all other layers.
+    fn inspector_is_topmost_z_order() {
+        // Inspector (z=8) must be higher than all other layers.
         for layer in [
             OverlayLayer::None,
             OverlayLayer::Toasts,
@@ -8998,14 +9417,20 @@ mod tests {
             OverlayLayer::MacroPlayback,
             OverlayLayer::Modal,
             OverlayLayer::Palette,
+            OverlayLayer::Help,
         ] {
-            assert!(OverlayLayer::Help > layer, "Help must be > {layer:?}",);
+            assert!(
+                OverlayLayer::Inspector > layer,
+                "Inspector must be > {layer:?}",
+            );
         }
     }
 
     #[test]
     fn palette_above_modal_above_action_menu() {
-        // Verify full z-order chain: Help > Palette > Modal > MacroPlayback > ActionMenu > ToastFocus > Toasts > None
+        // Verify full z-order chain:
+        // Inspector > Help > Palette > Modal > MacroPlayback > ActionMenu > ToastFocus > Toasts > None
+        assert!(OverlayLayer::Inspector > OverlayLayer::Help);
         assert!(OverlayLayer::Help > OverlayLayer::Palette);
         assert!(OverlayLayer::Palette > OverlayLayer::Modal);
         assert!(OverlayLayer::Modal > OverlayLayer::MacroPlayback);

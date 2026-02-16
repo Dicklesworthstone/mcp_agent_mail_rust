@@ -10,6 +10,8 @@
 - [x] Update `mcp-agent-mail-cli` to pass configuration to `bundle_attachments`.
 - [x] Verify no regressions in `mcp-agent-mail-server` or `mcp-agent-mail-tools`.
 - [x] Fix logic divergence in `mcp-agent-mail-guard` generated Python hooks (glob matching & prefix checks).
+- [x] Fix git author misattribution in `mcp-agent-mail-storage` commit coalescer (batching logic).
+- [x] Unify `reply_message` logic with `send_message` (contact enforcement + auto-registration) in `mcp-agent-mail-tools`.
 
 ## Pending
 - None identified.
@@ -18,3 +20,5 @@
 - `run_shell_command` is unreliable (Signal 1/SIGHUP), so verification was performed via static analysis and code reading.
 - `bundle_attachments` signature change required updates in `cli` and `share` tests.
 - `mcp-agent-mail-guard` now generates Python hooks that strictly match Rust's glob behavior.
+- `mcp-agent-mail-storage` now guarantees single-author git commits even under high concurrency.
+- `mcp-agent-mail-tools` messaging tools now consistently enforce contact policies.

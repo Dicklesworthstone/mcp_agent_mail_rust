@@ -22,15 +22,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 
-use mcp_agent_mail_db::search_planner::{Importance, SearchQuery, ScopePolicy, TimeRange};
+use mcp_agent_mail_db::search_planner::{Importance, ScopePolicy, SearchQuery, TimeRange};
 use mcp_agent_mail_db::search_scope::{
-    ContactPolicyKind, RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopeReason,
-    ScopeVerdict, SenderPolicy, ViewerIdentity, evaluate_scope,
+    ContactPolicyKind, RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopeReason, ScopeVerdict,
+    SenderPolicy, ViewerIdentity, evaluate_scope,
 };
-use mcp_agent_mail_db::search_service::{
-    SearchOptions, ScopedSearchResponse, execute_search,
-};
-use mcp_agent_mail_db::{queries, DbPool, DbPoolConfig};
+use mcp_agent_mail_db::search_service::{ScopedSearchResponse, SearchOptions, execute_search};
+use mcp_agent_mail_db::{DbPool, DbPoolConfig, queries};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -86,10 +84,8 @@ fn seed_agent(pool: &DbPool, project_id: i64, name: &str) -> i64 {
         let pool = pool.clone();
         let name = name.to_string();
         async move {
-            match queries::register_agent(
-                &cx, &pool, project_id, &name, "test", "test", None, None,
-            )
-            .await
+            match queries::register_agent(&cx, &pool, project_id, &name, "test", "test", None, None)
+                .await
             {
                 Outcome::Ok(a) => a.id.expect("agent id"),
                 other => panic!("register_agent failed: {other:?}"),
@@ -185,13 +181,23 @@ fn explain_fts_correlation_fields() {
     let pid = seed_project(&pool, "exp-fts");
     let aid = seed_agent(&pool, pid, "RedFox");
 
-    create_msg(&pool, pid, aid, "explain fts test", "explain fts body", "normal", None);
+    create_msg(
+        &pool,
+        pid,
+        aid,
+        "explain fts test",
+        "explain fts body",
+        "normal",
+        None,
+    );
 
     let mut q = SearchQuery::messages("explain", pid);
     q.explain = true;
 
     let resp = scoped_search(&pool, &q, &SearchOptions::default());
-    let explain = resp.explain.expect("explain should be present when requested");
+    let explain = resp
+        .explain
+        .expect("explain should be present when requested");
 
     // Method should be populated
     assert!(
@@ -226,7 +232,15 @@ fn explain_facets_populated() {
     let pid = seed_project(&pool, "exp-facets");
     let aid = seed_agent(&pool, pid, "BlueLake");
 
-    create_msg(&pool, pid, aid, "faceted query msg", "faceted body", "high", Some("thread-1"));
+    create_msg(
+        &pool,
+        pid,
+        aid,
+        "faceted query msg",
+        "faceted body",
+        "high",
+        Some("thread-1"),
+    );
 
     let mut q = SearchQuery::messages("faceted", pid);
     q.importance = vec![Importance::High];
@@ -264,7 +278,15 @@ fn explain_date_range_facets() {
     let pid = seed_project(&pool, "exp-date");
     let aid = seed_agent(&pool, pid, "GreenHawk");
 
-    create_msg(&pool, pid, aid, "dateexplain msg", "dateexplain body", "normal", None);
+    create_msg(
+        &pool,
+        pid,
+        aid,
+        "dateexplain msg",
+        "dateexplain body",
+        "normal",
+        None,
+    );
 
     let now = mcp_agent_mail_db::now_micros();
     let mut q = SearchQuery::messages("dateexplain", pid);
@@ -293,7 +315,15 @@ fn no_explain_when_not_requested() {
     let pid = seed_project(&pool, "no-exp");
     let aid = seed_agent(&pool, pid, "GoldWolf");
 
-    create_msg(&pool, pid, aid, "noexplain msg", "noexplain body", "normal", None);
+    create_msg(
+        &pool,
+        pid,
+        aid,
+        "noexplain msg",
+        "noexplain body",
+        "normal",
+        None,
+    );
 
     let q = SearchQuery::messages("noexplain", pid);
     // explain = false (default)
@@ -313,12 +343,7 @@ fn explain_sql_no_parameter_leak() {
     let aid = seed_agent(&pool, pid, "SilverPeak");
 
     let secret_body = "topsecret_password_xyzzy42";
-    create_msg(
-        &pool, pid, aid,
-        "sqlleak msg",
-        secret_body,
-        "normal", None,
-    );
+    create_msg(&pool, pid, aid, "sqlleak msg", secret_body, "normal", None);
 
     let mut q = SearchQuery::messages("sqlleak", pid);
     q.explain = true;
@@ -352,8 +377,24 @@ fn scope_audit_summary_counts() {
     let viewer_id = seed_agent(&pool, pid, "CalmPine");
 
     // Create messages from the sender
-    create_msg(&pool, pid, sender_id, "auditcnt msg1", "auditcnt body1", "normal", None);
-    create_msg(&pool, pid, sender_id, "auditcnt msg2", "auditcnt body2", "normal", None);
+    create_msg(
+        &pool,
+        pid,
+        sender_id,
+        "auditcnt msg1",
+        "auditcnt body1",
+        "normal",
+        None,
+    );
+    create_msg(
+        &pool,
+        pid,
+        sender_id,
+        "auditcnt msg2",
+        "auditcnt body2",
+        "normal",
+        None,
+    );
 
     // Viewer in same project with sender having block_all policy
     let mut ctx = viewer_ctx(viewer_id, pid);
@@ -482,7 +523,15 @@ fn audit_entry_deterministic_schema() {
     let sender_id = seed_agent(&pool, pid, "BrightOwl");
     let viewer_id = seed_agent(&pool, pid, "NobleLion");
 
-    create_msg(&pool, pid, sender_id, "detschema msg", "detschema body", "normal", None);
+    create_msg(
+        &pool,
+        pid,
+        sender_id,
+        "detschema msg",
+        "detschema body",
+        "normal",
+        None,
+    );
 
     // Set up block_all to generate audit entries
     let mut ctx = viewer_ctx(viewer_id, pid);
@@ -504,10 +553,7 @@ fn audit_entry_deterministic_schema() {
         for entry in &audit.entries {
             // Every entry must have required fields for machine processing
             assert!(entry.result_id > 0, "result_id must be positive");
-            assert!(
-                !entry.doc_kind.is_empty(),
-                "doc_kind must not be empty"
-            );
+            assert!(!entry.doc_kind.is_empty(), "doc_kind must not be empty");
             assert!(
                 !entry.explanation.is_empty(),
                 "explanation must not be empty"
@@ -530,7 +576,15 @@ fn explain_json_schema_stability() {
     let pid = seed_project(&pool, "json-stab");
     let aid = seed_agent(&pool, pid, "CoralOwl");
 
-    create_msg(&pool, pid, aid, "jsonstab msg", "jsonstab body", "normal", None);
+    create_msg(
+        &pool,
+        pid,
+        aid,
+        "jsonstab msg",
+        "jsonstab body",
+        "normal",
+        None,
+    );
 
     let mut q = SearchQuery::messages("jsonstab", pid);
     q.explain = true;
@@ -540,7 +594,9 @@ fn explain_json_schema_stability() {
 
     // Serialize to JSON and verify required keys
     let json = serde_json::to_value(&explain).expect("serialize explain to JSON");
-    let obj = json.as_object().expect("explain should serialize as object");
+    let obj = json
+        .as_object()
+        .expect("explain should serialize as object");
 
     // Required correlation fields for machine processing
     let required_fields = [
@@ -565,13 +621,31 @@ fn explain_json_schema_stability() {
 
     // Verify types
     assert!(obj["method"].is_string(), "method should be string");
-    assert!(obj["used_like_fallback"].is_boolean(), "used_like_fallback should be bool");
-    assert!(obj["facet_count"].is_number(), "facet_count should be number");
-    assert!(obj["facets_applied"].is_array(), "facets_applied should be array");
+    assert!(
+        obj["used_like_fallback"].is_boolean(),
+        "used_like_fallback should be bool"
+    );
+    assert!(
+        obj["facet_count"].is_number(),
+        "facet_count should be number"
+    );
+    assert!(
+        obj["facets_applied"].is_array(),
+        "facets_applied should be array"
+    );
     assert!(obj["sql"].is_string(), "sql should be string");
-    assert!(obj["scope_policy"].is_string(), "scope_policy should be string");
-    assert!(obj["denied_count"].is_number(), "denied_count should be number");
-    assert!(obj["redacted_count"].is_number(), "redacted_count should be number");
+    assert!(
+        obj["scope_policy"].is_string(),
+        "scope_policy should be string"
+    );
+    assert!(
+        obj["denied_count"].is_number(),
+        "denied_count should be number"
+    );
+    assert!(
+        obj["redacted_count"].is_number(),
+        "redacted_count should be number"
+    );
 }
 
 /// Test: `ScopeAuditSummary` serializes with stable field names.
@@ -588,7 +662,13 @@ fn audit_summary_json_schema_stability() {
     let json = serde_json::to_value(&summary).expect("serialize audit summary");
     let obj = json.as_object().expect("should be object");
 
-    let required = ["total_before", "visible_count", "redacted_count", "denied_count", "entries"];
+    let required = [
+        "total_before",
+        "visible_count",
+        "redacted_count",
+        "denied_count",
+        "entries",
+    ];
     for field in &required {
         assert!(
             obj.contains_key(*field),
@@ -602,7 +682,11 @@ fn audit_summary_json_schema_stability() {
 #[test]
 fn scope_enums_serde_roundtrip() {
     // Verdicts
-    for verdict in [ScopeVerdict::Allow, ScopeVerdict::Redact, ScopeVerdict::Deny] {
+    for verdict in [
+        ScopeVerdict::Allow,
+        ScopeVerdict::Redact,
+        ScopeVerdict::Deny,
+    ] {
         let json = serde_json::to_string(&verdict).expect("serialize verdict");
         let roundtrip: ScopeVerdict = serde_json::from_str(&json).expect("deserialize verdict");
         assert_eq!(verdict, roundtrip, "verdict roundtrip for {:?}", verdict);
@@ -670,10 +754,13 @@ fn explain_denied_redacted_counts() {
     // Create several messages
     for i in 0..5 {
         create_msg(
-            &pool, pid, sender_id,
+            &pool,
+            pid,
+            sender_id,
             &format!("expcounts msg{}", i),
             &format!("expcounts body{}", i),
-            "normal", None,
+            "normal",
+            None,
         );
     }
 
@@ -716,7 +803,15 @@ fn explain_caller_scoped_policy_label() {
     let pid = seed_project(&pool, "exp-caller");
     let aid = seed_agent(&pool, pid, "FrostyRaven");
 
-    create_msg(&pool, pid, aid, "expcaller msg", "expcaller body", "normal", None);
+    create_msg(
+        &pool,
+        pid,
+        aid,
+        "expcaller msg",
+        "expcaller body",
+        "normal",
+        None,
+    );
 
     let mut q = SearchQuery::messages("expcaller", pid);
     q.scope = ScopePolicy::CallerScoped {

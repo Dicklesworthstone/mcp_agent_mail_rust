@@ -19,11 +19,11 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::pattern_overlap::CompiledPattern;
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent,
     resolve_project,
 };
+use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
 /// Write a message bundle to the git archive (best-effort, non-blocking).
 /// Failures are logged but never fail the tool call.
@@ -1906,61 +1906,277 @@ effective_free_bytes={free}"
         ));
     }
 
-    // Resolve all recipients
+    // Resolve all recipients with auto-registration and deduplication
     let total_recip = to_names.len() + cc_names.len() + bcc_names.len();
     let mut all_recipients: SmallVec<[(i64, String); 8]> = SmallVec::with_capacity(total_recip);
     let mut resolved_to: SmallVec<[String; 4]> = SmallVec::with_capacity(to_names.len());
     let mut resolved_cc_recipients: SmallVec<[String; 4]> = SmallVec::with_capacity(cc_names.len());
     let mut resolved_bcc_recipients: SmallVec<[String; 4]> =
         SmallVec::with_capacity(bcc_names.len());
+    let mut recipient_map: HashMap<String, mcp_agent_mail_db::AgentRow> =
+        HashMap::with_capacity(total_recip);
+    let mut missing_local: Vec<String> = Vec::new();
 
     for name in &to_names {
-        let agent = resolve_agent(
+        if let Err(err) = push_recipient(
             ctx,
             &pool,
             project_id,
             name,
-            &project.slug,
+            "to",
+            &sender,
+            config,
             &project.human_key,
+            &project.slug,
+            &mut recipient_map,
+            &mut all_recipients,
+            &mut resolved_to,
         )
-        .await?;
-        let aid = agent.id.unwrap_or(0);
-        if !all_recipients.iter().any(|(id, _)| *id == aid) {
-            all_recipients.push((aid, "to".to_string()));
+        .await
+        {
+            if let Some(mut names) = extract_recipient_not_found_names(&err) {
+                if names.is_empty() {
+                    missing_local.push(name.clone());
+                } else {
+                    missing_local.append(&mut names);
+                }
+                continue;
+            }
+            return Err(err);
         }
-        resolved_to.push(agent.name);
     }
     for name in &cc_names {
-        let agent = resolve_agent(
+        if let Err(err) = push_recipient(
             ctx,
             &pool,
             project_id,
             name,
-            &project.slug,
+            "cc",
+            &sender,
+            config,
             &project.human_key,
+            &project.slug,
+            &mut recipient_map,
+            &mut all_recipients,
+            &mut resolved_cc_recipients,
         )
-        .await?;
-        let aid = agent.id.unwrap_or(0);
-        if !all_recipients.iter().any(|(id, _)| *id == aid) {
-            all_recipients.push((aid, "cc".to_string()));
+        .await
+        {
+            if let Some(mut names) = extract_recipient_not_found_names(&err) {
+                if names.is_empty() {
+                    missing_local.push(name.clone());
+                } else {
+                    missing_local.append(&mut names);
+                }
+                continue;
+            }
+            return Err(err);
         }
-        resolved_cc_recipients.push(agent.name);
     }
     for name in &bcc_names {
-        let agent = resolve_agent(
+        if let Err(err) = push_recipient(
             ctx,
             &pool,
             project_id,
             name,
-            &project.slug,
+            "bcc",
+            &sender,
+            config,
             &project.human_key,
+            &project.slug,
+            &mut recipient_map,
+            &mut all_recipients,
+            &mut resolved_bcc_recipients,
         )
-        .await?;
-        let aid = agent.id.unwrap_or(0);
-        if !all_recipients.iter().any(|(id, _)| *id == aid) {
-            all_recipients.push((aid, "bcc".to_string()));
+        .await
+        {
+            if let Some(mut names) = extract_recipient_not_found_names(&err) {
+                if names.is_empty() {
+                    missing_local.push(name.clone());
+                } else {
+                    missing_local.append(&mut names);
+                }
+                continue;
+            }
+            return Err(err);
         }
-        resolved_bcc_recipients.push(agent.name);
+    }
+
+    if !missing_local.is_empty() {
+        return Err(recipient_not_found_error(
+            &project.human_key,
+            &project.slug,
+            &sender,
+            &missing_local,
+        ));
+    }
+
+    if config.contact_enforcement_enabled {
+        let mut auto_ok_names: HashSet<String> = HashSet::new();
+
+        if !thread_id.is_empty() {
+            let thread_rows = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_thread_messages(
+                    ctx.cx(),
+                    &pool,
+                    project_id,
+                    &thread_id,
+                    Some(500),
+                )
+                .await,
+            )
+            .unwrap_or_default();
+            let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
+            for row in &thread_rows {
+                auto_ok_names.insert(row.from.clone());
+                message_ids.push(row.id);
+            }
+            let recipients = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_message_recipient_names_for_messages(
+                    ctx.cx(),
+                    &pool,
+                    project_id,
+                    &message_ids,
+                )
+                .await,
+            )
+            .unwrap_or_default();
+            for name in recipients {
+                auto_ok_names.insert(name);
+            }
+        }
+
+        let reservations = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
+        )
+        .unwrap_or_default();
+        let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
+            HashMap::with_capacity(reservations.len());
+        for res in reservations {
+            patterns_by_agent
+                .entry(res.agent_id)
+                .or_default()
+                .push(CompiledPattern::new(&res.path_pattern));
+        }
+        if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
+            for agent in recipient_map.values() {
+                if let Some(rec_id) = agent.id {
+                    if let Some(rec_patterns) = patterns_by_agent.get(&rec_id) {
+                        let overlaps = sender_patterns
+                            .iter()
+                            .any(|a| rec_patterns.iter().any(|b| a.overlaps(b)));
+                        if overlaps {
+                            auto_ok_names.insert(agent.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let now_micros = mcp_agent_mail_db::now_micros();
+        let ttl_seconds = i64::try_from(config.contact_auto_ttl_seconds).unwrap_or(i64::MAX);
+        let ttl_micros = ttl_seconds.saturating_mul(1_000_000);
+        let since_ts = now_micros.saturating_sub(ttl_micros);
+
+        let mut candidate_ids: Vec<i64> = recipient_map
+            .values()
+            .filter_map(|agent| agent.id)
+            .filter(|id| *id != sender_id)
+            .collect();
+        candidate_ids.sort_unstable();
+        candidate_ids.dedup();
+
+        let recent_ids = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
+                ctx.cx(),
+                &pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+                since_ts,
+            )
+            .await,
+        )
+        .unwrap_or_default();
+        let recent_set: HashSet<i64> = recent_ids.into_iter().collect();
+
+        let approved_ids = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_approved_contact_ids(
+                ctx.cx(),
+                &pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+            )
+            .await,
+        )
+        .unwrap_or_default();
+        let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
+
+        let mut blocked: Vec<String> = Vec::new();
+        for name in resolved_to
+            .iter()
+            .chain(resolved_cc_recipients.iter())
+            .chain(resolved_bcc_recipients.iter())
+        {
+            let Some(agent) = recipient_map.get(&name.to_lowercase()) else {
+                continue;
+            };
+            let rec_id = agent.id.unwrap_or(0);
+            let recent_ok = auto_ok_names.contains(&agent.name) || recent_set.contains(&rec_id);
+            let approved = approved_set.contains(&rec_id);
+            match contact_policy_decision(
+                &sender.name,
+                &agent.name,
+                &agent.contact_policy,
+                recent_ok,
+                approved,
+            ) {
+                ContactPolicyDecision::Allow => {}
+                ContactPolicyDecision::BlockAll => return Err(contact_blocked_error()),
+                ContactPolicyDecision::RequireApproval => blocked.push(agent.name.clone()),
+            }
+        }
+
+        let mut attempted: Vec<String> = Vec::new();
+        if !blocked.is_empty() && config.messaging_auto_handshake_on_block {
+            for name in &blocked {
+                if Box::pin(crate::macros::macro_contact_handshake(
+                    ctx,
+                    project.human_key.clone(),
+                    Some(sender.name.clone()),
+                    Some(name.clone()),
+                    None,
+                    None,
+                    None,
+                    Some("auto-handshake by reply_message".to_string()),
+                    Some(true),
+                    Some(ttl_seconds),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .await
+                .is_ok()
+                {
+                    attempted.push(name.clone());
+                }
+            }
+        }
+
+        if !blocked.is_empty() {
+            return Err(contact_required_error(
+                &project.human_key,
+                &sender.name,
+                &blocked,
+                &attempted,
+                ttl_seconds,
+            ));
+        }
     }
 
     // Create reply message + recipients in a single DB transaction

@@ -919,6 +919,140 @@ pub fn help_overlay_rect(area: Rect) -> Rect {
     Rect::new(x, y, overlay_width, overlay_height)
 }
 
+/// Compute the centered debug-inspector rectangle for a terminal frame area.
+#[must_use]
+pub fn inspector_overlay_rect(area: Rect) -> Rect {
+    let overlay_width = (u32::from(area.width) * 70 / 100).clamp(48, 96) as u16;
+    let overlay_height = (u32::from(area.height) * 72 / 100).clamp(12, 36) as u16;
+    let overlay_width = overlay_width.min(area.width.saturating_sub(2));
+    let overlay_height = overlay_height.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+    Rect::new(x, y, overlay_width, overlay_height)
+}
+
+/// Render the debug inspector overlay with a widget tree and optional properties panel.
+pub fn render_inspector_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    tree_lines: &[String],
+    selected_index: usize,
+    selected_area: Option<Rect>,
+    properties: &[String],
+    show_properties: bool,
+) {
+    use ftui::text::{Line, Span, Text};
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
+    if let Some(target) = selected_area {
+        draw_outline(target, frame, tp.panel_border_focused);
+    }
+
+    let overlay = inspector_overlay_rect(area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(" Inspector (F12/Esc close, Arrows move, Enter props) ")
+        .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
+    let inner = block.inner(overlay);
+    block.render(overlay, frame);
+    if inner.is_empty() {
+        return;
+    }
+
+    let panes = if show_properties && inner.width >= 56 {
+        Flex::horizontal()
+            .constraints([Constraint::Percentage(62.0), Constraint::Percentage(38.0)])
+            .split(inner)
+    } else {
+        vec![inner]
+    };
+
+    let tree_area = panes[0];
+    let tree_block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .title(" Widget Tree ")
+        .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
+    let tree_inner = tree_block.inner(tree_area);
+    tree_block.render(tree_area, frame);
+
+    let mut tree_render_lines: Vec<Line> = Vec::new();
+    if tree_lines.is_empty() {
+        tree_render_lines.push(Line::from_spans([Span::styled(
+            "  (no widgets recorded for this frame)",
+            Style::default().fg(tp.text_muted).bg(tp.help_bg),
+        )]));
+    } else {
+        let visible_rows = usize::from(tree_inner.height.max(1));
+        let selected = selected_index.min(tree_lines.len().saturating_sub(1));
+        let start = selected.saturating_sub(visible_rows.saturating_sub(1));
+        let end = (start + visible_rows).min(tree_lines.len());
+        for (idx, line) in tree_lines[start..end].iter().enumerate() {
+            let absolute = start + idx;
+            let is_selected = absolute == selected;
+            let prefix = if is_selected { ">" } else { " " };
+            let style = if is_selected {
+                Style::default()
+                    .fg(tp.help_bg)
+                    .bg(tp.panel_border_focused)
+                    .bold()
+            } else {
+                Style::default().fg(tp.help_fg).bg(tp.help_bg)
+            };
+            tree_render_lines.push(Line::from_spans([Span::styled(
+                format!("{prefix} {line}"),
+                style,
+            )]));
+        }
+    }
+    Paragraph::new(Text::from_lines(tree_render_lines))
+        .style(Style::default().bg(tp.help_bg))
+        .render(tree_inner, frame);
+
+    if panes.len() > 1 {
+        let props_area = panes[1];
+        let props_block = Block::bordered()
+            .border_type(BorderType::Plain)
+            .title(" Properties ")
+            .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
+        let props_inner = props_block.inner(props_area);
+        props_block.render(props_area, frame);
+        let props_lines = if properties.is_empty() {
+            vec!["(no widget selected)".to_string()]
+        } else {
+            properties.to_vec()
+        };
+        Paragraph::new(props_lines.join("\n"))
+            .style(Style::default().fg(tp.help_fg).bg(tp.help_bg))
+            .render(props_inner, frame);
+    }
+}
+
+fn draw_outline(rect: Rect, frame: &mut Frame, color: PackedRgba) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let left = rect.x;
+    let right = rect.right().saturating_sub(1);
+    let top = rect.y;
+    let bottom = rect.bottom().saturating_sub(1);
+    for x in left..=right {
+        if let Some(cell) = frame.buffer.get_mut(x, top) {
+            cell.fg = color;
+        }
+        if let Some(cell) = frame.buffer.get_mut(x, bottom) {
+            cell.fg = color;
+        }
+    }
+    for y in top..=bottom {
+        if let Some(cell) = frame.buffer.get_mut(left, y) {
+            cell.fg = color;
+        }
+        if let Some(cell) = frame.buffer.get_mut(right, y) {
+            cell.fg = color;
+        }
+    }
+}
+
 /// Render a single keybinding line with keycap style: `  key   action`.
 ///
 /// The key is rendered in reverse-video (keycap style) with the action
@@ -2006,6 +2140,40 @@ mod tests {
         assert_eq!(w, 36, "overlay width at 40 cols (clamped min)");
         // 12*60% = 7, clamped to 10 (min). Also min(10, 12-2) = 10.
         assert_eq!(h, 10, "overlay height at 12 rows (clamped min)");
+    }
+
+    #[test]
+    fn inspector_overlay_sizing_120x40() {
+        let rect = inspector_overlay_rect(Rect::new(0, 0, 120, 40));
+        assert_eq!(rect.width, 84, "inspector width at 120 cols (70%)");
+        assert_eq!(rect.height, 28, "inspector height at 40 rows (72%)");
+    }
+
+    #[test]
+    fn inspector_overlay_render_no_panic() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        let tree = vec![
+            "MailApp (x=0 y=0 w=120 h=40) [123us]".to_string(),
+            "  TabBar (x=0 y=0 w=120 h=1) [10us]".to_string(),
+            "  Screen Dashboard (x=0 y=1 w=120 h=38) [99us]".to_string(),
+        ];
+        let props = vec![
+            "Name: Screen Dashboard".to_string(),
+            "Depth: 1".to_string(),
+            "Rect: x=0 y=1 w=120 h=38".to_string(),
+            "HitId: 2100".to_string(),
+            "Render: 99us".to_string(),
+        ];
+        render_inspector_overlay(
+            &mut frame,
+            Rect::new(0, 0, 120, 40),
+            &tree,
+            2,
+            Some(Rect::new(0, 1, 120, 38)),
+            &props,
+            true,
+        );
     }
 
     #[test]

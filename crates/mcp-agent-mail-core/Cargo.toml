@@ -19,6 +19,7 @@ getrandom = "0.2"
 shellexpand = "3"
 sha1.workspace = true
 fs2.workspace = true
+globset.workspace = true
 
 [features]
 # Optional local filesystem probes for installed coding-agent CLIs.

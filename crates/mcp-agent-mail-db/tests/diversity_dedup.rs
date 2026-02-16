@@ -30,11 +30,9 @@ use asupersync::{Cx, Outcome};
 
 use mcp_agent_mail_db::search_planner::SearchQuery;
 use mcp_agent_mail_db::search_service::execute_search_simple;
-use mcp_agent_mail_db::{queries, DbPool, DbPoolConfig};
+use mcp_agent_mail_db::{DbPool, DbPoolConfig, queries};
 
-use mcp_agent_mail_search_core::diversity::{
-    DiversityConfig, DiversityMeta, diversify,
-};
+use mcp_agent_mail_search_core::diversity::{DiversityConfig, DiversityMeta, diversify};
 use mcp_agent_mail_search_core::fusion::{FusedHit, FusionExplain, SourceContribution};
 use mcp_agent_mail_search_core::hybrid_candidates::CandidateSource;
 
@@ -154,12 +152,7 @@ fn thread_count_in_top_k(
 ) -> usize {
     hits.iter()
         .take(k)
-        .filter(|h| {
-            metadata
-                .get(&h.doc_id)
-                .and_then(|m| m.thread_id.as_deref())
-                == Some(thread_id)
-        })
+        .filter(|h| metadata.get(&h.doc_id).and_then(|m| m.thread_id.as_deref()) == Some(thread_id))
         .count()
 }
 
@@ -171,12 +164,7 @@ fn sender_count_in_top_k(
 ) -> usize {
     hits.iter()
         .take(k)
-        .filter(|h| {
-            metadata
-                .get(&h.doc_id)
-                .and_then(|m| m.sender.as_deref())
-                == Some(sender)
-        })
+        .filter(|h| metadata.get(&h.doc_id).and_then(|m| m.sender.as_deref()) == Some(sender))
         .count()
 }
 
@@ -219,9 +207,7 @@ fn extract_relevances(hits: &[FusedHit], grades: &HashMap<i64, f64>) -> Vec<f64>
 fn thread_concentration_capping() {
     // Corpus: 10 docs, 8 from thread-A, 2 from thread-B.
     // All near-tied scores => diversity should spread thread-B docs into top positions.
-    let hits: Vec<FusedHit> = (0..10)
-        .map(|i| hit(i, 0.5 - (i as f64 * 0.0001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..10).map(|i| hit(i, 0.5 - (i as f64 * 0.0001))).collect();
 
     let mut metadata = HashMap::new();
     for i in 0..8 {
@@ -267,9 +253,7 @@ fn thread_concentration_capping() {
 #[test]
 fn sender_concentration_capping() {
     // 12 docs: 9 from alice, 3 from bob, all different threads
-    let hits: Vec<FusedHit> = (0..12)
-        .map(|i| hit(i, 0.8 - (i as f64 * 0.0001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..12).map(|i| hit(i, 0.8 - (i as f64 * 0.0001))).collect();
 
     let mut metadata = HashMap::new();
     for i in 0..9 {
@@ -357,9 +341,7 @@ fn ndcg_mrr_regression_with_diversity() {
     // Scenario: well-distributed relevance across threads.
     // Diversity should NOT significantly harm NDCG/MRR since relevant
     // docs from different threads get promoted.
-    let hits: Vec<FusedHit> = (0..20)
-        .map(|i| hit(i, 0.9 - (i as f64 * 0.001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..20).map(|i| hit(i, 0.9 - (i as f64 * 0.001))).collect();
 
     // Relevance grades: docs 0,5,10,15 are highly relevant,
     // docs 1,6,11,16 are relevant, rest are marginal.
@@ -448,9 +430,7 @@ fn ndcg_mrr_regression_with_diversity() {
 
 #[test]
 fn disabled_diversity_passthrough() {
-    let hits: Vec<FusedHit> = (0..10)
-        .map(|i| hit(i, 0.5 - (i as f64 * 0.001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..10).map(|i| hit(i, 0.5 - (i as f64 * 0.001))).collect();
 
     let mut metadata = HashMap::new();
     for i in 0..10 {
@@ -481,9 +461,7 @@ fn disabled_diversity_passthrough() {
 #[test]
 fn window_size_boundary() {
     // 15 hits, window_size=5. Only first 5 should be subject to diversity.
-    let hits: Vec<FusedHit> = (0..15)
-        .map(|i| hit(i, 0.8 - (i as f64 * 0.001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..15).map(|i| hit(i, 0.8 - (i as f64 * 0.001))).collect();
 
     let mut metadata = HashMap::new();
     for i in 0..15 {
@@ -517,9 +495,7 @@ fn window_size_boundary() {
 
 #[test]
 fn diversity_determinism() {
-    let hits: Vec<FusedHit> = (0..20)
-        .map(|i| hit(i, 0.7 - (i as f64 * 0.0005)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..20).map(|i| hit(i, 0.7 - (i as f64 * 0.0005))).collect();
 
     let mut metadata = HashMap::new();
     let threads = ["t1", "t1", "t1", "t2", "t2", "t3"];
@@ -568,9 +544,7 @@ fn diversity_determinism() {
 #[test]
 fn config_parameter_sweep() {
     // Fixed corpus: 20 docs, 4 threads × 5 docs each, 2 senders
-    let hits: Vec<FusedHit> = (0..20)
-        .map(|i| hit(i, 0.6 - (i as f64 * 0.001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..20).map(|i| hit(i, 0.6 - (i as f64 * 0.001))).collect();
 
     let mut metadata = HashMap::new();
     let threads = ["tA", "tB", "tC", "tD"];
@@ -622,11 +596,7 @@ fn config_parameter_sweep() {
         );
 
         // All configs should preserve total result count
-        assert_eq!(
-            result.hits.len(),
-            20,
-            "{label}: total hits preserved"
-        ); // assertions 41..44
+        assert_eq!(result.hits.len(), 20, "{label}: total hits preserved"); // assertions 41..44
 
         // Non-disabled diversity should produce at least some demotions
         // when all docs are near-tied and from limited threads/senders
@@ -643,9 +613,7 @@ fn config_parameter_sweep() {
 
 #[test]
 fn missing_metadata_graceful() {
-    let hits: Vec<FusedHit> = (0..10)
-        .map(|i| hit(i, 0.5 - (i as f64 * 0.001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..10).map(|i| hit(i, 0.5 - (i as f64 * 0.001))).collect();
 
     // Only metadata for half the docs
     let mut metadata = HashMap::new();
@@ -680,9 +648,7 @@ fn missing_metadata_graceful() {
 #[test]
 fn combined_thread_sender_caps() {
     // 15 docs: alice sends 10 in thread-A, bob sends 5 in thread-B
-    let hits: Vec<FusedHit> = (0..15)
-        .map(|i| hit(i, 0.7 - (i as f64 * 0.0001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..15).map(|i| hit(i, 0.7 - (i as f64 * 0.0001))).collect();
 
     let mut metadata = HashMap::new();
     for i in 0..10 {
@@ -707,7 +673,9 @@ fn combined_thread_sender_caps() {
     let thread_a_top5 = thread_count_in_top_k(&result.hits, &metadata, 5, "thread-A");
     let count_tb_top5 = thread_count_in_top_k(&result.hits, &metadata, 5, "thread-B");
 
-    eprintln!("combined_caps top-5: alice={alice_top5}, bob={bob_top5}, tA={thread_a_top5}, tB={count_tb_top5}");
+    eprintln!(
+        "combined_caps top-5: alice={alice_top5}, bob={bob_top5}, tA={thread_a_top5}, tB={count_tb_top5}"
+    );
 
     // Within the window, caps enforce max 3 per sender before forced placement kicks in.
     // In top-5, alice should be capped at max_per_sender=3 since bob docs are available.
@@ -740,9 +708,7 @@ fn combined_thread_sender_caps() {
 fn relevance_quality_floor_gating() {
     // Prove that for diverse corpora, diversity improves spread without
     // breaching a minimum quality floor.
-    let hits: Vec<FusedHit> = (0..30)
-        .map(|i| hit(i, 0.95 - (i as f64 * 0.001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..30).map(|i| hit(i, 0.95 - (i as f64 * 0.001))).collect();
 
     let mut metadata = HashMap::new();
     let mut grades = HashMap::new();
@@ -817,9 +783,7 @@ fn relevance_quality_floor_gating() {
 #[test]
 fn score_tolerance_effect() {
     // Same corpus, different tolerances. Higher tolerance = more diversity
-    let hits: Vec<FusedHit> = (0..10)
-        .map(|i| hit(i, 0.5 - (i as f64 * 0.005)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..10).map(|i| hit(i, 0.5 - (i as f64 * 0.005))).collect();
 
     let mut metadata = HashMap::new();
     for i in 0..10 {
@@ -899,9 +863,21 @@ fn db_integrated_diversity_regression() {
 
     // Create messages: 3 threads × 5 messages each, different senders
     let thread_data = [
-        ("thread-deploy", "RedFox", "deploy production release pipeline verification"),
-        ("thread-auth", "BlueLake", "auth token refresh session management oauth"),
-        ("thread-search", "GreenHawk", "search index rebuild query optimization performance"),
+        (
+            "thread-deploy",
+            "RedFox",
+            "deploy production release pipeline verification",
+        ),
+        (
+            "thread-auth",
+            "BlueLake",
+            "auth token refresh session management oauth",
+        ),
+        (
+            "thread-search",
+            "GreenHawk",
+            "search index rebuild query optimization performance",
+        ),
     ];
 
     let mut msg_ids = Vec::new();
@@ -997,7 +973,10 @@ fn db_integrated_diversity_regression() {
 
     // Check thread spread in top-5
     let unique_t_top5 = unique_threads_in_top_k(&result.hits, &diversity_meta, 5);
-    eprintln!("db_integrated: unique_threads_top5={unique_t_top5}, demotions={}", result.demotions);
+    eprintln!(
+        "db_integrated: unique_threads_top5={unique_t_top5}, demotions={}",
+        result.demotions
+    );
     // With 3 threads and max_per_thread=2, we should see >= 2 unique threads in top-5
     assert!(
         unique_t_top5 >= 2,
@@ -1012,13 +991,13 @@ fn db_integrated_diversity_regression() {
 #[test]
 fn concentration_regression_artifact() {
     // Produce a structured concentration report for CI.
-    let hits: Vec<FusedHit> = (0..20)
-        .map(|i| hit(i, 0.8 - (i as f64 * 0.001)))
-        .collect();
+    let hits: Vec<FusedHit> = (0..20).map(|i| hit(i, 0.8 - (i as f64 * 0.001))).collect();
 
     let mut metadata = HashMap::new();
     let threads = ["tA", "tA", "tA", "tA", "tA", "tB", "tB", "tC", "tD", "tE"];
-    let senders = ["alice", "alice", "alice", "bob", "bob", "carol", "carol", "dave", "dave", "eve"];
+    let senders = [
+        "alice", "alice", "alice", "bob", "bob", "carol", "carol", "dave", "dave", "eve",
+    ];
     for i in 0..20 {
         let idx = i as usize % threads.len();
         metadata.insert(i, meta(Some(threads[idx]), Some(senders[idx])));
@@ -1026,7 +1005,16 @@ fn concentration_regression_artifact() {
 
     let mut grades = HashMap::new();
     for i in 0..20 {
-        grades.insert(i, if i < 5 { 3.0 } else if i < 10 { 1.0 } else { 0.0 });
+        grades.insert(
+            i,
+            if i < 5 {
+                3.0
+            } else if i < 10 {
+                1.0
+            } else {
+                0.0
+            },
+        );
     }
 
     let configs = [

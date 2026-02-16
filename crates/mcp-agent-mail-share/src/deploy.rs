@@ -1459,14 +1459,28 @@ fn compute_integrity(bundle_dir: &Path) -> BTreeMap<String, String> {
     for rel in &key_files {
         let path = bundle_dir.join(rel);
         if path.is_file() {
-            if let Ok(data) = std::fs::read(&path) {
-                let hash = hex::encode(Sha256::digest(&data));
+            if let Ok(hash) = sha256_file_streaming(&path) {
                 checksums.insert((*rel).to_string(), hash);
             }
         }
     }
 
     checksums
+}
+
+fn sha256_file_streaming(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024]; // 64KB buffer
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 struct FileEntry {

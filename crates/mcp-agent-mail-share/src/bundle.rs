@@ -121,47 +121,72 @@ pub fn bundle_attachments(
     // SHA256 -> relative bundle path (for deduplication of identical content)
     let mut dedup_map: HashMap<String, String> = HashMap::new();
 
-    for row in &rows {
-        let msg_id: i64 = row.get_named("id").unwrap_or(0);
-        let att_json: String = row.get_named("attachments").unwrap_or_default();
+    let mut last_id = 0i64;
+    loop {
+        let rows = conn
+            .query_sync(
+                "SELECT id, attachments \
+                 FROM messages \
+                 WHERE attachments != '[]' AND attachments != '' AND id > ? \
+                 ORDER BY id ASC LIMIT 500",
+                &[SqlValue::BigInt(last_id)],
+            )
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("SELECT messages failed: {e}"),
+            })?;
 
-        let mut attachments: Vec<Value> = match serde_json::from_str(&att_json) {
-            Ok(Value::Array(arr)) => arr,
-            _ => continue,
-        };
+        if rows.is_empty() {
+            break;
+        }
 
-        let mut updated = false;
-        for att in &mut attachments {
-            let Some(obj) = att.as_object_mut() else {
-                continue;
+        for row in &rows {
+            let msg_id: i64 = row.get_named("id").unwrap_or(0);
+            last_id = msg_id;
+            let att_json: String = row.get_named("attachments").unwrap_or_default();
+
+            let mut attachments: Vec<Value> = match serde_json::from_str(&att_json) {
+                Ok(Value::Array(arr)) => arr,
+                _ => continue,
             };
 
-            // Try to resolve the source file path
-            let original_path = obj
-                .get("path")
-                .or_else(|| obj.get("original_path"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let mut updated = false;
+            for att in &mut attachments {
+                let Some(obj) = att.as_object_mut() else {
+                    continue;
+                };
 
-            let Some(orig_path_str) = &original_path else {
-                continue;
-            };
+                // Try to resolve the source file path
+                let original_path = obj
+                    .get("path")
+                    .or_else(|| obj.get("original_path"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
 
-            let source_file =
-                resolve_attachment_path(storage_root, orig_path_str, allow_absolute_paths);
+                let Some(orig_path_str) = &original_path else {
+                    continue;
+                };
 
-            let media_type = obj
-                .get("media_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("application/octet-stream")
-                .to_string();
+                let source_file =
+                    resolve_attachment_path(storage_root, orig_path_str, allow_absolute_paths);
 
-            match source_file {
-                Some(source) if source.exists() => {
-                    let file_size = source.metadata().map(|m| m.len() as usize).unwrap_or(0);
+                let media_type = obj
+                    .get("media_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+
+                let process_result = (|| -> std::io::Result<()> {
+                    let Some(source) = source_file.as_ref().filter(|s| s.exists()) else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "file not found or not accessible",
+                        ));
+                    };
+
+                    let file_size = source.metadata()?.len() as usize;
 
                     if file_size <= inline_threshold {
-                        let content = std::fs::read(&source)?;
+                        let content = std::fs::read(source)?;
                         let file_size = content.len();
                         let sha = hex_sha256(&content);
                         // Inline as base64 data URI
@@ -182,7 +207,7 @@ pub fn bundle_attachments(
                             message_id: msg_id,
                             mode: "inline".to_string(),
                             sha256: Some(sha),
-                            media_type: Some(media_type),
+                            media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
                             original_path: original_path.clone(),
                             bundle_path: None,
@@ -190,7 +215,7 @@ pub fn bundle_attachments(
                         updated = true;
                     } else if file_size >= detach_threshold {
                         // External — too large to bundle
-                        let sha = sha256_file(&source)?;
+                        let sha = sha256_file(source)?;
                         obj.insert("type".to_string(), Value::String("external".to_string()));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
                         obj.insert(
@@ -208,7 +233,7 @@ pub fn bundle_attachments(
                             message_id: msg_id,
                             mode: "external".to_string(),
                             sha256: Some(sha),
-                            media_type: Some(media_type),
+                            media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
                             original_path: original_path.clone(),
                             bundle_path: None,
@@ -216,7 +241,7 @@ pub fn bundle_attachments(
                         updated = true;
                     } else {
                         // Copy to bundle with deduplication
-                        let sha = sha256_file(&source)?;
+                        let sha = sha256_file(source)?;
                         let bundle_rel = if let Some(existing) = dedup_map.get(&sha) {
                             // Deduplicate: reuse existing path
                             existing.clone()
@@ -229,7 +254,7 @@ pub fn bundle_attachments(
                             if let Some(parent) = dest.parent() {
                                 std::fs::create_dir_all(parent)?;
                             }
-                            std::fs::copy(&source, &dest)?;
+                            std::fs::copy(source, &dest)?;
                             stats.bytes_copied += file_size as u64;
                             dedup_map.insert(sha.clone(), rel.clone());
                             rel
@@ -247,16 +272,22 @@ pub fn bundle_attachments(
                             message_id: msg_id,
                             mode: "file".to_string(),
                             sha256: Some(sha),
-                            media_type: Some(media_type),
+                            media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
                             original_path: original_path.clone(),
                             bundle_path: Some(bundle_rel),
                         });
                         updated = true;
                     }
-                }
-                _ => {
-                    // Missing
+                    Ok(())
+                })();
+
+                if let Err(e) = process_result {
+                    if source_file.is_some() && e.kind() != std::io::ErrorKind::NotFound {
+                        // Log warning for unexpected IO errors (permissions, etc)
+                    }
+
+                    // Missing fallback
                     obj.insert("type".to_string(), Value::String("missing".to_string()));
                     if let Some(ref p) = original_path {
                         obj.insert("original_path".to_string(), Value::String(p.clone()));
@@ -274,18 +305,19 @@ pub fn bundle_attachments(
                     updated = true;
                 }
             }
-        }
 
-        // Write back updated attachments
-        if updated {
-            let new_json = serde_json::to_string(&attachments).unwrap_or_else(|_| "[]".to_string());
-            conn.execute_sync(
-                "UPDATE messages SET attachments = ? WHERE id = ?",
-                &[SqlValue::Text(new_json), SqlValue::BigInt(msg_id)],
-            )
-            .map_err(|e| ShareError::Sqlite {
-                message: format!("UPDATE attachments failed: {e}"),
-            })?;
+            // Write back updated attachments
+            if updated {
+                let new_json =
+                    serde_json::to_string(&attachments).unwrap_or_else(|_| "[]".to_string());
+                conn.execute_sync(
+                    "UPDATE messages SET attachments = ? WHERE id = ?",
+                    &[SqlValue::Text(new_json), SqlValue::BigInt(msg_id)],
+                )
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("UPDATE attachments failed: {e}"),
+                })?;
+            }
         }
     }
 

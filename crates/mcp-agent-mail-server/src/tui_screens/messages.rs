@@ -1087,7 +1087,8 @@ impl MessageBrowserScreen {
         } else {
             usize::from(area.height.saturating_sub(2))
         };
-        let total_lines = estimate_message_detail_lines(entry);
+        let width = if area.width == 0 { 80 } else { area.width };
+        let total_lines = estimate_message_detail_lines(entry, width);
         total_lines.saturating_sub(visible_height)
     }
 
@@ -2328,7 +2329,7 @@ fn build_inline_image_block_with_hints(
 /// Render the detail panel for the selected message.
 #[allow(clippy::cast_possible_truncation)]
 /// Estimate how many lines the detail panel needs for a message entry.
-fn estimate_message_detail_lines(entry: &MessageEntry) -> usize {
+fn estimate_message_detail_lines(entry: &MessageEntry, width: u16) -> usize {
     // Header lines: From, To, Subject, Project, Time, Importance = 6
     let mut count: usize = 6;
     if !entry.thread_id.is_empty() {
@@ -2341,8 +2342,16 @@ fn estimate_message_detail_lines(entry: &MessageEntry) -> usize {
         count += 1; // ID line
     }
     count += 2; // Blank separator + "--- Body ---"
-    // Body lines: count newlines + 1
-    count += entry.body_md.lines().count().max(1);
+
+    // Body lines: approximate wrapping
+    let avail_width = usize::from(width.saturating_sub(2)).max(1); // -2 for borders/padding
+    let body_lines = entry.body_md.lines().map(|line| {
+        let len = ftui::text::display_width(line);
+        if len == 0 { 1 } else { len.div_ceil(avail_width) }
+    }).sum::<usize>().max(1);
+
+    count += body_lines;
+
     // Markdown image references may expand into additional inline preview rows.
     // Over-estimate to avoid clamping scroll too early.
     count += collect_markdown_image_refs(&entry.body_md)

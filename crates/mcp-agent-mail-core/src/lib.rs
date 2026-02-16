@@ -25,6 +25,7 @@ pub mod lock_order;
 pub mod memory;
 pub mod metrics;
 pub mod models;
+pub mod pattern_overlap;
 pub mod setup;
 pub mod slo;
 pub mod test_harness;

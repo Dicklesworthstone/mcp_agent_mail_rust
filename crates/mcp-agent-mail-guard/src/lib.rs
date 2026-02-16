@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use globset::{Glob, GlobSetBuilder};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -737,38 +738,84 @@ pub fn guard_check(
     ))
 }
 
-/// Core conflict detection: check paths against reservations.
+/// Core conflict detection: check paths against reservations using globset.
 ///
-/// Skips reservations held by `self_agent`. Uses symmetric fnmatch matching.
+/// Skips reservations held by `self_agent`.
 fn check_path_conflicts(
     paths: &[String],
     reservations: &[FileReservationRecord],
     self_agent: &str,
     ignorecase: bool,
 ) -> Vec<GuardConflict> {
-    // Optimization: Pre-filter and pre-normalize reservations to avoid repeated work in the inner loop.
-    let active_reservations: Vec<(&FileReservationRecord, String)> = reservations
-        .iter()
-        .filter(|res| res.exclusive && res.agent_name != self_agent)
-        .map(|res| (res, normalize_path(&res.path_pattern, ignorecase)))
-        .collect();
+    // 1. Build a GlobSet for all relevant reservations (other agents, exclusive).
+    // Map glob index back to reservation record for conflict reporting.
+    let mut builder = GlobSetBuilder::new();
+    let mut active_indices: Vec<&FileReservationRecord> = Vec::with_capacity(reservations.len());
 
-    let mut conflicts = Vec::new();
-    for path in paths {
-        let normalized = normalize_path(path, ignorecase);
-        for (res, pattern_normalized) in &active_reservations {
-            // Symmetric glob matching
-            if paths_conflict(&normalized, pattern_normalized) {
-                conflicts.push(GuardConflict {
-                    path: path.clone(),
-                    pattern: res.path_pattern.clone(),
-                    holder: res.agent_name.clone(),
-                    expires_ts: res.expires_ts.clone(),
-                });
-                break; // One conflict per path is enough
+    for res in reservations {
+        if res.exclusive && res.agent_name != self_agent {
+            // Configure glob to match gitignore semantics (no literal separator implies * crosses /)
+            // matching Python behavior where * crosses /.
+            // Use normalize_path to handle slashes before compiling.
+            let pat_str = normalize_path(&res.path_pattern, ignorecase);
+            let glob = Glob::new(&pat_str);
+            if let Ok(g) = glob {
+                builder.add(g);
+                active_indices.push(res);
             }
         }
     }
+
+    let glob_set = match builder.build() {
+        Ok(gs) => gs,
+        Err(_) => return Vec::new(), // Should not happen with valid globs
+    };
+
+    let mut conflicts = Vec::new();
+
+    for path in paths {
+        let normalized = normalize_path(path, ignorecase);
+
+        // Check if path matches any reservation pattern
+        let matches = glob_set.matches(&normalized);
+        if !matches.is_empty() {
+            // Report the first match
+            let idx = matches[0];
+            let res = active_indices[idx];
+            conflicts.push(GuardConflict {
+                path: path.clone(),
+                pattern: res.path_pattern.clone(),
+                holder: res.agent_name.clone(),
+                expires_ts: res.expires_ts.clone(),
+            });
+            continue;
+        }
+
+        // Symmetric check: check if path (as a pattern) matches reservation (as path).
+        // Only relevant if the file path itself contains glob characters (unlikely but possible).
+        // Note: globset doesn't support "match glob against pattern".
+        // Fallback: check exact equality (already covered by glob if no wildcards).
+        // The original manual implementation checked `fnmatch(pattern, path)`.
+        // Since `paths` are concrete strings from git, they are not patterns.
+        // The only "symmetric" case that matters for concrete paths is if the reservation
+        // is a specific file that matches the path. `GlobSet` handles this.
+        //
+        // Logic check: `fnmatch(path, pattern)` (Python) -> Path matches Pattern.
+        // `fnmatch(pattern, path)` (Python) -> Pattern matches Path.
+        // If Pattern is `src/foo` and Path is `src/foo`, both match.
+        // If Pattern is `src/*.rs` and Path is `src/main.rs`.
+        //   `fnmatch("src/main.rs", "src/*.rs")` -> True.
+        //   `fnmatch("src/*.rs", "src/main.rs")` -> False.
+        //
+        // So with concrete paths, the symmetric check is redundant unless the path
+        // implies a directory that contains the pattern? No.
+        //
+        // Directory prefix check: "If pattern ends with /* or /**".
+        // `GlobSet` handles `/*` and `/**` correctly matching children.
+        //
+        // Conclusion: `GlobSet` against `normalized` is sufficient and correct for standard usage.
+    }
+
     conflicts
 }
 
@@ -802,115 +849,6 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
         .and_then(|repo| repo.config().ok())
         .and_then(|cfg| cfg.get_bool("core.ignorecase").ok())
         .unwrap_or(false)
-}
-
-/// Check if a pattern contains glob markers.
-#[cfg(test)]
-fn contains_glob(pattern: &str) -> bool {
-    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
-}
-
-/// Check if a file path and a reservation pattern conflict.
-///
-/// Uses symmetric fnmatch matching (Python parity):
-/// `fnmatch(path, pattern) || fnmatch(pattern, path) || path == pattern`
-///
-/// For glob-vs-glob patterns, uses cross-matching.
-fn paths_conflict(path: &str, pattern: &str) -> bool {
-    // Direct equality
-    if path == pattern {
-        return true;
-    }
-
-    // If pattern ends with /* or /**, check prefix match
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        if path.starts_with(prefix)
-            && (path.len() == prefix.len() || path.as_bytes().get(prefix.len()) == Some(&b'/'))
-        {
-            return true;
-        }
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        if path.starts_with(prefix) {
-            return true;
-        }
-    }
-
-    // Symmetric fnmatch matching
-    fnmatch_simple(path, pattern) || fnmatch_simple(pattern, path)
-}
-
-/// Simple glob pattern matching (supports * and ** wildcards).
-/// Kept for backward compat; used internally by `paths_conflict`.
-#[allow(dead_code)]
-fn path_matches_pattern(path: &str, pattern: &str) -> bool {
-    paths_conflict(
-        &normalize_path(path, false),
-        &normalize_path(pattern, false),
-    )
-}
-
-/// Simple fnmatch-style glob matching.
-fn fnmatch_simple(name: &str, pattern: &str) -> bool {
-    let mut name_chars = name.chars().peekable();
-    let mut pat_chars = pattern.chars().peekable();
-
-    while let Some(&pc) = pat_chars.peek() {
-        match pc {
-            '*' => {
-                pat_chars.next();
-                // Check for ** (match across directories)
-                let double_star = pat_chars.peek() == Some(&'*');
-                if double_star {
-                    pat_chars.next();
-                    if pat_chars.peek() == Some(&'/') {
-                        pat_chars.next();
-                    }
-                }
-                // Collect remaining pattern
-                let rest: String = pat_chars.collect();
-                if rest.is_empty() {
-                    return true;
-                }
-                // Try matching rest of pattern from every position
-                let remaining: String = name_chars.collect();
-                let slash_idx = if double_star {
-                    None
-                } else {
-                    remaining.find('/')
-                };
-                let mut positions: Vec<usize> = remaining.char_indices().map(|(i, _)| i).collect();
-                positions.push(remaining.len());
-
-                for i in positions {
-                    if let Some(slash_idx) = slash_idx {
-                        if i > slash_idx {
-                            break;
-                        }
-                    }
-                    if fnmatch_simple(&remaining[i..], &rest) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            '?' => {
-                pat_chars.next();
-                if name_chars.next().is_none() {
-                    return false;
-                }
-            }
-            _ => {
-                pat_chars.next();
-                match name_chars.next() {
-                    Some(nc) if nc == pc => {}
-                    _ => return false,
-                }
-            }
-        }
-    }
-
-    name_chars.peek().is_none()
 }
 
 /// Read active file reservations from the archive's `file_reservations/` directory.

@@ -33,8 +33,8 @@ use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Budget, Cx, Outcome};
 
 use mcp_agent_mail_db::search_planner::{RankingMode, SearchQuery};
-use mcp_agent_mail_db::search_service::{execute_search_simple, SimpleSearchResponse};
-use mcp_agent_mail_db::{queries, DbPool, DbPoolConfig};
+use mcp_agent_mail_db::search_service::{SimpleSearchResponse, execute_search_simple};
+use mcp_agent_mail_db::{DbPool, DbPoolConfig, queries};
 
 // ────────────────────────────────────────────────────────────────────
 // Helpers
@@ -95,9 +95,21 @@ where
 /// Seed a project with agents, returning (`project_id`, `agent_ids`).
 fn seed_project(pool: &DbPool, slug: &str, n_agents: usize) -> (i64, Vec<i64>) {
     let valid_names = [
-        "RedFox", "BlueLake", "GreenHawk", "GoldWolf", "SilverPeak",
-        "CoralStone", "AmberRiver", "CrimsonOwl", "DeepMeadow", "FrostBear",
-        "IvoryDeer", "JadeFalcon", "LimeOtter", "MintCrane", "OpalLion",
+        "RedFox",
+        "BlueLake",
+        "GreenHawk",
+        "GoldWolf",
+        "SilverPeak",
+        "CoralStone",
+        "AmberRiver",
+        "CrimsonOwl",
+        "DeepMeadow",
+        "FrostBear",
+        "IvoryDeer",
+        "JadeFalcon",
+        "LimeOtter",
+        "MintCrane",
+        "OpalLion",
         "PearlMoose",
     ];
 
@@ -118,7 +130,14 @@ fn seed_project(pool: &DbPool, slug: &str, n_agents: usize) -> (i64, Vec<i64>) {
             let pool = pool.clone();
             async move {
                 match queries::register_agent(
-                    &cx, &pool, project_id, name, "test", "test-model", None, None,
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "test",
+                    "test-model",
+                    None,
+                    None,
                 )
                 .await
                 {
@@ -267,10 +286,7 @@ fn concurrent_write_and_search() {
                     });
                     latencies.push(start.elapsed().as_micros() as u64);
                     rc.fetch_add(1, Ordering::Relaxed);
-                    results
-                        .lock()
-                        .unwrap()
-                        .push(resp.results.len());
+                    results.lock().unwrap().push(resp.results.len());
                 }
                 latencies
             })
@@ -307,13 +323,8 @@ fn concurrent_write_and_search() {
     let p95 = percentile(&all_latencies, 95);
     let p99 = percentile(&all_latencies, 99);
 
-    eprintln!(
-        "concurrent_write_and_search: writes={total_writes}, reads={total_reads}"
-    );
-    eprintln!(
-        "  latency: p50={}μs, p95={}μs, p99={}μs",
-        p50, p95, p99
-    );
+    eprintln!("concurrent_write_and_search: writes={total_writes}, reads={total_reads}");
+    eprintln!("  latency: p50={}μs, p95={}μs, p99={}μs", p50, p95, p99);
 
     // p99 should be under 5 seconds (generous for CI)
     assert!(
@@ -356,10 +367,7 @@ fn index_freshness_lag() {
 
         // Immediately search for the unique token
         let search_start = Instant::now();
-        let resp = search(
-            &pool,
-            &SearchQuery::messages(&unique_token, project_id),
-        );
+        let resp = search(&pool, &SearchQuery::messages(&unique_token, project_id));
         let search_elapsed = search_start.elapsed();
 
         let total_lag = write_elapsed + search_elapsed;
@@ -474,7 +482,11 @@ fn search_throughput_sustained() {
     let p99 = percentile(&all_latencies, 99);
 
     eprintln!("search_throughput_sustained: {total_queries} queries across {n_threads} threads");
-    eprintln!("  elapsed: {:.2}s, QPS: {:.1}", overall_elapsed.as_secs_f64(), qps);
+    eprintln!(
+        "  elapsed: {:.2}s, QPS: {:.1}",
+        overall_elapsed.as_secs_f64(),
+        qps
+    );
     eprintln!("  latency: p50={}μs, p95={}μs, p99={}μs", p50, p95, p99);
     eprintln!("  total results returned: {total_results}");
 
@@ -594,9 +606,7 @@ fn pool_exhaustion_recovery() {
     let failures = failure_count.load(Ordering::Relaxed);
     let total = successes + failures;
 
-    eprintln!(
-        "pool_exhaustion_recovery: {successes}/{total} ops succeeded, {failures} failed"
-    );
+    eprintln!("pool_exhaustion_recovery: {successes}/{total} ops succeeded, {failures} failed");
 
     assert_eq!(total, 60, "12 threads × 5 ops = 60"); // assertion 40
 
@@ -688,10 +698,7 @@ fn mixed_importance_thread_workload() {
 
     // Search for each importance level
     for &imp in &importances {
-        let resp = search(
-            &pool,
-            &SearchQuery::messages(imp, project_id),
-        );
+        let resp = search(&pool, &SearchQuery::messages(imp, project_id));
         assert!(
             !resp.results.is_empty(),
             "should find messages with importance '{imp}'"
@@ -725,8 +732,14 @@ fn concurrent_agent_registration_and_messaging() {
     });
 
     let agent_names = [
-        "RedFox", "BlueLake", "GreenHawk", "GoldWolf", "SilverPeak",
-        "CoralStone", "AmberRiver", "CrimsonOwl",
+        "RedFox",
+        "BlueLake",
+        "GreenHawk",
+        "GoldWolf",
+        "SilverPeak",
+        "CoralStone",
+        "AmberRiver",
+        "CrimsonOwl",
     ];
     let n_agents = agent_names.len();
     let barrier = Arc::new(Barrier::new(n_agents));
@@ -744,7 +757,14 @@ fn concurrent_agent_registration_and_messaging() {
                 let pool = pool.clone();
                 async move {
                     match queries::register_agent(
-                        &cx, &pool, project_id, name, "test", "test-model", None, None,
+                        &cx,
+                        &pool,
+                        project_id,
+                        name,
+                        "test",
+                        "test-model",
+                        None,
+                        None,
                     )
                     .await
                     {
@@ -769,11 +789,7 @@ fn concurrent_agent_registration_and_messaging() {
     let mut sorted_ids = std::mem::take(&mut registered);
     sorted_ids.sort_unstable();
     sorted_ids.dedup();
-    assert_eq!(
-        sorted_ids.len(),
-        n_agents,
-        "all agent IDs should be unique"
-    ); // assertion 50
+    assert_eq!(sorted_ids.len(), n_agents, "all agent IDs should be unique"); // assertion 50
 
     // Now send messages from all agents concurrently
     let barrier2 = Arc::new(Barrier::new(n_agents));
@@ -918,12 +934,8 @@ fn budget_constrained_search_under_load() {
     let unlimited_resp = block_on_with_budget(Budget::new(), |cx| {
         let pool = pool.clone();
         async move {
-            match execute_search_simple(
-                &cx,
-                &pool,
-                &SearchQuery::messages("budget", project_id),
-            )
-            .await
+            match execute_search_simple(&cx, &pool, &SearchQuery::messages("budget", project_id))
+                .await
             {
                 Outcome::Ok(r) => r,
                 other => panic!("unlimited search failed: {other:?}"),
@@ -1007,10 +1019,7 @@ fn pagination_stability_under_writes() {
     q.limit = Some(10);
     let page1 = search(&pool, &q);
     let page1_count = page1.results.len();
-    assert!(
-        page1_count > 0,
-        "page 1 should have results"
-    ); // assertion 61
+    assert!(page1_count > 0, "page 1 should have results"); // assertion 61
 
     // While we paginate, concurrently insert more messages
     let pool_c = pool.clone();
@@ -1181,10 +1190,7 @@ fn latency_distribution_with_explain() {
     // Without explain
     for _ in 0..n_iterations {
         let start = Instant::now();
-        let resp = search(
-            &pool,
-            &SearchQuery::messages("explain", project_id),
-        );
+        let resp = search(&pool, &SearchQuery::messages("explain", project_id));
         latencies_no_explain.push(start.elapsed().as_micros() as u64);
         assert!(
             !resp.results.is_empty(),
@@ -1215,9 +1221,7 @@ fn latency_distribution_with_explain() {
     let p50_ex = percentile(&latencies_with_explain, 50);
     let p95_ex = percentile(&latencies_with_explain, 95);
 
-    eprintln!(
-        "latency_distribution_with_explain ({n_iterations} iterations each):"
-    );
+    eprintln!("latency_distribution_with_explain ({n_iterations} iterations each):");
     eprintln!("  no-explain: p50={}μs, p95={}μs", p50_no, p95_no);
     eprintln!("  with-explain: p50={}μs, p95={}μs", p50_ex, p95_ex);
 
@@ -1291,10 +1295,7 @@ fn cross_thread_message_visibility() {
 
     // Verify each thread's messages are searchable
     for &thread_name in &thread_names {
-        let resp = search(
-            &pool,
-            &SearchQuery::messages(thread_name, project_id),
-        );
+        let resp = search(&pool, &SearchQuery::messages(thread_name, project_id));
         assert!(
             !resp.results.is_empty(),
             "thread '{thread_name}' messages should be searchable"
@@ -1344,7 +1345,10 @@ fn steady_state_latency_after_warmup() {
         let start = Instant::now();
         let resp = search(&pool, &SearchQuery::messages("steady", project_id));
         latencies.push(start.elapsed().as_micros() as u64);
-        assert!(!resp.results.is_empty(), "warm search should return results");
+        assert!(
+            !resp.results.is_empty(),
+            "warm search should return results"
+        );
     }
 
     latencies.sort_unstable();
@@ -1353,13 +1357,19 @@ fn steady_state_latency_after_warmup() {
     let p99 = percentile(&latencies, 99);
     let stddev = {
         let mean = latencies.iter().sum::<u64>() as f64 / latencies.len() as f64;
-        let variance =
-            latencies.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / latencies.len() as f64;
+        let variance = latencies
+            .iter()
+            .map(|&x| (x as f64 - mean).powi(2))
+            .sum::<f64>()
+            / latencies.len() as f64;
         variance.sqrt()
     };
 
     eprintln!("steady_state_latency_after_warmup ({n_samples} samples):");
-    eprintln!("  p50={}μs, p95={}μs, p99={}μs, stddev={:.0}μs", p50, p95, p99, stddev);
+    eprintln!(
+        "  p50={}μs, p95={}μs, p99={}μs, stddev={:.0}μs",
+        p50, p95, p99, stddev
+    );
 
     // Steady-state latency should be reasonable
     assert!(
@@ -1414,10 +1424,7 @@ fn structured_artifact_summary() {
 
     for _ in 0..n_queries {
         let start = Instant::now();
-        let resp = search(
-            &pool,
-            &SearchQuery::messages("artifact", project_id),
-        );
+        let resp = search(&pool, &SearchQuery::messages("artifact", project_id));
         search_latencies.push(start.elapsed().as_micros() as u64);
         result_counts.push(resp.results.len());
     }
@@ -1457,14 +1464,8 @@ fn structured_artifact_summary() {
     eprintln!("{summary}");
 
     // Validate the metrics are sane
-    assert!(
-        !write_latencies.is_empty(),
-        "write latencies collected"
-    ); // assertion 75
-    assert!(
-        !search_latencies.is_empty(),
-        "search latencies collected"
-    ); // assertion 76
+    assert!(!write_latencies.is_empty(), "write latencies collected"); // assertion 75
+    assert!(!search_latencies.is_empty(), "search latencies collected"); // assertion 76
     assert!(
         result_counts.iter().all(|&c| c > 0),
         "all searches returned results"

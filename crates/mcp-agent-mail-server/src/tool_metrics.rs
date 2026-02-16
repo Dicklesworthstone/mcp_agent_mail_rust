@@ -186,7 +186,9 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
-    DbConn::open_file(&path).ok()
+    let conn = DbConn::open_file(&path).ok()?;
+    let _ = conn.execute_raw("PRAGMA busy_timeout = 60000;");
+    Some(conn)
 }
 
 fn ensure_metrics_schema(conn: &DbConn) {
@@ -244,6 +246,8 @@ fn persist_snapshot_rows(
                  latency_avg_ms, latency_min_ms, latency_max_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms, latency_is_slow\
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
+    conn.execute_sync("BEGIN IMMEDIATE", &[]).map_err(|e| e.to_string())?;
+
     for entry in snapshot {
         let capabilities_json =
             serde_json::to_string(&entry.capabilities).unwrap_or_else(|_| "[]".to_string());
@@ -264,8 +268,12 @@ fn persist_snapshot_rows(
             latency.map_or(Value::Null, |lat| Value::Double(lat.p99_ms)),
             Value::BigInt(i64::from(latency.is_some_and(|lat| lat.is_slow))),
         ];
-        conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
+        if let Err(e) = conn.execute_sync(sql, &params) {
+            let _ = conn.execute_sync("ROLLBACK", &[]);
+            return Err(e.to_string());
+        }
     }
+    conn.execute_sync("COMMIT", &[]).map_err(|e| e.to_string())?;
     Ok(())
 }
 

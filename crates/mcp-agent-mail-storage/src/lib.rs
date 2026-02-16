@@ -1774,8 +1774,16 @@ fn coalescer_pool_worker(
         {
             let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
             while batch.len() < COALESCER_MAX_BATCH_SIZE {
-                if let Some(fields) = q.pop_front() {
-                    batch.push(fields);
+                let next = q.front();
+                if let Some(next_fields) = next {
+                    if let Some(first) = batch.first() {
+                        if next_fields.git_author_name != first.git_author_name
+                            || next_fields.git_author_email != first.git_author_email
+                        {
+                            break;
+                        }
+                    }
+                    batch.push(q.pop_front().unwrap());
                 } else {
                     break;
                 }

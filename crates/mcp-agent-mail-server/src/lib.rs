@@ -713,6 +713,34 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         .build()
 }
 
+fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
+    // Only initialize if V3 (Lexical/Hybrid) or Shadow mode is enabled.
+    // This avoids creating the index directory if the user sticks to Legacy FTS5.
+    let rollout = &config.search_rollout;
+    let uses_v3 = rollout.engine.uses_lexical()
+        || rollout.surface_overrides.values().any(|e| e.uses_lexical());
+
+    if !uses_v3 && !rollout.should_shadow() {
+        return;
+    }
+
+    let index_dir = config.storage_root.join("search_index");
+    match mcp_agent_mail_db::search_v3::init_bridge(&index_dir) {
+        Ok(()) => {
+            tracing::info!(
+                "[startup-search] initialized search v3 bridge at {}",
+                index_dir.display()
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                "[startup-search] failed to initialize search v3 bridge: {}",
+                err
+            );
+        }
+    }
+}
+
 fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
     match mcp_agent_mail_storage::heal_archive_locks(config) {
         Ok(report) => {
@@ -769,6 +797,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
     heal_storage_lock_artifacts(config);
+    init_search_bridge(config);
     mcp_agent_mail_storage::wbq_start();
     cleanup::start(config);
     ack_ttl::start(config);
@@ -848,6 +877,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 
     // ── 2. Background workers (same as run_http) ────────────────────
     heal_storage_lock_artifacts(config);
+    init_search_bridge(config);
     mcp_agent_mail_storage::wbq_start();
     cleanup::start(config);
     ack_ttl::start(config);

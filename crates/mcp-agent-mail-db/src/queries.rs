@@ -16,6 +16,7 @@ use crate::models::{
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
 use asupersync::Outcome;
+use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use sqlmodel::prelude::*;
 use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
 use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
@@ -333,6 +334,16 @@ const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_
      FROM file_reservations";
 const AGENT_LINK_SELECT_COLUMNS_SQL: &str = "SELECT id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts \
      FROM agent_links";
+
+/// `SQLite` predicate for active reservations across legacy sentinel values.
+pub const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
+    OR (typeof(released_ts) IN ('integer', 'real') AND released_ts <= 0) \
+    OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none')) \
+    OR (typeof(released_ts) = 'text' \
+      AND length(trim(released_ts)) > 0 \
+      AND trim(released_ts) GLOB '*[0-9]*' \
+      AND trim(released_ts) NOT GLOB '*[^0-9.+-]*' \
+      AND CAST(trim(released_ts) AS REAL) <= 0)";
 
 /// Decode `ProductRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `product_uid`, `name`, `created_at`.
@@ -1224,54 +1235,6 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
                 Outcome::Ok(agent)
             },
         ),
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
-}
-
-/// Get multiple agents by ID.
-pub async fn get_agents_by_ids(
-    cx: &Cx,
-    pool: &DbPool,
-    agent_ids: &[i64],
-) -> Outcome<Vec<AgentRow>, DbError> {
-    if agent_ids.is_empty() {
-        return Outcome::Ok(Vec::new());
-    }
-
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
-    let placeholders = placeholders(agent_ids.len());
-    let sql = format!(
-        "SELECT id, project_id, name, program, model, task_description, \
-         inception_ts, last_active_ts, attachments_policy, contact_policy \
-         FROM agents WHERE id IN ({placeholders})"
-    );
-
-    let capped_ids = &agent_ids[..agent_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len());
-    for id in capped_ids {
-        params.push(Value::BigInt(*id));
-    }
-
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let agent = decode_agent_row_indexed(&row);
-                crate::cache::read_cache().put_agent(&agent);
-                out.push(agent);
-            }
-            Outcome::Ok(out)
-        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -3455,6 +3418,45 @@ pub async fn create_file_reservations(
     // Batch all reservation inserts in a single transaction (1 fsync instead of N).
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
+    // Check for conflicting active exclusive reservations held by others to prevent TOCTOU races.
+    let conflict_sql = format!(
+        "SELECT path_pattern FROM file_reservations \
+         WHERE project_id = ? AND agent_id != ? \
+           AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
+           AND exclusive = 1"
+    );
+    let conflict_params = [
+        Value::BigInt(project_id),
+        Value::BigInt(agent_id),
+        Value::BigInt(now),
+    ];
+    let active_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_query(cx, &tracked, &conflict_sql, &conflict_params).await)
+    );
+
+    let mut active_patterns = Vec::with_capacity(active_rows.len());
+    for row in active_rows {
+        if let Ok(pat) = row.get_named::<String>("path_pattern") {
+            active_patterns.push(CompiledPattern::new(&pat));
+        }
+    }
+
+    for path in paths {
+        let req_pat = CompiledPattern::new(path);
+        for active_pat in &active_patterns {
+            if req_pat.overlaps(active_pat) {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::ResourceBusy(format!(
+                    "Reservation conflict: '{}' overlaps with active exclusive reservation '{}'",
+                    path,
+                    active_pat.normalized()
+                )));
+            }
+        }
+    }
+
     let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
     for path in paths {
         let mut row = FileReservationRow {
@@ -3519,7 +3521,7 @@ pub async fn get_active_reservations(
 
     let sql = format!(
         "{FILE_RESERVATION_SELECT_COLUMNS_SQL} \
-         WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ?"
+         WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
     );
     let params = [Value::BigInt(project_id), Value::BigInt(now)];
 

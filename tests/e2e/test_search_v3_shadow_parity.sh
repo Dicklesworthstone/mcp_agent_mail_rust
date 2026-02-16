@@ -1050,13 +1050,16 @@ else
     search_v3_case_summary "cutover_gate" "fail" --message "ready=false overlap_bps=${mean_overlap_bps}"
 fi
 
+# Generate suite-level Search V3 summary artifacts before contract checks.
+search_v3_suite_summary
+
 e2e_case_banner "Artifact contract"
 
 e2e_assert_file_exists "parity case reports jsonl" "${PARITY_REPORTS_JSONL}"
 e2e_assert_file_exists "cutover readiness report" "${CUTOVER_REPORT}"
 e2e_assert_file_exists "search_v3 run manifest" "${SEARCH_V3_RUN_DIR}/run_manifest.json"
 e2e_assert_file_exists "search_v3 suite summary json" "${SEARCH_V3_RUN_DIR}/summaries/suite_summary.json"
-e2e_assert_file_exists "search_v3 suite summary text" "${SEARCH_V3_RUN_DIR}/summaries/suite_summary.txt"
+e2e_assert_file_exists "search_v3 suite summary log" "${SEARCH_V3_RUN_DIR}/logs/summary.log"
 
 REPORT_COUNT="$(wc -l < "${PARITY_REPORTS_JSONL}" | tr -d ' ')"
 e2e_assert_eq "parity report count matches case count" "${EXPECTED_CASE_COUNT}" "${REPORT_COUNT}"
@@ -1072,6 +1075,4 @@ fi
 # ---------------------------------------------------------------------------
 
 e2e_summary
-search_v3_suite_summary
 search_v3_log "Shadow parity artifacts: ${PARITY_DIR}"
-

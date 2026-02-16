@@ -20,11 +20,11 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::messaging::{enqueue_message_semantic_index, try_write_message_archive};
-use crate::pattern_overlap::CompiledPattern;
 use crate::reservation_index::{ReservationIndex, ReservationRef};
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
 };
+use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
 /// Granted reservation record
 #[derive(Debug, Clone, Serialize, Deserialize)]

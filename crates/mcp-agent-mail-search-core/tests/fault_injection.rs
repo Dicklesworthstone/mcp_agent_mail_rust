@@ -226,6 +226,177 @@ impl IndexLifecycle for FaultyLifecycle {
     }
 }
 
+/// Mutable in-memory source for CRUD transition integration tests.
+struct MutableSource {
+    docs: Mutex<Vec<Document>>,
+}
+
+impl MutableSource {
+    fn new(docs: Vec<Document>) -> Self {
+        Self {
+            docs: Mutex::new(docs),
+        }
+    }
+
+    fn upsert(&self, doc: Document) {
+        let mut docs = self.docs.lock().expect("lock");
+        if let Some(existing) = docs
+            .iter_mut()
+            .find(|existing| existing.id == doc.id && existing.kind == doc.kind)
+        {
+            *existing = doc;
+            return;
+        }
+        docs.push(doc);
+    }
+
+    fn delete(&self, id: i64, kind: DocKind) -> bool {
+        let mut docs = self.docs.lock().expect("lock");
+        let before = docs.len();
+        docs.retain(|d| !(d.id == id && d.kind == kind));
+        docs.len() != before
+    }
+
+    fn snapshot_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .docs
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|doc| doc_key(doc.id, doc.kind))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+}
+
+impl DocumentSource for MutableSource {
+    fn fetch_batch(&self, ids: &[i64]) -> SearchResult<Vec<Document>> {
+        Ok(self
+            .docs
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|doc| ids.contains(&doc.id))
+            .cloned()
+            .collect())
+    }
+
+    fn fetch_all_batched(&self, batch_size: usize, offset: usize) -> SearchResult<Vec<Document>> {
+        Ok(self
+            .docs
+            .lock()
+            .expect("lock")
+            .iter()
+            .skip(offset)
+            .take(batch_size)
+            .cloned()
+            .collect())
+    }
+
+    fn total_count(&self) -> SearchResult<usize> {
+        Ok(self.docs.lock().expect("lock").len())
+    }
+}
+
+/// Stateful lifecycle that applies upsert/delete changes by `(kind,id)` key.
+struct CrudLifecycle {
+    docs: Mutex<HashMap<(DocKind, i64), Document>>,
+    ready: AtomicBool,
+}
+
+impl CrudLifecycle {
+    fn new() -> Self {
+        Self {
+            docs: Mutex::new(HashMap::new()),
+            ready: AtomicBool::new(true),
+        }
+    }
+
+    fn with_docs(docs: Vec<Document>) -> Self {
+        let mut seeded = HashMap::new();
+        for doc in docs {
+            seeded.insert((doc.kind, doc.id), doc);
+        }
+        Self {
+            docs: Mutex::new(seeded),
+            ready: AtomicBool::new(true),
+        }
+    }
+
+    fn get_doc(&self, id: i64, kind: DocKind) -> Option<Document> {
+        self.docs.lock().expect("lock").get(&(kind, id)).cloned()
+    }
+
+    fn snapshot_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .docs
+            .lock()
+            .expect("lock")
+            .keys()
+            .map(|(kind, id)| doc_key(*id, *kind))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+}
+
+impl IndexLifecycle for CrudLifecycle {
+    fn rebuild(&self) -> SearchResult<IndexStats> {
+        self.docs.lock().expect("lock").clear();
+        Ok(IndexStats {
+            docs_indexed: 0,
+            docs_removed: 0,
+            elapsed_ms: 0,
+            warnings: Vec::new(),
+        })
+    }
+
+    fn update_incremental(&self, changes: &[DocChange]) -> SearchResult<usize> {
+        {
+            let mut docs = self.docs.lock().expect("lock");
+            for change in changes {
+                match change {
+                    DocChange::Upsert(doc) => {
+                        docs.insert((doc.kind, doc.id), doc.clone());
+                    }
+                    DocChange::Delete { id, kind } => {
+                        docs.remove(&(*kind, *id));
+                    }
+                }
+            }
+        }
+        Ok(changes.len())
+    }
+
+    fn health(&self) -> IndexHealth {
+        let docs = self.docs.lock().expect("lock");
+        IndexHealth {
+            ready: self.ready.load(Ordering::Relaxed),
+            doc_count: docs.len(),
+            size_bytes: None,
+            last_updated_ts: None,
+            status_message: "healthy".to_owned(),
+        }
+    }
+}
+
+fn sample_doc(id: i64, kind: DocKind, title: &str, body: &str) -> Document {
+    Document {
+        id,
+        kind,
+        body: body.to_owned(),
+        title: title.to_owned(),
+        project_id: Some(1),
+        created_ts: 1_700_000_000_000_000 + id,
+        metadata: HashMap::new(),
+    }
+}
+
+fn doc_key(id: i64, kind: DocKind) -> String {
+    format!("{kind}:{id}")
+}
+
 /// Helper to create a temp layout with a valid checkpoint
 fn setup_healthy_index(
     tmp: &tempfile::TempDir,
@@ -617,6 +788,202 @@ fn full_reindex_fails_on_incremental_oom_after_partial_progress() {
     assert_eq!(applied.len(), 2, "Expected 2 successful batch applies");
     assert_eq!(applied[0], 10);
     assert_eq!(applied[1], 10);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Section 3.5: Incremental CRUD + rebuild consistency
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn incremental_crud_transitions_stay_consistent_with_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scope = test_scope();
+    let schema = test_schema();
+    let layout = IndexLayout::new(tmp.path());
+
+    let source = MutableSource::new(vec![
+        sample_doc(1, DocKind::Message, "m1", "message-1"),
+        sample_doc(2, DocKind::Agent, "agent-a", "agent profile"),
+        sample_doc(3, DocKind::Project, "proj-a", "project profile"),
+    ]);
+    let lifecycle = CrudLifecycle::new();
+
+    // Seed index from source.
+    let initial = full_reindex(
+        &source,
+        &lifecycle,
+        &layout,
+        &scope,
+        &schema,
+        &ReindexConfig {
+            batch_size: 2,
+            write_checkpoint: true,
+        },
+        &NoProgress,
+    )
+    .unwrap();
+    assert_eq!(initial.stats.docs_indexed, 3);
+    assert!(initial.checkpoint_written);
+
+    let report = check_consistency(
+        &source,
+        &lifecycle,
+        &layout,
+        &scope,
+        &schema,
+        &ConsistencyConfig::default(),
+    )
+    .unwrap();
+    assert!(report.healthy);
+    assert!(!report.rebuild_recommended);
+
+    // CREATE
+    let created = sample_doc(4, DocKind::Message, "m4", "message-4");
+    source.upsert(created.clone());
+    lifecycle
+        .update_incremental(&[DocChange::Upsert(created)])
+        .unwrap();
+
+    // UPDATE (same id/kind with changed payload)
+    let updated_agent = sample_doc(2, DocKind::Agent, "agent-a-v2", "agent profile updated");
+    source.upsert(updated_agent.clone());
+    lifecycle
+        .update_incremental(&[DocChange::Upsert(updated_agent.clone())])
+        .unwrap();
+    let indexed_agent = lifecycle.get_doc(2, DocKind::Agent).expect("agent present");
+    assert_eq!(indexed_agent.title, updated_agent.title);
+    assert_eq!(indexed_agent.body, updated_agent.body);
+
+    // DELETE
+    assert!(source.delete(3, DocKind::Project));
+    lifecycle
+        .update_incremental(&[DocChange::Delete {
+            id: 3,
+            kind: DocKind::Project,
+        }])
+        .unwrap();
+
+    let post_crud = check_consistency(
+        &source,
+        &lifecycle,
+        &layout,
+        &scope,
+        &schema,
+        &ConsistencyConfig::default(),
+    )
+    .unwrap();
+    assert!(post_crud.healthy);
+    assert!(!post_crud.rebuild_recommended);
+    assert_eq!(source.total_count().unwrap(), lifecycle.health().doc_count);
+    assert_eq!(source.snapshot_keys(), lifecycle.snapshot_keys());
+
+    // Compare incremental state against a fresh full rebuild from the same source.
+    let rebuild_lifecycle = CrudLifecycle::new();
+    let rebuild = full_reindex(
+        &source,
+        &rebuild_lifecycle,
+        &layout,
+        &scope,
+        &schema,
+        &ReindexConfig {
+            batch_size: 2,
+            write_checkpoint: false,
+        },
+        &NoProgress,
+    )
+    .unwrap();
+    assert_eq!(rebuild.stats.docs_indexed, source.total_count().unwrap());
+    assert_eq!(lifecycle.snapshot_keys(), rebuild_lifecycle.snapshot_keys());
+
+    let rebuilt_agent = rebuild_lifecycle
+        .get_doc(2, DocKind::Agent)
+        .expect("rebuilt agent present");
+    assert_eq!(rebuilt_agent.title, "agent-a-v2");
+    assert_eq!(rebuilt_agent.body, "agent profile updated");
+}
+
+#[test]
+fn repair_recovers_from_failed_checkpoint_and_drifted_index_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scope = test_scope();
+    let schema = test_schema();
+    let layout = IndexLayout::new(tmp.path());
+    layout.ensure_dirs(&scope, &schema).unwrap();
+
+    let source = MutableSource::new(vec![
+        sample_doc(1, DocKind::Message, "m1", "message-1"),
+        sample_doc(2, DocKind::Agent, "agent-a", "agent profile"),
+        sample_doc(3, DocKind::Project, "proj-a", "project profile"),
+        sample_doc(4, DocKind::Thread, "thread-a", "thread summary"),
+    ]);
+
+    // Seed lifecycle with stale subset: source has 4 docs, index has only 2.
+    let lifecycle = CrudLifecycle::with_docs(vec![
+        sample_doc(1, DocKind::Message, "m1", "message-1"),
+        sample_doc(2, DocKind::Agent, "agent-a", "agent profile"),
+    ]);
+
+    // Force checkpoint failure state to require recovery.
+    let failed = IndexCheckpoint {
+        schema_hash: schema.clone(),
+        docs_indexed: 2,
+        started_ts: 1_700_000_000_000_000,
+        completed_ts: None,
+        max_version: 1_700_000_000_000_002,
+        success: false,
+    };
+    let lexical_dir = layout.lexical_dir(&scope, &schema);
+    failed.write_to(&lexical_dir).unwrap();
+
+    let pre_repair = check_consistency(
+        &source,
+        &lifecycle,
+        &layout,
+        &scope,
+        &schema,
+        &ConsistencyConfig::default(),
+    )
+    .unwrap();
+    assert!(pre_repair.rebuild_recommended);
+    assert!(
+        pre_repair
+            .findings
+            .iter()
+            .any(|f| f.category == "incomplete_build")
+    );
+    assert!(
+        pre_repair
+            .findings
+            .iter()
+            .any(|f| f.category == "count_mismatch")
+    );
+
+    let (_, reindex_result) =
+        repair_if_needed(&source, &lifecycle, &layout, &scope, &schema, &NoProgress).unwrap();
+    let reindex_result = reindex_result.expect("repair should run reindex");
+    assert!(reindex_result.checkpoint_written);
+    assert_eq!(
+        reindex_result.stats.docs_indexed,
+        source.total_count().unwrap()
+    );
+
+    let checkpoint = IndexCheckpoint::read_from(&lexical_dir).unwrap();
+    assert!(checkpoint.success);
+    assert!(checkpoint.completed_ts.is_some());
+    assert_eq!(checkpoint.docs_indexed, source.total_count().unwrap());
+
+    let post_repair = check_consistency(
+        &source,
+        &lifecycle,
+        &layout,
+        &scope,
+        &schema,
+        &ConsistencyConfig::default(),
+    )
+    .unwrap();
+    assert!(post_repair.healthy);
+    assert!(!post_repair.rebuild_recommended);
+    assert_eq!(source.snapshot_keys(), lifecycle.snapshot_keys());
 }
 
 // ═══════════════════════════════════════════════════════════════════════

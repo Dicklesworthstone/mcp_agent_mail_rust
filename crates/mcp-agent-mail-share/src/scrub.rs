@@ -204,122 +204,130 @@ pub fn scrub_snapshot(
             0
         };
 
-        // Iterate messages and scrub
+        // Iterate messages and scrub in chunks to avoid OOM
         let mut secrets_replaced: i64 = 0;
         let mut attachments_sanitized: i64 = 0;
         let mut bodies_redacted: i64 = 0;
         let mut attachments_cleared: i64 = 0;
 
-        let message_rows = conn
-            .query_sync(
-                "SELECT id, subject, body_md, attachments FROM messages",
-                &[],
-            )
-            .map_err(|e| ShareError::Sqlite {
-                message: format!("SELECT messages failed: {e}"),
-            })?;
+        let mut last_id = 0i64;
+        loop {
+            let message_rows = conn
+                .query_sync(
+                    "SELECT id, subject, body_md, attachments FROM messages WHERE id > ? ORDER BY id ASC LIMIT 500",
+                    &[SqlValue::BigInt(last_id)],
+                )
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("SELECT messages failed: {e}"),
+                })?;
 
-        // Collect messages to process (avoid borrowing conn during iteration)
-        let messages: Vec<(i64, String, String, String)> = message_rows
-            .iter()
-            .map(|row| {
-                let id: i64 = row.get_named("id").unwrap_or(0);
-                let subject: String = row.get_named("subject").unwrap_or_default();
-                let body_md: String = row.get_named("body_md").unwrap_or_default();
-                let attachments: String = row.get_named("attachments").unwrap_or_default();
-                (id, subject, body_md, attachments)
-            })
-            .collect();
-
-        for (msg_id, subject_original, body_original, attachments_value) in &messages {
-            let mut subject = subject_original.clone();
-            let mut body = body_original.clone();
-            let mut subj_replacements: i64 = 0;
-            let mut body_replacements: i64 = 0;
-
-            if cfg.scrub_secrets {
-                let (s, sr) = scrub_text(&subject);
-                subject = s;
-                subj_replacements = sr;
-                let (b, br) = scrub_text(&body);
-                body = b;
-                body_replacements = br;
-            }
-            secrets_replaced += subj_replacements + body_replacements;
-
-            // Parse attachments JSON
-            let mut attachments_data: Vec<Value> = parse_attachments_json(attachments_value);
-            let mut attachments_updated = false;
-            let mut attachment_replacements: i64 = 0;
-
-            // Drop attachments if preset requires it
-            if cfg.drop_attachments && !attachments_data.is_empty() {
-                attachments_data = Vec::new();
-                attachments_cleared += 1;
-                attachments_updated = true;
+            if message_rows.is_empty() {
+                break;
             }
 
-            // Scrub secrets in attachment structure
-            if cfg.scrub_secrets && !attachments_data.is_empty() {
-                let (sanitized, rep_count, keys_removed) =
-                    scrub_structure(&Value::Array(attachments_data.clone()));
-                attachment_replacements += rep_count;
-                if let Value::Array(arr) = sanitized {
-                    if arr != attachments_data {
-                        attachments_data = arr;
+            // Collect messages to process (avoid borrowing conn during iteration)
+            let messages: Vec<(i64, String, String, String)> = message_rows
+                .iter()
+                .map(|row| {
+                    let id: i64 = row.get_named("id").unwrap_or(0);
+                    let subject: String = row.get_named("subject").unwrap_or_default();
+                    let body_md: String = row.get_named("body_md").unwrap_or_default();
+                    let attachments: String = row.get_named("attachments").unwrap_or_default();
+                    (id, subject, body_md, attachments)
+                })
+                .collect();
+
+            for (msg_id, subject_original, body_original, attachments_value) in &messages {
+                last_id = *msg_id;
+                let mut subject = subject_original.clone();
+                let mut body = body_original.clone();
+                let mut subj_replacements: i64 = 0;
+                let mut body_replacements: i64 = 0;
+
+                if cfg.scrub_secrets {
+                    let (s, sr) = scrub_text(&subject);
+                    subject = s;
+                    subj_replacements = sr;
+                    let (b, br) = scrub_text(&body);
+                    body = b;
+                    body_replacements = br;
+                }
+                secrets_replaced += subj_replacements + body_replacements;
+
+                // Parse attachments JSON
+                let mut attachments_data: Vec<Value> = parse_attachments_json(attachments_value);
+                let mut attachments_updated = false;
+                let mut attachment_replacements: i64 = 0;
+
+                // Drop attachments if preset requires it
+                if cfg.drop_attachments && !attachments_data.is_empty() {
+                    attachments_data = Vec::new();
+                    attachments_cleared += 1;
+                    attachments_updated = true;
+                }
+
+                // Scrub secrets in attachment structure
+                if cfg.scrub_secrets && !attachments_data.is_empty() {
+                    let (sanitized, rep_count, keys_removed) =
+                        scrub_structure(&Value::Array(attachments_data.clone()), 0);
+                    attachment_replacements += rep_count;
+                    if let Value::Array(arr) = sanitized {
+                        if arr != attachments_data {
+                            attachments_data = arr;
+                            attachments_updated = true;
+                        }
+                    }
+                    if keys_removed > 0 {
                         attachments_updated = true;
                     }
                 }
-                if keys_removed > 0 {
-                    attachments_updated = true;
+
+                // Write back attachment changes
+                if attachments_updated {
+                    let sanitized_json = serde_json::to_string(&attachments_data)
+                        .unwrap_or_else(|_| "[]".to_string());
+                    exec_count(
+                        &conn,
+                        "UPDATE messages SET attachments = ? WHERE id = ?",
+                        &[SqlValue::Text(sanitized_json), SqlValue::BigInt(*msg_id)],
+                    )?;
                 }
-            }
 
-            // Write back attachment changes
-            if attachments_updated {
-                let sanitized_json =
-                    serde_json::to_string(&attachments_data).unwrap_or_else(|_| "[]".to_string());
-                exec_count(
-                    &conn,
-                    "UPDATE messages SET attachments = ? WHERE id = ?",
-                    &[SqlValue::Text(sanitized_json), SqlValue::BigInt(*msg_id)],
-                )?;
-            }
+                // Write back subject changes
+                if subject != *subject_original {
+                    exec_count(
+                        &conn,
+                        "UPDATE messages SET subject = ? WHERE id = ?",
+                        &[SqlValue::Text(subject), SqlValue::BigInt(*msg_id)],
+                    )?;
+                }
 
-            // Write back subject changes
-            if subject != *subject_original {
-                exec_count(
-                    &conn,
-                    "UPDATE messages SET subject = ? WHERE id = ?",
-                    &[SqlValue::Text(subject), SqlValue::BigInt(*msg_id)],
-                )?;
-            }
-
-            // Redact body or write back secret-scrubbed body
-            if cfg.redact_body {
-                let placeholder = cfg
-                    .body_placeholder
-                    .unwrap_or("[Message body redacted]")
-                    .to_string();
-                if *body_original != placeholder {
-                    bodies_redacted += 1;
+                // Redact body or write back secret-scrubbed body
+                if cfg.redact_body {
+                    let placeholder = cfg
+                        .body_placeholder
+                        .unwrap_or("[Message body redacted]")
+                        .to_string();
+                    if *body_original != placeholder {
+                        bodies_redacted += 1;
+                        exec_count(
+                            &conn,
+                            "UPDATE messages SET body_md = ? WHERE id = ?",
+                            &[SqlValue::Text(placeholder), SqlValue::BigInt(*msg_id)],
+                        )?;
+                    }
+                } else if body != *body_original {
                     exec_count(
                         &conn,
                         "UPDATE messages SET body_md = ? WHERE id = ?",
-                        &[SqlValue::Text(placeholder), SqlValue::BigInt(*msg_id)],
+                        &[SqlValue::Text(body), SqlValue::BigInt(*msg_id)],
                     )?;
                 }
-            } else if body != *body_original {
-                exec_count(
-                    &conn,
-                    "UPDATE messages SET body_md = ? WHERE id = ?",
-                    &[SqlValue::Text(body), SqlValue::BigInt(*msg_id)],
-                )?;
-            }
 
-            secrets_replaced += attachment_replacements;
-            if attachments_updated || attachment_replacements > 0 {
-                attachments_sanitized += 1;
+                secrets_replaced += attachment_replacements;
+                if attachments_updated || attachment_replacements > 0 {
+                    attachments_sanitized += 1;
+                }
             }
         }
 
@@ -397,7 +405,10 @@ fn parse_attachments_json(value: &str) -> Vec<Value> {
 
 /// Recursively scrub secrets in a JSON structure.
 /// Returns `(scrubbed_value, secret_replacement_count, keys_removed_count)`.
-fn scrub_structure(value: &Value) -> (Value, i64, i64) {
+fn scrub_structure(value: &Value, depth: usize) -> (Value, i64, i64) {
+    if depth > 20 {
+        return (value.clone(), 0, 0);
+    }
     match value {
         Value::String(s) => {
             let (scrubbed, count) = scrub_text(s);
@@ -409,7 +420,7 @@ fn scrub_structure(value: &Value) -> (Value, i64, i64) {
             let new_arr: Vec<Value> = arr
                 .iter()
                 .map(|item| {
-                    let (v, r, k) = scrub_structure(item);
+                    let (v, r, k) = scrub_structure(item, depth + 1);
                     total_reps += r;
                     total_keys += k;
                     v
@@ -430,7 +441,7 @@ fn scrub_structure(value: &Value) -> (Value, i64, i64) {
                     // Remove the key entirely (don't add to new_obj)
                     continue;
                 }
-                let (v, r, k) = scrub_structure(val);
+                let (v, r, k) = scrub_structure(val, depth + 1);
                 total_reps += r;
                 total_keys += k;
                 new_obj.insert(key.clone(), v);
@@ -567,7 +578,7 @@ mod tests {
         let input: Value = serde_json::from_str(
             r#"[{"type":"file","path":"data.json","download_url":"https://secret.example.com","authorization":"Bearer abc"}]"#,
         ).unwrap();
-        let (result, _, keys_removed) = scrub_structure(&input);
+        let (result, _, keys_removed) = scrub_structure(&input, 0);
         let arr = result.as_array().unwrap();
         let obj = arr[0].as_object().unwrap();
         assert!(!obj.contains_key("download_url"));
@@ -592,7 +603,7 @@ mod tests {
                 ]
             }
         }]);
-        let (result, replacements, keys_removed) = scrub_structure(&input);
+        let (result, replacements, keys_removed) = scrub_structure(&input, 0);
         assert_eq!(replacements, 2);
         assert_eq!(keys_removed, 0);
 
@@ -617,7 +628,7 @@ mod tests {
             " signed_url ": "https://secret.example.com",
             "headers\t": {"x-trace":"1"}
         }]);
-        let (result, replacements, keys_removed) = scrub_structure(&input);
+        let (result, replacements, keys_removed) = scrub_structure(&input, 0);
         let arr = result.as_array().unwrap();
         let obj = arr[0].as_object().unwrap();
 

@@ -30,6 +30,8 @@ I also performed deep dives into the following areas and found them to be robust
 - **Caching:** `crates/mcp-agent-mail-db/src/cache.rs` (S3-FIFO eviction, invalidation logic).
 - **Coalescing:** `crates/mcp-agent-mail-db/src/coalesce.rs` (Read singleflight) and `crates/mcp-agent-mail-storage/src/lib.rs` (Commit coalescer).
 - **Products:** `crates/mcp-agent-mail-tools/src/products.rs` (Cross-project search/inbox).
+- **Static Render:** `crates/mcp-agent-mail-share/src/static_render.rs` (Static site generation with defense-in-depth redaction).
+- **Search Service:** `crates/mcp-agent-mail-db/src/search_service.rs` (Hybrid search orchestration, fallback logic, hydration).
 
 ## Conclusion
 The codebase is now in a significantly more robust state. The critical persistence gap on shutdown has been closed, and several reliability/performance issues have been resolved.

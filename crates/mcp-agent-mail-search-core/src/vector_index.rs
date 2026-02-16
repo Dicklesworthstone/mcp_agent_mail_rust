@@ -318,7 +318,7 @@ pub struct VectorIndex {
     config: VectorIndexConfig,
     entries: Vec<IndexEntry>,
     /// Map from (`doc_id`, `doc_kind`) to index position
-    doc_index: HashMap<(i64, String), usize>,
+    doc_index: HashMap<(i64, DocKind), usize>,
 }
 
 impl Default for VectorIndex {
@@ -351,7 +351,7 @@ impl VectorIndex {
             )));
         }
 
-        let key = (entry.metadata.doc_id, entry.metadata.doc_kind.to_string());
+        let key = (entry.metadata.doc_id, entry.metadata.doc_kind);
 
         if let Some(&pos) = self.doc_index.get(&key) {
             // Update existing entry
@@ -378,7 +378,7 @@ impl VectorIndex {
     ///
     /// Returns true if the vector was found and removed.
     pub fn remove(&mut self, doc_id: i64, doc_kind: DocKind) -> bool {
-        let key = (doc_id, doc_kind.to_string());
+        let key = (doc_id, doc_kind);
         if let Some(pos) = self.doc_index.remove(&key) {
             // Swap-remove for O(1) removal
             self.entries.swap_remove(pos);
@@ -388,7 +388,7 @@ impl VectorIndex {
                 let swapped = &self.entries[pos];
                 let swapped_key = (
                     swapped.metadata.doc_id,
-                    swapped.metadata.doc_kind.to_string(),
+                    swapped.metadata.doc_kind,
                 );
                 self.doc_index.insert(swapped_key, pos);
             }
@@ -460,14 +460,14 @@ impl VectorIndex {
     /// Get a vector by document reference.
     #[must_use]
     pub fn get(&self, doc_id: i64, doc_kind: DocKind) -> Option<&IndexEntry> {
-        let key = (doc_id, doc_kind.to_string());
+        let key = (doc_id, doc_kind);
         self.doc_index.get(&key).map(|&pos| &self.entries[pos])
     }
 
     /// Check if a document exists in the index.
     #[must_use]
     pub fn contains(&self, doc_id: i64, doc_kind: DocKind) -> bool {
-        let key = (doc_id, doc_kind.to_string());
+        let key = (doc_id, doc_kind);
         self.doc_index.contains_key(&key)
     }
 

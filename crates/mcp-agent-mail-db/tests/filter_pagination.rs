@@ -24,8 +24,8 @@ use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 
 use mcp_agent_mail_db::search_planner::{Importance, RankingMode, SearchQuery, TimeRange};
-use mcp_agent_mail_db::search_service::{execute_search_simple, SimpleSearchResponse};
-use mcp_agent_mail_db::{queries, DbPool, DbPoolConfig};
+use mcp_agent_mail_db::search_service::{SimpleSearchResponse, execute_search_simple};
+use mcp_agent_mail_db::{DbPool, DbPoolConfig, queries};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -83,10 +83,8 @@ fn seed_agent(pool: &DbPool, project_id: i64, name: &str) -> i64 {
         let pool = pool.clone();
         let name = name.to_string();
         async move {
-            match queries::register_agent(
-                &cx, &pool, project_id, &name, "test", "test", None, None,
-            )
-            .await
+            match queries::register_agent(&cx, &pool, project_id, &name, "test", "test", None, None)
+                .await
             {
                 Outcome::Ok(a) => a.id.expect("agent id"),
                 other => panic!("register_agent failed: {other:?}"),
@@ -214,9 +212,18 @@ fn date_range_min_ts_only() {
 
     let resp = search(&pool, &q);
     let found: HashSet<i64> = result_ids(&resp).into_iter().collect();
-    assert!(found.contains(&ids[2]), "msg2 at boundary should be included");
-    assert!(found.contains(&ids[3]), "msg3 after boundary should be included");
-    assert!(found.contains(&ids[4]), "msg4 after boundary should be included");
+    assert!(
+        found.contains(&ids[2]),
+        "msg2 at boundary should be included"
+    );
+    assert!(
+        found.contains(&ids[3]),
+        "msg3 after boundary should be included"
+    );
+    assert!(
+        found.contains(&ids[4]),
+        "msg4 after boundary should be included"
+    );
     assert!(!found.contains(&ids[0]), "msg0 before boundary excluded");
     assert!(!found.contains(&ids[1]), "msg1 before boundary excluded");
 }
@@ -256,7 +263,10 @@ fn date_range_max_ts_only() {
     let found: HashSet<i64> = result_ids(&resp).into_iter().collect();
     assert!(found.contains(&ids[0]), "msg0 before boundary included");
     assert!(found.contains(&ids[1]), "msg1 before boundary included");
-    assert!(found.contains(&ids[2]), "msg2 at boundary included (inclusive)");
+    assert!(
+        found.contains(&ids[2]),
+        "msg2 at boundary included (inclusive)"
+    );
     assert!(!found.contains(&ids[3]), "msg3 after boundary excluded");
     assert!(!found.contains(&ids[4]), "msg4 after boundary excluded");
 }
@@ -308,10 +318,14 @@ fn date_range_empty_when_inverted() {
     let aid = seed_agent(&pool, pid, "GoldWolf");
 
     create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "empty-range msg",
         "empty-range body",
-        "normal", None, false,
+        "normal",
+        None,
+        false,
     );
 
     let mut q = SearchQuery::messages("empty-range", pid);
@@ -321,7 +335,10 @@ fn date_range_empty_when_inverted() {
     };
 
     let resp = search(&pool, &q);
-    assert!(resp.results.is_empty(), "inverted range should return 0 results");
+    assert!(
+        resp.results.is_empty(),
+        "inverted range should return 0 results"
+    );
 }
 
 /// Test: importance vector filter with multiple values.
@@ -331,10 +348,46 @@ fn importance_filter_multi() {
     let pid = seed_project(&pool, "imp-multi");
     let aid = seed_agent(&pool, pid, "SilverPeak");
 
-    let id_low = create_msg(&pool, pid, aid, "imp low msg", "imp low", "low", None, false);
-    let id_normal = create_msg(&pool, pid, aid, "imp normal msg", "imp normal", "normal", None, false);
-    let id_high = create_msg(&pool, pid, aid, "imp high msg", "imp high", "high", None, false);
-    let id_urgent = create_msg(&pool, pid, aid, "imp urgent msg", "imp urgent", "urgent", None, false);
+    let id_low = create_msg(
+        &pool,
+        pid,
+        aid,
+        "imp low msg",
+        "imp low",
+        "low",
+        None,
+        false,
+    );
+    let id_normal = create_msg(
+        &pool,
+        pid,
+        aid,
+        "imp normal msg",
+        "imp normal",
+        "normal",
+        None,
+        false,
+    );
+    let id_high = create_msg(
+        &pool,
+        pid,
+        aid,
+        "imp high msg",
+        "imp high",
+        "high",
+        None,
+        false,
+    );
+    let id_urgent = create_msg(
+        &pool,
+        pid,
+        aid,
+        "imp urgent msg",
+        "imp urgent",
+        "urgent",
+        None,
+        false,
+    );
 
     // Filter: high + urgent only
     let mut q = SearchQuery::messages("imp", pid);
@@ -355,9 +408,36 @@ fn importance_filter_single() {
     let pid = seed_project(&pool, "imp-single");
     let aid = seed_agent(&pool, pid, "DarkElm");
 
-    create_msg(&pool, pid, aid, "isf low msg", "isf low", "low", None, false);
-    let id_urgent = create_msg(&pool, pid, aid, "isf urgent msg", "isf urgent", "urgent", None, false);
-    create_msg(&pool, pid, aid, "isf normal msg", "isf normal", "normal", None, false);
+    create_msg(
+        &pool,
+        pid,
+        aid,
+        "isf low msg",
+        "isf low",
+        "low",
+        None,
+        false,
+    );
+    let id_urgent = create_msg(
+        &pool,
+        pid,
+        aid,
+        "isf urgent msg",
+        "isf urgent",
+        "urgent",
+        None,
+        false,
+    );
+    create_msg(
+        &pool,
+        pid,
+        aid,
+        "isf normal msg",
+        "isf normal",
+        "normal",
+        None,
+        false,
+    );
 
     let mut q = SearchQuery::messages("isf", pid);
     q.importance = vec![Importance::Urgent];
@@ -375,22 +455,34 @@ fn thread_id_filter() {
     let aid = seed_agent(&pool, pid, "CalmPine");
 
     let id_t1 = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "thfilter alpha msg",
         "thfilter alpha body",
-        "normal", Some("thread-alpha"), false,
+        "normal",
+        Some("thread-alpha"),
+        false,
     );
     let _id_t2 = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "thfilter beta msg",
         "thfilter beta body",
-        "normal", Some("thread-beta"), false,
+        "normal",
+        Some("thread-beta"),
+        false,
     );
     let id_t1b = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "thfilter alpha reply",
         "thfilter alpha reply body",
-        "normal", Some("thread-alpha"), false,
+        "normal",
+        Some("thread-alpha"),
+        false,
     );
 
     let mut q = SearchQuery::messages("thfilter", pid);
@@ -411,16 +503,24 @@ fn ack_required_filter() {
     let aid = seed_agent(&pool, pid, "SwiftDeer");
 
     let id_ack = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "ackfilt needs ack",
         "ackfilt ack body",
-        "normal", None, true,
+        "normal",
+        None,
+        true,
     );
     let _id_no = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "ackfilt no ack",
         "ackfilt no ack body",
-        "normal", None, false,
+        "normal",
+        None,
+        false,
     );
 
     let mut q = SearchQuery::messages("ackfilt", pid);
@@ -440,8 +540,26 @@ fn project_isolation() {
     let aid1 = seed_agent(&pool, pid1, "MistyFox");
     let aid2 = seed_agent(&pool, pid2, "FoggyWolf");
 
-    let id_p1 = create_msg(&pool, pid1, aid1, "projiso shared word", "projiso body a", "normal", None, false);
-    let _id_p2 = create_msg(&pool, pid2, aid2, "projiso shared word", "projiso body b", "normal", None, false);
+    let id_p1 = create_msg(
+        &pool,
+        pid1,
+        aid1,
+        "projiso shared word",
+        "projiso body a",
+        "normal",
+        None,
+        false,
+    );
+    let _id_p2 = create_msg(
+        &pool,
+        pid2,
+        aid2,
+        "projiso shared word",
+        "projiso body b",
+        "normal",
+        None,
+        false,
+    );
 
     let q = SearchQuery::messages("projiso", pid1);
     let resp = search(&pool, &q);
@@ -458,10 +576,14 @@ fn pagination_exhaustive_no_duplicates() {
 
     for i in 0..10 {
         create_msg(
-            &pool, pid, aid,
+            &pool,
+            pid,
+            aid,
             &format!("pagexhaust item{}", i),
             &format!("pagexhaust body{}", i),
-            "normal", None, false,
+            "normal",
+            None,
+            false,
         );
     }
 
@@ -509,10 +631,14 @@ fn pagination_determinism() {
 
     for i in 0..8 {
         create_msg(
-            &pool, pid, aid,
+            &pool,
+            pid,
+            aid,
             &format!("pagdet msg{}", i),
             &format!("pagdet body{}", i),
-            "normal", None, false,
+            "normal",
+            None,
+            false,
         );
     }
 
@@ -556,10 +682,14 @@ fn pagination_last_page_no_cursor() {
 
     for i in 0..5 {
         create_msg(
-            &pool, pid, aid,
+            &pool,
+            pid,
+            aid,
             &format!("paglast msg{}", i),
             &format!("paglast body{}", i),
-            "normal", None, false,
+            "normal",
+            None,
+            false,
         );
     }
 
@@ -578,7 +708,10 @@ fn pagination_last_page_no_cursor() {
 
     let resp2 = search(&pool, &q2);
     assert_eq!(resp2.results.len(), 5);
-    assert!(resp2.next_cursor.is_none(), "no cursor when all results returned");
+    assert!(
+        resp2.next_cursor.is_none(),
+        "no cursor when all results returned"
+    );
 }
 
 /// Test: recency ranking with `FilterOnly` mode returns newest-first.
@@ -594,10 +727,14 @@ fn recency_ranking_order() {
 
     for i in 0..5 {
         let id = create_msg(
-            &pool, pid, aid,
+            &pool,
+            pid,
+            aid,
             &format!("recency msg{}", i),
             &format!("recency body{}", i),
-            "high", None, false,
+            "high",
+            None,
+            false,
         );
         // Set timestamps with known ordering: id[0]=oldest, id[4]=newest
         set_message_ts(&pool, id, BASE_TS + i * MICROS_PER_HOUR);
@@ -632,34 +769,50 @@ fn combined_filters() {
 
     // Create messages with varying attributes
     let id1 = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "combofilter alpha",
         "combofilter alpha body",
-        "high", Some("thread-x"), false,
+        "high",
+        Some("thread-x"),
+        false,
     );
     set_message_ts(&pool, id1, BASE_TS + 1 * MICROS_PER_HOUR);
 
     let id2 = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "combofilter beta",
         "combofilter beta body",
-        "normal", Some("thread-x"), false,
+        "normal",
+        Some("thread-x"),
+        false,
     );
     set_message_ts(&pool, id2, BASE_TS + 2 * MICROS_PER_HOUR);
 
     let id3 = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "combofilter gamma",
         "combofilter gamma body",
-        "high", Some("thread-y"), false,
+        "high",
+        Some("thread-y"),
+        false,
     );
     set_message_ts(&pool, id3, BASE_TS + 3 * MICROS_PER_HOUR);
 
     let id4 = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "combofilter delta",
         "combofilter delta body",
-        "high", Some("thread-x"), false,
+        "high",
+        Some("thread-x"),
+        false,
     );
     set_message_ts(&pool, id4, BASE_TS + 5 * MICROS_PER_HOUR);
 
@@ -694,10 +847,14 @@ fn pagination_with_filters() {
     for i in 0..12 {
         let imp = if i % 2 == 0 { "high" } else { "normal" };
         let id = create_msg(
-            &pool, pid, aid,
+            &pool,
+            pid,
+            aid,
             &format!("pagfilt item{}", i),
             &format!("pagfilt body{}", i),
-            imp, None, false,
+            imp,
+            None,
+            false,
         );
         if i % 2 == 0 {
             high_ids.push(id);
@@ -736,7 +893,11 @@ fn pagination_with_filters() {
     let unique: HashSet<i64> = collected.iter().copied().collect();
     assert_eq!(unique.len(), 6, "all 6 high-importance messages");
     for hid in &high_ids {
-        assert!(unique.contains(hid), "high-importance msg {} collected", hid);
+        assert!(
+            unique.contains(hid),
+            "high-importance msg {} collected",
+            hid
+        );
     }
 }
 
@@ -750,26 +911,38 @@ fn date_boundary_exact_microsecond() {
     let exact_ts = BASE_TS + 42 * MICROS_PER_SEC;
 
     let id_at = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "usbnd exact msg",
         "usbnd exact body",
-        "normal", None, false,
+        "normal",
+        None,
+        false,
     );
     set_message_ts(&pool, id_at, exact_ts);
 
     let id_before = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "usbnd before msg",
         "usbnd before body",
-        "normal", None, false,
+        "normal",
+        None,
+        false,
     );
     set_message_ts(&pool, id_before, exact_ts - 1);
 
     let id_after = create_msg(
-        &pool, pid, aid,
+        &pool,
+        pid,
+        aid,
         "usbnd after msg",
         "usbnd after body",
-        "normal", None, false,
+        "normal",
+        None,
+        false,
     );
     set_message_ts(&pool, id_after, exact_ts + 1);
 
@@ -813,10 +986,14 @@ fn fts_pagination_with_date_filter() {
     // Create 8 messages spanning 8 days
     for i in 0..8 {
         let id = create_msg(
-            &pool, pid, aid,
+            &pool,
+            pid,
+            aid,
             &format!("ftspagdate msg{}", i),
             &format!("ftspagdate body{}", i),
-            "normal", None, false,
+            "normal",
+            None,
+            false,
         );
         set_message_ts(&pool, id, BASE_TS + i * MICROS_PER_DAY);
     }

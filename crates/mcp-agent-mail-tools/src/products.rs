@@ -44,20 +44,19 @@ fn is_hex_uid(candidate: &str) -> bool {
 }
 
 fn generate_product_uid(now_micros: i64) -> String {
+    use std::fmt::Write;
     let seq = PRODUCT_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = u64::from(std::process::id());
-    let raw = format!("{now_micros:x}{pid:x}{seq:x}");
     let mut out = String::with_capacity(20);
-    for ch in raw.chars() {
-        if ch.is_ascii_hexdigit() {
-            out.push(ch.to_ascii_lowercase());
+    // Format directly into the output buffer
+    let _ = write!(out, "{now_micros:x}{pid:x}{seq:x}");
+
+    if out.len() > 20 {
+        out.truncate(20);
+    } else {
+        while out.len() < 20 {
+            out.push('0');
         }
-        if out.len() == 20 {
-            break;
-        }
-    }
-    while out.len() < 20 {
-        out.push('0');
     }
     out
 }

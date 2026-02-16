@@ -133,14 +133,16 @@ impl ConformalPredictor {
             .iter()
             .map(|&x| (x - median).abs())
             .collect();
-        scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // The conformal quantile: ceil((n+1) * coverage) / n.
         // This ensures finite-sample coverage >= nominal coverage.
         let quantile_idx = ((n as f64 + 1.0) * self.coverage).ceil() as usize;
         let quantile_idx = quantile_idx.min(n) - 1; // 0-indexed, capped at n-1
 
-        let q = scores[quantile_idx];
+        let (_, q, _) = scores.select_nth_unstable_by(quantile_idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let q = *q;
 
         Some(PredictionInterval {
             lower: median - q,
@@ -152,16 +154,31 @@ impl ConformalPredictor {
 
     /// Compute the median of the calibration window.
     fn median(&self) -> f64 {
-        let mut sorted: Vec<f64> = self.observations.iter().copied().collect();
-        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = sorted.len();
+        let mut values: Vec<f64> = self.observations.iter().copied().collect();
+        let n = values.len();
         if n == 0 {
             return 0.0;
         }
+
+        let mid_idx = n / 2;
+        let (_, median, _) = values.select_nth_unstable_by(mid_idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let median_val = *median;
+
         if n % 2 == 0 {
-            f64::midpoint(sorted[n / 2 - 1], sorted[n / 2])
+            // Even number of elements: median is avg of sorted[mid-1] and sorted[mid].
+            // select_nth_unstable puts element at mid_idx in place, and everything
+            // smaller to the left. The max of the left partition is sorted[mid-1].
+            let left_max = values[..mid_idx]
+                .iter()
+                .copied()
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(median_val);
+
+            f64::midpoint(left_max, median_val)
         } else {
-            sorted[n / 2]
+            median_val
         }
     }
 
