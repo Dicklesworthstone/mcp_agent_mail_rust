@@ -21,7 +21,8 @@ use std::cell::{Cell, RefCell};
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
-    DocKind, Importance, RankingMode, SearchQuery, plan_search,
+    DocKind, Importance, RankingMode, RecoverySuggestion, SearchQuery, ZeroResultGuidance,
+    plan_search,
 };
 use mcp_agent_mail_db::search_recipes::{
     MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
@@ -402,6 +403,107 @@ struct ResultEntry {
     reason_codes: Vec<String>,
     /// Score factor summaries (populated when explain=on).
     score_factors: Vec<mcp_agent_mail_db::search_planner::ScoreFactorSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchDegradedDiagnostics {
+    degraded: bool,
+    fallback_mode: Option<String>,
+    timeout_stage: Option<String>,
+    budget_tier: Option<String>,
+    budget_exhausted: Option<bool>,
+    remediation_hint: Option<String>,
+}
+
+fn explain_facet_value<'a>(
+    explain: &'a mcp_agent_mail_db::search_planner::QueryExplain,
+    key: &str,
+) -> Option<&'a str> {
+    explain.facets_applied.iter().find_map(|facet| {
+        let (facet_key, facet_value) = facet.split_once(':')?;
+        if facet_key.eq_ignore_ascii_case(key) {
+            Some(facet_value)
+        } else {
+            None
+        }
+    })
+}
+
+fn derive_tui_degraded_diagnostics(
+    explain: Option<&mcp_agent_mail_db::search_planner::QueryExplain>,
+    selected_mode: SearchModeFilter,
+) -> Option<SearchDegradedDiagnostics> {
+    let mut diagnostics = SearchDegradedDiagnostics {
+        degraded: false,
+        fallback_mode: None,
+        timeout_stage: None,
+        budget_tier: None,
+        budget_exhausted: None,
+        remediation_hint: None,
+    };
+
+    // Current TUI path uses planner SQL for deterministic sync execution.
+    // Non-auto mode selection degrades to lexical behavior and must be visible.
+    if !matches!(
+        selected_mode,
+        SearchModeFilter::Auto | SearchModeFilter::Lexical
+    ) {
+        diagnostics.degraded = true;
+        diagnostics.fallback_mode = Some("mode_degraded_to_lexical".to_string());
+        diagnostics.remediation_hint = Some(
+            "Semantic/Hybrid mode selection is currently degraded to lexical in this TUI path."
+                .to_string(),
+        );
+    }
+
+    if let Some(explain) = explain {
+        if explain.used_like_fallback || explain.method.eq_ignore_ascii_case("like_fallback") {
+            diagnostics.degraded = true;
+            diagnostics
+                .fallback_mode
+                .get_or_insert_with(|| "like_fallback".to_string());
+            diagnostics.remediation_hint.get_or_insert_with(|| {
+                "FTS syntax fallback active; simplify operators or use quoted phrases.".to_string()
+            });
+        }
+
+        if let Some(outcome) = explain_facet_value(explain, "rerank_outcome") {
+            if let Some(tier) = outcome.strip_prefix("skipped_by_budget_governor_") {
+                diagnostics.degraded = true;
+                diagnostics
+                    .fallback_mode
+                    .get_or_insert_with(|| "hybrid_budget_governor".to_string());
+                diagnostics.budget_tier = Some(tier.to_string());
+                diagnostics.budget_exhausted = Some(tier.eq_ignore_ascii_case("critical"));
+                diagnostics.remediation_hint.get_or_insert_with(|| {
+                    "Budget pressure detected; lower limit or narrow filters.".to_string()
+                });
+            } else if outcome.to_ascii_lowercase().contains("timeout") {
+                diagnostics.degraded = true;
+                diagnostics
+                    .fallback_mode
+                    .get_or_insert_with(|| "rerank_timeout".to_string());
+                diagnostics.timeout_stage = Some("rerank".to_string());
+                diagnostics.remediation_hint.get_or_insert_with(|| {
+                    "Rerank timed out; retry with tighter query scope.".to_string()
+                });
+            }
+        }
+
+        if let Some(stage) = explain_facet_value(explain, "timeout_stage") {
+            diagnostics.degraded = true;
+            diagnostics.timeout_stage = Some(stage.to_string());
+            diagnostics.remediation_hint.get_or_insert_with(|| {
+                "A search stage timed out; narrow query scope and retry.".to_string()
+            });
+        }
+    }
+
+    if diagnostics.degraded {
+        Some(diagnostics)
+    } else {
+        None
+    }
 }
 
 /// Wrapper for `VirtualizedList` rendering of search results.
@@ -844,6 +946,10 @@ pub struct SearchCockpitScreen {
     last_query: String,
     last_error: Option<String>,
     query_assistance: Option<QueryAssistance>,
+    /// Zero-result recovery guidance (populated when results are empty).
+    guidance: Option<ZeroResultGuidance>,
+    /// Derived degraded-mode diagnostics for the most recent message query.
+    last_diagnostics: Option<SearchDegradedDiagnostics>,
     debounce_remaining: u8,
     search_dirty: bool,
 
@@ -908,6 +1014,8 @@ impl SearchCockpitScreen {
             last_query: String::new(),
             last_error: None,
             query_assistance: None,
+            guidance: None,
+            last_diagnostics: None,
             debounce_remaining: 0,
             search_dirty: true,
             saved_recipes: Vec::new(),
@@ -1019,12 +1127,14 @@ impl SearchCockpitScreen {
     fn execute_search(&mut self, state: &TuiSharedState) {
         let raw = self.query_input.value().trim().to_string();
         self.last_query.clone_from(&raw);
+        self.last_diagnostics = None;
         self.last_error = validate_query_syntax(&raw);
         if self.last_error.is_some() {
             self.query_assistance = None;
             self.highlight_terms.clear();
             self.results.clear();
             self.total_sql_rows = 0;
+            self.guidance = None;
             self.cursor = 0;
             self.detail_scroll = 0;
             self.search_dirty = false;
@@ -1071,6 +1181,13 @@ impl SearchCockpitScreen {
 
         self.db_conn = Some(conn);
 
+        // Generate zero-result guidance from TUI facet state
+        self.guidance = if self.results.is_empty() && !raw.is_empty() {
+            Some(self.build_guidance())
+        } else {
+            None
+        };
+
         // Clamp cursor
         if self.results.is_empty() {
             self.cursor = 0;
@@ -1080,6 +1197,65 @@ impl SearchCockpitScreen {
         self.detail_scroll = 0;
         self.search_dirty = false;
         self.record_history();
+    }
+
+    /// Build zero-result recovery guidance from current TUI facet state.
+    fn build_guidance(&self) -> ZeroResultGuidance {
+        let mut suggestions = Vec::new();
+
+        if self.importance_filter != ImportanceFilter::Any {
+            suggestions.push(RecoverySuggestion {
+                kind: "drop_importance_filter".to_string(),
+                label: "Remove importance filter".to_string(),
+                detail: Some(format!(
+                    "Currently filtering to \"{}\". Try removing the importance constraint.",
+                    self.importance_filter.label()
+                )),
+            });
+        }
+        if self.ack_filter != AckFilter::Any {
+            suggestions.push(RecoverySuggestion {
+                kind: "drop_ack_filter".to_string(),
+                label: "Remove ack-required filter".to_string(),
+                detail: None,
+            });
+        }
+        if self.thread_filter.is_some() {
+            suggestions.push(RecoverySuggestion {
+                kind: "drop_thread_filter".to_string(),
+                label: "Remove thread filter".to_string(),
+                detail: Some("Search across all threads instead of a single thread.".to_string()),
+            });
+        }
+        if let Some(ref assist) = self.query_assistance {
+            for hint in &assist.did_you_mean {
+                suggestions.push(RecoverySuggestion {
+                    kind: "fix_typo".to_string(),
+                    label: format!("Did you mean \"{}:{}\"?", hint.suggested_field, hint.value),
+                    detail: Some(format!(
+                        "\"{}\" is not a recognized field. Try \"{}\" instead.",
+                        hint.token, hint.suggested_field
+                    )),
+                });
+            }
+        }
+        if suggestions.is_empty() {
+            suggestions.push(RecoverySuggestion {
+                kind: "simplify_query".to_string(),
+                label: "Simplify search terms".to_string(),
+                detail: Some("Try fewer or broader keywords.".to_string()),
+            });
+        }
+
+        let count = suggestions.len();
+        ZeroResultGuidance {
+            summary: format!(
+                "No results found. {count} suggestion{s} available to broaden your search.",
+                count = count,
+                s = if count == 1 { "" } else { "s" }
+            ),
+            suggestions,
+        }
     }
 
     /// Run a search for a single doc kind using sync queries.
@@ -1123,6 +1299,8 @@ impl SearchCockpitScreen {
         }
 
         let plan = plan_search(&query);
+        self.last_diagnostics =
+            derive_tui_degraded_diagnostics(Some(&plan.explain()), self.search_mode);
         if plan.sql.is_empty() {
             return Vec::new();
         }
@@ -1139,6 +1317,7 @@ impl SearchCockpitScreen {
 
     /// Recent messages view (empty query).
     fn search_messages_recent(&mut self, conn: &DbConn) -> Vec<ResultEntry> {
+        self.last_diagnostics = derive_tui_degraded_diagnostics(None, self.search_mode);
         let mut where_clauses: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 
@@ -1975,6 +2154,7 @@ impl MailScreen for SearchCockpitScreen {
         self.focused_synthetic.as_ref()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 4 || area.width < 30 {
             let tp = crate::tui_theme::TuiThemePalette::current();
@@ -2073,6 +2253,7 @@ impl MailScreen for SearchCockpitScreen {
             &self.highlight_terms,
             self.sort_direction,
             matches!(self.focus, Focus::ResultList),
+            self.guidance.as_ref(),
         );
         if let Some(detail_area) = split.dock {
             render_detail(
@@ -2081,6 +2262,7 @@ impl MailScreen for SearchCockpitScreen {
                 self.results.get(self.cursor),
                 self.detail_scroll,
                 &self.highlight_terms,
+                self.last_diagnostics.as_ref(),
                 !matches!(self.focus, Focus::QueryBar),
             );
         }
@@ -2443,7 +2625,7 @@ fn QUERY_HELP_BG() -> PackedRgba {
     crate::tui_theme::TuiThemePalette::current().bg_deep
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_query_bar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2498,23 +2680,53 @@ fn render_query_bar(
         let w = inner.width as usize;
         let (hint, style) = screen.last_error.as_ref().map_or_else(
             || {
-                screen.assistance_hint_line().map_or_else(
-                    || {
-                        if screen.focus == Focus::QueryBar {
-                            (
-                                "Syntax: \"phrase\" term* AND/OR/NOT | field:value | Mouse wheel sort + drag split"
-                                    .to_string(),
-                                Style::default().fg(FACET_LABEL_FG()),
+                screen
+                    .last_diagnostics
+                    .as_ref()
+                    .filter(|diag| diag.degraded)
+                    .map_or_else(
+                        || {
+                            screen.assistance_hint_line().map_or_else(
+                                || {
+                                    if screen.focus == Focus::QueryBar {
+                                        (
+                                            "Syntax: \"phrase\" term* AND/OR/NOT | field:value | Mouse wheel sort + drag split"
+                                                .to_string(),
+                                            Style::default().fg(FACET_LABEL_FG()),
+                                        )
+                                    } else {
+                                        (
+                                            format!("Route: {}", screen.route_string()),
+                                            Style::default().fg(FACET_LABEL_FG()),
+                                        )
+                                    }
+                                },
+                                |line| (line, Style::default().fg(FACET_LABEL_FG())),
                             )
-                        } else {
+                        },
+                        |diag| {
+                            let mut parts = Vec::new();
+                            if let Some(mode) = &diag.fallback_mode {
+                                parts.push(format!("fallback={mode}"));
+                            }
+                            if let Some(stage) = &diag.timeout_stage {
+                                parts.push(format!("timeout_stage={stage}"));
+                            }
+                            if let Some(tier) = &diag.budget_tier {
+                                parts.push(format!("budget_tier={tier}"));
+                            }
+                            if let Some(exhausted) = diag.budget_exhausted {
+                                parts.push(format!("budget_exhausted={exhausted}"));
+                            }
+                            if let Some(hint) = &diag.remediation_hint {
+                                parts.push(format!("hint={hint}"));
+                            }
                             (
-                                format!("Route: {}", screen.route_string()),
-                                Style::default().fg(FACET_LABEL_FG()),
+                                format!("DEGRADED: {}", parts.join(" | ")),
+                                crate::tui_theme::text_warning(&tp),
                             )
-                        }
-                    },
-                    |line| (line, Style::default().fg(FACET_LABEL_FG())),
-                )
+                        },
+                    )
             },
             |err| (format!("ERR: {err}"), Style::default().fg(ERROR_FG())),
         );
@@ -2789,6 +3001,23 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
         },
         screen.sort_direction.label()
     ));
+    if let Some(diag) = screen
+        .last_diagnostics
+        .as_ref()
+        .filter(|diag| diag.degraded)
+    {
+        let mut parts = Vec::new();
+        if let Some(mode) = &diag.fallback_mode {
+            parts.push(format!("fallback={mode}"));
+        }
+        if let Some(stage) = &diag.timeout_stage {
+            parts.push(format!("timeout={stage}"));
+        }
+        if let Some(tier) = &diag.budget_tier {
+            parts.push(format!("budget={tier}"));
+        }
+        rows.push(format!("degraded: {}", parts.join(" | ")));
+    }
 
     for (idx, row) in rows.into_iter().enumerate() {
         let y = lab_inner.y + u16::try_from(idx).unwrap_or(0);
@@ -2935,6 +3164,7 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
 }
 
 /// Render search results using `VirtualizedList` for O(1) scroll performance.
+#[allow(clippy::too_many_arguments)]
 fn render_results(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2943,6 +3173,7 @@ fn render_results(
     highlight_terms: &[QueryTerm],
     sort_direction: SortDirection,
     focused: bool,
+    guidance: Option<&ZeroResultGuidance>,
 ) {
     // Show match count and search posture in header.
     let title = if results.is_empty() {
@@ -2969,7 +3200,11 @@ fn render_results(
     }
 
     if results.is_empty() {
-        Paragraph::new("  No results found.").render(inner, frame);
+        if let Some(guide) = guidance {
+            render_guidance(frame, inner, guide, &tp);
+        } else {
+            Paragraph::new("  No results found.").render(inner, frame);
+        }
         return;
     }
 
@@ -3028,6 +3263,35 @@ fn estimate_search_detail_lines(entry: &ResultEntry) -> usize {
     count
 }
 
+/// Render zero-result recovery guidance inside the results pane.
+fn render_guidance(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    guidance: &ZeroResultGuidance,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    let label_style = crate::tui_theme::text_meta(tp);
+    let accent_style = crate::tui_theme::text_accent(tp);
+    let value_style = crate::tui_theme::text_primary(tp);
+
+    let mut lines = Vec::new();
+    lines.push(Line::styled(format!("  {}", guidance.summary), label_style));
+    lines.push(Line::raw(String::new()));
+
+    for (i, suggestion) in guidance.suggestions.iter().enumerate() {
+        lines.push(Line::from_spans([
+            Span::styled(format!("  {}. ", i + 1), label_style),
+            Span::styled(suggestion.label.clone(), accent_style),
+        ]));
+        if let Some(ref detail) = suggestion.detail {
+            lines.push(Line::styled(format!("     {detail}"), value_style));
+        }
+    }
+
+    let text = Text::from_iter(lines);
+    Paragraph::new(text).render(area, frame);
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_detail(
     frame: &mut Frame<'_>,
@@ -3035,6 +3299,7 @@ fn render_detail(
     entry: Option<&ResultEntry>,
     scroll: usize,
     highlight_terms: &[QueryTerm],
+    diagnostics: Option<&SearchDegradedDiagnostics>,
     focused: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -3189,6 +3454,32 @@ fn render_detail(
                 Span::styled(format!(" {} ", sf.key), label_style),
                 Span::styled(sf.summary.clone(), value_style),
             ]));
+        }
+    }
+
+    if let Some(diag) = diagnostics.filter(|diag| diag.degraded) {
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::styled(
+            "\u{2500}\u{2500}\u{2500} Degraded Mode \u{2500}\u{2500}\u{2500}".to_string(),
+            label_style,
+        ));
+        if let Some(mode) = &diag.fallback_mode {
+            lines.push(styled_field("Fallback:   ", mode.clone()));
+        }
+        if let Some(stage) = &diag.timeout_stage {
+            lines.push(styled_field("Timeout:    ", stage.clone()));
+        }
+        if let Some(tier) = &diag.budget_tier {
+            lines.push(styled_field("Budget:     ", format!("tier={tier}")));
+        }
+        if let Some(exhausted) = diag.budget_exhausted {
+            lines.push(styled_field(
+                "BudgetExh:  ",
+                if exhausted { "true" } else { "false" }.to_string(),
+            ));
+        }
+        if let Some(hint) = &diag.remediation_hint {
+            lines.push(styled_field("Hint:       ", hint.clone()));
         }
     }
 
@@ -3422,6 +3713,36 @@ mod tests {
         assert!(screen.search_dirty);
         assert!(screen.thread_filter.is_none());
         assert!(screen.last_error.is_none());
+    }
+
+    #[test]
+    fn derive_tui_diagnostics_like_fallback() {
+        let explain = mcp_agent_mail_db::search_planner::QueryExplain {
+            method: "like_fallback".to_string(),
+            normalized_query: Some("x".to_string()),
+            used_like_fallback: true,
+            facet_count: 0,
+            facets_applied: Vec::new(),
+            sql: "SELECT 1".to_string(),
+            scope_policy: "unrestricted".to_string(),
+            denied_count: 0,
+            redacted_count: 0,
+        };
+        let diagnostics = derive_tui_degraded_diagnostics(Some(&explain), SearchModeFilter::Auto)
+            .expect("diagnostics");
+        assert!(diagnostics.degraded);
+        assert_eq!(diagnostics.fallback_mode.as_deref(), Some("like_fallback"));
+    }
+
+    #[test]
+    fn derive_tui_diagnostics_marks_semantic_mode_degraded() {
+        let diagnostics =
+            derive_tui_degraded_diagnostics(None, SearchModeFilter::Semantic).expect("diagnostics");
+        assert!(diagnostics.degraded);
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("mode_degraded_to_lexical")
+        );
     }
 
     #[test]
@@ -4337,6 +4658,7 @@ mod tests {
             Some(&entry),
             0,
             &[],
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -4367,6 +4689,7 @@ mod tests {
             Some(&entry),
             0,
             &[],
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -4380,7 +4703,15 @@ mod tests {
     fn render_detail_no_entry_shows_prompt() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(60, 10, &mut pool);
-        render_detail(&mut frame, Rect::new(0, 0, 60, 10), None, 0, &[], true);
+        render_detail(
+            &mut frame,
+            Rect::new(0, 0, 60, 10),
+            None,
+            0,
+            &[],
+            None,
+            true,
+        );
         let text = buffer_to_text(&frame.buffer);
         assert!(
             text.contains("Select a result"),
@@ -4710,6 +5041,7 @@ mod tests {
             Some(&entry),
             0,
             &[],
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -4735,6 +5067,7 @@ mod tests {
             Some(&entry),
             0,
             &terms,
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);

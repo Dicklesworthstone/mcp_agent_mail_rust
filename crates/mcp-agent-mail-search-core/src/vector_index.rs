@@ -351,20 +351,20 @@ impl VectorIndex {
             )));
         }
 
-        // Check capacity
-        if self.config.max_vectors > 0 && self.entries.len() >= self.config.max_vectors {
-            return Err(SearchError::Internal(format!(
-                "Vector index full (max {} vectors)",
-                self.config.max_vectors
-            )));
-        }
-
         let key = (entry.metadata.doc_id, entry.metadata.doc_kind.to_string());
 
         if let Some(&pos) = self.doc_index.get(&key) {
             // Update existing entry
             self.entries[pos] = entry;
         } else {
+            // Check capacity before adding new entry
+            if self.config.max_vectors > 0 && self.entries.len() >= self.config.max_vectors {
+                return Err(SearchError::Internal(format!(
+                    "Vector index full (max {} vectors)",
+                    self.config.max_vectors
+                )));
+            }
+
             // Add new entry
             let pos = self.entries.len();
             self.doc_index.insert(key, pos);

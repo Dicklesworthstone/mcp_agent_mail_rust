@@ -269,12 +269,14 @@ pub struct ProductSearchResponse {
     pub result: Vec<ProductSearchItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistance: Option<mcp_agent_mail_db::QueryAssistance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<crate::search::SearchDiagnostics>,
 }
 
 /// Full-text search across all projects linked to a product.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
-    description = "Full-text search across all projects linked to a product.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id }], assistance? }"
+    description = "Full-text search across all projects linked to a product.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id }], assistance?, diagnostics? }"
 )]
 pub async fn search_messages_product(
     ctx: &McpContext,
@@ -309,6 +311,7 @@ pub async fn search_messages_product(
         let response = ProductSearchResponse {
             result: Vec::new(),
             assistance: None,
+            diagnostics: None,
         };
         return serde_json::to_string(&response)
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
@@ -376,7 +379,8 @@ pub async fn search_messages_product(
         ranking: mcp_agent_mail_db::search_planner::RankingMode::default(),
         limit: Some(max_results),
         cursor: None,
-        explain: false,
+        // Collect explain internally to derive deterministic degraded diagnostics.
+        explain: true,
         ..Default::default()
     };
 
@@ -401,9 +405,11 @@ pub async fn search_messages_product(
         })
         .collect();
 
+    let diagnostics = crate::search::derive_search_diagnostics(planner_response.explain.as_ref());
     let response = ProductSearchResponse {
         result,
         assistance: planner_response.assistance,
+        diagnostics,
     };
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
@@ -942,6 +948,7 @@ mod tests {
         let resp = ProductSearchResponse {
             result: Vec::new(),
             assistance: None,
+            diagnostics: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
@@ -974,6 +981,7 @@ mod tests {
                 },
             ],
             assistance: None,
+            diagnostics: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();

@@ -10,7 +10,7 @@ use mcp_agent_mail_core::{
 };
 use mcp_agent_mail_db::DbPoolConfig;
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
@@ -184,12 +184,15 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
         }
     }
 
-    // Read body (limited to first 1KB for safety)
-    let mut body = String::new();
-    let mut body_bytes = [0u8; 1024];
-    if let Ok(n) = std::io::Read::read(&mut reader, &mut body_bytes) {
-        body = String::from_utf8_lossy(&body_bytes[..n]).to_string();
+    // Read body (limited to first 4KB for safety)
+    let mut body_bytes = Vec::new();
+    // Use take(4096) to prevent OOM/hangs, and read_to_end to ensure we get
+    // the full response body (until EOF or limit) even if fragmented.
+    // The request sent "Connection: close", so the server should close the socket.
+    if reader.take(4096).read_to_end(&mut body_bytes).is_ok() {
+        // Continue
     }
+    let body = String::from_utf8_lossy(&body_bytes).to_string();
 
     // Check for Agent Mail signatures in headers or body
     // The server sets Server header or returns JSON with known fields

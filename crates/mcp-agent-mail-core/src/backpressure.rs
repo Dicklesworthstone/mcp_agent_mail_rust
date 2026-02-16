@@ -183,7 +183,6 @@ impl HealthSignals {
         // Yellow: any elevated subsystem
         if self.pool_acquire_p95_us > yellow::POOL_ACQUIRE_P95_US
             || self.pool_utilization_pct >= yellow::POOL_UTIL_PCT
-            || self.pool_over_80_for_s >= yellow::OVER_80_DURATION_S
             || self.wbq_depth_pct >= yellow::WBQ_DEPTH_PCT
             || self.commit_depth_pct >= yellow::COMMIT_DEPTH_PCT
         {

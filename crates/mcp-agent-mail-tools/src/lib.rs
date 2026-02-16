@@ -1128,6 +1128,14 @@ pub(crate) mod pattern_overlap {
     }
 }
 
+/// Returns true when two glob/literal patterns overlap under Agent Mail semantics.
+#[must_use]
+pub fn patterns_overlap(left: &str, right: &str) -> bool {
+    let left = pattern_overlap::CompiledPattern::new(left);
+    let right = pattern_overlap::CompiledPattern::new(right);
+    left.overlaps(&right)
+}
+
 /// Tool cluster identifiers for grouping and RBAC
 pub mod clusters {
     pub const INFRASTRUCTURE: &str = "infrastructure";

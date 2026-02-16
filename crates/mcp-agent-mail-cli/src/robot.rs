@@ -1979,32 +1979,13 @@ fn build_reservations(
     ))
 }
 
-/// Simple glob pattern overlap check.
+/// Check for glob pattern overlap using the robust implementation from tools.
 ///
-/// Returns true if `pattern` could match `path` or they share a common prefix.
-/// Uses the same symmetric logic as the guard crate but without the `globset` dependency.
+/// Delegates to `mcp_agent_mail_tools::pattern_overlap::CompiledPattern` to ensure
+/// consistency with server-side conflict detection. Handles complex globs,
+/// normalization, and symmetric matching correctly.
 fn glob_matches(pattern: &str, path: &str) -> bool {
-    // Exact match
-    if pattern == path {
-        return true;
-    }
-    // If pattern ends with /** or /*, check prefix containment
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path.starts_with(prefix);
-    }
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        // Must match exactly one level
-        return path.starts_with(prefix)
-            && path.len() > prefix.len()
-            && !path[prefix.len() + 1..].contains('/');
-    }
-    // If path is a pattern with wildcards, check reverse
-    if path.contains('*') {
-        if let Some(prefix) = path.strip_suffix("/**") {
-            return pattern.starts_with(prefix);
-        }
-    }
-    false
+    mcp_agent_mail_tools::patterns_overlap(pattern, path)
 }
 
 // ── Timeline command implementation ─────────────────────────────────────────

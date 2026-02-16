@@ -12,13 +12,17 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
-use mcp_agent_mail_core::{AnomalySeverity, InsightCard, InsightFeed, quick_insight_feed};
+use mcp_agent_mail_core::{
+    AnomalyAlert, AnomalyKind, AnomalySeverity, InsightCard, InsightFeed, build_insight_feed,
+    quick_insight_feed,
+};
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg};
 
 /// Refresh the insight feed every N ticks (~100ms each → ~5s).
 const REFRESH_INTERVAL_TICKS: u64 = 50;
+const PERSISTED_TOOL_METRIC_LIMIT: usize = 128;
 
 pub struct AnalyticsScreen {
     feed: InsightFeed,
@@ -41,8 +45,16 @@ impl AnalyticsScreen {
         }
     }
 
-    fn refresh_feed(&mut self) {
+    fn refresh_feed(&mut self, state: Option<&TuiSharedState>) {
         self.feed = quick_insight_feed();
+        if self.feed.cards.is_empty() {
+            if let Some(state) = state {
+                let persisted = build_persisted_insight_feed(state);
+                if !persisted.cards.is_empty() {
+                    self.feed = persisted;
+                }
+            }
+        }
         if self.selected >= self.feed.cards.len() && !self.feed.cards.is_empty() {
             self.selected = self.feed.cards.len() - 1;
         }
@@ -161,6 +173,136 @@ fn confidence_bar(confidence: f64) -> String {
         "░".repeat(empty),
         confidence * 100.0
     )
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn build_persisted_insight_feed_from_rows(
+    rows: &[crate::tool_metrics::PersistedToolMetric],
+    persisted_samples: u64,
+) -> InsightFeed {
+    if rows.is_empty() {
+        return InsightFeed {
+            cards: Vec::new(),
+            alerts_processed: 0,
+            cards_produced: 0,
+        };
+    }
+
+    let total_calls: u64 = rows.iter().map(|r| r.calls).sum();
+    let total_errors: u64 = rows.iter().map(|r| r.errors).sum();
+    let global_error_rate = if total_calls == 0 {
+        0.0
+    } else {
+        (total_errors as f64 / total_calls as f64) * 100.0
+    };
+
+    let mut alerts: Vec<AnomalyAlert> = Vec::new();
+    for metric in rows.iter().take(16) {
+        if metric.calls == 0 {
+            continue;
+        }
+        let err_rate = (metric.errors as f64 / metric.calls as f64) * 100.0;
+        if metric.errors > 0 && (err_rate >= 1.0 || metric.errors >= 3) {
+            let severity = if err_rate >= 15.0 {
+                AnomalySeverity::Critical
+            } else if err_rate >= 5.0 {
+                AnomalySeverity::High
+            } else {
+                AnomalySeverity::Medium
+            };
+            alerts.push(AnomalyAlert {
+                kind: AnomalyKind::HighErrorRate,
+                severity,
+                score: (err_rate / 25.0).clamp(0.1, 1.0),
+                current_value: err_rate,
+                threshold: 1.0,
+                baseline_value: Some(global_error_rate),
+                explanation: format!(
+                    "{} has {:.1}% errors ({} / {} calls, cluster: {}, sample_ts={})",
+                    metric.tool_name,
+                    err_rate,
+                    metric.errors,
+                    metric.calls,
+                    metric.cluster,
+                    metric.collected_ts
+                ),
+                suggested_action: format!(
+                    "Inspect Tool Metrics for {} and recent failures ({} persisted snapshots)",
+                    metric.tool_name, persisted_samples
+                ),
+            });
+        }
+
+        if metric.p95_ms >= 250.0 || metric.is_slow {
+            let severity = if metric.p95_ms >= 1_000.0 {
+                AnomalySeverity::Critical
+            } else if metric.p95_ms >= 500.0 {
+                AnomalySeverity::High
+            } else {
+                AnomalySeverity::Medium
+            };
+            alerts.push(AnomalyAlert {
+                kind: AnomalyKind::LatencySpike,
+                severity,
+                score: (metric.p95_ms / 1_000.0).clamp(0.1, 1.0),
+                current_value: metric.p95_ms,
+                threshold: 250.0,
+                baseline_value: Some(metric.avg_ms),
+                explanation: format!(
+                    "{} latency elevated: p95 {:.1}ms, p99 {:.1}ms (complexity: {}, sample_ts={})",
+                    metric.tool_name,
+                    metric.p95_ms,
+                    metric.p99_ms,
+                    metric.complexity,
+                    metric.collected_ts
+                ),
+                suggested_action: format!(
+                    "Profile {} and inspect recent request payloads ({} persisted snapshots)",
+                    metric.tool_name, persisted_samples
+                ),
+            });
+        }
+
+        if alerts.len() >= 12 {
+            break;
+        }
+    }
+
+    if alerts.is_empty() {
+        for metric in rows.iter().take(3) {
+            alerts.push(AnomalyAlert {
+                kind: AnomalyKind::LatencySpike,
+                severity: AnomalySeverity::Low,
+                score: 0.25,
+                current_value: metric.p95_ms.max(metric.avg_ms),
+                threshold: 250.0,
+                baseline_value: Some(metric.avg_ms),
+                explanation: format!(
+                    "{} historical volume: {} calls, p95 {:.1}ms, p99 {:.1}ms (sample_ts={})",
+                    metric.tool_name,
+                    metric.calls,
+                    metric.p95_ms,
+                    metric.p99_ms,
+                    metric.collected_ts
+                ),
+                suggested_action: format!(
+                    "Open Tool Metrics for detailed breakdown ({persisted_samples} persisted snapshots)"
+                ),
+            });
+        }
+    }
+
+    build_insight_feed(&alerts, &[], &[])
+}
+
+fn build_persisted_insight_feed(state: &TuiSharedState) -> InsightFeed {
+    let cfg = state.config_snapshot();
+    let rows = crate::tool_metrics::load_latest_persisted_metrics(
+        &cfg.raw_database_url,
+        PERSISTED_TOOL_METRIC_LIMIT,
+    );
+    let persisted_samples = crate::tool_metrics::persisted_metric_store_size(&cfg.raw_database_url);
+    build_persisted_insight_feed_from_rows(&rows, persisted_samples)
 }
 
 fn render_card_list(
@@ -342,7 +484,7 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
 // ── MailScreen implementation ──────────────────────────────────────────
 
 impl MailScreen for AnalyticsScreen {
-    fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+    fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         let Event::Key(key) = event else {
             return Cmd::None;
         };
@@ -369,7 +511,7 @@ impl MailScreen for AnalyticsScreen {
             }
             KeyCode::Enter => self.navigate_deep_link(),
             KeyCode::Char('r') => {
-                self.refresh_feed();
+                self.refresh_feed(Some(state));
                 Cmd::None
             }
             KeyCode::Home => {
@@ -413,9 +555,9 @@ impl MailScreen for AnalyticsScreen {
         }
     }
 
-    fn tick(&mut self, tick_count: u64, _state: &TuiSharedState) {
+    fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         if tick_count.wrapping_sub(self.last_refresh_tick) >= REFRESH_INTERVAL_TICKS {
-            self.refresh_feed();
+            self.refresh_feed(Some(state));
             self.last_refresh_tick = tick_count;
         }
     }
@@ -565,6 +707,27 @@ mod tests {
         assert!(!bindings.is_empty());
         assert!(bindings.iter().any(|b| b.key == "j/k"));
         assert!(bindings.iter().any(|b| b.key == "Enter"));
+    }
+
+    #[test]
+    fn persisted_rows_generate_insight_cards() {
+        let rows = vec![crate::tool_metrics::PersistedToolMetric {
+            tool_name: "send_message".to_string(),
+            calls: 120,
+            errors: 12,
+            cluster: "messaging".to_string(),
+            complexity: "medium".to_string(),
+            avg_ms: 180.0,
+            p50_ms: 95.0,
+            p95_ms: 620.0,
+            p99_ms: 950.0,
+            is_slow: true,
+            collected_ts: 1_700_000_000_000_000,
+        }];
+
+        let feed = build_persisted_insight_feed_from_rows(&rows, 50);
+        assert!(!feed.cards.is_empty());
+        assert!(feed.cards_produced > 0);
     }
 
     #[test]

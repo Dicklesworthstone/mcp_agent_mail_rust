@@ -369,11 +369,12 @@ fn scrub_text(input: &str) -> (String, i64) {
     let mut result = input.to_string();
     let mut count: i64 = 0;
     for pattern in SECRET_PATTERNS.iter() {
-        let before = result.clone();
-        result = pattern.replace_all(&result, "[REDACTED]").to_string();
-        if result != before {
-            // Count the actual number of matches in the original text for this pattern
-            count += i64::try_from(pattern.find_iter(&before).count()).unwrap_or(0);
+        // Optimization: check count first to avoid unnecessary allocation/replacement
+        // logic if the pattern is not present.
+        let matches = pattern.find_iter(&result).count();
+        if matches > 0 {
+            count += matches as i64;
+            result = pattern.replace_all(&result, "[REDACTED]").to_string();
         }
     }
     (result, count)

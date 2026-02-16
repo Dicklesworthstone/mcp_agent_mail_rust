@@ -51,7 +51,7 @@ pub struct SearchResponse {
 }
 
 /// Deterministic degraded-mode diagnostics extracted from explain metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchDiagnostics {
     pub degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,9 +201,9 @@ pub(crate) fn derive_search_diagnostics(
     if let Some(outcome) = explain_facet_value(explain, "rerank_outcome") {
         if let Some(tier) = parse_budget_tier_from_rerank_outcome(outcome) {
             diagnostics.degraded = true;
-            diagnostics.fallback_mode.get_or_insert_with(|| {
-                "hybrid_budget_governor".to_string()
-            });
+            diagnostics
+                .fallback_mode
+                .get_or_insert_with(|| "hybrid_budget_governor".to_string());
             diagnostics.budget_tier = Some(tier.to_string());
             diagnostics.budget_exhausted = Some(tier.eq_ignore_ascii_case("critical"));
             diagnostics
@@ -211,14 +211,18 @@ pub(crate) fn derive_search_diagnostics(
                 .push("Reduce `limit` or narrow filters to avoid budget pressure.".to_string());
         } else if outcome.to_ascii_lowercase().contains("timeout") {
             diagnostics.degraded = true;
-            diagnostics.fallback_mode.get_or_insert_with(|| "rerank_timeout".to_string());
+            diagnostics
+                .fallback_mode
+                .get_or_insert_with(|| "rerank_timeout".to_string());
             diagnostics.timeout_stage = Some("rerank".to_string());
             diagnostics
                 .remediation_hints
                 .push("Retry with tighter filters or switch to lexical mode.".to_string());
         } else if outcome.to_ascii_lowercase().contains("failed") {
             diagnostics.degraded = true;
-            diagnostics.fallback_mode.get_or_insert_with(|| "rerank_failed".to_string());
+            diagnostics
+                .fallback_mode
+                .get_or_insert_with(|| "rerank_failed".to_string());
             diagnostics
                 .remediation_hints
                 .push("Hybrid refinement failed; retry or use lexical mode.".to_string());
@@ -613,7 +617,11 @@ pub(crate) fn parse_time_range_with_aliases(
 ///
 /// # Returns
 /// List of matching message summaries
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines
+)]
 #[tool(
     description = "Full-text search over subject and body for a project.\n\nTips\n----\n- SQLite FTS5 syntax supported: phrases (\"build plan\"), prefix (mig*), boolean (plan AND users)\n- Results are ordered by bm25 score (best matches first) unless ranking=\"recency\"\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (BM25, default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`diagnostics` is present when degraded-mode signals are detected (fallback, budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
 )]

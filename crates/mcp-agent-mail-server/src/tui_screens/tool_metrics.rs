@@ -259,7 +259,11 @@ impl ToolStats {
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn ms_f64_to_u64(value: f64) -> u64 {
     if !value.is_finite() || value <= 0.0 {
         0
@@ -465,26 +469,31 @@ impl ToolMetricsScreen {
 
     fn hydrate_from_persisted_metrics(&mut self, state: &TuiSharedState) {
         let cfg = state.config_snapshot();
-        let persisted = crate::tool_metrics::load_latest_persisted_metrics(&cfg.raw_database_url, 512);
+        let persisted =
+            crate::tool_metrics::load_latest_persisted_metrics(&cfg.raw_database_url, 512);
         if persisted.is_empty() {
             return;
         }
 
         let mut updated = false;
         for metric in &persisted {
-            let stats = self
+            let tool_stats = self
                 .tool_map
                 .entry(metric.tool_name.clone())
                 .or_insert_with(|| ToolStats::new(metric.tool_name.clone()));
-            if stats.calls > metric.calls {
+            if tool_stats.calls > metric.calls {
                 continue;
             }
 
-            stats.calls = metric.calls;
-            stats.errors = metric.errors.min(metric.calls);
-            stats.total_duration_ms = total_duration_ms_from_avg(metric.avg_ms, metric.calls);
-            stats.recent_latencies =
-                synthesize_recent_latency_samples(metric.avg_ms, metric.p50_ms, metric.p95_ms, metric.p99_ms);
+            tool_stats.calls = metric.calls;
+            tool_stats.errors = metric.errors.min(metric.calls);
+            tool_stats.total_duration_ms = total_duration_ms_from_avg(metric.avg_ms, metric.calls);
+            tool_stats.recent_latencies = synthesize_recent_latency_samples(
+                metric.avg_ms,
+                metric.p50_ms,
+                metric.p95_ms,
+                metric.p99_ms,
+            );
             updated = true;
         }
 
@@ -1318,13 +1327,13 @@ mod tests {
         let mut screen = ToolMetricsScreen::new();
         screen.tick(0, &state);
 
-        let stats = screen
+        let hydrated_stats = screen
             .tool_map
             .get("send_message")
             .expect("persisted metrics should hydrate tool stats");
-        assert_eq!(stats.calls, 42);
-        assert_eq!(stats.errors, 5);
-        assert!(!stats.recent_latencies.is_empty());
+        assert_eq!(hydrated_stats.calls, 42);
+        assert_eq!(hydrated_stats.errors, 5);
+        assert!(!hydrated_stats.recent_latencies.is_empty());
     }
 
     #[test]

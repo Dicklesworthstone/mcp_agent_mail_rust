@@ -1908,24 +1908,39 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
 
     for line in existing.lines() {
         let trimmed = line.trim_start();
-        let maybe = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-        let Some((key, _)) = maybe.split_once('=') else {
+
+        let is_export = trimmed.starts_with("export ");
+
+        let content = if is_export { &trimmed[7..] } else { trimmed };
+
+        let Some((key_str, _)) = content.split_once('=') else {
             out_lines.push(line.to_string());
+
             continue;
         };
-        let key = key.trim();
+
+        let key = key_str.trim();
+
         let Some(value) = updates.get(key) else {
             out_lines.push(line.to_string());
+
             continue;
         };
 
         let comment = extract_inline_comment(line);
-        let mut replaced = format!("{key}={value}");
-        if let Some(suffix) = comment {
-            replaced.push(' ');
-            replaced.push_str(suffix.trim_start());
-        }
+
+        // Calculate the index of '=' to preserve everything before it
+
+        let equals_idx = line.len() - content.len() + key_str.len();
+
+        let prefix = &line[..=equals_idx];
+
+        let suffix = comment.map_or_else(String::new, |c| format!(" {c}"));
+
+        let replaced = format!("{prefix}{value}{suffix}");
+
         out_lines.push(replaced);
+
         seen.insert(key);
     }
 

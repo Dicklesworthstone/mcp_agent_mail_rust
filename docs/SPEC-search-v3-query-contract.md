@@ -413,50 +413,64 @@ pub struct ShadowComparison {
 
 ## 6. MCP Tool Interface
 
-### 6.1 `search_messages` (unchanged signature)
+### 6.1 `search_messages` (current contract)
 
-The existing MCP tool signature is **not changed**:
+`search_messages` is the canonical MCP surface and now supports rich filters:
 
-```
-search_messages(project_key: str, query: str, limit: int) → [{id, subject, importance, ack_required, created_ts, thread_id, from}]
-```
-
-V3 behavior: internally constructs `SearchQuery { text: query, mode: Lexical, ... }`.
-The tool uses the default engine selection (auto-fallback chain).
-
-### 6.2 `search_messages_v3` (new tool, V3 surfaces only)
-
-A new tool exposes the full V3 contract:
-
-```
-search_messages_v3(
+```text
+search_messages(
     project_key: str,
     query: str,
-    mode: Optional[str],          # "lexical" | "semantic" | "hybrid" | "hybrid_rerank"
-    limit: Optional[int],
-    cursor: Optional[str],
-    importance: Optional[list[str]],
-    sender_name: Optional[str],
-    recipient_name: Optional[str],
-    thread_id: Optional[str],
-    ack_required: Optional[bool],
-    since_ts: Optional[str],      # ISO-8601 → min_ts
-    until_ts: Optional[str],      # ISO-8601 → max_ts
-    min_score: Optional[float],
-    explain: Optional[bool],
-) → {
-    results: [{id, subject, importance, ack_required, created_ts, thread_id, from, score}],
-    next_cursor: Optional[str],
-    explain: Optional[QueryExplain],    # when explain=true
+    limit?: int,                # default 20, max 1000
+    offset?: int,               # default 0
+    ranking?: str,              # "relevance" | "recency"
+    sender?: str,               # aliases: from_agent, sender_name
+    importance?: str,           # comma-separated: low,normal,high,urgent
+    thread_id?: str,
+    date_start?: str,           # aliases: date_from, after, since
+    date_end?: str,             # aliases: date_to, before, until
+    explain?: bool
+) -> {
+    result: [{id, subject, importance, ack_required, created_ts, thread_id, from, reason_codes?, score_factors?}],
+    assistance?: QueryAssistance,
+    guidance?: ZeroResultGuidance,
+    explain?: QueryExplain,     # only when explain=true
+    next_cursor?: str,
+    diagnostics?: SearchDiagnostics  # fallback/budget/timeout signals when degraded
 }
 ```
 
-### 6.3 Backward compatibility guarantee
+Date-only bounds are normalized in UTC and `date_end` is inclusive through end-of-day.
 
-- `search_messages` (V2) behavior is unchanged; it will never return V3-only
-  fields or require V3-only parameters.
-- `search_messages_v3` is additive — it does not replace the V2 tool.
-- Both tools share the same underlying `execute_search` pipeline.
+### 6.2 `search_messages_product` (current contract)
+
+`search_messages_product` supports product-wide search plus project/date/sender aliases:
+
+```text
+search_messages_product(
+    product_key: str,
+    query: str,
+    limit?: int,
+    project?: str,              # aliases: project_key_filter, project_slug, proj
+    sender?: str,               # aliases: from_agent, sender_name
+    importance?: str,
+    thread_id?: str,
+    date_start?: str,           # aliases: date_from, after, since
+    date_end?: str,             # aliases: date_to, before, until
+) -> {
+    result: [{id, subject, importance, ack_required, created_ts, thread_id, from, project_id}],
+    assistance?: QueryAssistance,
+    diagnostics?: SearchDiagnostics
+}
+```
+
+### 6.3 Notes
+
+- Degraded-mode diagnostics are deterministic and intended for automation branching.
+- `explain` is optional for callers; diagnostics may still be emitted when degradation signals are detected.
+- TUI Search mode guidance:
+  - `Auto` / `Lexical`: default deterministic path for low-latency operator triage.
+  - `Semantic` / `Hybrid`: when unavailable in the active sync path, UI must surface degraded-mode hints instead of silently pretending success.
 
 ## 7. Filters Summary
 

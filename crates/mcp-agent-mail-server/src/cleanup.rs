@@ -159,7 +159,7 @@ fn detect_and_release_stale(
     pool: &DbPool,
     cx: &Cx,
     project_id: i64,
-) -> Result<usize, String> {
+) -> Result<Vec<i64>, String> {
     let inactivity_us =
         i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(1800) * 1_000_000;
     let grace_us =
@@ -238,12 +238,12 @@ fn detect_and_release_stale(
     }
 
     if stale_ids.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // Bulk-release stale reservations.
     match block_on(async { release_reservations_by_ids(cx, pool, &stale_ids).await }) {
-        Outcome::Ok(n) => Ok(n),
+        Outcome::Ok(_) => Ok(stale_ids),
         other => Err(format!("failed to release stale reservations: {other:?}")),
     }
 }
@@ -353,12 +353,7 @@ fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf>
     }
 }
 
-/// Write archive artifacts for released reservations (best-effort).
-///
-/// Released reservations are no longer in the unreleased list, so we would need
-/// a dedicated query to fetch them by ID. For now the DB remains the source of
-/// truth; archive artifacts are written when reservations are released via the
-/// normal tool path (`file_reservation_paths` / `release_file_reservations`).
+/// Record cleanup releases to logs (best-effort).
 fn write_cleanup_artifacts(
     _config: &Config,
     pool: &DbPool,

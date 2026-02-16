@@ -481,25 +481,14 @@ pub fn capture_env_snapshot() -> BTreeMap<String, String> {
 /// Returns 0 on non-Linux or on read failure.
 #[must_use]
 pub fn read_rss_kb() -> u64 {
-    std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| {
-            s.split_whitespace()
-                .nth(1)
-                .and_then(|v| v.parse::<u64>().ok())
-        })
-        .map_or(0, |pages| pages * 4) // 4KB pages
+    crate::memory::read_rss_bytes().map_or(0, |b| b / 1024)
 }
 
 /// Read process uptime by checking `/proc/self/stat` start time.
 /// Returns 0.0 on failure.
 #[must_use]
 pub fn read_uptime_secs() -> f64 {
-    // Fallback: use process start via Instant approximation
-    // This is a rough estimate; precise /proc parsing is complex
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let start = START.get_or_init(std::time::Instant::now);
-    start.elapsed().as_secs_f64()
+    crate::diagnostics::process_uptime().as_secs_f64()
 }
 
 // ── Artifact Scanning (br-36xx) ─────────────────────────────────────

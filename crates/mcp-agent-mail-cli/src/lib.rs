@@ -2001,17 +2001,40 @@ fn auto_clear_port(host: &str, port: u16) {
 }
 
 /// Kill whatever process is holding `port` using `fuser` (Linux) or `lsof` (macOS).
+/// Attempts graceful termination (SIGTERM) before forceful kill (SIGKILL).
 fn kill_port_holder(port: u16) {
     // Try fuser first (Linux, fastest)
-    let result = std::process::Command::new("fuser")
-        .args(["-k", &format!("{port}/tcp")])
+    // First, try SIGTERM
+    let term_result = std::process::Command::new("fuser")
+        .args(["-k", "-TERM", &format!("{port}/tcp")])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    if let Ok(s) = result {
+    if let Ok(s) = term_result {
+        // fuser returns 0 if it successfully identified processes
         if s.success() {
             // Give the OS a moment to release the port
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+
+            // Check if still held
+            let check_result = std::process::Command::new("fuser")
+                .args([&format!("{port}/tcp")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+
+            // If check fails (exit code 1), it means no processes found -> success
+            if check_result.map_or(false, |s| !s.success()) {
+                return;
+            }
+
+            // Still held: FORCE KILL
+            let _ = std::process::Command::new("fuser")
+                .args(["-k", "-KILL", &format!("{port}/tcp")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
             std::thread::sleep(std::time::Duration::from_millis(300));
             return;
         }
@@ -2023,17 +2046,28 @@ fn kill_port_holder(port: u16) {
         .output();
 
     if let Ok(out) = lsof_output {
-        let pids = String::from_utf8_lossy(&out.stdout);
-        for pid_str in pids.split_whitespace() {
-            if let Ok(pid) = pid_str.parse::<i32>() {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .status();
-            }
+        let pids_str = String::from_utf8_lossy(&out.stdout);
+        let pids: Vec<String> = pids_str.split_whitespace().map(|s| s.to_string()).collect();
+
+        if pids.is_empty() {
+            return;
         }
-        if !pids.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Try SIGTERM (15)
+        for pid in &pids {
+            let _ = std::process::Command::new("kill")
+                .args(["-15", pid])
+                .status();
         }
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        // Force kill (9) any survivors
+        for pid in &pids {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .status();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
     }
 }
 
@@ -2705,7 +2739,29 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
 fn handle_guard(action: GuardCommand) -> CliResult<()> {
     match action {
         GuardCommand::Install { project, repo, .. } => {
-            mcp_agent_mail_guard::install_guard(&project, repo.as_path())?;
+            let config = Config::from_env();
+            let db_cfg = mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                ..Default::default()
+            };
+            let abs_db_path = db_cfg
+                .sqlite_path()
+                .ok()
+                .map(|s| {
+                    let p = PathBuf::from(s);
+                    if p.exists() {
+                        p.canonicalize().unwrap_or(p)
+                    } else {
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            std::env::current_dir().unwrap_or_default().join(p)
+                        }
+                    }
+                })
+                .map(|p| p.to_string_lossy().to_string());
+
+            mcp_agent_mail_guard::install_guard(&project, repo.as_path(), abs_db_path.as_deref())?;
             ftui_runtime::ftui_println!("Guard installed successfully.");
             Ok(())
         }
@@ -4162,7 +4218,7 @@ fn handle_file_reservations_with_conn(
                            AND fr.expires_ts > ? AND fr.agent_id != ? \
                            AND (fr.exclusive = 1 OR ? = 1) \
                            AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
-                                OR ? LIKE fr.path_pattern)",
+                                OR ? GLOB fr.path_pattern)",
                         &[
                             sqlmodel_core::Value::BigInt(project_id),
                             sqlmodel_core::Value::BigInt(now_us),
@@ -17280,6 +17336,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         &config.storage_root,
         params.inline_threshold,
         params.detach_threshold,
+        config.allow_absolute_attachment_paths,
     )?;
     ftui_runtime::ftui_println!(
         "  Attachments: {} inline, {} copied, {} external, {} missing",
@@ -17505,6 +17562,7 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         &config.storage_root,
         params.inline_threshold,
         params.detach_threshold,
+        config.allow_absolute_attachment_paths,
     )?;
     ftui_runtime::ftui_println!(
         "  Attachments: {} inline, {} copied, {} external, {} missing",

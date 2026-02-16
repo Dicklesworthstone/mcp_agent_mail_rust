@@ -291,6 +291,7 @@ mod tests {
             &storage,
             crate::INLINE_ATTACHMENT_THRESHOLD,
             crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
         )
         .unwrap();
         assert_eq!(att_manifest.stats.inline, 1); // small file → inline

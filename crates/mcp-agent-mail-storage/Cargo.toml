@@ -24,7 +24,8 @@ base64 = "0.22"
 thiserror.workspace = true
 tracing.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
+mcp-agent-mail-db = { path = "../mcp-agent-mail-db" }
+fastmcp-core.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-mcp-agent-mail-db = { path = "../mcp-agent-mail-db" }

@@ -140,7 +140,7 @@ fn query_assistance_payload(query: &SearchQuery) -> Option<QueryAssistance> {
 fn generate_zero_result_guidance(
     query: &SearchQuery,
     result_count: usize,
-    assistance: &Option<QueryAssistance>,
+    assistance: Option<&QueryAssistance>,
 ) -> Option<ZeroResultGuidance> {
     if result_count > 0 {
         return None;
@@ -2186,7 +2186,7 @@ pub async fn execute_search(
         } else {
             None
         };
-        let guidance = generate_zero_result_guidance(query, 0, &assistance);
+        let guidance = generate_zero_result_guidance(query, 0, assistance.as_ref());
         return Outcome::Ok(ScopedSearchResponse {
             results: Vec::new(),
             next_cursor: None,
@@ -2283,7 +2283,7 @@ pub async fn execute_search(
         None
     };
 
-    let guidance = generate_zero_result_guidance(query, scoped_results.len(), &assistance);
+    let guidance = generate_zero_result_guidance(query, scoped_results.len(), assistance.as_ref());
 
     Outcome::Ok(ScopedSearchResponse {
         results: scoped_results,
@@ -2317,7 +2317,7 @@ fn finish_scoped_response(
         recipient_map: Vec::new(),
     });
     let (scoped_results, audit_summary) = apply_scope(raw_results, &scope_ctx, &redaction);
-    let guidance = generate_zero_result_guidance(query, scoped_results.len(), &assistance);
+    let guidance = generate_zero_result_guidance(query, scoped_results.len(), assistance.as_ref());
     let explain = if query.explain {
         explain.map(|mut value| {
             value.denied_count = audit_summary.denied_count;
@@ -2372,7 +2372,7 @@ pub async fn execute_search_simple(
         } else {
             None
         };
-        let guidance = generate_zero_result_guidance(query, 0, &assistance);
+        let guidance = generate_zero_result_guidance(query, 0, assistance.as_ref());
         return Outcome::Ok(SearchResponse {
             results: Vec::new(),
             next_cursor: None,
@@ -2424,7 +2424,7 @@ pub async fn execute_search_simple(
         None
     };
 
-    let guidance = generate_zero_result_guidance(query, raw_results.len(), &assistance);
+    let guidance = generate_zero_result_guidance(query, raw_results.len(), assistance.as_ref());
 
     Outcome::Ok(SearchResponse {
         results: raw_results,
@@ -2559,7 +2559,7 @@ fn compute_next_cursor(results: &[SearchResult], limit: usize) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search_planner::SearchCursor;
+    use crate::search_planner::{Importance, SearchCursor};
     use mcp_agent_mail_core::metrics::global_metrics;
     #[cfg(feature = "hybrid")]
     use std::time::Duration;
@@ -2641,6 +2641,135 @@ mod tests {
         assert!(opts.scope_ctx.is_none());
         assert!(opts.redaction_policy.is_none());
         assert!(!opts.track_telemetry);
+    }
+
+    // ── Zero-result guidance tests ──────────────────────────────────
+
+    #[test]
+    fn guidance_none_when_results_present() {
+        let query = SearchQuery::messages("test", 1);
+        let result = generate_zero_result_guidance(&query, 5, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn guidance_generated_when_zero_results() {
+        let query = SearchQuery::messages("test", 1);
+        let result = generate_zero_result_guidance(&query, 0, None);
+        assert!(result.is_some());
+        let guidance = result.unwrap();
+        assert!(!guidance.summary.is_empty());
+        // Plain query with no facets → simplify_query suggestion
+        assert_eq!(guidance.suggestions.len(), 1);
+        assert_eq!(guidance.suggestions[0].kind, "simplify_query");
+    }
+
+    #[test]
+    fn guidance_suggests_dropping_importance_filter() {
+        let query = SearchQuery {
+            text: "migration".to_string(),
+            importance: vec![Importance::Urgent],
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None).unwrap();
+        assert!(
+            guidance
+                .suggestions
+                .iter()
+                .any(|s| s.kind == "drop_importance_filter"),
+            "expected drop_importance_filter suggestion"
+        );
+    }
+
+    #[test]
+    fn guidance_suggests_dropping_thread_filter() {
+        let query = SearchQuery {
+            text: "migration".to_string(),
+            thread_id: Some("br-100".to_string()),
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None).unwrap();
+        assert!(
+            guidance
+                .suggestions
+                .iter()
+                .any(|s| s.kind == "drop_thread_filter"),
+            "expected drop_thread_filter suggestion"
+        );
+    }
+
+    #[test]
+    fn guidance_suggests_dropping_agent_filter() {
+        let query = SearchQuery {
+            text: "migration".to_string(),
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None).unwrap();
+        assert!(
+            guidance
+                .suggestions
+                .iter()
+                .any(|s| s.kind == "drop_agent_filter"),
+            "expected drop_agent_filter suggestion"
+        );
+    }
+
+    #[test]
+    fn guidance_surfaces_did_you_mean_from_assistance() {
+        let assistance = Some(QueryAssistance {
+            query_text: "form:BlueLake migration".to_string(),
+            applied_filter_hints: Vec::new(),
+            did_you_mean: vec![mcp_agent_mail_search_core::DidYouMeanHint {
+                token: "form:BlueLake".to_string(),
+                suggested_field: "from".to_string(),
+                value: "BlueLake".to_string(),
+            }],
+        });
+        let query = SearchQuery::messages("form:BlueLake migration", 1);
+        let guidance = generate_zero_result_guidance(&query, 0, assistance.as_ref()).unwrap();
+        assert!(
+            guidance.suggestions.iter().any(|s| s.kind == "fix_typo"),
+            "expected fix_typo suggestion"
+        );
+        let typo = guidance
+            .suggestions
+            .iter()
+            .find(|s| s.kind == "fix_typo")
+            .unwrap();
+        assert!(typo.label.contains("from:BlueLake"));
+    }
+
+    #[test]
+    fn guidance_multiple_suggestions_for_constrained_query() {
+        let query = SearchQuery {
+            text: "migration".to_string(),
+            importance: vec![Importance::High],
+            agent_name: Some("BlueLake".to_string()),
+            thread_id: Some("br-100".to_string()),
+            ack_required: Some(true),
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None).unwrap();
+        assert!(
+            guidance.suggestions.len() >= 4,
+            "expected at least 4 suggestions, got {}",
+            guidance.suggestions.len()
+        );
+    }
+
+    #[test]
+    fn guidance_summary_reflects_suggestion_count() {
+        let query = SearchQuery {
+            text: "test".to_string(),
+            importance: vec![Importance::Urgent],
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None).unwrap();
+        assert!(
+            guidance.summary.contains("suggestion"),
+            "summary should mention suggestions"
+        );
     }
 
     fn result_with_score(id: i64, score: f64) -> SearchResult {

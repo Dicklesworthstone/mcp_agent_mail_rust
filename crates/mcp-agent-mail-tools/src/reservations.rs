@@ -106,21 +106,56 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
              Use more specific patterns like 'src/api/*.py' or 'lib/auth/**'."
         ));
     }
-    // 2. Absolute paths (but not UNC paths starting with //)
-    if p.starts_with('/') && !p.starts_with("//") {
-        return Some(format!(
-            "Pattern '{p}' looks like an absolute path. File reservation patterns should be \
-             project-relative (e.g., 'src/module.py' not '/full/path/src/module.py')."
-        ));
-    }
-    // 3. Very short patterns with wildcards
+    // 2. Very short patterns with wildcards
     if p.len() <= 2 && p.contains('*') {
         return Some(format!(
             "Pattern '{p}' is very short and may match more files than intended. \
              Consider using a more specific pattern."
         ));
     }
+
+    // 3. Absolute paths (should be relative to project root)
+    // Note: We explicitly allow UNC-like paths (starting with //) to pass this specific check
+    // to match legacy test behavior, though they likely won't match anything in the project.
+    if p.starts_with('/') && !p.starts_with("//") {
+        return Some(format!(
+            "Pattern '{p}' looks like an absolute path. \
+             File reservations must be relative to the project root (e.g. 'src/main.rs')."
+        ));
+    }
+
     None
+}
+
+fn relativize_path(project_root: &str, path: &str) -> Option<String> {
+    let path_path = std::path::Path::new(path);
+    if path_path.is_absolute() {
+        if let Ok(rel) = path_path.strip_prefix(project_root) {
+            return Some(rel.to_string_lossy().to_string());
+        }
+        // Absolute path outside project root
+        return None;
+    }
+
+    // Check for traversal in relative path
+    let mut depth = 0;
+    for component in path_path.components() {
+        match std::path::Component::ParentDir {
+            _ if component == std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return None; // Traversal above root
+                }
+            }
+            _ if matches!(component, std::path::Component::Normal(_)) => {
+                depth += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Already relative and safe
+    Some(path.to_string())
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
@@ -219,13 +254,6 @@ pub async fn file_reservation_paths(
         ));
     }
 
-    // Warn about suspicious patterns (matching Python's ctx.info behavior)
-    for pattern in &paths {
-        if let Some(warning) = detect_suspicious_file_reservation(pattern) {
-            tracing::warn!("[warn] {}", warning);
-        }
-    }
-
     let ttl = ttl_seconds.unwrap_or(3600).max(0);
     if ttl < 60 {
         tracing::info!(
@@ -240,6 +268,32 @@ pub async fn file_reservation_paths(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
+
+    // Normalize paths relative to project root
+    let mut normalized_paths = Vec::with_capacity(paths.len());
+    for p in &paths {
+        match relativize_path(&project.human_key, p) {
+            Some(rel) => normalized_paths.push(rel),
+            None => {
+                return Err(legacy_tool_error(
+                    "INVALID_PATH",
+                    format!(
+                        "Path '{p}' is outside the project root '{}'. File reservations must be within the project directory.",
+                        project.human_key
+                    ),
+                    true,
+                    json!({ "path": p, "project_root": project.human_key }),
+                ));
+            }
+        }
+    }
+
+    // Warn about suspicious patterns (matching Python's ctx.info behavior)
+    for pattern in &normalized_paths {
+        if let Some(warning) = detect_suspicious_file_reservation(pattern) {
+            tracing::warn!("[warn] {}", warning);
+        }
+    }
 
     let agent = resolve_agent(
         ctx,
@@ -283,10 +337,12 @@ pub async fn file_reservation_paths(
     );
 
     // Precompile requested patterns once.
-    let requested_compiled: Vec<CompiledPattern> =
-        paths.iter().map(|p| CompiledPattern::new(p)).collect();
+    let requested_compiled: Vec<CompiledPattern> = normalized_paths
+        .iter()
+        .map(|p| CompiledPattern::new(p))
+        .collect();
 
-    for (path, path_pat) in paths.iter().zip(requested_compiled.iter()) {
+    for (path, path_pat) in normalized_paths.iter().zip(requested_compiled.iter()) {
         let conflict_refs = index.find_conflicts(path_pat);
 
         if conflict_refs.is_empty() {
@@ -954,12 +1010,33 @@ pub fn install_precommit_guard(
     }
 
     // Install the guard via the guard crate
-    mcp_agent_mail_guard::install_guard(&project_key, &repo_path).map_err(|e| {
-        McpError::new(
-            McpErrorCode::InternalError,
-            format!("Failed to install guard: {e}"),
-        )
-    })?;
+    let db_cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: config.database_url.clone(),
+        ..Default::default()
+    };
+    let abs_db_path = db_cfg
+        .sqlite_path()
+        .ok()
+        .map(|s| {
+            let p = std::path::PathBuf::from(s);
+            if p.exists() {
+                p.canonicalize().unwrap_or(p)
+            } else if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir().unwrap_or_default().join(p)
+            }
+        })
+        .map(|p| p.to_string_lossy().to_string());
+
+    mcp_agent_mail_guard::install_guard(&project_key, &repo_path, abs_db_path.as_deref()).map_err(
+        |e| {
+            McpError::new(
+                McpErrorCode::InternalError,
+                format!("Failed to install guard: {e}"),
+            )
+        },
+    )?;
 
     // Resolve the actual hook path (honors core.hooksPath, worktrees, etc.)
     let hooks_dir = mcp_agent_mail_guard::resolve_hooks_dir(&repo_path).map_err(|e| {
@@ -1325,6 +1402,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     // ── Path expansion edge cases ──
+
+    #[test]
+    fn relativize_path_rejects_traversal() {
+        let root = "/project";
+        assert_eq!(relativize_path(root, "../outside"), None);
+        assert_eq!(relativize_path(root, "src/../../outside"), None);
+        assert_eq!(
+            relativize_path(root, "src/../internal"),
+            Some("src/../internal".to_string())
+        );
+    }
 
     #[test]
     fn expand_tilde_double_tilde_unchanged() {

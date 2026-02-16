@@ -3929,6 +3929,66 @@ pub fn store_attachment(
     Ok(StoredAttachment { meta, rel_paths })
 }
 
+/// Store a raw attachment (no conversion) in the archive.
+///
+/// Copies the file to `attachments/files/{sha1[:2]}/{sha1}.{ext}`.
+/// Returns metadata and relative paths for git commit.
+pub fn store_raw_attachment(
+    archive: &ProjectArchive,
+    file_path: &Path,
+) -> Result<StoredAttachment> {
+    // Read file
+    let bytes = fs::read(file_path)?;
+    if bytes.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "Attachment file is empty".to_string(),
+        ));
+    }
+
+    // Compute SHA1
+    let digest = {
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(&bytes);
+        hex::encode(hasher.finalize())
+    };
+
+    let prefix = &digest[..2.min(digest.len())];
+    let ext = file_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
+
+    let attach_dir = archive.root.join("attachments");
+    let file_dir = attach_dir.join("files").join(prefix);
+    ensure_dir(&file_dir)?;
+
+    let filename = format!("{digest}{ext}");
+    let target_path = file_dir.join(&filename);
+
+    if !target_path.exists() {
+        fs::write(&target_path, &bytes)?;
+    }
+
+    let rel_path = rel_path_cached(&archive.canonical_repo_root, &target_path)?;
+
+    let meta = AttachmentMeta {
+        kind: "file".to_string(),
+        media_type: "application/octet-stream".to_string(),
+        bytes: bytes.len(),
+        sha1: digest,
+        width: 0,
+        height: 0,
+        data_base64: None,
+        path: Some(rel_path.clone()),
+        original_path: None,
+    };
+
+    Ok(StoredAttachment {
+        meta,
+        rel_paths: vec![rel_path],
+    })
+}
+
 /// Process attachment paths and store them in the archive.
 ///
 /// Resolves paths sequentially (fast), then converts up to

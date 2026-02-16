@@ -34,7 +34,7 @@ const METRICS_RETENTION_DAYS: i64 = 30;
 const PRUNE_INTERVAL_TICKS: u64 = 60;
 
 #[derive(Debug, Clone)]
-pub(crate) struct PersistedToolMetric {
+pub struct PersistedToolMetric {
     pub tool_name: String,
     pub calls: u64,
     pub errors: u64,
@@ -223,7 +223,7 @@ fn ensure_metrics_schema(conn: &DbConn) {
 }
 
 #[allow(clippy::cast_possible_wrap)]
-fn i64_from_u64_saturating(value: u64) -> i64 {
+const fn i64_from_u64_saturating(value: u64) -> i64 {
     if value > i64::MAX as u64 {
         i64::MAX
     } else {
@@ -323,10 +323,7 @@ fn decode_metric_row(row: &mcp_agent_mail_db::sqlmodel_core::Row) -> Option<Pers
 }
 
 #[must_use]
-pub(crate) fn load_latest_persisted_metrics(
-    database_url: &str,
-    limit: usize,
-) -> Vec<PersistedToolMetric> {
+pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<PersistedToolMetric> {
     let Some(conn) = open_metrics_connection(database_url) else {
         return Vec::new();
     };
@@ -352,7 +349,7 @@ pub(crate) fn load_latest_persisted_metrics(
 }
 
 #[must_use]
-pub(crate) fn persisted_metric_store_size(database_url: &str) -> u64 {
+pub fn persisted_metric_store_size(database_url: &str) -> u64 {
     let Some(conn) = open_metrics_connection(database_url) else {
         return 0;
     };

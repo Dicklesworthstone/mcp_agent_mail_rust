@@ -1058,22 +1058,22 @@ effective_free_bytes={free}"
     }
 
     // Validate recipients
-    if to.is_empty() {
+    let cc_list = cc.unwrap_or_default();
+    let bcc_list = bcc.unwrap_or_default();
+
+    if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
-            "At least one recipient (to) is required. Provide agent names in the 'to' array.",
+            "At least one recipient is required. Provide agent names in to, cc, or bcc.",
             true,
             json!({
-                "field": "to",
+                "field": "to|cc|bcc",
                 "error_detail": "empty recipient list",
             }),
         ));
     }
 
     // Resolve all recipients (to, cc, bcc) with optional auto-registration
-    let cc_list = cc.unwrap_or_default();
-    let bcc_list = bcc.unwrap_or_default();
-
     let total_recip = to.len() + cc_list.len() + bcc_list.len();
     let mut all_recipients: SmallVec<[(i64, String); 8]> = SmallVec::with_capacity(total_recip);
     let mut resolved_to: SmallVec<[String; 4]> = SmallVec::with_capacity(to.len());
@@ -1267,26 +1267,114 @@ effective_free_bytes={free}"
             }
         }
     } else if let Some(ref paths) = attachment_paths {
-        // No conversion: validate source paths and store canonical references.
-        for p in paths {
-            let resolved =
-                mcp_agent_mail_storage::resolve_attachment_source_path(base_dir, config, p)
-                    .map_err(|e| {
-                        legacy_tool_error(
-                            "INVALID_ARGUMENT",
-                            format!("Invalid attachment path: {e}"),
-                            true,
-                            json!({
-                                "field": "attachment_paths",
-                                "provided": p,
-                            }),
-                        )
-                    })?;
-            all_attachment_meta.push(serde_json::json!({
-                "type": "file",
-                "path": resolved.to_string_lossy(),
-                "media_type": "application/octet-stream",
-            }));
+        // No conversion: store raw files in archive
+        let slug = &project.slug;
+        match mcp_agent_mail_storage::ensure_archive(config, slug) {
+            Ok(archive) => {
+                for p in paths {
+                    // Resolve source path first
+                    let resolved =
+                        mcp_agent_mail_storage::resolve_attachment_source_path(base_dir, config, p)
+                            .map_err(|e| {
+                                legacy_tool_error(
+                                    "INVALID_ARGUMENT",
+                                    format!("Invalid attachment path: {e}"),
+                                    true,
+                                    json!({
+                                        "field": "attachment_paths",
+                                        "provided": p,
+                                    }),
+                                )
+                            })?;
+
+                    // Store raw file in archive
+                    let stored = mcp_agent_mail_storage::store_raw_attachment(&archive, &resolved)
+                        .map_err(|e| {
+                            legacy_tool_error(
+                                "ARCHIVE_ERROR",
+                                format!("Failed to store raw attachment: {e}"),
+                                true,
+                                json!({
+                                    "path": p,
+                                }),
+                            )
+                        })?;
+
+                    all_attachment_rel_paths.extend(stored.rel_paths);
+                    if let Ok(v) = serde_json::to_value(&stored.meta) {
+                        all_attachment_meta.push(v);
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(legacy_tool_error(
+                    "ARCHIVE_ERROR",
+                    format!(
+                        "Failed to initialize git archive for project '{slug}'. This prevents storing attachments: {e}"
+                    ),
+                    true,
+                    json!({
+                        "project_slug": slug,
+                        "project_root": project.human_key,
+                    }),
+                ));
+            }
+        }
+    }
+
+    // Re-validate size limits on the final (potentially inlined) body.
+    // If inline images were processed, final_body may be significantly larger than body_md.
+    if do_convert {
+        if config.max_message_body_bytes > 0 && final_body.len() > config.max_message_body_bytes {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "Message body exceeds size limit after inlining images: {} bytes > {} byte limit. \
+                     Use 'file' attachments policy or reduce image sizes.",
+                    final_body.len(),
+                    config.max_message_body_bytes,
+                ),
+                true,
+                json!({
+                    "field": "body_md",
+                    "size_bytes": final_body.len(),
+                    "limit_bytes": config.max_message_body_bytes,
+                }),
+            ));
+        }
+
+        if config.max_total_message_bytes > 0 {
+            let mut total_size = subject.len().saturating_add(final_body.len());
+            for meta in &all_attachment_meta {
+                if meta.get("type").and_then(serde_json::Value::as_str) == Some("file") {
+                    if let Some(bytes) = meta.get("bytes").and_then(serde_json::Value::as_u64) {
+                        if let Ok(bytes_usize) = usize::try_from(bytes) {
+                            total_size = total_size.saturating_add(bytes_usize);
+                        } else {
+                            // On 32-bit platforms, treat oversized metadata as exceeding limits.
+                            total_size = usize::MAX;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if total_size > config.max_total_message_bytes {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Total message size exceeds limit after processing: {} bytes > {} byte limit. \
+                         Reduce body or attachment sizes.",
+                        total_size, config.max_total_message_bytes,
+                    ),
+                    true,
+                    json!({
+                        "field": "total",
+                        "size_bytes": total_size,
+                        "limit_bytes": config.max_total_message_bytes,
+                    }),
+                ));
+            }
         }
     }
 
@@ -1590,6 +1678,10 @@ effective_free_bytes={free}"
         all_recipient_names.extend(resolved_to.iter().cloned());
         all_recipient_names.extend(resolved_cc_recipients.iter().cloned());
         all_recipient_names.extend(resolved_bcc_recipients.iter().cloned());
+
+        // Deduplicate recipient names for archive write (avoid duplicate inbox writes)
+        all_recipient_names.sort_unstable();
+        all_recipient_names.dedup();
 
         let msg_json = serde_json::json!({
             "id": message_id,
@@ -1920,6 +2012,10 @@ effective_free_bytes={free}"
         all_recipient_names.extend(resolved_to.iter().cloned());
         all_recipient_names.extend(resolved_cc_recipients.iter().cloned());
         all_recipient_names.extend(resolved_bcc_recipients.iter().cloned());
+
+        // Deduplicate recipient names for archive write (avoid duplicate inbox writes)
+        all_recipient_names.sort_unstable();
+        all_recipient_names.dedup();
 
         let msg_json = serde_json::json!({
             "id": reply_id,

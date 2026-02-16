@@ -95,7 +95,7 @@ pub const fn classify_pressure(
 /// Parses the `VmRSS:` line and converts kB to bytes.
 /// Returns `None` with an error string on non-Linux platforms or if the file
 /// cannot be parsed.
-fn read_rss_bytes() -> Result<u64, String> {
+pub(crate) fn read_rss_bytes() -> Result<u64, String> {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string("/proc/self/status")

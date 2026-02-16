@@ -2504,7 +2504,7 @@ impl Model for MailAppModel {
                     }
 
                     if !self.toast_muted {
-                        if let Some(toast) = toast_for_event(event, self.toast_severity) {
+                        if let Some(toast) = safe_toast_for_event(event, self.toast_severity) {
                             self.notifications.notify(self.apply_toast_policy(toast));
                         }
                     }
@@ -4219,6 +4219,26 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
     } else {
         None
     }
+}
+
+fn safe_toast_from_builder<F>(build: F) -> Option<Toast>
+where
+    F: FnOnce() -> Option<Toast>,
+{
+    match catch_unwind(AssertUnwindSafe(build)) {
+        Ok(toast) => toast,
+        Err(payload) => {
+            tracing::error!(
+                panic = %panic_payload_to_string(&payload),
+                "toast generation panicked; dropping toast to keep TUI alive"
+            );
+            None
+        }
+    }
+}
+
+fn safe_toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Option<Toast> {
+    safe_toast_from_builder(|| toast_for_event(event, severity))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -7079,6 +7099,14 @@ mod tests {
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
         assert!(toast.content.message.starts_with("BlueLake: "));
         assert!(toast.content.message.contains('—'));
+    }
+
+    #[test]
+    fn safe_toast_wrapper_recovers_from_panics() {
+        let toast = safe_toast_from_builder(|| -> Option<Toast> {
+            panic!("synthetic panic in toast builder");
+        });
+        assert!(toast.is_none());
     }
 
     #[test]

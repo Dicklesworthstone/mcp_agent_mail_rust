@@ -870,9 +870,11 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let limit = query.effective_limit();
     let scope_label = scope_policy_label(&query.scope);
 
+    let terms = extract_like_terms(&query.text, 5);
+
     // Identity FTS tables (fts_agents) are dropped at runtime by
     // enforce_runtime_identity_fts_cleanup, so always use LIKE fallback.
-    let method = if query.text.is_empty() {
+    let method = if query.text.is_empty() || terms.is_empty() {
         PlanMethod::Empty
     } else {
         PlanMethod::Like
@@ -888,7 +890,6 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let mut scope_enforced = false;
 
     let (select_cols, from_clause, order_clause) = {
-        let terms = extract_like_terms(&query.text, 5);
         let mut like_parts = Vec::new();
         for term in &terms {
             let escaped = term.replace('%', "\\%").replace('_', "\\_");
@@ -953,9 +954,11 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     let limit = query.effective_limit();
     let scope_label = scope_policy_label(&query.scope);
 
+    let terms = extract_like_terms(&query.text, 5);
+
     // Identity FTS tables (fts_projects) are dropped at runtime by
     // enforce_runtime_identity_fts_cleanup, so always use LIKE fallback.
-    let method = if query.text.is_empty() {
+    let method = if query.text.is_empty() || terms.is_empty() {
         PlanMethod::Empty
     } else {
         PlanMethod::Like
@@ -971,7 +974,6 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     let mut scope_enforced = false;
 
     let (select_cols, from_clause, order_clause) = {
-        let terms = extract_like_terms(&query.text, 5);
         let mut like_parts = Vec::new();
         for term in &terms {
             let escaped = term.replace('%', "\\%").replace('_', "\\_");
@@ -1929,6 +1931,72 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("audit"));
         assert!(json.contains("redacted"));
+    }
+
+    // ── ZeroResultGuidance serialization ─────────────────────────
+
+    #[test]
+    fn guidance_omitted_when_none() {
+        let resp = SearchResponse {
+            results: vec![],
+            next_cursor: None,
+            explain: None,
+            assistance: None,
+            guidance: None,
+            audit: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("guidance"));
+    }
+
+    #[test]
+    fn guidance_included_when_present() {
+        let resp = SearchResponse {
+            results: vec![],
+            next_cursor: None,
+            explain: None,
+            assistance: None,
+            guidance: Some(ZeroResultGuidance {
+                summary: "No results found.".to_string(),
+                suggestions: vec![RecoverySuggestion {
+                    kind: "simplify_query".to_string(),
+                    label: "Simplify search terms".to_string(),
+                    detail: Some("Try fewer or broader keywords.".to_string()),
+                }],
+            }),
+            audit: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("guidance"));
+        assert!(json.contains("simplify_query"));
+        assert!(json.contains("Simplify search terms"));
+    }
+
+    #[test]
+    fn guidance_roundtrip_serde() {
+        let original = ZeroResultGuidance {
+            summary: "No results.".to_string(),
+            suggestions: vec![
+                RecoverySuggestion {
+                    kind: "drop_filter".to_string(),
+                    label: "Remove filter".to_string(),
+                    detail: None,
+                },
+                RecoverySuggestion {
+                    kind: "fix_typo".to_string(),
+                    label: "Did you mean from:X?".to_string(),
+                    detail: Some("Explanation here.".to_string()),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: ZeroResultGuidance = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.summary, original.summary);
+        assert_eq!(restored.suggestions.len(), 2);
+        assert_eq!(restored.suggestions[0].kind, "drop_filter");
+        assert!(restored.suggestions[0].detail.is_none());
+        assert_eq!(restored.suggestions[1].kind, "fix_typo");
+        assert!(restored.suggestions[1].detail.is_some());
     }
 
     // ── SearchQuery with scope serde ──────────────────────────────

@@ -638,12 +638,21 @@ fn build_tool_directory() -> ToolDirectory {
             tools: vec![
                 ToolDirectoryEntry {
                     name: "search_messages".to_string(),
-                    summary: "Run FTS5 queries across subject/body text to locate relevant threads.".to_string(),
-                    use_when: "Triage or gathering context before editing.".to_string(),
+                    summary: "Run full-text search with structured filters and degraded-mode diagnostics.".to_string(),
+                    use_when: "Triage context quickly, then branch on explain/diagnostics when degraded fallback appears.".to_string(),
                     related: vec!["fetch_inbox".to_string(), "summarize_thread".to_string()],
                     expected_frequency: "Regular during investigation phases.".to_string(),
                     required_capabilities: vec!["search".to_string()],
-                    usage_examples: vec![ToolUsageExample { hint: "FTS".to_string(), sample: "search_messages(project_key='backend', query='\"build plan\" AND users', limit=20)".to_string() }],
+                    usage_examples: vec![
+                        ToolUsageExample {
+                            hint: "Filtered recency search".to_string(),
+                            sample: "search_messages(project_key='backend', query='migration', ranking='recency', sender='BlueLake', importance='high,urgent', date_from='2026-02-01', date_to='2026-02-15', limit=50)".to_string(),
+                        },
+                        ToolUsageExample {
+                            hint: "Explain + diagnostics".to_string(),
+                            sample: "search_messages(project_key='backend', query='\"build plan\" AND users', explain=true, limit=20)".to_string(),
+                        },
+                    ],
                     capabilities: vec!["search".to_string()],
                     complexity: "medium".to_string(),
                 },
@@ -780,12 +789,21 @@ fn build_tool_directory() -> ToolDirectory {
                 },
                 ToolDirectoryEntry {
                     name: "search_messages_product".to_string(),
-                    summary: "Search messages across all projects linked to a product.".to_string(),
-                    use_when: "Global search across a multi-repo product.".to_string(),
+                    summary: "Search messages across product-linked projects with filter aliases and diagnostics.".to_string(),
+                    use_when: "Cross-repo incident/context search where project-scoped filtering may still be needed.".to_string(),
                     related: vec!["fetch_inbox_product".to_string(), "summarize_thread_product".to_string()],
                     expected_frequency: "Ad hoc during investigation or triage.".to_string(),
                     required_capabilities: vec!["product".to_string(), "search".to_string()],
-                    usage_examples: vec![ToolUsageExample { hint: "Search".to_string(), sample: "search_messages_product(product_uid='prod-123', query='outage')".to_string() }],
+                    usage_examples: vec![
+                        ToolUsageExample {
+                            hint: "Product-wide search".to_string(),
+                            sample: "search_messages_product(product_key='prod-123', query='outage', sender='BlueLake', importance='high,urgent')".to_string(),
+                        },
+                        ToolUsageExample {
+                            hint: "Scoped inside product".to_string(),
+                            sample: "search_messages_product(product_key='prod-123', query='rollback', project_slug='backend', date_from='2026-02-01', date_to='2026-02-15')".to_string(),
+                        },
+                    ],
                     capabilities: vec!["product".to_string(), "search".to_string()],
                     complexity: "medium".to_string(),
                 },

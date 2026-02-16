@@ -432,7 +432,10 @@ impl QueryTracker {
             if let Some(ref table_str) = name {
                 *aux.unknown_tables.entry(table_str.clone()).or_insert(0) += 1;
             }
-            if is_slow && aux.slow_queries.len() < SLOW_QUERY_LIMIT {
+            if is_slow {
+                if aux.slow_queries.len() >= SLOW_QUERY_LIMIT {
+                    aux.slow_queries.remove(0);
+                }
                 aux.slow_queries.push(SlowQueryEntry {
                     table: name,
                     duration_ms: round_ms(duration_us),
@@ -443,12 +446,13 @@ impl QueryTracker {
             self.per_table[table_id as usize].fetch_add(1, Ordering::Relaxed);
             if is_slow {
                 let mut aux = self.aux.lock();
-                if aux.slow_queries.len() < SLOW_QUERY_LIMIT {
-                    aux.slow_queries.push(SlowQueryEntry {
-                        table: Some(table_id.as_str().to_string()),
-                        duration_ms: round_ms(duration_us),
-                    });
+                if aux.slow_queries.len() >= SLOW_QUERY_LIMIT {
+                    aux.slow_queries.remove(0);
                 }
+                aux.slow_queries.push(SlowQueryEntry {
+                    table: Some(table_id.as_str().to_string()),
+                    duration_ms: round_ms(duration_us),
+                });
             }
         }
     }

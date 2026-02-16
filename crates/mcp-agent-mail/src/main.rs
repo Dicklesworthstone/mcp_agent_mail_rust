@@ -314,6 +314,9 @@ fn decide_reuse_preflight(
 
 #[allow(clippy::too_many_lines)]
 fn main() {
+    // Initialize process start time immediately for accurate uptime.
+    mcp_agent_mail_core::diagnostics::init_process_start();
+
     // Decide runtime mode before setting up logging or parsing the MCP CLI.
     // This ensures `--help` renders the correct surface and avoids polluting CLI-mode output.
     let mode = match am_interface_mode_from_env() {

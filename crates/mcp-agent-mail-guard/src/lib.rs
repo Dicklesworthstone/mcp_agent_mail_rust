@@ -272,9 +272,14 @@ fn render_chain_runner_script(hook_name: &str) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-fn render_guard_plugin_script(project: &str, hook_name: &str) -> String {
+fn render_guard_plugin_script(
+    project: &str,
+    hook_name: &str,
+    default_db_path: Option<&str>,
+) -> String {
     // Real guard plugin: checks active file reservations against staged changes.
     // Uses the `am` CLI binary to query reservations and compare against `git diff --cached`.
+    let db_fallback = default_db_path.unwrap_or("");
     format!(
         r#"#!/usr/bin/env python3
 # mcp-agent-mail guard plugin ({hook_name})
@@ -290,6 +295,7 @@ from fnmatch import fnmatch
 PROJECT = "{project}"
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
 GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
+DEFAULT_DB_PATH = "{db_fallback}"
 
 def get_staged_files():
     """Get list of staged files from git."""
@@ -345,10 +351,13 @@ def get_active_reservations():
     """Query active exclusive file reservations from the database."""
     db_path = os.environ.get("AGENT_MAIL_DB", "")
     if not db_path:
-        # Try default locations
-        storage_root = os.environ.get("AGENT_MAIL_STORAGE_ROOT", "")
-        if storage_root:
-            db_path = os.path.join(storage_root, "..", "storage.sqlite3")
+        if DEFAULT_DB_PATH:
+            db_path = DEFAULT_DB_PATH
+        else:
+            # Try default locations
+            storage_root = os.environ.get("AGENT_MAIL_STORAGE_ROOT", "")
+            if storage_root:
+                db_path = os.path.join(storage_root, "..", "storage.sqlite3")
     if not db_path or not os.path.exists(db_path):
         return []
     try:
@@ -379,7 +388,17 @@ def check_conflicts(staged, reservations):
             holder = res.get("agent_name", "unknown")
             if holder == AGENT_NAME:
                 continue  # Skip our own reservations
-            if fnmatch(f, pattern) or fnmatch(pattern, f) or f.startswith(pattern.rstrip("*")):
+            
+            # Symmetric glob matching (fnmatch handles * and ? and [seq])
+            if fnmatch(f, pattern) or fnmatch(pattern, f):
+                conflicts.append((f, pattern, holder))
+                break
+            
+            # Directory prefix matching for non-glob patterns
+            # e.g. pattern "src" should match "src/main.rs"
+            # But "src/file" should NOT match "src/file.bak" unless pattern was "src/file*"
+            has_glob = any(c in pattern for c in "*?[")
+            if not has_glob and f.startswith(pattern + "/"):
                 conflicts.append((f, pattern, holder))
                 break
     return conflicts
@@ -419,7 +438,11 @@ if __name__ == "__main__":
     )
 }
 
-pub fn install_guard(_project: &str, repo: &Path) -> GuardResult<()> {
+pub fn install_guard(
+    _project: &str,
+    repo: &Path,
+    default_db_path: Option<&str>,
+) -> GuardResult<()> {
     if !repo.exists() {
         return Err(GuardError::InvalidRepo {
             path: repo.display().to_string(),
@@ -466,7 +489,7 @@ pub fn install_guard(_project: &str, repo: &Path) -> GuardResult<()> {
     let plugin_path = run_dir.join(PLUGIN_FILE_NAME);
     std::fs::write(
         &plugin_path,
-        render_guard_plugin_script(_project, "pre-commit"),
+        render_guard_plugin_script(_project, "pre-commit", default_db_path),
     )?;
     chmod_exec(&plugin_path)?;
 
@@ -704,21 +727,19 @@ fn check_path_conflicts(
     self_agent: &str,
     ignorecase: bool,
 ) -> Vec<GuardConflict> {
+    // Optimization: Pre-filter and pre-normalize reservations to avoid repeated work in the inner loop.
+    let active_reservations: Vec<(&FileReservationRecord, String)> = reservations
+        .iter()
+        .filter(|res| res.exclusive && res.agent_name != self_agent)
+        .map(|res| (res, normalize_path(&res.path_pattern, ignorecase)))
+        .collect();
+
     let mut conflicts = Vec::new();
     for path in paths {
         let normalized = normalize_path(path, ignorecase);
-        for res in reservations {
-            // Skip our own reservations
-            if res.agent_name == self_agent {
-                continue;
-            }
-            // Only exclusive reservations block
-            if !res.exclusive {
-                continue;
-            }
-            let pattern_normalized = normalize_path(&res.path_pattern, ignorecase);
+        for (res, pattern_normalized) in &active_reservations {
             // Symmetric glob matching
-            if paths_conflict(&normalized, &pattern_normalized) {
+            if paths_conflict(&normalized, pattern_normalized) {
                 conflicts.push(GuardConflict {
                     path: path.clone(),
                     pattern: res.path_pattern.clone(),
@@ -1291,7 +1312,7 @@ mod tests {
         let orig_body = "#!/bin/sh\necho original\n";
         std::fs::write(&pre_commit, orig_body).expect("write pre-commit");
 
-        install_guard("/abs/path/backend", &repo_dir).expect("install_guard");
+        install_guard("/abs/path/backend", &repo_dir, None).expect("install_guard");
 
         let chain_body = std::fs::read_to_string(&pre_commit).expect("read chain");
         assert!(
@@ -2077,7 +2098,7 @@ mod tests {
         std::fs::create_dir_all(&repo_dir).expect("mkdir");
         run_git(&repo_dir, &["init", "-q"]);
 
-        install_guard("/test/project", &repo_dir).expect("install");
+        install_guard("/test/project", &repo_dir, None).expect("install");
 
         let status = guard_status(&repo_dir).expect("guard_status");
         assert!(
@@ -2277,7 +2298,7 @@ mod tests {
     fn install_guard_nonexistent_repo_returns_error() {
         let td = tempfile::TempDir::new().expect("tempdir");
         let nonexistent = td.path().join("nonexistent");
-        let result = install_guard("/test/project", &nonexistent);
+        let result = install_guard("/test/project", &nonexistent, None);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -2293,8 +2314,8 @@ mod tests {
         run_git(&repo_dir, &["init", "-q"]);
 
         // Install twice - should not error
-        install_guard("/test/project", &repo_dir).expect("first install");
-        install_guard("/test/project", &repo_dir).expect("second install");
+        install_guard("/test/project", &repo_dir, None).expect("first install");
+        install_guard("/test/project", &repo_dir, None).expect("second install");
 
         let status = guard_status(&repo_dir).expect("status");
         assert!(status.pre_commit_present);
@@ -2568,7 +2589,7 @@ mod tests {
 
     #[test]
     fn guard_plugin_script_contains_project() {
-        let script = render_guard_plugin_script("/my/project", "pre-commit");
+        let script = render_guard_plugin_script("/my/project", "pre-commit", None);
         assert!(script.contains("mcp-agent-mail guard plugin (pre-commit)"));
         assert!(script.contains("PROJECT = \"/my/project\""));
         assert!(script.contains("get_staged_files"));

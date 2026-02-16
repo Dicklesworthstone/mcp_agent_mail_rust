@@ -513,7 +513,30 @@ impl DbPool {
         let conn = DbConn::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("startup integrity check: open failed: {e}")))?;
 
-        integrity::quick_check(&conn)
+        match integrity::quick_check(&conn) {
+            Ok(res) => Ok(res),
+            Err(DbError::IntegrityCorruption { .. }) => {
+                tracing::warn!(
+                    path = %self.sqlite_path,
+                    "startup integrity check failed; attempting auto-recovery from backup"
+                );
+                // Close connection before attempting restore (Windows/locking safety)
+                drop(conn);
+
+                if let Err(e) = ensure_sqlite_file_healthy(Path::new(&self.sqlite_path)) {
+                    return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
+                }
+
+                // Re-open and re-verify
+                let conn = DbConn::open_file(&self.sqlite_path).map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "startup integrity check (post-recovery): open failed: {e}"
+                    ))
+                })?;
+                integrity::quick_check(&conn)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Run a full `PRAGMA integrity_check` on a dedicated connection.

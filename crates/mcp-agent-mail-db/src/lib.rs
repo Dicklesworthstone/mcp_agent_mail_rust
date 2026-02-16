@@ -66,6 +66,7 @@ pub static QUERY_TRACKER: std::sync::LazyLock<QueryTracker> =
 // Re-export sqlmodel for convenience
 pub use mcp_agent_mail_search_core::{QueryAssistance, parse_query_assistance};
 pub use sqlmodel;
+pub use sqlmodel_core;
 pub use sqlmodel_frankensqlite;
 pub use sqlmodel_sqlite;
 

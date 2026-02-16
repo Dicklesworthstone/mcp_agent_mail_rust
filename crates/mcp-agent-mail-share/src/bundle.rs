@@ -86,6 +86,7 @@ pub fn bundle_attachments(
     storage_root: &Path,
     inline_threshold: usize,
     detach_threshold: usize,
+    allow_absolute_paths: bool,
 ) -> ShareResult<AttachmentManifest> {
     use base64::Engine;
 
@@ -146,7 +147,8 @@ pub fn bundle_attachments(
                 continue;
             };
 
-            let source_file = resolve_attachment_path(storage_root, orig_path_str);
+            let source_file =
+                resolve_attachment_path(storage_root, orig_path_str, allow_absolute_paths);
 
             let media_type = obj
                 .get("media_type")
@@ -531,15 +533,25 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
 
 // === Internal helpers ===
 
-fn resolve_attachment_path(storage_root: &Path, path: &str) -> Option<PathBuf> {
+fn resolve_attachment_path(
+    storage_root: &Path,
+    path: &str,
+    allow_absolute_paths: bool,
+) -> Option<PathBuf> {
     let root = storage_root
         .canonicalize()
         .unwrap_or_else(|_| storage_root.to_path_buf());
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        root.join(path)
-    };
+    let path_path = Path::new(path);
+
+    // Absolute source paths are only allowed when explicitly configured.
+    if path_path.is_absolute() {
+        if !allow_absolute_paths {
+            return None;
+        }
+        return path_path.canonicalize().ok();
+    }
+
+    let candidate = root.join(path);
     let canonical = candidate.canonicalize().ok()?;
     if !canonical.starts_with(&root) {
         return None;
@@ -1265,6 +1277,7 @@ mod tests {
             &storage,
             crate::INLINE_ATTACHMENT_THRESHOLD,
             crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
         )
         .unwrap();
 
@@ -1303,6 +1316,7 @@ mod tests {
             &storage,
             crate::INLINE_ATTACHMENT_THRESHOLD,
             crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
         )
         .unwrap();
 
@@ -1339,6 +1353,7 @@ mod tests {
             &storage,
             crate::INLINE_ATTACHMENT_THRESHOLD,
             crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
         )
         .unwrap();
 
@@ -1362,7 +1377,7 @@ mod tests {
         let output = dir.path().join("bundle");
         std::fs::create_dir_all(&output).unwrap();
 
-        let result = bundle_attachments(&db, &output, &storage, 50, 100).unwrap();
+        let result = bundle_attachments(&db, &output, &storage, 50, 100, true).unwrap();
 
         assert_eq!(result.stats.externalized, 1);
         assert_eq!(result.items[0].mode, "external");
@@ -1387,7 +1402,7 @@ mod tests {
         let output = dir.path().join("bundle");
         std::fs::create_dir_all(&output).unwrap();
 
-        let result = bundle_attachments(&db, &output, &storage, 50, 150).unwrap();
+        let result = bundle_attachments(&db, &output, &storage, 50, 150, true).unwrap();
 
         assert_eq!(result.stats.inline, 1);
         assert_eq!(result.stats.copied, 1);
@@ -1455,6 +1470,7 @@ mod tests {
             &storage,
             crate::INLINE_ATTACHMENT_THRESHOLD,
             crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
         )
         .unwrap();
 
@@ -1483,6 +1499,7 @@ mod tests {
             &storage,
             crate::INLINE_ATTACHMENT_THRESHOLD,
             crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
         )
         .unwrap();
 
@@ -1533,6 +1550,7 @@ mod tests {
             &storage,
             crate::INLINE_ATTACHMENT_THRESHOLD,
             crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
         )
         .unwrap();
 

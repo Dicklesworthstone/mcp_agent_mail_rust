@@ -109,7 +109,7 @@ pub fn init_process_start() {
 }
 
 #[inline]
-fn process_uptime() -> std::time::Duration {
+pub fn process_uptime() -> std::time::Duration {
     PROCESS_START.elapsed()
 }
 
@@ -393,13 +393,13 @@ impl DiagnosticReport {
                         truncated.locks.truncate(5);
                         locks_truncated = true;
                     } else {
-                        // Give up and return truncated raw JSON (safe on
-                        // UTF-8 boundary).
-                        let mut end = MAX_REPORT_BYTES;
-                        while end > 0 && !json.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        return json[..end].to_string();
+                        // Give up. Return a valid JSON error object instead of broken JSON.
+                        return serde_json::json!({
+                            "error": "report too large",
+                            "message": "diagnostic report exceeded 100KB limit even after truncation",
+                            "size_bytes": json.len()
+                        })
+                        .to_string();
                     }
                 }
                 serde_json::to_string_pretty(&truncated).unwrap_or(json)
