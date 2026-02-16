@@ -263,8 +263,6 @@ impl ReservationsScreen {
         for row in &snapshot.reservation_snapshots {
             let key = reservation_key(&row.project_slug, &row.agent_name, &row.path_pattern);
             seen_active.insert(key.clone());
-            let released =
-                row.is_released() || next.get(&key).is_some_and(|existing| existing.released);
             let reservation = ActiveReservation {
                 reservation_id: Some(row.id),
                 agent: row.agent_name.clone(),
@@ -273,7 +271,9 @@ impl ReservationsScreen {
                 granted_ts: row.granted_ts,
                 ttl_s: Self::ttl_secs_from_snapshot(row),
                 project: row.project_slug.clone(),
-                released,
+                // DB snapshot rows are authoritative. If a previously released
+                // row key is re-acquired, clear stale `released` state.
+                released: row.is_released(),
             };
             next.insert(key, reservation);
         }
@@ -1019,6 +1019,53 @@ mod tests {
         });
         assert!(!changed);
         assert_eq!(screen.reservations.len(), 1);
+    }
+
+    #[test]
+    fn apply_db_snapshot_reacquired_key_clears_stale_released_state() {
+        let mut screen = ReservationsScreen::new();
+
+        let key = reservation_key("proj", "BlueLake", "src/**");
+        screen.reservations.insert(
+            key.clone(),
+            ActiveReservation {
+                reservation_id: Some(9),
+                agent: "BlueLake".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                granted_ts: 1_000_000,
+                ttl_s: 10,
+                project: "proj".into(),
+                released: true,
+            },
+        );
+
+        let changed = screen.apply_db_snapshot(&DbStatSnapshot {
+            reservation_snapshots: vec![ReservationSnapshot {
+                id: 10,
+                project_slug: "proj".into(),
+                agent_name: "BlueLake".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                granted_ts: 2_000_000,
+                expires_ts: 8_000_000,
+                released_ts: None,
+            }],
+            timestamp_micros: 42,
+            ..Default::default()
+        });
+
+        assert!(changed);
+        let row = screen
+            .reservations
+            .get(&key)
+            .expect("reacquired snapshot row should exist");
+        assert!(
+            !row.released,
+            "active snapshot row must not remain released"
+        );
+        let (active, _, _, _) = screen.summary_counts();
+        assert_eq!(active, 1);
     }
 
     #[test]

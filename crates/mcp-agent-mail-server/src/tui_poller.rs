@@ -406,15 +406,59 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
     conn.query_sync(
         &format!(
-            "SELECT fr.id, \
-             COALESCE(p.slug, '[unknown-project]') AS project_slug, \
-             COALESCE(a.name, '[unknown-agent]') AS agent_name, \
-             fr.path_pattern, fr.exclusive, fr.created_ts, fr.expires_ts, fr.released_ts \
-             FROM file_reservations fr \
-             LEFT JOIN projects p ON p.id = fr.project_id \
-             LEFT JOIN agents a ON a.id = fr.agent_id \
-             WHERE fr.released_ts IS NULL \
-             ORDER BY fr.expires_ts ASC \
+            "WITH normalized AS ( \
+               SELECT \
+                 fr.id, \
+                 COALESCE(p.slug, '[unknown-project]') AS project_slug, \
+                 COALESCE(a.name, '[unknown-agent]') AS agent_name, \
+                 fr.path_pattern, \
+                 fr.exclusive, \
+                 CASE \
+                   WHEN fr.created_ts IS NULL THEN 0 \
+                   WHEN typeof(fr.created_ts) = 'text' THEN COALESCE( \
+                     CAST(strftime('%s', fr.created_ts) AS INTEGER) * 1000000 + \
+                       CASE \
+                         WHEN instr(fr.created_ts, '.') > 0 THEN CAST(substr(fr.created_ts || '000000', instr(fr.created_ts, '.') + 1, 6) AS INTEGER) \
+                         ELSE 0 \
+                       END, \
+                     0 \
+                   ) \
+                   ELSE fr.created_ts \
+                 END AS created_ts_micros, \
+                 CASE \
+                   WHEN fr.expires_ts IS NULL THEN 0 \
+                   WHEN typeof(fr.expires_ts) = 'text' THEN COALESCE( \
+                     CAST(strftime('%s', fr.expires_ts) AS INTEGER) * 1000000 + \
+                       CASE \
+                         WHEN instr(fr.expires_ts, '.') > 0 THEN CAST(substr(fr.expires_ts || '000000', instr(fr.expires_ts, '.') + 1, 6) AS INTEGER) \
+                         ELSE 0 \
+                       END, \
+                     0 \
+                   ) \
+                   ELSE fr.expires_ts \
+                 END AS expires_ts_micros, \
+                 CASE \
+                   WHEN fr.released_ts IS NULL THEN NULL \
+                   WHEN typeof(fr.released_ts) = 'text' \
+                     AND lower(trim(fr.released_ts)) IN ('', 'null', 'none') THEN NULL \
+                   WHEN typeof(fr.released_ts) = 'text' THEN \
+                     CAST(strftime('%s', fr.released_ts) AS INTEGER) * 1000000 + \
+                       CASE \
+                         WHEN instr(fr.released_ts, '.') > 0 THEN CAST(substr(fr.released_ts || '000000', instr(fr.released_ts, '.') + 1, 6) AS INTEGER) \
+                         ELSE 0 \
+                       END \
+                   ELSE fr.released_ts \
+                 END AS released_ts_micros \
+               FROM file_reservations fr \
+               LEFT JOIN projects p ON p.id = fr.project_id \
+               LEFT JOIN agents a ON a.id = fr.agent_id \
+             ) \
+             SELECT \
+               id, project_slug, agent_name, path_pattern, exclusive, \
+               created_ts_micros, expires_ts_micros, released_ts_micros \
+             FROM normalized \
+             WHERE released_ts_micros IS NULL \
+             ORDER BY expires_ts_micros ASC \
              LIMIT {MAX_RESERVATIONS}"
         ),
         &[],
@@ -438,9 +482,9 @@ fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
                         .get_named::<i64>("exclusive")
                         .ok()
                         .is_none_or(|value| value != 0),
-                    granted_ts: row.get_named::<i64>("created_ts").ok()?,
-                    expires_ts: row.get_named::<i64>("expires_ts").ok()?,
-                    released_ts: row.get_named::<i64>("released_ts").ok(),
+                    granted_ts: row.get_named::<i64>("created_ts_micros").ok().unwrap_or(0),
+                    expires_ts: row.get_named::<i64>("expires_ts_micros").ok().unwrap_or(0),
+                    released_ts: row.get_named::<i64>("released_ts_micros").ok(),
                 })
             })
             .collect()
@@ -1082,5 +1126,108 @@ mod tests {
         assert_eq!(rows[0].project_slug, "[unknown-project]");
         assert_eq!(rows[0].agent_name, "[unknown-agent]");
         assert_eq!(rows[0].path_pattern, "src/**");
+    }
+
+    #[test]
+    fn reservation_snapshots_accept_legacy_text_timestamps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservation_legacy_timestamps.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts TEXT,
+                expires_ts TEXT,
+                released_ts TEXT
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'proj')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (2, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 2, 'src/**', 1, '2026-02-10 10:00:00.123456', '2026-02-10 11:00:00.123456', NULL),
+                (2, 1, 2, 'tests/**', 0, '2026-02-10 10:10:00.000000', '2026-02-10 11:10:00.000000', ''),
+                (3, 1, 2, 'docs/**', 0, '2026-02-10 10:20:00.000000', '2026-02-10 11:20:00.000000', '2026-02-10 10:30:00.000000')",
+            &[],
+        )
+        .expect("insert reservations");
+
+        let rows = fetch_reservation_snapshots(&conn);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path_pattern, "src/**");
+        assert_eq!(rows[1].path_pattern, "tests/**");
+        assert!(rows[0].granted_ts > 0);
+        assert!(rows[0].expires_ts > rows[0].granted_ts);
+        assert!(rows.iter().all(|row| row.released_ts.is_none()));
+    }
+
+    #[test]
+    fn reservation_snapshots_keep_invalid_text_timestamp_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservation_invalid_timestamps.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts TEXT,
+                expires_ts TEXT,
+                released_ts TEXT
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'proj')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
+             VALUES (1, 1, 1, 'broken/**', 1, 'not-a-date', 'still-not-a-date', NULL)",
+            &[],
+        )
+        .expect("insert reservation");
+
+        let rows = fetch_reservation_snapshots(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path_pattern, "broken/**");
+        assert_eq!(rows[0].granted_ts, 0);
+        assert_eq!(rows[0].expires_ts, 0);
     }
 }

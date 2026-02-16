@@ -253,11 +253,8 @@ impl ReadCache {
     pub fn get_project(&self, slug: &str) -> Option<ProjectRow> {
         let slug_owned = slug.to_owned();
         let mut cache = self.projects_by_slug.write();
-        let expired = cache
-            .get(&slug_owned)
-            .is_none_or(|e| e.is_expired(PROJECT_TTL));
-        if expired {
-            if cache.contains_key(&slug_owned) {
+        match cache.get(&slug_owned) {
+            Some(entry) if entry.is_expired(PROJECT_TTL) => {
                 mcp_agent_mail_core::evidence_ledger().record(
                     "cache.eviction",
                     serde_json::json!({ "key": slug_owned, "reason": "ttl_expired", "category": "project" }),
@@ -266,10 +263,16 @@ impl ReadCache {
                     0.9,
                     "s3fifo_v1",
                 );
+                cache.remove(&slug_owned);
+                CACHE_METRICS.record_project_miss();
+                return None;
             }
-            cache.remove(&slug_owned);
-            CACHE_METRICS.record_project_miss();
-            return None;
+            Some(_) => {} // valid entry — fall through to touch + return
+            None => {
+                // Not in cache (or Ghost) — don't remove, preserves S3-FIFO ghost state
+                CACHE_METRICS.record_project_miss();
+                return None;
+            }
         }
         let entry = cache.get_mut(&slug_owned)?;
         entry.touch();
@@ -283,13 +286,17 @@ impl ReadCache {
     pub fn get_project_by_human_key(&self, human_key: &str) -> Option<ProjectRow> {
         let key_owned = human_key.to_owned();
         let mut cache = self.projects_by_human_key.write();
-        let expired = cache
-            .get(&key_owned)
-            .is_none_or(|e| e.is_expired(PROJECT_TTL));
-        if expired {
-            cache.remove(&key_owned);
-            CACHE_METRICS.record_project_miss();
-            return None;
+        match cache.get(&key_owned) {
+            Some(entry) if entry.is_expired(PROJECT_TTL) => {
+                cache.remove(&key_owned);
+                CACHE_METRICS.record_project_miss();
+                return None;
+            }
+            Some(_) => {}
+            None => {
+                CACHE_METRICS.record_project_miss();
+                return None;
+            }
         }
         let entry = cache.get_mut(&key_owned)?;
         entry.touch();
@@ -320,11 +327,17 @@ impl ReadCache {
     pub fn get_agent(&self, project_id: i64, name: &str) -> Option<AgentRow> {
         let key = (project_id, InternedStr::new(name));
         let mut cache = self.agents_by_key.write();
-        let expired = cache.get(&key).is_none_or(|e| e.is_expired(AGENT_TTL));
-        if expired {
-            cache.remove(&key);
-            CACHE_METRICS.record_agent_miss();
-            return None;
+        match cache.get(&key) {
+            Some(entry) if entry.is_expired(AGENT_TTL) => {
+                cache.remove(&key);
+                CACHE_METRICS.record_agent_miss();
+                return None;
+            }
+            Some(_) => {}
+            None => {
+                CACHE_METRICS.record_agent_miss();
+                return None;
+            }
         }
         let entry = cache.get_mut(&key)?;
         entry.touch();
@@ -337,11 +350,17 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_agent_by_id(&self, agent_id: i64) -> Option<AgentRow> {
         let mut cache = self.agents_by_id.write();
-        let expired = cache.get(&agent_id).is_none_or(|e| e.is_expired(AGENT_TTL));
-        if expired {
-            cache.remove(&agent_id);
-            CACHE_METRICS.record_agent_miss();
-            return None;
+        match cache.get(&agent_id) {
+            Some(entry) if entry.is_expired(AGENT_TTL) => {
+                cache.remove(&agent_id);
+                CACHE_METRICS.record_agent_miss();
+                return None;
+            }
+            Some(_) => {}
+            None => {
+                CACHE_METRICS.record_agent_miss();
+                return None;
+            }
         }
         let entry = cache.get_mut(&agent_id)?;
         entry.touch();
@@ -434,12 +453,13 @@ impl ReadCache {
     pub fn get_inbox_stats_scoped(&self, scope: &str, agent_id: i64) -> Option<InboxStatsRow> {
         let key = (scope_fingerprint(scope), agent_id);
         let mut cache = self.inbox_stats.write();
-        let expired = cache
-            .get(&key)
-            .is_none_or(|e| e.is_expired(INBOX_STATS_TTL));
-        if expired {
-            cache.remove(&key);
-            return None;
+        match cache.get(&key) {
+            Some(entry) if entry.is_expired(INBOX_STATS_TTL) => {
+                cache.remove(&key);
+                return None;
+            }
+            Some(_) => {}
+            None => return None,
         }
         let entry = cache.get_mut(&key)?;
         entry.touch();

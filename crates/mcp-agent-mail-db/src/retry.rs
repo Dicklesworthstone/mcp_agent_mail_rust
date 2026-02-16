@@ -1149,9 +1149,15 @@ mod tests {
     }
 
     // -- Health status tests ------------------------------------------------
+    // These tests manipulate global circuit-breaker statics and must not run
+    // in parallel with each other (or with `retry_sync_with_circuit_breaker`
+    // which also touches a global CB).  A simple mutex serialises them.
+
+    static HEALTH_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn health_status_closed() {
+        let _lock = HEALTH_TEST_MUTEX.lock().unwrap();
         // Reset global CBs for this test.
         CIRCUIT_BREAKER.reset();
         CIRCUIT_DB.reset();
@@ -1172,6 +1178,7 @@ mod tests {
 
     #[test]
     fn health_status_shows_per_subsystem() {
+        let _lock = HEALTH_TEST_MUTEX.lock().unwrap();
         CIRCUIT_DB.reset();
         CIRCUIT_GIT.reset();
         CIRCUIT_SIGNAL.reset();

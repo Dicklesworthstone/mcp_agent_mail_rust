@@ -1766,9 +1766,16 @@ fn cache_zipfian_within_capacity() {
         })
         .collect();
 
-    // Pre-warm cache
+    // Pre-warm cache: two passes needed because S3-FIFO's Small queue is 10%
+    // of capacity (20 slots). First pass fills Small and overflows 80 items to
+    // Ghost. Second pass promotes those Ghost items to Main via get→miss→put.
     for agent in &agents {
         cache.put_agent(agent);
+    }
+    for agent in &agents {
+        if cache.get_agent(agent.project_id, &agent.name).is_none() {
+            cache.put_agent(agent); // promote from Ghost to Main
+        }
     }
 
     let mut rng_state: u64 = 0xCAFE_1234_5678_ABCD;

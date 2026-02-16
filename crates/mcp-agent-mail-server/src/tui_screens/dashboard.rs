@@ -1814,6 +1814,7 @@ fn render_reservation_watch_panel(
     Paragraph::new(Text::from_lines(lines)).render(list_area, frame);
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_signal_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1898,6 +1899,40 @@ fn render_signal_panel(
             ),
         ]));
         pushed += 1;
+    }
+
+    for entry in entries.iter().rev().filter(|entry| {
+        matches!(
+            entry.kind,
+            MailEventKind::MessageSent | MailEventKind::MessageReceived
+        ) && text_matches_query_terms(&entry.summary, &query_terms)
+    }) {
+        if pushed >= usize::from(inner.height) {
+            break;
+        }
+        let marker = if entry.kind == MailEventKind::MessageSent {
+            "↑"
+        } else {
+            "↓"
+        };
+        lines.push(Line::from_spans([
+            Span::styled(
+                format!("{marker} "),
+                Style::default().fg(tp.metric_messages),
+            ),
+            Span::styled(
+                truncate(&entry.summary, usize::from(inner.width.saturating_sub(2))),
+                Style::default().fg(tp.text_primary),
+            ),
+        ]));
+        pushed += 1;
+    }
+
+    if pushed == 1 && usize::from(inner.height) > 1 {
+        lines.push(Line::from_spans([Span::styled(
+            "No active warnings or message activity",
+            crate::tui_theme::text_meta(&tp),
+        )]));
     }
 
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
