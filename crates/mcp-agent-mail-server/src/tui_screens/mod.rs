@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn from_number_invalid() {
-        assert_eq!(MailScreenId::from_number(15), None);
+        assert_eq!(MailScreenId::from_number(16), None);
         assert_eq!(MailScreenId::from_number(100), None);
     }
 
