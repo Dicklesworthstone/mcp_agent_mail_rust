@@ -36,6 +36,10 @@ const MAX_CONTACTS: usize = 200;
 const MAX_RESERVATIONS: usize = 1000;
 /// Maximum silent interval before a heartbeat `HealthPulse` is emitted.
 const HEALTH_PULSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// `SQLite` predicate for active reservations across legacy sentinel values.
+const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
+    OR (typeof(released_ts) IN ('integer', 'real') AND released_ts <= 0) \
+    OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none'))";
 
 /// Batched aggregate counters used to populate [`DbStatSnapshot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -77,21 +81,21 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn fetch_counts(&self) -> DbSnapshotCounts {
+        let reservation_count_sql = format!(
+            "SELECT \
+             (SELECT COUNT(*) FROM projects) AS projects_count, \
+             (SELECT COUNT(*) FROM agents) AS agents_count, \
+             (SELECT COUNT(*) FROM messages) AS messages_count, \
+             (SELECT COUNT(*) FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})) \
+               AS reservations_count, \
+             (SELECT COUNT(*) FROM agent_links) AS contacts_count, \
+             (SELECT COUNT(*) FROM message_recipients mr \
+                JOIN messages m ON m.id = mr.message_id \
+               WHERE m.ack_required = 1 AND mr.ack_ts IS NULL) AS ack_pending_count"
+        );
         let batched = self
             .conn
-            .query_sync(
-                "SELECT \
-                 (SELECT COUNT(*) FROM projects) AS projects_count, \
-                 (SELECT COUNT(*) FROM agents) AS agents_count, \
-                 (SELECT COUNT(*) FROM messages) AS messages_count, \
-                 (SELECT COUNT(*) FROM file_reservations WHERE released_ts IS NULL) \
-                   AS reservations_count, \
-                 (SELECT COUNT(*) FROM agent_links) AS contacts_count, \
-                 (SELECT COUNT(*) FROM message_recipients mr \
-                    JOIN messages m ON m.id = mr.message_id \
-                   WHERE m.ack_required = 1 AND mr.ack_ts IS NULL) AS ack_pending_count",
-                &[],
-            )
+            .query_sync(&reservation_count_sql, &[])
             .ok()
             .and_then(|rows| rows.into_iter().next())
             .map(|row| {
@@ -123,9 +127,9 @@ impl<'a> DbStatQueryBatcher<'a> {
             projects: self.run_count_query("SELECT COUNT(*) AS c FROM projects"),
             agents: self.run_count_query("SELECT COUNT(*) AS c FROM agents"),
             messages: self.run_count_query("SELECT COUNT(*) AS c FROM messages"),
-            file_reservations: self.run_count_query(
-                "SELECT COUNT(*) AS c FROM file_reservations WHERE released_ts IS NULL",
-            ),
+            file_reservations: self.run_count_query(&format!(
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})"
+            )),
             contact_links: self.run_count_query("SELECT COUNT(*) AS c FROM agent_links"),
             ack_pending: self.run_count_query(
                 "SELECT COUNT(*) AS c FROM message_recipients mr \
@@ -280,6 +284,12 @@ fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
 
 /// Open a sync `SQLite` connection from a database URL.
 fn open_sync_connection(database_url: &str) -> Option<DbConn> {
+    // `:memory:` URLs would create a brand-new private DB per poll cycle,
+    // which diverges from the server pool and yields misleading empty
+    // snapshots. Skip polling in that mode instead of reporting false zeros.
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
     let cfg = DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -314,54 +324,52 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
 
 /// Fetch the project list with per-project agent/message/reservation counts.
 fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
-    conn.query_sync(
-        &format!(
-            "SELECT p.id, p.slug, p.human_key, p.created_at, \
-             COALESCE(ac.cnt, 0) AS agent_count, \
-             COALESCE(mc.cnt, 0) AS message_count, \
-             COALESCE(rc.cnt, 0) AS reservation_count \
-             FROM projects p \
-             LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM agents GROUP BY project_id) ac \
-               ON ac.project_id = p.id \
-             LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM messages GROUP BY project_id) mc \
-               ON mc.project_id = p.id \
-             LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM file_reservations \
-               WHERE released_ts IS NULL GROUP BY project_id) rc \
-               ON rc.project_id = p.id \
-             ORDER BY p.created_at DESC \
-             LIMIT {MAX_PROJECTS}"
-        ),
-        &[],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .filter_map(|row| {
-                Some(ProjectSummary {
-                    id: row.get_named::<i64>("id").ok()?,
-                    slug: row.get_named::<String>("slug").ok()?,
-                    human_key: row.get_named::<String>("human_key").ok()?,
-                    agent_count: row
-                        .get_named::<i64>("agent_count")
-                        .ok()
-                        .and_then(|v| u64::try_from(v).ok())
-                        .unwrap_or(0),
-                    message_count: row
-                        .get_named::<i64>("message_count")
-                        .ok()
-                        .and_then(|v| u64::try_from(v).ok())
-                        .unwrap_or(0),
-                    reservation_count: row
-                        .get_named::<i64>("reservation_count")
-                        .ok()
-                        .and_then(|v| u64::try_from(v).ok())
-                        .unwrap_or(0),
-                    created_at: row.get_named::<i64>("created_at").ok().unwrap_or(0),
+    let sql = format!(
+        "SELECT p.id, p.slug, p.human_key, p.created_at, \
+         COALESCE(ac.cnt, 0) AS agent_count, \
+         COALESCE(mc.cnt, 0) AS message_count, \
+         COALESCE(rc.cnt, 0) AS reservation_count \
+         FROM projects p \
+         LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM agents GROUP BY project_id) ac \
+           ON ac.project_id = p.id \
+         LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM messages GROUP BY project_id) mc \
+           ON mc.project_id = p.id \
+         LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM file_reservations \
+           WHERE ({ACTIVE_RESERVATION_PREDICATE}) GROUP BY project_id) rc \
+           ON rc.project_id = p.id \
+         ORDER BY p.created_at DESC \
+         LIMIT {MAX_PROJECTS}"
+    );
+    conn.query_sync(&sql, &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    Some(ProjectSummary {
+                        id: row.get_named::<i64>("id").ok()?,
+                        slug: row.get_named::<String>("slug").ok()?,
+                        human_key: row.get_named::<String>("human_key").ok()?,
+                        agent_count: row
+                            .get_named::<i64>("agent_count")
+                            .ok()
+                            .and_then(|v| u64::try_from(v).ok())
+                            .unwrap_or(0),
+                        message_count: row
+                            .get_named::<i64>("message_count")
+                            .ok()
+                            .and_then(|v| u64::try_from(v).ok())
+                            .unwrap_or(0),
+                        reservation_count: row
+                            .get_named::<i64>("reservation_count")
+                            .ok()
+                            .and_then(|v| u64::try_from(v).ok())
+                            .unwrap_or(0),
+                        created_at: row.get_named::<i64>("created_at").ok().unwrap_or(0),
+                    })
                 })
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Fetch the contact links list with agent names resolved.
@@ -403,6 +411,7 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 }
 
 /// Fetch active file reservations with project and agent names.
+#[allow(clippy::too_many_lines)]
 fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
     conn.query_sync(
         &format!(
@@ -415,6 +424,9 @@ fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
                  fr.exclusive, \
                  CASE \
                    WHEN fr.created_ts IS NULL THEN 0 \
+                   WHEN typeof(fr.created_ts) = 'text' \
+                     AND length(trim(fr.created_ts)) > 0 \
+                     AND trim(fr.created_ts) NOT GLOB '*[^0-9]*' THEN CAST(trim(fr.created_ts) AS INTEGER) \
                    WHEN typeof(fr.created_ts) = 'text' THEN COALESCE( \
                      CAST(strftime('%s', fr.created_ts) AS INTEGER) * 1000000 + \
                        CASE \
@@ -427,6 +439,9 @@ fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
                  END AS created_ts_micros, \
                  CASE \
                    WHEN fr.expires_ts IS NULL THEN 0 \
+                   WHEN typeof(fr.expires_ts) = 'text' \
+                     AND length(trim(fr.expires_ts)) > 0 \
+                     AND trim(fr.expires_ts) NOT GLOB '*[^0-9]*' THEN CAST(trim(fr.expires_ts) AS INTEGER) \
                    WHEN typeof(fr.expires_ts) = 'text' THEN COALESCE( \
                      CAST(strftime('%s', fr.expires_ts) AS INTEGER) * 1000000 + \
                        CASE \
@@ -439,14 +454,25 @@ fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
                  END AS expires_ts_micros, \
                  CASE \
                    WHEN fr.released_ts IS NULL THEN NULL \
+                   WHEN typeof(fr.released_ts) IN ('integer', 'real') AND fr.released_ts <= 0 THEN NULL \
                    WHEN typeof(fr.released_ts) = 'text' \
-                     AND lower(trim(fr.released_ts)) IN ('', 'null', 'none') THEN NULL \
-                   WHEN typeof(fr.released_ts) = 'text' THEN \
+                     AND lower(trim(fr.released_ts)) IN ('', '0', 'null', 'none') THEN NULL \
+                   WHEN typeof(fr.released_ts) = 'text' \
+                     AND length(trim(fr.released_ts)) > 0 \
+                     AND trim(fr.released_ts) NOT GLOB '*[^0-9]*' \
+                     AND CAST(trim(fr.released_ts) AS INTEGER) <= 0 THEN NULL \
+                   WHEN typeof(fr.released_ts) = 'text' \
+                     AND length(trim(fr.released_ts)) > 0 \
+                     AND trim(fr.released_ts) NOT GLOB '*[^0-9]*' \
+                     THEN CAST(trim(fr.released_ts) AS INTEGER) \
+                   WHEN typeof(fr.released_ts) = 'text' THEN COALESCE( \
                      CAST(strftime('%s', fr.released_ts) AS INTEGER) * 1000000 + \
                        CASE \
                          WHEN instr(fr.released_ts, '.') > 0 THEN CAST(substr(fr.released_ts || '000000', instr(fr.released_ts, '.') + 1, 6) AS INTEGER) \
                          ELSE 0 \
-                       END \
+                       END, \
+                     NULL \
+                   ) \
                    ELSE fr.released_ts \
                  END AS released_ts_micros \
                FROM file_reservations fr \
@@ -719,7 +745,16 @@ mod tests {
                 to_agent: "B".into(),
                 ..Default::default()
             }],
-            reservation_snapshots: vec![],
+            reservation_snapshots: vec![ReservationSnapshot {
+                id: 1,
+                project_slug: "p".into(),
+                agent_name: "A".into(),
+                path_pattern: "*.rs".into(),
+                exclusive: true,
+                granted_ts: 1,
+                expires_ts: 999,
+                released_ts: None,
+            }],
             timestamp_micros: 1,
         };
         let d = snapshot_delta(&a, &b);
@@ -1059,7 +1094,7 @@ mod tests {
 
     #[test]
     fn fetch_stats_returns_none_on_bad_url() {
-        assert!(fetch_db_stats("sqlite:///nonexistent_path_xyz.db").is_none());
+        assert!(fetch_db_stats("sqlite:///no/such/dir/nonexistent.db").is_none());
     }
 
     #[test]
@@ -1080,6 +1115,12 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
         assert!(open_sync_connection(&url).is_some());
+    }
+
+    #[test]
+    fn open_sync_connection_returns_none_for_memory_url() {
+        assert!(open_sync_connection("sqlite:///:memory:").is_none());
+        assert!(open_sync_connection("sqlite:///:memory:?cache=shared").is_none());
     }
 
     #[test]
@@ -1229,5 +1270,159 @@ mod tests {
         assert_eq!(rows[0].path_pattern, "broken/**");
         assert_eq!(rows[0].granted_ts, 0);
         assert_eq!(rows[0].expires_ts, 0);
+    }
+
+    #[test]
+    fn reservation_snapshots_treat_zero_released_ts_as_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservation_zero_released.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER,
+                released_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'proj')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/**', 1, 1000, 2000, 0),
+                (2, 1, 1, 'tests/**', 1, 1000, 2000, NULL),
+                (3, 1, 1, 'docs/**', 1, 1000, 2000, 123456)",
+            &[],
+        )
+        .expect("insert reservations");
+
+        let rows = fetch_reservation_snapshots(&conn);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.path_pattern == "src/**"));
+        assert!(rows.iter().any(|row| row.path_pattern == "tests/**"));
+    }
+
+    #[test]
+    fn reservation_snapshots_accept_numeric_text_micros() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservation_numeric_text.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts TEXT,
+                expires_ts TEXT,
+                released_ts TEXT
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'proj')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/**', 1, '1771210958613964', '1771218158613964', '0'),
+                (2, 1, 1, 'docs/**', 1, '1771210958613999', '1771218158613999', '1771211000000000')",
+            &[],
+        )
+        .expect("insert reservations");
+
+        let rows = fetch_reservation_snapshots(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path_pattern, "src/**");
+        assert_eq!(rows[0].granted_ts, 1_771_210_958_613_964);
+        assert_eq!(rows[0].expires_ts, 1_771_218_158_613_964);
+    }
+
+    #[test]
+    fn fetch_counts_treats_legacy_active_released_ts_sentinels_as_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_counts_legacy_released_ts.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
+            .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
+            .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER, ack_ts INTEGER)",
+            &[],
+        )
+        .expect("create recipients");
+        conn.execute_sync("CREATE TABLE agent_links (id INTEGER PRIMARY KEY)", &[])
+            .expect("create links");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER,
+                released_ts TEXT
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/**', 1, 1000, 2000, NULL),
+                (2, 1, 1, 'tests/**', 1, 1000, 2000, '0'),
+                (3, 1, 1, 'docs/**', 1, 1000, 2000, 'null'),
+                (4, 1, 1, 'tmp/**', 1, 1000, 2000, '1771211000000000')",
+            &[],
+        )
+        .expect("insert reservations");
+
+        let counts = DbStatQueryBatcher::new(&conn).fetch_counts();
+        assert_eq!(counts.file_reservations, 3);
     }
 }

@@ -884,9 +884,14 @@ impl MailScreen for ThreadExplorerScreen {
                                 KeyCode::Home => {
                                     self.detail_cursor = 0;
                                 }
-                                // Tree expansion controls
+                                // Tree expansion controls (fall back to ThreadList if nothing to collapse)
                                 KeyCode::Left | KeyCode::Char('h') => {
+                                    let before = self.collapsed_tree_ids.len();
                                     self.collapse_selected_branch();
+                                    if self.collapsed_tree_ids.len() == before {
+                                        self.focus = Focus::ThreadList;
+                                        self.load_older_selected = false;
+                                    }
                                 }
                                 KeyCode::Right | KeyCode::Char('l') => {
                                     self.expand_selected_branch();

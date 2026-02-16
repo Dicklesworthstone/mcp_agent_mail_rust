@@ -4204,6 +4204,15 @@ fn normalize_project_value(value: String) -> String {
 }
 
 fn parse_call_tool_result_payload(call_result: &serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(structured) = call_result
+        .get("structuredContent")
+        .or_else(|| call_result.get("structured_content"))
+    {
+        if !structured.is_null() {
+            return Some(structured.clone());
+        }
+    }
+
     let blocks = call_result.get("content")?.as_array()?;
     for block in blocks {
         if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
@@ -4212,11 +4221,41 @@ fn parse_call_tool_result_payload(call_result: &serde_json::Value) -> Option<ser
         let Some(text) = block.get("text").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(payload) = parse_text_payload_json(text) {
             return Some(payload);
         }
     }
     None
+}
+
+fn parse_text_payload_json(text: &str) -> Option<serde_json::Value> {
+    let candidates = [
+        Some(text.trim()),
+        strip_markdown_code_fence(text),
+        strip_markdown_code_fence(text.trim()),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if let serde_json::Value::String(inner) = &payload {
+                if let Ok(unwrapped) = serde_json::from_str::<serde_json::Value>(inner.trim()) {
+                    return Some(unwrapped);
+                }
+            }
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn strip_markdown_code_fence(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    let fence = trimmed.strip_prefix("```")?;
+    let (_, body) = fence.split_once('\n')?;
+    let (inner, _) = body.rsplit_once("```")?;
+    Some(inner.trim())
 }
 
 fn json_i64_field(value: &serde_json::Value, key: &str) -> Option<i64> {
@@ -4398,8 +4437,9 @@ fn derive_message_domain_events(
 fn derive_fetch_inbox_domain_events(
     payload: &serde_json::Value,
     ctx: &DomainEventContext,
+    fallback_project: Option<&str>,
 ) -> Vec<tui_events::MailEvent> {
-    let Some(project_value) = ctx.project.as_deref() else {
+    let Some(project_value) = ctx.project.as_deref().or(fallback_project) else {
         return Vec::new();
     };
     let Some(messages) = payload.as_array() else {
@@ -4585,7 +4625,12 @@ fn derive_domain_events_from_tool_payload(
     let ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
     match tool_name {
         "send_message" | "reply_message" => derive_message_domain_events(payload, &ctx),
-        "fetch_inbox" | "fetch_inbox_product" => derive_fetch_inbox_domain_events(payload, &ctx),
+        "fetch_inbox" => derive_fetch_inbox_domain_events(payload, &ctx, None),
+        "fetch_inbox_product" => {
+            let product_fallback = extract_arg_str(call_args, &["product_key"])
+                .map(|product_key| format!("product:{product_key}"));
+            derive_fetch_inbox_domain_events(payload, &ctx, product_fallback.as_deref())
+        }
         "file_reservation_paths" => {
             derive_reservation_granted_domain_events(call_args, payload, &ctx)
         }
@@ -4771,10 +4816,12 @@ impl std::fmt::Display for RequestKind {
 }
 
 fn classify_request(req: &JsonRpcRequest) -> (RequestKind, Option<String>) {
-    if req.method == "tools/call" {
-        if let Some(params) = req.params.as_ref() {
-            if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
-                return (RequestKind::Tools, Some(name.to_string()));
+    if req.method.starts_with("tools/") {
+        if req.method == "tools/call" {
+            if let Some(params) = req.params.as_ref() {
+                if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                    return (RequestKind::Tools, Some(name.to_string()));
+                }
             }
         }
         return (RequestKind::Tools, None);
@@ -12181,6 +12228,72 @@ mod tests {
     }
 
     #[test]
+    fn derive_domain_events_from_structured_content_payload() {
+        let payload = serde_json::json!({
+            "deliveries": [{
+                "project": "alpha",
+                "payload": {
+                    "id": 43,
+                    "from": "RedFox",
+                    "to": ["BlueLake"],
+                    "subject": "Structured content",
+                    "thread_id": "br-43"
+                }
+            }],
+            "count": 1
+        });
+        let call_result = serde_json::json!({
+            "structuredContent": payload
+        });
+
+        let events =
+            derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageSent { id, subject, .. } => {
+                assert_eq!(*id, 43);
+                assert_eq!(subject, "Structured content");
+            }
+            other => panic!("expected MessageSent event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_double_encoded_text_payload() {
+        let payload = serde_json::json!({
+            "deliveries": [{
+                "project": "alpha",
+                "payload": {
+                    "id": 44,
+                    "from": "RedFox",
+                    "to": ["BlueLake"],
+                    "subject": "Double encoded",
+                    "thread_id": "br-44"
+                }
+            }],
+            "count": 1
+        });
+        let double_encoded = serde_json::to_string(&payload.to_string()).expect("json string");
+        let call_result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": double_encoded
+            }]
+        });
+
+        let events =
+            derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageSent { id, subject, .. } => {
+                assert_eq!(*id, 44);
+                assert_eq!(subject, "Double encoded");
+            }
+            other => panic!("expected MessageSent event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn derive_domain_events_from_plain_payload_fallback() {
         let payload = serde_json::json!({
             "deliveries": [{
@@ -12346,6 +12459,36 @@ mod tests {
             tui_events::MailEvent::MessageReceived { id, subject, .. } => {
                 assert_eq!(*id, 2001);
                 assert_eq!(subject, "Product inbox");
+            }
+            other => panic!("expected MessageReceived event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_fetch_inbox_product_without_project_hint() {
+        let payload = serde_json::json!([{
+            "id": 2002,
+            "from": "GreenPeak",
+            "subject": "Product fallback",
+            "thread_id": "br-2002"
+        }]);
+        let call_args = serde_json::json!({
+            "agent_name": "BlueLake",
+            "product_key": "prod-xyz"
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "fetch_inbox_product",
+            Some(&call_args),
+            &payload,
+            None,
+            Some("BlueLake"),
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageReceived { id, project, .. } => {
+                assert_eq!(*id, 2002);
+                assert_eq!(project, "product:prod-xyz");
             }
             other => panic!("expected MessageReceived event, got {other:?}"),
         }

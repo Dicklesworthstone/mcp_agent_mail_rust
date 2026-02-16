@@ -557,28 +557,6 @@ pub fn get_semantic_bridge() -> Option<Arc<SemanticBridge>> {
     SEMANTIC_BRIDGE.get().and_then(std::clone::Clone::clone)
 }
 
-/// Try executing semantic candidate retrieval for hybrid mode.
-///
-/// Semantic retrieval is intentionally optional at this stage: if no semantic
-/// backend is initialized yet, we return `None` and the orchestration stage
-/// degrades to lexical-only while preserving deterministic behavior.
-#[cfg(feature = "hybrid")]
-fn try_semantic_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
-    let bridge = get_or_init_semantic_bridge()?;
-    let results = bridge.search(query, limit);
-    if results.is_empty() {
-        None
-    } else {
-        Some(results)
-    }
-}
-
-/// Fallback for when hybrid feature is not enabled.
-#[cfg(not(feature = "hybrid"))]
-const fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
-    None
-}
-
 /// Enqueue a document for background semantic indexing.
 #[cfg(feature = "hybrid")]
 #[must_use]
@@ -907,20 +885,18 @@ fn get_or_init_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
 
 /// Try executing semantic candidate retrieval using two-tier system.
 ///
-/// Prefers the two-tier bridge when available. Falls back to legacy
-/// `SemanticBridge` only when the two-tier bridge is unavailable.
+/// Uses the two-tier bridge when available. When unavailable, callers
+/// deterministically degrade to lexical-only candidate orchestration.
 #[cfg(feature = "hybrid")]
 fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
     // Use atomic get_or_init pattern to avoid race condition on initialization.
     // Only one TwoTierBridge instance is ever created under concurrent access.
-    if let Some(bridge) = get_or_init_two_tier_bridge() {
-        if bridge.is_available() {
-            return Some(bridge.search(query, limit));
-        }
+    let bridge = get_or_init_two_tier_bridge()?;
+    if bridge.is_available() {
+        Some(bridge.search(query, limit))
+    } else {
+        None
     }
-
-    // Fall back to legacy semantic bridge
-    try_semantic_search(query, limit)
 }
 
 #[cfg(feature = "hybrid")]
@@ -929,15 +905,7 @@ fn try_two_tier_search_with_cx(
     query: &SearchQuery,
     limit: usize,
 ) -> Option<Vec<SearchResult>> {
-    // Use atomic get_or_init pattern to avoid race condition on initialization.
-    // Only one TwoTierBridge instance is ever created under concurrent access.
-    if let Some(bridge) = get_or_init_two_tier_bridge() {
-        if bridge.is_available() {
-            return Some(bridge.search(query, limit));
-        }
-    }
-
-    // Fall back to sync two-tier/legacy path.
+    // Cx-capable variant currently shares the same two-tier dispatch path.
     try_two_tier_search(query, limit)
 }
 
@@ -1203,12 +1171,13 @@ pub async fn execute_search(
     //
     // Stage order:
     // 1) lexical candidate retrieval (Tantivy bridge)
-    // 2) semantic candidate retrieval (two-tier with auto-init, or legacy fallback)
+    // 2) semantic candidate retrieval (two-tier with auto-init)
     // 3) deterministic dedupe + merge prep (mode-aware budgets)
     // Fusion/rerank stages are implemented by follow-up Search V3 tracks.
     if matches!(engine, SearchEngine::Hybrid | SearchEngine::Auto) {
         if let Some(lexical_results) = try_tantivy_search(query) {
-            // Try two-tier semantic search first, then fall back to legacy
+            // Two-tier semantic candidates are optional; missing bridge degrades
+            // to lexical-only while preserving deterministic fusion behavior.
             #[cfg(feature = "hybrid")]
             let semantic_results =
                 try_two_tier_search_with_cx(cx, query, query.effective_limit()).unwrap_or_default();

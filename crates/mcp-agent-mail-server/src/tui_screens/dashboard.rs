@@ -4,7 +4,7 @@
 //! responsive layout that adapts from 80×24 to 200×50+.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ftui::Style;
@@ -102,6 +102,14 @@ const RESERVATION_SOON_THRESHOLD_MICROS: i64 = 5 * 60 * 1_000_000;
 const AGENT_ACTIVE_THRESHOLD_MICROS: i64 = 60 * 1_000_000;
 const AGENT_IDLE_THRESHOLD_MICROS: i64 = 5 * 60 * 1_000_000;
 const TOP_MATCH_SAMPLE_CAP: usize = 4;
+const ULTRAWIDE_INSIGHT_MIN_WIDTH: u16 = 120;
+const ULTRAWIDE_INSIGHT_MIN_HEIGHT: u16 = 14;
+const ULTRAWIDE_BOTTOM_MIN_WIDTH: u16 = 130;
+const ULTRAWIDE_BOTTOM_MIN_HEIGHT: u16 = 8;
+const SUPERGRID_INSIGHT_MIN_WIDTH: u16 = 170;
+const SUPERGRID_INSIGHT_MIN_HEIGHT: u16 = 20;
+const SUPERGRID_BOTTOM_MIN_WIDTH: u16 = 180;
+const SUPERGRID_BOTTOM_MIN_HEIGHT: u16 = 9;
 
 /// Anomaly thresholds.
 const ACK_PENDING_WARN: u64 = 3;
@@ -249,6 +257,14 @@ pub struct DashboardScreen {
     console_log_last_seq: u64,
     /// Dashboard event stream rendered via `LogViewer`.
     event_log_viewer: RefCell<crate::console::LogPane>,
+    /// Last DB snapshot timestamp used for synthetic delta events.
+    last_db_snapshot_micros: i64,
+    /// Last observed message counter for DB-delta synthesis.
+    last_db_messages: u64,
+    /// Last observed reservation counter for DB-delta synthesis.
+    last_db_reservations: u64,
+    /// Whether DB-delta baseline has been initialized.
+    db_delta_baseline_ready: bool,
 }
 
 /// A pre-formatted event log entry.
@@ -372,6 +388,10 @@ impl DashboardScreen {
             console_log: RefCell::new(crate::console::LogPane::new()),
             console_log_last_seq: 0,
             event_log_viewer: RefCell::new(crate::console::LogPane::new()),
+            last_db_snapshot_micros: 0,
+            last_db_messages: 0,
+            last_db_reservations: 0,
+            db_delta_baseline_ready: false,
         }
     }
 
@@ -385,7 +405,79 @@ impl DashboardScreen {
             }
             self.event_log.push(format_event(event));
         }
-        // Trim to capacity
+        self.trim_event_log();
+    }
+
+    fn ingest_db_delta_events(&mut self, state: &TuiSharedState) {
+        let Some(snapshot) = state.db_stats_snapshot() else {
+            return;
+        };
+        if snapshot.timestamp_micros <= self.last_db_snapshot_micros {
+            return;
+        }
+
+        if !self.db_delta_baseline_ready {
+            self.db_delta_baseline_ready = true;
+            self.last_db_messages = snapshot.messages;
+            self.last_db_reservations = snapshot.file_reservations;
+            self.last_db_snapshot_micros = snapshot.timestamp_micros;
+            return;
+        }
+
+        if snapshot.messages > self.last_db_messages {
+            let delta = snapshot.messages.saturating_sub(self.last_db_messages);
+            let summary = if delta == 1 {
+                "DB observed 1 new message".to_string()
+            } else {
+                format!("DB observed {delta} new messages")
+            };
+            let synthetic = MailEvent::message_received(
+                i64::try_from(snapshot.messages).unwrap_or(i64::MAX),
+                "db-poller",
+                Vec::new(),
+                &summary,
+                "db-snapshot",
+                "all-projects",
+            );
+            if let Some(preview) = RecentMessagePreview::from_event(&synthetic) {
+                self.recent_message_preview = Some(preview);
+            }
+            self.event_log.push(format_event(&synthetic));
+        }
+
+        if snapshot.file_reservations > self.last_db_reservations {
+            let delta = snapshot
+                .file_reservations
+                .saturating_sub(self.last_db_reservations);
+            let path = if delta == 1 {
+                "1 active reservation added".to_string()
+            } else {
+                format!("{delta} active reservations added")
+            };
+            let synthetic =
+                MailEvent::reservation_granted("db-poller", vec![path], false, 0, "all-projects");
+            self.event_log.push(format_event(&synthetic));
+        } else if snapshot.file_reservations < self.last_db_reservations {
+            let delta = self
+                .last_db_reservations
+                .saturating_sub(snapshot.file_reservations);
+            let path = if delta == 1 {
+                "1 active reservation removed".to_string()
+            } else {
+                format!("{delta} active reservations removed")
+            };
+            let synthetic =
+                MailEvent::reservation_released("db-poller", vec![path], "all-projects");
+            self.event_log.push(format_event(&synthetic));
+        }
+
+        self.last_db_messages = snapshot.messages;
+        self.last_db_reservations = snapshot.file_reservations;
+        self.last_db_snapshot_micros = snapshot.timestamp_micros;
+        self.trim_event_log();
+    }
+
+    fn trim_event_log(&mut self) {
         if self.event_log.len() > EVENT_LOG_CAPACITY {
             let excess = self.event_log.len() - EVENT_LOG_CAPACITY;
             self.event_log.drain(..excess);
@@ -757,6 +849,10 @@ impl MailScreen for DashboardScreen {
 
         // Ingest new events every tick
         self.ingest_events(state);
+        // Synthesize dashboard-friendly deltas from polled DB counters so
+        // message/reservation movement remains visible even when no matching
+        // domain events were emitted into the ring buffer.
+        self.ingest_db_delta_events(state);
         // Keep scroll offset in-bounds so the log view never goes empty due
         // stale offsets after trims/filter changes.
         self.clamp_scroll_offset();
@@ -1082,6 +1178,14 @@ fn event_entry_matches_query(entry: &EventEntry, query_terms: &[String]) -> bool
     text_matches_query_terms(&searchable, query_terms)
 }
 
+fn parse_tool_end_duration(summary: &str) -> Option<(String, u64)> {
+    let mut parts = summary.split_whitespace();
+    let tool_name = parts.next()?;
+    let duration_token = parts.next()?;
+    let duration_ms = duration_token.strip_suffix("ms")?.parse::<u64>().ok()?;
+    Some((tool_name.to_string(), duration_ms))
+}
+
 fn format_relative_micros(timestamp_micros: i64, now_micros: i64) -> String {
     if timestamp_micros <= 0 {
         return "n/a".to_string();
@@ -1098,6 +1202,14 @@ fn format_relative_micros(timestamp_micros: i64, now_micros: i64) -> String {
         return format!("{}h", secs / 3600);
     }
     format!("{}d", secs / 86_400)
+}
+
+const fn is_supergrid_insight_area(area: Rect) -> bool {
+    area.width >= SUPERGRID_INSIGHT_MIN_WIDTH && area.height >= SUPERGRID_INSIGHT_MIN_HEIGHT
+}
+
+const fn is_supergrid_bottom_area(area: Rect) -> bool {
+    area.width >= SUPERGRID_BOTTOM_MIN_WIDTH && area.height >= SUPERGRID_BOTTOM_MIN_HEIGHT
 }
 
 fn split_top(area: Rect, top_h: u16) -> (Rect, Rect) {
@@ -1477,7 +1589,7 @@ fn render_dashboard_query_bar(
         return;
     }
     let mode_line = if query_terms.is_empty() {
-        "Live panels: throughput, agents, projects, reservations, signals"
+        "Live panels: throughput, agents, contacts, projects, reservations, signals, tools"
     } else {
         "Filtering uses case-insensitive AND matching across each panel"
     };
@@ -1502,8 +1614,13 @@ fn render_insight_rail(
         return;
     }
 
+    let ultrawide = area.width >= ULTRAWIDE_INSIGHT_MIN_WIDTH && area.height >= 20;
     let (trend_area, remaining) = if area.height >= 20 {
-        let trend_height = (area.height / 3).max(7);
+        let trend_height = if ultrawide {
+            (area.height.saturating_mul(2) / 5).max(8)
+        } else {
+            (area.height / 3).max(7)
+        };
         split_top(area, trend_height)
     } else {
         (Rect::new(0, 0, 0, 0), area)
@@ -1520,6 +1637,73 @@ fn render_insight_rail(
     }
 
     if remaining.height < 4 {
+        return;
+    }
+
+    if is_supergrid_insight_area(remaining) {
+        let (col_a, rest) = split_width_ratio(remaining, 0.25);
+        let (col_b, rest) = split_width_ratio(rest, 1.0 / 3.0);
+        let (col_c, col_d) = split_width_ratio(rest, 0.5);
+        let (a_top, a_bottom) = split_height_ratio(col_a, 0.5);
+        let (b_top, b_bottom) = split_height_ratio(col_b, 0.5);
+        let (c_top, c_bottom) = split_height_ratio(col_c, 0.5);
+        let (d_top, d_bottom) = split_height_ratio(col_d, 0.5);
+
+        render_agents_snapshot_panel(frame, a_top, &db_snapshot.agents_list, query_text);
+        render_contacts_snapshot_panel(frame, a_bottom, &db_snapshot.contacts_list, query_text);
+        render_projects_snapshot_panel(frame, b_top, &db_snapshot.projects_list, query_text);
+        render_project_load_panel(frame, b_bottom, &db_snapshot.projects_list, query_text);
+        render_reservation_watch_panel(
+            frame,
+            c_top,
+            &db_snapshot.reservation_snapshots,
+            query_text,
+        );
+        render_reservation_ttl_buckets_panel(
+            frame,
+            c_bottom,
+            &db_snapshot.reservation_snapshots,
+            query_text,
+        );
+        render_signal_panel(
+            frame,
+            d_top,
+            anomalies,
+            entries,
+            &db_snapshot.contacts_list,
+            query_text,
+        );
+        render_tool_latency_panel(frame, d_bottom, entries, query_text);
+        return;
+    }
+
+    if remaining.width >= ULTRAWIDE_INSIGHT_MIN_WIDTH
+        && remaining.height >= ULTRAWIDE_INSIGHT_MIN_HEIGHT
+    {
+        let (col_a, rest) = split_width_ratio(remaining, 0.34);
+        let (col_b, col_c) = split_width_ratio(rest, 0.5);
+        let (a_top, a_bottom) = split_height_ratio(col_a, 0.5);
+        let (b_top, b_bottom) = split_height_ratio(col_b, 0.5);
+        let (c_top, c_bottom) = split_height_ratio(col_c, 0.5);
+
+        render_agents_snapshot_panel(frame, a_top, &db_snapshot.agents_list, query_text);
+        render_contacts_snapshot_panel(frame, a_bottom, &db_snapshot.contacts_list, query_text);
+        render_projects_snapshot_panel(frame, b_top, &db_snapshot.projects_list, query_text);
+        render_reservation_watch_panel(
+            frame,
+            b_bottom,
+            &db_snapshot.reservation_snapshots,
+            query_text,
+        );
+        render_signal_panel(
+            frame,
+            c_top,
+            anomalies,
+            entries,
+            &db_snapshot.contacts_list,
+            query_text,
+        );
+        render_event_mix_panel(frame, c_bottom, entries, query_text);
         return;
     }
 
@@ -1566,6 +1750,33 @@ fn render_bottom_rail(
     preview: Option<&RecentMessagePreview>,
 ) {
     if area.width < 24 || area.height < 4 {
+        return;
+    }
+
+    if is_supergrid_bottom_area(area) {
+        let (left, rest) = split_width_ratio(area, 0.34);
+        let (middle, rest) = split_width_ratio(rest, 0.33);
+        let (right, aux) = split_width_ratio(rest, 0.5);
+        render_recent_message_preview_panel(frame, left, preview);
+        render_query_matches_panel(frame, middle, query_text, db_snapshot, entries);
+        render_recent_activity_panel(frame, right, entries, query_text);
+
+        if aux.height >= 10 {
+            let (aux_top, aux_bottom) = split_height_ratio(aux, 0.5);
+            render_event_mix_panel(frame, aux_top, entries, query_text);
+            render_message_flow_panel(frame, aux_bottom, entries, query_text);
+        } else {
+            render_message_flow_panel(frame, aux, entries, query_text);
+        }
+        return;
+    }
+
+    if area.width >= ULTRAWIDE_BOTTOM_MIN_WIDTH && area.height >= ULTRAWIDE_BOTTOM_MIN_HEIGHT {
+        let (left, rest) = split_width_ratio(area, 0.5);
+        let (middle, right) = split_width_ratio(rest, 0.5);
+        render_recent_message_preview_panel(frame, left, preview);
+        render_query_matches_panel(frame, middle, query_text, db_snapshot, entries);
+        render_recent_activity_panel(frame, right, entries, query_text);
         return;
     }
 
@@ -1643,6 +1854,101 @@ fn render_agents_snapshot_panel(
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
 }
 
+fn render_contacts_snapshot_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    contacts: &[ContactSummary],
+    query_text: &str,
+) {
+    if area.width < 18 || area.height < 3 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Contacts")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let mut rows: Vec<&ContactSummary> = contacts
+        .iter()
+        .filter(|contact| {
+            text_matches_query_terms(
+                &format!(
+                    "{} {} {} {} {} {}",
+                    contact.from_agent,
+                    contact.to_agent,
+                    contact.from_project_slug,
+                    contact.to_project_slug,
+                    contact.status,
+                    contact.reason
+                ),
+                &query_terms,
+            )
+        })
+        .collect();
+    rows.sort_by_key(|contact| std::cmp::Reverse(contact.updated_ts));
+
+    let pending = rows
+        .iter()
+        .filter(|contact| contact.status.eq_ignore_ascii_case("pending"))
+        .count();
+    let accepted = rows
+        .iter()
+        .filter(|contact| contact.status.eq_ignore_ascii_case("accepted"))
+        .count();
+
+    let now = unix_epoch_micros_now().unwrap_or_default();
+    let mut lines = Vec::new();
+    lines.push(Line::from_spans([
+        Span::styled(
+            format!("pending:{pending} active:{accepted}"),
+            Style::default().fg(tp.text_primary).bold(),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("total:{}", rows.len()),
+            crate::tui_theme::text_meta(&tp),
+        ),
+    ]));
+
+    for contact in rows
+        .iter()
+        .take(usize::from(inner.height).saturating_sub(1))
+    {
+        let age = format_relative_micros(contact.updated_ts, now);
+        lines.push(Line::from_spans([
+            Span::styled(
+                truncate(&contact.from_agent, 10),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw("→"),
+            Span::styled(
+                truncate(&contact.to_agent, 10),
+                Style::default().fg(tp.text_primary),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&contact.status, 7),
+                crate::tui_theme::text_meta(&tp),
+            ),
+            Span::raw(" "),
+            Span::styled(age, crate::tui_theme::text_meta(&tp)),
+        ]));
+    }
+
+    let visible = lines
+        .into_iter()
+        .take(usize::from(inner.height))
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+}
+
 fn render_projects_snapshot_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1704,6 +2010,95 @@ fn render_projects_snapshot_panel(
         ]));
     }
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+fn render_project_load_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    projects: &[ProjectSummary],
+    query_text: &str,
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Project Load")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let mut rows: Vec<(&ProjectSummary, u64)> = projects
+        .iter()
+        .filter(|project| {
+            text_matches_query_terms(
+                &format!("{} {}", project.slug, project.human_key),
+                &query_terms,
+            )
+        })
+        .map(|project| {
+            let load_score = project
+                .message_count
+                .saturating_add(project.agent_count.saturating_mul(2))
+                .saturating_add(project.reservation_count.saturating_mul(3));
+            (project, load_score)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if rows.is_empty() {
+        Paragraph::new("No matching projects")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let mut lines = Vec::new();
+    let total_score = rows.iter().map(|(_, score)| *score).sum::<u64>();
+    lines.push(Line::from_spans([
+        Span::styled("score ", crate::tui_theme::text_meta(&tp)),
+        Span::styled(
+            format!("{total_score}"),
+            Style::default().fg(tp.metric_requests).bold(),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("projects:{}", rows.len()),
+            crate::tui_theme::text_meta(&tp),
+        ),
+    ]));
+
+    for (project, score) in rows
+        .iter()
+        .take(usize::from(inner.height).saturating_sub(1))
+    {
+        lines.push(Line::from_spans([
+            Span::styled(
+                truncate(&project.slug, 14),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(
+                    "L:{score} m:{} a:{} r:{}",
+                    project.message_count, project.agent_count, project.reservation_count
+                ),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+
+    let visible = lines
+        .into_iter()
+        .take(usize::from(inner.height))
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
 }
 
 fn render_reservation_watch_panel(
@@ -1812,6 +2207,119 @@ fn render_reservation_watch_panel(
         ]));
     }
     Paragraph::new(Text::from_lines(lines)).render(list_area, frame);
+}
+
+fn render_reservation_ttl_buckets_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    reservations: &[ReservationSnapshot],
+    query_text: &str,
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Reservation TTL")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let now = unix_epoch_micros_now().unwrap_or_default();
+    let query_terms = parse_query_terms(query_text);
+    let filtered: Vec<&ReservationSnapshot> = reservations
+        .iter()
+        .filter(|reservation| !reservation.is_released())
+        .filter(|reservation| {
+            text_matches_query_terms(
+                &format!(
+                    "{} {} {}",
+                    reservation.project_slug, reservation.agent_name, reservation.path_pattern
+                ),
+                &query_terms,
+            )
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        Paragraph::new("No matching reservations")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let mut expired = 0usize;
+    let mut s60 = 0usize;
+    let mut m5 = 0usize;
+    let mut m30 = 0usize;
+    let mut long = 0usize;
+    let mut exclusive = 0usize;
+
+    for reservation in &filtered {
+        if reservation.exclusive {
+            exclusive += 1;
+        }
+        let remaining = reservation_remaining_seconds(reservation, now);
+        if remaining == 0 {
+            expired += 1;
+        } else if remaining <= 60 {
+            s60 += 1;
+        } else if remaining <= 300 {
+            m5 += 1;
+        } else if remaining <= 1_800 {
+            m30 += 1;
+        } else {
+            long += 1;
+        }
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from_spans([Span::styled(
+        format!("active:{} excl:{}", filtered.len(), exclusive),
+        Style::default().fg(tp.text_primary).bold(),
+    )]));
+    lines.push(Line::from_spans([Span::styled(
+        format!("exp:{expired} <=60s:{s60} <=5m:{m5} <=30m:{m30} >30m:{long}"),
+        crate::tui_theme::text_meta(&tp),
+    )]));
+
+    let soonest = filtered
+        .iter()
+        .min_by_key(|reservation| reservation.expires_ts);
+    if let Some(soonest) = soonest {
+        let ttl = reservation_remaining_seconds(soonest, now);
+        lines.push(Line::from_spans([
+            Span::styled("next ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                format!("{ttl}s"),
+                Style::default().fg(tp.metric_latency).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&soonest.agent_name, 12),
+                Style::default().fg(tp.text_primary),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(
+                    &soonest.path_pattern,
+                    usize::from(inner.width.saturating_sub(24)),
+                ),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+
+    let visible = lines
+        .into_iter()
+        .take(usize::from(inner.height))
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1936,6 +2444,352 @@ fn render_signal_panel(
     }
 
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+fn render_event_mix_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entries: &[&EventEntry],
+    query_text: &str,
+) {
+    if area.width < 18 || area.height < 3 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Event Mix")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let filtered: Vec<&EventEntry> = entries
+        .iter()
+        .copied()
+        .filter(|entry| event_entry_matches_query(entry, &query_terms))
+        .collect();
+    if filtered.is_empty() {
+        Paragraph::new("No matching events")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let mut by_kind: HashMap<MailEventKind, usize> = HashMap::new();
+    let mut msg = 0usize;
+    let mut tool = 0usize;
+    let mut reservation = 0usize;
+    let mut http = 0usize;
+    let mut lifecycle = 0usize;
+    let mut warn = 0usize;
+    let mut error = 0usize;
+
+    for entry in &filtered {
+        *by_kind.entry(entry.kind).or_insert(0) += 1;
+        if matches!(entry.severity, EventSeverity::Warn) {
+            warn += 1;
+        }
+        if matches!(entry.severity, EventSeverity::Error) {
+            error += 1;
+        }
+        match entry.kind {
+            MailEventKind::MessageSent | MailEventKind::MessageReceived => msg += 1,
+            MailEventKind::ToolCallStart | MailEventKind::ToolCallEnd => tool += 1,
+            MailEventKind::ReservationGranted | MailEventKind::ReservationReleased => {
+                reservation += 1;
+            }
+            MailEventKind::HttpRequest => http += 1,
+            MailEventKind::ServerStarted
+            | MailEventKind::ServerShutdown
+            | MailEventKind::HealthPulse
+            | MailEventKind::AgentRegistered => lifecycle += 1,
+        }
+    }
+
+    let mut top_kinds = by_kind.into_iter().collect::<Vec<_>>();
+    top_kinds.sort_by_key(|pair| std::cmp::Reverse(pair.1));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from_spans([Span::styled(
+        format!("total:{} warn:{} err:{}", filtered.len(), warn, error),
+        Style::default().fg(tp.text_primary).bold(),
+    )]));
+    lines.push(Line::from_spans([Span::styled(
+        format!("msg:{msg} tool:{tool} res:{reservation} http:{http} sys:{lifecycle}"),
+        crate::tui_theme::text_meta(&tp),
+    )]));
+    if let Some((kind, count)) = top_kinds.first() {
+        lines.push(Line::from_spans([
+            Span::styled("top ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                format!("{} ({count})", kind.compact_label()),
+                Style::default().fg(tp.metric_requests),
+            ),
+        ]));
+    }
+    if let Some((kind, count)) = top_kinds.get(1) {
+        lines.push(Line::from_spans([
+            Span::styled("next ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                format!("{} ({count})", kind.compact_label()),
+                Style::default().fg(tp.text_primary),
+            ),
+        ]));
+    }
+
+    let visible = lines
+        .into_iter()
+        .take(usize::from(inner.height))
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+}
+
+fn render_tool_latency_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entries: &[&EventEntry],
+    query_text: &str,
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Tool Latency")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    #[derive(Default)]
+    struct ToolAgg {
+        calls: usize,
+        total_ms: u64,
+        max_ms: u64,
+        samples: Vec<u64>,
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let mut by_tool: HashMap<String, ToolAgg> = HashMap::new();
+    for entry in entries.iter().filter(|entry| {
+        entry.kind == MailEventKind::ToolCallEnd
+            && text_matches_query_terms(&entry.summary, &query_terms)
+    }) {
+        if let Some((tool_name, duration_ms)) = parse_tool_end_duration(&entry.summary) {
+            let slot = by_tool.entry(tool_name).or_default();
+            slot.calls += 1;
+            slot.total_ms = slot.total_ms.saturating_add(duration_ms);
+            slot.max_ms = slot.max_ms.max(duration_ms);
+            slot.samples.push(duration_ms);
+        }
+    }
+
+    if by_tool.is_empty() {
+        Paragraph::new("No matching tool completions")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let mut rows = by_tool.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.1.calls
+            .cmp(&a.1.calls)
+            .then_with(|| b.1.max_ms.cmp(&a.1.max_ms))
+    });
+
+    let total_calls = rows.iter().map(|(_, stats)| stats.calls).sum::<usize>();
+    let avg_latency = rows
+        .iter()
+        .map(|(_, stats)| stats.total_ms)
+        .sum::<u64>()
+        .checked_div(u64::try_from(total_calls).unwrap_or(1))
+        .unwrap_or(0);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from_spans([Span::styled(
+        format!(
+            "calls:{total_calls} tools:{} avg:{avg_latency}ms",
+            rows.len()
+        ),
+        Style::default().fg(tp.text_primary).bold(),
+    )]));
+
+    for (tool_name, stats) in rows
+        .iter()
+        .take(usize::from(inner.height).saturating_sub(1))
+    {
+        let mut samples = stats.samples.clone();
+        samples.sort_unstable();
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len().saturating_sub(1))];
+        let calls_u64 = u64::try_from(stats.calls).unwrap_or(1);
+        let avg = stats.total_ms.checked_div(calls_u64).unwrap_or(0);
+        lines.push(Line::from_spans([
+            Span::styled(
+                truncate(tool_name, 16),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("c:{} avg:{avg} p95:{p95} max:{}", stats.calls, stats.max_ms),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+
+    let visible = lines
+        .into_iter()
+        .take(usize::from(inner.height))
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+}
+
+fn render_recent_activity_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entries: &[&EventEntry],
+    query_text: &str,
+) {
+    if area.width < 18 || area.height < 3 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Recent Activity")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let mut lines = Vec::new();
+    for entry in entries.iter().rev().filter(|entry| {
+        text_matches_query_terms(
+            &format!("{} {}", entry.kind.compact_label(), entry.summary),
+            &query_terms,
+        )
+    }) {
+        if lines.len() >= usize::from(inner.height) {
+            break;
+        }
+        lines.push(Line::from_spans([
+            Span::styled(entry.timestamp.clone(), crate::tui_theme::text_meta(&tp)),
+            Span::raw(" "),
+            Span::styled(
+                entry.icon.to_string(),
+                Style::default().fg(tp.metric_requests),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&entry.summary, usize::from(inner.width.saturating_sub(18))),
+                Style::default().fg(tp.text_primary),
+            ),
+        ]));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from_spans([Span::styled(
+            "No matching events",
+            crate::tui_theme::text_meta(&tp),
+        )]));
+    }
+
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+fn render_message_flow_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entries: &[&EventEntry],
+    query_text: &str,
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Message Flow")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let filtered = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                MailEventKind::MessageSent | MailEventKind::MessageReceived
+            ) && text_matches_query_terms(&entry.summary, &query_terms)
+        })
+        .collect::<Vec<_>>();
+
+    if filtered.is_empty() {
+        Paragraph::new("No matching messages")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let sent = filtered
+        .iter()
+        .filter(|entry| entry.kind == MailEventKind::MessageSent)
+        .count();
+    let recv = filtered
+        .iter()
+        .filter(|entry| entry.kind == MailEventKind::MessageReceived)
+        .count();
+    let delta =
+        i128::try_from(sent).unwrap_or(i128::MAX) - i128::try_from(recv).unwrap_or(i128::MAX);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from_spans([Span::styled(
+        format!("sent:{sent} recv:{recv} Δ:{delta:+}"),
+        Style::default().fg(tp.text_primary).bold(),
+    )]));
+
+    for entry in filtered
+        .iter()
+        .rev()
+        .take(usize::from(inner.height).saturating_sub(1))
+    {
+        let marker = if entry.kind == MailEventKind::MessageSent {
+            "↑"
+        } else {
+            "↓"
+        };
+        lines.push(Line::from_spans([
+            Span::styled(marker, Style::default().fg(tp.metric_messages)),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&entry.summary, usize::from(inner.width.saturating_sub(2))),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+
+    let visible = lines
+        .into_iter()
+        .take(usize::from(inner.height))
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2976,6 +3830,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_end_duration_extracts_tool_and_ms() {
+        let parsed = parse_tool_end_duration("send_message 42ms q=5 [BlueLake@proj]");
+        assert_eq!(parsed, Some(("send_message".to_string(), 42)));
+        assert_eq!(parse_tool_end_duration("→ send_message"), None);
+        assert_eq!(parse_tool_end_duration("send_message bad q=1"), None);
+    }
+
+    #[test]
+    fn supergrid_breakpoints_detect_large_panels() {
+        assert!(!is_supergrid_insight_area(Rect::new(
+            0,
+            0,
+            SUPERGRID_INSIGHT_MIN_WIDTH - 1,
+            SUPERGRID_INSIGHT_MIN_HEIGHT
+        )));
+        assert!(!is_supergrid_insight_area(Rect::new(
+            0,
+            0,
+            SUPERGRID_INSIGHT_MIN_WIDTH,
+            SUPERGRID_INSIGHT_MIN_HEIGHT - 1
+        )));
+        assert!(is_supergrid_insight_area(Rect::new(
+            0,
+            0,
+            SUPERGRID_INSIGHT_MIN_WIDTH,
+            SUPERGRID_INSIGHT_MIN_HEIGHT
+        )));
+
+        assert!(!is_supergrid_bottom_area(Rect::new(
+            0,
+            0,
+            SUPERGRID_BOTTOM_MIN_WIDTH - 1,
+            SUPERGRID_BOTTOM_MIN_HEIGHT
+        )));
+        assert!(!is_supergrid_bottom_area(Rect::new(
+            0,
+            0,
+            SUPERGRID_BOTTOM_MIN_WIDTH,
+            SUPERGRID_BOTTOM_MIN_HEIGHT - 1
+        )));
+        assert!(is_supergrid_bottom_area(Rect::new(
+            0,
+            0,
+            SUPERGRID_BOTTOM_MIN_WIDTH,
+            SUPERGRID_BOTTOM_MIN_HEIGHT
+        )));
+    }
+
+    #[test]
     fn summarize_recipients_formats_by_count() {
         assert_eq!(summarize_recipients(&[]), "(none)");
         assert_eq!(summarize_recipients(&["A".to_string()]), "A");
@@ -3284,6 +4187,85 @@ mod tests {
 
         screen.ingest_events(&state);
         assert_eq!(screen.event_log.len(), 2);
+    }
+
+    #[test]
+    fn dashboard_synthesizes_message_delta_from_db_snapshot() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 10,
+            file_reservations: 3,
+            timestamp_micros: 1,
+            ..Default::default()
+        });
+        screen.tick(1, &state);
+        assert!(
+            screen.event_log.is_empty(),
+            "first snapshot should seed baseline"
+        );
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 12,
+            file_reservations: 3,
+            timestamp_micros: 2,
+            ..Default::default()
+        });
+        screen.tick(2, &state);
+
+        let entry = screen
+            .event_log
+            .iter()
+            .find(|entry| entry.kind == MailEventKind::MessageReceived)
+            .expect("expected synthetic MessageReceived entry");
+        assert!(entry.summary.contains("DB observed 2 new messages"));
+    }
+
+    #[test]
+    fn dashboard_synthesizes_reservation_deltas_from_db_snapshot() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 5,
+            file_reservations: 4,
+            timestamp_micros: 10,
+            ..Default::default()
+        });
+        screen.tick(1, &state);
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 5,
+            file_reservations: 6,
+            timestamp_micros: 11,
+            ..Default::default()
+        });
+        screen.tick(2, &state);
+
+        let granted = screen
+            .event_log
+            .iter()
+            .find(|entry| entry.kind == MailEventKind::ReservationGranted)
+            .expect("expected synthetic ReservationGranted entry");
+        assert!(granted.summary.contains("active reservations added"));
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 5,
+            file_reservations: 2,
+            timestamp_micros: 12,
+            ..Default::default()
+        });
+        screen.tick(3, &state);
+
+        let released = screen
+            .event_log
+            .iter()
+            .find(|entry| entry.kind == MailEventKind::ReservationReleased)
+            .expect("expected synthetic ReservationReleased entry");
+        assert!(released.summary.contains("active reservations removed"));
     }
 
     #[test]

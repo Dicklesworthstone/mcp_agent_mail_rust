@@ -863,6 +863,8 @@ impl MailEvent {
             } => {
                 let recipients = if to.len() > 2 {
                     format!("{}, {} +{}", to[0], to[1], to.len() - 2)
+                } else if to.len() == 2 {
+                    format!("{} +1", to[0])
                 } else {
                     to.join(", ")
                 };

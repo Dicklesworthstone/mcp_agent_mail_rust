@@ -2719,7 +2719,7 @@ impl Model for MailAppModel {
                         }
                         if self.help_visible {
                             match key.code {
-                                KeyCode::Escape => {
+                                KeyCode::Escape | KeyCode::Char('?') => {
                                     self.help_visible = false;
                                 }
                                 KeyCode::Char('j') | KeyCode::Down => {
