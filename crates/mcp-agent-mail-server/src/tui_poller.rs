@@ -68,9 +68,9 @@ impl<'a> DbStatQueryBatcher<'a> {
         Self { conn }
     }
 
-    fn fetch_snapshot(&self) -> Option<DbStatSnapshot> {
+    fn fetch_snapshot(&self) -> DbStatSnapshot {
         let counts = self.fetch_counts();
-        Some(DbStatSnapshot {
+        DbStatSnapshot {
             projects: counts.projects,
             agents: counts.agents,
             messages: counts.messages,
@@ -82,7 +82,7 @@ impl<'a> DbStatQueryBatcher<'a> {
             contacts_list: fetch_contacts_list(self.conn),
             reservation_snapshots: fetch_reservation_snapshots(self.conn),
             timestamp_micros: now_micros(),
-        })
+        }
     }
 
     fn fetch_counts(&self) -> DbSnapshotCounts {
@@ -295,7 +295,7 @@ impl Drop for DbPollerHandle {
 /// previous snapshot instead of clearing existing data.
 fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
     let conn = open_sync_connection(database_url)?;
-    DbStatQueryBatcher::new(&conn).fetch_snapshot()
+    Some(DbStatQueryBatcher::new(&conn).fetch_snapshot())
 }
 
 /// Open a sync `SQLite` connection from a database URL.

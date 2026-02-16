@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::fmt::Write;
 
 use ftui::layout::Rect;
-use ftui::text::{Line, Span, Text};
+use ftui::text::{Line, Span, Text, display_width};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
@@ -1253,6 +1253,8 @@ pub struct MetricTile<'a> {
     block: Option<Block<'a>>,
     /// Color for the value text.
     value_color: PackedRgba,
+    /// Color for the sparkline.
+    sparkline_color: PackedRgba,
 }
 
 /// Trend direction for a metric tile.
@@ -1299,6 +1301,7 @@ impl<'a> MetricTile<'a> {
             sparkline: None,
             block: None,
             value_color: PackedRgba::rgb(240, 240, 240),
+            sparkline_color: PackedRgba::rgb(100, 160, 200),
         }
     }
 
@@ -1320,6 +1323,13 @@ impl<'a> MetricTile<'a> {
     #[must_use]
     pub const fn value_color(mut self, color: PackedRgba) -> Self {
         self.value_color = color;
+        self
+    }
+
+    /// Set the sparkline color.
+    #[must_use]
+    pub const fn sparkline_color(mut self, color: PackedRgba) -> Self {
+        self.sparkline_color = color;
         self
     }
 }
@@ -1377,29 +1387,19 @@ impl Widget for MetricTile<'_> {
             self.trend.color()
         };
 
-        let mut spans = vec![
+        let spans = vec![
             Span::styled(self.value.to_string(), Style::new().fg(self.value_color)),
             Span::raw(" "),
             Span::styled(trend_str.to_string(), Style::new().fg(trend_color)),
         ];
 
-        // Inline sparkline from recent history (br-2bbt.4.1: now using ftui_widgets::Sparkline).
-        if let Some(data) = self.sparkline {
-            let used_len: usize = self.value.len() + 1 + trend_str.len();
-            let spark_width = (inner.width as usize).saturating_sub(used_len + 2);
-            if spark_width > 0 && !data.is_empty() {
-                // Take last spark_width values for right-aligned display.
-                let start_idx = data.len().saturating_sub(spark_width);
-                let slice = &data[start_idx..];
-                // Use Sparkline widget's render_to_string() for consistent block-char mapping.
-                let spark_str = Sparkline::new(slice).min(0.0).render_to_string();
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    spark_str,
-                    Style::new().fg(PackedRgba::rgb(100, 160, 200)),
-                ));
-            }
-        }
+        let value_w = display_width(self.value);
+        let trend_w = display_width(trend_str);
+        // value + space + trend + space
+        let used_width = value_w
+            .saturating_add(1)
+            .saturating_add(trend_w)
+            .saturating_add(1);
 
         let value_line = Line::from_spans(spans);
         Paragraph::new(value_line).render(
@@ -1411,6 +1411,31 @@ impl Widget for MetricTile<'_> {
             },
             frame,
         );
+
+        // Inline sparkline from recent history (rendered directly as widget).
+        if let Some(data) = self.sparkline {
+            let spark_width = (inner.width as usize).saturating_sub(used_width);
+            if spark_width > 0 && !data.is_empty() {
+                // Take last spark_width values for right-aligned display.
+                let start_idx = data.len().saturating_sub(spark_width);
+                let slice = &data[start_idx..];
+
+                let spark_x = inner
+                    .x
+                    .saturating_add(u16::try_from(used_width).unwrap_or(u16::MAX));
+                let spark_rect = Rect::new(
+                    spark_x,
+                    inner.y + 1,
+                    u16::try_from(spark_width).unwrap_or(u16::MAX),
+                    1,
+                );
+
+                Sparkline::new(slice)
+                    .min(0.0)
+                    .style(Style::new().fg(self.sparkline_color))
+                    .render(spark_rect, frame);
+            }
+        }
     }
 }
 

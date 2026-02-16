@@ -1322,7 +1322,7 @@ mod tests {
         )
         .expect("insert metrics row");
 
-        let database_url = format!("sqlite://{}", db_path.display());
+        let database_url = format!("sqlite:///{}", db_path.display());
         let state = test_state_with_database_url(database_url);
         let mut screen = ToolMetricsScreen::new();
         screen.tick(0, &state);

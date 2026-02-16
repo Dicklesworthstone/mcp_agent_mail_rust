@@ -1680,7 +1680,9 @@ fn render_summary_band(
             tile_w
         };
         let tile_area = Rect::new(x, area.y, w, area.height);
-        let tile = MetricTile::new(label, value, *trend).value_color(*color);
+        let tile = MetricTile::new(label, value, *trend)
+            .value_color(*color)
+            .sparkline_color(*color);
         tile.render(tile_area, frame);
     }
 }

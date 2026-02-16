@@ -814,6 +814,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     cleanup::shutdown();
     disk_monitor::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
+    mcp_agent_mail_storage::flush_async_commits();
     if let Some(dashboard) = dashboard.as_ref() {
         dashboard.shutdown();
     }
@@ -893,6 +894,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         cleanup::shutdown();
         disk_monitor::shutdown();
         mcp_agent_mail_storage::wbq_shutdown();
+        mcp_agent_mail_storage::flush_async_commits();
 
         return supervisor_result;
     }
@@ -914,6 +916,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     cleanup::shutdown();
     disk_monitor::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
+    mcp_agent_mail_storage::flush_async_commits();
 
     // Return first error encountered
     tui_result.and(supervisor_result)

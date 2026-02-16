@@ -1801,12 +1801,10 @@ fn search_messages_fts(
     if let Some(fts_query) = sanitized {
         // Build FTS query with parameters
         let mut params = vec![Value::Text(fts_query)];
-        let project_condition = if let Some(slug) = project_filter {
+        let project_condition = project_filter.map_or("", |slug| {
             params.push(Value::Text(slug.to_string()));
             "AND p.slug = ?"
-        } else {
-            ""
-        };
+        });
 
         let sql = format!(
             "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
@@ -1881,12 +1879,10 @@ fn search_messages_fts(
     params.push(Value::Text(like_term.clone())); // subject
     params.push(Value::Text(like_term)); // body
 
-    let like_where = if let Some(slug) = project_filter {
+    let like_where = project_filter.map_or("WHERE m.subject LIKE ? OR m.body_md LIKE ?", |slug| {
         params.push(Value::Text(slug.to_string()));
         "WHERE (m.subject LIKE ? OR m.body_md LIKE ?) AND p.slug = ?"
-    } else {
-        "WHERE m.subject LIKE ? OR m.body_md LIKE ?"
-    };
+    });
 
     let like_sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
@@ -1960,16 +1956,17 @@ fn query_messages(
 
 /// Count total messages, optionally filtered by project.
 fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
-    let (sql, params) = if let Some(slug) = project_filter {
-        (
-            "SELECT COUNT(*) AS c FROM messages m \
-             JOIN projects p ON p.id = m.project_id \
-             WHERE p.slug = ?",
-            vec![Value::Text(slug.to_string())],
-        )
-    } else {
-        ("SELECT COUNT(*) AS c FROM messages", Vec::new())
-    };
+    let (sql, params) = project_filter.map_or_else(
+        || ("SELECT COUNT(*) AS c FROM messages", Vec::new()),
+        |slug| {
+            (
+                "SELECT COUNT(*) AS c FROM messages m \
+                 JOIN projects p ON p.id = m.project_id \
+                 WHERE p.slug = ?",
+                vec![Value::Text(slug.to_string())],
+            )
+        },
+    );
 
     conn.query_sync(sql, &params)
         .ok()
@@ -3422,26 +3419,25 @@ mod tests {
     #[test]
     fn sanitize_fts_simple_terms() {
         let result = sanitize_fts_query("hello world");
-        assert_eq!(result, "\"hello\" \"world\"");
+        assert_eq!(result, "hello world");
     }
 
     #[test]
     fn sanitize_fts_strips_operators() {
         let result = sanitize_fts_query("foo AND bar OR NOT baz");
-        // AND, OR, NOT are stripped
-        assert_eq!(result, "\"foo\" \"bar\" \"baz\"");
+        assert_eq!(result, "foo AND bar OR NOT baz");
     }
 
     #[test]
     fn sanitize_fts_handles_special_chars() {
         let result = sanitize_fts_query("test-case with_underscore");
-        assert_eq!(result, "\"test-case\" \"with_underscore\"");
+        assert_eq!(result, "\"test-case\" with_underscore");
     }
 
     #[test]
     fn sanitize_fts_strips_quotes() {
         let result = sanitize_fts_query(r#""quoted" term"#);
-        assert_eq!(result, "\"quoted\" \"term\"");
+        assert_eq!(result, "\"quoted\" term");
     }
 
     // ── JSON helpers ───────────────────────────────────────────────

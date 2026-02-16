@@ -637,7 +637,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("tool_metrics_snapshots.db");
-        let database_url = format!("sqlite://{}", db_path.display());
+        let database_url = format!("sqlite:///{}", db_path.display());
         let conn = open_metrics_connection(&database_url).expect("open metrics sqlite");
         ensure_metrics_schema(&conn);
 
@@ -667,7 +667,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("tool_metrics_store_size.db");
-        let database_url = format!("sqlite://{}", db_path.display());
+        let database_url = format!("sqlite:///{}", db_path.display());
         let conn = open_metrics_connection(&database_url).expect("open metrics sqlite");
         ensure_metrics_schema(&conn);
 

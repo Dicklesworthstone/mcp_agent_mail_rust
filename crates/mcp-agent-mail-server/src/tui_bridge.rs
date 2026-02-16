@@ -266,7 +266,8 @@ impl TuiSharedState {
             _ => {}
         }
 
-        self.sparkline_data.push(duration_ms as f64);
+        let duration_ms_f64 = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX));
+        self.sparkline_data.push(duration_ms_f64);
     }
 
     pub fn update_db_stats(&self, stats: DbStatSnapshot) {
