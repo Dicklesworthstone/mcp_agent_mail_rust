@@ -60,11 +60,95 @@ impl CompiledPattern {
             return true;
         }
 
+        // 1. Check subset/containment (existing logic)
+        // If one pattern matches the other's *string representation*, they definitely overlap.
+        // This handles cases like `src/*.rs` matching `src/main.rs`.
         match (&self.matcher, &other.matcher) {
-            (Some(a), Some(b)) => a.is_match(&other.norm) || b.is_match(&self.norm),
-            _ => false,
+            (Some(a), Some(b)) => {
+                if a.is_match(&other.norm) || b.is_match(&self.norm) {
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+
+        // 2. Heuristic check for intersecting globs (e.g. `src/a*` vs `src/*b`)
+        // If both are globs and neither strictly matches the other as a string,
+        // they might still intersect.
+        if self.is_glob() && other.is_glob() {
+            return segments_overlap(&self.norm, &other.norm);
+        }
+
+        false
+    }
+}
+
+/// Heuristic check for overlap between two glob patterns.
+///
+/// This is conservative: it returns `true` (overlap) if it cannot prove disjointness.
+///
+/// Rules:
+/// 1. If either pattern contains `**` (recursive), assume overlap.
+/// 2. If segment counts differ (and no `**`), assume disjoint.
+/// 3. Compare segments pairwise:
+///    - If both are globs, assume overlap (conservative).
+///    - If one is glob and one literal, check match.
+///    - If both literal, check equality.
+fn segments_overlap(p1: &str, p2: &str) -> bool {
+    // fast path for recursive globs
+    if p1.contains("**") || p2.contains("**") {
+        return true;
+    }
+
+    let s1: Vec<&str> = p1.split('/').collect();
+    let s2: Vec<&str> = p2.split('/').collect();
+
+    if s1.len() != s2.len() {
+        return false;
+    }
+
+    for (seg1, seg2) in s1.iter().zip(s2.iter()) {
+        if !segment_pair_overlaps(seg1, seg2) {
+            return false;
         }
     }
+
+    true
+}
+
+fn segment_pair_overlaps(s1: &str, s2: &str) -> bool {
+    if s1 == s2 {
+        return true;
+    }
+
+    let g1 = has_glob_meta(s1);
+    let g2 = has_glob_meta(s2);
+
+    if g1 && g2 {
+        // Both are globs (e.g. `*.rs` vs `*.txt`, or `a*` vs `*b`).
+        // Without a regex intersection engine, we must be conservative and assume overlap.
+        // This yields false positives (blocking `*.rs` vs `*.txt`) but ensures safety.
+        return true;
+    }
+
+    if g1 {
+        // s1 glob, s2 literal
+        return match Glob::new(s1) {
+            Ok(g) => g.compile_matcher().is_match(s2),
+            Err(_) => false, // Invalid glob treated as non-matching
+        };
+    }
+
+    if g2 {
+        // s2 glob, s1 literal
+        return match Glob::new(s2) {
+            Ok(g) => g.compile_matcher().is_match(s1),
+            Err(_) => false,
+        };
+    }
+
+    // Both literal, unequal
+    false
 }
 
 /// Returns true when two glob/literal patterns overlap under Agent Mail semantics.

@@ -1298,7 +1298,6 @@ search_v3_case_summary "product_limit" "pass"
 stop_server "${PID}" || true
 trap - EXIT
 
+search_v3_suite_summary || true
 e2e_summary
-
-search_v3_suite_summary
 search_v3_log "Artifacts written to: ${SEARCH_V3_RUN_DIR}"

@@ -673,6 +673,8 @@ pub struct MessageBrowserScreen {
     last_detail_area: Cell<Rect>,
     /// Message compose modal state (when active).
     compose_form: Option<ComposeFormState>,
+    /// Cache for rendered message body with inline images: (message_id, width, rendered_content).
+    detail_cache: RefCell<Option<(i64, u16, String)>>,
 }
 
 impl MessageBrowserScreen {
@@ -708,6 +710,7 @@ impl MessageBrowserScreen {
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
             compose_form: None,
+            detail_cache: RefCell::new(None),
         }
     }
 
@@ -1624,6 +1627,7 @@ impl MailScreen for MessageBrowserScreen {
                 self.results.get(self.cursor),
                 self.detail_scroll,
                 !matches!(self.focus, Focus::SearchBar),
+                &self.detail_cache,
             );
         }
 
@@ -2345,10 +2349,19 @@ fn estimate_message_detail_lines(entry: &MessageEntry, width: u16) -> usize {
 
     // Body lines: approximate wrapping
     let avail_width = usize::from(width.saturating_sub(2)).max(1); // -2 for borders/padding
-    let body_lines = entry.body_md.lines().map(|line| {
-        let len = ftui::text::display_width(line);
-        if len == 0 { 1 } else { len.div_ceil(avail_width) }
-    }).sum::<usize>().max(1);
+    let body_lines = entry
+        .body_md
+        .lines()
+        .map(|line| {
+            let len = ftui::text::display_width(line);
+            if len == 0 {
+                1
+            } else {
+                len.div_ceil(avail_width)
+            }
+        })
+        .sum::<usize>()
+        .max(1);
 
     count += body_lines;
 
@@ -2367,6 +2380,7 @@ fn render_detail_panel(
     entry: Option<&MessageEntry>,
     scroll: usize,
     focused: bool,
+    cache: &RefCell<Option<(i64, u16, String)>>,
 ) {
     let detail_title = entry.map_or_else(
         || "Detail".to_string(),
@@ -2445,14 +2459,34 @@ fn render_detail_panel(
     let body_text = if looks_like_json(&msg.body_md) {
         colorize_json_body(&msg.body_md, &tp)
     } else {
-        let mut body_md = msg.body_md.clone();
-        let image_block = build_inline_image_block(&msg.body_md, content_inner.width);
-        if !image_block.is_empty() {
-            body_md.push_str("\n\n");
-            body_md.push_str(&image_block);
-        }
+        let width = content_inner.width;
+        let mut cached = cache.borrow_mut();
+
+        let cached_body = if let Some((id, w, ref body)) = *cached {
+            if id == msg.id && w == width {
+                Some(body.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let body_str = if let Some(body) = cached_body {
+            body
+        } else {
+            let mut body_md = msg.body_md.clone();
+            let image_block = build_inline_image_block(&msg.body_md, width);
+            if !image_block.is_empty() {
+                body_md.push_str("\n\n");
+                body_md.push_str(&image_block);
+            }
+            *cached = Some((msg.id, width, body_md.clone()));
+            body_md
+        };
+
         let md_theme = crate::tui_theme::markdown_theme();
-        crate::tui_markdown::render_body(&body_md, &md_theme)
+        crate::tui_markdown::render_body(&body_str, &md_theme)
     };
 
     for line in body_text.lines() {
@@ -3516,7 +3550,7 @@ mod tests {
             show_project: false,
         };
         let baseline = 6 + 2 + msg.body_md.lines().count().max(1);
-        let estimate = estimate_message_detail_lines(&msg);
+        let estimate = estimate_message_detail_lines(&msg, 80);
         assert!(
             estimate >= baseline + 12,
             "expected image headroom in estimate, baseline={baseline}, estimate={estimate}"
@@ -3708,7 +3742,8 @@ mod tests {
     fn render_detail_no_message_no_panic() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), None, 0, true);
+        let cache = RefCell::new(None);
+        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), None, 0, true, &cache);
     }
 
     #[test]
@@ -3730,7 +3765,8 @@ mod tests {
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0, true);
+        let cache = RefCell::new(None);
+        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0, true, &cache);
     }
 
     #[test]
@@ -3754,7 +3790,8 @@ mod tests {
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 10, true);
+        let cache = RefCell::new(None);
+        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 10, true, &cache);
     }
 
     #[test]
@@ -3775,7 +3812,8 @@ mod tests {
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0, true);
+        let cache = RefCell::new(None);
+        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0, true, &cache);
     }
 
     #[test]

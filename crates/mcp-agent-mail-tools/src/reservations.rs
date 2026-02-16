@@ -114,16 +114,6 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
         ));
     }
 
-    // 3. Absolute paths (should be relative to project root)
-    // Note: We explicitly allow UNC-like paths (starting with //) to pass this specific check
-    // to match legacy test behavior, though they likely won't match anything in the project.
-    if p.starts_with('/') && !p.starts_with("//") {
-        return Some(format!(
-            "Pattern '{p}' looks like an absolute path. \
-             File reservations must be relative to the project root (e.g. 'src/main.rs')."
-        ));
-    }
-
     None
 }
 

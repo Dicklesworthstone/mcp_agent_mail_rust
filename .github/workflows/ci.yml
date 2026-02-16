@@ -266,6 +266,212 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # ── Search V3 E2E + diagnostics contract ──────────────────────────────
+  search-v3-e2e:
+    name: Search V3 E2E + Diagnostics
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries
+        run: |
+          cargo build -p mcp-agent-mail-cli
+          cargo build -p mcp-agent-mail
+
+      - name: Run mandatory Search V3 E2E suites
+        run: |
+          set -euo pipefail
+          mkdir -p tests/artifacts/search_v3_ci
+          FAILED=0
+
+          run_suite() {
+            local suite_script="$1"
+            local suite_name
+            suite_name="$(basename "${suite_script}" .sh)"
+            local log_file="tests/artifacts/search_v3_ci/${suite_name}.log"
+
+            echo "::group::${suite_name}"
+            if E2E_CLOCK_MODE=deterministic \
+              E2E_SEED=424242 \
+              SEARCH_V3_LOG_ROOT="${PWD}/tests/artifacts/search_v3" \
+              SV3_ARTIFACT_ROOT="${PWD}/tests/artifacts/search_v3" \
+              bash "${suite_script}" 2>&1 | tee "${log_file}"; then
+              echo "PASS: ${suite_name}"
+            else
+              echo "FAIL: ${suite_name}"
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          }
+
+          run_suite tests/e2e/test_search_v3_stdio.sh
+          run_suite tests/e2e/test_search_v3_http.sh
+          run_suite tests/e2e/test_search_v3_shadow_parity.sh
+          run_suite tests/e2e/test_search_v3_resilience.sh
+          run_suite tests/e2e/test_search_v3_load_concurrency.sh
+
+          cat > tests/artifacts/search_v3_ci/required_suites.txt <<'EOF'
+          tests/e2e/test_search_v3_stdio.sh
+          tests/e2e/test_search_v3_http.sh
+          tests/e2e/test_search_v3_shadow_parity.sh
+          tests/e2e/test_search_v3_resilience.sh
+          tests/e2e/test_search_v3_load_concurrency.sh
+          EOF
+
+          echo "SEARCH_V3_E2E_FAILED=${FAILED}" >> "${GITHUB_ENV}"
+
+      - name: Run Search V3 diagnostics rust tests
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p tests/artifacts/search_v3_ci
+          FAILED=0
+
+          run_diag_test() {
+            local test_name="$1"
+            local log_file="tests/artifacts/search_v3_ci/${test_name}.log"
+            echo "::group::${test_name}"
+            if cargo test -p mcp-agent-mail-db --test "${test_name}" -- --nocapture 2>&1 | tee "${log_file}"; then
+              echo "PASS: ${test_name}"
+            else
+              echo "FAIL: ${test_name}"
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          }
+
+          run_diag_test filter_pagination
+          run_diag_test logging_redaction
+          run_diag_test diversity_dedup
+          run_diag_test timeout_backpressure
+
+          echo "SEARCH_V3_DIAG_FAILED=${FAILED}" >> "${GITHUB_ENV}"
+
+      - name: Verify Search V3 artifact + assertion contract
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          artifact_root = Path("tests/artifacts")
+          errors: list[str] = []
+
+          floors = {
+              "search_v3_stdio": 80,
+              "search_v3_http": 90,
+              "search_v3_shadow_parity": 1,
+              "search_v3_resilience": 70,
+              "search_v3_load_concurrency": 60,
+          }
+
+          def newest(paths):
+              return sorted(paths, key=lambda p: str(p))[-1] if paths else None
+
+          for suite, floor in floors.items():
+              summary = newest((artifact_root / suite).glob("*/summary.json"))
+              if summary is None:
+                  errors.append(f"{suite}: missing tests/artifacts/{suite}/*/summary.json")
+                  continue
+              data = json.loads(summary.read_text(encoding="utf-8"))
+              total = int(data.get("total", -1))
+              failed = int(data.get("fail", -1))
+              if total < floor:
+                  errors.append(f"{suite}: assertion floor violated ({total} < {floor}) in {summary}")
+              if failed != 0:
+                  errors.append(f"{suite}: non-zero failures ({failed}) in {summary}")
+
+          structured_expectations = {
+              "search_v3_stdio": [
+                  "summaries/suite_summary.json",
+                  "summaries/suite_summary.txt",
+                  "logs/summary.log",
+              ],
+              "search_v3_http": [
+                  "summaries/suite_summary.json",
+                  "summaries/suite_summary.txt",
+                  "logs/summary.log",
+              ],
+              "search_v3_shadow_parity": [
+                  "summaries/suite_summary.json",
+                  "summaries/suite_summary.txt",
+                  "logs/summary.log",
+              ],
+              "search_v3_load_concurrency": [
+                  "summaries/suite_summary.json",
+                  "summaries/suite_summary.txt",
+                  "logs/summary.log",
+              ],
+              "search_v3_resilience": [
+                  "summary.json",
+                  "summary.txt",
+                  "run_metadata.json",
+              ],
+          }
+
+          sv3_root = artifact_root / "search_v3"
+          for suite, rel_files in structured_expectations.items():
+              run_root = newest((sv3_root / suite).glob("*/"))
+              if run_root is None:
+                  errors.append(f"{suite}: missing structured root under {sv3_root / suite}")
+                  continue
+              for rel in rel_files:
+                  target = run_root / rel
+                  if not target.is_file():
+                      errors.append(f"{suite}: missing structured artifact {target}")
+
+          for test_name in ("filter_pagination", "logging_redaction", "diversity_dedup", "timeout_backpressure"):
+              log_path = artifact_root / "search_v3_ci" / f"{test_name}.log"
+              if not log_path.is_file():
+                  errors.append(f"missing diagnostics test log: {log_path}")
+
+          if errors:
+              print("Search V3 CI contract verification failed:")
+              for err in errors:
+                  print(f" - {err}")
+              sys.exit(1)
+
+          print("Search V3 CI contract verification passed.")
+          PY
+
+      - name: Enforce Search V3 pass/fail contract
+        if: always()
+        run: |
+          set -euo pipefail
+          E2E_FAILED="${SEARCH_V3_E2E_FAILED:-1}"
+          DIAG_FAILED="${SEARCH_V3_DIAG_FAILED:-1}"
+          echo "SEARCH_V3_E2E_FAILED=${E2E_FAILED}"
+          echo "SEARCH_V3_DIAG_FAILED=${DIAG_FAILED}"
+          if [ "${E2E_FAILED}" -ne 0 ] || [ "${DIAG_FAILED}" -ne 0 ]; then
+            echo "Search V3 suites/tests reported failures."
+            exit 1
+          fi
+
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
+
+      - name: Upload Search V3 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-v3-artifacts
+          path: |
+            tests/artifacts/search_v3_*/
+            tests/artifacts/search_v3/
+            tests/artifacts/search_v3_ci/
+          retention-days: 14
+          if-no-files-found: error
+
   # ── Help snapshots (golden contract drift detection) ────────────────
   snapshots:
     name: Help Snapshots
@@ -313,7 +519,7 @@ jobs:
     name: Skip Guard
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [test, mode-matrix, conformance, perf-security, e2e-dual-mode, snapshots]
+    needs: [test, mode-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, snapshots]
     if: always()
     steps:
       - name: Verify all required jobs passed
@@ -324,6 +530,7 @@ jobs:
           echo "  conformance: ${{ needs.conformance.result }}"
           echo "  perf-security: ${{ needs.perf-security.result }}"
           echo "  e2e-dual-mode: ${{ needs.e2e-dual-mode.result }}"
+          echo "  search-v3-e2e: ${{ needs.search-v3-e2e.result }}"
           echo "  snapshots: ${{ needs.snapshots.result }}"
 
           FAILED=0
@@ -333,6 +540,7 @@ jobs:
             "${{ needs.conformance.result }}" \
             "${{ needs.perf-security.result }}" \
             "${{ needs.e2e-dual-mode.result }}" \
+            "${{ needs.search-v3-e2e.result }}" \
             "${{ needs.snapshots.result }}"; do
             if [ "$result" != "success" ]; then
               echo "FAIL: job result = $result"

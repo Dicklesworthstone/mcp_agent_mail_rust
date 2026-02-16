@@ -4,7 +4,8 @@
 # br-2tnl.7.7: Build Search V3 E2E logging/artifact harness for deterministic diagnostics
 #
 # This harness EXTENDS scripts/e2e_lib.sh with Search V3 specific capabilities:
-#   - Standardized artifact directory layout under test_logs/search_v3/<timestamp>/
+#   - Standardized artifact directory layout under
+#     test_logs/search_v3/<suite>/<timestamp>/
 #   - Mode/filter parameter logging (SearchMode, DocKind, ImportanceFilter, etc.)
 #   - Ranking score diffs with expected vs actual comparison
 #   - Index freshness timestamps and consistency tracking
@@ -47,8 +48,9 @@ source "${_SEARCH_V3_LIB_DIR}/e2e_lib.sh"
 # Search V3 Configuration
 # ---------------------------------------------------------------------------
 
-# Search V3 artifact subdirectory (under test_logs/search_v3/<timestamp>/)
-SEARCH_V3_LOG_ROOT="${E2E_PROJECT_ROOT}/test_logs/search_v3"
+# Search V3 artifact subdirectory (under test_logs/search_v3/<suite>/<timestamp>/)
+# Can be overridden in CI to co-locate diagnostics with tests/artifacts.
+SEARCH_V3_LOG_ROOT="${SEARCH_V3_LOG_ROOT:-${E2E_PROJECT_ROOT}/test_logs/search_v3}"
 SEARCH_V3_RUN_DIR=""
 
 # Search V3 modes
@@ -90,7 +92,7 @@ SEARCH_V3_SEMANTIC_MODEL_VERSION=""
 # search_v3_init: Initialize Search V3 artifact directory layout
 #
 # Creates:
-#   test_logs/search_v3/<timestamp>/
+#   test_logs/search_v3/<suite>/<timestamp>/
 #     ├── cases/           Per-case artifacts
 #     ├── rankings/        Ranking diff artifacts
 #     ├── index_meta/      Index freshness snapshots
@@ -100,7 +102,7 @@ SEARCH_V3_SEMANTIC_MODEL_VERSION=""
 search_v3_init() {
     local run_timestamp="${1:-${E2E_TIMESTAMP}}"
 
-    SEARCH_V3_RUN_DIR="${SEARCH_V3_LOG_ROOT}/${run_timestamp}"
+    SEARCH_V3_RUN_DIR="${SEARCH_V3_LOG_ROOT}/${E2E_SUITE}/${run_timestamp}"
 
     mkdir -p "${SEARCH_V3_RUN_DIR}/cases"
     mkdir -p "${SEARCH_V3_RUN_DIR}/rankings"
@@ -599,6 +601,7 @@ search_v3_suite_summary() {
     run_ended_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
     local summary_file="${SEARCH_V3_RUN_DIR}/summaries/suite_summary.json"
+    local summary_txt="${SEARCH_V3_RUN_DIR}/summaries/suite_summary.txt"
 
     # Calculate elapsed time
     local start_epoch="${E2E_RUN_START_EPOCH_S}"
@@ -661,8 +664,8 @@ EOJSON
     echo " Artifacts: ${SEARCH_V3_RUN_DIR}"
     echo "========================================================================"
 
-    # Also write to log
-    cat > "${SEARCH_V3_RUN_DIR}/logs/summary.log" << EOLOG
+    # Persist a deterministic human-readable summary file for CI artifact triage.
+    cat > "${summary_txt}" << EOLOG
 Search V3 E2E Suite Summary: ${E2E_SUITE}
 ============================================
 Run timestamp: ${E2E_TIMESTAMP}
@@ -686,6 +689,9 @@ Index Metadata:
 
 Artifacts: ${SEARCH_V3_RUN_DIR}
 EOLOG
+
+    # Mirror the same summary to the historical log location used by existing tools.
+    cp "${summary_txt}" "${SEARCH_V3_RUN_DIR}/logs/summary.log"
 
     # Return exit code based on failures
     if [ "${SEARCH_V3_FAIL_COUNT}" -gt 0 ]; then

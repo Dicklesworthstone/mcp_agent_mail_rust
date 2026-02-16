@@ -8,6 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ftui::layout::Rect;
@@ -25,7 +26,7 @@ use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
 use crate::tui_layout::{DockLayout, DockPreset};
 use crate::tui_persist::{PreferencePersister, TuiPreferences};
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg};
 
 // Re-use dashboard formatting helpers.
 use super::dashboard::{EventEntry, format_event};
@@ -42,6 +43,8 @@ const PAGE_SIZE: usize = 20;
 const SHIMMER_WINDOW_MICROS: i64 = 500_000;
 const SHIMMER_MAX_ROWS: usize = 5;
 const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
+const COMMIT_REFRESH_EVERY_TICKS: u64 = 20;
+const COMMIT_LIMIT_PER_PROJECT: usize = 200;
 
 // ──────────────────────────────────────────────────────────────────────
 // TimelinePane
@@ -139,6 +142,137 @@ impl RenderItem for TimelineEntry {
 
         let paragraph = Paragraph::new(Text::from_line(line));
         paragraph.render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommitTimelineEntry {
+    project_slug: String,
+    short_sha: String,
+    timestamp_micros: i64,
+    timestamp_label: String,
+    subject: String,
+    commit_type: String,
+    sender: Option<String>,
+    recipients: Vec<String>,
+    author: String,
+}
+
+impl CommitTimelineEntry {
+    fn from_storage(project_slug: String, entry: mcp_agent_mail_storage::TimelineEntry) -> Self {
+        let timestamp_micros = entry.timestamp.saturating_mul(1_000_000);
+        Self {
+            project_slug,
+            short_sha: entry.short_sha,
+            timestamp_micros,
+            timestamp_label: crate::tui_events::format_event_timestamp(timestamp_micros),
+            subject: entry.subject,
+            commit_type: entry.commit_type,
+            sender: entry.sender,
+            recipients: entry.recipients,
+            author: entry.author,
+        }
+    }
+
+    fn type_label(&self) -> &'static str {
+        match self.commit_type.as_str() {
+            "message" => "CommitMsg",
+            "file_reservation" => "FileResv",
+            "chore" => "Chore",
+            _ => "Commit",
+        }
+    }
+
+    fn detail_summary(&self) -> String {
+        if let Some(sender) = &self.sender {
+            if self.recipients.is_empty() {
+                return format!("{sender} · {}", self.subject);
+            }
+            return format!(
+                "{sender} -> {} · {}",
+                self.recipients.join(", "),
+                self.subject
+            );
+        }
+        format!("{} · {}", self.author, self.subject)
+    }
+}
+
+impl RenderItem for CommitTimelineEntry {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::widgets::Widget;
+
+        if area.height == 0 || area.width < 10 {
+            return;
+        }
+
+        let marker = if selected {
+            crate::tui_theme::SELECTION_PREFIX
+        } else {
+            crate::tui_theme::SELECTION_PREFIX_EMPTY
+        };
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let cursor_style = Style::default()
+            .fg(tp.selection_fg)
+            .bg(tp.selection_bg)
+            .bold();
+        let meta_style = crate::tui_theme::text_meta(&tp);
+        let type_style = match self.commit_type.as_str() {
+            "message" => Style::default().fg(tp.status_accent),
+            "file_reservation" => Style::default().fg(tp.severity_warn),
+            "chore" => Style::default().fg(tp.text_secondary),
+            _ => Style::default().fg(tp.text_muted),
+        };
+
+        let mut line = Line::from_spans([
+            Span::styled(
+                format!(
+                    "{marker}{:<8} {} [{}] ",
+                    self.short_sha, self.timestamp_label, self.project_slug
+                ),
+                meta_style,
+            ),
+            Span::styled(format!(" {:<10} ", self.type_label()), type_style),
+            Span::styled(self.detail_summary(), Style::default()),
+        ]);
+
+        if selected {
+            line.apply_base_style(cursor_style);
+        }
+
+        Paragraph::new(Text::from_line(line)).render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CombinedTimelineRow {
+    Event(TimelineEntry),
+    Commit(CommitTimelineEntry),
+}
+
+impl CombinedTimelineRow {
+    const fn timestamp_micros(&self) -> i64 {
+        match self {
+            Self::Event(entry) => entry.timestamp_micros,
+            Self::Commit(entry) => entry.timestamp_micros,
+        }
+    }
+}
+
+impl RenderItem for CombinedTimelineRow {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        match self {
+            Self::Event(entry) => entry.render(area, frame, selected),
+            Self::Commit(entry) => entry.render(area, frame, selected),
+        }
     }
 
     fn height(&self) -> u16 {
@@ -347,8 +481,20 @@ enum DockDragState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimelineViewMode {
-    Timeline,
+    Events,
+    Commits,
+    Combined,
     LogViewer,
+}
+
+impl TimelineViewMode {
+    const fn next_primary(self) -> Self {
+        match self {
+            Self::Events => Self::Commits,
+            Self::Commits => Self::Combined,
+            Self::Combined | Self::LogViewer => Self::Events,
+        }
+    }
 }
 
 /// A full TUI screen backed by [`TimelinePane`].
@@ -366,8 +512,12 @@ pub struct TimelineScreen {
     /// Last known content area (updated each view call) for mouse hit-testing.
     /// Uses `Cell` for interior mutability since `view()` takes `&self`.
     last_area: Cell<Rect>,
-    /// Active render mode for `v` toggle (timeline table vs `LogViewer`).
+    /// Active render mode.
     view_mode: TimelineViewMode,
+    /// Cached commit timeline rows for commit/combined views.
+    commit_entries: Vec<CommitTimelineEntry>,
+    /// Last tick when commit rows were refreshed from storage.
+    last_commit_refresh_tick: u64,
     /// Log viewer pane used when `view_mode == LogViewer`.
     log_viewer: RefCell<crate::console::LogPane>,
     /// Debounced preference persister (auto-saves dock layout to envfile).
@@ -384,7 +534,9 @@ impl TimelineScreen {
             dock: DockLayout::right_40(),
             dock_drag: DockDragState::Idle,
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
-            view_mode: TimelineViewMode::Timeline,
+            view_mode: TimelineViewMode::Events,
+            commit_entries: Vec::new(),
+            last_commit_refresh_tick: 0,
             log_viewer: RefCell::new(crate::console::LogPane::new()),
             persister: None,
         }
@@ -400,7 +552,9 @@ impl TimelineScreen {
             dock: prefs.dock,
             dock_drag: DockDragState::Idle,
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
-            view_mode: TimelineViewMode::Timeline,
+            view_mode: TimelineViewMode::Events,
+            commit_entries: Vec::new(),
+            last_commit_refresh_tick: 0,
             log_viewer: RefCell::new(crate::console::LogPane::new()),
             persister: Some(PreferencePersister::new(config)),
         }
@@ -408,7 +562,7 @@ impl TimelineScreen {
 
     /// Sync `VirtualizedListState` with `TimelinePane` cursor.
     fn sync_list_state(&self) {
-        let total = self.pane.filtered_len();
+        let total = self.active_row_count();
         let cursor = self.pane.cursor().min(total.saturating_sub(1));
         let mut state = self.list_state.borrow_mut();
         state.select(if total > 0 { Some(cursor) } else { None });
@@ -418,6 +572,126 @@ impl TimelineScreen {
     fn dock_changed(&mut self) {
         if let Some(ref mut p) = self.persister {
             p.mark_dirty();
+        }
+    }
+
+    fn active_row_count(&self) -> usize {
+        match self.view_mode {
+            TimelineViewMode::Events | TimelineViewMode::LogViewer => self.pane.filtered_len(),
+            TimelineViewMode::Commits => self.commit_entries.len(),
+            TimelineViewMode::Combined => self.pane.filtered_len() + self.commit_entries.len(),
+        }
+    }
+
+    fn cursor_down(&mut self, n: usize) {
+        let max = self.active_row_count().saturating_sub(1);
+        self.pane.cursor = (self.pane.cursor + n).min(max);
+    }
+
+    fn cursor_up(&mut self, n: usize) {
+        self.pane.cursor = self.pane.cursor.saturating_sub(n);
+        self.pane.follow = false;
+    }
+
+    fn cursor_home(&mut self) {
+        self.pane.cursor = 0;
+        self.pane.follow = false;
+    }
+
+    fn cursor_end(&mut self) {
+        self.pane.cursor = self.active_row_count().saturating_sub(1);
+    }
+
+    fn clamp_cursor_for_mode(&mut self) {
+        self.pane.cursor = self
+            .pane
+            .cursor
+            .min(self.active_row_count().saturating_sub(1));
+    }
+
+    fn refresh_commit_entries(&mut self, tick_count: u64, state: &TuiSharedState) {
+        if !self.commit_entries.is_empty()
+            && tick_count.saturating_sub(self.last_commit_refresh_tick) < COMMIT_REFRESH_EVERY_TICKS
+        {
+            return;
+        }
+        self.last_commit_refresh_tick = tick_count;
+
+        let cfg = state.config_snapshot();
+        if cfg.storage_root.is_empty() {
+            self.commit_entries.clear();
+            self.clamp_cursor_for_mode();
+            return;
+        }
+
+        let db = state.db_stats_snapshot().unwrap_or_default();
+        let mut project_slugs: Vec<String> = db.projects_list.into_iter().map(|p| p.slug).collect();
+        project_slugs.sort_unstable();
+        project_slugs.dedup();
+        if project_slugs.is_empty() {
+            self.commit_entries.clear();
+            self.clamp_cursor_for_mode();
+            return;
+        }
+
+        let root = Path::new(&cfg.storage_root);
+        let mut commits = Vec::new();
+        for slug in project_slugs {
+            if let Ok(rows) =
+                mcp_agent_mail_storage::get_timeline_commits(root, &slug, COMMIT_LIMIT_PER_PROJECT)
+            {
+                commits.extend(
+                    rows.into_iter()
+                        .map(|entry| CommitTimelineEntry::from_storage(slug.clone(), entry)),
+                );
+            }
+        }
+
+        commits.sort_by_key(|entry| entry.timestamp_micros);
+        if commits.len() > TIMELINE_CAPACITY {
+            let keep_from = commits.len() - TIMELINE_CAPACITY;
+            commits.drain(..keep_from);
+        }
+
+        self.commit_entries = commits;
+        if self.pane.follow {
+            self.cursor_end();
+        } else {
+            self.clamp_cursor_for_mode();
+        }
+    }
+
+    fn combined_rows(&self) -> Vec<CombinedTimelineRow> {
+        let mut rows: Vec<CombinedTimelineRow> = self
+            .pane
+            .filtered_entries()
+            .into_iter()
+            .cloned()
+            .map(CombinedTimelineRow::Event)
+            .collect();
+        rows.extend(
+            self.commit_entries
+                .iter()
+                .cloned()
+                .map(CombinedTimelineRow::Commit),
+        );
+        rows.sort_by_key(CombinedTimelineRow::timestamp_micros);
+        rows
+    }
+
+    fn selected_combined_is_commit(&self) -> bool {
+        let rows = self.combined_rows();
+        matches!(
+            rows.get(self.pane.cursor),
+            Some(CombinedTimelineRow::Commit(_))
+        )
+    }
+
+    fn selected_combined_event(&self) -> Option<MailEvent> {
+        let rows = self.combined_rows();
+        match rows.get(self.pane.cursor) {
+            Some(CombinedTimelineRow::Event(entry)) => Some(entry.raw.clone()),
+            _ => None,
         }
     }
 }
@@ -435,51 +709,74 @@ impl MailScreen for TimelineScreen {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 match key.code {
                     // Cursor navigation
-                    KeyCode::Char('j') | KeyCode::Down => self.pane.cursor_down(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.pane.cursor_up(1),
+                    KeyCode::Char('j') | KeyCode::Down => self.cursor_down(1),
+                    KeyCode::Char('k') | KeyCode::Up => self.cursor_up(1),
                     KeyCode::PageDown | KeyCode::Char('d') => {
-                        self.pane.cursor_down(PAGE_SIZE);
+                        self.cursor_down(PAGE_SIZE);
                     }
                     KeyCode::PageUp | KeyCode::Char('u') => {
-                        self.pane.cursor_up(PAGE_SIZE);
+                        self.cursor_up(PAGE_SIZE);
                     }
-                    KeyCode::Char('G') | KeyCode::End => self.pane.cursor_end(),
-                    KeyCode::Char('g') | KeyCode::Home => self.pane.cursor_home(),
+                    KeyCode::Char('G') | KeyCode::End => self.cursor_end(),
+                    KeyCode::Char('g') | KeyCode::Home => self.cursor_home(),
 
                     // Follow mode
-                    KeyCode::Char('f') => self.pane.toggle_follow(),
-
-                    // Toggle timeline table vs log viewer mode.
-                    KeyCode::Char('v') => {
-                        self.view_mode = match self.view_mode {
-                            TimelineViewMode::Timeline => TimelineViewMode::LogViewer,
-                            TimelineViewMode::LogViewer => TimelineViewMode::Timeline,
-                        };
+                    KeyCode::Char('f') => {
+                        self.pane.toggle_follow();
+                        if self.pane.follow {
+                            self.cursor_end();
+                        }
                     }
 
-                    // Cycle verbosity tier (Shift+V).
+                    // Capital-V cycles timeline views (Events -> Commits -> Combined).
                     KeyCode::Char('V') => {
+                        self.view_mode = self.view_mode.next_primary();
+                        self.clamp_cursor_for_mode();
+                    }
+
+                    // Keep lowercase `v` available for future visual-selection workflows.
+                    KeyCode::Char('v') => {}
+
+                    // Cycle verbosity tier.
+                    KeyCode::Char('Z') => {
                         self.pane.verbosity = self.pane.verbosity.next();
-                        self.pane.clamp_cursor();
+                        self.clamp_cursor_for_mode();
                     }
 
                     // Cycle kind filter
                     KeyCode::Char('t') => {
                         cycle_kind_filter(&mut self.pane.kind_filter);
-                        self.pane.clamp_cursor();
+                        self.clamp_cursor_for_mode();
                     }
 
                     // Cycle source filter
                     KeyCode::Char('s') => {
                         cycle_source_filter(&mut self.pane.source_filter);
-                        self.pane.clamp_cursor();
+                        self.clamp_cursor_for_mode();
                     }
 
                     // Clear all filters
-                    KeyCode::Char('c') => self.pane.clear_filters(),
+                    KeyCode::Char('c') => {
+                        self.pane.clear_filters();
+                        self.clamp_cursor_for_mode();
+                    }
 
                     // Toggle inspector panel (dock)
-                    KeyCode::Char('i') | KeyCode::Enter => {
+                    KeyCode::Char('i') => {
+                        self.dock.toggle_visible();
+                    }
+                    KeyCode::Enter => {
+                        let open_archive = match self.view_mode {
+                            TimelineViewMode::Commits => !self.commit_entries.is_empty(),
+                            TimelineViewMode::Combined => self.selected_combined_is_commit(),
+                            _ => false,
+                        };
+                        if open_archive {
+                            if self.dock != dock_before {
+                                self.dock_changed();
+                            }
+                            return Cmd::Msg(MailScreenMsg::Navigate(MailScreenId::ArchiveBrowser));
+                        }
                         self.dock.toggle_visible();
                     }
 
@@ -498,14 +795,26 @@ impl MailScreen for TimelineScreen {
 
                     // Correlation link navigation (1-9 when dock is visible)
                     KeyCode::Char(c @ '1'..='9') if self.dock.visible => {
-                        if let Some(event) = self.pane.selected_event() {
-                            let idx = (c as u8 - b'0') as usize;
-                            if let Some(target) = super::inspector::resolve_link(event, idx) {
-                                // Auto-save if needed before navigating away.
-                                if self.dock != dock_before {
-                                    self.dock_changed();
+                        if self.view_mode == TimelineViewMode::Events {
+                            if let Some(event) = self.pane.selected_event() {
+                                let idx = (c as u8 - b'0') as usize;
+                                if let Some(target) = super::inspector::resolve_link(event, idx) {
+                                    // Auto-save if needed before navigating away.
+                                    if self.dock != dock_before {
+                                        self.dock_changed();
+                                    }
+                                    return Cmd::Msg(MailScreenMsg::DeepLink(target));
                                 }
-                                return Cmd::Msg(MailScreenMsg::DeepLink(target));
+                            }
+                        } else if self.view_mode == TimelineViewMode::Combined {
+                            let idx = (c as u8 - b'0') as usize;
+                            if let Some(event) = self.selected_combined_event() {
+                                if let Some(target) = super::inspector::resolve_link(&event, idx) {
+                                    if self.dock != dock_before {
+                                        self.dock_changed();
+                                    }
+                                    return Cmd::Msg(MailScreenMsg::DeepLink(target));
+                                }
                             }
                         }
                     }
@@ -546,8 +855,9 @@ impl MailScreen for TimelineScreen {
         Cmd::None
     }
 
-    fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
+    fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         self.pane.ingest(state);
+        self.refresh_commit_entries(tick_count, state);
         // Sync list state after ingesting new events.
         self.sync_list_state();
         // Flush debounced preference save.
@@ -575,8 +885,9 @@ impl MailScreen for TimelineScreen {
         self.last_area.set(area);
         let split = self.dock.split(area);
         let effects_enabled = state.config_snapshot().tui_effects;
+        let mut combined_selected_event: Option<MailEvent> = None;
         match self.view_mode {
-            TimelineViewMode::Timeline => {
+            TimelineViewMode::Events => {
                 let mut list_state = self.list_state.borrow_mut();
                 render_timeline(
                     frame,
@@ -585,6 +896,35 @@ impl MailScreen for TimelineScreen {
                     self.dock,
                     &mut list_state,
                     effects_enabled,
+                );
+            }
+            TimelineViewMode::Commits => {
+                let mut list_state = self.list_state.borrow_mut();
+                render_commit_timeline(
+                    frame,
+                    split.primary,
+                    &self.commit_entries,
+                    self.pane.cursor,
+                    self.pane.follow,
+                    self.dock,
+                    &mut list_state,
+                );
+            }
+            TimelineViewMode::Combined => {
+                let rows = self.combined_rows();
+                combined_selected_event = match rows.get(self.pane.cursor) {
+                    Some(CombinedTimelineRow::Event(entry)) => Some(entry.raw.clone()),
+                    _ => None,
+                };
+                let mut list_state = self.list_state.borrow_mut();
+                render_combined_timeline(
+                    frame,
+                    split.primary,
+                    &rows,
+                    self.pane.cursor,
+                    self.pane.follow,
+                    self.dock,
+                    &mut list_state,
                 );
             }
             TimelineViewMode::LogViewer => {
@@ -599,7 +939,12 @@ impl MailScreen for TimelineScreen {
             }
         }
         if let Some(dock_area) = split.dock {
-            super::inspector::render_inspector(frame, dock_area, self.pane.selected_event());
+            let event_ref = if self.view_mode == TimelineViewMode::Events {
+                self.pane.selected_event()
+            } else {
+                combined_selected_event.as_ref()
+            };
+            super::inspector::render_inspector(frame, dock_area, event_ref);
         }
     }
 
@@ -622,11 +967,11 @@ impl MailScreen for TimelineScreen {
                 action: "Toggle follow",
             },
             HelpEntry {
-                key: "v",
-                action: "Toggle Timeline/LogViewer",
+                key: "V",
+                action: "Cycle Events/Commits/Combined",
             },
             HelpEntry {
-                key: "V",
+                key: "Z",
                 action: "Cycle verbosity tier",
             },
             HelpEntry {
@@ -643,7 +988,7 @@ impl MailScreen for TimelineScreen {
             },
             HelpEntry {
                 key: "i/Enter",
-                action: "Toggle inspector",
+                action: "Toggle inspector (Enter opens archive from commit rows)",
             },
             HelpEntry {
                 key: "[/]",
@@ -665,12 +1010,29 @@ impl MailScreen for TimelineScreen {
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("Chronological event log. Expand entries for detail, use correlation links.")
+        Some(
+            "Timeline views: V cycles events/commits/combined. Enter on commit rows opens Archive Browser.",
+        )
     }
 
     fn copyable_content(&self) -> Option<String> {
-        let entry = self.pane.selected_entry()?;
-        Some(entry.display.summary.clone())
+        match self.view_mode {
+            TimelineViewMode::Events | TimelineViewMode::LogViewer => {
+                let entry = self.pane.selected_entry()?;
+                Some(entry.display.summary.clone())
+            }
+            TimelineViewMode::Commits => self
+                .commit_entries
+                .get(self.pane.cursor)
+                .map(CommitTimelineEntry::detail_summary),
+            TimelineViewMode::Combined => {
+                let rows = self.combined_rows();
+                rows.get(self.pane.cursor).map(|row| match row {
+                    CombinedTimelineRow::Event(entry) => entry.display.summary.clone(),
+                    CombinedTimelineRow::Commit(entry) => entry.detail_summary(),
+                })
+            }
+        }
     }
 
     fn title(&self) -> &'static str {
@@ -873,6 +1235,102 @@ fn render_timeline(
 
     // Render VirtualizedList into inner area.
     let list = VirtualizedList::new(&filtered)
+        .style(Style::default())
+        .highlight_style(
+            Style::default()
+                .fg(tp.selection_fg)
+                .bg(tp.selection_bg)
+                .bold(),
+        )
+        .show_scrollbar(true);
+    StatefulWidget::render(&list, inner_area, frame, list_state);
+}
+
+fn render_commit_timeline(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    commits: &[CommitTimelineEntry],
+    cursor: usize,
+    follow: bool,
+    dock: DockLayout,
+    list_state: &mut VirtualizedListState,
+) {
+    let pos = if commits.is_empty() {
+        "empty".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            cursor.min(commits.len().saturating_sub(1)) + 1,
+            commits.len()
+        )
+    };
+    let follow_tag = if follow { " [FOLLOW]" } else { "" };
+    let dock_tag = if dock.visible {
+        format!(" [{}]", dock.state_label())
+    } else {
+        String::new()
+    };
+    let title = format!("Timeline Commits ({pos}){follow_tag}{dock_tag}");
+
+    render_virtualized_rows(frame, area, commits, cursor, &title, list_state);
+}
+
+fn render_combined_timeline(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    rows: &[CombinedTimelineRow],
+    cursor: usize,
+    follow: bool,
+    dock: DockLayout,
+    list_state: &mut VirtualizedListState,
+) {
+    let pos = if rows.is_empty() {
+        "empty".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            cursor.min(rows.len().saturating_sub(1)) + 1,
+            rows.len()
+        )
+    };
+    let follow_tag = if follow { " [FOLLOW]" } else { "" };
+    let dock_tag = if dock.visible {
+        format!(" [{}]", dock.state_label())
+    } else {
+        String::new()
+    };
+    let title = format!("Timeline Combined ({pos}){follow_tag}{dock_tag}");
+
+    render_virtualized_rows(frame, area, rows, cursor, &title, list_state);
+}
+
+fn render_virtualized_rows<T: RenderItem>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    rows: &[T],
+    cursor: usize,
+    title: &str,
+    list_state: &mut VirtualizedListState,
+) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner_area = block.inner(area);
+    block.render(area, frame);
+
+    if inner_area.height == 0 {
+        return;
+    }
+
+    list_state.select(if rows.is_empty() {
+        None
+    } else {
+        Some(cursor.min(rows.len().saturating_sub(1)))
+    });
+
+    let list = VirtualizedList::new(rows)
         .style(Style::default())
         .highlight_style(
             Style::default()
@@ -1813,12 +2271,12 @@ mod tests {
     }
 
     #[test]
-    fn verbosity_cycles_on_shift_v_key() {
+    fn verbosity_cycles_on_z_key() {
         let mut screen = TimelineScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         assert_eq!(screen.pane.verbosity, VerbosityTier::Standard);
 
-        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('V')));
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('Z')));
         screen.update(&key, &state);
         assert_eq!(screen.pane.verbosity, VerbosityTier::Verbose);
 
@@ -1833,29 +2291,42 @@ mod tests {
     }
 
     #[test]
-    fn v_key_toggles_between_timeline_and_log_viewer_modes() {
+    fn capital_v_cycles_events_commits_combined_views() {
         let mut screen = TimelineScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
-        assert_eq!(screen.view_mode, TimelineViewMode::Timeline);
+        assert_eq!(screen.view_mode, TimelineViewMode::Events);
 
-        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('V')));
         screen.update(&key, &state);
-        assert_eq!(screen.view_mode, TimelineViewMode::LogViewer);
+        assert_eq!(screen.view_mode, TimelineViewMode::Commits);
 
         screen.update(&key, &state);
-        assert_eq!(screen.view_mode, TimelineViewMode::Timeline);
+        assert_eq!(screen.view_mode, TimelineViewMode::Combined);
+
+        screen.update(&key, &state);
+        assert_eq!(screen.view_mode, TimelineViewMode::Events);
     }
 
     #[test]
-    fn filters_persist_across_v_toggle() {
+    fn lowercase_v_is_reserved_noop_for_future_visual_selection() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        screen.update(&key, &state);
+        assert_eq!(screen.view_mode, TimelineViewMode::Events);
+    }
+
+    #[test]
+    fn filters_persist_across_view_cycle() {
         let mut screen = TimelineScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         screen.pane.kind_filter.insert(MailEventKind::HttpRequest);
         screen.pane.source_filter.insert(EventSource::Http);
 
-        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('V')));
         screen.update(&key, &state);
-        assert_eq!(screen.view_mode, TimelineViewMode::LogViewer);
+        assert_eq!(screen.view_mode, TimelineViewMode::Commits);
         assert!(
             screen
                 .pane
@@ -1865,7 +2336,7 @@ mod tests {
         assert!(screen.pane.source_filter.contains(&EventSource::Http));
 
         screen.update(&key, &state);
-        assert_eq!(screen.view_mode, TimelineViewMode::Timeline);
+        assert_eq!(screen.view_mode, TimelineViewMode::Combined);
         assert!(
             screen
                 .pane
@@ -1873,6 +2344,82 @@ mod tests {
                 .contains(&MailEventKind::HttpRequest)
         );
         assert!(screen.pane.source_filter.contains(&EventSource::Http));
+    }
+
+    #[test]
+    fn commit_timeline_entry_maps_storage_fields() {
+        let storage_entry = mcp_agent_mail_storage::TimelineEntry {
+            sha: "0123456789abcdef".to_string(),
+            short_sha: "01234567".to_string(),
+            date: "2026-02-16T15:00:00Z".to_string(),
+            timestamp: 1_700_000_000,
+            subject: "mail: BluePuma -> SilentOwl | hello".to_string(),
+            commit_type: "message".to_string(),
+            sender: Some("BluePuma".to_string()),
+            recipients: vec!["SilentOwl".to_string()],
+            author: "BluePuma".to_string(),
+        };
+        let mapped = CommitTimelineEntry::from_storage("proj-a".to_string(), storage_entry);
+        assert_eq!(mapped.project_slug, "proj-a");
+        assert_eq!(mapped.type_label(), "CommitMsg");
+        assert!(mapped.detail_summary().contains("BluePuma -> SilentOwl"));
+        assert!(mapped.timestamp_micros > 0);
+    }
+
+    #[test]
+    fn combined_rows_sort_by_timestamp_across_event_and_commit_streams() {
+        let mut screen = TimelineScreen::new();
+        screen.pane.verbosity = VerbosityTier::All;
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/first", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            3,
+            MailEvent::http_request("GET", "/third", 200, 1, "127.0.0.1"),
+        );
+        screen.commit_entries.push(CommitTimelineEntry {
+            project_slug: "proj".to_string(),
+            short_sha: "deadbeef".to_string(),
+            timestamp_micros: 2_000_000,
+            timestamp_label: "00:00:02.000".to_string(),
+            subject: "mail: test".to_string(),
+            commit_type: "message".to_string(),
+            sender: Some("BluePuma".to_string()),
+            recipients: vec!["SilentOwl".to_string()],
+            author: "BluePuma".to_string(),
+        });
+
+        let rows = screen.combined_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].timestamp_micros(), 1_000_000);
+        assert_eq!(rows[1].timestamp_micros(), 2_000_000);
+        assert_eq!(rows[2].timestamp_micros(), 3_000_000);
+    }
+
+    #[test]
+    fn enter_on_commit_view_navigates_to_archive_browser() {
+        let mut screen = TimelineScreen::new();
+        screen.view_mode = TimelineViewMode::Commits;
+        screen.commit_entries.push(CommitTimelineEntry {
+            project_slug: "proj".to_string(),
+            short_sha: "deadbeef".to_string(),
+            timestamp_micros: 2_000_000,
+            timestamp_label: "00:00:02.000".to_string(),
+            subject: "mail: test".to_string(),
+            commit_type: "message".to_string(),
+            sender: Some("BluePuma".to_string()),
+            recipients: vec!["SilentOwl".to_string()],
+            author: "BluePuma".to_string(),
+        });
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let cmd = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert!(
+            matches!(cmd, Cmd::Msg(MailScreenMsg::Navigate(MailScreenId::ArchiveBrowser))),
+            "Expected Navigate to ArchiveBrowser"
+        );
     }
 
     #[test]

@@ -1890,6 +1890,44 @@ effective_free_bytes={free}"
         subject
     };
 
+    // ── Per-message size limits (subject/total) ──
+    if config.max_subject_bytes > 0 && subject.len() > config.max_subject_bytes {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Reply subject exceeds size limit: {} bytes > {} byte limit. Shorten the subject.",
+                subject.len(),
+                config.max_subject_bytes,
+            ),
+            true,
+            json!({
+                "field": "subject",
+                "size_bytes": subject.len(),
+                "limit_bytes": config.max_subject_bytes,
+            }),
+        ));
+    }
+
+    if config.max_total_message_bytes > 0 {
+        let total_size = subject.len().saturating_add(body_md.len());
+        if total_size > config.max_total_message_bytes {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "Total message size exceeds limit: {} bytes > {} byte limit. \
+                     Reduce body or attachment sizes.",
+                    total_size, config.max_total_message_bytes,
+                ),
+                true,
+                json!({
+                    "field": "total",
+                    "size_bytes": total_size,
+                    "limit_bytes": config.max_total_message_bytes,
+                }),
+            ));
+        }
+    }
+
     // Default to to original sender if not specified
     let to_names = to.unwrap_or_else(|| vec![original_sender.name.clone()]);
     let cc_names = cc.unwrap_or_default();

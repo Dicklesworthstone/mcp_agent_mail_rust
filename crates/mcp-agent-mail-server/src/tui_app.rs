@@ -40,9 +40,10 @@ use crate::tui_focus::{FocusManager, FocusTarget, focus_graph_for_screen, focus_
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg, agents::AgentsScreen,
-    analytics::AnalyticsScreen, attachments::AttachmentExplorerScreen, contacts::ContactsScreen,
-    dashboard::DashboardScreen, explorer::MailExplorerScreen, messages::MessageBrowserScreen,
-    projects::ProjectsScreen, reservations::ReservationsScreen, screen_from_jump_key, screen_meta,
+    analytics::AnalyticsScreen, archive_browser::ArchiveBrowserScreen,
+    attachments::AttachmentExplorerScreen, contacts::ContactsScreen, dashboard::DashboardScreen,
+    explorer::MailExplorerScreen, messages::MessageBrowserScreen, projects::ProjectsScreen,
+    reservations::ReservationsScreen, screen_from_jump_key, screen_meta,
     search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
     timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
@@ -805,6 +806,7 @@ impl ScreenManager {
             MailScreenId::Explorer => Box::new(MailExplorerScreen::new()),
             MailScreenId::Analytics => Box::new(AnalyticsScreen::new()),
             MailScreenId::Attachments => Box::new(AttachmentExplorerScreen::new()),
+            MailScreenId::ArchiveBrowser => Box::new(ArchiveBrowserScreen::new()),
         }
     }
 
@@ -3572,6 +3574,7 @@ mod palette_action_ids {
     pub const SCREEN_EXPLORER: &str = "screen:explorer";
     pub const SCREEN_ANALYTICS: &str = "screen:analytics";
     pub const SCREEN_ATTACHMENTS: &str = "screen:attachments";
+    pub const SCREEN_ARCHIVE_BROWSER: &str = "screen:archive_browser";
 }
 
 fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
@@ -3590,6 +3593,7 @@ fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
         palette_action_ids::SCREEN_EXPLORER => Some(MailScreenId::Explorer),
         palette_action_ids::SCREEN_ANALYTICS => Some(MailScreenId::Analytics),
         palette_action_ids::SCREEN_ATTACHMENTS => Some(MailScreenId::Attachments),
+        palette_action_ids::SCREEN_ARCHIVE_BROWSER => Some(MailScreenId::ArchiveBrowser),
         _ => None,
     }
 }
@@ -3610,6 +3614,7 @@ const fn screen_palette_action_id(id: MailScreenId) -> &'static str {
         MailScreenId::Explorer => palette_action_ids::SCREEN_EXPLORER,
         MailScreenId::Analytics => palette_action_ids::SCREEN_ANALYTICS,
         MailScreenId::Attachments => palette_action_ids::SCREEN_ATTACHMENTS,
+        MailScreenId::ArchiveBrowser => palette_action_ids::SCREEN_ARCHIVE_BROWSER,
     }
 }
 
@@ -6905,6 +6910,7 @@ mod tests {
             MailScreenId::Explorer => "explorer",
             MailScreenId::Analytics => "analytics",
             MailScreenId::Attachments => "attachments",
+            MailScreenId::ArchiveBrowser => "archive_browser",
         }
     }
 

@@ -576,6 +576,19 @@ const ATTACHMENTS_FOCUS: [FocusNodeTemplate; 2] = [
     ),
 ];
 
+const ARCHIVE_BROWSER_FOCUS: [FocusNodeTemplate; 2] = [
+    tpl("archive.tree", FocusTarget::List(0), 0, 0, 0, 400, 1000),
+    tpl(
+        "archive.preview",
+        FocusTarget::DetailPanel,
+        1,
+        400,
+        0,
+        600,
+        1000,
+    ),
+];
+
 const fn focus_templates_for_screen(screen: MailScreenId) -> &'static [FocusNodeTemplate] {
     match screen {
         MailScreenId::Dashboard => &DASHBOARD_FOCUS,
@@ -592,6 +605,7 @@ const fn focus_templates_for_screen(screen: MailScreenId) -> &'static [FocusNode
         MailScreenId::Explorer => &EXPLORER_FOCUS,
         MailScreenId::Analytics => &ANALYTICS_FOCUS,
         MailScreenId::Attachments => &ATTACHMENTS_FOCUS,
+        MailScreenId::ArchiveBrowser => &ARCHIVE_BROWSER_FOCUS,
     }
 }
 

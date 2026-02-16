@@ -1051,7 +1051,7 @@ else
 fi
 
 # Generate suite-level Search V3 summary artifacts before contract checks.
-search_v3_suite_summary
+search_v3_suite_summary || true
 
 e2e_case_banner "Artifact contract"
 

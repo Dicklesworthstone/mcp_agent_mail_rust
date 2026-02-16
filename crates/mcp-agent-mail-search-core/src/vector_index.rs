@@ -386,10 +386,7 @@ impl VectorIndex {
             // Update the index for the swapped entry (if any)
             if pos < self.entries.len() {
                 let swapped = &self.entries[pos];
-                let swapped_key = (
-                    swapped.metadata.doc_id,
-                    swapped.metadata.doc_kind,
-                );
+                let swapped_key = (swapped.metadata.doc_id, swapped.metadata.doc_kind);
                 self.doc_index.insert(swapped_key, pos);
             }
 

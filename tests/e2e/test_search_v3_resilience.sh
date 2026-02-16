@@ -980,4 +980,5 @@ e2e_step_end "invalid_limits"
 # Summary
 # ═════════════════════════════════════════════════════════════════════════
 
+sv3_write_summary || true
 e2e_summary

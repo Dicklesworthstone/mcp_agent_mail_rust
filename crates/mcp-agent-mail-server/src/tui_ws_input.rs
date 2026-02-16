@@ -3,7 +3,7 @@
 use crate::tui_bridge::RemoteTerminalEvent;
 use serde::Deserialize;
 
-const MAX_INGRESS_EVENTS: usize = 256;
+const MAX_INGRESS_EVENTS: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRemoteEvents {

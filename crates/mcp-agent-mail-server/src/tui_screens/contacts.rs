@@ -1,24 +1,25 @@
 //! Contacts screen — cross-agent contact links and policy display.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
-use ftui::widgets::StatefulWidget;
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
+use ftui::widgets::StatefulWidget;
+use ftui::widgets::Widget;
 use ftui::{Buffer, Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPolicy};
 use ftui_extras::{mermaid_layout, mermaid_render};
 use ftui_runtime::program::Cmd;
 
-use crate::tui_action_menu::{ActionEntry, contacts_actions};
+use crate::tui_action_menu::{contacts_actions, ActionEntry};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{ContactSummary, MailEvent};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -33,6 +34,9 @@ const COL_UPDATED: usize = 4;
 
 const SORT_LABELS: &[&str] = &["From", "To", "Status", "Reason", "Updated"];
 const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
+const GRAPH_EVENTS_WINDOW: usize = 512;
+const GRAPH_MIN_WIDTH: u16 = 60;
+const GRAPH_MIN_HEIGHT: u16 = 10;
 
 #[derive(Debug, Clone)]
 struct MermaidPanelCache {
@@ -40,6 +44,40 @@ struct MermaidPanelCache {
     width: u16,
     height: u16,
     buffer: Buffer,
+}
+
+#[derive(Debug, Default, Clone)]
+struct GraphFlowMetrics {
+    edge_volume: HashMap<(String, String), u32>,
+    node_sent: HashMap<String, u32>,
+    node_received: HashMap<String, u32>,
+}
+
+impl GraphFlowMetrics {
+    fn node_total(&self, agent: &str) -> u32 {
+        self.node_sent.get(agent).copied().unwrap_or(0)
+            + self.node_received.get(agent).copied().unwrap_or(0)
+    }
+
+    fn edge_weight(&self, from: &str, to: &str) -> u32 {
+        self.edge_volume
+            .get(&(from.to_string(), to.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn max_node_total(&self) -> u32 {
+        self.node_sent
+            .keys()
+            .chain(self.node_received.keys())
+            .map(|agent| self.node_total(agent))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn max_edge_weight(&self) -> u32 {
+        self.edge_volume.values().copied().max().unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +135,7 @@ pub struct ContactsScreen {
     view_mode: ViewMode,
     /// (Agent Name, x, y) normalized 0.0-1.0
     graph_nodes: Vec<(String, f64, f64)>,
+    graph_selected_idx: usize,
     show_mermaid_panel: bool,
     mermaid_cache: RefCell<Option<MermaidPanelCache>>,
     mermaid_last_render_at: RefCell<Option<Instant>>,
@@ -115,6 +154,7 @@ impl ContactsScreen {
             status_filter: StatusFilter::All,
             view_mode: ViewMode::Table,
             graph_nodes: Vec::new(),
+            graph_selected_idx: 0,
             show_mermaid_panel: false,
             mermaid_cache: RefCell::new(None),
             mermaid_last_render_at: RefCell::new(None),
@@ -153,11 +193,16 @@ impl ContactsScreen {
                 COL_UPDATED => a.updated_ts.cmp(&b.updated_ts),
                 _ => std::cmp::Ordering::Equal,
             };
-            if self.sort_asc { cmp } else { cmp.reverse() }
+            if self.sort_asc {
+                cmp
+            } else {
+                cmp.reverse()
+            }
         });
 
         self.contacts = rows;
-        self.layout_graph();
+        let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
+        self.layout_graph(&recent_events);
 
         // Clamp selection
         if let Some(sel) = self.table_state.selected {
@@ -171,18 +216,29 @@ impl ContactsScreen {
         }
     }
 
-    fn layout_graph(&mut self) {
+    fn layout_graph(&mut self, recent_events: &[MailEvent]) {
         // Collect unique agents
         let mut agents = std::collections::HashSet::new();
         for c in &self.contacts {
             agents.insert(c.from_agent.clone());
             agents.insert(c.to_agent.clone());
         }
+        for (from, recipients) in message_flow_iter(recent_events) {
+            if !from.trim().is_empty() {
+                agents.insert(from.to_string());
+            }
+            for to in recipients {
+                if !to.trim().is_empty() {
+                    agents.insert(to.to_string());
+                }
+            }
+        }
         let mut agents_vec: Vec<String> = agents.into_iter().collect();
         agents_vec.sort();
 
         let count = agents_vec.len();
         self.graph_nodes.clear();
+        self.graph_selected_idx = self.graph_selected_idx.min(count.saturating_sub(1));
 
         if count == 0 {
             return;
@@ -211,6 +267,29 @@ impl ContactsScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
+    }
+
+    fn move_graph_selection(&mut self, delta: isize) {
+        if self.graph_nodes.is_empty() {
+            self.graph_selected_idx = 0;
+            return;
+        }
+        let len = self.graph_nodes.len();
+        let current = self.graph_selected_idx;
+        let next = if delta > 0 {
+            current
+                .saturating_add(delta.unsigned_abs())
+                .min(len.saturating_sub(1))
+        } else {
+            current.saturating_sub(delta.unsigned_abs())
+        };
+        self.graph_selected_idx = next;
+    }
+
+    fn selected_graph_agent(&self) -> Option<&str> {
+        self.graph_nodes
+            .get(self.graph_selected_idx)
+            .map(|(name, _, _)| name.as_str())
     }
 }
 
@@ -244,16 +323,51 @@ impl MailScreen for ContactsScreen {
                 }
 
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                            self.move_graph_selection(1);
+                        } else {
+                            self.move_selection(1);
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                            self.move_graph_selection(-1);
+                        } else {
+                            self.move_selection(-1);
+                        }
+                    }
+                    KeyCode::Left => {
+                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                            self.move_graph_selection(-1);
+                        }
+                    }
+                    KeyCode::Right => {
+                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                            self.move_graph_selection(1);
+                        }
+                    }
                     KeyCode::Char('G') | KeyCode::End => {
-                        if !self.contacts.is_empty() {
+                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                            self.graph_selected_idx = self.graph_nodes.len().saturating_sub(1);
+                        } else if !self.contacts.is_empty() {
                             self.table_state.selected = Some(self.contacts.len() - 1);
                         }
                     }
                     KeyCode::Home => {
-                        if !self.contacts.is_empty() {
+                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                            self.graph_selected_idx = 0;
+                        } else if !self.contacts.is_empty() {
                             self.table_state.selected = Some(0);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                            if let Some(agent) = self.selected_graph_agent() {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::AgentByName(agent.to_string()),
+                                ));
+                            }
                         }
                     }
                     KeyCode::Char('g') => {
@@ -272,6 +386,7 @@ impl MailScreen for ContactsScreen {
                             ViewMode::Table => ViewMode::Graph,
                             ViewMode::Graph => ViewMode::Table,
                         };
+                        self.graph_selected_idx = 0;
                     }
                     KeyCode::Char('s') => {
                         self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
@@ -303,7 +418,7 @@ impl MailScreen for ContactsScreen {
         }
     }
 
-    fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 3 || area.width < 20 {
             return;
         }
@@ -339,10 +454,21 @@ impl MailScreen for ContactsScreen {
         let p = Paragraph::new(info);
         p.render(header_area, frame);
 
+        let graph_mode_active = self.view_mode == ViewMode::Graph || self.show_mermaid_panel;
+        let recent_events = if graph_mode_active {
+            state.recent_events(GRAPH_EVENTS_WINDOW)
+        } else {
+            Vec::new()
+        };
+        let metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
+
         if self.show_mermaid_panel {
-            self.render_mermaid_panel(frame, table_area);
-        } else if self.view_mode == ViewMode::Graph {
-            self.render_graph(frame, table_area);
+            self.render_mermaid_panel(frame, table_area, &recent_events);
+        } else if self.view_mode == ViewMode::Graph
+            && table_area.width >= GRAPH_MIN_WIDTH
+            && table_area.height >= GRAPH_MIN_HEIGHT
+        {
+            self.render_graph(frame, table_area, &metrics);
         } else {
             self.render_table(frame, table_area);
         }
@@ -352,11 +478,15 @@ impl MailScreen for ContactsScreen {
         vec![
             HelpEntry {
                 key: "j/k",
-                action: "Select contact",
+                action: "Select contact / graph node",
             },
             HelpEntry {
                 key: "g",
                 action: "Toggle Mermaid graph panel",
+            },
+            HelpEntry {
+                key: "Enter",
+                action: "Open selected graph node in Agents",
             },
             HelpEntry {
                 key: "/",
@@ -446,7 +576,7 @@ impl ContactsScreen {
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    fn render_graph(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_graph(&self, frame: &mut Frame<'_>, area: Rect, metrics: &GraphFlowMetrics) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Network Graph")
@@ -464,8 +594,9 @@ impl ContactsScreen {
 
         let w = f64::from(inner.width) * 2.0; // Braille resolution width (2 cols per cell)
         let h = f64::from(inner.height) * 4.0; // Braille resolution height (4 rows per cell)
+        let max_edge_weight = metrics.max_edge_weight();
 
-        // Draw edges
+        // Draw edges with directional arrowheads and weight-based thickness.
         for contact in &self.contacts {
             if let (Some(start), Some(end)) = (
                 self.find_node(&contact.from_agent),
@@ -477,23 +608,36 @@ impl ContactsScreen {
                     _ => tp.contact_pending,
                 };
 
-                let x1 = (start.1 * w) as i32;
-                let y1 = (start.2 * h) as i32;
-                let x2 = (end.1 * w) as i32;
-                let y2 = (end.2 * h) as i32;
+                let x1 = (start.1 * w).round() as i32;
+                let y1 = (start.2 * h).round() as i32;
+                let x2 = (end.1 * w).round() as i32;
+                let y2 = (end.2 * h).round() as i32;
 
-                painter.line_colored(x1, y1, x2, y2, Some(color));
+                let weight = metrics.edge_weight(&contact.from_agent, &contact.to_agent);
+                let thickness = scaled_level(weight, max_edge_weight, 1, 3) as i32;
+                draw_weighted_line(&mut painter, x1, y1, x2, y2, thickness, color);
+                draw_arrow_head(&mut painter, x1, y1, x2, y2, color);
             }
         }
 
-        // Draw nodes (white circles)
-        for (_name, nx, ny) in &self.graph_nodes {
-            let x = (nx * w) as i32;
-            let y = (ny * h) as i32;
-            // Draw small filled area for node
-            for dx in -1..=1_i32 {
-                for dy in -1..=1_i32 {
-                    painter.point_colored(x + dx, y + dy, tp.text_primary);
+        // Draw nodes with traffic-based radius and selected highlight.
+        let max_node_volume = metrics.max_node_total();
+        for (idx, (name, nx, ny)) in self.graph_nodes.iter().enumerate() {
+            let x = (nx * w).round() as i32;
+            let y = (ny * h).round() as i32;
+            let node_volume = metrics.node_total(name);
+            let radius = scaled_level(node_volume, max_node_volume, 1, 3) as i32;
+            let selected = idx == self.graph_selected_idx;
+            let node_color = if selected {
+                tp.panel_border_focused
+            } else {
+                tp.text_primary
+            };
+            for dx in -radius..=radius {
+                for dy in -radius..=radius {
+                    if dx * dx + dy * dy <= radius * radius {
+                        painter.point_colored(x + dx, y + dy, node_color);
+                    }
                 }
             }
         }
@@ -501,7 +645,7 @@ impl ContactsScreen {
         CanvasRef::from_painter(&painter).render(inner, frame);
 
         // Draw labels (overlay on top of canvas)
-        for (name, nx, ny) in &self.graph_nodes {
+        for (idx, (name, nx, ny)) in self.graph_nodes.iter().enumerate() {
             // Map normalized coords back to cell coords
             let cx = inner.x + (nx * f64::from(inner.width)) as u16;
             let cy = inner.y + (ny * f64::from(inner.height)) as u16;
@@ -515,8 +659,17 @@ impl ContactsScreen {
                 && cy >= inner.y
                 && cy < inner.bottom()
             {
-                let fg_color = tp.panel_title_fg;
-                let bg_color = tp.bg_deep;
+                let selected = idx == self.graph_selected_idx;
+                let fg_color = if selected {
+                    tp.selection_fg
+                } else {
+                    tp.panel_title_fg
+                };
+                let bg_color = if selected {
+                    tp.selection_bg
+                } else {
+                    tp.bg_deep
+                };
                 for (i, ch) in label.chars().enumerate() {
                     if let Some(cell) = frame.buffer.get_mut(lx + i as u16, cy) {
                         cell.content = ftui::Cell::from_char(ch).content;
@@ -526,9 +679,20 @@ impl ContactsScreen {
                 }
             }
         }
+
+        if let Some(agent) = self.selected_graph_agent() {
+            let sent = metrics.node_sent.get(agent).copied().unwrap_or(0);
+            let received = metrics.node_received.get(agent).copied().unwrap_or(0);
+            let total = sent + received;
+            let hint = format!(
+                "Node: {agent} | sent: {sent} recv: {received} total: {total} | Enter: open agent"
+            );
+            let hint_rect = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+            Paragraph::new(hint).render(hint_rect, frame);
+        }
     }
 
-    fn render_mermaid_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_mermaid_panel(&self, frame: &mut Frame<'_>, area: Rect, events: &[MailEvent]) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Mermaid Contact Graph [g]")
@@ -541,8 +705,7 @@ impl ContactsScreen {
             return;
         }
 
-        let events: [MailEvent; 0] = [];
-        let source = generate_contact_graph_mermaid(&self.contacts, &events);
+        let source = generate_contact_graph_mermaid(&self.contacts, events);
         let source_hash = stable_hash(source.as_bytes());
 
         let (has_cache, source_changed, size_changed) = {
@@ -642,6 +805,130 @@ impl ContactsScreen {
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, area, frame, &mut ts);
     }
+}
+
+fn build_graph_flow_metrics(contacts: &[ContactSummary], events: &[MailEvent]) -> GraphFlowMetrics {
+    let mut metrics = GraphFlowMetrics::default();
+    for contact in contacts {
+        metrics
+            .edge_volume
+            .entry((contact.from_agent.clone(), contact.to_agent.clone()))
+            .or_insert(0);
+    }
+
+    for (from, recipients) in message_flow_iter(events) {
+        if from.trim().is_empty() {
+            continue;
+        }
+        for to in recipients {
+            if to.trim().is_empty() {
+                continue;
+            }
+            *metrics
+                .edge_volume
+                .entry((from.to_string(), to.to_string()))
+                .or_insert(0) += 1;
+            *metrics.node_sent.entry(from.to_string()).or_insert(0) += 1;
+            *metrics.node_received.entry(to.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    if metrics.max_edge_weight() == 0 {
+        for contact in contacts {
+            *metrics
+                .edge_volume
+                .entry((contact.from_agent.clone(), contact.to_agent.clone()))
+                .or_insert(0) += 1;
+            *metrics
+                .node_sent
+                .entry(contact.from_agent.clone())
+                .or_insert(0) += 1;
+            *metrics
+                .node_received
+                .entry(contact.to_agent.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    metrics
+}
+
+fn message_flow_iter(events: &[MailEvent]) -> impl Iterator<Item = (&str, &[String])> {
+    events.iter().filter_map(|event| match event {
+        MailEvent::MessageSent { from, to, .. } | MailEvent::MessageReceived { from, to, .. } => {
+            Some((from.as_str(), to.as_slice()))
+        }
+        _ => None,
+    })
+}
+
+fn scaled_level(value: u32, max_value: u32, min: u32, max: u32) -> u32 {
+    if min >= max || max_value == 0 {
+        return min;
+    }
+    let clamped = value.min(max_value);
+    let range = max - min;
+    let scaled = min + (clamped.saturating_mul(range) + (max_value / 2)) / max_value;
+    scaled.clamp(min, max)
+}
+
+fn draw_weighted_line(
+    painter: &mut Painter,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    thickness: i32,
+    color: ftui::PackedRgba,
+) {
+    painter.line_colored(x1, y1, x2, y2, Some(color));
+    if thickness <= 1 {
+        return;
+    }
+
+    let dx = (x2 - x1).abs();
+    let dy = (y2 - y1).abs();
+    if dx >= dy {
+        painter.line_colored(x1, y1 + 1, x2, y2 + 1, Some(color));
+        if thickness >= 3 {
+            painter.line_colored(x1, y1 - 1, x2, y2 - 1, Some(color));
+        }
+    } else {
+        painter.line_colored(x1 + 1, y1, x2 + 1, y2, Some(color));
+        if thickness >= 3 {
+            painter.line_colored(x1 - 1, y1, x2 - 1, y2, Some(color));
+        }
+    }
+}
+
+fn draw_arrow_head(
+    painter: &mut Painter,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    color: ftui::PackedRgba,
+) {
+    let vx = f64::from(x2 - x1);
+    let vy = f64::from(y2 - y1);
+    let len = (vx * vx + vy * vy).sqrt();
+    if len < 1.0 {
+        return;
+    }
+    let ux = vx / len;
+    let uy = vy / len;
+    let arrow_len = 3.0;
+    let wing = 1.6;
+    let base_x = f64::from(x2) - ux * arrow_len;
+    let base_y = f64::from(y2) - uy * arrow_len;
+    let perp_x = -uy;
+    let perp_y = ux;
+    let left_x = (base_x + perp_x * wing).round() as i32;
+    let left_y = (base_y + perp_y * wing).round() as i32;
+    let right_x = (base_x - perp_x * wing).round() as i32;
+    let right_y = (base_y - perp_y * wing).round() as i32;
+    painter.line_colored(x2, y2, left_x, left_y, Some(color));
+    painter.line_colored(x2, y2, right_x, right_y, Some(color));
 }
 
 fn stable_hash<T: Hash>(value: T) -> u64 {
@@ -1049,6 +1336,99 @@ mod tests {
             .expect("second render should keep cache");
 
         assert_ne!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn graph_metrics_track_flow_counts_from_mail_events() {
+        let contacts = vec![
+            ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                ..Default::default()
+            },
+            ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Gamma".to_string(),
+                status: "approved".to_string(),
+                ..Default::default()
+            },
+        ];
+        let events = vec![
+            MailEvent::message_sent(
+                1,
+                "Alpha",
+                vec!["Beta".to_string(), "Gamma".to_string()],
+                "s",
+                "t",
+                "p",
+            ),
+            MailEvent::message_received(2, "Beta", vec!["Alpha".to_string()], "s", "t", "p"),
+        ];
+        let metrics = build_graph_flow_metrics(&contacts, &events);
+        assert_eq!(metrics.edge_weight("Alpha", "Beta"), 1);
+        assert_eq!(metrics.edge_weight("Alpha", "Gamma"), 1);
+        assert_eq!(metrics.edge_weight("Beta", "Alpha"), 1);
+        assert_eq!(metrics.node_total("Alpha"), 3);
+        assert_eq!(metrics.node_total("Gamma"), 1);
+    }
+
+    #[test]
+    fn graph_metrics_fallback_to_contact_degree_when_no_message_events() {
+        let contacts = vec![ContactSummary {
+            from_agent: "Alpha".to_string(),
+            to_agent: "Beta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        }];
+        let metrics = build_graph_flow_metrics(&contacts, &[]);
+        assert_eq!(metrics.edge_weight("Alpha", "Beta"), 1);
+        assert_eq!(metrics.node_sent.get("Alpha").copied(), Some(1));
+        assert_eq!(metrics.node_received.get("Beta").copied(), Some(1));
+    }
+
+    #[test]
+    fn graph_layout_includes_agents_seen_only_in_recent_events() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        state.push_event(MailEvent::message_sent(
+            1,
+            "OnlyInEvents",
+            vec!["Beta".to_string()],
+            "subject",
+            "thread",
+            "project",
+        ));
+        screen.rebuild_from_state(&state);
+        assert!(screen
+            .graph_nodes
+            .iter()
+            .any(|(name, _, _)| name == "OnlyInEvents"));
+    }
+
+    #[test]
+    fn enter_on_graph_node_opens_agents_deeplink() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.view_mode = ViewMode::Graph;
+        state.push_event(MailEvent::message_sent(
+            1,
+            "GraphAgent",
+            vec!["Peer".to_string()],
+            "subject",
+            "thread",
+            "project",
+        ));
+        screen.rebuild_from_state(&state);
+        screen.graph_selected_idx = 0;
+
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        let cmd = screen.update(&enter, &state);
+        assert!(matches!(
+            cmd,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::AgentByName(ref name)))
+                if name == "GraphAgent"
+        ));
     }
 
     // ── truncate_str UTF-8 safety ────────────────────────────────────

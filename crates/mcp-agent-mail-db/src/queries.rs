@@ -1951,7 +1951,7 @@ pub async fn list_thread_messages(
     // Removed the unconditional push which was confusing (though technically correct for the numeric case, it was weird).
     // Actually, strictly speaking, the previous code WAS correct but hard to read.
     // However, I will rewrite it to be explicit for clarity.
-    
+
     sql.push_str(" ORDER BY m.created_ts ASC");
 
     if let Some(limit) = limit {
@@ -3756,7 +3756,9 @@ pub async fn list_file_reservations(
     let (sql, params) = if active_only {
         let now = now_micros();
         (
-            format!("SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? ORDER BY id"),
+            format!(
+                "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? ORDER BY id"
+            ),
             vec![Value::BigInt(project_id), Value::BigInt(now)],
         )
     } else {
@@ -3861,10 +3863,12 @@ pub async fn list_unreleased_file_reservations(
 
     let tracked = tracked(&*conn);
 
-    let sql = format!("SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id");
+    let sql = format!(
+        "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id"
+    );
     let params = vec![Value::BigInt(project_id)];
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());

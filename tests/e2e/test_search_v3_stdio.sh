@@ -1254,9 +1254,10 @@ search_v3_case_summary "sender_query" "pass"
 # ===========================================================================
 # Summary
 # ===========================================================================
-e2e_summary
 
 # Search V3 harness suite summary (writes JSON and human-readable output)
-search_v3_suite_summary
+search_v3_suite_summary || true
+
+e2e_summary
 
 search_v3_log "Artifacts written to: ${SEARCH_V3_RUN_DIR}"

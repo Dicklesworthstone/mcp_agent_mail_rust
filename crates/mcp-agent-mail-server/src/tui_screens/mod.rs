@@ -6,6 +6,7 @@
 
 pub mod agents;
 pub mod analytics;
+pub mod archive_browser;
 pub mod attachments;
 pub mod contacts;
 pub mod dashboard;
@@ -50,6 +51,7 @@ pub enum MailScreenId {
     Explorer,
     Analytics,
     Attachments,
+    ArchiveBrowser,
 }
 
 /// All screen IDs in display order.
@@ -68,6 +70,7 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::Explorer,
     MailScreenId::Analytics,
     MailScreenId::Attachments,
+    MailScreenId::ArchiveBrowser,
 ];
 
 /// Shifted number-row symbols used for direct jump bindings beyond screen 10.
@@ -506,6 +509,13 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         category: ScreenCategory::Communication,
         description: "Attachment browser with inline preview and source provenance trails",
     },
+    MailScreenMeta {
+        id: MailScreenId::ArchiveBrowser,
+        title: "Archive Browser",
+        short_label: "Archive",
+        category: ScreenCategory::Operations,
+        description: "Two-pane Git archive browser with directory tree and file content preview",
+    },
 ];
 
 /// Look up metadata for a screen ID.
@@ -583,7 +593,7 @@ mod tests {
     #[test]
     fn screen_count_matches() {
         assert_eq!(ALL_SCREEN_IDS.len(), MAIL_SCREEN_REGISTRY.len());
-        assert_eq!(ALL_SCREEN_IDS.len(), 14);
+        assert_eq!(ALL_SCREEN_IDS.len(), 15);
     }
 
     #[test]
@@ -655,13 +665,17 @@ mod tests {
         assert_eq!(screen_from_jump_key('@'), Some(MailScreenId::Explorer));
         assert_eq!(screen_from_jump_key('#'), Some(MailScreenId::Analytics));
         assert_eq!(screen_from_jump_key('$'), Some(MailScreenId::Attachments));
+        assert_eq!(
+            screen_from_jump_key('%'),
+            Some(MailScreenId::ArchiveBrowser)
+        );
         assert_eq!(screen_from_jump_key(')'), None);
     }
 
     #[test]
     fn jump_key_legend_reflects_screen_count() {
         let legend = jump_key_legend();
-        assert_eq!(legend, "1-9,0,!,@,#,$");
+        assert_eq!(legend, "1-9,0,!,@,#,$,%");
     }
 
     #[test]
@@ -828,12 +842,12 @@ mod tests {
     // ── Shell Navigation & Discoverability Contracts (br-1xt0m.1.13.6) ──
 
     #[test]
-    fn jump_key_legend_reflects_14_screens() {
+    fn jump_key_legend_reflects_15_screens() {
         let legend = jump_key_legend();
         assert!(legend.contains("1-9"), "legend should have digits");
         assert!(legend.contains('0'), "legend should have 0 for screen 10");
-        // With 14 screens, expect shifted symbols for 11-14
-        for sym in ['!', '@', '#', '$'] {
+        // With 15 screens, expect shifted symbols for 11-15
+        for sym in ['!', '@', '#', '$', '%'] {
             assert!(
                 legend.contains(sym),
                 "legend should contain '{sym}' for 14 screens, got: {legend}"

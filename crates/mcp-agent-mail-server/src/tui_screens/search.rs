@@ -3261,10 +3261,18 @@ fn estimate_search_detail_lines(entry: &ResultEntry, width: u16) -> usize {
     // Body lines
     let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
     let avail_width = usize::from(width.saturating_sub(2)).max(1);
-    let body_lines = body.lines().map(|line| {
-        let len = ftui::text::display_width(line);
-        if len == 0 { 1 } else { len.div_ceil(avail_width) }
-    }).sum::<usize>().max(1);
+    let body_lines = body
+        .lines()
+        .map(|line| {
+            let len = ftui::text::display_width(line);
+            if len == 0 {
+                1
+            } else {
+                len.div_ceil(avail_width)
+            }
+        })
+        .sum::<usize>()
+        .max(1);
     count += body_lines;
     count
 }

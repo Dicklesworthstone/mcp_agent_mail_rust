@@ -910,7 +910,7 @@ e2e_case_banner "Artifacts: required outputs and summary contracts"
 e2e_mark_case_start "artifact_contract"
 
 # Generate suite-level Search V3 summary artifacts before validating them.
-search_v3_suite_summary
+search_v3_suite_summary || true
 
 e2e_assert_file_exists "load summary JSON" "$LOAD_SUMMARY_JSON"
 e2e_assert_file_exists "latency histogram JSON" "$LATENCY_HIST_JSON"

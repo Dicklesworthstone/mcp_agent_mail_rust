@@ -120,6 +120,7 @@ pub struct ConfigSnapshot {
     pub storage_root: String,
     pub console_theme: String,
     pub tool_filter_profile: String,
+    pub tui_debug: bool,
 }
 
 impl ConfigSnapshot {
@@ -145,6 +146,7 @@ impl ConfigSnapshot {
             storage_root: config.storage_root.display().to_string(),
             console_theme: format!("{:?}", config.console_theme),
             tool_filter_profile: config.tool_filter.profile.clone(),
+            tui_debug: config.tui_debug,
         }
     }
 
@@ -632,6 +634,7 @@ mod tests {
             storage_root: "/tmp/am".into(),
             console_theme: "cyberpunk_aurora".into(),
             tool_filter_profile: "default".into(),
+            tui_debug: false,
         };
         assert_eq!(snap.transport_mode(), "custom");
     }
@@ -652,6 +655,7 @@ mod tests {
                 storage_root: String::new(),
                 console_theme: String::new(),
                 tool_filter_profile: String::new(),
+                tui_debug: false,
             }
         };
         assert_eq!(snap.transport_mode(), "mcp");
@@ -673,6 +677,7 @@ mod tests {
                 storage_root: String::new(),
                 console_theme: String::new(),
                 tool_filter_profile: String::new(),
+                tui_debug: false,
             }
         };
         assert_eq!(snap.transport_mode(), "api");
@@ -752,6 +757,7 @@ mod tests {
             storage_root: "/tmp/new".into(),
             console_theme: "default".into(),
             tool_filter_profile: "minimal".into(),
+            tui_debug: false,
         };
         state.update_config_snapshot(new_snap);
         let snap2 = state.config_snapshot();

@@ -246,7 +246,8 @@ fn persist_snapshot_rows(
                  latency_avg_ms, latency_min_ms, latency_max_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms, latency_is_slow\
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-    conn.execute_sync("BEGIN IMMEDIATE", &[]).map_err(|e| e.to_string())?;
+    conn.execute_sync("BEGIN IMMEDIATE", &[])
+        .map_err(|e| e.to_string())?;
 
     for entry in snapshot {
         let capabilities_json =
@@ -273,7 +274,8 @@ fn persist_snapshot_rows(
             return Err(e.to_string());
         }
     }
-    conn.execute_sync("COMMIT", &[]).map_err(|e| e.to_string())?;
+    conn.execute_sync("COMMIT", &[])
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
