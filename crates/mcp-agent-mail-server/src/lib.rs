@@ -3725,7 +3725,7 @@ impl HttpState {
 
             if kind == RequestKind::Resources {
                 // Legacy python allows resources regardless of role membership.
-            } else if kind == RequestKind::Tools {
+            } else if kind == RequestKind::Tools && json_rpc.method == "tools/call" {
                 if let Some(ref name) = tool_name {
                     if self.config.http_rbac_readonly_tools.contains(name) {
                         if !is_reader && !is_writer {
@@ -4816,14 +4816,15 @@ impl std::fmt::Display for RequestKind {
 }
 
 fn classify_request(req: &JsonRpcRequest) -> (RequestKind, Option<String>) {
-    if req.method.starts_with("tools/") {
-        if req.method == "tools/call" {
-            if let Some(params) = req.params.as_ref() {
-                if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
-                    return (RequestKind::Tools, Some(name.to_string()));
-                }
+    if req.method == "tools/call" {
+        if let Some(params) = req.params.as_ref() {
+            if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                return (RequestKind::Tools, Some(name.to_string()));
             }
         }
+        return (RequestKind::Tools, None);
+    }
+    if req.method == "tools/list" {
         return (RequestKind::Tools, None);
     }
     if req.method.starts_with("resources/") {
