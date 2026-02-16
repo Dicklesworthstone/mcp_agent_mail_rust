@@ -416,8 +416,11 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 }
 
 /// Fetch active file reservations with project and agent names.
+///
+/// This is reused by the reservations screen as a direct fallback when the
+/// background poller snapshot is unavailable or stale.
 #[allow(clippy::too_many_lines)]
-fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
+pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
     let sql = format!(
         "SELECT \
            fr.id, \

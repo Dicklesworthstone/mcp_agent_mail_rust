@@ -31,6 +31,8 @@ const COL_PROJECT: usize = 4;
 const SORT_LABELS: &[&str] = &["Agent", "Path", "Excl", "TTL", "Project"];
 /// Number of empty DB snapshots tolerated before pruning active rows.
 const EMPTY_SNAPSHOT_HOLD_CYCLES: u8 = 1;
+/// Minimum tick spacing between direct DB fallback probes.
+const FALLBACK_DB_REFRESH_TICKS: u64 = 10;
 
 /// Tracked reservation state from events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +113,10 @@ pub struct ReservationsScreen {
     last_render_offset: Cell<usize>,
     /// Last rendered table area for mouse hit-testing.
     last_table_area: Cell<Rect>,
+    /// Last fallback probe failure details, shown in empty-state diagnostics.
+    fallback_issue: Option<String>,
+    /// Tick index of the last direct fallback probe.
+    last_fallback_probe_tick: u64,
 }
 
 impl ReservationsScreen {
@@ -129,6 +135,8 @@ impl ReservationsScreen {
             focused_synthetic: None,
             last_render_offset: Cell::new(0),
             last_table_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            fallback_issue: None,
+            last_fallback_probe_tick: 0,
         }
     }
 
@@ -339,6 +347,58 @@ impl ReservationsScreen {
         true
     }
 
+    fn refresh_from_db_fallback(&mut self, state: &TuiSharedState) -> bool {
+        let database_url = state.config_snapshot().database_url;
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&database_url) {
+            self.fallback_issue = Some(
+                "DB snapshots are unavailable for :memory: SQLite URLs; use a file-backed DATABASE_URL for reservations visibility."
+                    .to_string(),
+            );
+            return false;
+        }
+
+        let db_cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url,
+            ..Default::default()
+        };
+        let path = match db_cfg.sqlite_path() {
+            Ok(path) => path,
+            Err(err) => {
+                self.fallback_issue = Some(format!(
+                    "Unable to parse SQLite path for reservations fallback: {err}"
+                ));
+                return false;
+            }
+        };
+
+        let conn = match mcp_agent_mail_db::DbConn::open_file(&path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                self.fallback_issue = Some(format!(
+                    "Unable to open DB for reservations fallback ({}): {err}",
+                    path
+                ));
+                return false;
+            }
+        };
+
+        let rows = crate::tui_poller::fetch_reservation_snapshots(&conn);
+        if rows.is_empty() {
+            self.fallback_issue =
+                Some("Direct DB fallback returned no active reservation rows.".to_string());
+            return false;
+        }
+
+        self.fallback_issue = None;
+        let fallback_snapshot = DbStatSnapshot {
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            file_reservations: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            reservation_snapshots: rows,
+            ..DbStatSnapshot::default()
+        };
+        self.apply_db_snapshot(&fallback_snapshot)
+    }
+
     fn rebuild_sorted(&mut self) {
         let show_released = self.show_released;
         let now_micros = chrono::Utc::now().timestamp_micros();
@@ -487,10 +547,23 @@ impl MailScreen for ReservationsScreen {
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         let mut changed = false;
-        if let Some(snapshot) = state.db_stats_snapshot() {
+        let snapshot = state.db_stats_snapshot();
+        if let Some(snapshot) = snapshot.clone() {
             changed |= self.apply_db_snapshot(&snapshot);
+            if !snapshot.reservation_snapshots.is_empty() || snapshot.file_reservations == 0 {
+                self.fallback_issue = None;
+            }
         }
         changed |= self.ingest_events(state);
+        let needs_fallback = snapshot.as_ref().is_some_and(|snap| {
+            snap.reservation_snapshots.is_empty() && snap.file_reservations > 0
+        });
+        if needs_fallback
+            && tick_count.saturating_sub(self.last_fallback_probe_tick) >= FALLBACK_DB_REFRESH_TICKS
+        {
+            self.last_fallback_probe_tick = tick_count;
+            changed |= self.refresh_from_db_fallback(state);
+        }
         if changed || tick_count % 10 == 0 {
             self.rebuild_sorted();
         }
@@ -674,15 +747,22 @@ impl MailScreen for ReservationsScreen {
         render_ttl_overlays(frame, table_area, &ttl_overlay_rows, ts.offset, &tp);
         if rows_empty && inner.height > 1 && inner.width > 4 {
             let text = if row_mismatch {
-                format!(
+                let mut message = format!(
                     "DB reports {db_active_total} active reservations, but detail rows are unavailable. Poller snapshot is stale or failing."
-                )
+                );
+                if let Some(issue) = &self.fallback_issue {
+                    message.push(' ');
+                    message.push_str(issue);
+                }
+                message
+            } else if let Some(issue) = &self.fallback_issue {
+                issue.clone()
             } else if self.show_released {
                 "No reservations match current filters.".to_string()
             } else {
                 "No active reservations.".to_string()
             };
-            let style = if row_mismatch {
+            let style = if row_mismatch || self.fallback_issue.is_some() {
                 crate::tui_theme::text_warning(&tp)
             } else {
                 crate::tui_theme::text_meta(&tp)
@@ -940,6 +1020,57 @@ mod tests {
         assert!(
             text.contains("DB reports 5 active reservations"),
             "missing mismatch warning text: {text}"
+        );
+    }
+
+    #[test]
+    fn tick_sets_fallback_issue_when_snapshot_rows_are_missing_for_memory_url() {
+        let mut cfg = Config::default();
+        cfg.database_url = "sqlite:///:memory:".to_string();
+        let state = TuiSharedState::new(&cfg);
+        state.update_db_stats(DbStatSnapshot {
+            file_reservations: 1,
+            timestamp_micros: 1,
+            ..Default::default()
+        });
+
+        let mut screen = ReservationsScreen::new();
+        screen.tick(10, &state);
+
+        let issue = screen
+            .fallback_issue
+            .as_deref()
+            .expect("fallback issue should be set");
+        assert!(
+            issue.contains("file-backed DATABASE_URL"),
+            "unexpected fallback issue text: {issue}"
+        );
+    }
+
+    #[test]
+    fn empty_view_includes_fallback_issue_context_when_rows_mismatch() {
+        let mut cfg = Config::default();
+        cfg.database_url = "sqlite:///:memory:".to_string();
+        let state = TuiSharedState::new(&cfg);
+        state.update_db_stats(DbStatSnapshot {
+            file_reservations: 1,
+            timestamp_micros: 1,
+            ..Default::default()
+        });
+        let mut screen = ReservationsScreen::new();
+        screen.tick(10, &state);
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("DB reports 1 active reservations"),
+            "missing mismatch warning text: {text}"
+        );
+        assert!(
+            text.contains("file-backed DATABASE_URL"),
+            "missing fallback context text: {text}"
         );
     }
 

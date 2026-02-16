@@ -407,6 +407,7 @@ impl std::fmt::Display for SearchShadowMode {
 ///
 /// Provides safe rollout controls with explicit kill switches and per-surface overrides.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SearchRolloutConfig {
     /// Primary search engine (default: Legacy).
     pub engine: SearchEngine,
@@ -418,6 +419,8 @@ pub struct SearchRolloutConfig {
     pub rerank_enabled: bool,
     /// Fall back to legacy FTS on V3 error (default: true).
     pub fallback_on_error: bool,
+    /// Kill switch for post-fusion diversity reranking (default: true).
+    pub diversity_enabled: bool,
     /// Per-surface engine overrides (tool name -> engine).
     pub surface_overrides: HashMap<String, SearchEngine>,
 }
@@ -429,6 +432,7 @@ impl Default for SearchRolloutConfig {
             shadow_mode: SearchShadowMode::default(),
             semantic_enabled: false,
             rerank_enabled: false,
+            diversity_enabled: true,
             fallback_on_error: true,
             surface_overrides: HashMap::new(),
         }
@@ -1182,6 +1186,10 @@ impl Config {
         config.search_rollout.rerank_enabled = env_bool(
             "AM_SEARCH_RERANK_ENABLED",
             config.search_rollout.rerank_enabled,
+        );
+        config.search_rollout.diversity_enabled = env_bool(
+            "AM_SEARCH_DIVERSITY_ENABLED",
+            config.search_rollout.diversity_enabled,
         );
         config.search_rollout.fallback_on_error = env_bool(
             "AM_SEARCH_FALLBACK_ON_ERROR",

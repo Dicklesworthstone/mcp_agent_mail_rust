@@ -4386,6 +4386,83 @@ fn message_sent_event_from_payload(
     Some((id, project, event))
 }
 
+fn message_recipients_from_payload(payload: &serde_json::Value) -> Vec<String> {
+    let mut recipients = Vec::new();
+    let mut seen = HashSet::new();
+    for key in ["to", "cc", "bcc"] {
+        for recipient in json_string_vec_field(payload, key) {
+            let trimmed = recipient.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value = trimmed.to_string();
+            if seen.insert(value.clone()) {
+                recipients.push(value);
+            }
+        }
+    }
+    recipients
+}
+
+fn append_message_flow_events(
+    events: &mut Vec<tui_events::MailEvent>,
+    seen_sent: &mut HashSet<(i64, String)>,
+    seen_received: &mut HashSet<(i64, String, String)>,
+    msg_payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    fallback_sender: Option<&str>,
+    recipient_budget: &mut usize,
+) -> bool {
+    let Some((id, project, sent_event)) =
+        message_sent_event_from_payload(msg_payload, project_hint, fallback_sender)
+    else {
+        return false;
+    };
+
+    let (from, subject, thread_id) = match &sent_event {
+        tui_events::MailEvent::MessageSent {
+            from,
+            subject,
+            thread_id,
+            ..
+        } => (from.clone(), subject.clone(), thread_id.clone()),
+        _ => return false,
+    };
+
+    if seen_sent.insert((id, project.clone())) {
+        events.push(sent_event);
+    }
+
+    if *recipient_budget == 0 {
+        return true;
+    }
+    let recipients = message_recipients_from_payload(msg_payload);
+    if recipients.is_empty() {
+        return true;
+    }
+
+    for recipient in recipients {
+        if *recipient_budget == 0 {
+            break;
+        }
+        let key = (id, project.clone(), recipient.clone());
+        if !seen_received.insert(key) {
+            continue;
+        }
+        events.push(tui_events::MailEvent::message_received(
+            id,
+            &from,
+            vec![recipient],
+            &subject,
+            &thread_id,
+            &project,
+        ));
+        *recipient_budget = recipient_budget.saturating_sub(1);
+    }
+
+    true
+}
+
 #[derive(Debug, Clone, Default)]
 struct DomainEventContext {
     project: Option<String>,
@@ -4426,7 +4503,10 @@ fn derive_message_domain_events(
     ctx: &DomainEventContext,
 ) -> Vec<tui_events::MailEvent> {
     let mut events = Vec::new();
-    let mut seen: HashSet<(i64, String)> = HashSet::new();
+    let mut seen_sent: HashSet<(i64, String)> = HashSet::new();
+    let mut seen_received: HashSet<(i64, String, String)> = HashSet::new();
+    let mut found_message = false;
+    let mut recipient_budget = 64_usize;
     if let Some(deliveries) = payload
         .get("deliveries")
         .and_then(serde_json::Value::as_array)
@@ -4437,23 +4517,27 @@ fn derive_message_domain_events(
                 .and_then(serde_json::Value::as_str)
                 .or(ctx.project.as_deref());
             let msg_payload = delivery.get("payload").unwrap_or(payload);
-            if let Some((id, proj, event)) =
-                message_sent_event_from_payload(msg_payload, delivery_project, ctx.agent.as_deref())
-            {
-                if seen.insert((id, proj.clone())) {
-                    events.push(event);
-                }
-            }
+            found_message |= append_message_flow_events(
+                &mut events,
+                &mut seen_sent,
+                &mut seen_received,
+                msg_payload,
+                delivery_project,
+                ctx.agent.as_deref(),
+                &mut recipient_budget,
+            );
         }
     }
-    if events.is_empty() {
-        if let Some((id, proj, event)) =
-            message_sent_event_from_payload(payload, ctx.project.as_deref(), ctx.agent.as_deref())
-        {
-            if seen.insert((id, proj)) {
-                events.push(event);
-            }
-        }
+    if !found_message {
+        let _ = append_message_flow_events(
+            &mut events,
+            &mut seen_sent,
+            &mut seen_received,
+            payload,
+            ctx.project.as_deref(),
+            ctx.agent.as_deref(),
+            &mut recipient_budget,
+        );
     }
     events
 }
@@ -12341,7 +12425,7 @@ mod tests {
 
         let events =
             derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0] {
             tui_events::MailEvent::MessageSent {
                 id,
@@ -12361,6 +12445,62 @@ mod tests {
             }
             other => panic!("expected MessageSent event, got {other:?}"),
         }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            tui_events::MailEvent::MessageReceived { id, to, .. }
+                if *id == 42 && to.as_slice() == ["BlueLake"]
+        )));
+    }
+
+    #[test]
+    fn derive_domain_events_from_send_message_deduplicates_cc_and_bcc_recipients() {
+        let payload = serde_json::json!({
+            "deliveries": [{
+                "project": "alpha",
+                "payload": {
+                    "id": 46,
+                    "from": "RedFox",
+                    "to": ["BlueLake", "BlueLake"],
+                    "cc": ["RedStone"],
+                    "bcc": ["RedStone", "GrayWolf"],
+                    "subject": "Dedup recipients",
+                    "thread_id": "br-46"
+                }
+            }],
+            "count": 1
+        });
+        let call_result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": payload.to_string()
+            }]
+        });
+
+        let events =
+            derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
+        let sent = events
+            .iter()
+            .filter(|event| matches!(event, tui_events::MailEvent::MessageSent { .. }))
+            .count();
+        assert_eq!(sent, 1);
+
+        let recipients: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                tui_events::MailEvent::MessageReceived { id, to, .. } if *id == 46 => {
+                    to.first().cloned()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recipients,
+            vec![
+                "BlueLake".to_string(),
+                "RedStone".to_string(),
+                "GrayWolf".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -12384,7 +12524,7 @@ mod tests {
 
         let events =
             derive_domain_events_from_tool_contents("send_message", None, &contents, None, None);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0] {
             tui_events::MailEvent::MessageSent { id, subject, .. } => {
                 assert_eq!(*id, 45);
@@ -12392,6 +12532,11 @@ mod tests {
             }
             other => panic!("expected MessageSent event, got {other:?}"),
         }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            tui_events::MailEvent::MessageReceived { id, to, .. }
+                if *id == 45 && to.as_slice() == ["BlueLake"]
+        )));
     }
 
     #[test]
@@ -12425,7 +12570,7 @@ mod tests {
 
         let events =
             derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0] {
             tui_events::MailEvent::MessageSent { id, subject, .. } => {
                 assert_eq!(*id, 43);
@@ -12433,6 +12578,11 @@ mod tests {
             }
             other => panic!("expected MessageSent event, got {other:?}"),
         }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            tui_events::MailEvent::MessageReceived { id, to, .. }
+                if *id == 43 && to.as_slice() == ["BlueLake"]
+        )));
     }
 
     #[test]
@@ -12460,7 +12610,7 @@ mod tests {
 
         let events =
             derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0] {
             tui_events::MailEvent::MessageSent { id, subject, .. } => {
                 assert_eq!(*id, 44);
@@ -12468,6 +12618,11 @@ mod tests {
             }
             other => panic!("expected MessageSent event, got {other:?}"),
         }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            tui_events::MailEvent::MessageReceived { id, to, .. }
+                if *id == 44 && to.as_slice() == ["BlueLake"]
+        )));
     }
 
     #[test]
@@ -12493,7 +12648,7 @@ mod tests {
             Some("alpha"),
             None,
         );
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0] {
             tui_events::MailEvent::MessageSent { id, subject, .. } => {
                 assert_eq!(*id, 99);
@@ -12501,6 +12656,11 @@ mod tests {
             }
             other => panic!("expected MessageSent event, got {other:?}"),
         }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            tui_events::MailEvent::MessageReceived { id, to, .. }
+                if *id == 99 && to.as_slice() == ["BlueLake"]
+        )));
     }
 
     #[test]
@@ -12831,7 +12991,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0] {
             tui_events::MailEvent::MessageSent { id, subject, .. } => {
                 assert_eq!(*id, 4001);
@@ -12839,6 +12999,11 @@ mod tests {
             }
             other => panic!("expected MessageSent event, got {other:?}"),
         }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            tui_events::MailEvent::MessageReceived { id, to, .. }
+                if *id == 4001 && to.as_slice() == ["RedStone"]
+        )));
     }
 
     #[test]
