@@ -126,6 +126,7 @@ pub fn to_fs_scored_result(result: &crate::two_tier::ScoredResult) -> FsScoredRe
         quality_score: None,
         lexical_score: None,
         rerank_score: None,
+        explanation: None,
         metadata: None,
     }
 }
@@ -345,6 +346,7 @@ mod tests {
             quality_score: None,
             lexical_score: None,
             rerank_score: None,
+            explanation: None,
             metadata: None,
         };
 
@@ -369,6 +371,7 @@ mod tests {
             quality_score: None,
             lexical_score: None,
             rerank_score: None,
+            explanation: None,
             metadata: None,
         };
         assert!(from_fs_scored_result(&fs_result).is_none());

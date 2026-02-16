@@ -1,0 +1,21 @@
+[package]
+name = "mcp-agent-mail-agent-detect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Local coding-agent install detection primitives for MCP Agent Mail"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+dirs = "6"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

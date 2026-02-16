@@ -419,7 +419,7 @@ impl MailExplorerScreen {
             return;
         }
         self.db_conn_attempted = true;
-        let db_url = &state.config_snapshot().database_url;
+        let db_url = &state.config_snapshot().raw_database_url;
         let cfg = DbPoolConfig {
             database_url: db_url.clone(),
             ..Default::default()

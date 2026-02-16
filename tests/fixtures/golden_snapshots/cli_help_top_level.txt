@@ -5,8 +5,7 @@ Usage: am [COMMAND]
 Commands:
   serve-http                  
   serve-stdio                 
-  check-inbox                 Check agent inbox for unread messages (for git hooks and editor
-                              integrations)
+  check-inbox                 Check agent inbox for unread messages (for git hooks and editor integrations)
   ci                          Run CI quality gates (format, lint, build, test)
   bench                       Run native CLI benchmarks
   lint                        
@@ -31,8 +30,7 @@ Commands:
   doctor                      
   agents                      
   tooling                     
-  macros                      Composite workflow macros (session boot, thread prep, reservation
-                              cycles, contact handshake)
+  macros                      Composite workflow macros (session boot, thread prep, reservation cycles, contact handshake)
   contacts                    Contact request/approve/reject/policy lifecycle
   beads                       Query beads (issue tracker) status for the current project
   setup                       Detect coding agents and configure MCP server connections

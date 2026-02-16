@@ -618,7 +618,7 @@ impl TuiThemePalette {
 
             json_key: purple,
             json_string: yellow_d,
-            json_number: PackedRgba::rgb(189, 147, 249),
+            json_number: cyan_d,
             json_literal: pink,
             json_punctuation: comment,
         }
@@ -2677,6 +2677,65 @@ mod tests {
                 p.text_primary, p.text_secondary,
                 "theme {name}: primary == secondary"
             );
+        }
+    }
+
+    /// Toast notification colors (error, warning, info, success) are distinct in each theme.
+    #[test]
+    fn named_themes_toast_colors_distinct() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            let toasts = [
+                ("error", p.toast_error),
+                ("warning", p.toast_warning),
+                ("info", p.toast_info),
+                ("success", p.toast_success),
+            ];
+            for i in 0..toasts.len() {
+                for j in (i + 1)..toasts.len() {
+                    assert_ne!(
+                        toasts[i].1, toasts[j].1,
+                        "theme {name}: toast {} and {} are identical",
+                        toasts[i].0, toasts[j].0
+                    );
+                }
+            }
+        }
+    }
+
+    /// JSON token colors (key, string, number, literal, punctuation) are distinct in each theme.
+    #[test]
+    fn named_themes_json_token_colors_distinct() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            let tokens = [
+                ("key", p.json_key),
+                ("string", p.json_string),
+                ("number", p.json_number),
+                ("literal", p.json_literal),
+                ("punctuation", p.json_punctuation),
+            ];
+            for i in 0..tokens.len() {
+                for j in (i + 1)..tokens.len() {
+                    assert_ne!(
+                        tokens[i].1, tokens[j].1,
+                        "theme {name}: json {} and {} are identical",
+                        tokens[i].0, tokens[j].0
+                    );
+                }
+            }
         }
     }
 }

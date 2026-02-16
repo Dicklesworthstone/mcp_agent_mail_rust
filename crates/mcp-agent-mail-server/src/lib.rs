@@ -3830,6 +3830,7 @@ impl HttpState {
                     ],
                 );
                 let output_mode = runtime_output_mode(&self.config);
+                let call_arguments = params.arguments.clone();
 
                 let tool_call_console_enabled = self.config.log_rich_enabled
                     && self.config.tools_log_enabled
@@ -3945,6 +3946,16 @@ impl HttpState {
                     }
                 };
                 let mut value = serde_json::to_value(out).map_err(McpError::from)?;
+
+                for event in derive_domain_events_from_tool_result(
+                    &tool_name,
+                    call_arguments.as_ref(),
+                    &value,
+                    project_hint.as_deref(),
+                    agent_hint.as_deref(),
+                ) {
+                    emit_tui_event(event);
+                }
 
                 // Emit tool-call-end panel
                 if let Some(start) = call_start {
@@ -4190,6 +4201,415 @@ fn normalize_project_value(value: String) -> String {
     } else {
         value
     }
+}
+
+fn parse_call_tool_result_payload(call_result: &serde_json::Value) -> Option<serde_json::Value> {
+    let blocks = call_result.get("content")?.as_array()?;
+    for block in blocks {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = block.get("text").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(text) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn json_i64_field(value: &serde_json::Value, key: &str) -> Option<i64> {
+    let field = value.get(key)?;
+    if let Some(v) = field.as_i64() {
+        return Some(v);
+    }
+    field.as_u64().and_then(|v| i64::try_from(v).ok())
+}
+
+fn json_u64_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    let field = value.get(key)?;
+    if let Some(v) = field.as_u64() {
+        return Some(v);
+    }
+    field.as_i64().and_then(|v| u64::try_from(v).ok())
+}
+
+fn json_string_vec_field(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_arg_bool(arguments: Option<&serde_json::Value>, key: &str) -> Option<bool> {
+    arguments?.as_object()?.get(key)?.as_bool()
+}
+
+fn extract_arg_u64(arguments: Option<&serde_json::Value>, key: &str) -> Option<u64> {
+    let value = arguments?.as_object()?.get(key)?;
+    if let Some(v) = value.as_u64() {
+        return Some(v);
+    }
+    value.as_i64().and_then(|v| u64::try_from(v).ok())
+}
+
+fn extract_arg_i64_vec(arguments: Option<&serde_json::Value>, key: &str) -> Vec<i64> {
+    arguments
+        .and_then(serde_json::Value::as_object)
+        .and_then(|m| m.get(key))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_i64()
+                        .or_else(|| item.as_u64().and_then(|v| i64::try_from(v).ok()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_arg_string_vec(arguments: Option<&serde_json::Value>, key: &str) -> Vec<String> {
+    arguments
+        .and_then(serde_json::Value::as_object)
+        .and_then(|m| m.get(key))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn message_sent_event_from_payload(
+    payload: &serde_json::Value,
+    project: Option<&str>,
+    fallback_sender: Option<&str>,
+) -> Option<(i64, String, tui_events::MailEvent)> {
+    let id = json_i64_field(payload, "id")?;
+    let project = project.filter(|p| !p.is_empty()).map(str::to_string)?;
+    let from = payload
+        .get("from")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or(fallback_sender)
+        .unwrap_or("unknown")
+        .to_string();
+    let to = json_string_vec_field(payload, "to");
+    let subject = payload
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let thread_id = payload
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unthreaded")
+        .to_string();
+    let event = tui_events::MailEvent::message_sent(id, from, to, subject, thread_id, &project);
+    Some((id, project, event))
+}
+
+#[derive(Debug, Clone, Default)]
+struct DomainEventContext {
+    project: Option<String>,
+    agent: Option<String>,
+}
+
+fn resolve_domain_event_context(
+    call_args: Option<&serde_json::Value>,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) -> DomainEventContext {
+    let project = project_hint.map(str::to_string).or_else(|| {
+        extract_arg_str(
+            call_args,
+            &["project_key", "project", "human_key", "project_slug"],
+        )
+        .map(normalize_project_value)
+    });
+    let agent = agent_hint.map(str::to_string).or_else(|| {
+        extract_arg_str(
+            call_args,
+            &[
+                "agent_name",
+                "sender_name",
+                "from_agent",
+                "requester",
+                "target",
+                "to_agent",
+                "agent",
+            ],
+        )
+    });
+    DomainEventContext { project, agent }
+}
+
+fn derive_message_domain_events(
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    let mut events = Vec::new();
+    let mut seen: HashSet<(i64, String)> = HashSet::new();
+    if let Some(deliveries) = payload
+        .get("deliveries")
+        .and_then(serde_json::Value::as_array)
+    {
+        for delivery in deliveries.iter().take(32) {
+            let delivery_project = delivery
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+                .or(ctx.project.as_deref());
+            let msg_payload = delivery.get("payload").unwrap_or(payload);
+            if let Some((id, proj, event)) =
+                message_sent_event_from_payload(msg_payload, delivery_project, ctx.agent.as_deref())
+            {
+                if seen.insert((id, proj.clone())) {
+                    events.push(event);
+                }
+            }
+        }
+    }
+    if events.is_empty() {
+        if let Some((id, proj, event)) =
+            message_sent_event_from_payload(payload, ctx.project.as_deref(), ctx.agent.as_deref())
+        {
+            if seen.insert((id, proj)) {
+                events.push(event);
+            }
+        }
+    }
+    events
+}
+
+fn derive_fetch_inbox_domain_events(
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    let Some(project_value) = ctx.project.as_deref() else {
+        return Vec::new();
+    };
+    let Some(messages) = payload.as_array() else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for message in messages.iter().take(16) {
+        let Some(id) = json_i64_field(message, "id") else {
+            continue;
+        };
+        let from = message
+            .get("from")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let subject = message
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let thread_id = message
+            .get("thread_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unthreaded");
+        let mut to = Vec::new();
+        if let Some(agent_name) = ctx.agent.as_deref() {
+            to.push(agent_name.to_string());
+        }
+        events.push(tui_events::MailEvent::message_received(
+            id,
+            from,
+            to,
+            subject,
+            thread_id,
+            project_value,
+        ));
+    }
+    events
+}
+
+fn derive_reservation_granted_domain_events(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    let Some(granted) = payload.get("granted").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    if granted.is_empty() {
+        return Vec::new();
+    }
+    let mut paths: Vec<String> = granted
+        .iter()
+        .filter_map(|row| row.get("path_pattern"))
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect();
+    if paths.is_empty() {
+        paths = extract_arg_string_vec(call_args, "paths");
+    }
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let exclusive = extract_arg_bool(call_args, "exclusive")
+        .or_else(|| {
+            granted
+                .first()
+                .and_then(|row| row.get("exclusive"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true);
+    let ttl_s = extract_arg_u64(call_args, "ttl_seconds").unwrap_or(3600);
+    let Some(project_value) = &ctx.project else {
+        return Vec::new();
+    };
+    let agent_value = ctx.agent.clone().unwrap_or_else(|| "unknown".to_string());
+    vec![tui_events::MailEvent::reservation_granted(
+        agent_value,
+        paths,
+        exclusive,
+        ttl_s,
+        project_value.clone(),
+    )]
+}
+
+fn derive_release_domain_events(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    if json_u64_field(payload, "released").unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+    let Some(project_value) = &ctx.project else {
+        return Vec::new();
+    };
+    let agent_value = ctx.agent.clone().unwrap_or_else(|| "unknown".to_string());
+    let mut paths = extract_arg_string_vec(call_args, "paths");
+    if paths.is_empty() {
+        paths = extract_arg_i64_vec(call_args, "file_reservation_ids")
+            .into_iter()
+            .map(|id| format!("id:{id}"))
+            .collect();
+    }
+    if paths.is_empty() {
+        paths.push("<all-active>".to_string());
+    }
+    vec![tui_events::MailEvent::reservation_released(
+        agent_value,
+        paths,
+        project_value.clone(),
+    )]
+}
+
+fn derive_force_release_domain_events(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    if json_u64_field(payload, "released").unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+    let Some(project_value) = &ctx.project else {
+        return Vec::new();
+    };
+    let reservation = payload.get("reservation");
+    let mut paths = reservation
+        .and_then(|r| r.get("path_pattern"))
+        .and_then(serde_json::Value::as_str)
+        .map(|path| vec![path.to_string()])
+        .unwrap_or_default();
+    if paths.is_empty() {
+        paths = extract_arg_u64(call_args, "file_reservation_id")
+            .map(|id| vec![format!("id:{id}")])
+            .unwrap_or_default();
+    }
+    if paths.is_empty() {
+        paths.push("<unknown>".to_string());
+    }
+    let agent_value = reservation
+        .and_then(|r| r.get("agent"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| ctx.agent.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    vec![tui_events::MailEvent::reservation_released(
+        agent_value,
+        paths,
+        project_value.clone(),
+    )]
+}
+
+fn derive_agent_registered_domain_events(
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    let Some(project_value) = &ctx.project else {
+        return Vec::new();
+    };
+    let Some(name) = payload.get("name").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(program) = payload.get("program").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(model) = payload.get("model").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    vec![tui_events::MailEvent::agent_registered(
+        name,
+        program,
+        model,
+        project_value.clone(),
+    )]
+}
+
+fn derive_domain_events_from_tool_payload(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) -> Vec<tui_events::MailEvent> {
+    let ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    match tool_name {
+        "send_message" | "reply_message" => derive_message_domain_events(payload, &ctx),
+        "fetch_inbox" | "fetch_inbox_product" => derive_fetch_inbox_domain_events(payload, &ctx),
+        "file_reservation_paths" => {
+            derive_reservation_granted_domain_events(call_args, payload, &ctx)
+        }
+        "release_file_reservations" => derive_release_domain_events(call_args, payload, &ctx),
+        "force_release_file_reservation" => {
+            derive_force_release_domain_events(call_args, payload, &ctx)
+        }
+        "register_agent" | "create_agent_identity" => {
+            derive_agent_registered_domain_events(payload, &ctx)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn derive_domain_events_from_tool_result(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    call_result: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) -> Vec<tui_events::MailEvent> {
+    let payload =
+        parse_call_tool_result_payload(call_result).unwrap_or_else(|| call_result.clone());
+    derive_domain_events_from_tool_payload(tool_name, call_args, &payload, project_hint, agent_hint)
 }
 
 fn log_tool_query_stats(
@@ -11712,6 +12132,302 @@ mod tests {
         assert!(per_table.iter().any(|(t, c)| t == "messages" && *c == 4));
         assert!(per_table.iter().any(|(t, c)| t == "projects" && *c == 1));
         assert!(!per_table.iter().any(|(t, _)| t == "agents"));
+    }
+
+    #[test]
+    fn derive_domain_events_from_send_message_payload() {
+        let payload = serde_json::json!({
+            "deliveries": [{
+                "project": "alpha",
+                "payload": {
+                    "id": 42,
+                    "from": "RedFox",
+                    "to": ["BlueLake"],
+                    "subject": "Hello",
+                    "thread_id": "br-42"
+                }
+            }],
+            "count": 1
+        });
+        let call_result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": payload.to_string()
+            }]
+        });
+
+        let events =
+            derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageSent {
+                id,
+                from,
+                to,
+                subject,
+                thread_id,
+                project,
+                ..
+            } => {
+                assert_eq!(*id, 42);
+                assert_eq!(from, "RedFox");
+                assert_eq!(to.as_slice(), ["BlueLake"]);
+                assert_eq!(subject, "Hello");
+                assert_eq!(thread_id, "br-42");
+                assert_eq!(project, "alpha");
+            }
+            other => panic!("expected MessageSent event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_plain_payload_fallback() {
+        let payload = serde_json::json!({
+            "deliveries": [{
+                "project": "alpha",
+                "payload": {
+                    "id": 99,
+                    "from": "RedFox",
+                    "to": ["BlueLake"],
+                    "subject": "Plain payload",
+                    "thread_id": "br-99"
+                }
+            }],
+            "count": 1
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "send_message",
+            None,
+            &payload,
+            Some("alpha"),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageSent { id, subject, .. } => {
+                assert_eq!(*id, 99);
+                assert_eq!(subject, "Plain payload");
+            }
+            other => panic!("expected MessageSent event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_reservation_grant_payload() {
+        let payload = serde_json::json!({
+            "granted": [{
+                "id": 7,
+                "path_pattern": "src/**",
+                "exclusive": false,
+                "reason": "test",
+                "expires_ts": "2026-01-01T00:00:00Z"
+            }],
+            "conflicts": []
+        });
+        let call_result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": payload.to_string()
+            }]
+        });
+        let call_args = serde_json::json!({
+            "agent_name": "BlueLake",
+            "ttl_seconds": 900,
+            "exclusive": false,
+            "paths": ["src/**"]
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "file_reservation_paths",
+            Some(&call_args),
+            &call_result,
+            Some("proj-alpha"),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::ReservationGranted {
+                agent,
+                paths,
+                exclusive,
+                ttl_s,
+                project,
+                ..
+            } => {
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(paths.as_slice(), ["src/**"]);
+                assert!(!exclusive);
+                assert_eq!(*ttl_s, 900);
+                assert_eq!(project, "proj-alpha");
+            }
+            other => panic!("expected ReservationGranted event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_fetch_inbox_payload() {
+        let payload = serde_json::json!([
+            {
+                "id": 1001,
+                "from": "GreenPeak",
+                "subject": "Need review",
+                "thread_id": "br-1001"
+            },
+            {
+                "id": 1002,
+                "from": "SilverCrest",
+                "subject": "Follow-up",
+                "thread_id": "br-1002"
+            }
+        ]);
+        let call_result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": payload.to_string()
+            }]
+        });
+        let call_args = serde_json::json!({
+            "agent_name": "BlueLake",
+            "project_key": "/data/projects/proj-alpha"
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "fetch_inbox",
+            Some(&call_args),
+            &call_result,
+            Some("proj-alpha"),
+            Some("BlueLake"),
+        );
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            tui_events::MailEvent::MessageReceived {
+                id,
+                from,
+                to,
+                subject,
+                thread_id,
+                project,
+                ..
+            } => {
+                assert_eq!(*id, 1001);
+                assert_eq!(from, "GreenPeak");
+                assert_eq!(to.as_slice(), ["BlueLake"]);
+                assert_eq!(subject, "Need review");
+                assert_eq!(thread_id, "br-1001");
+                assert_eq!(project, "proj-alpha");
+            }
+            other => panic!("expected MessageReceived event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_fetch_inbox_product_payload() {
+        let payload = serde_json::json!([{
+            "id": 2001,
+            "from": "GreenPeak",
+            "subject": "Product inbox",
+            "thread_id": "br-2001"
+        }]);
+        let call_args = serde_json::json!({
+            "agent_name": "BlueLake",
+            "project_key": "/data/projects/proj-alpha"
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "fetch_inbox_product",
+            Some(&call_args),
+            &payload,
+            Some("proj-alpha"),
+            Some("BlueLake"),
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::MessageReceived { id, subject, .. } => {
+                assert_eq!(*id, 2001);
+                assert_eq!(subject, "Product inbox");
+            }
+            other => panic!("expected MessageReceived event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_release_without_paths_uses_all_marker() {
+        let payload = serde_json::json!({
+            "released": 3,
+            "released_at": "2026-01-01T00:00:00Z"
+        });
+        let call_result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": payload.to_string()
+            }]
+        });
+        let call_args = serde_json::json!({
+            "agent_name": "BlueLake"
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "release_file_reservations",
+            Some(&call_args),
+            &call_result,
+            Some("proj-alpha"),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::ReservationReleased {
+                agent,
+                paths,
+                project,
+                ..
+            } => {
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(paths.as_slice(), ["<all-active>"]);
+                assert_eq!(project, "proj-alpha");
+            }
+            other => panic!("expected ReservationReleased event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_register_agent_payload() {
+        let payload = serde_json::json!({
+            "id": 1,
+            "name": "BlueLake",
+            "program": "codex-cli",
+            "model": "gpt5-codex"
+        });
+        let call_result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": payload.to_string()
+            }]
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "register_agent",
+            None,
+            &call_result,
+            Some("proj-alpha"),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::AgentRegistered {
+                name,
+                program,
+                model_name,
+                project,
+                ..
+            } => {
+                assert_eq!(name, "BlueLake");
+                assert_eq!(program, "codex-cli");
+                assert_eq!(model_name, "gpt5-codex");
+                assert_eq!(project, "proj-alpha");
+            }
+            other => panic!("expected AgentRegistered event, got {other:?}"),
+        }
     }
 
     #[test]

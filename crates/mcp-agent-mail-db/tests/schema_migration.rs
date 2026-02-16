@@ -18,7 +18,8 @@
 use asupersync::cx::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_db::schema::{
-    self, MIGRATIONS_TABLE_NAME, PRAGMA_SETTINGS_SQL, migrate_to_latest, migration_status,
+    self, MIGRATIONS_TABLE_NAME, PRAGMA_SETTINGS_SQL, enforce_runtime_identity_fts_cleanup,
+    migrate_to_latest, migration_status,
 };
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
@@ -623,6 +624,9 @@ fn pool_initialization_creates_same_schema_as_direct_migration() {
         let conn = &conn;
         move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
     });
+    // Apply the same runtime cleanup that pool startup performs (drops legacy
+    // identity FTS tables: fts_agents, fts_projects and their triggers).
+    enforce_runtime_identity_fts_cleanup(&conn).expect("identity fts cleanup");
 
     let direct_tables: Vec<String> = conn
         .query_sync(

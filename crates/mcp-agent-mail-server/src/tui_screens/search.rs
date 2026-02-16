@@ -779,6 +779,8 @@ pub struct SearchCockpitScreen {
     dock_drag: DockDragState,
     /// Last rendered query bar area.
     last_query_area: Cell<Rect>,
+    /// Last rendered full screen area.
+    last_screen_area: Cell<Rect>,
     /// Last rendered facet area.
     last_facet_area: Cell<Rect>,
     /// Last rendered results area.
@@ -830,6 +832,7 @@ impl SearchCockpitScreen {
             dock: DockLayout::right_40(),
             dock_drag: DockDragState::Idle,
             last_query_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_screen_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_facet_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
@@ -875,7 +878,7 @@ impl SearchCockpitScreen {
             return;
         }
         self.db_conn_attempted = true;
-        let db_url = &state.config_snapshot().database_url;
+        let db_url = &state.config_snapshot().raw_database_url;
         let cfg = DbPoolConfig {
             database_url: db_url.clone(),
             ..Default::default()
@@ -1526,6 +1529,18 @@ impl MailScreen for SearchCockpitScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         match event {
             Event::Mouse(mouse) => {
+                if self.query_help_visible {
+                    let popup = query_help_popup_rect(
+                        self.last_screen_area.get(),
+                        self.last_query_area.get(),
+                    );
+                    let inside = popup.is_some_and(|rect| point_in_rect(rect, mouse.x, mouse.y));
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && !inside {
+                        self.query_help_visible = false;
+                    }
+                    // Query help popup traps pointer input while visible.
+                    return Cmd::None;
+                }
                 let split_area = self.last_split_area.get();
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -1897,6 +1912,7 @@ impl MailScreen for SearchCockpitScreen {
         let query_area = Rect::new(area.x, area.y, area.width, query_h);
         let body_area = Rect::new(area.x, area.y + query_h, area.width, body_h);
         self.last_query_area.set(query_area);
+        self.last_screen_area.set(area);
 
         let layout_label = if self.dock.visible {
             self.dock.state_label()
@@ -1917,21 +1933,24 @@ impl MailScreen for SearchCockpitScreen {
 
         // Body: facet rail (left) + dock-split content area (results/detail)
         let min_remaining_for_results: u16 = 26;
-        let max_facet_w = body_area
-            .width
-            .saturating_sub(min_remaining_for_results)
-            .max(12);
+        let max_facet_w = body_area.width.saturating_sub(min_remaining_for_results);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let computed_facet_w = ((f32::from(body_area.width) * 0.2).round() as u16).clamp(12, 28);
-        let facet_w: u16 = computed_facet_w.min(max_facet_w).max(12);
+        let facet_w: u16 = if body_area.width <= min_remaining_for_results {
+            0
+        } else {
+            computed_facet_w.min(max_facet_w).min(body_area.width)
+        };
         let facet_area = Rect::new(body_area.x, body_area.y, facet_w, body_area.height);
         self.last_facet_area.set(facet_area);
-        render_facet_rail(
-            frame,
-            facet_area,
-            self,
-            matches!(self.focus, Focus::FacetRail),
-        );
+        if facet_area.width > 0 {
+            render_facet_rail(
+                frame,
+                facet_area,
+                self,
+                matches!(self.focus, Focus::FacetRail),
+            );
+        }
 
         let split_area = Rect::new(
             body_area.x + facet_w,
@@ -2433,23 +2452,33 @@ fn render_query_bar(
     }
 }
 
-fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) {
-    if area.width < 28 || area.height < 8 {
-        return;
+fn query_help_popup_rect(area: Rect, query_area: Rect) -> Option<Rect> {
+    if area.width < 28 || area.height < 6 {
+        return None;
     }
-
     let width = area.width.saturating_sub(2).min(60);
-    let height: u16 = 8;
-    if width < 24 || area.height <= height {
-        return;
+    let height = 8_u16.min(area.height.saturating_sub(2));
+    if width < 24 || height < 5 {
+        return None;
     }
-
     let x = area.x + 1;
-    // Position popup just below the query area (not overlapping)
-    let desired_y = query_area.y + query_area.height;
-    let max_y = area.y + area.height.saturating_sub(height);
-    let y = desired_y.min(max_y);
-    let popup_area = Rect::new(x, y, width, height);
+    // Prefer below query bar, but flip above when there is not enough room.
+    let below_y = query_area.y.saturating_add(query_area.height);
+    let area_bottom = area.y.saturating_add(area.height);
+    let y = if below_y.saturating_add(height) <= area_bottom {
+        below_y
+    } else if query_area.y >= area.y.saturating_add(height) {
+        query_area.y.saturating_sub(height)
+    } else {
+        area_bottom.saturating_sub(height)
+    };
+    Some(Rect::new(x, y.max(area.y), width, height))
+}
+
+fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) {
+    let Some(popup_area) = query_help_popup_rect(area, query_area) else {
+        return;
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3927,6 +3956,55 @@ mod tests {
             text.contains("subject:deploy"),
             "expected column example, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn query_help_popup_rect_flips_above_query_when_needed() {
+        let area = Rect::new(0, 0, 80, 12);
+        let query_area = Rect::new(0, 8, 80, 4);
+        let popup = query_help_popup_rect(area, query_area).expect("popup rect");
+        assert!(popup.y < query_area.y);
+    }
+
+    #[test]
+    fn query_help_popup_mouse_outside_dismisses_and_traps() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_help_visible = true;
+        screen.last_screen_area.set(Rect::new(0, 0, 100, 30));
+        screen.last_query_area.set(Rect::new(0, 0, 100, 6));
+
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: 0,
+            y: 29,
+            modifiers: Modifiers::empty(),
+        });
+        let _ = screen.update(&click, &state);
+        assert!(!screen.query_help_visible);
+    }
+
+    #[test]
+    fn query_help_popup_mouse_inside_keeps_popup_visible() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_help_visible = true;
+        screen.last_screen_area.set(Rect::new(0, 0, 100, 30));
+        screen.last_query_area.set(Rect::new(0, 0, 100, 6));
+        let popup =
+            query_help_popup_rect(screen.last_screen_area.get(), screen.last_query_area.get())
+                .expect("popup rect");
+
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: popup.x.saturating_add(1),
+            y: popup.y.saturating_add(1),
+            modifiers: Modifiers::empty(),
+        });
+        let _ = screen.update(&click, &state);
+        assert!(screen.query_help_visible);
     }
 
     #[test]

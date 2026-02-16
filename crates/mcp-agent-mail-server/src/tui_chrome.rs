@@ -88,6 +88,7 @@ const fn category_key_color(
 }
 
 /// Render the tab bar into a 1-row area.
+#[allow(clippy::too_many_lines)]
 pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut Frame, area: Rect) {
     use ftui::text::{Line, Span, Text};
     use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
@@ -125,13 +126,19 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
 
         // " 1:Label " — each tab has fixed structure
         let key_str = format!("{number}");
+        let key_w = u16::try_from(display_width(key_str.as_str())).unwrap_or(u16::MAX);
+        let label_w = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
         // Width: indicator + space + key + colon? + label? + space
         let has_label = !label.is_empty();
         let tab_width = if has_label {
-            u16::try_from(1 + key_str.len() + 1 + label.len() + 1).unwrap_or(u16::MAX)
+            1_u16
+                .saturating_add(key_w)
+                .saturating_add(1)
+                .saturating_add(label_w)
+                .saturating_add(1)
         } else {
             // Ultra-compact: " 1 " (space + key + space)
-            u16::try_from(1 + key_str.len() + 1).unwrap_or(u16::MAX)
+            1_u16.saturating_add(key_w).saturating_add(1)
         };
 
         // Inter-tab separator (heavier between categories, lighter within)
@@ -232,6 +239,8 @@ pub fn record_tab_hit_slots(area: Rect, dispatcher: &crate::tui_hit_regions::Mou
 
     for (i, meta) in MAIL_SCREEN_REGISTRY.iter().enumerate() {
         let number = i + 1;
+        let key_str = format!("{number}");
+        let key_w = u16::try_from(display_width(key_str.as_str())).unwrap_or(u16::MAX);
         let label = if ultra_compact {
             ""
         } else if compact {
@@ -239,13 +248,16 @@ pub fn record_tab_hit_slots(area: Rect, dispatcher: &crate::tui_hit_regions::Mou
         } else {
             meta.title
         };
-        let key_str_len = if number >= 10 { 2 } else { 1 };
+        let label_w = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
         let has_label = !label.is_empty();
-        #[allow(clippy::cast_possible_truncation)]
         let tab_width: u16 = if has_label {
-            (1 + key_str_len + 1 + label.len() + 1) as u16
+            1_u16
+                .saturating_add(key_w)
+                .saturating_add(1)
+                .saturating_add(label_w)
+                .saturating_add(1)
         } else {
-            (1 + key_str_len + 1) as u16
+            1_u16.saturating_add(key_w).saturating_add(1)
         };
 
         // Separator before each tab except the first.
@@ -296,6 +308,70 @@ struct StatusSegment {
     fg: PackedRgba,
     bold: bool,
     effect: StatusEffect,
+}
+
+fn status_group_width(segments: &[StatusSegment], separated: bool) -> u16 {
+    segments.iter().enumerate().fold(0u16, |acc, (idx, seg)| {
+        let sep = if separated && idx > 0 { 3 } else { 0 };
+        let width = u16::try_from(display_width(&seg.text)).unwrap_or(u16::MAX);
+        acc.saturating_add(sep).saturating_add(width)
+    })
+}
+
+fn status_total_width(
+    left: &[StatusSegment],
+    center: &[StatusSegment],
+    right: &[StatusSegment],
+) -> u16 {
+    let left_width = status_group_width(left, false);
+    let center_width = status_group_width(center, true);
+    let right_width = status_group_width(right, false);
+    left_width
+        .saturating_add(center_width)
+        .saturating_add(right_width)
+}
+
+fn drop_last_priority(segments: &mut Vec<StatusSegment>, priority: StatusPriority) -> bool {
+    segments
+        .iter()
+        .rposition(|seg| seg.priority == priority)
+        .is_some_and(|idx| {
+            segments.remove(idx);
+            true
+        })
+}
+
+fn prune_status_segments_to_fit(
+    left: &mut Vec<StatusSegment>,
+    center: &mut Vec<StatusSegment>,
+    right: &mut Vec<StatusSegment>,
+    available: u16,
+) {
+    loop {
+        if status_total_width(left, center, right) <= available {
+            break;
+        }
+        let removed = drop_last_priority(center, StatusPriority::Low)
+            || drop_last_priority(left, StatusPriority::Low)
+            || drop_last_priority(right, StatusPriority::Low)
+            || drop_last_priority(center, StatusPriority::Medium)
+            || drop_last_priority(left, StatusPriority::Medium)
+            || drop_last_priority(right, StatusPriority::Medium)
+            || drop_last_priority(center, StatusPriority::High)
+            || drop_last_priority(left, StatusPriority::High)
+            || drop_last_priority(right, StatusPriority::High);
+        if removed {
+            continue;
+        }
+
+        // Preserve the help affordance when possible and peel other critical
+        // tags first (e.g. LIVE on ultra-narrow terminals).
+        if right.len() > 1 {
+            right.pop();
+            continue;
+        }
+        break;
+    }
 }
 
 /// Compute which segments to show given available width.
@@ -493,22 +569,6 @@ fn plan_status_segments(
         });
     }
 
-    // Drop segments that don't fit.
-    // Width breakpoints: Critical always fits, High >= 60, Medium >= 80, Low >= 100.
-    let max_priority = if available >= 100 {
-        StatusPriority::Low
-    } else if available >= 80 {
-        StatusPriority::Medium
-    } else if available >= 60 {
-        StatusPriority::High
-    } else {
-        StatusPriority::Critical
-    };
-
-    left.retain(|s| s.priority <= max_priority);
-    center.retain(|s| s.priority <= max_priority);
-    right.retain(|s| s.priority <= max_priority);
-
     // If both Medium error count and Low full counters survived, drop
     // the Medium error-only duplicate (full counters include it).
     if center.len() > 1
@@ -518,6 +578,22 @@ fn plan_status_segments(
     {
         center.retain(|s| !(s.priority == StatusPriority::Medium && s.text.starts_with("err:")));
     }
+
+    // Coarse priority bands by width, then fine-grained pruning for fit.
+    let max_priority = if available >= 100 {
+        StatusPriority::Low
+    } else if available >= 80 {
+        StatusPriority::Medium
+    } else if available >= 60 {
+        StatusPriority::High
+    } else {
+        StatusPriority::Critical
+    };
+    left.retain(|s| s.priority <= max_priority);
+    center.retain(|s| s.priority <= max_priority);
+    right.retain(|s| s.priority <= max_priority);
+
+    prune_status_segments_to_fit(&mut left, &mut center, &mut right, available);
 
     (left, center, right)
 }
@@ -730,8 +806,10 @@ pub fn render_help_overlay_sections(
     let key_col = 14u16;
     let col_width = inner.width.saturating_sub(1);
     let mut line_idx: u16 = 0;
-    let visible_start = scroll_offset;
-    let visible_end = scroll_offset.saturating_add(inner.height);
+    let max_scroll = total_lines.saturating_sub(usize::from(inner.height));
+    let clamped_scroll = usize::from(scroll_offset).min(max_scroll);
+    let visible_start = u16::try_from(clamped_scroll).unwrap_or(u16::MAX);
+    let visible_end = visible_start.saturating_add(inner.height);
     let mut y_pos = 0u16;
 
     for (si, section) in sections.iter().enumerate() {

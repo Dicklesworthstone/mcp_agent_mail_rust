@@ -242,5 +242,5 @@ export CARGO_TARGET_DIR="/tmp/target-$(whoami)-am"
 
 - Rust nightly required (see `rust-toolchain.toml`)
 - Uses local workspace crates from sibling directories: `fastmcp_rust`,
-  `sqlmodel_rust`, `asupersync`, `frankentui`, `beads_rust`,
-  `coding_agent_session_search`
+  `sqlmodel_rust`, `asupersync`, `frankentui`, `beads_rust`, plus
+  crates.io `franken-agent-detection` for installed-agent probing

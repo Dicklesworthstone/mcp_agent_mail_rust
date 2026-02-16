@@ -1124,7 +1124,7 @@ impl MessageBrowserScreen {
             return;
         }
         self.db_conn_attempted = true;
-        let db_url = &state.config_snapshot().database_url;
+        let db_url = &state.config_snapshot().raw_database_url;
         let cfg = DbPoolConfig {
             database_url: db_url.clone(),
             ..Default::default()
@@ -1168,6 +1168,7 @@ impl MessageBrowserScreen {
         // Merge live events from the event ring buffer.
         // Live events may contain messages not yet committed to the DB.
         let live = Self::search_live_events(state, &query, show_project);
+        let mut live_added = 0usize;
         if !live.is_empty() {
             // Collect DB result IDs for dedup (live events with a positive ID
             // that already appears in DB results are skipped).
@@ -1183,13 +1184,14 @@ impl MessageBrowserScreen {
                     }
                 }
                 results.push(entry);
+                live_added = live_added.saturating_add(1);
             }
             // Re-sort by timestamp descending (newest first)
             results.sort_by_key(|r| std::cmp::Reverse(r.timestamp_micros));
         }
 
         self.results = results;
-        self.total_results = total;
+        self.total_results = total.saturating_add(live_added);
 
         // Clamp cursor
         if self.results.is_empty() {

@@ -171,7 +171,7 @@ screens = ["Search", "Explorer", "Analytics", "Tool Metrics"]
 seen = []
 seen_set = set()
 pat_by_screen = {
-    screen: re.compile(re.escape(screen) + r"\s*\|\s*mode:", re.IGNORECASE)
+    screen: re.compile(re.escape(screen) + r"\s+(?:mcp\s|cli\s|\|\s*mode:)", re.IGNORECASE)
     for screen in screens
 }
 
@@ -313,7 +313,7 @@ spawn env DATABASE_URL=sqlite:////$db \
 sleep 5
 
 proc tab_to_screen {label max_steps} {
-    set pat [format {%s \| mode:} $label]
+    set pat [format {%s\s+(mcp|cli|\|)} $label]
     for {set i 0} {$i < $max_steps} {incr i} {
         send "\t"
         sleep 0.35
@@ -326,7 +326,7 @@ proc tab_to_screen {label max_steps} {
 }
 
 # Wait for the dashboard chrome to appear first.
-expect -timeout 8 -re {Dashboard \| mode:} {}
+expect -timeout 8 -re {Dashboard\s+(mcp|cli|\|)} {}
 
 # Keyboard-only navigation across core screens.
 # Prefer Tab cycling (more deterministic than palette search selection).
@@ -534,5 +534,27 @@ fi
 
 # After toggling off, the Tool Metrics hint label should not appear.
 e2e_assert_file_not_contains "key hints hidden" "${RENDERED4}" "Navigate tools"
+
+# Write adapter result manifest if requested by the harness.
+if [ -n "${AM_TUI_A11Y_ADAPTER_OUTPUT:-}" ]; then
+    _adapter_status="pass"
+    _adapter_exit=0
+    if [ "${_E2E_FAIL:-0}" -gt 0 ]; then
+        _adapter_status="fail"
+        _adapter_exit=1
+    fi
+    cat > "${AM_TUI_A11Y_ADAPTER_OUTPUT}" <<ADAPTER_EOF
+{
+  "suite": "${E2E_SUITE}",
+  "timestamp": "$(_e2e_now_rfc3339)",
+  "status": "${_adapter_status}",
+  "exit_code": ${_adapter_exit},
+  "artifact_dir": "${E2E_ARTIFACT_DIR}",
+  "summary_path": "${E2E_ARTIFACT_DIR}/summary.json",
+  "bundle_path": "${E2E_ARTIFACT_DIR}/bundle.json",
+  "trace_path": "${E2E_ARTIFACT_DIR}/trace/events.jsonl"
+}
+ADAPTER_EOF
+fi
 
 e2e_summary

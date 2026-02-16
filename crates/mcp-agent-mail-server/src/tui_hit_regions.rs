@@ -297,8 +297,8 @@ impl MouseDispatcher {
     /// Priority order (highest first):
     /// 1. Tab bar clicks → `SwitchScreen`
     /// 2. Status line clicks:
-    ///    - Left help zone → `ToggleHelp`
     ///    - Right palette zone → `OpenPalette`
+    ///    - Right-adjacent help zone → `ToggleHelp`
     ///    - Center region → `Forward`
     /// 3. Everything else → `Forward` to active screen
     ///
@@ -328,14 +328,22 @@ impl MouseDispatcher {
         let status_area = self.status_line_area.get();
         if point_in_rect(status_area, mx, my) {
             let rel_x = mx.saturating_sub(status_area.x);
-            let help_zone = STATUS_HELP_ZONE_WIDTH.min(status_area.width);
-            if rel_x < help_zone {
-                return MouseAction::ToggleHelp;
+            let mut palette_zone = STATUS_PALETTE_ZONE_WIDTH.min(status_area.width);
+            let mut help_zone =
+                STATUS_HELP_ZONE_WIDTH.min(status_area.width.saturating_sub(palette_zone));
+            if help_zone == 0 && status_area.width > 1 {
+                // On ultra-narrow status bars, split the line so both actions
+                // remain reachable.
+                help_zone = status_area.width / 2;
+                palette_zone = status_area.width.saturating_sub(help_zone);
             }
-
-            let palette_zone = STATUS_PALETTE_ZONE_WIDTH.min(status_area.width);
-            if rel_x >= status_area.width.saturating_sub(palette_zone) {
+            let palette_start = status_area.width.saturating_sub(palette_zone);
+            if rel_x >= palette_start {
                 return MouseAction::OpenPalette;
+            }
+            let help_start = palette_start.saturating_sub(help_zone);
+            if rel_x >= help_start {
+                return MouseAction::ToggleHelp;
             }
 
             return MouseAction::Forward;
@@ -589,7 +597,7 @@ mod tests {
     fn dispatcher_status_line_click_toggles_help() {
         let d = MouseDispatcher::new();
         d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
-        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 5, 24);
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 52, 24);
         assert_eq!(d.dispatch(&ev), MouseAction::ToggleHelp);
     }
 
@@ -605,8 +613,20 @@ mod tests {
     fn dispatcher_status_center_forwards() {
         let d = MouseDispatcher::new();
         d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
-        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 40, 24);
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 24, 24);
         assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn dispatcher_status_narrow_width_keeps_help_and_palette_accessible() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 10, 1), Rect::new(0, 24, 10, 1));
+
+        let help = make_mouse(MouseEventKind::Down(MouseButton::Left), 1, 24);
+        assert_eq!(d.dispatch(&help), MouseAction::ToggleHelp);
+
+        let palette = make_mouse(MouseEventKind::Down(MouseButton::Left), 9, 24);
+        assert_eq!(d.dispatch(&palette), MouseAction::OpenPalette);
     }
 
     #[test]

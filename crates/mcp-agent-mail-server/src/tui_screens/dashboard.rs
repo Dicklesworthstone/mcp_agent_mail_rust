@@ -23,8 +23,8 @@ use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{
-    DbStatSnapshot, EventLogEntry, EventSeverity, MailEvent, MailEventKind, VerbosityTier,
-    format_event_timestamp,
+    AgentSummary, ContactSummary, DbStatSnapshot, EventLogEntry, EventSeverity, MailEvent,
+    MailEventKind, ProjectSummary, ReservationSnapshot, VerbosityTier, format_event_timestamp,
 };
 use crate::tui_layout::{
     DensityHint, PanelConstraint, PanelPolicy, PanelSlot, ReactiveLayout, SplitAxis, TerminalClass,
@@ -32,8 +32,9 @@ use crate::tui_layout::{
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::{
     AnomalyCard, AnomalySeverity, ChartTransition, MetricTile, MetricTrend, PercentileRibbon,
-    PercentileSample,
+    PercentileSample, ReservationGauge,
 };
+use ftui_widgets::input::TextInput;
 use ftui_widgets::sparkline::Sparkline;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -96,6 +97,11 @@ const PERCENTILE_HISTORY_CAP: usize = 120;
 const THROUGHPUT_HISTORY_CAP: usize = 120;
 /// Chart transition duration for throughput updates.
 const CHART_TRANSITION_DURATION: Duration = Duration::from_millis(200);
+const RECENT_MESSAGE_PREVIEW_STALE_MICROS: i64 = 10 * 60 * 1_000_000;
+const RESERVATION_SOON_THRESHOLD_MICROS: i64 = 5 * 60 * 1_000_000;
+const AGENT_ACTIVE_THRESHOLD_MICROS: i64 = 60 * 1_000_000;
+const AGENT_IDLE_THRESHOLD_MICROS: i64 = 5 * 60 * 1_000_000;
+const TOP_MATCH_SAMPLE_CAP: usize = 4;
 
 /// Anomaly thresholds.
 const ACK_PENDING_WARN: u64 = 3;
@@ -131,6 +137,15 @@ impl DashboardQuickFilter {
         }
     }
 
+    const fn control_label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Messages => "Msg",
+            Self::Tools => "Tools",
+            Self::Reservations => "Resv",
+        }
+    }
+
     const fn key(self) -> &'static str {
         match self {
             Self::All => "1",
@@ -138,6 +153,10 @@ impl DashboardQuickFilter {
             Self::Tools => "3",
             Self::Reservations => "4",
         }
+    }
+
+    const fn includes_messages(self) -> bool {
+        matches!(self, Self::All | Self::Messages)
     }
 }
 
@@ -220,6 +239,10 @@ pub struct DashboardScreen {
     chart_animations_enabled: bool,
     /// Whether the console log panel is visible (toggled with `l`).
     show_log_panel: bool,
+    /// Live dashboard query input (`/` to focus). Filters every panel in-place.
+    quick_query_input: TextInput,
+    /// True while the query input has keyboard focus.
+    quick_query_active: bool,
     /// Console log pane for tool call cards / HTTP requests.
     console_log: RefCell<crate::console::LogPane>,
     /// Last consumed console log sequence number.
@@ -234,6 +257,7 @@ pub(crate) type EventEntry = EventLogEntry;
 /// Dashboard preview payload for the most recent message event.
 #[derive(Debug, Clone)]
 struct RecentMessagePreview {
+    timestamp_micros: i64,
     direction: &'static str,
     timestamp: String,
     from: String,
@@ -255,6 +279,7 @@ impl RecentMessagePreview {
                 project,
                 ..
             } => Some(Self {
+                timestamp_micros: *timestamp_micros,
                 direction: "Outbound",
                 timestamp: format_ts(*timestamp_micros),
                 from: from.clone(),
@@ -272,6 +297,7 @@ impl RecentMessagePreview {
                 project,
                 ..
             } => Some(Self {
+                timestamp_micros: *timestamp_micros,
                 direction: "Inbound",
                 timestamp: format_ts(*timestamp_micros),
                 from: from.clone(),
@@ -306,6 +332,12 @@ impl RecentMessagePreview {
             self.direction, self.timestamp, subject, self.from, self.to, thread, project
         )
     }
+
+    fn is_stale(&self) -> bool {
+        unix_epoch_micros_now().is_some_and(|now| {
+            now.saturating_sub(self.timestamp_micros) > RECENT_MESSAGE_PREVIEW_STALE_MICROS
+        })
+    }
 }
 
 impl DashboardScreen {
@@ -333,6 +365,10 @@ impl DashboardScreen {
             reduced_motion: reduced_motion_enabled(),
             chart_animations_enabled: chart_animations_enabled(),
             show_log_panel: false,
+            quick_query_input: TextInput::new()
+                .with_placeholder("Type to live-filter dashboard; Enter opens Search Cockpit")
+                .with_focused(false),
+            quick_query_active: false,
             console_log: RefCell::new(crate::console::LogPane::new()),
             console_log_last_seq: 0,
             event_log_viewer: RefCell::new(crate::console::LogPane::new()),
@@ -358,13 +394,29 @@ impl DashboardScreen {
 
     /// Visible entries after applying verbosity tier and type filter.
     fn visible_entries(&self) -> Vec<&EventEntry> {
+        let query_terms = parse_query_terms(self.quick_query());
         self.event_log
             .iter()
             .filter(|e| {
                 self.verbosity.includes(e.severity)
                     && (self.type_filter.is_empty() || self.type_filter.contains(&e.kind))
+                    && event_entry_matches_query(e, &query_terms)
             })
             .collect()
+    }
+
+    fn quick_query(&self) -> &str {
+        self.quick_query_input.value().trim()
+    }
+
+    fn begin_query_edit(&mut self) {
+        self.quick_query_active = true;
+        self.quick_query_input.set_focused(true);
+    }
+
+    fn end_query_edit(&mut self) {
+        self.quick_query_active = false;
+        self.quick_query_input.set_focused(false);
     }
 
     /// Detect anomalies from current state.
@@ -515,6 +567,7 @@ impl DashboardScreen {
                 SplitAxis::Horizontal,
                 PanelConstraint::HIDDEN,
             )
+            .at(TerminalClass::Normal, PanelConstraint::visible(0.22, 5))
             .at(TerminalClass::Wide, PanelConstraint::visible(0.30, 8))
             .at(TerminalClass::UltraWide, PanelConstraint::visible(0.28, 9)),
         )
@@ -538,10 +591,20 @@ impl DashboardScreen {
                 self.type_filter.insert(MailEventKind::ReservationReleased);
             }
         }
+        self.clamp_scroll_offset();
     }
 
     fn cycle_quick_filter(&mut self) {
         self.apply_quick_filter(self.quick_filter.next());
+    }
+
+    fn clamp_scroll_offset(&mut self) {
+        if self.auto_follow {
+            self.scroll_offset = 0;
+            return;
+        }
+        let max_scroll = self.visible_entries().len().saturating_sub(1);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
     }
 }
 
@@ -552,70 +615,113 @@ impl Default for DashboardScreen {
 }
 
 impl MailScreen for DashboardScreen {
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         match event {
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                // Scroll
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if self.scroll_offset > 0 {
-                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if self.quick_query_active {
+                    match key.code {
+                        KeyCode::Enter => {
+                            let query = self.quick_query().to_string();
+                            self.end_query_edit();
+                            return Cmd::msg(MailScreenMsg::DeepLink(
+                                DeepLinkTarget::SearchFocused(query),
+                            ));
+                        }
+                        KeyCode::Escape | KeyCode::Tab => {
+                            self.end_query_edit();
+                        }
+                        _ => {
+                            let before = self.quick_query_input.value().to_string();
+                            self.quick_query_input.handle_event(event);
+                            if self.quick_query_input.value() != before {
+                                self.clamp_scroll_offset();
+                            }
+                        }
                     }
-                    if self.scroll_offset == 0 {
+                    return Cmd::None;
+                }
+
+                match key.code {
+                    KeyCode::Char('/') => {
+                        self.begin_query_edit();
+                    }
+                    KeyCode::Escape => {
+                        if !self.quick_query().is_empty() {
+                            self.quick_query_input.clear();
+                            self.clamp_scroll_offset();
+                        }
+                    }
+                    // Scroll
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if self.scroll_offset > 0 {
+                            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                        }
+                        if self.scroll_offset == 0 {
+                            self.auto_follow = true;
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.scroll_offset += 1;
+                        self.auto_follow = false;
+                    }
+                    KeyCode::Char('G') | KeyCode::End => {
+                        self.scroll_offset = 0;
                         self.auto_follow = true;
                     }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.scroll_offset += 1;
-                    self.auto_follow = false;
-                }
-                KeyCode::Char('G') | KeyCode::End => {
-                    self.scroll_offset = 0;
-                    self.auto_follow = true;
-                }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    let visible = self.visible_entries();
-                    self.scroll_offset = visible.len().saturating_sub(1);
-                    self.auto_follow = false;
-                }
-                // Toggle follow mode
-                KeyCode::Char('f') => {
-                    self.auto_follow = !self.auto_follow;
-                    if self.auto_follow {
-                        self.scroll_offset = 0;
+                    KeyCode::Char('g') | KeyCode::Home => {
+                        let visible = self.visible_entries();
+                        self.scroll_offset = visible.len().saturating_sub(1);
+                        self.auto_follow = false;
                     }
-                }
-                // Deep-link: jump to Timeline at focused event timestamp.
-                KeyCode::Enter => {
-                    let visible = self.visible_entries();
-                    let idx = visible.len().saturating_sub(1 + self.scroll_offset);
-                    if let Some(entry) = visible.get(idx) {
-                        return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::TimelineAtTime(
-                            entry.timestamp_micros,
-                        )));
+                    // Toggle follow mode
+                    KeyCode::Char('f') => {
+                        self.auto_follow = !self.auto_follow;
+                        if self.auto_follow {
+                            self.scroll_offset = 0;
+                        }
                     }
+                    // Enter with query jumps to Search; otherwise timeline at focused event.
+                    KeyCode::Enter => {
+                        if !self.quick_query().is_empty() {
+                            return Cmd::msg(MailScreenMsg::DeepLink(
+                                DeepLinkTarget::SearchFocused(self.quick_query().to_string()),
+                            ));
+                        }
+                        let visible = self.visible_entries();
+                        let idx = visible.len().saturating_sub(1 + self.scroll_offset);
+                        if let Some(entry) = visible.get(idx) {
+                            return Cmd::msg(MailScreenMsg::DeepLink(
+                                DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
+                            ));
+                        }
+                    }
+                    // Cycle verbosity tier
+                    KeyCode::Char('v') => {
+                        self.verbosity = self.verbosity.next();
+                        self.clamp_scroll_offset();
+                    }
+                    // Toggle trend panel visibility
+                    KeyCode::Char('p') => {
+                        self.show_trend_panel = !self.show_trend_panel;
+                    }
+                    // Toggle console log panel
+                    KeyCode::Char('l') => {
+                        self.show_log_panel = !self.show_log_panel;
+                    }
+                    // Toggle type filter
+                    KeyCode::Char('t') => {
+                        self.cycle_quick_filter();
+                    }
+                    KeyCode::Char('1') => self.apply_quick_filter(DashboardQuickFilter::All),
+                    KeyCode::Char('2') => self.apply_quick_filter(DashboardQuickFilter::Messages),
+                    KeyCode::Char('3') => self.apply_quick_filter(DashboardQuickFilter::Tools),
+                    KeyCode::Char('4') => {
+                        self.apply_quick_filter(DashboardQuickFilter::Reservations);
+                    }
+                    _ => {}
                 }
-                // Cycle verbosity tier
-                KeyCode::Char('v') => {
-                    self.verbosity = self.verbosity.next();
-                }
-                // Toggle trend panel visibility
-                KeyCode::Char('p') => {
-                    self.show_trend_panel = !self.show_trend_panel;
-                }
-                // Toggle console log panel
-                KeyCode::Char('l') => {
-                    self.show_log_panel = !self.show_log_panel;
-                }
-                // Toggle type filter
-                KeyCode::Char('t') => {
-                    self.cycle_quick_filter();
-                }
-                KeyCode::Char('1') => self.apply_quick_filter(DashboardQuickFilter::All),
-                KeyCode::Char('2') => self.apply_quick_filter(DashboardQuickFilter::Messages),
-                KeyCode::Char('3') => self.apply_quick_filter(DashboardQuickFilter::Tools),
-                KeyCode::Char('4') => self.apply_quick_filter(DashboardQuickFilter::Reservations),
-                _ => {}
-            },
+            }
             // Mouse: scroll wheel moves event log (parity with j/k)
             Event::Mouse(mouse) => match mouse.kind {
                 ftui::MouseEventKind::ScrollDown => {
@@ -651,6 +757,9 @@ impl MailScreen for DashboardScreen {
 
         // Ingest new events every tick
         self.ingest_events(state);
+        // Keep scroll offset in-bounds so the log view never goes empty due
+        // stale offsets after trims/filter changes.
+        self.clamp_scroll_offset();
 
         // Ingest console log entries when panel is visible
         if self.show_log_panel {
@@ -751,7 +860,10 @@ impl MailScreen for DashboardScreen {
             render_anomaly_rail(frame, anomaly_area, &self.anomalies);
         }
 
-        // Main: event log + optional trend panel + recent message markdown preview + console log.
+        // Main: dense adaptive dashboard composition.
+        let db_snapshot = state.db_stats_snapshot().unwrap_or_default();
+        let visible_entries = self.visible_entries();
+        let quick_query = self.quick_query();
         let layout = Self::main_content_layout(self.show_trend_panel, self.show_log_panel);
         let comp = layout.compute(main_area);
         // When the anomaly rail is hidden (Tiny), inject an inline annotation
@@ -761,11 +873,15 @@ impl MailScreen for DashboardScreen {
         } else {
             0
         };
-        render_event_log(
+        render_primary_cluster(
             frame,
             comp.primary(),
             &self.event_log_viewer,
-            &self.visible_entries(),
+            &self.quick_query_input,
+            self.quick_query_active,
+            quick_query,
+            &db_snapshot,
+            &visible_entries,
             self.scroll_offset,
             self.auto_follow,
             self.quick_filter,
@@ -774,19 +890,33 @@ impl MailScreen for DashboardScreen {
             effects_enabled && !self.reduced_motion,
         );
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
-            render_trend_panel(
+            render_insight_rail(
                 frame,
                 trend_rect,
+                &db_snapshot,
+                quick_query,
+                &self.anomalies,
+                &visible_entries,
                 &self.percentile_history,
                 &self.animated_throughput_history,
                 &self.event_log,
             );
         }
         if let Some(preview_rect) = comp.rect(PanelSlot::Footer) {
-            render_recent_message_preview_panel(
+            let preview = if self.quick_filter.includes_messages() {
+                self.recent_message_preview
+                    .as_ref()
+                    .filter(|preview| !preview.is_stale())
+            } else {
+                None
+            };
+            render_bottom_rail(
                 frame,
                 preview_rect,
-                self.recent_message_preview.as_ref(),
+                quick_query,
+                &db_snapshot,
+                &visible_entries,
+                preview,
             );
         }
         if let Some(log_rect) = comp.rect(PanelSlot::Sidebar) {
@@ -806,7 +936,15 @@ impl MailScreen for DashboardScreen {
             },
             HelpEntry {
                 key: "Enter",
-                action: "Timeline at event",
+                action: "Search (if query) or timeline event",
+            },
+            HelpEntry {
+                key: "/",
+                action: "Focus live dashboard search",
+            },
+            HelpEntry {
+                key: "Esc",
+                action: "Exit/clear live search",
             },
             HelpEntry {
                 key: "f",
@@ -849,6 +987,10 @@ impl MailScreen for DashboardScreen {
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some("Overview of projects, agents, and live request counters.")
+    }
+
+    fn consumes_text_input(&self) -> bool {
+        self.quick_query_active
     }
 
     fn title(&self) -> &'static str {
@@ -907,6 +1049,91 @@ fn summarize_recipients(recipients: &[String]) -> String {
             format!("{one}, {two}, {three} +{}", rest.len())
         }
     }
+}
+
+fn parse_query_terms(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn text_matches_query_terms(haystack: &str, query_terms: &[String]) -> bool {
+    if query_terms.is_empty() {
+        return true;
+    }
+    let lower = haystack.to_ascii_lowercase();
+    query_terms.iter().all(|term| lower.contains(term))
+}
+
+fn event_entry_matches_query(entry: &EventEntry, query_terms: &[String]) -> bool {
+    if query_terms.is_empty() {
+        return true;
+    }
+    let searchable = format!(
+        "{} {} {} {} {}",
+        entry.kind.compact_label(),
+        entry.summary,
+        entry.timestamp,
+        entry.severity.badge(),
+        entry.icon
+    );
+    text_matches_query_terms(&searchable, query_terms)
+}
+
+fn format_relative_micros(timestamp_micros: i64, now_micros: i64) -> String {
+    if timestamp_micros <= 0 {
+        return "n/a".to_string();
+    }
+    let elapsed = now_micros.saturating_sub(timestamp_micros).max(0);
+    let secs = elapsed / 1_000_000;
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < 3600 {
+        return format!("{}m", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{}h", secs / 3600);
+    }
+    format!("{}d", secs / 86_400)
+}
+
+fn split_top(area: Rect, top_h: u16) -> (Rect, Rect) {
+    let top_h = top_h.min(area.height);
+    let top = Rect::new(area.x, area.y, area.width, top_h);
+    let bottom = Rect::new(
+        area.x,
+        area.y.saturating_add(top_h),
+        area.width,
+        area.height.saturating_sub(top_h),
+    );
+    (top, bottom)
+}
+
+fn split_left(area: Rect, left_w: u16) -> (Rect, Rect) {
+    let left_w = left_w.min(area.width);
+    let left = Rect::new(area.x, area.y, left_w, area.height);
+    let right = Rect::new(
+        area.x.saturating_add(left_w),
+        area.y,
+        area.width.saturating_sub(left_w),
+        area.height,
+    );
+    (left, right)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn split_width_ratio(area: Rect, left_ratio: f32) -> (Rect, Rect) {
+    let left_w = (f32::from(area.width) * left_ratio).round() as u16;
+    split_left(area, left_w)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn split_height_ratio(area: Rect, top_ratio: f32) -> (Rect, Rect) {
+    let top_h = (f32::from(area.height) * top_ratio).round() as u16;
+    split_top(area, top_h)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1075,6 +1302,777 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
         let card = AnomalyCard::new(anomaly.severity, anomaly.confidence, &anomaly.headline)
             .rationale(&anomaly.rationale);
         card.render(card_area, frame);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_primary_cluster(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    viewer: &RefCell<crate::console::LogPane>,
+    query_input: &TextInput,
+    query_active: bool,
+    query_text: &str,
+    db_snapshot: &DbStatSnapshot,
+    entries: &[&EventEntry],
+    scroll_offset: usize,
+    auto_follow: bool,
+    quick_filter: DashboardQuickFilter,
+    verbosity: VerbosityTier,
+    inline_anomaly_count: usize,
+    effects_enabled: bool,
+) {
+    if area.height < 3 || area.width < 24 {
+        return;
+    }
+
+    let mut query_h = if area.height >= 15 {
+        3
+    } else if area.height >= 9 {
+        2
+    } else {
+        0
+    };
+    if area.height.saturating_sub(query_h) < 3 {
+        query_h = 0;
+    }
+    let (query_area, event_area) = split_top(area, query_h);
+
+    if query_h > 0 {
+        render_dashboard_query_bar(
+            frame,
+            query_area,
+            query_input,
+            query_active,
+            query_text,
+            db_snapshot,
+            entries,
+        );
+    }
+
+    if event_area.height >= 3 {
+        render_event_log(
+            frame,
+            event_area,
+            viewer,
+            entries,
+            scroll_offset,
+            auto_follow,
+            quick_filter,
+            verbosity,
+            inline_anomaly_count,
+            effects_enabled,
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_dashboard_query_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    query_input: &TextInput,
+    query_active: bool,
+    query_text: &str,
+    db_snapshot: &DbStatSnapshot,
+    entries: &[&EventEntry],
+) {
+    if area.is_empty() {
+        return;
+    }
+    let query_terms = parse_query_terms(query_text);
+    let agent_matches = db_snapshot
+        .agents_list
+        .iter()
+        .filter(|agent| {
+            text_matches_query_terms(&format!("{} {}", agent.name, agent.program), &query_terms)
+        })
+        .count();
+    let project_matches = db_snapshot
+        .projects_list
+        .iter()
+        .filter(|project| {
+            text_matches_query_terms(
+                &format!("{} {}", project.slug, project.human_key),
+                &query_terms,
+            )
+        })
+        .count();
+    let reservation_matches = db_snapshot
+        .reservation_snapshots
+        .iter()
+        .filter(|reservation| {
+            text_matches_query_terms(
+                &format!(
+                    "{} {} {}",
+                    reservation.project_slug, reservation.agent_name, reservation.path_pattern
+                ),
+                &query_terms,
+            )
+        })
+        .count();
+    let contact_matches = db_snapshot
+        .contacts_list
+        .iter()
+        .filter(|contact| {
+            text_matches_query_terms(
+                &format!(
+                    "{} {} {} {}",
+                    contact.from_agent, contact.to_agent, contact.status, contact.reason
+                ),
+                &query_terms,
+            )
+        })
+        .count();
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = if query_active {
+        "Live Filter [EDITING]"
+    } else {
+        "Live Filter [/ to edit]"
+    };
+    let border = if query_active {
+        Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
+    } else {
+        Style::default().fg(tp.panel_border)
+    };
+    let block = Block::default()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(border);
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    query_input.render(Rect::new(inner.x, inner.y, inner.width, 1), frame);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    let status_line = if query_terms.is_empty() {
+        format!(
+            "Type to filter all panels in-place. Enter opens Search Cockpit. Totals: ev={} ag={} pr={} rs={} ct={}",
+            entries.len(),
+            db_snapshot.agents,
+            db_snapshot.projects,
+            db_snapshot.file_reservations,
+            db_snapshot.contact_links
+        )
+    } else {
+        format!(
+            "Matches: ev={} ag={} pr={} rs={} ct={} · Esc clears · Enter opens Search",
+            entries.len(),
+            agent_matches,
+            project_matches,
+            reservation_matches,
+            contact_matches
+        )
+    };
+    Paragraph::new(truncate(&status_line, usize::from(inner.width)))
+        .render(Rect::new(inner.x, inner.y + 1, inner.width, 1), frame);
+
+    if inner.height < 3 {
+        return;
+    }
+    let mode_line = if query_terms.is_empty() {
+        "Live panels: throughput, agents, projects, reservations, signals"
+    } else {
+        "Filtering uses case-insensitive AND matching across each panel"
+    };
+    Paragraph::new(truncate(mode_line, usize::from(inner.width)))
+        .style(crate::tui_theme::text_meta(&tp))
+        .render(Rect::new(inner.x, inner.y + 2, inner.width, 1), frame);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_insight_rail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    db_snapshot: &DbStatSnapshot,
+    query_text: &str,
+    anomalies: &[DetectedAnomaly],
+    entries: &[&EventEntry],
+    percentile_history: &[PercentileSample],
+    throughput_history: &[f64],
+    event_log: &[EventEntry],
+) {
+    if area.width < 24 || area.height < 8 {
+        return;
+    }
+
+    let (trend_area, remaining) = if area.height >= 20 {
+        let trend_height = (area.height / 3).max(7);
+        split_top(area, trend_height)
+    } else {
+        (Rect::new(0, 0, 0, 0), area)
+    };
+
+    if trend_area.height > 0 {
+        render_trend_panel(
+            frame,
+            trend_area,
+            percentile_history,
+            throughput_history,
+            event_log,
+        );
+    }
+
+    if remaining.height < 4 {
+        return;
+    }
+
+    if remaining.width < 50 || remaining.height < 12 {
+        let (top, bottom) = split_height_ratio(remaining, 0.5);
+        render_agents_snapshot_panel(frame, top, &db_snapshot.agents_list, query_text);
+        render_reservation_watch_panel(
+            frame,
+            bottom,
+            &db_snapshot.reservation_snapshots,
+            query_text,
+        );
+        return;
+    }
+
+    let (top_row, bottom_row) = split_height_ratio(remaining, 0.5);
+    let (top_left, top_right) = split_width_ratio(top_row, 0.54);
+    let (bottom_left, bottom_right) = split_width_ratio(bottom_row, 0.54);
+
+    render_agents_snapshot_panel(frame, top_left, &db_snapshot.agents_list, query_text);
+    render_projects_snapshot_panel(frame, top_right, &db_snapshot.projects_list, query_text);
+    render_reservation_watch_panel(
+        frame,
+        bottom_left,
+        &db_snapshot.reservation_snapshots,
+        query_text,
+    );
+    render_signal_panel(
+        frame,
+        bottom_right,
+        anomalies,
+        entries,
+        &db_snapshot.contacts_list,
+        query_text,
+    );
+}
+
+fn render_bottom_rail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    query_text: &str,
+    db_snapshot: &DbStatSnapshot,
+    entries: &[&EventEntry],
+    preview: Option<&RecentMessagePreview>,
+) {
+    if area.width < 24 || area.height < 4 {
+        return;
+    }
+
+    if area.width < 70 || area.height < 6 {
+        if query_text.is_empty() {
+            render_recent_message_preview_panel(frame, area, preview);
+        } else {
+            render_query_matches_panel(frame, area, query_text, db_snapshot, entries);
+        }
+        return;
+    }
+
+    let (left, right) = split_width_ratio(area, 0.62);
+    render_recent_message_preview_panel(frame, left, preview);
+    render_query_matches_panel(frame, right, query_text, db_snapshot, entries);
+}
+
+fn render_agents_snapshot_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    agents: &[AgentSummary],
+    query_text: &str,
+) {
+    if area.width < 18 || area.height < 3 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Agents")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let mut rows: Vec<&AgentSummary> = agents
+        .iter()
+        .filter(|agent| {
+            text_matches_query_terms(&format!("{} {}", agent.name, agent.program), &query_terms)
+        })
+        .collect();
+    rows.sort_by_key(|agent| std::cmp::Reverse(agent.last_active_ts));
+
+    if rows.is_empty() {
+        Paragraph::new("No matching agents")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let now = unix_epoch_micros_now().unwrap_or_default();
+    let mut lines = Vec::new();
+    for agent in rows.iter().take(usize::from(inner.height)) {
+        let (marker, color) = agent_status_marker(agent.last_active_ts, now);
+        let age = format_relative_micros(agent.last_active_ts, now);
+        lines.push(Line::from_spans([
+            Span::styled(marker.to_string(), Style::default().fg(color)),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&agent.name, 14),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&agent.program, 9),
+                crate::tui_theme::text_meta(&tp),
+            ),
+            Span::raw(" "),
+            Span::styled(age, crate::tui_theme::text_meta(&tp)),
+        ]));
+    }
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+fn render_projects_snapshot_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    projects: &[ProjectSummary],
+    query_text: &str,
+) {
+    if area.width < 18 || area.height < 3 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Projects")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let mut rows: Vec<&ProjectSummary> = projects
+        .iter()
+        .filter(|project| {
+            text_matches_query_terms(
+                &format!("{} {}", project.slug, project.human_key),
+                &query_terms,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.message_count
+            .cmp(&a.message_count)
+            .then_with(|| b.agent_count.cmp(&a.agent_count))
+    });
+
+    if rows.is_empty() {
+        Paragraph::new("No matching projects")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let mut lines = Vec::new();
+    for project in rows.iter().take(usize::from(inner.height)) {
+        lines.push(Line::from_spans([
+            Span::styled(
+                truncate(&project.slug, 16),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(
+                    "m:{} a:{} r:{}",
+                    project.message_count, project.agent_count, project.reservation_count
+                ),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+fn render_reservation_watch_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    reservations: &[ReservationSnapshot],
+    query_text: &str,
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Reservations")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let now = unix_epoch_micros_now().unwrap_or_default();
+    let query_terms = parse_query_terms(query_text);
+    let mut rows: Vec<&ReservationSnapshot> = reservations
+        .iter()
+        .filter(|reservation| !reservation.is_released())
+        .filter(|reservation| {
+            text_matches_query_terms(
+                &format!(
+                    "{} {} {}",
+                    reservation.project_slug, reservation.agent_name, reservation.path_pattern
+                ),
+                &query_terms,
+            )
+        })
+        .collect();
+    rows.sort_by_key(|reservation| reservation.expires_ts);
+
+    if rows.is_empty() {
+        Paragraph::new("No active reservations")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let soon_count = rows
+        .iter()
+        .filter(|reservation| {
+            reservation.expires_ts.saturating_sub(now) <= RESERVATION_SOON_THRESHOLD_MICROS
+        })
+        .count();
+    let earliest = rows.first().copied();
+    let ttl_display = earliest.map_or_else(
+        || "none".to_string(),
+        |reservation| {
+            let secs = reservation_remaining_seconds(reservation, now);
+            if secs == 0 {
+                "expired".to_string()
+            } else {
+                format!("{secs}s next")
+            }
+        },
+    );
+
+    let gauge_h = if inner.height >= 4 { 2 } else { 1 };
+    let (gauge_area, list_area) = split_top(inner, gauge_h);
+    let soon_count = u32::try_from(soon_count).unwrap_or(u32::MAX);
+    let total_rows = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    ReservationGauge::new("Expiring ≤5m", soon_count, total_rows)
+        .ttl_display(&ttl_display)
+        .render(gauge_area, frame);
+
+    if list_area.height == 0 {
+        return;
+    }
+    let mut lines = Vec::new();
+    for reservation in rows.iter().take(usize::from(list_area.height)) {
+        let remaining = reservation_remaining_seconds(reservation, now);
+        let urgency = if remaining == 0 {
+            ("✖", tp.severity_error)
+        } else if remaining <= 60 {
+            ("!", tp.severity_critical)
+        } else if remaining <= 300 {
+            ("▲", tp.severity_warn)
+        } else {
+            ("·", tp.text_muted)
+        };
+        lines.push(Line::from_spans([
+            Span::styled(urgency.0, Style::default().fg(urgency.1)),
+            Span::raw(" "),
+            Span::styled(
+                format!("{remaining:>4}s"),
+                Style::default().fg(tp.metric_latency),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&reservation.agent_name, 12),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&reservation.path_pattern, 20),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+    Paragraph::new(Text::from_lines(lines)).render(list_area, frame);
+}
+
+fn render_signal_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    anomalies: &[DetectedAnomaly],
+    entries: &[&EventEntry],
+    contacts: &[ContactSummary],
+    query_text: &str,
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Signals")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let pending_contacts = contacts
+        .iter()
+        .filter(|contact| contact.status.eq_ignore_ascii_case("pending"))
+        .count();
+    let active_contacts = contacts
+        .iter()
+        .filter(|contact| contact.status.eq_ignore_ascii_case("accepted"))
+        .count();
+
+    let mut lines = Vec::new();
+    lines.push(Line::from_spans([
+        Span::styled("contacts ", crate::tui_theme::text_meta(&tp)),
+        Span::styled(
+            format!("pending:{pending_contacts} active:{active_contacts}"),
+            Style::default().fg(tp.text_primary).bold(),
+        ),
+    ]));
+
+    let mut pushed = 1usize;
+    for anomaly in anomalies.iter().filter(|anomaly| {
+        text_matches_query_terms(
+            &format!("{} {}", anomaly.headline, anomaly.rationale),
+            &query_terms,
+        )
+    }) {
+        if pushed >= usize::from(inner.height) {
+            break;
+        }
+        lines.push(Line::from_spans([
+            Span::styled("▲ ", Style::default().fg(anomaly.severity.color())),
+            Span::styled(
+                truncate(
+                    &anomaly.headline,
+                    usize::from(inner.width.saturating_sub(2)),
+                ),
+                Style::default().fg(tp.text_primary),
+            ),
+        ]));
+        pushed += 1;
+    }
+
+    for entry in entries.iter().filter(|entry| {
+        matches!(entry.severity, EventSeverity::Warn | EventSeverity::Error)
+            && text_matches_query_terms(&entry.summary, &query_terms)
+    }) {
+        if pushed >= usize::from(inner.height) {
+            break;
+        }
+        let marker = if entry.severity == EventSeverity::Error {
+            ("✖", tp.severity_error)
+        } else {
+            ("!", tp.severity_warn)
+        };
+        lines.push(Line::from_spans([
+            Span::styled(format!("{} ", marker.0), Style::default().fg(marker.1)),
+            Span::styled(
+                truncate(&entry.summary, usize::from(inner.width.saturating_sub(2))),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+        pushed += 1;
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from_spans([Span::styled(
+            "No active warnings",
+            crate::tui_theme::text_meta(&tp),
+        )]));
+    }
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_query_matches_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    query_text: &str,
+    db_snapshot: &DbStatSnapshot,
+    entries: &[&EventEntry],
+) {
+    if area.width < 22 || area.height < 3 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Live Search")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let mut lines = Vec::new();
+    if query_terms.is_empty() {
+        lines.push(Line::from_spans([
+            Span::styled("Hint: ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                "press / then type",
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+        ]));
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "Totals · events:{} agents:{} projects:{} reservations:{}",
+                entries.len(),
+                db_snapshot.agents,
+                db_snapshot.projects,
+                db_snapshot.file_reservations
+            ),
+            crate::tui_theme::text_meta(&tp),
+        )]));
+        lines.push(Line::from_spans([Span::styled(
+            "Enter jumps to Search with the same query",
+            crate::tui_theme::text_meta(&tp),
+        )]));
+    } else {
+        let matched_agents: Vec<String> = db_snapshot
+            .agents_list
+            .iter()
+            .filter(|agent| {
+                text_matches_query_terms(&format!("{} {}", agent.name, agent.program), &query_terms)
+            })
+            .take(TOP_MATCH_SAMPLE_CAP)
+            .map(|agent| agent.name.clone())
+            .collect();
+        let matched_projects: Vec<String> = db_snapshot
+            .projects_list
+            .iter()
+            .filter(|project| {
+                text_matches_query_terms(
+                    &format!("{} {}", project.slug, project.human_key),
+                    &query_terms,
+                )
+            })
+            .take(TOP_MATCH_SAMPLE_CAP)
+            .map(|project| project.slug.clone())
+            .collect();
+        let matched_paths: Vec<String> = db_snapshot
+            .reservation_snapshots
+            .iter()
+            .filter(|reservation| {
+                text_matches_query_terms(
+                    &format!(
+                        "{} {} {}",
+                        reservation.project_slug, reservation.agent_name, reservation.path_pattern
+                    ),
+                    &query_terms,
+                )
+            })
+            .take(TOP_MATCH_SAMPLE_CAP)
+            .map(|reservation| reservation.path_pattern.clone())
+            .collect();
+
+        lines.push(Line::from_spans([
+            Span::styled("Query ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                format!("\"{}\"", truncate(query_text, 42)),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+        ]));
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "Matches · events:{} agents:{} projects:{} reservations:{}",
+                entries.len(),
+                matched_agents.len(),
+                matched_projects.len(),
+                matched_paths.len()
+            ),
+            crate::tui_theme::text_meta(&tp),
+        )]));
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "Agents: {}",
+                if matched_agents.is_empty() {
+                    "none".to_string()
+                } else {
+                    matched_agents.join(", ")
+                }
+            ),
+            crate::tui_theme::text_meta(&tp),
+        )]));
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "Projects: {}",
+                if matched_projects.is_empty() {
+                    "none".to_string()
+                } else {
+                    matched_projects.join(", ")
+                }
+            ),
+            crate::tui_theme::text_meta(&tp),
+        )]));
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "Paths: {}",
+                if matched_paths.is_empty() {
+                    "none".to_string()
+                } else {
+                    matched_paths.join(", ")
+                }
+            ),
+            crate::tui_theme::text_meta(&tp),
+        )]));
+    }
+
+    let visible_lines = lines
+        .into_iter()
+        .take(usize::from(inner.height))
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible_lines)).render(inner, frame);
+}
+
+fn reservation_remaining_seconds(snapshot: &ReservationSnapshot, now_micros: i64) -> u64 {
+    if snapshot.expires_ts <= now_micros {
+        return 0;
+    }
+    let delta = snapshot.expires_ts.saturating_sub(now_micros);
+    let secs = delta.saturating_add(999_999) / 1_000_000;
+    u64::try_from(secs).unwrap_or(u64::MAX)
+}
+
+fn agent_status_marker(last_active_micros: i64, now_micros: i64) -> (char, PackedRgba) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    if last_active_micros <= 0 {
+        return ('○', tp.activity_stale);
+    }
+    let elapsed = now_micros.saturating_sub(last_active_micros);
+    if elapsed < AGENT_ACTIVE_THRESHOLD_MICROS {
+        ('●', tp.activity_active)
+    } else if elapsed < AGENT_IDLE_THRESHOLD_MICROS {
+        ('●', tp.activity_idle)
+    } else {
+        ('○', tp.activity_stale)
     }
 }
 
@@ -1447,12 +2445,13 @@ fn render_event_log(
         return;
     }
 
-    let controls_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    let controls_height = quick_filter_controls_height(inner.width, inner.height);
+    let controls_area = Rect::new(inner.x, inner.y, inner.width, controls_height);
     let viewer_area = Rect::new(
         inner.x,
-        inner.y.saturating_add(1),
+        inner.y.saturating_add(controls_height),
         inner.width,
-        inner.height.saturating_sub(1),
+        inner.height.saturating_sub(controls_height),
     );
 
     let meta_style = crate::tui_theme::text_meta(&tp);
@@ -1461,13 +2460,15 @@ fn render_event_log(
         .bg(tp.selection_bg)
         .bold();
     let mut controls = Vec::new();
+    let mut controls_chars = 0usize;
     for filter in [
         DashboardQuickFilter::All,
         DashboardQuickFilter::Messages,
         DashboardQuickFilter::Tools,
         DashboardQuickFilter::Reservations,
     ] {
-        let label = format!(" [{}:{}] ", filter.key(), filter.label());
+        let label = format!(" [{}:{}] ", filter.key(), filter.control_label());
+        controls_chars = controls_chars.saturating_add(label.len());
         let span = if quick_filter == filter {
             Span::styled(label, active_style)
         } else {
@@ -1475,12 +2476,26 @@ fn render_event_log(
         };
         controls.push(span);
     }
-    Paragraph::new(Text::from_line(Line::from_spans(controls))).render(controls_area, frame);
+    if controls_area.height > 0 {
+        let controls_text = Text::from_line(Line::from_spans(controls));
+        let mut paragraph = Paragraph::new(controls_text);
+        if controls_area.height > 1 || controls_chars > usize::from(inner.width) {
+            paragraph = paragraph.wrap(ftui::text::WrapMode::Word);
+        }
+        paragraph.render(controls_area, frame);
+    }
 
-    let shimmer_progresses = dashboard_shimmer_progresses(entries, effects_enabled);
+    if viewer_area.height == 0 {
+        return;
+    }
+
+    let (window_start, window_end) =
+        event_log_window_bounds(total, scroll_offset, usize::from(viewer_area.height));
+    let window_entries = &entries[window_start..window_end];
+    let shimmer_progresses = dashboard_shimmer_progresses(window_entries, effects_enabled);
     let mut pane = viewer.borrow_mut();
     pane.clear();
-    pane.push_many(entries.iter().enumerate().map(|(idx, entry)| {
+    pane.push_many(window_entries.iter().enumerate().map(|(idx, entry)| {
         let line = format!(
             "{:>6} {} {:<3} {} {:<10} {}",
             entry.seq,
@@ -1496,12 +2511,50 @@ fn render_event_log(
         )
     }));
     pane.scroll_to_bottom();
-    if !auto_follow && scroll_offset > 0 {
-        pane.scroll_up(scroll_offset);
+    pane.render(viewer_area, frame);
+}
+
+fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
+    if width == 0 || available_height == 0 {
+        return 0;
     }
-    if viewer_area.height > 0 {
-        pane.render(viewer_area, frame);
+    if available_height == 1 {
+        return 1;
     }
+    let total_chars = [
+        DashboardQuickFilter::All,
+        DashboardQuickFilter::Messages,
+        DashboardQuickFilter::Tools,
+        DashboardQuickFilter::Reservations,
+    ]
+    .iter()
+    .fold(0usize, |acc, filter| {
+        acc.saturating_add(format!(" [{}:{}] ", filter.key(), filter.control_label()).len())
+    });
+    let width_usize = usize::from(width.max(1));
+    let estimated_lines = total_chars.saturating_add(width_usize.saturating_sub(1)) / width_usize;
+    let estimated_lines = estimated_lines.max(1);
+    let max_controls = available_height.saturating_sub(1);
+    u16::try_from(estimated_lines)
+        .unwrap_or(u16::MAX)
+        .min(max_controls.max(1))
+}
+
+fn event_log_window_bounds(
+    total: usize,
+    scroll_offset: usize,
+    viewport_rows: usize,
+) -> (usize, usize) {
+    if total == 0 || viewport_rows == 0 {
+        return (0, 0);
+    }
+
+    let end = total.saturating_sub(scroll_offset);
+    let window_rows = viewport_rows
+        .saturating_mul(4)
+        .max(viewport_rows.saturating_add(8));
+    let start = end.saturating_sub(window_rows);
+    (start, end)
 }
 
 fn unix_epoch_micros_now() -> Option<i64> {
@@ -1962,6 +3015,7 @@ mod tests {
     #[test]
     fn recent_message_preview_markdown_contains_key_metadata() {
         let preview = RecentMessagePreview {
+            timestamp_micros: 1_700_000_000_000_000,
             direction: "Outbound",
             timestamp: "12:34:56.789".to_string(),
             from: "FrostyLantern".to_string(),
@@ -1978,6 +3032,29 @@ mod tests {
         assert!(md.contains("TealBasin, CalmCrane"));
         assert!(md.contains("br-3vwi.6.5"));
         assert!(md.contains("data-projects-mcp-agent-mail-rust"));
+    }
+
+    #[test]
+    fn quick_filter_includes_messages_only_for_all_or_messages() {
+        assert!(DashboardQuickFilter::All.includes_messages());
+        assert!(DashboardQuickFilter::Messages.includes_messages());
+        assert!(!DashboardQuickFilter::Tools.includes_messages());
+        assert!(!DashboardQuickFilter::Reservations.includes_messages());
+    }
+
+    #[test]
+    fn recent_message_preview_stale_detection() {
+        let stale = RecentMessagePreview {
+            timestamp_micros: 0,
+            direction: "Inbound",
+            timestamp: "00:00:00.000".to_string(),
+            from: "A".to_string(),
+            to: "B".to_string(),
+            subject: "S".to_string(),
+            thread_id: "t".to_string(),
+            project: "p".to_string(),
+        };
+        assert!(stale.is_stale());
     }
 
     #[test]
@@ -2002,6 +3079,20 @@ mod tests {
     }
 
     #[test]
+    fn quick_filter_controls_height_scales_with_width() {
+        assert_eq!(quick_filter_controls_height(120, 12), 1);
+        assert_eq!(quick_filter_controls_height(28, 12), 2);
+        assert_eq!(quick_filter_controls_height(18, 12), 3);
+    }
+
+    #[test]
+    fn quick_filter_controls_height_preserves_viewer_space() {
+        assert_eq!(quick_filter_controls_height(8, 1), 1);
+        assert_eq!(quick_filter_controls_height(8, 2), 1);
+        assert_eq!(quick_filter_controls_height(8, 3), 2);
+    }
+
+    #[test]
     fn main_layout_ultrawide_exposes_double_surface_vs_standard() {
         let standard =
             DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 100, 30));
@@ -2020,11 +3111,11 @@ mod tests {
             .count();
 
         assert!(
-            ultra_visible >= standard_visible.saturating_mul(2),
-            "expected ultrawide to expose at least 2x panel surface: standard={standard_visible}, ultrawide={ultra_visible}"
+            ultra_visible > standard_visible,
+            "expected ultrawide to expose strictly more panel surface: standard={standard_visible}, ultrawide={ultra_visible}"
         );
         assert!(standard.rect(PanelSlot::Inspector).is_none());
-        assert!(standard.rect(PanelSlot::Footer).is_none());
+        assert!(standard.rect(PanelSlot::Footer).is_some());
         assert!(ultra.rect(PanelSlot::Inspector).is_some());
         assert!(ultra.rect(PanelSlot::Footer).is_some());
     }
@@ -2167,22 +3258,20 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_health_pulse_hidden_until_all_verbosity() {
+    fn dashboard_health_pulse_visible_at_verbose_verbosity() {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);
         let mut screen = DashboardScreen::new();
 
         let _ = state.push_event(MailEvent::health_pulse(DbStatSnapshot::default()));
         screen.ingest_events(&state);
-        // Health pulses are Trace-level, so Verbose (new default) still hides them.
+        // Health pulses are Debug-level, so Verbose (default) includes them.
         assert_eq!(screen.event_log.len(), 1, "event should be stored");
         assert_eq!(
             screen.visible_entries().len(),
-            0,
-            "health pulses hidden at default Verbose verbosity"
+            1,
+            "health pulses visible at default Verbose verbosity"
         );
-
-        // Switching to All makes them visible
         screen.verbosity = VerbosityTier::All;
         assert_eq!(
             screen.visible_entries().len(),
@@ -2234,6 +3323,63 @@ mod tests {
         assert!(bindings.iter().any(|b| b.key == "f"));
         assert!(bindings.iter().any(|b| b.key == "v"));
         assert!(bindings.iter().any(|b| b.key == "t"));
+    }
+
+    #[test]
+    fn slash_focuses_live_query_input() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        assert!(!screen.consumes_text_input());
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('/'))), &state);
+        assert!(screen.quick_query_active);
+        assert!(screen.consumes_text_input());
+    }
+
+    #[test]
+    fn live_query_filters_visible_entries() {
+        let mut screen = DashboardScreen::new();
+        screen.verbosity = VerbosityTier::All;
+        screen.event_log.push(EventEntry {
+            kind: MailEventKind::HttpRequest,
+            severity: EventSeverity::Debug,
+            seq: 1,
+            timestamp_micros: 0,
+            timestamp: "00:00:00.000".to_string(),
+            icon: '↔',
+            summary: "alpha endpoint".to_string(),
+        });
+        screen.event_log.push(EventEntry {
+            kind: MailEventKind::ToolCallEnd,
+            severity: EventSeverity::Debug,
+            seq: 2,
+            timestamp_micros: 1_000,
+            timestamp: "00:00:00.001".to_string(),
+            icon: '⚙',
+            summary: "beta tool".to_string(),
+        });
+
+        screen.quick_query_input.set_value("alpha");
+        let visible = screen.visible_entries();
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].summary.contains("alpha"));
+    }
+
+    #[test]
+    fn enter_with_live_query_navigates_to_search() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.quick_query_input.set_value("deploy pipeline");
+
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        let cmd = screen.update(&enter, &state);
+        assert!(matches!(
+            cmd,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::SearchFocused(query)))
+                if query == "deploy pipeline"
+        ));
     }
 
     #[test]
@@ -2537,6 +3683,39 @@ mod tests {
 
         screen.update(&f, &state);
         assert!(screen.auto_follow);
+        assert_eq!(screen.scroll_offset, 0);
+    }
+
+    #[test]
+    fn tick_clamps_stale_scroll_offset_to_visible_range() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.auto_follow = false;
+        screen.scroll_offset = 9_999;
+
+        let _ = state.push_event(MailEvent::server_started("http://test", "cfg"));
+        let _ = state.push_event(MailEvent::server_started("http://test", "cfg"));
+        let _ = state.push_event(MailEvent::server_started("http://test", "cfg"));
+
+        screen.tick(1, &state);
+        let max_scroll = screen.visible_entries().len().saturating_sub(1);
+        assert_eq!(screen.scroll_offset, max_scroll);
+    }
+
+    #[test]
+    fn quick_filter_change_clamps_stale_scroll_offset_immediately() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.auto_follow = false;
+        screen.scroll_offset = 9_999;
+
+        let _ = state.push_event(MailEvent::server_started("http://test", "cfg"));
+        let _ = state.push_event(MailEvent::server_started("http://test", "cfg"));
+        screen.ingest_events(&state);
+
+        screen.apply_quick_filter(DashboardQuickFilter::Tools);
         assert_eq!(screen.scroll_offset, 0);
     }
 
@@ -3066,5 +4245,19 @@ mod tests {
     fn title_band_hidden_on_tiny() {
         assert_eq!(title_band_height(TerminalClass::Tiny), 0);
         assert_eq!(title_band_height(TerminalClass::Compact), 1);
+    }
+
+    #[test]
+    fn event_log_window_bounds_follow_mode_uses_tail_window() {
+        let (start, end) = event_log_window_bounds(1_000, 0, 10);
+        assert_eq!(end, 1_000);
+        assert_eq!(start, 960);
+    }
+
+    #[test]
+    fn event_log_window_bounds_scrolls_back_without_scanning_full_log() {
+        let (start, end) = event_log_window_bounds(1_000, 300, 10);
+        assert_eq!(end, 700);
+        assert_eq!(start, 660);
     }
 }

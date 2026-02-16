@@ -51,9 +51,6 @@ ftui-render = { version = "0.2.0", path = "../frankentui/crates/ftui-render" }
 beads_rust = { path = "../beads_rust" }
 toon = { version = "0.2.0", package = "tru", path = "../toon_rust" }
 
-# Agent detection (tokio-based upstream; declare optional in crates that use it)
-coding-agent-search = { path = "../coding_agent_session_search" }
-
 # Internal workspace crates
 mcp-agent-mail-core = { path = "crates/mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "crates/mcp-agent-mail-db" }
@@ -67,6 +64,7 @@ mcp-agent-mail-conformance = { path = "crates/mcp-agent-mail-conformance" }
 mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 
 # Core ecosystem deps
+franken-agent-detection = "0.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"

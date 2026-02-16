@@ -137,7 +137,7 @@ impl FocusGraph {
     /// Build a focus graph for a specific screen and render area.
     #[must_use]
     pub fn for_screen(screen: MailScreenId, area: Rect) -> Self {
-        let templates = focus_templates_for_screen(screen);
+        let templates = focus_templates_for_screen_with_area(screen, area);
         let rects: Vec<Rect> = templates
             .iter()
             .map(|template| rect_from_template(area, *template))
@@ -301,6 +301,19 @@ const MESSAGES_FOCUS: [FocusNodeTemplate; 3] = [
         550,
         880,
     ),
+];
+
+const MESSAGES_FOCUS_COMPACT: [FocusNodeTemplate; 2] = [
+    tpl(
+        "messages.search",
+        FocusTarget::TextInput(0),
+        0,
+        0,
+        0,
+        1000,
+        120,
+    ),
+    tpl("messages.list", FocusTarget::List(0), 1, 0, 120, 1000, 880),
 ];
 
 const THREADS_FOCUS: [FocusNodeTemplate; 2] = [
@@ -579,6 +592,17 @@ const fn focus_templates_for_screen(screen: MailScreenId) -> &'static [FocusNode
         MailScreenId::Explorer => &EXPLORER_FOCUS,
         MailScreenId::Analytics => &ANALYTICS_FOCUS,
         MailScreenId::Attachments => &ATTACHMENTS_FOCUS,
+    }
+}
+
+const fn focus_templates_for_screen_with_area(
+    screen: MailScreenId,
+    area: Rect,
+) -> &'static [FocusNodeTemplate] {
+    match screen {
+        // Message screen hides the detail split on compact terminals.
+        MailScreenId::Messages if area.width < 68 || area.height < 8 => &MESSAGES_FOCUS_COMPACT,
+        _ => focus_templates_for_screen(screen),
     }
 }
 
@@ -1404,6 +1428,15 @@ mod tests {
         assert_eq!(graph.nodes()[list_idx].neighbors.up, Some(search_idx));
         assert_eq!(graph.nodes()[detail_idx].neighbors.right, None);
         assert_eq!(graph.nodes()[list_idx].neighbors.left, None);
+    }
+
+    #[test]
+    fn focus_graph_messages_compact_layout_omits_hidden_detail_panel() {
+        let graph = FocusGraph::for_screen(MailScreenId::Messages, Rect::new(0, 0, 60, 20));
+        assert_eq!(graph.nodes().len(), 2);
+        assert!(graph.node(FocusTarget::DetailPanel).is_none());
+        assert!(graph.node(FocusTarget::TextInput(0)).is_some());
+        assert!(graph.node(FocusTarget::List(0)).is_some());
     }
 
     #[test]

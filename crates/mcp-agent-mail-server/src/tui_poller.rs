@@ -3,12 +3,13 @@
 //! The poller runs on a dedicated background thread using sync `SQLite`
 //! connections (not the async pool).  It wakes every `interval`, queries
 //! aggregate counts + agent list, computes deltas against the previous
-//! snapshot, and only pushes updates when something changed.
+//! snapshot, refreshes shared stats every cycle, and emits health pulses
+//! on data changes plus periodic heartbeat intervals.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
@@ -33,6 +34,8 @@ const MAX_CONTACTS: usize = 200;
 
 /// Maximum reservation rows to fetch per poll cycle.
 const MAX_RESERVATIONS: usize = 1000;
+/// Maximum silent interval before a heartbeat `HealthPulse` is emitted.
+const HEALTH_PULSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Batched aggregate counters used to populate [`DbStatSnapshot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -200,17 +203,24 @@ impl DbPoller {
     /// Main polling loop.
     fn run(self) {
         let mut prev = DbStatSnapshot::default();
+        let now = Instant::now();
+        let mut last_health_emit = now
+            .checked_sub(HEALTH_PULSE_HEARTBEAT_INTERVAL)
+            .unwrap_or(now);
 
         while !self.stop.load(Ordering::Relaxed) {
             // Fetch fresh snapshot
-            let snapshot = fetch_db_stats(&self.database_url);
-
-            // Only push if data fields changed (ignore timestamp_micros)
-            if snapshot_delta(&prev, &snapshot).any_changed() {
+            if let Some(snapshot) = fetch_db_stats(&self.database_url) {
+                let changed = snapshot_delta(&prev, &snapshot).any_changed();
+                // Always refresh shared DB stats so timestamp/list snapshots
+                // stay current even when aggregate counters are steady.
                 self.state.update_db_stats(snapshot.clone());
-                let _ = self
-                    .state
-                    .push_event(MailEvent::health_pulse(snapshot.clone()));
+                if changed || last_health_emit.elapsed() >= HEALTH_PULSE_HEARTBEAT_INTERVAL {
+                    let _ = self
+                        .state
+                        .push_event(MailEvent::health_pulse(snapshot.clone()));
+                    last_health_emit = Instant::now();
+                }
                 prev = snapshot;
             }
 
@@ -261,13 +271,11 @@ impl Drop for DbPollerHandle {
 /// Fetch a complete [`DbStatSnapshot`] from the database.
 ///
 /// Opens a fresh sync connection, runs aggregate queries, and returns
-/// the snapshot.  On any error, returns a default (zeroed) snapshot.
-fn fetch_db_stats(database_url: &str) -> DbStatSnapshot {
-    let Some(conn) = open_sync_connection(database_url) else {
-        return DbStatSnapshot::default();
-    };
-
-    DbStatQueryBatcher::new(&conn).fetch_snapshot()
+/// the snapshot.  On any error, returns `None` so callers can keep the
+/// previous snapshot instead of clearing existing data.
+fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
+    let conn = open_sync_connection(database_url)?;
+    Some(DbStatQueryBatcher::new(&conn).fetch_snapshot())
 }
 
 /// Open a sync `SQLite` connection from a database URL.
@@ -398,11 +406,13 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
     conn.query_sync(
         &format!(
-            "SELECT fr.id, p.slug AS project_slug, a.name AS agent_name, \
+            "SELECT fr.id, \
+             COALESCE(p.slug, '[unknown-project]') AS project_slug, \
+             COALESCE(a.name, '[unknown-agent]') AS agent_name, \
              fr.path_pattern, fr.exclusive, fr.created_ts, fr.expires_ts, fr.released_ts \
              FROM file_reservations fr \
-             JOIN projects p ON p.id = fr.project_id \
-             JOIN agents a ON a.id = fr.agent_id \
+             LEFT JOIN projects p ON p.id = fr.project_id \
+             LEFT JOIN agents a ON a.id = fr.agent_id \
              WHERE fr.released_ts IS NULL \
              ORDER BY fr.expires_ts ASC \
              LIMIT {MAX_RESERVATIONS}"
@@ -415,8 +425,14 @@ fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
             .filter_map(|row| {
                 Some(ReservationSnapshot {
                     id: row.get_named::<i64>("id").ok()?,
-                    project_slug: row.get_named::<String>("project_slug").ok()?,
-                    agent_name: row.get_named::<String>("agent_name").ok()?,
+                    project_slug: row
+                        .get_named::<String>("project_slug")
+                        .ok()
+                        .unwrap_or_else(|| "[unknown-project]".to_string()),
+                    agent_name: row
+                        .get_named::<String>("agent_name")
+                        .ok()
+                        .unwrap_or_else(|| "[unknown-agent]".to_string()),
                     path_pattern: row.get_named::<String>("path_pattern").ok()?,
                     exclusive: row
                         .get_named::<i64>("exclusive")
@@ -858,6 +874,55 @@ mod tests {
     }
 
     #[test]
+    fn poller_refreshes_snapshot_timestamp_without_data_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_snapshot_refresh.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
+            .expect("create");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+        conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
+            .expect("create");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+        conn.execute_sync("CREATE TABLE agent_links (id INTEGER PRIMARY KEY)", &[])
+            .expect("create");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+        drop(conn);
+
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let poller =
+            DbPoller::new(Arc::clone(&state), db_url).with_interval(Duration::from_millis(50));
+        let mut handle = poller.start();
+
+        thread::sleep(Duration::from_millis(120));
+        let first = state.db_stats_snapshot().expect("first snapshot");
+        thread::sleep(Duration::from_millis(120));
+        let second = state.db_stats_snapshot().expect("second snapshot");
+
+        assert!(
+            second.timestamp_micros > first.timestamp_micros,
+            "expected timestamp_micros to advance even with unchanged counts"
+        );
+
+        handle.stop();
+    }
+
+    #[test]
     fn batcher_fetch_counts_aggregates_metrics_in_single_row() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_batch_counts.db");
@@ -949,19 +1014,13 @@ mod tests {
     // ── fetch_db_stats with nonexistent DB ───────────────────────────
 
     #[test]
-    fn fetch_stats_returns_default_on_bad_url() {
-        let stats = fetch_db_stats("sqlite:///nonexistent_path_xyz.db");
-        let expected = DbStatSnapshot {
-            timestamp_micros: stats.timestamp_micros,
-            ..DbStatSnapshot::default()
-        };
-        assert_eq!(stats, expected);
+    fn fetch_stats_returns_none_on_bad_url() {
+        assert!(fetch_db_stats("sqlite:///nonexistent_path_xyz.db").is_none());
     }
 
     #[test]
-    fn fetch_stats_returns_default_on_empty_url() {
-        let stats = fetch_db_stats("");
-        assert_eq!(stats, DbStatSnapshot::default());
+    fn fetch_stats_returns_none_on_empty_url() {
+        assert!(fetch_db_stats("").is_none());
     }
 
     // ── open_sync_connection ─────────────────────────────────────────
@@ -977,5 +1036,51 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
         assert!(open_sync_connection(&url).is_some());
+    }
+
+    #[test]
+    fn reservation_snapshots_keep_rows_when_agent_or_project_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservation_orphans.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER,
+                released_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 111, 222, 'src/**', 1, 1_000_000, 2_000_000, NULL)",
+            &[],
+        )
+        .expect("insert orphan reservation");
+
+        let rows = fetch_reservation_snapshots(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project_slug, "[unknown-project]");
+        assert_eq!(rows[0].agent_name, "[unknown-agent]");
+        assert_eq!(rows[0].path_pattern, "src/**");
     }
 }

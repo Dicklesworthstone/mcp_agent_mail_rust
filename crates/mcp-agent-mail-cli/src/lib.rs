@@ -6936,7 +6936,7 @@ fn handle_doctor_check_with(
         "detail": format!("{}", storage_root.display()),
     }));
 
-    // Check 3: Installed coding-agent connectors (coding_agent_session_search integration)
+    // Check 3: Installed coding-agent connectors
     let detect_opts = AgentDetectOptions {
         only_connectors: None,
         include_undetected: true,

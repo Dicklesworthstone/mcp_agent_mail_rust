@@ -82,7 +82,7 @@ pub struct EventLogEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSeverity {
-    /// High-frequency background noise (tool starts, health pulses).
+    /// High-frequency background noise (tool starts).
     Trace,
     /// Routine operational detail (tool completions, successful HTTP).
     Debug,
@@ -680,14 +680,14 @@ impl MailEvent {
 
     /// Derive severity from the event data.
     ///
-    /// HTTP severity depends on status code; tool starts and health pulses
-    /// are trace-level; tool completions are debug; messages, reservations,
+    /// HTTP severity depends on status code; tool starts are trace-level;
+    /// health pulses and tool completions are debug; messages, reservations,
     /// and lifecycle events are info; server shutdown is warn.
     #[must_use]
     pub const fn severity(&self) -> EventSeverity {
         match self {
-            Self::ToolCallStart { .. } | Self::HealthPulse { .. } => EventSeverity::Trace,
-            Self::ToolCallEnd { .. } => EventSeverity::Debug,
+            Self::ToolCallStart { .. } => EventSeverity::Trace,
+            Self::HealthPulse { .. } | Self::ToolCallEnd { .. } => EventSeverity::Debug,
             Self::MessageSent { .. }
             | Self::MessageReceived { .. }
             | Self::ReservationGranted { .. }
@@ -913,8 +913,13 @@ impl MailEvent {
                 ..
             } => format!("{method} {path} {status} {duration_ms}ms"),
             Self::HealthPulse { db_stats, .. } => format!(
-                "p={} a={} m={}",
-                db_stats.projects, db_stats.agents, db_stats.messages
+                "p={} a={} m={} r={} c={} ack={}",
+                db_stats.projects,
+                db_stats.agents,
+                db_stats.messages,
+                db_stats.file_reservations,
+                db_stats.contact_links,
+                db_stats.ack_pending
             ),
             Self::ServerStarted { endpoint, .. } => format!("Server started at {endpoint}"),
             Self::ServerShutdown { .. } => "Server shutting down".to_string(),
@@ -2429,7 +2434,7 @@ mod tests {
         assert_eq!(MailEvent::server_shutdown().severity(), EventSeverity::Warn);
         assert_eq!(
             MailEvent::health_pulse(DbStatSnapshot::default()).severity(),
-            EventSeverity::Trace
+            EventSeverity::Debug
         );
     }
 
@@ -2470,7 +2475,7 @@ mod tests {
             ),
             (
                 MailEvent::health_pulse(DbStatSnapshot::default()),
-                EventSeverity::Trace,
+                EventSeverity::Debug,
             ),
             (
                 MailEvent::server_started("http://127.0.0.1:8765", "cfg"),
@@ -3354,10 +3359,10 @@ mod tests {
         let _ = ring.push(sample_http("/threshold", 200));
 
         // Push 20 Trace-level events via try_push (HttpRequest with 200 is Debug).
-        // We need events that are Trace-level. HealthPulse is Trace.
+        // ToolCallStart remains Trace-level and exercises sampling behavior.
         let mut sampled = 0u64;
         for _ in 0..20 {
-            let event = MailEvent::health_pulse(DbStatSnapshot::default());
+            let event = MailEvent::tool_call_start("sampled_trace", Value::Null, None, None);
             if ring.try_push(event).is_none() {
                 sampled += 1;
             }

@@ -1075,8 +1075,15 @@ impl MailAppModel {
         let content_area = *self.last_content_area.borrow();
         let graph = focus_graph_for_screen(active_screen, content_area);
         let current_target = self.focus_manager.current();
-        let Some(current_idx) = graph.node_index(current_target) else {
-            return false;
+        let current_idx = if let Some(idx) = graph.node_index(current_target) {
+            idx
+        } else {
+            let Some(fallback_target) = graph.nodes().first().map(|node| node.target) else {
+                return false;
+            };
+            let _ = self.focus_manager.focus(fallback_target);
+            self.focus_memory.insert(active_screen, fallback_target);
+            graph.node_index(fallback_target).unwrap_or(0)
         };
         let current = graph.nodes()[current_idx];
         let next_idx = match direction {
@@ -2710,6 +2717,21 @@ impl Model for MailAppModel {
                         {
                             return Cmd::none();
                         }
+                        if self.help_visible {
+                            match key.code {
+                                KeyCode::Escape => {
+                                    self.help_visible = false;
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    self.help_scroll = self.help_scroll.saturating_add(1);
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                                }
+                                _ => {}
+                            }
+                            return Cmd::none();
+                        }
                         match key.code {
                             KeyCode::Char('q') if !text_mode => {
                                 self.flush_before_shutdown();
@@ -2762,19 +2784,6 @@ impl Model for MailAppModel {
                                         self.action_menu.open(entries, anchor, ctx);
                                     }
                                 }
-                                return Cmd::none();
-                            }
-                            KeyCode::Escape if self.help_visible => {
-                                self.help_visible = false;
-                                return Cmd::none();
-                            }
-                            // Scroll help overlay with j/k or arrow keys.
-                            KeyCode::Char('j') | KeyCode::Down if self.help_visible => {
-                                self.help_scroll = self.help_scroll.saturating_add(1);
-                                return Cmd::none();
-                            }
-                            KeyCode::Char('k') | KeyCode::Up if self.help_visible => {
-                                self.help_scroll = self.help_scroll.saturating_sub(1);
                                 return Cmd::none();
                             }
                             // Clipboard yank: y copies focused content
@@ -3446,8 +3455,9 @@ fn query_palette_agent_metadata(
     state: &TuiSharedState,
     limit: usize,
 ) -> HashMap<String, (String, String)> {
+    let snapshot = state.config_snapshot();
     let cfg = DbPoolConfig {
-        database_url: state.config_snapshot().database_url,
+        database_url: snapshot.raw_database_url,
         ..Default::default()
     };
     let Ok(path) = cfg.sqlite_path() else {
@@ -3490,8 +3500,9 @@ fn query_palette_recent_messages(
     state: &TuiSharedState,
     limit: usize,
 ) -> Vec<PaletteMessageSummary> {
+    let snapshot = state.config_snapshot();
     let cfg = DbPoolConfig {
-        database_url: state.config_snapshot().database_url,
+        database_url: snapshot.raw_database_url,
         ..Default::default()
     };
     let Ok(path) = cfg.sqlite_path() else {
@@ -3556,7 +3567,7 @@ fn fetch_palette_db_data(
     HashMap<String, (String, String)>,
     Vec<PaletteMessageSummary>,
 ) {
-    let database_url = state.config_snapshot().database_url;
+    let database_url = state.config_snapshot().raw_database_url;
     let bridge_state = palette_cache_bridge_state(state);
     let now = now_micros();
     let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
@@ -4902,6 +4913,20 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_arrow_recovers_from_hidden_focus_target_in_compact_layout() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        *model.last_content_area.borrow_mut() = Rect::new(0, 0, 60, 20);
+        model.restore_focus_for_screen(MailScreenId::Messages);
+        // Simulate stale focus memory from a wider layout.
+        let _ = model.focus_manager.focus(FocusTarget::DetailPanel);
+
+        let ctrl_down = Event::Key(KeyEvent::new(KeyCode::Down).with_modifiers(Modifiers::CTRL));
+        model.update(MailMsg::Terminal(ctrl_down));
+        assert_eq!(model.focus_manager.current(), FocusTarget::List(0));
+    }
+
+    #[test]
     fn ctrl_arrow_down_moves_from_search_to_preview_panel() {
         let mut model = test_model();
         model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
@@ -5934,7 +5959,7 @@ mod tests {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         let bridge_state = palette_cache_bridge_state(&state);
-        let db_url = state.config_snapshot().database_url;
+        let db_url = state.config_snapshot().raw_database_url;
         let expected = PaletteMessageSummary {
             id: 7,
             subject: "cached subject".to_string(),
@@ -5978,7 +6003,7 @@ mod tests {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         let bridge_state = palette_cache_bridge_state(&state);
-        let db_url = state.config_snapshot().database_url;
+        let db_url = state.config_snapshot().raw_database_url;
         let expected = PaletteMessageSummary {
             id: 11,
             subject: "stale subject".to_string(),
@@ -8190,6 +8215,24 @@ mod tests {
         model.update(esc);
         assert!(model.toast_focus_index.is_none());
         assert!(model.help_visible, "help should still be visible");
+    }
+
+    #[test]
+    fn help_overlay_traps_tab_navigation_keys() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        model.help_visible = true;
+        let before = model.screen_manager.active_screen();
+
+        let tab = MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Tab)));
+        model.update(tab);
+        assert_eq!(model.screen_manager.active_screen(), before);
+        assert!(model.help_visible);
+
+        let backtab = MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::BackTab)));
+        model.update(backtab);
+        assert_eq!(model.screen_manager.active_screen(), before);
+        assert!(model.help_visible);
     }
 
     // ── Coach hint tests ─────────────────────────────────────────

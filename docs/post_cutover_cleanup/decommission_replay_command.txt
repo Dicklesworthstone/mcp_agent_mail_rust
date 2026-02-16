@@ -1,0 +1,5 @@
+cd /data/projects/mcp_agent_mail_rust && POST_CUTOVER_FORCE_LOCAL_CIRCUIT=1 scripts/e2e/post_cutover_cleanup_agent_mail.sh --mode smoke --execution live
+
+cd /data/projects/mcp_agent_mail_rust && run_dir=test_logs/post_cutover_cleanup/post-cutover-cleanup-agent-mail-20260216T005908Z-1771203548545421330-2664254 && jq '.status,.reason_code,.stage_started_count,.stage_completed_count' "$run_dir/summary.json"
+
+cd /data/projects/mcp_agent_mail_rust && RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- cargo check -p mcp-agent-mail-search-core --all-targets --features hybrid

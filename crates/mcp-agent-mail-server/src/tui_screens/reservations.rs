@@ -1,9 +1,10 @@
 //! Reservations screen — active file reservations with TTL progress bars.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
+use ftui::text::display_width;
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -31,6 +32,7 @@ const SORT_LABELS: &[&str] = &["Agent", "Path", "Excl", "TTL", "Project"];
 /// Tracked reservation state from events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveReservation {
+    reservation_id: Option<i64>,
     agent: String,
     path_pattern: String,
     exclusive: bool,
@@ -74,8 +76,12 @@ impl ActiveReservation {
 
     /// Composite key for dedup.
     fn key(&self) -> String {
-        format!("{}:{}:{}", self.project, self.agent, self.path_pattern)
+        reservation_key(&self.project, &self.agent, &self.path_pattern)
     }
+}
+
+fn reservation_key(project: &str, agent: &str, path_pattern: &str) -> String {
+    format!("{project}:{agent}:{path_pattern}")
 }
 
 pub struct ReservationsScreen {
@@ -145,6 +151,7 @@ impl ReservationsScreen {
                 } => {
                     for path in paths {
                         let res = ActiveReservation {
+                            reservation_id: None,
                             agent: agent.clone(),
                             path_pattern: path.clone(),
                             exclusive: *exclusive,
@@ -166,20 +173,74 @@ impl ReservationsScreen {
                     project,
                     ..
                 } => {
-                    for path in paths {
-                        let key = format!("{project}:{agent}:{path}");
-                        if let Some(res) = self.reservations.get_mut(&key) {
-                            if !res.released {
-                                res.released = true;
-                                changed = true;
-                            }
-                        }
+                    for token in paths {
+                        changed |= self.mark_released(project, agent, token);
                     }
                 }
                 _ => {}
             }
         }
         changed
+    }
+
+    fn mark_released(&mut self, project: &str, agent: &str, token: &str) -> bool {
+        if token == "<all-active>" {
+            let mut changed = false;
+            for res in self.reservations.values_mut() {
+                if res.project == project && res.agent == agent && !res.released {
+                    res.released = true;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        if let Some(id_str) = token.strip_prefix("id:") {
+            if let Ok(target_id) = id_str.parse::<i64>() {
+                let mut changed = false;
+                for res in self.reservations.values_mut() {
+                    if res.project == project
+                        && res.agent == agent
+                        && res.reservation_id == Some(target_id)
+                        && !res.released
+                    {
+                        res.released = true;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    return true;
+                }
+
+                // The event stream does not always carry reservation IDs on
+                // grant events. If there is exactly one active candidate for
+                // this agent/project, reconcile release eagerly instead of
+                // waiting for the next DB snapshot to map `id:*`.
+                let mut candidates: Vec<_> = self
+                    .reservations
+                    .iter_mut()
+                    .filter(|(_, res)| {
+                        res.project == project && res.agent == agent && !res.released
+                    })
+                    .collect();
+                if candidates.len() == 1 {
+                    let (_, res) = candidates.remove(0);
+                    res.released = true;
+                    res.reservation_id = Some(target_id);
+                    return true;
+                }
+                return changed;
+            }
+        }
+
+        let key = reservation_key(project, agent, token);
+        if let Some(res) = self.reservations.get_mut(&key) {
+            if !res.released {
+                res.released = true;
+                return true;
+            }
+        }
+        false
     }
 
     fn ttl_secs_from_snapshot(snapshot: &ReservationSnapshot) -> u64 {
@@ -197,22 +258,30 @@ impl ReservationsScreen {
         }
         self.last_snapshot_micros = snapshot.timestamp_micros;
 
-        let next: HashMap<String, ActiveReservation> = snapshot
-            .reservation_snapshots
-            .iter()
-            .map(|row| {
-                let reservation = ActiveReservation {
-                    agent: row.agent_name.clone(),
-                    path_pattern: row.path_pattern.clone(),
-                    exclusive: row.exclusive,
-                    granted_ts: row.granted_ts,
-                    ttl_s: Self::ttl_secs_from_snapshot(row),
-                    project: row.project_slug.clone(),
-                    released: row.is_released(),
-                };
-                (reservation.key(), reservation)
-            })
-            .collect();
+        let mut seen_active: HashSet<String> = HashSet::new();
+        let mut next = self.reservations.clone();
+        for row in &snapshot.reservation_snapshots {
+            let key = reservation_key(&row.project_slug, &row.agent_name, &row.path_pattern);
+            seen_active.insert(key.clone());
+            let released =
+                row.is_released() || next.get(&key).is_some_and(|existing| existing.released);
+            let reservation = ActiveReservation {
+                reservation_id: Some(row.id),
+                agent: row.agent_name.clone(),
+                path_pattern: row.path_pattern.clone(),
+                exclusive: row.exclusive,
+                granted_ts: row.granted_ts,
+                ttl_s: Self::ttl_secs_from_snapshot(row),
+                project: row.project_slug.clone(),
+                released,
+            };
+            next.insert(key, reservation);
+        }
+        // Keep released history rows for operator visibility and keep very
+        // recent event-only grants that may race a stale DB snapshot.
+        next.retain(|key, res| {
+            seen_active.contains(key) || res.released || res.granted_ts > snapshot.timestamp_micros
+        });
 
         if self.reservations == next {
             return false;
@@ -411,7 +480,8 @@ impl MailScreen for ReservationsScreen {
         let p = Paragraph::new(summary);
         p.render(header_area, frame);
         if !critical_alert.is_empty() {
-            let start_offset = u16::try_from(summary_base.len()).unwrap_or(u16::MAX);
+            let start_offset =
+                u16::try_from(display_width(summary_base.as_str())).unwrap_or(u16::MAX);
             if start_offset < header_area.width {
                 let alert_area = Rect::new(
                     header_area.x.saturating_add(start_offset),
@@ -817,6 +887,138 @@ mod tests {
         screen.show_released = true;
         screen.rebuild_sorted();
         assert_eq!(screen.sorted_keys.len(), 1);
+    }
+
+    #[test]
+    fn ingest_release_all_active_marker_releases_all_agent_rows() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+
+        let _ = state.push_event(MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/**/*.rs".to_string(), "tests/**/*.rs".to_string()],
+            true,
+            3600,
+            "proj",
+        ));
+        let _ = state.push_event(MailEvent::reservation_released(
+            "BlueLake",
+            vec!["<all-active>".to_string()],
+            "proj",
+        ));
+
+        assert!(screen.ingest_events(&state));
+        let (active, _, _, _) = screen.summary_counts();
+        assert_eq!(active, 0);
+
+        screen.show_released = true;
+        screen.rebuild_sorted();
+        assert_eq!(screen.sorted_keys.len(), 2);
+    }
+
+    #[test]
+    fn ingest_release_id_token_matches_snapshot_reservation_id() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            reservation_snapshots: vec![
+                ReservationSnapshot {
+                    id: 10,
+                    project_slug: "proj".into(),
+                    agent_name: "BlueLake".into(),
+                    path_pattern: "src/**".into(),
+                    exclusive: true,
+                    granted_ts: 1_000_000,
+                    expires_ts: 4_000_000,
+                    released_ts: None,
+                },
+                ReservationSnapshot {
+                    id: 11,
+                    project_slug: "proj".into(),
+                    agent_name: "BlueLake".into(),
+                    path_pattern: "tests/**".into(),
+                    exclusive: true,
+                    granted_ts: 1_000_000,
+                    expires_ts: 4_000_000,
+                    released_ts: None,
+                },
+            ],
+            timestamp_micros: 42,
+            ..Default::default()
+        });
+        screen.tick(1, &state);
+
+        let _ = state.push_event(MailEvent::reservation_released(
+            "BlueLake",
+            vec!["id:11".to_string()],
+            "proj",
+        ));
+        assert!(screen.ingest_events(&state));
+
+        let src_key = reservation_key("proj", "BlueLake", "src/**");
+        let tests_key = reservation_key("proj", "BlueLake", "tests/**");
+        assert!(
+            !screen.reservations.get(&src_key).unwrap().released,
+            "id:11 should not release src/**"
+        );
+        assert!(
+            screen.reservations.get(&tests_key).unwrap().released,
+            "id:11 should release tests/**"
+        );
+    }
+
+    #[test]
+    fn ingest_release_id_token_releases_single_event_only_candidate() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+
+        let _ = state.push_event(MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/**".to_string()],
+            true,
+            3600,
+            "proj",
+        ));
+        assert!(screen.ingest_events(&state));
+
+        let _ = state.push_event(MailEvent::reservation_released(
+            "BlueLake",
+            vec!["id:77".to_string()],
+            "proj",
+        ));
+        assert!(screen.ingest_events(&state));
+
+        let key = reservation_key("proj", "BlueLake", "src/**");
+        let row = screen.reservations.get(&key).expect("reservation row");
+        assert!(row.released);
+        assert_eq!(row.reservation_id, Some(77));
+    }
+
+    #[test]
+    fn apply_db_snapshot_preserves_recent_event_only_grants() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+
+        let _ = state.push_event(MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/**/*.rs".to_string()],
+            true,
+            3600,
+            "proj",
+        ));
+        assert!(screen.ingest_events(&state));
+        assert_eq!(screen.reservations.len(), 1);
+
+        // Snapshot with no rows and an older timestamp should not wipe the
+        // event-derived grant.
+        let changed = screen.apply_db_snapshot(&DbStatSnapshot {
+            reservation_snapshots: vec![],
+            timestamp_micros: 1,
+            ..Default::default()
+        });
+        assert!(!changed);
+        assert_eq!(screen.reservations.len(), 1);
     }
 
     #[test]

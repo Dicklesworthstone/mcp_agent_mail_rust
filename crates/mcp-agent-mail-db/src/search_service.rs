@@ -782,84 +782,6 @@ impl TwoTierBridge {
         scored_results_to_search_results(hits)
     }
 
-    /// Execute the frankensearch probe seam using a snapshot of the two-tier index.
-    ///
-    /// The snapshot avoids holding the index `RwLock` across `await`.
-    /// Falls back to the synchronous two-tier path on probe failures.
-    pub async fn search_with_frankensearch_probe(
-        &self,
-        cx: &Cx,
-        query: &SearchQuery,
-        limit: usize,
-    ) -> Vec<SearchResult> {
-        let ctx = get_two_tier_context();
-        if ctx.fast_info().is_none() {
-            tracing::debug!(
-                target: "search.semantic",
-                "fast embedder unavailable, skipping two-tier probe search"
-            );
-            return Vec::new();
-        }
-
-        let entries = {
-            let index = self.index();
-            match index.entries_snapshot() {
-                Ok(entries) => entries,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "search.semantic",
-                        error = %error,
-                        "failed to snapshot two-tier index for frankensearch probe; using sync path"
-                    );
-                    return self.search(query, limit);
-                }
-            }
-        };
-
-        let probe_index = match TwoTierIndex::build(
-            "auto-init-semantic-fast",
-            "auto-init-semantic-quality",
-            &self.config,
-            entries,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                tracing::warn!(
-                    target: "search.semantic",
-                    error = %error,
-                    "failed to rebuild two-tier probe index; using sync path"
-                );
-                return self.search(query, limit);
-            }
-        };
-
-        let Some(searcher) = ctx.create_searcher(&probe_index) else {
-            tracing::debug!(
-                target: "search.semantic",
-                "failed to create probe searcher; using sync path"
-            );
-            return self.search(query, limit);
-        };
-
-        match searcher
-            .search_with_frankensearch_probe(cx, &query.text, limit)
-            .await
-        {
-            Ok(phases) => select_best_two_tier_results(phases).map_or_else(
-                || self.search(query, limit),
-                scored_results_to_search_results,
-            ),
-            Err(error) => {
-                tracing::warn!(
-                    target: "search.semantic",
-                    error = %error,
-                    "frankensearch probe search failed; using sync path"
-                );
-                self.search(query, limit)
-            }
-        }
-    }
-
     /// Add a document to the two-tier index.
     ///
     /// Automatically embeds using available tiers.
@@ -1002,8 +924,8 @@ fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchRe
 }
 
 #[cfg(feature = "hybrid")]
-async fn try_two_tier_search_with_cx(
-    cx: &Cx,
+fn try_two_tier_search_with_cx(
+    _cx: &Cx,
     query: &SearchQuery,
     limit: usize,
 ) -> Option<Vec<SearchResult>> {
@@ -1011,11 +933,7 @@ async fn try_two_tier_search_with_cx(
     // Only one TwoTierBridge instance is ever created under concurrent access.
     if let Some(bridge) = get_or_init_two_tier_bridge() {
         if bridge.is_available() {
-            return Some(
-                bridge
-                    .search_with_frankensearch_probe(cx, query, limit)
-                    .await,
-            );
+            return Some(bridge.search(query, limit));
         }
     }
 
@@ -1292,9 +1210,8 @@ pub async fn execute_search(
         if let Some(lexical_results) = try_tantivy_search(query) {
             // Try two-tier semantic search first, then fall back to legacy
             #[cfg(feature = "hybrid")]
-            let semantic_results = try_two_tier_search_with_cx(cx, query, query.effective_limit())
-                .await
-                .unwrap_or_default();
+            let semantic_results =
+                try_two_tier_search_with_cx(cx, query, query.effective_limit()).unwrap_or_default();
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
 

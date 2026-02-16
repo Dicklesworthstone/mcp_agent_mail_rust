@@ -1,0 +1,48 @@
+{
+  "schema": "mcp-post-cutover-decommission-manifest-v1",
+  "v": 1,
+  "generated_at": "2026-02-16T01:07:00Z",
+  "source_bead": "bd-3un.37.2.2",
+  "parent_bead": "bd-3un.37.2",
+  "status": "assist-slice-complete",
+  "validation_run": {
+    "run_id": "post-cutover-cleanup-agent-mail-20260216T005908Z-1771203548545421330-2664254",
+    "run_dir": "test_logs/post_cutover_cleanup/post-cutover-cleanup-agent-mail-20260216T005908Z-1771203548545421330-2664254",
+    "summary_json": "test_logs/post_cutover_cleanup/post-cutover-cleanup-agent-mail-20260216T005908Z-1771203548545421330-2664254/summary.json",
+    "status": "ok",
+    "reason_code": "post_cutover_cleanup.lane.passed"
+  },
+  "retired_or_disconnected_surfaces": [
+    {
+      "surface": "search_with_frankensearch_probe transitional seams",
+      "evidence": "bd-3un.37.2 comment 1572 (GreenSummit)",
+      "notes": "Removed from search-core vector/two-tier and db bridge path; canonical bridge.search() path retained."
+    }
+  ],
+  "compatibility_fixes": [
+    {
+      "surface": "frankensearch::ScoredResult initializer schema drift",
+      "resolution": "Added explanation: None in mcp search-core bridge/fusion/two-tier FsScoredResult initializers",
+      "files": [
+        "crates/mcp-agent-mail-search-core/src/fusion.rs",
+        "crates/mcp-agent-mail-search-core/src/fs_bridge.rs",
+        "crates/mcp-agent-mail-search-core/src/two_tier.rs"
+      ]
+    }
+  ],
+  "changed_files_this_slice": [
+    "scripts/e2e/post_cutover_cleanup_agent_mail.sh",
+    "crates/mcp-agent-mail-search-core/src/fusion.rs",
+    "crates/mcp-agent-mail-search-core/src/fs_bridge.rs",
+    "crates/mcp-agent-mail-search-core/src/two_tier.rs",
+    "docs/post_cutover_cleanup/decommission_manifest.json",
+    "docs/post_cutover_cleanup/decommission_validation_report.md",
+    "docs/post_cutover_cleanup/decommission_replay_command.txt"
+  ],
+  "artifacts": {
+    "validation_report": "docs/post_cutover_cleanup/decommission_validation_report.md",
+    "replay_command": "docs/post_cutover_cleanup/decommission_replay_command.txt",
+    "structured_events": "test_logs/post_cutover_cleanup/post-cutover-cleanup-agent-mail-20260216T005908Z-1771203548545421330-2664254/events.jsonl",
+    "terminal_transcript": "test_logs/post_cutover_cleanup/post-cutover-cleanup-agent-mail-20260216T005908Z-1771203548545421330-2664254/terminal_transcript.txt"
+  }
+}

@@ -21,12 +21,12 @@ sha1.workspace = true
 fs2.workspace = true
 
 [features]
-# Placeholder feature for optional agent detection integration
-agent-detect = ["coding-agent-search"]
+# Optional local filesystem probes for installed coding-agent CLIs.
+agent-detect = ["franken-agent-detection"]
 # Enable loom model-checking tests (run with `cargo test --features loom-tests`)
 loom-tests = []
 
-[dependencies.coding-agent-search]
+[dependencies.franken-agent-detection]
 workspace = true
 optional = true
 

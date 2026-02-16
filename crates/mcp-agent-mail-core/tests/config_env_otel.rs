@@ -27,13 +27,12 @@ fn otel_config_fields_can_be_set() {
 // Dependency policy: no tokio, no alternative async runtimes (br-2ei.6.1)
 // ---------------------------------------------------------------------------
 
-/// Verify that the agent-detect feature (which pulls in coding-agent-search,
-/// a tokio-based crate) is not enabled by default.
+/// Verify that the optional `agent-detect` surface is not required for core defaults.
 #[test]
 fn agent_detect_feature_not_enabled_by_default() {
     // When the `agent-detect` feature is off, the Config type should still
     // be constructible. This test's existence proves the crate compiles
-    // without the optional coding-agent-search dependency.
+    // without enabling the optional `agent-detect` feature.
     let config = Config::default();
     assert!(
         !config.instrumentation_enabled,

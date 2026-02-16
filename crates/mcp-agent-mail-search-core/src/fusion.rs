@@ -153,6 +153,7 @@ fn build_fs_lexical_hits(candidates: &[PreparedCandidate]) -> Vec<FsScoredResult
             quality_score: None,
             lexical_score: Some(f32::NEG_INFINITY),
             rerank_score: None,
+            explanation: None,
             metadata: None,
         })
         .collect();
@@ -169,6 +170,7 @@ fn build_fs_lexical_hits(candidates: &[PreparedCandidate]) -> Vec<FsScoredResult
                     quality_score: None,
                     lexical_score: candidate.lexical_score.map(|score| score as f32),
                     rerank_score: None,
+                    explanation: None,
                     metadata: None,
                 };
             }

@@ -1340,6 +1340,7 @@ mod tests {
                 quality_score: None,
                 lexical_score: None,
                 rerank_score: None,
+                explanation: None,
                 metadata: None,
             }],
             latency: std::time::Duration::from_millis(9),

@@ -1,7 +1,9 @@
 #![allow(clippy::module_name_repetitions)]
 
 use crate::console;
-use crate::tui_events::{DbStatSnapshot, EventRingBuffer, EventRingStats, MailEvent};
+use crate::tui_events::{
+    DbStatSnapshot, EventRingBuffer, EventRingStats, EventSeverity, MailEvent,
+};
 use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,7 +75,10 @@ pub struct ConfigSnapshot {
     pub app_environment: String,
     pub auth_enabled: bool,
     pub tui_effects: bool,
+    /// Database URL sanitized for UI rendering/logging.
     pub database_url: String,
+    /// Raw database URL for internal DB connectivity.
+    pub raw_database_url: String,
     pub storage_root: String,
     pub console_theme: String,
     pub tool_filter_profile: String,
@@ -98,6 +103,7 @@ impl ConfigSnapshot {
             auth_enabled: config.http_bearer_token.is_some(),
             tui_effects: config.tui_effects,
             database_url,
+            raw_database_url: config.database_url.clone(),
             storage_root: config.storage_root.display().to_string(),
             console_theme: format!("{:?}", config.console_theme),
             tool_filter_profile: config.tool_filter.profile.clone(),
@@ -176,7 +182,16 @@ impl TuiSharedState {
 
     #[must_use]
     pub fn push_event(&self, event: MailEvent) -> bool {
-        self.events.try_push(event).is_some()
+        // Fast path: non-blocking push.
+        if self.events.try_push(event.clone()).is_some() {
+            return true;
+        }
+        // Never drop business-significant events due transient lock contention.
+        if event.severity() >= EventSeverity::Info {
+            let _ = self.events.push(event);
+            return true;
+        }
+        false
     }
 
     #[must_use]
@@ -221,9 +236,11 @@ impl TuiSharedState {
     }
 
     pub fn update_db_stats(&self, stats: DbStatSnapshot) {
-        if let Ok(mut current) = self.db_stats.try_lock() {
-            *current = stats;
-        }
+        let mut current = self
+            .db_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = stats;
     }
 
     pub fn request_shutdown(&self) {
@@ -311,16 +328,21 @@ impl TuiSharedState {
 
     #[must_use]
     pub fn db_stats_snapshot(&self) -> Option<DbStatSnapshot> {
-        self.db_stats.try_lock().ok().map(|stats| stats.clone())
+        Some(
+            self.db_stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
     }
 
     #[must_use]
     pub fn sparkline_snapshot(&self) -> Vec<f64> {
-        self.sparkline_data
-            .try_lock()
-            .ok()
-            .map(|sparkline| sparkline.iter().copied().collect())
-            .unwrap_or_default()
+        let sparkline = self
+            .sparkline_data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sparkline.iter().copied().collect()
     }
 
     #[must_use]
@@ -346,27 +368,27 @@ impl TuiSharedState {
     /// Push a console log line (tool call card, HTTP request, etc.).
     pub fn push_console_log(&self, text: String) {
         let seq = self.console_log_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Ok(mut log) = self.console_log.try_lock() {
-            if log.len() >= CONSOLE_LOG_CAPACITY {
-                let _ = log.pop_front();
-            }
-            log.push_back((seq, text));
+        let mut log = self
+            .console_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if log.len() >= CONSOLE_LOG_CAPACITY {
+            let _ = log.pop_front();
         }
+        log.push_back((seq, text));
     }
 
     /// Return console log entries with sequence > `since_seq`.
     #[must_use]
     pub fn console_log_since(&self, since_seq: u64) -> Vec<(u64, String)> {
-        self.console_log
-            .try_lock()
-            .ok()
-            .map(|log| {
-                log.iter()
-                    .filter(|(seq, _)| *seq > since_seq)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        let log = self
+            .console_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.iter()
+            .filter(|(seq, _)| *seq > since_seq)
+            .cloned()
+            .collect()
     }
 }
 
@@ -389,6 +411,7 @@ mod tests {
         let config = config_for_test();
         let snapshot = ConfigSnapshot::from_config(&config);
         assert!(!snapshot.database_url.contains("supersecret"));
+        assert!(snapshot.raw_database_url.contains("supersecret"));
         assert!(snapshot.auth_enabled);
         assert!(snapshot.endpoint.contains("http://"));
     }
@@ -549,6 +572,7 @@ mod tests {
             auth_enabled: false,
             tui_effects: true,
             database_url: "sqlite:///./storage.sqlite3".into(),
+            raw_database_url: "sqlite:///./storage.sqlite3".into(),
             storage_root: "/tmp/am".into(),
             console_theme: "cyberpunk_aurora".into(),
             tool_filter_profile: "default".into(),
@@ -568,6 +592,7 @@ mod tests {
                 auth_enabled: false,
                 tui_effects: true,
                 database_url: String::new(),
+                raw_database_url: String::new(),
                 storage_root: String::new(),
                 console_theme: String::new(),
                 tool_filter_profile: String::new(),
@@ -588,6 +613,7 @@ mod tests {
                 auth_enabled: false,
                 tui_effects: true,
                 database_url: String::new(),
+                raw_database_url: String::new(),
                 storage_root: String::new(),
                 console_theme: String::new(),
                 tool_filter_profile: String::new(),
@@ -666,6 +692,7 @@ mod tests {
             auth_enabled: true,
             tui_effects: false,
             database_url: "sqlite:///./new.sqlite3".into(),
+            raw_database_url: "sqlite:///./new.sqlite3".into(),
             storage_root: "/tmp/new".into(),
             console_theme: "default".into(),
             tool_filter_profile: "minimal".into(),
