@@ -10,9 +10,17 @@
 //! **Corpus version**: 2.0.0 (extends v1 with sender/date/thread intent queries)
 
 #![allow(
+    dead_code,
     clippy::cast_precision_loss,
     clippy::too_many_lines,
-    clippy::missing_const_for_fn
+    clippy::missing_const_for_fn,
+    clippy::similar_names,
+    clippy::clone_on_copy,
+    clippy::or_fun_call,
+    clippy::uninlined_format_args,
+    clippy::stable_sort_primitive,
+    clippy::items_after_statements,
+    clippy::manual_assert
 )]
 
 use asupersync::runtime::RuntimeBuilder;
