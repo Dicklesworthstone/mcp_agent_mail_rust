@@ -39,7 +39,12 @@ const HEALTH_PULSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// `SQLite` predicate for active reservations across legacy sentinel values.
 const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
     OR (typeof(released_ts) IN ('integer', 'real') AND released_ts <= 0) \
-    OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none'))";
+    OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none')) \
+    OR (typeof(released_ts) = 'text' \
+      AND length(trim(released_ts)) > 0 \
+      AND trim(released_ts) GLOB '*[0-9]*' \
+      AND trim(released_ts) NOT GLOB '*[^0-9.+-]*' \
+      AND CAST(trim(released_ts) AS REAL) <= 0)";
 
 /// Batched aggregate counters used to populate [`DbStatSnapshot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -413,109 +418,87 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 /// Fetch active file reservations with project and agent names.
 #[allow(clippy::too_many_lines)]
 fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
-    conn.query_sync(
-        &format!(
-            "WITH normalized AS ( \
-               SELECT \
-                 fr.id, \
-                 COALESCE(p.slug, '[unknown-project]') AS project_slug, \
-                 COALESCE(a.name, '[unknown-agent]') AS agent_name, \
-                 fr.path_pattern, \
-                 fr.exclusive, \
+    let sql = format!(
+        "SELECT \
+           fr.id, \
+           COALESCE(p.slug, '[unknown-project]') AS project_slug, \
+           COALESCE(a.name, '[unknown-agent]') AS agent_name, \
+           fr.path_pattern, \
+           fr.exclusive, \
+           CASE \
+             WHEN fr.created_ts IS NULL THEN 0 \
+             WHEN typeof(fr.created_ts) IN ('integer', 'real') THEN CAST(fr.created_ts AS INTEGER) \
+             WHEN typeof(fr.created_ts) = 'text' \
+               AND length(trim(fr.created_ts)) > 0 \
+               AND trim(fr.created_ts) NOT GLOB '*[^0-9]*' THEN CAST(trim(fr.created_ts) AS INTEGER) \
+             WHEN typeof(fr.created_ts) = 'text' THEN COALESCE( \
+               CAST(strftime('%s', fr.created_ts) AS INTEGER) * 1000000 + \
                  CASE \
-                   WHEN fr.created_ts IS NULL THEN 0 \
-                   WHEN typeof(fr.created_ts) = 'text' \
-                     AND length(trim(fr.created_ts)) > 0 \
-                     AND trim(fr.created_ts) NOT GLOB '*[^0-9]*' THEN CAST(trim(fr.created_ts) AS INTEGER) \
-                   WHEN typeof(fr.created_ts) = 'text' THEN COALESCE( \
-                     CAST(strftime('%s', fr.created_ts) AS INTEGER) * 1000000 + \
-                       CASE \
-                         WHEN instr(fr.created_ts, '.') > 0 THEN CAST(substr(fr.created_ts || '000000', instr(fr.created_ts, '.') + 1, 6) AS INTEGER) \
-                         ELSE 0 \
-                       END, \
-                     0 \
-                   ) \
-                   ELSE fr.created_ts \
-                 END AS created_ts_micros, \
-                 CASE \
-                   WHEN fr.expires_ts IS NULL THEN 0 \
-                   WHEN typeof(fr.expires_ts) = 'text' \
-                     AND length(trim(fr.expires_ts)) > 0 \
-                     AND trim(fr.expires_ts) NOT GLOB '*[^0-9]*' THEN CAST(trim(fr.expires_ts) AS INTEGER) \
-                   WHEN typeof(fr.expires_ts) = 'text' THEN COALESCE( \
-                     CAST(strftime('%s', fr.expires_ts) AS INTEGER) * 1000000 + \
-                       CASE \
-                         WHEN instr(fr.expires_ts, '.') > 0 THEN CAST(substr(fr.expires_ts || '000000', instr(fr.expires_ts, '.') + 1, 6) AS INTEGER) \
-                         ELSE 0 \
-                       END, \
-                     0 \
-                   ) \
-                   ELSE fr.expires_ts \
-                 END AS expires_ts_micros, \
-                 CASE \
-                   WHEN fr.released_ts IS NULL THEN NULL \
-                   WHEN typeof(fr.released_ts) IN ('integer', 'real') AND fr.released_ts <= 0 THEN NULL \
-                   WHEN typeof(fr.released_ts) = 'text' \
-                     AND lower(trim(fr.released_ts)) IN ('', '0', 'null', 'none') THEN NULL \
-                   WHEN typeof(fr.released_ts) = 'text' \
-                     AND length(trim(fr.released_ts)) > 0 \
-                     AND trim(fr.released_ts) NOT GLOB '*[^0-9]*' \
-                     AND CAST(trim(fr.released_ts) AS INTEGER) <= 0 THEN NULL \
-                   WHEN typeof(fr.released_ts) = 'text' \
-                     AND length(trim(fr.released_ts)) > 0 \
-                     AND trim(fr.released_ts) NOT GLOB '*[^0-9]*' \
-                     THEN CAST(trim(fr.released_ts) AS INTEGER) \
-                   WHEN typeof(fr.released_ts) = 'text' THEN COALESCE( \
-                     CAST(strftime('%s', fr.released_ts) AS INTEGER) * 1000000 + \
-                       CASE \
-                         WHEN instr(fr.released_ts, '.') > 0 THEN CAST(substr(fr.released_ts || '000000', instr(fr.released_ts, '.') + 1, 6) AS INTEGER) \
-                         ELSE 0 \
-                       END, \
-                     NULL \
-                   ) \
-                   ELSE fr.released_ts \
-                 END AS released_ts_micros \
-               FROM file_reservations fr \
-               LEFT JOIN projects p ON p.id = fr.project_id \
-               LEFT JOIN agents a ON a.id = fr.agent_id \
+                   WHEN instr(fr.created_ts, '.') > 0 THEN CAST(substr(fr.created_ts || '000000', instr(fr.created_ts, '.') + 1, 6) AS INTEGER) \
+                   ELSE 0 \
+                 END, \
+               0 \
              ) \
-             SELECT \
-               id, project_slug, agent_name, path_pattern, exclusive, \
-               created_ts_micros, expires_ts_micros, released_ts_micros \
-             FROM normalized \
-             WHERE released_ts_micros IS NULL \
-             ORDER BY expires_ts_micros ASC \
-             LIMIT {MAX_RESERVATIONS}"
-        ),
-        &[],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .filter_map(|row| {
-                Some(ReservationSnapshot {
-                    id: row.get_named::<i64>("id").ok()?,
-                    project_slug: row
-                        .get_named::<String>("project_slug")
-                        .ok()
-                        .unwrap_or_else(|| "[unknown-project]".to_string()),
-                    agent_name: row
-                        .get_named::<String>("agent_name")
-                        .ok()
-                        .unwrap_or_else(|| "[unknown-agent]".to_string()),
-                    path_pattern: row.get_named::<String>("path_pattern").ok()?,
-                    exclusive: row
-                        .get_named::<i64>("exclusive")
-                        .ok()
-                        .is_none_or(|value| value != 0),
-                    granted_ts: row.get_named::<i64>("created_ts_micros").ok().unwrap_or(0),
-                    expires_ts: row.get_named::<i64>("expires_ts_micros").ok().unwrap_or(0),
-                    released_ts: row.get_named::<i64>("released_ts_micros").ok(),
-                })
+             ELSE 0 \
+           END AS created_ts_micros, \
+           CASE \
+             WHEN fr.expires_ts IS NULL THEN 0 \
+             WHEN typeof(fr.expires_ts) IN ('integer', 'real') THEN CAST(fr.expires_ts AS INTEGER) \
+             WHEN typeof(fr.expires_ts) = 'text' \
+               AND length(trim(fr.expires_ts)) > 0 \
+               AND trim(fr.expires_ts) NOT GLOB '*[^0-9]*' THEN CAST(trim(fr.expires_ts) AS INTEGER) \
+             WHEN typeof(fr.expires_ts) = 'text' THEN COALESCE( \
+               CAST(strftime('%s', fr.expires_ts) AS INTEGER) * 1000000 + \
+                 CASE \
+                   WHEN instr(fr.expires_ts, '.') > 0 THEN CAST(substr(fr.expires_ts || '000000', instr(fr.expires_ts, '.') + 1, 6) AS INTEGER) \
+                   ELSE 0 \
+                 END, \
+               0 \
+             ) \
+             ELSE 0 \
+           END AS expires_ts_micros \
+         FROM file_reservations fr \
+         LEFT JOIN projects p ON p.id = fr.project_id \
+         LEFT JOIN agents a ON a.id = fr.agent_id \
+         WHERE ({ACTIVE_RESERVATION_PREDICATE}) \
+         ORDER BY expires_ts_micros ASC \
+         LIMIT {MAX_RESERVATIONS}"
+    );
+
+    let rows = match conn.query_sync(&sql, &[]) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                "tui_poller.fetch_reservation_snapshots query failed; returning empty snapshot set"
+            );
+            return Vec::new();
+        }
+    };
+
+    rows.into_iter()
+        .filter_map(|row| {
+            Some(ReservationSnapshot {
+                id: row.get_named::<i64>("id").ok()?,
+                project_slug: row
+                    .get_named::<String>("project_slug")
+                    .ok()
+                    .unwrap_or_else(|| "[unknown-project]".to_string()),
+                agent_name: row
+                    .get_named::<String>("agent_name")
+                    .ok()
+                    .unwrap_or_else(|| "[unknown-agent]".to_string()),
+                path_pattern: row.get_named::<String>("path_pattern").ok()?,
+                exclusive: row
+                    .get_named::<i64>("exclusive")
+                    .ok()
+                    .is_none_or(|value| value != 0),
+                granted_ts: row.get_named::<i64>("created_ts_micros").ok().unwrap_or(0),
+                expires_ts: row.get_named::<i64>("expires_ts_micros").ok().unwrap_or(0),
+                released_ts: None,
             })
-            .collect()
-    })
-    .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Read `CONSOLE_POLL_INTERVAL_MS` from environment, default 2000ms.
@@ -1375,6 +1358,57 @@ mod tests {
     }
 
     #[test]
+    fn reservation_snapshots_treat_numeric_text_zero_variants_as_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservation_numeric_zero_variants.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER,
+                released_ts TEXT
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'proj')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/**', 1, 1000, 2000, '0.0'),
+                (2, 1, 1, 'tests/**', 0, 1000, 2000, '-1'),
+                (3, 1, 1, 'docs/**', 1, 1000, 2000, '1771211000000000')",
+            &[],
+        )
+        .expect("insert reservations");
+
+        let rows = fetch_reservation_snapshots(&conn);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.path_pattern == "src/**"));
+        assert!(rows.iter().any(|row| row.path_pattern == "tests/**"));
+    }
+
+    #[test]
     fn fetch_counts_treats_legacy_active_released_ts_sentinels_as_active() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_counts_legacy_released_ts.db");
@@ -1417,12 +1451,13 @@ mod tests {
                 (1, 1, 1, 'src/**', 1, 1000, 2000, NULL),
                 (2, 1, 1, 'tests/**', 1, 1000, 2000, '0'),
                 (3, 1, 1, 'docs/**', 1, 1000, 2000, 'null'),
-                (4, 1, 1, 'tmp/**', 1, 1000, 2000, '1771211000000000')",
+                (4, 1, 1, 'tmp/**', 1, 1000, 2000, '0.0'),
+                (5, 1, 1, 'build/**', 1, 1000, 2000, '1771211000000000')",
             &[],
         )
         .expect("insert reservations");
 
         let counts = DbStatQueryBatcher::new(&conn).fetch_counts();
-        assert_eq!(counts.file_reservations, 3);
+        assert_eq!(counts.file_reservations, 4);
     }
 }

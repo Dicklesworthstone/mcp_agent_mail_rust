@@ -594,6 +594,10 @@ impl MailScreen for ReservationsScreen {
         // Table rows
         let header = Row::new(["Agent", "Path Pattern", "Excl", "TTL Remaining", "Project"])
             .style(Style::default().bold());
+        let db_active_total = state
+            .db_stats_snapshot()
+            .and_then(|snapshot| usize::try_from(snapshot.file_reservations).ok())
+            .unwrap_or(0);
 
         let mut ttl_overlay_rows: Vec<TtlOverlayRow> = Vec::new();
         let rows: Vec<Row> = self
@@ -643,18 +647,21 @@ impl MailScreen for ReservationsScreen {
             })
             .collect();
 
-        let widths = [
-            Constraint::Percentage(18.0),
-            Constraint::Percentage(27.0),
-            Constraint::Percentage(8.0),
-            Constraint::Percentage(30.0),
-            Constraint::Percentage(17.0),
-        ];
-
         let block = Block::default()
             .title("Reservations")
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
+        let inner = block.inner(table_area);
+        let width_cells = compute_table_widths(inner.width);
+        let widths = [
+            Constraint::Fixed(width_cells[COL_AGENT]),
+            Constraint::Fixed(width_cells[COL_PATH]),
+            Constraint::Fixed(width_cells[COL_EXCLUSIVE]),
+            Constraint::Fixed(width_cells[COL_TTL]),
+            Constraint::Fixed(width_cells[COL_PROJECT]),
+        ];
+        let rows_empty = rows.is_empty();
+        let row_mismatch = rows_empty && !self.show_released && db_active_total > 0;
 
         let table = Table::new(rows, widths)
             .header(header)
@@ -665,6 +672,31 @@ impl MailScreen for ReservationsScreen {
         StatefulWidget::render(&table, table_area, frame, &mut ts);
         self.last_render_offset.set(ts.offset);
         render_ttl_overlays(frame, table_area, &ttl_overlay_rows, ts.offset, &tp);
+        if rows_empty && inner.height > 1 && inner.width > 4 {
+            let text = if row_mismatch {
+                format!(
+                    "DB reports {db_active_total} active reservations, but detail rows are unavailable. Poller snapshot is stale or failing."
+                )
+            } else if self.show_released {
+                "No reservations match current filters.".to_string()
+            } else {
+                "No active reservations.".to_string()
+            };
+            let style = if row_mismatch {
+                crate::tui_theme::text_warning(&tp)
+            } else {
+                crate::tui_theme::text_meta(&tp)
+            };
+            Paragraph::new(text).style(style).render(
+                Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(1),
+                    inner.width,
+                    inner.height.saturating_sub(1),
+                ),
+                frame,
+            );
+        }
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -849,6 +881,7 @@ fn format_ttl(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftui_harness::buffer_to_text;
     use mcp_agent_mail_core::Config;
 
     fn test_state() -> std::sync::Arc<TuiSharedState> {
@@ -889,6 +922,54 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(10, 2, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 10, 2), &state);
+    }
+
+    #[test]
+    fn empty_view_warns_when_db_reports_active_rows_but_none_loaded() {
+        let state = test_state();
+        state.update_db_stats(DbStatSnapshot {
+            file_reservations: 5,
+            timestamp_micros: 10,
+            ..Default::default()
+        });
+        let screen = ReservationsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("DB reports 5 active reservations"),
+            "missing mismatch warning text: {text}"
+        );
+    }
+
+    #[test]
+    fn empty_view_shows_no_active_when_db_count_is_zero() {
+        let state = test_state();
+        let screen = ReservationsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("No active reservations."),
+            "missing empty-state text: {text}"
+        );
+    }
+
+    #[test]
+    fn empty_view_with_show_released_uses_filter_message() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+        screen.show_released = true;
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("No reservations match current filters."),
+            "missing filtered empty-state text: {text}"
+        );
     }
 
     #[test]

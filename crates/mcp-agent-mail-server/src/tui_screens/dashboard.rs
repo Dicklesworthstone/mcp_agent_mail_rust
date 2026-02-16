@@ -220,6 +220,8 @@ pub struct DashboardScreen {
     verbosity: VerbosityTier,
     /// Previous `DbStatSnapshot` for delta indicators.
     prev_db_stats: DbStatSnapshot,
+    /// Current `DbStatSnapshot` used for summary panels and trend deltas.
+    current_db_stats: DbStatSnapshot,
     /// Sparkline data: recent latency samples.
     sparkline_data: Vec<f64>,
     // ── Showcase composition state ───────────────────────────────
@@ -368,6 +370,7 @@ impl DashboardScreen {
             quick_filter: DashboardQuickFilter::All,
             verbosity: VerbosityTier::Verbose,
             prev_db_stats: DbStatSnapshot::default(),
+            current_db_stats: DbStatSnapshot::default(),
             sparkline_data: Vec::with_capacity(60),
             anomalies: Vec::new(),
             percentile_history: Vec::with_capacity(PERCENTILE_HISTORY_CAP),
@@ -566,6 +569,20 @@ impl DashboardScreen {
                 confidence: 0.85,
                 headline: format!("Event ring {}% full", ring.fill_pct()),
                 rationale: format!("{} events dropped", ring.total_drops()),
+            });
+        }
+
+        // Counter/list divergence makes reservation and detail panes look empty.
+        if db.file_reservations > 0 && db.reservation_snapshots.is_empty() {
+            out.push(DetectedAnomaly {
+                severity: AnomalySeverity::High,
+                confidence: 0.92,
+                headline: format!(
+                    "{} active reservations but no reservation rows",
+                    db.file_reservations
+                ),
+                rationale: "DB summary counters and reservation detail snapshots diverged"
+                    .to_string(),
             });
         }
 
@@ -877,7 +894,14 @@ impl MailScreen for DashboardScreen {
         // Refresh stats and compute trends on stat interval
         if tick_count % STAT_REFRESH_TICKS == 0 {
             if let Some(stats) = state.db_stats_snapshot() {
-                self.prev_db_stats = stats;
+                if self.current_db_stats.timestamp_micros == 0 {
+                    self.current_db_stats = stats.clone();
+                    self.prev_db_stats = stats;
+                } else if stats.timestamp_micros > self.current_db_stats.timestamp_micros {
+                    self.prev_db_stats = std::mem::replace(&mut self.current_db_stats, stats);
+                } else {
+                    self.current_db_stats = stats;
+                }
             }
 
             // Compute anomalies
@@ -947,6 +971,7 @@ impl MailScreen for DashboardScreen {
             frame,
             summary_area,
             state,
+            &self.current_db_stats,
             &self.prev_db_stats,
             density,
             self.pulse_phase,
@@ -957,7 +982,11 @@ impl MailScreen for DashboardScreen {
         }
 
         // Main: dense adaptive dashboard composition.
-        let db_snapshot = state.db_stats_snapshot().unwrap_or_default();
+        let db_snapshot = if self.current_db_stats.timestamp_micros > 0 {
+            self.current_db_stats.clone()
+        } else {
+            state.db_stats_snapshot().unwrap_or_default()
+        };
         let visible_entries = self.visible_entries();
         let quick_query = self.quick_query();
         let layout = Self::main_content_layout(self.show_trend_panel, self.show_log_panel);
@@ -1311,8 +1340,10 @@ fn render_gradient_title(frame: &mut Frame<'_>, area: Rect, effects_enabled: boo
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title_text = "Agent Mail Dashboard";
-    let text_len = u16::try_from(title_text.len()).unwrap_or(u16::MAX);
+    let full_title = "Agent Mail Dashboard";
+    let title_text = truncate(full_title, usize::from(area.width));
+    let text_len = u16::try_from(title_text.len()).unwrap_or(area.width);
+    let text_len = text_len.min(area.width);
     let x_offset = area.width.saturating_sub(text_len) / 2;
     let title_area = Rect::new(area.x + x_offset, area.y, text_len, 1);
 
@@ -1344,12 +1375,13 @@ fn render_summary_band(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &TuiSharedState,
+    current_stats: &DbStatSnapshot,
     prev_stats: &DbStatSnapshot,
     density: DensityHint,
     pulse_phase: f32,
 ) {
     let counters = state.request_counters();
-    let db = state.db_stats_snapshot().unwrap_or_default();
+    let db = current_stats;
     let uptime_str = format_duration(state.uptime());
     let avg_ms = counters
         .latency_total_ms
@@ -1362,10 +1394,27 @@ fn render_summary_band(
     let project_str = format!("{}", db.projects);
     let ack_str = format!("{}", db.ack_pending);
     let req_str = format!("{}", counters.total);
+    let contact_str = format!("{}", db.contact_links);
+    let ring_stats = state.event_ring_stats();
+    let ring_fill = ring_stats.fill_pct();
+    let ring_fill_str = format!("{ring_fill}%");
+    let drop_count = ring_stats.total_drops();
+    let drop_str = format!("{drop_count}");
+    let error_total = counters.status_4xx.saturating_add(counters.status_5xx);
+    #[allow(clippy::cast_precision_loss)]
+    let error_rate = if counters.total == 0 {
+        0.0
+    } else {
+        error_total as f64 / counters.total as f64
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let error_rate_str = format!("{:.1}%", error_rate * 100.0);
 
     // Determine trend directions by comparing to previous snapshot.
     let msg_trend = trend_for(db.messages, prev_stats.messages);
     let agent_trend = trend_for(db.agents, prev_stats.agents);
+    let contact_trend = trend_for(db.contact_links, prev_stats.contact_links);
+    let reservation_trend = trend_for(db.file_reservations, prev_stats.file_reservations);
     let ack_trend = match db.ack_pending.cmp(&prev_stats.ack_pending) {
         std::cmp::Ordering::Greater => MetricTrend::Up, // ack growing = bad
         std::cmp::Ordering::Less => MetricTrend::Down,
@@ -1386,25 +1435,46 @@ fn render_summary_band(
     } else {
         tp.metric_ack_ok
     };
-    let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
+    let error_color = if error_rate >= ERROR_RATE_HIGH {
+        tp.severity_error
+    } else if error_rate >= ERROR_RATE_WARN {
+        tp.severity_warn
+    } else {
+        tp.severity_ok
+    };
+    let ring_color = if ring_fill >= RING_FILL_WARN {
+        tp.severity_warn
+    } else {
+        tp.metric_requests
+    };
+    let drop_color = if drop_count > 0 {
+        tp.severity_warn
+    } else {
+        tp.severity_ok
+    };
+    let mut tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
         DensityHint::Minimal | DensityHint::Compact => vec![
             ("Msg", &msg_str, msg_trend, tp.metric_messages),
-            ("Locks", &lock_str, MetricTrend::Flat, tp.ttl_warning),
+            ("Ack", &ack_str, ack_trend, ack_color),
+            ("Locks", &lock_str, reservation_trend, tp.ttl_warning),
             ("Req", &req_str, MetricTrend::Flat, req_color),
         ],
         DensityHint::Normal => vec![
             ("Messages", &msg_str, msg_trend, tp.metric_messages),
             ("Ack Pend", &ack_str, ack_trend, ack_color),
-            ("Locks", &lock_str, MetricTrend::Flat, tp.ttl_warning),
+            ("Locks", &lock_str, reservation_trend, tp.ttl_warning),
             ("Agents", &agent_str, agent_trend, tp.metric_agents),
+            ("Contacts", &contact_str, contact_trend, tp.status_accent),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
+            ("Error %", &error_rate_str, MetricTrend::Flat, error_color),
         ],
         DensityHint::Detailed => vec![
             ("Messages", &msg_str, msg_trend, tp.metric_messages),
             ("Ack Pend", &ack_str, ack_trend, ack_color),
-            ("Locks", &lock_str, MetricTrend::Flat, tp.ttl_warning),
+            ("Locks", &lock_str, reservation_trend, tp.ttl_warning),
             ("Agents", &agent_str, agent_trend, tp.metric_agents),
+            ("Contacts", &contact_str, contact_trend, tp.status_accent),
             (
                 "Projects",
                 &project_str,
@@ -1413,9 +1483,17 @@ fn render_summary_band(
             ),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
+            ("Error %", &error_rate_str, MetricTrend::Flat, error_color),
+            ("Ring Fill", &ring_fill_str, MetricTrend::Flat, ring_color),
+            ("Drops", &drop_str, MetricTrend::Flat, drop_color),
             ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
         ],
     };
+
+    let max_tiles_by_width = usize::from((area.width / 12).max(1));
+    if tiles.len() > max_tiles_by_width {
+        tiles.truncate(max_tiles_by_width);
+    }
 
     let tile_count = tiles.len();
     if tile_count == 0 || area.width == 0 || area.height == 0 {
@@ -1881,7 +1959,7 @@ fn render_agents_snapshot_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Agents · {}", rows.len());
     let block = Block::default()
-        .title(title)
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
     let inner = block.inner(area);
@@ -1897,7 +1975,7 @@ fn render_agents_snapshot_panel(
         return;
     }
 
-    let hint_rows = if inner.height >= 5 { 1usize } else { 0usize };
+    let hint_rows = usize::from(inner.height >= 5);
     let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
     if content_rows >= 2 {
@@ -1907,10 +1985,7 @@ fn render_agents_snapshot_panel(
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
-            Span::styled(
-                "●<60s ●<5m ○>=5m",
-                crate::tui_theme::text_meta(&tp),
-            ),
+            Span::styled("●<60s ●<5m ○>=5m", crate::tui_theme::text_meta(&tp)),
         ]));
     }
     let list_budget = content_rows.saturating_sub(lines.len());
@@ -1939,6 +2014,7 @@ fn render_agents_snapshot_panel(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_contacts_snapshot_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1980,7 +2056,7 @@ fn render_contacts_snapshot_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Contacts · {} (p:{pending})", rows.len());
     let block = Block::default()
-        .title(title)
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
     let inner = block.inner(area);
@@ -1996,7 +2072,7 @@ fn render_contacts_snapshot_panel(
         return;
     }
 
-    let hint_rows = if inner.height >= 5 { 1usize } else { 0usize };
+    let hint_rows = usize::from(inner.height >= 5);
     let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let now = unix_epoch_micros_now().unwrap_or_default();
     let mut lines = Vec::new();
@@ -2082,7 +2158,7 @@ fn render_projects_snapshot_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Projects · {}", rows.len());
     let block = Block::default()
-        .title(title)
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
     let inner = block.inner(area);
@@ -2098,22 +2174,23 @@ fn render_projects_snapshot_panel(
         return;
     }
 
-    let total_messages = rows.iter().map(|project| project.message_count).sum::<u64>();
+    let total_messages = rows
+        .iter()
+        .map(|project| project.message_count)
+        .sum::<u64>();
     let total_agents = rows.iter().map(|project| project.agent_count).sum::<u64>();
     let total_reservations = rows
         .iter()
         .map(|project| project.reservation_count)
         .sum::<u64>();
 
-    let hint_rows = if inner.height >= 5 { 1usize } else { 0usize };
+    let hint_rows = usize::from(inner.height >= 5);
     let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
     if content_rows >= 2 {
         lines.push(Line::from_spans([
             Span::styled(
-                format!(
-                    "msg:{total_messages} ag:{total_agents} res:{total_reservations}"
-                ),
+                format!("msg:{total_messages} ag:{total_agents} res:{total_reservations}"),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
@@ -2178,7 +2255,7 @@ fn render_project_load_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Project Load · {}", rows.len());
     let block = Block::default()
-        .title(title)
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
     let inner = block.inner(area);
@@ -2194,7 +2271,7 @@ fn render_project_load_panel(
         return;
     }
 
-    let hint_rows = if inner.height >= 5 { 1usize } else { 0usize };
+    let hint_rows = usize::from(inner.height >= 5);
     let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
     let total_score = rows.iter().map(|(_, score)| *score).sum::<u64>();
@@ -2245,6 +2322,7 @@ fn render_project_load_panel(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_reservation_watch_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2254,17 +2332,6 @@ fn render_reservation_watch_panel(
     if area.width < 20 || area.height < 3 {
         return;
     }
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Reservations")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let now = unix_epoch_micros_now().unwrap_or_default();
     let query_terms = parse_query_terms(query_text);
     let mut rows: Vec<&ReservationSnapshot> = reservations
@@ -2282,6 +2349,25 @@ fn render_reservation_watch_panel(
         .collect();
     rows.sort_by_key(|reservation| reservation.expires_ts);
 
+    let soon_count = rows
+        .iter()
+        .filter(|reservation| {
+            reservation.expires_ts.saturating_sub(now) <= RESERVATION_SOON_THRESHOLD_MICROS
+        })
+        .count();
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Reservations · {} (≤5m:{soon_count})", rows.len());
+    let block = Block::default()
+        .title(&title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
     if rows.is_empty() {
         Paragraph::new("No active reservations")
             .style(crate::tui_theme::text_meta(&tp))
@@ -2289,12 +2375,6 @@ fn render_reservation_watch_panel(
         return;
     }
 
-    let soon_count = rows
-        .iter()
-        .filter(|reservation| {
-            reservation.expires_ts.saturating_sub(now) <= RESERVATION_SOON_THRESHOLD_MICROS
-        })
-        .count();
     let earliest = rows.first().copied();
     let ttl_display = earliest.map_or_else(
         || "none".to_string(),
@@ -2308,8 +2388,17 @@ fn render_reservation_watch_panel(
         },
     );
 
-    let gauge_h = if inner.height >= 4 { 2 } else { 1 };
-    let (gauge_area, list_area) = split_top(inner, gauge_h);
+    let hint_rows = usize::from(inner.height >= 6);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    let gauge_h = if content_area.height >= 4 { 2 } else { 1 };
+    let (gauge_area, list_area) = split_top(content_area, gauge_h);
     let soon_count = u32::try_from(soon_count).unwrap_or(u32::MAX);
     let total_rows = u32::try_from(rows.len()).unwrap_or(u32::MAX);
     ReservationGauge::new("Expiring ≤5m", soon_count, total_rows)
@@ -2351,6 +2440,9 @@ fn render_reservation_watch_panel(
         ]));
     }
     Paragraph::new(Text::from_lines(lines)).render(list_area, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "symbols: ✖ expired · ! <=60s · ▲ <=5m");
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2361,17 +2453,6 @@ fn render_reservation_ttl_buckets_panel(
     query_text: &str,
 ) {
     if area.width < 20 || area.height < 3 {
-        return;
-    }
-
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Reservation TTL")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
         return;
     }
 
@@ -2390,6 +2471,18 @@ fn render_reservation_ttl_buckets_panel(
             )
         })
         .collect();
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Reservation TTL · {}", filtered.len());
+    let block = Block::default()
+        .title(&title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     if filtered.is_empty() {
         Paragraph::new("No matching reservations")
@@ -2426,60 +2519,70 @@ fn render_reservation_ttl_buckets_panel(
     let soon_u64 = u64::try_from(soon).unwrap_or(u64::MAX);
     let filtered_u64 = u64::try_from(filtered.len()).unwrap_or(u64::MAX).max(1);
 
+    let hint_rows = usize::from(inner.height >= 5);
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
-    lines.push(Line::from_spans([Span::styled(
-        format!("active:{} excl:{}", filtered.len(), exclusive),
-        Style::default().fg(tp.text_primary).bold(),
-    )]));
-    lines.push(Line::from_spans([Span::styled(
-        format!("exp:{expired} <=60s:{s60} <=5m:{m5} <=30m:{m30} >30m:{long}"),
-        crate::tui_theme::text_meta(&tp),
-    )]));
-    lines.push(Line::from_spans([
-        Span::styled("soon ", crate::tui_theme::text_meta(&tp)),
-        Span::styled(
-            ratio_bar(soon_u64, filtered_u64, 10),
-            Style::default().fg(tp.ttl_warning),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!("{soon}/{}", filtered.len()),
+    if content_rows >= 1 {
+        lines.push(Line::from_spans([Span::styled(
+            format!("active:{} excl:{}", filtered.len(), exclusive),
+            Style::default().fg(tp.text_primary).bold(),
+        )]));
+    }
+    if content_rows >= 2 {
+        lines.push(Line::from_spans([Span::styled(
+            format!("exp:{expired} <=60s:{s60} <=5m:{m5} <=30m:{m30} >30m:{long}"),
             crate::tui_theme::text_meta(&tp),
-        ),
-    ]));
-
-    let soonest = filtered
-        .iter()
-        .min_by_key(|reservation| reservation.expires_ts);
-    if let Some(soonest) = soonest {
-        let ttl = reservation_remaining_seconds(soonest, now);
+        )]));
+    }
+    if content_rows >= 3 {
         lines.push(Line::from_spans([
-            Span::styled("next ", crate::tui_theme::text_meta(&tp)),
+            Span::styled("soon ", crate::tui_theme::text_meta(&tp)),
             Span::styled(
-                format!("{ttl}s"),
-                Style::default().fg(tp.metric_latency).bold(),
+                ratio_bar(soon_u64, filtered_u64, 10),
+                Style::default().fg(tp.ttl_warning),
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&soonest.agent_name, 12),
-                Style::default().fg(tp.text_primary),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                truncate(
-                    &soonest.path_pattern,
-                    usize::from(inner.width.saturating_sub(24)),
-                ),
+                format!("{soon}/{}", filtered.len()),
                 crate::tui_theme::text_meta(&tp),
             ),
         ]));
     }
 
-    let visible = lines
-        .into_iter()
-        .take(usize::from(inner.height))
-        .collect::<Vec<_>>();
+    let soonest = filtered
+        .iter()
+        .min_by_key(|reservation| reservation.expires_ts);
+    if lines.len() < content_rows {
+        if let Some(soonest) = soonest {
+            let ttl = reservation_remaining_seconds(soonest, now);
+            lines.push(Line::from_spans([
+                Span::styled("next ", crate::tui_theme::text_meta(&tp)),
+                Span::styled(
+                    format!("{ttl}s"),
+                    Style::default().fg(tp.metric_latency).bold(),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    truncate(&soonest.agent_name, 12),
+                    Style::default().fg(tp.text_primary),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    truncate(
+                        &soonest.path_pattern,
+                        usize::from(inner.width.saturating_sub(24)),
+                    ),
+                    crate::tui_theme::text_meta(&tp),
+                ),
+            ]));
+        }
+    }
+
+    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
     Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "exclusive reservations should be short-lived");
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2494,17 +2597,6 @@ fn render_signal_panel(
     if area.width < 20 || area.height < 3 {
         return;
     }
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Signals")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let query_terms = parse_query_terms(query_text);
     let pending_contacts = contacts
         .iter()
@@ -2515,6 +2607,20 @@ fn render_signal_panel(
         .filter(|contact| contact.status.eq_ignore_ascii_case("accepted"))
         .count();
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Signals · anomalies:{}", anomalies.len());
+    let block = Block::default()
+        .title(&title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let hint_rows = usize::from(inner.height >= 5);
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
     lines.push(Line::from_spans([
         Span::styled("contacts ", crate::tui_theme::text_meta(&tp)),
@@ -2531,7 +2637,7 @@ fn render_signal_panel(
             &query_terms,
         )
     }) {
-        if pushed >= usize::from(inner.height) {
+        if pushed >= content_rows {
             break;
         }
         lines.push(Line::from_spans([
@@ -2551,7 +2657,7 @@ fn render_signal_panel(
         matches!(entry.severity, EventSeverity::Warn | EventSeverity::Error)
             && text_matches_query_terms(&entry.summary, &query_terms)
     }) {
-        if pushed >= usize::from(inner.height) {
+        if pushed >= content_rows {
             break;
         }
         let marker = if entry.severity == EventSeverity::Error {
@@ -2575,7 +2681,7 @@ fn render_signal_panel(
             MailEventKind::MessageSent | MailEventKind::MessageReceived
         ) && text_matches_query_terms(&entry.summary, &query_terms)
     }) {
-        if pushed >= usize::from(inner.height) {
+        if pushed >= content_rows {
             break;
         }
         let marker = if entry.kind == MailEventKind::MessageSent {
@@ -2596,14 +2702,22 @@ fn render_signal_panel(
         pushed += 1;
     }
 
-    if pushed == 1 && usize::from(inner.height) > 1 {
+    if pushed == 1 && content_rows > 1 {
         lines.push(Line::from_spans([Span::styled(
             "No active warnings or message activity",
             crate::tui_theme::text_meta(&tp),
         )]));
     }
 
-    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(
+            frame,
+            inner,
+            "priority: anomalies, then warn/error, then traffic",
+        );
+    }
 }
 
 fn render_event_mix_panel(
@@ -2615,9 +2729,17 @@ fn render_event_mix_panel(
     if area.width < 18 || area.height < 3 {
         return;
     }
+    let query_terms = parse_query_terms(query_text);
+    let filtered: Vec<&EventEntry> = entries
+        .iter()
+        .copied()
+        .filter(|entry| event_entry_matches_query(entry, &query_terms))
+        .collect();
+
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Event Mix · {}", filtered.len());
     let block = Block::default()
-        .title("Event Mix")
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
     let inner = block.inner(area);
@@ -2626,12 +2748,6 @@ fn render_event_mix_panel(
         return;
     }
 
-    let query_terms = parse_query_terms(query_text);
-    let filtered: Vec<&EventEntry> = entries
-        .iter()
-        .copied()
-        .filter(|entry| event_entry_matches_query(entry, &query_terms))
-        .collect();
     if filtered.is_empty() {
         Paragraph::new("No matching events")
             .style(crate::tui_theme::text_meta(&tp))
@@ -2673,39 +2789,49 @@ fn render_event_mix_panel(
     let mut top_kinds = by_kind.into_iter().collect::<Vec<_>>();
     top_kinds.sort_by_key(|pair| std::cmp::Reverse(pair.1));
 
+    let hint_rows = usize::from(inner.height >= 5);
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
-    lines.push(Line::from_spans([Span::styled(
-        format!("total:{} warn:{} err:{}", filtered.len(), warn, error),
-        Style::default().fg(tp.text_primary).bold(),
-    )]));
-    lines.push(Line::from_spans([Span::styled(
-        format!("msg:{msg} tool:{tool} res:{reservation} http:{http} sys:{lifecycle}"),
-        crate::tui_theme::text_meta(&tp),
-    )]));
-    if let Some((kind, count)) = top_kinds.first() {
-        lines.push(Line::from_spans([
-            Span::styled("top ", crate::tui_theme::text_meta(&tp)),
-            Span::styled(
-                format!("{} ({count})", kind.compact_label()),
-                Style::default().fg(tp.metric_requests),
-            ),
-        ]));
+    if content_rows >= 1 {
+        lines.push(Line::from_spans([Span::styled(
+            format!("total:{} warn:{} err:{}", filtered.len(), warn, error),
+            Style::default().fg(tp.text_primary).bold(),
+        )]));
     }
-    if let Some((kind, count)) = top_kinds.get(1) {
-        lines.push(Line::from_spans([
-            Span::styled("next ", crate::tui_theme::text_meta(&tp)),
-            Span::styled(
-                format!("{} ({count})", kind.compact_label()),
-                Style::default().fg(tp.text_primary),
-            ),
-        ]));
+    if content_rows >= 2 {
+        lines.push(Line::from_spans([Span::styled(
+            format!("msg:{msg} tool:{tool} res:{reservation} http:{http} sys:{lifecycle}"),
+            crate::tui_theme::text_meta(&tp),
+        )]));
+    }
+    if lines.len() < content_rows {
+        if let Some((kind, count)) = top_kinds.first() {
+            lines.push(Line::from_spans([
+                Span::styled("top ", crate::tui_theme::text_meta(&tp)),
+                Span::styled(
+                    format!("{} ({count})", kind.compact_label()),
+                    Style::default().fg(tp.metric_requests),
+                ),
+            ]));
+        }
+    }
+    if lines.len() < content_rows {
+        if let Some((kind, count)) = top_kinds.get(1) {
+            lines.push(Line::from_spans([
+                Span::styled("next ", crate::tui_theme::text_meta(&tp)),
+                Span::styled(
+                    format!("{} ({count})", kind.compact_label()),
+                    Style::default().fg(tp.text_primary),
+                ),
+            ]));
+        }
     }
 
-    let visible = lines
-        .into_iter()
-        .take(usize::from(inner.height))
-        .collect::<Vec<_>>();
+    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
     Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "mix reflects current query + quick filter");
+    }
 }
 
 #[derive(Default)]
@@ -2716,10 +2842,10 @@ struct ToolAgg {
     samples: Vec<u64>,
 }
 
-#[allow(dead_code)]
 struct ToolLatencyRow {
     tool_name: String,
     calls: usize,
+    total_ms: u64,
     avg_ms: u64,
     p95_ms: u64,
     max_ms: u64,
@@ -2736,17 +2862,6 @@ fn render_tool_latency_panel(
         return;
     }
 
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Tool Latency")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let query_terms = parse_query_terms(query_text);
     let mut by_tool: HashMap<String, ToolAgg> = HashMap::new();
     for entry in entries.iter().filter(|entry| {
@@ -2760,6 +2875,18 @@ fn render_tool_latency_panel(
             slot.max_ms = slot.max_ms.max(duration_ms);
             slot.samples.push(duration_ms);
         }
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Tool Latency · {}", by_tool.len());
+    let block = Block::default()
+        .title(&title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
     }
 
     if by_tool.is_empty() {
@@ -2781,6 +2908,7 @@ fn render_tool_latency_panel(
             ToolLatencyRow {
                 tool_name,
                 calls: stats.calls,
+                total_ms: stats.total_ms,
                 avg_ms,
                 p95_ms,
                 max_ms: stats.max_ms,
@@ -2795,11 +2923,9 @@ fn render_tool_latency_panel(
     });
 
     let total_calls = rows.iter().map(|stats| stats.calls).sum::<usize>();
-    let avg_latency = rows
-        .iter()
-        .map(|stats| stats.avg_ms)
-        .sum::<u64>()
-        .checked_div(u64::try_from(rows.len()).unwrap_or(1).max(1))
+    let total_latency_ms = rows.iter().map(|stats| stats.total_ms).sum::<u64>();
+    let avg_latency = total_latency_ms
+        .checked_div(u64::try_from(total_calls).unwrap_or(1).max(1))
         .unwrap_or(0);
     let max_p95 = rows
         .iter()
@@ -2808,19 +2934,21 @@ fn render_tool_latency_panel(
         .unwrap_or(1)
         .max(1);
 
+    let hint_rows = usize::from(inner.height >= 5);
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
-    lines.push(Line::from_spans([Span::styled(
-        format!(
-            "tools:{} calls:{total_calls} fleet-avg:{avg_latency}ms",
-            rows.len(),
-        ),
-        Style::default().fg(tp.text_primary).bold(),
-    )]));
+    if content_rows >= 1 {
+        lines.push(Line::from_spans([Span::styled(
+            format!(
+                "tools:{} calls:{total_calls} fleet-avg:{avg_latency}ms",
+                rows.len(),
+            ),
+            Style::default().fg(tp.text_primary).bold(),
+        )]));
+    }
 
-    for stats in rows
-        .iter()
-        .take(usize::from(inner.height).saturating_sub(1))
-    {
+    let list_budget = content_rows.saturating_sub(lines.len());
+    for stats in rows.iter().take(list_budget) {
         let calls_u64 = u64::try_from(stats.calls).unwrap_or(0);
         let bar = ratio_bar(stats.p95_ms, max_p95, 8);
         lines.push(Line::from_spans([
@@ -2841,11 +2969,15 @@ fn render_tool_latency_panel(
         ]));
     }
 
-    let visible = lines
-        .into_iter()
-        .take(usize::from(inner.height))
-        .collect::<Vec<_>>();
+    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
     Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(
+            frame,
+            inner,
+            "ranked by p95; fleet-avg weighted by call count",
+        );
+    }
 }
 
 fn render_recent_activity_panel(
@@ -2857,9 +2989,24 @@ fn render_recent_activity_panel(
     if area.width < 18 || area.height < 3 {
         return;
     }
+
+    let query_terms = parse_query_terms(query_text);
+    let filtered = entries
+        .iter()
+        .rev()
+        .copied()
+        .filter(|entry| {
+            text_matches_query_terms(
+                &format!("{} {}", entry.kind.compact_label(), entry.summary),
+                &query_terms,
+            )
+        })
+        .collect::<Vec<_>>();
+
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Recent Activity · {}", filtered.len());
     let block = Block::default()
-        .title("Recent Activity")
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
     let inner = block.inner(area);
@@ -2868,15 +3015,11 @@ fn render_recent_activity_panel(
         return;
     }
 
-    let query_terms = parse_query_terms(query_text);
+    let hint_rows = usize::from(inner.height >= 5);
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
-    for entry in entries.iter().rev().filter(|entry| {
-        text_matches_query_terms(
-            &format!("{} {}", entry.kind.compact_label(), entry.summary),
-            &query_terms,
-        )
-    }) {
-        if lines.len() >= usize::from(inner.height) {
+    for entry in filtered.iter().take(content_rows) {
+        if lines.len() >= content_rows {
             break;
         }
         lines.push(Line::from_spans([
@@ -2884,7 +3027,7 @@ fn render_recent_activity_panel(
             Span::raw(" "),
             Span::styled(
                 entry.icon.to_string(),
-                Style::default().fg(tp.metric_requests),
+                Style::default().fg(entry.severity.color()),
             ),
             Span::raw(" "),
             Span::styled(
@@ -2901,7 +3044,11 @@ fn render_recent_activity_panel(
         )]));
     }
 
-    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "icon color reflects event severity");
+    }
 }
 
 fn render_message_flow_panel(
@@ -2911,17 +3058,6 @@ fn render_message_flow_panel(
     query_text: &str,
 ) {
     if area.width < 20 || area.height < 3 {
-        return;
-    }
-
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Message Flow")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
         return;
     }
 
@@ -2936,6 +3072,18 @@ fn render_message_flow_panel(
             ) && text_matches_query_terms(&entry.summary, &query_terms)
         })
         .collect::<Vec<_>>();
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Message Flow · {}", filtered.len());
+    let block = Block::default()
+        .title(&title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     if filtered.is_empty() {
         Paragraph::new("No matching messages")
@@ -2958,37 +3106,40 @@ fn render_message_flow_panel(
     let sent_u64 = u64::try_from(sent).unwrap_or(0);
     let recv_u64 = u64::try_from(recv).unwrap_or(0);
 
+    let hint_rows = usize::from(inner.height >= 5);
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let mut lines = Vec::new();
-    lines.push(Line::from_spans([Span::styled(
-        format!("sent:{sent} recv:{recv} Δ:{delta:+}"),
-        Style::default().fg(tp.text_primary).bold(),
-    )]));
-    lines.push(Line::from_spans([
-        Span::styled("↑", Style::default().fg(tp.metric_messages)),
-        Span::styled(
-            ratio_bar(sent_u64, total_msgs, 6),
-            Style::default().fg(tp.metric_messages),
-        ),
-        Span::raw(" "),
-        Span::styled("↓", Style::default().fg(tp.metric_requests)),
-        Span::styled(
-            ratio_bar(recv_u64, total_msgs, 6),
-            Style::default().fg(tp.metric_requests),
-        ),
-    ]));
+    if content_rows >= 1 {
+        lines.push(Line::from_spans([Span::styled(
+            format!("sent:{sent} recv:{recv} Δ:{delta:+}"),
+            Style::default().fg(tp.text_primary).bold(),
+        )]));
+    }
+    if content_rows >= 2 {
+        lines.push(Line::from_spans([
+            Span::styled("↑", Style::default().fg(tp.metric_messages)),
+            Span::styled(
+                ratio_bar(sent_u64, total_msgs, 6),
+                Style::default().fg(tp.metric_messages),
+            ),
+            Span::raw(" "),
+            Span::styled("↓", Style::default().fg(tp.metric_requests)),
+            Span::styled(
+                ratio_bar(recv_u64, total_msgs, 6),
+                Style::default().fg(tp.metric_requests),
+            ),
+        ]));
+    }
 
-    for entry in filtered
-        .iter()
-        .rev()
-        .take(usize::from(inner.height).saturating_sub(2))
-    {
-        let marker = if entry.kind == MailEventKind::MessageSent {
-            "↑"
+    let list_budget = content_rows.saturating_sub(lines.len());
+    for entry in filtered.iter().rev().take(list_budget) {
+        let (marker, color) = if entry.kind == MailEventKind::MessageSent {
+            ("↑", tp.metric_messages)
         } else {
-            "↓"
+            ("↓", tp.metric_requests)
         };
         lines.push(Line::from_spans([
-            Span::styled(marker, Style::default().fg(tp.metric_messages)),
+            Span::styled(marker, Style::default().fg(color)),
             Span::raw(" "),
             Span::styled(
                 truncate(&entry.summary, usize::from(inner.width.saturating_sub(2))),
@@ -2997,11 +3148,11 @@ fn render_message_flow_panel(
         ]));
     }
 
-    let visible = lines
-        .into_iter()
-        .take(usize::from(inner.height))
-        .collect::<Vec<_>>();
+    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
     Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "↑ outbound, ↓ inbound (relative share bars)");
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3026,6 +3177,8 @@ fn render_query_matches_panel(
         return;
     }
 
+    let hint_rows = usize::from(inner.height >= 6);
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
     let query_terms = parse_query_terms(query_text);
     let mut lines = Vec::new();
     if query_terms.is_empty() {
@@ -3050,6 +3203,12 @@ fn render_query_matches_panel(
             "Enter jumps to Search with the same query",
             crate::tui_theme::text_meta(&tp),
         )]));
+        if content_rows >= 4 {
+            lines.push(Line::from_spans([Span::styled(
+                "Live filtering is case-insensitive and uses AND semantics",
+                crate::tui_theme::text_meta(&tp),
+            )]));
+        }
     } else {
         let mut matched_agents = Vec::new();
         let mut matched_agents_total = 0usize;
@@ -3096,6 +3255,18 @@ fn render_query_matches_panel(
                 matched_paths.push(reservation.path_pattern.clone());
             }
         }
+        let agent_den = u64::try_from(db_snapshot.agents_list.len())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let project_den = u64::try_from(db_snapshot.projects_list.len())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let reservation_den = u64::try_from(db_snapshot.reservation_snapshots.len())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let matched_agents_u64 = u64::try_from(matched_agents_total).unwrap_or(u64::MAX);
+        let matched_projects_u64 = u64::try_from(matched_projects_total).unwrap_or(u64::MAX);
+        let matched_paths_u64 = u64::try_from(matched_paths_total).unwrap_or(u64::MAX);
 
         lines.push(Line::from_spans([
             Span::styled("Query ", crate::tui_theme::text_meta(&tp)),
@@ -3114,6 +3285,25 @@ fn render_query_matches_panel(
             ),
             crate::tui_theme::text_meta(&tp),
         )]));
+        lines.push(Line::from_spans([
+            Span::styled("ag ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                ratio_bar(matched_agents_u64, agent_den, 6),
+                Style::default().fg(tp.metric_agents),
+            ),
+            Span::raw(" "),
+            Span::styled("pr ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                ratio_bar(matched_projects_u64, project_den, 6),
+                Style::default().fg(tp.status_accent),
+            ),
+            Span::raw(" "),
+            Span::styled("rs ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                ratio_bar(matched_paths_u64, reservation_den, 6),
+                Style::default().fg(tp.ttl_warning),
+            ),
+        ]));
         lines.push(Line::from_spans([Span::styled(
             format!(
                 "Agents: {}",
@@ -3137,11 +3327,11 @@ fn render_query_matches_panel(
         )]));
     }
 
-    let visible_lines = lines
-        .into_iter()
-        .take(usize::from(inner.height))
-        .collect::<Vec<_>>();
+    let visible_lines = lines.into_iter().take(content_rows).collect::<Vec<_>>();
     Paragraph::new(Text::from_lines(visible_lines)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "Enter opens Search with this exact query");
+    }
 }
 
 fn reservation_remaining_seconds(snapshot: &ReservationSnapshot, now_micros: i64) -> u64 {
@@ -4493,6 +4683,60 @@ mod tests {
             .find(|entry| entry.kind == MailEventKind::ReservationReleased)
             .expect("expected synthetic ReservationReleased entry");
         assert!(released.summary.contains("active reservations removed"));
+    }
+
+    #[test]
+    fn dashboard_stat_refresh_tracks_previous_and_current_snapshots() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 5,
+            agents: 2,
+            file_reservations: 1,
+            timestamp_micros: 100,
+            ..Default::default()
+        });
+        screen.tick(STAT_REFRESH_TICKS, &state);
+        assert_eq!(screen.current_db_stats.messages, 5);
+        assert_eq!(screen.prev_db_stats.messages, 5);
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 9,
+            agents: 3,
+            file_reservations: 4,
+            timestamp_micros: 200,
+            ..Default::default()
+        });
+        screen.tick(STAT_REFRESH_TICKS * 2, &state);
+
+        assert_eq!(screen.prev_db_stats.messages, 5);
+        assert_eq!(screen.current_db_stats.messages, 9);
+        assert_eq!(screen.prev_db_stats.file_reservations, 1);
+        assert_eq!(screen.current_db_stats.file_reservations, 4);
+    }
+
+    #[test]
+    fn detect_anomalies_flags_reservation_counter_snapshot_divergence() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let screen = DashboardScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            file_reservations: 7,
+            reservation_snapshots: Vec::new(),
+            timestamp_micros: 123,
+            ..Default::default()
+        });
+
+        let anomalies = screen.detect_anomalies(&state);
+        assert!(
+            anomalies
+                .iter()
+                .any(|anomaly| anomaly.headline == "7 active reservations but no reservation rows"),
+            "expected divergence anomaly to be emitted"
+        );
     }
 
     #[test]

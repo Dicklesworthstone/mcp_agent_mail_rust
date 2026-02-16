@@ -34,10 +34,10 @@ use mcp_agent_mail_search_core::{
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
     DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
-    EmbeddingRequest, EmbeddingResult, FsScoredResult, HashEmbedder, JobMetricsSnapshot,
-    ModelInfo, ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig,
-    ScoredResult, SearchPhase, TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex,
-    VectorFilter, VectorIndex, VectorIndexConfig, fs, get_two_tier_context,
+    EmbeddingRequest, EmbeddingResult, FsScoredResult, HashEmbedder, JobMetricsSnapshot, ModelInfo,
+    ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult,
+    SearchPhase, TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter,
+    VectorIndex, VectorIndexConfig, fs, get_two_tier_context,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
@@ -947,6 +947,13 @@ impl RerankBlendPolicy {
             _ => Self::Weighted,
         }
     }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Weighted => "weighted",
+            Self::Replace => "replace",
+        }
+    }
 }
 
 #[cfg(feature = "hybrid")]
@@ -970,6 +977,19 @@ impl Default for HybridRerankConfig {
             blend_weight: 0.35,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct HybridRerankAudit {
+    enabled: bool,
+    attempted: bool,
+    outcome: String,
+    candidate_count: usize,
+    top_k: usize,
+    min_candidates: usize,
+    blend_policy: Option<String>,
+    blend_weight: Option<f64>,
+    applied_count: usize,
 }
 
 #[cfg(feature = "hybrid")]
@@ -1092,7 +1112,7 @@ fn blend_rerank_score(
 
 #[cfg(feature = "hybrid")]
 fn apply_rerank_scores_and_sort(
-    merged: &mut Vec<SearchResult>,
+    merged: &mut [SearchResult],
     rerank_scores: &BTreeMap<i64, f64>,
     policy: RerankBlendPolicy,
     weight: f64,
@@ -1118,27 +1138,52 @@ fn apply_rerank_scores_and_sort(
 }
 
 #[cfg(feature = "hybrid")]
-async fn maybe_apply_hybrid_rerank(cx: &Cx, query: &SearchQuery, merged: &mut Vec<SearchResult>) {
+#[allow(clippy::too_many_lines)]
+async fn maybe_apply_hybrid_rerank(
+    cx: &Cx,
+    query: &SearchQuery,
+    merged: &mut [SearchResult],
+) -> HybridRerankAudit {
     let config = hybrid_rerank_config_from_env();
+    let candidate_count = merged.len();
+    let top_k = config.top_k.min(candidate_count);
+    let min_candidates = config.min_candidates.min(top_k.max(1));
+    let mut audit = HybridRerankAudit {
+        enabled: config.enabled,
+        attempted: false,
+        outcome: if config.enabled {
+            "not_attempted".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        candidate_count,
+        top_k,
+        min_candidates,
+        blend_policy: Some(config.blend_policy.as_str().to_string()),
+        blend_weight: Some(config.blend_weight),
+        applied_count: 0,
+    };
+
     if !config.enabled {
-        return;
+        return audit;
     }
-    if merged.len() < config.min_candidates {
+    if candidate_count < config.min_candidates {
+        audit.outcome = "insufficient_candidates".to_string();
         tracing::debug!(
             target: "search.metrics",
-            candidate_count = merged.len(),
+            candidate_count,
             min_candidates = config.min_candidates,
             "skipping rerank due to insufficient candidates"
         );
-        return;
+        return audit;
     }
 
     let Some(reranker) = get_or_init_hybrid_reranker() else {
-        return;
+        audit.outcome = "reranker_unavailable".to_string();
+        return audit;
     };
 
-    let top_k = config.top_k.min(merged.len());
-    let min_candidates = config.min_candidates.min(top_k.max(1));
+    audit.attempted = true;
 
     let text_by_doc = merged
         .iter()
@@ -1180,12 +1225,13 @@ async fn maybe_apply_hybrid_rerank(cx: &Cx, query: &SearchQuery, merged: &mut Ve
     .await;
 
     if let Err(error) = rerank_outcome {
+        audit.outcome = "rerank_error".to_string();
         tracing::warn!(
             target: "search.metrics",
             error = %error,
             "rerank step failed; degrading to fusion-only ranking"
         );
-        return;
+        return audit;
     }
 
     let rerank_scores = fs_candidates
@@ -1197,11 +1243,12 @@ async fn maybe_apply_hybrid_rerank(cx: &Cx, query: &SearchQuery, merged: &mut Ve
         })
         .collect::<BTreeMap<_, _>>();
     if rerank_scores.is_empty() {
+        audit.outcome = "no_scores".to_string();
         tracing::debug!(
             target: "search.metrics",
             "rerank step produced no scores; preserving fusion order"
         );
-        return;
+        return audit;
     }
 
     let applied = apply_rerank_scores_and_sort(
@@ -1210,6 +1257,12 @@ async fn maybe_apply_hybrid_rerank(cx: &Cx, query: &SearchQuery, merged: &mut Ve
         config.blend_policy,
         config.blend_weight,
     );
+    audit.applied_count = applied;
+    audit.outcome = if applied > 0 {
+        "applied".to_string()
+    } else {
+        "no_matching_scores".to_string()
+    };
     tracing::debug!(
         target: "search.metrics",
         applied_count = applied,
@@ -1219,6 +1272,7 @@ async fn maybe_apply_hybrid_rerank(cx: &Cx, query: &SearchQuery, merged: &mut Ve
         blend_policy = ?config.blend_policy,
         "hybrid rerank applied"
     );
+    audit
 }
 
 fn orchestrate_hybrid_results(
@@ -1304,13 +1358,54 @@ async fn orchestrate_hybrid_results_with_optional_rerank(
     engine: SearchEngine,
     lexical_results: Vec<SearchResult>,
     semantic_results: Vec<SearchResult>,
-) -> Vec<SearchResult> {
+) -> (Vec<SearchResult>, Option<HybridRerankAudit>) {
     let mut merged = orchestrate_hybrid_results(query, engine, lexical_results, semantic_results);
 
     #[cfg(feature = "hybrid")]
-    maybe_apply_hybrid_rerank(cx, query, &mut merged).await;
+    let rerank_audit = Some(maybe_apply_hybrid_rerank(cx, query, merged.as_mut_slice()).await);
+    #[cfg(not(feature = "hybrid"))]
+    let rerank_audit = None;
 
-    merged
+    (merged, rerank_audit)
+}
+
+fn build_v3_query_explain(
+    query: &SearchQuery,
+    engine: SearchEngine,
+    rerank_audit: Option<&HybridRerankAudit>,
+) -> crate::search_planner::QueryExplain {
+    let mut facets_applied = vec![format!("engine:{engine}")];
+    if let Some(audit) = rerank_audit {
+        facets_applied.push(format!("rerank_enabled:{}", audit.enabled));
+        facets_applied.push(format!("rerank_attempted:{}", audit.attempted));
+        facets_applied.push(format!("rerank_outcome:{}", audit.outcome));
+        facets_applied.push(format!("rerank_candidates:{}", audit.candidate_count));
+        facets_applied.push(format!("rerank_top_k:{}", audit.top_k));
+        facets_applied.push(format!("rerank_min_candidates:{}", audit.min_candidates));
+        facets_applied.push(format!("rerank_applied_count:{}", audit.applied_count));
+        if let Some(policy) = &audit.blend_policy {
+            facets_applied.push(format!("rerank_blend_policy:{policy}"));
+        }
+        if let Some(weight) = audit.blend_weight {
+            facets_applied.push(format!("rerank_blend_weight:{weight:.3}"));
+        }
+    }
+
+    crate::search_planner::QueryExplain {
+        method: format!("{engine}_v3"),
+        normalized_query: if query.text.is_empty() {
+            None
+        } else {
+            Some(query.text.clone())
+        },
+        used_like_fallback: false,
+        facet_count: facets_applied.len(),
+        facets_applied,
+        sql: "-- v3 pipeline (non-SQL result assembly)".to_string(),
+        scope_policy: "unrestricted".to_string(),
+        denied_count: 0,
+        redacted_count: 0,
+    }
 }
 
 fn decision_confidence(decision: &CandidateBudgetDecision) -> f64 {
@@ -1482,13 +1577,24 @@ pub async fn execute_search(
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
         if let Some(raw_results) = try_tantivy_search(query) {
+            let explain = if query.explain {
+                Some(build_v3_query_explain(query, engine, None))
+            } else {
+                None
+            };
             let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
             if options.track_telemetry {
                 record_query("search_service_tantivy", latency_us);
             }
             // Record V3 metrics
             global_metrics().search.record_v3_query(latency_us, false);
-            return finish_scoped_response(raw_results, query, options, assistance.clone());
+            return finish_scoped_response(
+                raw_results,
+                query,
+                options,
+                assistance.clone(),
+                explain,
+            );
         }
         maybe_record_v3_fallback(engine, query);
         // Bridge not initialized → fall through to FTS5.
@@ -1500,7 +1606,7 @@ pub async fn execute_search(
     // 1) lexical candidate retrieval (Tantivy bridge)
     // 2) semantic candidate retrieval (two-tier with auto-init)
     // 3) deterministic dedupe + merge prep (mode-aware budgets)
-    // Fusion/rerank stages are implemented by follow-up Search V3 tracks.
+    // 4) optional rerank refinement with graceful fallback.
     if matches!(engine, SearchEngine::Hybrid | SearchEngine::Auto) {
         if let Some(lexical_results) = try_tantivy_search(query) {
             // Two-tier semantic candidates are optional; missing bridge degrades
@@ -1511,7 +1617,7 @@ pub async fn execute_search(
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
 
-            let raw_results = orchestrate_hybrid_results_with_optional_rerank(
+            let (raw_results, rerank_audit) = orchestrate_hybrid_results_with_optional_rerank(
                 cx,
                 query,
                 engine,
@@ -1519,12 +1625,23 @@ pub async fn execute_search(
                 semantic_results,
             )
             .await;
+            let explain = if query.explain {
+                Some(build_v3_query_explain(query, engine, rerank_audit.as_ref()))
+            } else {
+                None
+            };
             let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
             if options.track_telemetry {
                 record_query("search_service_hybrid_candidates", latency_us);
             }
             global_metrics().search.record_v3_query(latency_us, false);
-            return finish_scoped_response(raw_results, query, options, assistance.clone());
+            return finish_scoped_response(
+                raw_results,
+                query,
+                options,
+                assistance.clone(),
+                explain,
+            );
         }
         maybe_record_v3_fallback(engine, query);
         // No lexical bridge available yet → fall through to legacy FTS.
@@ -1665,6 +1782,7 @@ fn finish_scoped_response(
     query: &SearchQuery,
     options: &SearchOptions,
     assistance: Option<QueryAssistance>,
+    explain: Option<crate::search_planner::QueryExplain>,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let sql_row_count = raw_results.len();
     let next_cursor = compute_next_cursor(&raw_results, query.effective_limit());
@@ -1677,6 +1795,18 @@ fn finish_scoped_response(
         recipient_map: Vec::new(),
     });
     let (scoped_results, audit_summary) = apply_scope(raw_results, &scope_ctx, &redaction);
+    let explain = if query.explain {
+        explain.map(|mut value| {
+            value.denied_count = audit_summary.denied_count;
+            value.redacted_count = audit_summary.redacted_count;
+            if scope_ctx.viewer.is_some() {
+                value.scope_policy = "caller_scoped".to_string();
+            }
+            value
+        })
+    } else {
+        None
+    };
     let audit = if scope_ctx.viewer.is_some() {
         Some(audit_summary)
     } else {
@@ -1685,7 +1815,7 @@ fn finish_scoped_response(
     Outcome::Ok(ScopedSearchResponse {
         results: scoped_results,
         next_cursor,
-        explain: None,
+        explain,
         audit_summary: audit,
         sql_row_count,
         assistance,
@@ -2025,6 +2155,107 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, 1);
         assert_eq!(merged[1].id, 2);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn blend_rerank_score_replace_policy_uses_rerank_score() {
+        let blended = blend_rerank_score(0.91, 0.27, RerankBlendPolicy::Replace, 0.8);
+        assert!((blended - 0.27).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn blend_rerank_score_weighted_policy_respects_weight() {
+        let blended = blend_rerank_score(0.8, 0.2, RerankBlendPolicy::Weighted, 0.25);
+        assert!((blended - 0.65).abs() < 1e-12);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn apply_rerank_scores_replace_policy_reorders_and_tie_breaks_by_id() {
+        let mut merged = vec![
+            result_with_score(11, 0.95),
+            result_with_score(22, 0.85),
+            result_with_score(33, 0.75),
+        ];
+        let rerank_scores = BTreeMap::from([(11_i64, 0.4_f64), (22_i64, 0.9_f64), (33_i64, 0.9)]);
+
+        let applied = apply_rerank_scores_and_sort(
+            merged.as_mut_slice(),
+            &rerank_scores,
+            RerankBlendPolicy::Replace,
+            0.5,
+        );
+
+        assert_eq!(applied, 3);
+        let ids = merged.iter().map(|result| result.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![22, 33, 11]);
+        assert!((merged[0].score.unwrap_or_default() - 0.9).abs() < 1e-12);
+        assert!((merged[1].score.unwrap_or_default() - 0.9).abs() < 1e-12);
+        assert!((merged[2].score.unwrap_or_default() - 0.4).abs() < 1e-12);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn apply_rerank_scores_with_no_matches_preserves_scores() {
+        let mut merged = vec![result_with_score(1, 0.8), result_with_score(2, 0.7)];
+        let rerank_scores = BTreeMap::from([(10_i64, 0.3_f64)]);
+
+        let applied = apply_rerank_scores_and_sort(
+            merged.as_mut_slice(),
+            &rerank_scores,
+            RerankBlendPolicy::Weighted,
+            0.5,
+        );
+
+        assert_eq!(applied, 0);
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged[1].id, 2);
+        assert!((merged[0].score.unwrap_or_default() - 0.8).abs() < 1e-12);
+        assert!((merged[1].score.unwrap_or_default() - 0.7).abs() < 1e-12);
+    }
+
+    #[test]
+    fn build_v3_query_explain_includes_engine_and_rerank_facets() {
+        let query = SearchQuery {
+            text: "outage rollback".to_string(),
+            explain: true,
+            ..SearchQuery::messages("outage rollback", 1)
+        };
+        let rerank_audit = HybridRerankAudit {
+            enabled: true,
+            attempted: true,
+            outcome: "applied".to_string(),
+            candidate_count: 24,
+            top_k: 12,
+            min_candidates: 5,
+            blend_policy: Some("weighted".to_string()),
+            blend_weight: Some(0.35),
+            applied_count: 9,
+        };
+
+        let explain = build_v3_query_explain(&query, SearchEngine::Hybrid, Some(&rerank_audit));
+        assert_eq!(explain.method, "hybrid_v3");
+        assert_eq!(explain.facet_count, explain.facets_applied.len());
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "engine:hybrid")
+        );
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "rerank_outcome:applied")
+        );
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "rerank_applied_count:9")
+        );
     }
 
     #[test]
