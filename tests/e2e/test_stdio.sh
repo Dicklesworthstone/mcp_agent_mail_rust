@@ -29,24 +29,116 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 WORK="$(e2e_mktemp "e2e_stdio")"
 STDIO_DB="${WORK}/stdio_test.sqlite3"
 
+# Helper: write structured stdio request artifact(s) as JSON.
+write_stdio_request_artifact() {
+    local mode="$1"
+    local out_file="$2"
+    shift 2
+
+    python3 - "$mode" "$out_file" "$@" <<'PY'
+import json
+import sys
+
+mode = sys.argv[1]
+out_file = sys.argv[2]
+payloads = sys.argv[3:]
+
+entries = []
+for idx, raw in enumerate(payloads, start=1):
+    item = {"index": idx, "payload_raw": raw}
+    try:
+        item["payload_json"] = json.loads(raw)
+        item["payload_valid"] = True
+    except Exception as exc:  # noqa: BLE001
+        item["payload_valid"] = False
+        item["parse_error"] = str(exc)
+    entries.append(item)
+
+doc = {"transport": "stdio", "mode": mode}
+if mode == "single":
+    item = entries[0] if entries else {"payload_raw": "", "payload_valid": False}
+    doc["payload_raw"] = item.get("payload_raw", "")
+    doc["payload_valid"] = bool(item.get("payload_valid", False))
+    if "payload_json" in item:
+        doc["payload_json"] = item["payload_json"]
+    if "parse_error" in item:
+        doc["parse_error"] = item["parse_error"]
+else:
+    doc["payloads"] = entries
+
+with open(out_file, "w", encoding="utf-8") as f:
+    json.dump(doc, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+}
+
+# Helper: write structured stdio response artifact as JSON.
+write_stdio_response_artifact() {
+    local raw_file="$1"
+    local out_file="$2"
+
+    python3 - "$raw_file" "$out_file" <<'PY'
+import json
+import pathlib
+import sys
+
+raw_file = pathlib.Path(sys.argv[1])
+out_file = pathlib.Path(sys.argv[2])
+raw = raw_file.read_text(encoding="utf-8", errors="replace") if raw_file.exists() else ""
+
+entries = []
+for line_num, line in enumerate(raw.splitlines(), start=1):
+    text = line.strip()
+    if not text:
+        continue
+    try:
+        entries.append({"line": line_num, "json": json.loads(text)})
+    except Exception as exc:  # noqa: BLE001
+        entries.append({"line": line_num, "raw": text, "parse_error": str(exc)})
+
+doc = {
+    "transport": "stdio",
+    "line_count": len(raw.splitlines()),
+    "entries": entries,
+    "raw": raw,
+}
+
+out_file.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
+}
+
 # Helper: send a JSON-RPC request to the server via stdin and capture the response.
 # Uses a FIFO and background process. Each call starts a fresh server because
 # the stdio transport doesn't support multiplexing easily in bash.
 send_jsonrpc() {
     local db_path="$1"
-    local request="$2"
-    local timeout_s="${3:-10}"
-    local output_file="${WORK}/response_$$.txt"
+    local case_id="$2"
+    local request="$3"
+    local timeout_s="${4:-10}"
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local request_file="${case_dir}/request.json"
+    local response_raw_file="${case_dir}/response.raw.txt"
+    local response_file="${case_dir}/response.json"
+    local headers_file="${case_dir}/headers.txt"
+    local timing_file="${case_dir}/timing.txt"
+    local status_file="${case_dir}/status.txt"
+    local stderr_file="${case_dir}/stderr.txt"
+    local start_ms end_ms elapsed_ms
 
     # Create a temp dir for this server instance
     local srv_work
     srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
+    mkdir -p "$case_dir"
+
+    e2e_mark_case_start "$case_id"
+    write_stdio_request_artifact "single" "$request_file" "$request"
+    start_ms="$(_e2e_now_ms)"
 
     # Start server in background, reading from FIFO
     DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
+        am serve-stdio < "$fifo" > "$response_raw_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
 
     # Give server a moment to start
@@ -58,8 +150,9 @@ send_jsonrpc() {
 
     # Wait for response with timeout
     local elapsed=0
+    local timed_out=false
     while [ "$elapsed" -lt "$timeout_s" ]; do
-        if [ -s "$output_file" ]; then
+        if [ -s "$response_raw_file" ]; then
             # Got some output, wait a tiny bit more for it to complete
             sleep 0.2
             break
@@ -67,6 +160,9 @@ send_jsonrpc() {
         sleep 0.2
         elapsed=$((elapsed + 1))
     done
+    if [ "$elapsed" -ge "$timeout_s" ] && [ ! -s "$response_raw_file" ]; then
+        timed_out=true
+    fi
 
     # Clean up: close the FIFO to signal EOF to server
     wait "$write_pid" 2>/dev/null || true
@@ -74,28 +170,67 @@ send_jsonrpc() {
     # Give server a moment to exit
     sleep 0.3
     kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
+    local srv_exit=0
+    if wait "$srv_pid" 2>/dev/null; then
+        srv_exit=0
+    else
+        srv_exit=$?
+    fi
+    end_ms="$(_e2e_now_ms)"
+    elapsed_ms=$((end_ms - start_ms))
+
+    cp "${srv_work}/stderr.txt" "$stderr_file" 2>/dev/null || : > "$stderr_file"
+    write_stdio_response_artifact "$response_raw_file" "$response_file"
+    {
+        echo "transport=stdio"
+        echo "mode=single"
+        echo "timeout_s=${timeout_s}"
+        echo "timed_out=${timed_out}"
+        echo "server_exit_code=${srv_exit}"
+        echo "stderr_file=stderr.txt"
+    } > "$headers_file"
+    echo "$elapsed_ms" > "$timing_file"
+    if [ "$timed_out" = true ]; then
+        echo "timeout" > "$status_file"
+    else
+        echo "ok" > "$status_file"
+    fi
+    e2e_mark_case_end "$case_id"
 
     # Return the response
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
+    if [ -f "$response_raw_file" ]; then
+        cat "$response_raw_file"
     fi
 }
 
 # Helper: send multiple JSON-RPC requests in sequence to a single server session
 send_jsonrpc_session() {
     local db_path="$1"
-    shift
+    local case_id="$2"
+    shift 2
     # Remaining args are JSON-RPC request strings
     local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local request_file="${case_dir}/request.json"
+    local response_raw_file="${case_dir}/response.raw.txt"
+    local response_file="${case_dir}/response.json"
+    local headers_file="${case_dir}/headers.txt"
+    local timing_file="${case_dir}/timing.txt"
+    local status_file="${case_dir}/status.txt"
+    local stderr_file="${case_dir}/stderr.txt"
+    local start_ms end_ms elapsed_ms
     local srv_work
     srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
+    mkdir -p "$case_dir"
+
+    e2e_mark_case_start "$case_id"
+    write_stdio_request_artifact "session" "$request_file" "${requests[@]}"
+    start_ms="$(_e2e_now_ms)"
 
     DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
+        am serve-stdio < "$fifo" > "$response_raw_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
 
     sleep 0.3
@@ -113,6 +248,7 @@ send_jsonrpc_session() {
     # Wait for all responses
     local timeout_s=15
     local elapsed=0
+    local timed_out=false
     while [ "$elapsed" -lt "$timeout_s" ]; do
         # Check if server has exited
         if ! kill -0 "$srv_pid" 2>/dev/null; then
@@ -121,13 +257,42 @@ send_jsonrpc_session() {
         sleep 0.5
         elapsed=$((elapsed + 1))
     done
+    if [ "$elapsed" -ge "$timeout_s" ] && kill -0 "$srv_pid" 2>/dev/null; then
+        timed_out=true
+    fi
 
     wait "$write_pid" 2>/dev/null || true
     kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
+    local srv_exit=0
+    if wait "$srv_pid" 2>/dev/null; then
+        srv_exit=0
+    else
+        srv_exit=$?
+    fi
+    end_ms="$(_e2e_now_ms)"
+    elapsed_ms=$((end_ms - start_ms))
 
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
+    cp "${srv_work}/stderr.txt" "$stderr_file" 2>/dev/null || : > "$stderr_file"
+    write_stdio_response_artifact "$response_raw_file" "$response_file"
+    {
+        echo "transport=stdio"
+        echo "mode=session"
+        echo "request_count=${#requests[@]}"
+        echo "timeout_s=${timeout_s}"
+        echo "timed_out=${timed_out}"
+        echo "server_exit_code=${srv_exit}"
+        echo "stderr_file=stderr.txt"
+    } > "$headers_file"
+    echo "$elapsed_ms" > "$timing_file"
+    if [ "$timed_out" = true ]; then
+        echo "timeout" > "$status_file"
+    else
+        echo "ok" > "$status_file"
+    fi
+    e2e_mark_case_end "$case_id"
+
+    if [ -f "$response_raw_file" ]; then
+        cat "$response_raw_file"
     fi
 }
 
@@ -138,7 +303,7 @@ e2e_case_banner "Server responds to initialize"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"1.0"}}}'
 
-INIT_RESP="$(send_jsonrpc "$STDIO_DB" "$INIT_REQ")"
+INIT_RESP="$(send_jsonrpc "$STDIO_DB" "case_01_initialize" "$INIT_REQ")"
 e2e_save_artifact "case_01_init_response.txt" "$INIT_RESP"
 
 if [ -n "$INIT_RESP" ]; then
@@ -181,7 +346,7 @@ e2e_case_banner "Server lists tools via tools/list"
 
 TOOLS_REQ='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 
-TOOLS_RESP="$(send_jsonrpc_session "$STDIO_DB" "$INIT_REQ" "$TOOLS_REQ")"
+TOOLS_RESP="$(send_jsonrpc_session "$STDIO_DB" "case_02_tools_list" "$INIT_REQ" "$TOOLS_REQ")"
 e2e_save_artifact "case_02_tools_response.txt" "$TOOLS_RESP"
 
 # Parse last JSON-RPC response (tools/list)
@@ -242,7 +407,7 @@ e2e_case_banner "Server executes ensure_project tool call"
 
 TOOL_CALL_REQ='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ensure_project","arguments":{"human_key":"/tmp/e2e_stdio_test_project"}}}'
 
-TOOL_RESP="$(send_jsonrpc_session "$STDIO_DB" "$INIT_REQ" "$TOOL_CALL_REQ")"
+TOOL_RESP="$(send_jsonrpc_session "$STDIO_DB" "case_03_ensure_project" "$INIT_REQ" "$TOOL_CALL_REQ")"
 e2e_save_artifact "case_03_tool_call_response.txt" "$TOOL_RESP"
 
 # Parse the tool call response
@@ -283,7 +448,7 @@ e2e_case_banner "Server handles invalid JSON"
 
 INVALID_REQ='{"this is not valid json'
 
-INVALID_RESP="$(send_jsonrpc "$STDIO_DB" "$INVALID_REQ" 5)"
+INVALID_RESP="$(send_jsonrpc "$STDIO_DB" "case_04_invalid_json" "$INVALID_REQ" 5)"
 e2e_save_artifact "case_04_invalid_json_response.txt" "$INVALID_RESP"
 
 # The server should either return a JSON-RPC error or handle gracefully
@@ -317,11 +482,16 @@ fi
 # Case 5: Server exits cleanly on stdin close
 # ===========================================================================
 e2e_case_banner "Server exits cleanly on stdin close"
+e2e_mark_case_start "case_05_stdin_close"
 
 # Start server, send initialize, then close stdin immediately
 SRV_WORK="$(mktemp -d "${WORK}/srv_exit.XXXXXX")"
 FIFO="${SRV_WORK}/stdin_fifo"
 mkfifo "$FIFO"
+CASE_05_DIR="${E2E_ARTIFACT_DIR}/case_05_stdin_close"
+mkdir -p "$CASE_05_DIR"
+write_stdio_request_artifact "single" "${CASE_05_DIR}/request.json" "$INIT_REQ"
+CASE_05_START_MS="$(_e2e_now_ms)"
 
 DATABASE_URL="sqlite:////${STDIO_DB}" RUST_LOG=error \
     am serve-stdio < "$FIFO" > "${SRV_WORK}/stdout.txt" 2>"${SRV_WORK}/stderr.txt" &
@@ -335,12 +505,14 @@ echo "$INIT_REQ" > "$FIFO"
 # Wait for server to exit (should happen quickly after stdin closes)
 set +e
 WAIT_COUNT=0
+CASE_05_TIMED_OUT=true
 while kill -0 "$SRV_PID" 2>/dev/null && [ "$WAIT_COUNT" -lt 10 ]; do
     sleep 0.5
     WAIT_COUNT=$((WAIT_COUNT + 1))
 done
 
 if ! kill -0 "$SRV_PID" 2>/dev/null; then
+    CASE_05_TIMED_OUT=false
     wait "$SRV_PID" 2>/dev/null
     EXIT_CODE=$?
     e2e_pass "server exited after stdin close (exit=$EXIT_CODE, waited ${WAIT_COUNT}s)"
@@ -352,6 +524,25 @@ fi
 set -e
 
 e2e_copy_artifact "${SRV_WORK}/stderr.txt" "case_05_stderr.txt"
+cp "${SRV_WORK}/stderr.txt" "${CASE_05_DIR}/stderr.txt" 2>/dev/null || : > "${CASE_05_DIR}/stderr.txt"
+cp "${SRV_WORK}/stdout.txt" "${CASE_05_DIR}/response.raw.txt" 2>/dev/null || : > "${CASE_05_DIR}/response.raw.txt"
+write_stdio_response_artifact "${CASE_05_DIR}/response.raw.txt" "${CASE_05_DIR}/response.json"
+CASE_05_END_MS="$(_e2e_now_ms)"
+CASE_05_ELAPSED_MS=$((CASE_05_END_MS - CASE_05_START_MS))
+echo "${CASE_05_ELAPSED_MS}" > "${CASE_05_DIR}/timing.txt"
+{
+    echo "transport=stdio"
+    echo "mode=single"
+    echo "server_exit_code=${EXIT_CODE:-0}"
+    echo "wait_loops=${WAIT_COUNT}"
+    echo "stderr_file=stderr.txt"
+} > "${CASE_05_DIR}/headers.txt"
+if [ "${CASE_05_TIMED_OUT}" = true ]; then
+    echo "timeout" > "${CASE_05_DIR}/status.txt"
+else
+    echo "ok" > "${CASE_05_DIR}/status.txt"
+fi
+e2e_mark_case_end "case_05_stdin_close"
 
 # ===========================================================================
 # Case 6: Force-release stale file reservation (full pipeline)
@@ -376,7 +567,7 @@ SETUP_REQS=(
     '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"file_reservation_paths","arguments":{"project_key":"/tmp/e2e_force_release_project","agent_name":"GreenLake","paths":["src/main.rs"],"ttl_seconds":3600,"exclusive":true,"reason":"editing main"}}}'
 )
 
-SETUP_RESP="$(send_jsonrpc_session "$FR_DB" "${SETUP_REQS[@]}")"
+SETUP_RESP="$(send_jsonrpc_session "$FR_DB" "case_06_force_release_setup" "${SETUP_REQS[@]}")"
 e2e_save_artifact "case_06_setup_response.txt" "$SETUP_RESP"
 
 # Extract the reservation ID from the file_reservation_paths response (id=13)
@@ -419,7 +610,7 @@ FORCE_REQS=(
     "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"/tmp/e2e_force_release_project\",\"agent_name\":\"BluePeak\",\"file_reservation_id\":$RES_ID,\"note\":\"e2e test force release\",\"notify_previous\":true}}}"
 )
 
-FORCE_RESP="$(send_jsonrpc_session "$FR_DB" "${FORCE_REQS[@]}")"
+FORCE_RESP="$(send_jsonrpc_session "$FR_DB" "case_06_force_release_action" "${FORCE_REQS[@]}")"
 e2e_save_artifact "case_06_force_release_response.txt" "$FORCE_RESP"
 
 # Parse and validate the force-release response
@@ -483,7 +674,7 @@ ERROR_REQS=(
     '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"force_release_file_reservation","arguments":{"project_key":"/tmp/e2e_force_release_project","agent_name":"BluePeak","file_reservation_id":99999}}}'
 )
 
-ERROR_RESP="$(send_jsonrpc_session "$FR_DB" "${ERROR_REQS[@]}")"
+ERROR_RESP="$(send_jsonrpc_session "$FR_DB" "case_06_force_release_error" "${ERROR_REQS[@]}")"
 e2e_save_artifact "case_06_error_response.txt" "$ERROR_RESP"
 
 ERROR_CHECK="$(echo "$ERROR_RESP" | python3 -c "

@@ -31,19 +31,111 @@ MACRO_DB="${WORK}/macros_test.sqlite3"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-macros","version":"1.0"}}}'
 
+# Helper: write structured stdio request artifact(s) as JSON.
+write_stdio_request_artifact() {
+    local mode="$1"
+    local out_file="$2"
+    shift 2
+
+    python3 - "$mode" "$out_file" "$@" <<'PY'
+import json
+import sys
+
+mode = sys.argv[1]
+out_file = sys.argv[2]
+payloads = sys.argv[3:]
+
+entries = []
+for idx, raw in enumerate(payloads, start=1):
+    item = {"index": idx, "payload_raw": raw}
+    try:
+        item["payload_json"] = json.loads(raw)
+        item["payload_valid"] = True
+    except Exception as exc:  # noqa: BLE001
+        item["payload_valid"] = False
+        item["parse_error"] = str(exc)
+    entries.append(item)
+
+doc = {"transport": "stdio", "mode": mode}
+if mode == "single":
+    item = entries[0] if entries else {"payload_raw": "", "payload_valid": False}
+    doc["payload_raw"] = item.get("payload_raw", "")
+    doc["payload_valid"] = bool(item.get("payload_valid", False))
+    if "payload_json" in item:
+        doc["payload_json"] = item["payload_json"]
+    if "parse_error" in item:
+        doc["parse_error"] = item["parse_error"]
+else:
+    doc["payloads"] = entries
+
+with open(out_file, "w", encoding="utf-8") as f:
+    json.dump(doc, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+}
+
+# Helper: write structured stdio response artifact as JSON.
+write_stdio_response_artifact() {
+    local raw_file="$1"
+    local out_file="$2"
+
+    python3 - "$raw_file" "$out_file" <<'PY'
+import json
+import pathlib
+import sys
+
+raw_file = pathlib.Path(sys.argv[1])
+out_file = pathlib.Path(sys.argv[2])
+raw = raw_file.read_text(encoding="utf-8", errors="replace") if raw_file.exists() else ""
+
+entries = []
+for line_num, line in enumerate(raw.splitlines(), start=1):
+    text = line.strip()
+    if not text:
+        continue
+    try:
+        entries.append({"line": line_num, "json": json.loads(text)})
+    except Exception as exc:  # noqa: BLE001
+        entries.append({"line": line_num, "raw": text, "parse_error": str(exc)})
+
+doc = {
+    "transport": "stdio",
+    "line_count": len(raw.splitlines()),
+    "entries": entries,
+    "raw": raw,
+}
+
+out_file.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
+}
+
 # Helper: send multiple JSON-RPC requests in sequence to a single server session
 send_jsonrpc_session() {
     local db_path="$1"
-    shift
+    local case_id="$2"
+    shift 2
     local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local request_file="${case_dir}/request.json"
+    local response_raw_file="${case_dir}/response.raw.txt"
+    local response_file="${case_dir}/response.json"
+    local headers_file="${case_dir}/headers.txt"
+    local timing_file="${case_dir}/timing.txt"
+    local status_file="${case_dir}/status.txt"
+    local stderr_file="${case_dir}/stderr.txt"
+    local start_ms end_ms elapsed_ms
     local srv_work
     srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
+    mkdir -p "$case_dir"
+
+    e2e_mark_case_start "$case_id"
+    write_stdio_request_artifact "session" "$request_file" "${requests[@]}"
+    start_ms="$(_e2e_now_ms)"
 
     DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
+        am serve-stdio < "$fifo" > "$response_raw_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
 
     sleep 0.3
@@ -58,6 +150,7 @@ send_jsonrpc_session() {
 
     local timeout_s=20
     local elapsed=0
+    local timed_out=false
     while [ "$elapsed" -lt "$timeout_s" ]; do
         if ! kill -0 "$srv_pid" 2>/dev/null; then
             break
@@ -65,13 +158,42 @@ send_jsonrpc_session() {
         sleep 0.5
         elapsed=$((elapsed + 1))
     done
+    if [ "$elapsed" -ge "$timeout_s" ] && kill -0 "$srv_pid" 2>/dev/null; then
+        timed_out=true
+    fi
 
     wait "$write_pid" 2>/dev/null || true
     kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
+    local srv_exit=0
+    if wait "$srv_pid" 2>/dev/null; then
+        srv_exit=0
+    else
+        srv_exit=$?
+    fi
+    end_ms="$(_e2e_now_ms)"
+    elapsed_ms=$((end_ms - start_ms))
 
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
+    cp "${srv_work}/stderr.txt" "$stderr_file" 2>/dev/null || : > "$stderr_file"
+    write_stdio_response_artifact "$response_raw_file" "$response_file"
+    {
+        echo "transport=stdio"
+        echo "mode=session"
+        echo "request_count=${#requests[@]}"
+        echo "timeout_s=${timeout_s}"
+        echo "timed_out=${timed_out}"
+        echo "server_exit_code=${srv_exit}"
+        echo "stderr_file=stderr.txt"
+    } > "$headers_file"
+    echo "$elapsed_ms" > "$timing_file"
+    if [ "$timed_out" = true ]; then
+        echo "timeout" > "$status_file"
+    else
+        echo "ok" > "$status_file"
+    fi
+    e2e_mark_case_end "$case_id"
+
+    if [ -f "$response_raw_file" ]; then
+        cat "$response_raw_file"
     fi
 }
 
@@ -132,7 +254,7 @@ SESSION_REQS=(
     '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"macro_start_session","arguments":{"human_key":"/tmp/e2e_macro_project","program":"e2e-test","model":"test-model","task_description":"macro E2E testing","inbox_limit":5}}}'
 )
 
-SESSION_RESP="$(send_jsonrpc_session "$MACRO_DB" "${SESSION_REQS[@]}")"
+SESSION_RESP="$(send_jsonrpc_session "$MACRO_DB" "case_01_start_session" "${SESSION_REQS[@]}")"
 e2e_save_artifact "case_01_start_session.txt" "$SESSION_RESP"
 
 SESSION_TEXT="$(extract_result "$SESSION_RESP" 10)"
@@ -203,7 +325,7 @@ SETUP_REQS=(
     '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"macro_file_reservation_cycle","arguments":{"project_key":"/tmp/e2e_macro_project","agent_name":"SilverWolf","paths":["src/lib.rs","src/main.rs"],"reason":"macro cycle test","ttl_seconds":3600,"auto_release":false}}}'
 )
 
-CYCLE_RESP="$(send_jsonrpc_session "$MACRO_DB" "${SETUP_REQS[@]}")"
+CYCLE_RESP="$(send_jsonrpc_session "$MACRO_DB" "case_02_reservation_cycle" "${SETUP_REQS[@]}")"
 e2e_save_artifact "case_02_reservation_cycle.txt" "$CYCLE_RESP"
 
 CYCLE_TEXT="$(extract_result "$CYCLE_RESP" 12)"
@@ -258,7 +380,7 @@ HANDSHAKE_REQS=(
     '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"macro_contact_handshake","arguments":{"project_key":"/tmp/e2e_macro_project","requester":"SilverWolf","target":"GoldHawk","auto_accept":true,"reason":"E2E macro test","welcome_subject":"Hello from macro test","welcome_body":"Testing macro_contact_handshake auto-accept flow."}}}'
 )
 
-HANDSHAKE_RESP="$(send_jsonrpc_session "$MACRO_DB" "${HANDSHAKE_REQS[@]}")"
+HANDSHAKE_RESP="$(send_jsonrpc_session "$MACRO_DB" "case_03_contact_handshake" "${HANDSHAKE_REQS[@]}")"
 e2e_save_artifact "case_03_contact_handshake.txt" "$HANDSHAKE_RESP"
 
 # Check registration succeeded
@@ -293,7 +415,7 @@ INBOX_REQS=(
     '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"fetch_inbox","arguments":{"project_key":"/tmp/e2e_macro_project","agent_name":"GoldHawk","include_bodies":true,"limit":5}}}'
 )
 
-INBOX_RESP="$(send_jsonrpc_session "$MACRO_DB" "${INBOX_REQS[@]}")"
+INBOX_RESP="$(send_jsonrpc_session "$MACRO_DB" "case_03_inbox_verify" "${INBOX_REQS[@]}")"
 e2e_save_artifact "case_03_inbox.txt" "$INBOX_RESP"
 
 INBOX_TEXT="$(extract_result "$INBOX_RESP" 15)"
@@ -340,7 +462,7 @@ SLOT_REQS=(
     '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"release_build_slot","arguments":{"project_key":"/tmp/e2e_macro_project","agent_name":"SilverWolf","slot":"cargo-build"}}}'
 )
 
-SLOT_RESP="$(send_jsonrpc_session "$MACRO_DB" "${SLOT_REQS[@]}")"
+SLOT_RESP="$(send_jsonrpc_session "$MACRO_DB" "case_04_build_slots" "${SLOT_REQS[@]}")"
 e2e_save_artifact "case_04_build_slots.txt" "$SLOT_RESP"
 
 # Check acquire
@@ -437,7 +559,7 @@ CONFLICT_REQS=(
     '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"acquire_build_slot","arguments":{"project_key":"/tmp/e2e_macro_project","agent_name":"GoldHawk","slot":"test-build","ttl_seconds":300}}}'
 )
 
-CONFLICT_RESP="$(send_jsonrpc_session "$MACRO_DB" "${CONFLICT_REQS[@]}")"
+CONFLICT_RESP="$(send_jsonrpc_session "$MACRO_DB" "case_05_slot_conflict" "${CONFLICT_REQS[@]}")"
 e2e_save_artifact "case_05_slot_conflict.txt" "$CONFLICT_RESP"
 
 # First acquire should succeed
