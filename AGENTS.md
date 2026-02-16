@@ -407,6 +407,96 @@ mcp-agent-mail                            # stdio transport (for MCP client inte
 am --help                                 # Full operator CLI
 ```
 
+### Robot Mode (`am robot`)
+
+`am robot` is the non-interactive, agent-first CLI surface for TUI-equivalent situational awareness.
+Use it when you need structured snapshots quickly (especially in automated loops and when tokens matter).
+
+#### Command Reference
+
+| Command | Purpose | Key flags |
+|---------|---------|----------|
+| `am robot status` | Dashboard synthesis across health, inbox, activity, reservations, top threads | `--format`, `--project`, `--agent` |
+| `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
+| `am robot timeline` | Event stream since last check | `--since`, `--kind`, `--source` |
+| `am robot overview` | Cross-project summary of actionable state | `--format`, `--project`, `--agent` |
+| `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
+| `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
+| `am robot message <id>` | Single-message deep view with context | `--format`, `--project`, `--agent` |
+| `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
+| `am robot reservations` | Reservation view with conflict/expiry awareness | `--all`, `--conflicts`, `--expiring`, `--agent` |
+| `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
+| `am robot health` | Runtime/system diagnostics synthesis | `--format`, `--project`, `--agent` |
+| `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
+| `am robot agents` | Agent roster and activity overview | `--active`, `--sort` |
+| `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
+| `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
+| `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
+
+#### Output Formats
+
+- `toon` (default at TTY): token-efficient, compact, optimized for agent parsing.
+- `json` (default when piped): strict machine-readable envelope with `_meta`, `_alerts`, `_actions`.
+- `md` (thread/message-focused): human-readable narrative output for deep context.
+
+Example (`toon`, truncated):
+```text
+_meta{command,format}: status,toon
+health{status,db}: ok,connected
+inbox_summary{total,urgent,ack_overdue}: 12,2,1
+```
+
+Example (`json`, truncated):
+```json
+{
+  "_meta": { "command": "status", "format": "json" },
+  "health": { "status": "ok" },
+  "inbox_summary": { "total": 12, "urgent": 2, "ack_overdue": 1 }
+}
+```
+
+Example (`md`, thread):
+```markdown
+# Thread: br-123 — Reservation conflict triage
+**Messages**: 4 | **Participants**: 3 | **Last activity**: 2026-02-16T16:33:00Z
+```
+
+#### Agent Workflow Recipes
+
+1. Startup triage:
+   `am robot status --project /abs/path --agent <AgentName>`
+2. Immediate urgency pass:
+   `am robot inbox --project /abs/path --agent <AgentName> --urgent --format json`
+3. Incremental monitoring loop:
+   `am robot timeline --project /abs/path --agent <AgentName> --since <iso8601>`
+4. Deep thread drill-down:
+   `am robot thread <thread_id> --project /abs/path --agent <AgentName> --format md`
+5. Reservation safety check before edits:
+   `am robot reservations --project /abs/path --agent <AgentName> --conflicts --expiring 30`
+
+#### Validation & Diagnostics
+
+Use these reproducible checks after docs changes:
+
+```bash
+# Section and command discoverability
+rg -n '^### Robot Mode \\(` AGENTS.md
+rg -n 'am robot (status|inbox|timeline|overview|thread|search|message|navigate|reservations|metrics|health|analytics|agents|contacts|projects|attachments)' AGENTS.md
+
+# CLI command surface validation
+AM_INTERFACE_MODE=cli am robot --help
+for c in status inbox timeline overview thread search message navigate reservations metrics health analytics agents contacts projects attachments; do
+  AM_INTERFACE_MODE=cli am robot "$c" --help >/dev/null
+done
+
+# Integration/E2E contract validation
+bash tests/e2e/test_robot.sh
+```
+
+Expected diagnostics:
+- `tests/e2e/test_robot.sh` summary with pass/fail counts and artifact path under `tests/artifacts/robot/...`
+- command help output confirming all subcommands and key flags remain available
+
 ### File Reservations for Multi-Agent Editing
 
 Before editing, agents should reserve file paths to avoid conflicts:

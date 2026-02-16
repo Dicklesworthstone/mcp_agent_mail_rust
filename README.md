@@ -74,6 +74,23 @@ am golden                               # Golden output validation
 am check-inbox                          # Check agent inbox
 ```
 
+### Agent-First Robot Mode
+
+For non-interactive agent workflows, use `am robot`:
+
+```bash
+am robot status --project /abs/path --agent BlueLake
+am robot inbox --project /abs/path --agent BlueLake --urgent --format json
+am robot thread br-123 --project /abs/path --agent BlueLake --format md
+```
+
+`am robot` supports 16 subcommands (`status`, `inbox`, `timeline`, `overview`, `thread`,
+`search`, `message`, `navigate`, `reservations`, `metrics`, `health`, `analytics`,
+`agents`, `contacts`, `projects`, `attachments`) with `toon/json/md` output modes.
+
+Full command reference, output examples, and workflow recipes are documented in
+`AGENTS.md` under **Robot Mode (`am robot`)**.
+
 ### Dual-Mode Interface (MCP Server vs CLI)
 
 This repo exposes **two command surfaces** from a single `mcp-agent-mail` binary:
