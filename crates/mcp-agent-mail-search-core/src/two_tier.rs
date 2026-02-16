@@ -318,15 +318,23 @@ impl TwoTierIndex {
         let mut project_ids = Vec::with_capacity(doc_count);
         let mut has_quality_flags = Vec::with_capacity(doc_count);
 
-        for entry in entries {
+        for TwoTierEntry {
+            doc_id,
+            doc_kind,
+            project_id,
+            mut fast_embedding,
+            mut quality_embedding,
+            has_quality,
+        } in entries
+        {
             // Determine has_quality: use explicit flag if set, otherwise detect zero vectors
-            let has_quality = entry.has_quality && !is_zero_vector_f16(&entry.quality_embedding);
-            fast_embeddings.extend(entry.fast_embedding);
-            quality_embeddings.extend(entry.quality_embedding);
-            doc_ids.push(entry.doc_id);
-            doc_kinds.push(entry.doc_kind);
-            project_ids.push(entry.project_id);
-            has_quality_flags.push(has_quality);
+            let has_quality_flag = has_quality && !is_zero_vector_f16(&quality_embedding);
+            fast_embeddings.append(&mut fast_embedding);
+            quality_embeddings.append(&mut quality_embedding);
+            doc_ids.push(doc_id);
+            doc_kinds.push(doc_kind);
+            project_ids.push(project_id);
+            has_quality_flags.push(has_quality_flag);
         }
 
         Ok(Self {
@@ -541,13 +549,16 @@ impl TwoTierIndex {
 
         let mut heap = BinaryHeap::with_capacity(k + 1);
 
-        for idx in 0..self.metadata.doc_count {
-            if let Some(embedding) = self.fast_embedding(idx) {
-                let score = dot_product_f16_simd(embedding, query_vec);
-                heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
-                if heap.len() > k {
-                    heap.pop();
-                }
+        for (idx, embedding) in self
+            .fast_embeddings
+            .chunks_exact(dim)
+            .take(self.metadata.doc_count)
+            .enumerate()
+        {
+            let score = dot_product_f16_simd(embedding, query_vec);
+            heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
+            if heap.len() > k {
+                heap.pop();
             }
         }
 
@@ -588,16 +599,19 @@ impl TwoTierIndex {
 
         let mut heap = BinaryHeap::with_capacity(k + 1);
 
-        for idx in 0..self.metadata.doc_count {
-            if !self.has_quality(idx) {
+        for (idx, (embedding, has_quality)) in self
+            .quality_embeddings
+            .chunks_exact(dim)
+            .zip(self.has_quality_flags.iter().copied())
+            .enumerate()
+        {
+            if !has_quality {
                 continue;
             }
-            if let Some(embedding) = self.quality_embedding(idx) {
-                let score = dot_product_f16_simd(embedding, query_vec);
-                heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
-                if heap.len() > k {
-                    heap.pop();
-                }
+            let score = dot_product_f16_simd(embedding, query_vec);
+            heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
+            if heap.len() > k {
+                heap.pop();
             }
         }
 
@@ -620,13 +634,26 @@ impl TwoTierIndex {
     /// Get quality scores for a set of document indices.
     #[must_use]
     pub fn quality_scores_for_indices(&self, query_vec: &[f32], indices: &[usize]) -> Vec<f32> {
+        let dim = self.config.quality_dimension;
+
         indices
             .iter()
             .map(|&idx| {
-                if !self.has_quality(idx) {
+                if idx >= self.metadata.doc_count
+                    || !self.has_quality_flags.get(idx).copied().unwrap_or(false)
+                {
                     return 0.0;
                 }
-                self.quality_embedding(idx)
+
+                let Some(start) = idx.checked_mul(dim) else {
+                    return 0.0;
+                };
+                let Some(end) = start.checked_add(dim) else {
+                    return 0.0;
+                };
+
+                self.quality_embeddings
+                    .get(start..end)
                     .map_or(0.0, |emb| dot_product_f16_simd(emb, query_vec))
             })
             .collect()
@@ -638,30 +665,39 @@ impl TwoTierIndex {
     ///
     /// Returns an error if embedding dimensions don't match.
     pub fn add_entry(&mut self, entry: TwoTierEntry) -> SearchResult<()> {
-        if entry.fast_embedding.len() != self.config.fast_dimension {
+        let TwoTierEntry {
+            doc_id,
+            doc_kind,
+            project_id,
+            mut fast_embedding,
+            mut quality_embedding,
+            has_quality,
+        } = entry;
+
+        if fast_embedding.len() != self.config.fast_dimension {
             return Err(SearchError::InvalidQuery(format!(
                 "fast embedding dimension mismatch: expected {}, got {}",
                 self.config.fast_dimension,
-                entry.fast_embedding.len()
+                fast_embedding.len()
             )));
         }
-        if entry.quality_embedding.len() != self.config.quality_dimension {
+        if quality_embedding.len() != self.config.quality_dimension {
             return Err(SearchError::InvalidQuery(format!(
                 "quality embedding dimension mismatch: expected {}, got {}",
                 self.config.quality_dimension,
-                entry.quality_embedding.len()
+                quality_embedding.len()
             )));
         }
 
         // Determine has_quality: use explicit flag if set, otherwise detect zero vectors
-        let has_quality = entry.has_quality && !is_zero_vector_f16(&entry.quality_embedding);
+        let has_quality_flag = has_quality && !is_zero_vector_f16(&quality_embedding);
 
-        self.fast_embeddings.extend(entry.fast_embedding);
-        self.quality_embeddings.extend(entry.quality_embedding);
-        self.doc_ids.push(entry.doc_id);
-        self.doc_kinds.push(entry.doc_kind);
-        self.project_ids.push(entry.project_id);
-        self.has_quality_flags.push(has_quality);
+        self.fast_embeddings.append(&mut fast_embedding);
+        self.quality_embeddings.append(&mut quality_embedding);
+        self.doc_ids.push(doc_id);
+        self.doc_kinds.push(doc_kind);
+        self.project_ids.push(project_id);
+        self.has_quality_flags.push(has_quality_flag);
         self.metadata.doc_count += 1;
 
         Ok(())
