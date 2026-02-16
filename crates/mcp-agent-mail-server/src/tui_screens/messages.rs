@@ -34,7 +34,7 @@ use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_action_menu::{ActionEntry, messages_actions};
-use crate::tui_bridge::{MessageDragSnapshot, TuiSharedState};
+use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_layout::DockLayout;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -165,7 +165,14 @@ struct MessageEntry {
 
 impl RenderItem for MessageEntry {
     fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
-        self.render_row(area, frame, selected, None, MessageDropZoneState::None);
+        self.render_row(
+            area,
+            frame,
+            selected,
+            None,
+            MessageDropZoneState::None,
+            false,
+        );
     }
 
     fn height(&self) -> u16 {
@@ -182,6 +189,7 @@ impl MessageEntry {
         selected: bool,
         shimmer_progress: Option<f64>,
         drop_zone: MessageDropZoneState,
+        keyboard_marked: bool,
     ) {
         use ftui::widgets::Widget;
         if area.height == 0 || area.width < 10 {
@@ -252,6 +260,7 @@ impl MessageEntry {
         } else {
             String::new()
         };
+        let moving_badge = if keyboard_marked { " [MOVING]" } else { "" };
 
         // Calculate how much space remains for subject
         // Format: marker + badge(2) + ack(1) + space + id(6) + space + time(8) + space + sender(<=12) + space + project + subject
@@ -265,7 +274,8 @@ impl MessageEntry {
             + 1  // space
             + sender.chars().count()
             + 1  // space
-            + project_badge.chars().count();
+            + project_badge.chars().count()
+            + moving_badge.chars().count();
         let remaining = inner_w.saturating_sub(fixed_len);
         let subj = truncate_str(&self.subject, remaining);
 
@@ -280,6 +290,10 @@ impl MessageEntry {
             Span::raw(" "),
             Span::styled(format!("{sender:<12}"), sender_style),
             Span::raw(format!(" {project_badge}")),
+            Span::styled(
+                moving_badge,
+                Style::default().fg(tp.selection_indicator).bold(),
+            ),
         ];
         let base_subject_style = Style::default().fg(tp.text_primary);
         if let Some(progress) = shimmer_progress.filter(|_| !selected) {
@@ -340,6 +354,7 @@ struct MessageRenderRow<'a> {
     entry: &'a MessageEntry,
     shimmer_progress: Option<f64>,
     drop_zone: MessageDropZoneState,
+    keyboard_marked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -351,8 +366,14 @@ struct MessageDropVisual<'a> {
 
 impl RenderItem for MessageRenderRow<'_> {
     fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
-        self.entry
-            .render_row(area, frame, selected, self.shimmer_progress, self.drop_zone);
+        self.entry.render_row(
+            area,
+            frame,
+            selected,
+            self.shimmer_progress,
+            self.drop_zone,
+            self.keyboard_marked,
+        );
     }
 
     fn height(&self) -> u16 {
@@ -1267,6 +1288,48 @@ impl MessageBrowserScreen {
         cmd
     }
 
+    fn selected_result_entry(&self) -> Option<&MessageEntry> {
+        self.results.get(self.cursor)
+    }
+
+    fn mark_selected_result_for_keyboard_move(&self, state: &TuiSharedState) {
+        let Some(entry) = self.selected_result_entry() else {
+            return;
+        };
+        if entry.thread_id.is_empty() {
+            return;
+        }
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: entry.id,
+            subject: entry.subject.clone(),
+            source_thread_id: entry.thread_id.clone(),
+            source_project_slug: entry.project_slug.clone(),
+        }));
+    }
+
+    fn execute_keyboard_move_to_selected_context(
+        &self,
+        state: &TuiSharedState,
+    ) -> Cmd<MailScreenMsg> {
+        let Some(marker) = state.keyboard_move_snapshot() else {
+            return Cmd::None;
+        };
+        let Some(target_thread_id) = self
+            .selected_result_entry()
+            .map(|entry| entry.thread_id.as_str())
+            .filter(|thread_id| !thread_id.is_empty())
+        else {
+            return Cmd::None;
+        };
+        if target_thread_id == marker.source_thread_id {
+            return Cmd::None;
+        }
+
+        let op = format!("rethread_message:{}:{target_thread_id}", marker.message_id);
+        state.clear_keyboard_move_snapshot();
+        Cmd::msg(MailScreenMsg::ActionExecute(op, marker.source_thread_id))
+    }
+
     fn detail_visible(&self) -> bool {
         let area = self.last_detail_area.get();
         area.width > 0 && area.height > 0
@@ -1484,6 +1547,15 @@ impl MailScreen for MessageBrowserScreen {
         if self.compose_form.is_some() {
             return self.handle_compose_event(event);
         }
+        if let Event::Key(key) = event {
+            if key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Escape
+                && state.keyboard_move_snapshot().is_some()
+            {
+                state.clear_keyboard_move_snapshot();
+                return Cmd::None;
+            }
+        }
         if !matches!(event, Event::Mouse(_)) && !matches!(self.message_drag, MessageDragState::Idle)
         {
             self.clear_message_drag_state(state);
@@ -1601,6 +1673,10 @@ impl MailScreen for MessageBrowserScreen {
                     }
                 },
                 Focus::ResultList => match key.code {
+                    KeyCode::Escape if state.keyboard_move_snapshot().is_some() => {
+                        state.clear_keyboard_move_snapshot();
+                        return Cmd::None;
+                    }
                     // Enter search mode
                     KeyCode::Char('/') | KeyCode::Tab => {
                         self.focus = Focus::SearchBar;
@@ -1677,6 +1753,15 @@ impl MailScreen for MessageBrowserScreen {
                     KeyCode::Char('c') if !key.modifiers.contains(Modifiers::CTRL) => {
                         self.open_compose_modal(Some(state), None);
                         return Cmd::None;
+                    }
+                    // Mark selected message for keyboard move.
+                    KeyCode::Char('m') if key.modifiers.contains(Modifiers::CTRL) => {
+                        self.mark_selected_result_for_keyboard_move(state);
+                        return Cmd::None;
+                    }
+                    // Drop marked message onto current selected thread context.
+                    KeyCode::Char('v') if key.modifiers.contains(Modifiers::CTRL) => {
+                        return self.execute_keyboard_move_to_selected_context(state);
                     }
                     // Clear search
                     KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
@@ -1834,6 +1919,9 @@ impl MailScreen for MessageBrowserScreen {
             }),
             _ => None,
         };
+        let keyboard_marked_message_id = state
+            .keyboard_move_snapshot()
+            .map(|marker| marker.message_id);
         render_results_list(
             frame,
             split.primary,
@@ -1843,6 +1931,7 @@ impl MailScreen for MessageBrowserScreen {
             state.config_snapshot().tui_effects,
             self.reduced_motion,
             drop_visual,
+            keyboard_marked_message_id,
         );
         drop(list_state);
 
@@ -1902,11 +1991,15 @@ impl MailScreen for MessageBrowserScreen {
             },
             HelpEntry {
                 key: "Esc",
-                action: "Exit search",
+                action: "Exit search / cancel move",
             },
             HelpEntry {
                 key: "Ctrl+C",
                 action: "Clear search",
+            },
+            HelpEntry {
+                key: "Ctrl+M / Ctrl+V",
+                action: "Mark message / drop to current thread",
             },
             HelpEntry {
                 key: "p/P",
@@ -2290,6 +2383,7 @@ fn render_results_list(
     effects_enabled: bool,
     reduced_motion: bool,
     drop_visual: Option<MessageDropVisual<'_>>,
+    keyboard_marked_message_id: Option<i64>,
 ) {
     let title = if results.is_empty() {
         "Results".to_string()
@@ -2349,6 +2443,7 @@ fn render_results_list(
                     MessageDropZoneState::None
                 }
             }),
+            keyboard_marked: keyboard_marked_message_id == Some(entry.id),
         })
         .collect();
 
@@ -3456,6 +3551,14 @@ mod tests {
         })
     }
 
+    fn ctrl_key(code: KeyCode) -> Event {
+        Event::Key(ftui::KeyEvent {
+            code,
+            modifiers: Modifiers::CTRL,
+            kind: KeyEventKind::Press,
+        })
+    }
+
     // ── Construction ────────────────────────────────────────────────
 
     #[test]
@@ -3774,6 +3877,90 @@ mod tests {
         assert!(matches!(screen.message_drag, MessageDragState::Idle));
     }
 
+    #[test]
+    fn ctrl_m_marks_selected_message_for_keyboard_move() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        screen.results = vec![test_message_entry(10, "thread-a", "Subject A")];
+        screen.cursor = 0;
+
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        assert!(matches!(cmd, Cmd::None));
+        let marker = state
+            .keyboard_move_snapshot()
+            .expect("keyboard move marker");
+        assert_eq!(marker.message_id, 10);
+        assert_eq!(marker.source_thread_id, "thread-a");
+    }
+
+    #[test]
+    fn ctrl_m_replaces_existing_keyboard_move_marker() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        screen.results = vec![
+            test_message_entry(10, "thread-a", "Subject A"),
+            test_message_entry(11, "thread-b", "Subject B"),
+        ];
+
+        let _ = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        screen.cursor = 1;
+        let _ = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+
+        let marker = state
+            .keyboard_move_snapshot()
+            .expect("keyboard move marker");
+        assert_eq!(marker.message_id, 11);
+        assert_eq!(marker.source_thread_id, "thread-b");
+    }
+
+    #[test]
+    fn ctrl_v_dispatches_marked_message_to_selected_thread() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        screen.results = vec![
+            test_message_entry(10, "thread-a", "Subject A"),
+            test_message_entry(11, "thread-b", "Subject B"),
+        ];
+        screen.cursor = 1;
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: 10,
+            subject: "Subject A".to_string(),
+            source_thread_id: "thread-a".to_string(),
+            source_project_slug: "proj".to_string(),
+        }));
+
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('v')), &state);
+        match cmd {
+            Cmd::Msg(MailScreenMsg::ActionExecute(op, ctx)) => {
+                assert_eq!(op, "rethread_message:10:thread-b");
+                assert_eq!(ctx, "thread-a");
+            }
+            _ => panic!("expected ActionExecute command"),
+        }
+        assert!(state.keyboard_move_snapshot().is_none());
+    }
+
+    #[test]
+    fn escape_clears_keyboard_move_marker() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        screen.results = vec![test_message_entry(10, "thread-a", "Subject A")];
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: 10,
+            subject: "Subject A".to_string(),
+            source_thread_id: "thread-a".to_string(),
+            source_project_slug: "proj".to_string(),
+        }));
+
+        let cmd = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+        assert!(matches!(cmd, Cmd::None));
+        assert!(state.keyboard_move_snapshot().is_none());
+    }
+
     // ── FTS sanitization ────────────────────────────────────────────
 
     #[test]
@@ -4019,6 +4206,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
     }
 
@@ -4067,6 +4255,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
     }
 
@@ -4098,6 +4287,7 @@ mod tests {
             true,
             true,
             false,
+            None,
             None,
         );
     }

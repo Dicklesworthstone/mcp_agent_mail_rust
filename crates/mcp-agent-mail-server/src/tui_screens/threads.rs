@@ -30,7 +30,7 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
-use crate::tui_bridge::{MessageDragSnapshot, TuiSharedState};
+use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedState};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::{MermaidThreadMessage, generate_thread_flow_mermaid};
 
@@ -776,6 +776,48 @@ impl ThreadExplorerScreen {
         cmd
     }
 
+    fn mark_selected_message_for_keyboard_move(&self, state: &TuiSharedState) {
+        let Some(message) = self.selected_message() else {
+            return;
+        };
+        let Some(thread) = self.threads.get(self.cursor) else {
+            return;
+        };
+        if thread.thread_id.is_empty() {
+            return;
+        }
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: message.id,
+            subject: message.subject.clone(),
+            source_thread_id: thread.thread_id.clone(),
+            source_project_slug: thread.project_slug.clone(),
+        }));
+    }
+
+    fn execute_keyboard_move_to_selected_thread(
+        &self,
+        state: &TuiSharedState,
+    ) -> Cmd<MailScreenMsg> {
+        let Some(marker) = state.keyboard_move_snapshot() else {
+            return Cmd::None;
+        };
+        let Some(target_thread_id) = self
+            .threads
+            .get(self.cursor)
+            .map(|thread| thread.thread_id.as_str())
+            .filter(|thread_id| !thread_id.is_empty())
+        else {
+            return Cmd::None;
+        };
+        if target_thread_id == marker.source_thread_id {
+            return Cmd::None;
+        }
+
+        let op = format!("rethread_message:{}:{target_thread_id}", marker.message_id);
+        state.clear_keyboard_move_snapshot();
+        Cmd::msg(MailScreenMsg::ActionExecute(op, marker.source_thread_id))
+    }
+
     fn clamp_detail_cursor_to_tree_rows(&mut self) {
         let row_count = self.detail_tree_rows().len();
         if row_count == 0 {
@@ -957,6 +999,18 @@ impl MailScreen for ThreadExplorerScreen {
 
         if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Press {
+                if key.code == KeyCode::Escape && state.keyboard_move_snapshot().is_some() {
+                    state.clear_keyboard_move_snapshot();
+                    return Cmd::None;
+                }
+                if key.code == KeyCode::Char('m') && key.modifiers.contains(Modifiers::CTRL) {
+                    self.mark_selected_message_for_keyboard_move(state);
+                    return Cmd::None;
+                }
+                if key.code == KeyCode::Char('v') && key.modifiers.contains(Modifiers::CTRL) {
+                    return self.execute_keyboard_move_to_selected_thread(state);
+                }
+
                 // Filter editing mode
                 if self.filter_editing {
                     match key.code {
@@ -1244,7 +1298,7 @@ impl MailScreen for ThreadExplorerScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 4 || area.width < 20 {
             return;
         }
@@ -1272,6 +1326,7 @@ impl MailScreen for ThreadExplorerScreen {
             }),
             _ => None,
         };
+        let keyboard_move = state.keyboard_move_snapshot();
 
         // Split content: thread list (left) + detail (right) if wide enough
         if content_area.width >= 80 {
@@ -1302,6 +1357,7 @@ impl MailScreen for ThreadExplorerScreen {
                 self.sort_mode,
                 self.urgent_pulse_on,
                 drop_visual,
+                keyboard_move.as_ref(),
             );
             if self.show_mermaid_panel {
                 self.render_mermaid_panel(
@@ -1352,6 +1408,7 @@ impl MailScreen for ThreadExplorerScreen {
                             self.sort_mode,
                             self.urgent_pulse_on,
                             drop_visual,
+                            keyboard_move.as_ref(),
                         );
                     }
                     Focus::DetailPanel => {
@@ -1410,6 +1467,10 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Drag message to thread row",
             },
             HelpEntry {
+                key: "Ctrl+M / Ctrl+V",
+                action: "Mark message / drop to selected thread",
+            },
+            HelpEntry {
                 key: "Left/Right",
                 action: "Collapse/expand selected branch",
             },
@@ -1431,7 +1492,7 @@ impl MailScreen for ThreadExplorerScreen {
             },
             HelpEntry {
                 key: "Esc/h",
-                action: "Close Mermaid / back to thread list",
+                action: "Cancel move / close Mermaid / back to list",
             },
             HelpEntry {
                 key: "/",
@@ -1720,6 +1781,7 @@ fn render_thread_list(
     sort_mode: SortMode,
     urgent_pulse_on: bool,
     drop_visual: Option<ThreadDropVisual<'_>>,
+    keyboard_move: Option<&KeyboardMoveSnapshot>,
 ) {
     let focus_tag = if focused { "" } else { " (inactive)" };
     let escalated = threads.iter().filter(|t| t.has_escalation).count();
@@ -1728,8 +1790,11 @@ fn render_thread_list(
     } else {
         String::new()
     };
+    let moving_tag = keyboard_move
+        .map(|marker| format!("  [MOVING #{}]", marker.message_id))
+        .unwrap_or_default();
     let title = format!(
-        "Threads ({}){}  [v]{}  [s]{}{focus_tag}",
+        "Threads ({}){}  [v]{}  [s]{}{moving_tag}{focus_tag}",
         threads.len(),
         esc_tag,
         view_lens.label(),
@@ -1778,6 +1843,8 @@ fn render_thread_list(
     for (view_idx, thread) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
         let is_selected = abs_idx == cursor_clamped;
+        let keyboard_marked_source =
+            keyboard_move.is_some_and(|marker| marker.source_thread_id == thread.thread_id);
         let valid_drop_zone =
             drop_visual.is_some_and(|drag| thread.thread_id != drag.source_thread_id);
         let hovered_here = drop_visual
@@ -1807,6 +1874,14 @@ fn render_thread_list(
             Span::styled(
                 format!(" {}", thread.unread_count),
                 crate::tui_theme::text_accent(&tp),
+            )
+        } else {
+            Span::raw("")
+        };
+        let moving_span = if keyboard_marked_source {
+            Span::styled(
+                " [MOVING]",
+                Style::default().fg(tp.selection_indicator).bold(),
             )
         } else {
             Span::raw("")
@@ -1871,6 +1946,7 @@ fn render_thread_list(
             ),
             Span::styled(format!(" {meta}"), crate::tui_theme::text_meta(&tp)),
             unread_span,
+            moving_span,
         ]);
         if is_selected {
             primary.apply_base_style(cursor_style);
@@ -2480,6 +2556,14 @@ mod tests {
         })
     }
 
+    fn ctrl_key(code: KeyCode) -> Event {
+        Event::Key(ftui::KeyEvent {
+            code,
+            modifiers: Modifiers::CTRL,
+            kind: KeyEventKind::Press,
+        })
+    }
+
     // ── Construction ────────────────────────────────────────────────
 
     #[test]
@@ -2606,6 +2690,67 @@ mod tests {
         assert!(matches!(cmd, Cmd::None));
         assert!(matches!(screen.message_drag, MessageDragState::Idle));
         assert!(state.message_drag_snapshot().is_none());
+    }
+
+    #[test]
+    fn ctrl_m_marks_selected_detail_message_for_keyboard_move() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.detail_messages.push(make_message(77));
+        screen.focus = Focus::DetailPanel;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        assert!(matches!(cmd, Cmd::None));
+        let marker = state
+            .keyboard_move_snapshot()
+            .expect("keyboard move marker");
+        assert_eq!(marker.message_id, 77);
+        assert_eq!(marker.source_thread_id, "t1");
+    }
+
+    #[test]
+    fn ctrl_v_dispatches_marked_message_to_selected_thread() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.threads.push(make_thread("t2", 2, 2));
+        screen.cursor = 1;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: 88,
+            subject: "Subj".to_string(),
+            source_thread_id: "t1".to_string(),
+            source_project_slug: "project".to_string(),
+        }));
+
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('v')), &state);
+        match cmd {
+            Cmd::Msg(MailScreenMsg::ActionExecute(op, ctx)) => {
+                assert_eq!(op, "rethread_message:88:t2");
+                assert_eq!(ctx, "t1");
+            }
+            _ => panic!("expected ActionExecute command"),
+        }
+        assert!(state.keyboard_move_snapshot().is_none());
+    }
+
+    #[test]
+    fn escape_clears_keyboard_move_marker_before_focus_change() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.focus = Focus::DetailPanel;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: 88,
+            subject: "Subj".to_string(),
+            source_thread_id: "t1".to_string(),
+            source_project_slug: "project".to_string(),
+        }));
+
+        let cmd = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+        assert!(matches!(cmd, Cmd::None));
+        assert!(state.keyboard_move_snapshot().is_none());
+        assert!(matches!(screen.focus, Focus::DetailPanel));
     }
 
     #[test]

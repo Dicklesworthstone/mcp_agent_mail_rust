@@ -9,7 +9,7 @@
 //! Layout changes during drag or rapid key-presses are debounced so
 //! the envfile is written at most once per `SAVE_DEBOUNCE` interval.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -27,10 +27,97 @@ const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const PALETTE_USAGE_FILENAME: &str = "palette_usage.json";
 /// JSON filename for persisted dismissed coach-hint IDs.
 const DISMISSED_HINTS_FILENAME: &str = "dismissed_hints.json";
+/// JSON filename for persisted screen filter presets.
+const SCREEN_FILTER_PRESETS_FILENAME: &str = "screen_filter_presets.json";
 
 /// Persisted command-palette usage map:
 /// `action_id` -> (`usage_count`, `last_used_micros`)
 pub type PaletteUsageMap = HashMap<String, (u32, i64)>;
+
+/// Persisted filter preset for a specific screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenFilterPreset {
+    /// Human-readable preset name (unique within one screen).
+    pub name: String,
+    /// Optional short description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Serialized filter key/value payload.
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
+    /// Last update time in microseconds.
+    pub updated_at_micros: i64,
+}
+
+/// Persisted presets grouped by screen ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScreenFilterPresetStore {
+    /// `screen_id` -> sorted preset list.
+    #[serde(default)]
+    presets_by_screen: BTreeMap<String, Vec<ScreenFilterPreset>>,
+}
+
+impl ScreenFilterPresetStore {
+    /// List preset names for one screen in stable sorted order.
+    #[must_use]
+    pub fn list_names(&self, screen_id: &str) -> Vec<String> {
+        self.presets_by_screen
+            .get(screen_id)
+            .map_or_else(Vec::new, |presets| {
+                presets.iter().map(|p| p.name.clone()).collect()
+            })
+    }
+
+    /// Return a preset by `(screen_id, name)`.
+    #[must_use]
+    pub fn get(&self, screen_id: &str, name: &str) -> Option<&ScreenFilterPreset> {
+        self.presets_by_screen
+            .get(screen_id)?
+            .iter()
+            .find(|preset| preset.name == name)
+    }
+
+    /// Upsert a preset under a screen namespace.
+    pub fn upsert(
+        &mut self,
+        screen_id: impl Into<String>,
+        name: impl Into<String>,
+        description: Option<String>,
+        values: BTreeMap<String, String>,
+    ) {
+        let screen_id = screen_id.into();
+        let name = name.into();
+        let updated_at_micros = chrono::Utc::now().timestamp_micros();
+        let presets = self.presets_by_screen.entry(screen_id).or_default();
+        if let Some(existing) = presets.iter_mut().find(|preset| preset.name == name) {
+            existing.description = description;
+            existing.values = values;
+            existing.updated_at_micros = updated_at_micros;
+            return;
+        }
+        presets.push(ScreenFilterPreset {
+            name,
+            description,
+            values,
+            updated_at_micros,
+        });
+        presets.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+
+    /// Delete a preset. Returns `true` when something was removed.
+    pub fn remove(&mut self, screen_id: &str, name: &str) -> bool {
+        let Some(presets) = self.presets_by_screen.get_mut(screen_id) else {
+            return false;
+        };
+        let original_len = presets.len();
+        presets.retain(|preset| preset.name != name);
+        let removed = presets.len() != original_len;
+        if presets.is_empty() {
+            self.presets_by_screen.remove(screen_id);
+        }
+        removed
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // TuiPreferences — the saved state
@@ -196,6 +283,99 @@ pub fn load_dismissed_hints_or_default(path: &Path) -> std::collections::HashSet
                 path.display()
             );
             std::collections::HashSet::new()
+        }
+    }
+}
+
+/// Default location of the console envfile when `CONSOLE_PERSIST_PATH` is not set.
+#[must_use]
+pub fn default_console_persist_path() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".config")
+        .join("mcp-agent-mail")
+        .join("config.env")
+}
+
+/// Resolve the console envfile path from `CONSOLE_PERSIST_PATH`, falling back
+/// to the default location.
+#[must_use]
+pub fn console_persist_path_from_env_or_default() -> PathBuf {
+    let candidate = std::env::var("CONSOLE_PERSIST_PATH")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if let Some(value) = candidate {
+        if value == "~" {
+            return std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."));
+        }
+        if let Some(rest) = value.strip_prefix("~/") {
+            return std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(rest);
+        }
+        return PathBuf::from(value);
+    }
+    default_console_persist_path()
+}
+
+/// Compute the path used for persisted screen filter presets.
+#[must_use]
+pub fn screen_filter_presets_path(console_persist_path: &Path) -> PathBuf {
+    console_persist_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(SCREEN_FILTER_PRESETS_FILENAME)
+}
+
+/// Save screen filter presets to disk.
+///
+/// # Errors
+///
+/// Returns an error if parent directory creation, JSON serialization,
+/// or file writing fails.
+pub fn save_screen_filter_presets(
+    path: &Path,
+    store: &ScreenFilterPresetStore,
+) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(store)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, json)
+}
+
+/// Load screen filter presets from disk.
+///
+/// # Errors
+///
+/// Returns an error if the file does not exist, cannot be read, or contains
+/// invalid JSON for the expected schema.
+pub fn load_screen_filter_presets(path: &Path) -> Result<ScreenFilterPresetStore, std::io::Error> {
+    let json = std::fs::read_to_string(path)?;
+    serde_json::from_str::<ScreenFilterPresetStore>(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Load screen filter presets with graceful fallback.
+///
+/// Missing or malformed files return an empty preset store.
+#[must_use]
+pub fn load_screen_filter_presets_or_default(path: &Path) -> ScreenFilterPresetStore {
+    match load_screen_filter_presets(path) {
+        Ok(store) => store,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ScreenFilterPresetStore::default(),
+        Err(e) => {
+            eprintln!(
+                "tui_persist: failed to load screen filter presets from {}: {e}",
+                path.display()
+            );
+            ScreenFilterPresetStore::default()
         }
     }
 }
@@ -1295,6 +1475,104 @@ mod tests {
 
         let loaded = load_dismissed_hints_or_default(&path);
         assert!(loaded.is_empty());
+    }
+
+    // ── Screen filter preset persistence tests ─────────────────────
+
+    #[test]
+    fn default_console_persist_path_ends_with_config_env() {
+        let path = default_console_persist_path();
+        assert!(
+            path.ends_with(std::path::Path::new(".config/mcp-agent-mail/config.env")),
+            "unexpected default console persist path: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn screen_filter_presets_path_is_next_to_envfile() {
+        let env = std::path::Path::new("/tmp/mcp-agent-mail/config.env");
+        let path = screen_filter_presets_path(env);
+        assert_eq!(
+            path,
+            std::path::Path::new("/tmp/mcp-agent-mail/screen_filter_presets.json")
+        );
+    }
+
+    #[test]
+    fn screen_filter_store_upsert_remove_and_isolation() {
+        let mut store = ScreenFilterPresetStore::default();
+        let mut timeline_values = BTreeMap::new();
+        timeline_values.insert("kind_filter".to_string(), "messages".to_string());
+        store.upsert(
+            "timeline",
+            "triage",
+            Some("Message-focused".to_string()),
+            timeline_values,
+        );
+
+        let mut reservations_values = BTreeMap::new();
+        reservations_values.insert("sort_col".to_string(), "ttl".to_string());
+        store.upsert("reservations", "expiring", None, reservations_values);
+
+        assert_eq!(store.list_names("timeline"), vec!["triage".to_string()]);
+        assert_eq!(
+            store.list_names("reservations"),
+            vec!["expiring".to_string()]
+        );
+        assert!(store.get("timeline", "expiring").is_none());
+        assert!(store.get("reservations", "triage").is_none());
+
+        assert!(store.remove("timeline", "triage"));
+        assert!(store.list_names("timeline").is_empty());
+        assert_eq!(
+            store.list_names("reservations"),
+            vec!["expiring".to_string()]
+        );
+    }
+
+    #[test]
+    fn screen_filter_store_save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("screen_filter_presets.json");
+
+        let mut store = ScreenFilterPresetStore::default();
+        let mut values = BTreeMap::new();
+        values.insert("direction".to_string(), "inbound".to_string());
+        values.insert("ack_filter".to_string(), "pending".to_string());
+        store.upsert(
+            "explorer",
+            "pending-inbox",
+            Some("Pending inbound acks".to_string()),
+            values,
+        );
+
+        save_screen_filter_presets(&path, &store).expect("save presets");
+        let loaded = load_screen_filter_presets(&path).expect("load presets");
+        assert_eq!(
+            loaded.list_names("explorer"),
+            vec!["pending-inbox".to_string()]
+        );
+        let preset = loaded
+            .get("explorer", "pending-inbox")
+            .expect("preset should exist");
+        assert_eq!(
+            preset.values.get("direction").map(String::as_str),
+            Some("inbound")
+        );
+    }
+
+    #[test]
+    fn screen_filter_store_missing_or_corrupt_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing_screen_filter_presets.json");
+        let loaded = load_screen_filter_presets_or_default(&missing);
+        assert!(loaded.list_names("timeline").is_empty());
+
+        let corrupt = dir.path().join("screen_filter_presets.json");
+        std::fs::write(&corrupt, "{not-valid-json").unwrap();
+        let loaded = load_screen_filter_presets_or_default(&corrupt);
+        assert!(loaded.list_names("timeline").is_empty());
     }
 
     // ── Theme persistence tests ─────────────────────────────────

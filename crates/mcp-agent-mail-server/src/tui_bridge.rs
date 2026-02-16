@@ -185,6 +185,15 @@ pub struct MessageDragSnapshot {
     pub invalid_hover: bool,
 }
 
+/// Shared snapshot for keyboard-driven message move operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardMoveSnapshot {
+    pub message_id: i64,
+    pub subject: String,
+    pub source_thread_id: String,
+    pub source_project_slug: String,
+}
+
 #[derive(Debug)]
 pub struct TuiSharedState {
     events: EventRingBuffer,
@@ -201,6 +210,7 @@ pub struct TuiSharedState {
     sparkline_data: AtomicSparkline,
     remote_terminal_events: Mutex<VecDeque<RemoteTerminalEvent>>,
     message_drag: Mutex<Option<MessageDragSnapshot>>,
+    keyboard_move: Mutex<Option<KeyboardMoveSnapshot>>,
     server_control_tx: Mutex<Option<Sender<ServerControlMsg>>>,
     /// Console log ring buffer: `(seq, text)` pairs for tool call cards etc.
     console_log: Mutex<VecDeque<(u64, String)>>,
@@ -232,6 +242,7 @@ impl TuiSharedState {
                 REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY,
             )),
             message_drag: Mutex::new(None),
+            keyboard_move: Mutex::new(None),
             server_control_tx: Mutex::new(None),
             console_log: Mutex::new(VecDeque::with_capacity(CONSOLE_LOG_CAPACITY)),
             console_log_seq: AtomicU64::new(0),
@@ -357,6 +368,27 @@ impl TuiSharedState {
     /// Clear any active message drag state.
     pub fn clear_message_drag_snapshot(&self) {
         self.set_message_drag_snapshot(None);
+    }
+
+    /// Snapshot the active keyboard move marker, if any.
+    #[must_use]
+    pub fn keyboard_move_snapshot(&self) -> Option<KeyboardMoveSnapshot> {
+        self.keyboard_move
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Replace the active keyboard move marker.
+    pub fn set_keyboard_move_snapshot(&self, marker: Option<KeyboardMoveSnapshot>) {
+        if let Ok(mut guard) = self.keyboard_move.lock() {
+            *guard = marker;
+        }
+    }
+
+    /// Clear any active keyboard move marker.
+    pub fn clear_keyboard_move_snapshot(&self) {
+        self.set_keyboard_move_snapshot(None);
     }
 
     pub fn set_server_control_sender(&self, tx: Sender<ServerControlMsg>) {
@@ -1015,6 +1047,25 @@ mod tests {
 
         state.clear_message_drag_snapshot();
         assert!(state.message_drag_snapshot().is_none());
+    }
+
+    #[test]
+    fn keyboard_move_snapshot_round_trip() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(state.keyboard_move_snapshot().is_none());
+
+        let snapshot = KeyboardMoveSnapshot {
+            message_id: 7,
+            subject: "Re-thread".to_string(),
+            source_thread_id: "thread-a".to_string(),
+            source_project_slug: "proj".to_string(),
+        };
+        state.set_keyboard_move_snapshot(Some(snapshot.clone()));
+        assert_eq!(state.keyboard_move_snapshot(), Some(snapshot));
+
+        state.clear_keyboard_move_snapshot();
+        assert!(state.keyboard_move_snapshot().is_none());
     }
 
     #[test]

@@ -595,14 +595,21 @@ impl ComposeState {
             KeyCode::Backspace => {
                 let offset = self.body_offset();
                 if offset > 0 {
-                    self.body.remove(offset - 1);
                     if self.body_cursor_col > 0 {
+                        self.body.remove(offset - 1);
                         self.body_cursor_col -= 1;
                     } else if self.body_cursor_line > 0 {
+                        // Joining lines: capture prev line length *before* removal.
+                        let prev_line_len = self
+                            .body
+                            .split('\n')
+                            .nth(self.body_cursor_line - 1)
+                            .map_or(0, str::len);
+                        self.body.remove(offset - 1);
                         self.body_cursor_line -= 1;
-                        let lines = self.body_lines();
-                        self.body_cursor_col =
-                            lines.get(self.body_cursor_line).map_or(0, |l| l.len());
+                        self.body_cursor_col = prev_line_len;
+                    } else {
+                        self.body.remove(offset - 1);
                     }
                     self.dirty = true;
                 }
@@ -1983,9 +1990,8 @@ mod tests {
         s.handle_key(&make_key(KeyCode::Backspace));
         assert_eq!(s.body, "helloworld");
         assert_eq!(s.body_cursor_line, 0);
-        // After removing '\n', the joined line is "helloworld" (len 10),
-        // and cursor_col is set to the full line length.
-        assert_eq!(s.body_cursor_col, 10);
+        // Cursor lands at the join point (end of previous line before join).
+        assert_eq!(s.body_cursor_col, 5);
     }
 
     #[test]

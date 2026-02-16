@@ -7,8 +7,8 @@
 //! inspector detail panel alongside.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ftui::layout::Rect;
@@ -17,7 +17,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, MouseButton, MouseEventKind, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
@@ -25,7 +25,11 @@ use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListStat
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
 use crate::tui_layout::{DockLayout, DockPreset};
-use crate::tui_persist::{PreferencePersister, TuiPreferences};
+use crate::tui_persist::{
+    PreferencePersister, ScreenFilterPresetStore, TuiPreferences,
+    console_persist_path_from_env_or_default, load_screen_filter_presets_or_default,
+    save_screen_filter_presets, screen_filter_presets_path,
+};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg};
 
 // Re-use dashboard formatting helpers.
@@ -45,6 +49,7 @@ const SHIMMER_MAX_ROWS: usize = 5;
 const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
 const COMMIT_REFRESH_EVERY_TICKS: u64 = 20;
 const COMMIT_LIMIT_PER_PROJECT: usize = 200;
+const TIMELINE_PRESET_SCREEN_ID: &str = "timeline";
 
 // ──────────────────────────────────────────────────────────────────────
 // TimelinePane
@@ -547,6 +552,28 @@ enum TimelineViewMode {
     LogViewer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresetDialogMode {
+    None,
+    Save,
+    Load,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavePresetField {
+    Name,
+    Description,
+}
+
+impl SavePresetField {
+    const fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Description,
+            Self::Description => Self::Name,
+        }
+    }
+}
+
 impl TimelineViewMode {
     const fn next_primary(self) -> Self {
         match self {
@@ -584,16 +611,31 @@ pub struct TimelineScreen {
     log_viewer: RefCell<crate::console::LogPane>,
     /// Debounced preference persister (auto-saves dock layout to envfile).
     persister: Option<PreferencePersister>,
+    /// On-disk path for persisted screen filter presets.
+    filter_presets_path: PathBuf,
+    /// Preset store loaded from `filter_presets_path`.
+    filter_presets: ScreenFilterPresetStore,
+    /// Active preset dialog mode (save/load/none).
+    preset_dialog_mode: PresetDialogMode,
+    /// Save dialog field focus.
+    save_preset_field: SavePresetField,
+    /// Save dialog: preset name input buffer.
+    save_preset_name: String,
+    /// Save dialog: optional description input buffer.
+    save_preset_description: String,
+    /// Load dialog selected preset row.
+    load_preset_cursor: usize,
 }
 
 impl TimelineScreen {
-    /// Create with default layout (no persistence).
-    #[must_use]
-    pub fn new() -> Self {
+    fn build(dock: DockLayout, persister: Option<PreferencePersister>) -> Self {
+        let console_path = console_persist_path_from_env_or_default();
+        let filter_presets_path = screen_filter_presets_path(&console_path);
+        let filter_presets = load_screen_filter_presets_or_default(&filter_presets_path);
         Self {
             pane: TimelinePane::new(),
             list_state: RefCell::new(VirtualizedListState::new().with_persistence_id("timeline")),
-            dock: DockLayout::right_40(),
+            dock,
             dock_drag: DockDragState::Idle,
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
             view_mode: TimelineViewMode::Events,
@@ -601,27 +643,36 @@ impl TimelineScreen {
             commit_stats: CommitTimelineStats::default(),
             last_commit_refresh_tick: 0,
             log_viewer: RefCell::new(crate::console::LogPane::new()),
-            persister: None,
+            persister,
+            filter_presets_path,
+            filter_presets,
+            preset_dialog_mode: PresetDialogMode::None,
+            save_preset_field: SavePresetField::Name,
+            save_preset_name: String::new(),
+            save_preset_description: String::new(),
+            load_preset_cursor: 0,
         }
+    }
+
+    #[cfg(test)]
+    fn with_filter_presets_path_for_test(path: PathBuf) -> Self {
+        let mut screen = Self::build(DockLayout::right_40(), None);
+        screen.filter_presets_path = path.clone();
+        screen.filter_presets = load_screen_filter_presets_or_default(&path);
+        screen
+    }
+
+    /// Create with default layout (no persistence).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::build(DockLayout::right_40(), None)
     }
 
     /// Create with layout loaded from config and auto-persistence.
     #[must_use]
     pub fn with_config(config: &mcp_agent_mail_core::Config) -> Self {
         let prefs = TuiPreferences::from_config(config);
-        Self {
-            pane: TimelinePane::new(),
-            list_state: RefCell::new(VirtualizedListState::new().with_persistence_id("timeline")),
-            dock: prefs.dock,
-            dock_drag: DockDragState::Idle,
-            last_area: Cell::new(Rect::new(0, 0, 0, 0)),
-            view_mode: TimelineViewMode::Events,
-            commit_entries: Vec::new(),
-            commit_stats: CommitTimelineStats::default(),
-            last_commit_refresh_tick: 0,
-            log_viewer: RefCell::new(crate::console::LogPane::new()),
-            persister: Some(PreferencePersister::new(config)),
-        }
+        Self::build(prefs.dock, Some(PreferencePersister::new(config)))
     }
 
     /// Sync `VirtualizedListState` with `TimelinePane` cursor.
@@ -781,6 +832,218 @@ impl TimelineScreen {
             _ => None,
         }
     }
+
+    fn preset_names(&self) -> Vec<String> {
+        self.filter_presets.list_names(TIMELINE_PRESET_SCREEN_ID)
+    }
+
+    fn persist_filter_presets(&self) {
+        if let Err(err) =
+            save_screen_filter_presets(&self.filter_presets_path, &self.filter_presets)
+        {
+            eprintln!(
+                "timeline: failed to save presets to {}: {err}",
+                self.filter_presets_path.display()
+            );
+        }
+    }
+
+    fn snapshot_filter_values(&self) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        values.insert(
+            "verbosity".to_string(),
+            verbosity_token(self.pane.verbosity).to_string(),
+        );
+        if !self.pane.kind_filter.is_empty() {
+            let mut tokens: Vec<_> = self
+                .pane
+                .kind_filter
+                .iter()
+                .map(|k| event_kind_token(*k))
+                .collect();
+            tokens.sort_unstable();
+            values.insert("kind".to_string(), tokens.join(","));
+        }
+        if !self.pane.source_filter.is_empty() {
+            let mut tokens: Vec<_> = self
+                .pane
+                .source_filter
+                .iter()
+                .map(|s| event_source_token(*s))
+                .collect();
+            tokens.sort_unstable();
+            values.insert("source".to_string(), tokens.join(","));
+        }
+        values
+    }
+
+    fn save_named_preset(&mut self, name: String, description: Option<String>) -> bool {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            return false;
+        }
+        let trimmed_description = description.and_then(|text| {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+        let values = self.snapshot_filter_values();
+        self.filter_presets.upsert(
+            TIMELINE_PRESET_SCREEN_ID,
+            trimmed_name.to_string(),
+            trimmed_description,
+            values,
+        );
+        self.persist_filter_presets();
+        true
+    }
+
+    fn apply_preset_values(&mut self, values: &BTreeMap<String, String>) {
+        self.pane.kind_filter.clear();
+        self.pane.source_filter.clear();
+        self.pane.verbosity = values
+            .get("verbosity")
+            .and_then(|raw| parse_verbosity_token(raw))
+            .unwrap_or_default();
+
+        if let Some(kind_raw) = values.get("kind") {
+            for token in kind_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
+                if let Some(kind) = parse_event_kind_token(token) {
+                    self.pane.kind_filter.insert(kind);
+                }
+            }
+        }
+        if let Some(source_raw) = values.get("source") {
+            for token in source_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
+                if let Some(source) = parse_event_source_token(token) {
+                    self.pane.source_filter.insert(source);
+                }
+            }
+        }
+        self.clamp_cursor_for_mode();
+        self.sync_list_state();
+    }
+
+    fn apply_named_preset(&mut self, name: &str) -> bool {
+        let Some(preset) = self
+            .filter_presets
+            .get(TIMELINE_PRESET_SCREEN_ID, name)
+            .cloned()
+        else {
+            return false;
+        };
+        self.apply_preset_values(&preset.values);
+        true
+    }
+
+    fn remove_named_preset(&mut self, name: &str) -> bool {
+        let removed = self.filter_presets.remove(TIMELINE_PRESET_SCREEN_ID, name);
+        if removed {
+            self.persist_filter_presets();
+        }
+        removed
+    }
+
+    fn open_save_preset_dialog(&mut self) {
+        self.preset_dialog_mode = PresetDialogMode::Save;
+        self.save_preset_field = SavePresetField::Name;
+        self.save_preset_description.clear();
+        if self.save_preset_name.is_empty() {
+            self.save_preset_name = "timeline-preset".to_string();
+        }
+    }
+
+    fn open_load_preset_dialog(&mut self) {
+        self.preset_dialog_mode = PresetDialogMode::Load;
+        let names = self.preset_names();
+        if names.is_empty() {
+            self.load_preset_cursor = 0;
+        } else {
+            self.load_preset_cursor = self.load_preset_cursor.min(names.len().saturating_sub(1));
+        }
+    }
+
+    fn handle_save_dialog_key(&mut self, key: &ftui::KeyEvent) {
+        match key.code {
+            KeyCode::Escape => {
+                self.preset_dialog_mode = PresetDialogMode::None;
+            }
+            KeyCode::Tab => {
+                self.save_preset_field = self.save_preset_field.next();
+            }
+            KeyCode::Backspace => match self.save_preset_field {
+                SavePresetField::Name => {
+                    self.save_preset_name.pop();
+                }
+                SavePresetField::Description => {
+                    self.save_preset_description.pop();
+                }
+            },
+            KeyCode::Enter => {
+                if self.save_named_preset(
+                    self.save_preset_name.clone(),
+                    Some(self.save_preset_description.clone()),
+                ) {
+                    self.preset_dialog_mode = PresetDialogMode::None;
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(Modifiers::CTRL) => {
+                match self.save_preset_field {
+                    SavePresetField::Name => self.save_preset_name.push(ch),
+                    SavePresetField::Description => self.save_preset_description.push(ch),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_load_dialog_key(&mut self, key: &ftui::KeyEvent) {
+        let names = self.preset_names();
+        match key.code {
+            KeyCode::Escape => {
+                self.preset_dialog_mode = PresetDialogMode::None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !names.is_empty() {
+                    self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
+            }
+            KeyCode::Delete => {
+                if let Some(name) = names.get(self.load_preset_cursor) {
+                    let _ = self.remove_named_preset(name);
+                }
+                let refreshed = self.preset_names();
+                if refreshed.is_empty() {
+                    self.load_preset_cursor = 0;
+                } else {
+                    self.load_preset_cursor = self
+                        .load_preset_cursor
+                        .min(refreshed.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(name) = names.get(self.load_preset_cursor) {
+                    let _ = self.apply_named_preset(name);
+                    self.preset_dialog_mode = PresetDialogMode::None;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Default for TimelineScreen {
@@ -794,6 +1057,32 @@ impl MailScreen for TimelineScreen {
         let dock_before = self.dock;
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if self.preset_dialog_mode != PresetDialogMode::None {
+                    match self.preset_dialog_mode {
+                        PresetDialogMode::Save => self.handle_save_dialog_key(key),
+                        PresetDialogMode::Load => self.handle_load_dialog_key(key),
+                        PresetDialogMode::None => {}
+                    }
+                    self.sync_list_state();
+                    return Cmd::None;
+                }
+
+                if key.modifiers.contains(Modifiers::CTRL) {
+                    match key.code {
+                        KeyCode::Char('s') => {
+                            self.open_save_preset_dialog();
+                            self.sync_list_state();
+                            return Cmd::None;
+                        }
+                        KeyCode::Char('l') => {
+                            self.open_load_preset_dialog();
+                            self.sync_list_state();
+                            return Cmd::None;
+                        }
+                        _ => {}
+                    }
+                }
+
                 match key.code {
                     // Cursor navigation
                     KeyCode::Char('j') | KeyCode::Down => self.cursor_down(1),
@@ -1035,6 +1324,20 @@ impl MailScreen for TimelineScreen {
             };
             super::inspector::render_inspector(frame, dock_area, event_ref);
         }
+        match self.preset_dialog_mode {
+            PresetDialogMode::Save => render_save_preset_dialog(
+                frame,
+                area,
+                &self.save_preset_name,
+                &self.save_preset_description,
+                self.save_preset_field,
+            ),
+            PresetDialogMode::Load => {
+                let names = self.preset_names();
+                render_load_preset_dialog(frame, area, &names, self.load_preset_cursor);
+            }
+            PresetDialogMode::None => {}
+        }
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -1076,6 +1379,18 @@ impl MailScreen for TimelineScreen {
                 action: "Clear all filters",
             },
             HelpEntry {
+                key: "Ctrl+S",
+                action: "Save filter preset",
+            },
+            HelpEntry {
+                key: "Ctrl+L",
+                action: "Load preset list",
+            },
+            HelpEntry {
+                key: "Del",
+                action: "Delete selected preset (load dialog)",
+            },
+            HelpEntry {
                 key: "i/Enter",
                 action: "Toggle inspector (Enter opens archive from commit rows)",
             },
@@ -1100,7 +1415,7 @@ impl MailScreen for TimelineScreen {
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some(
-            "Timeline views: V cycles events/commits/combined. Enter on commit rows opens Archive Browser.",
+            "Timeline views: V cycles events/commits/combined. Ctrl+S saves and Ctrl+L loads screen-scoped filter presets.",
         )
     }
 
@@ -1227,6 +1542,83 @@ fn cycle_source_filter(filter: &mut HashSet<EventSource>) {
     }
 }
 
+const fn event_kind_token(kind: MailEventKind) -> &'static str {
+    match kind {
+        MailEventKind::ToolCallStart => "tool_call_start",
+        MailEventKind::ToolCallEnd => "tool_call_end",
+        MailEventKind::MessageSent => "message_sent",
+        MailEventKind::MessageReceived => "message_received",
+        MailEventKind::ReservationGranted => "reservation_granted",
+        MailEventKind::ReservationReleased => "reservation_released",
+        MailEventKind::AgentRegistered => "agent_registered",
+        MailEventKind::HttpRequest => "http_request",
+        MailEventKind::HealthPulse => "health_pulse",
+        MailEventKind::ServerStarted => "server_started",
+        MailEventKind::ServerShutdown => "server_shutdown",
+    }
+}
+
+fn parse_event_kind_token(token: &str) -> Option<MailEventKind> {
+    match token {
+        "tool_call_start" => Some(MailEventKind::ToolCallStart),
+        "tool_call_end" => Some(MailEventKind::ToolCallEnd),
+        "message_sent" => Some(MailEventKind::MessageSent),
+        "message_received" => Some(MailEventKind::MessageReceived),
+        "reservation_granted" => Some(MailEventKind::ReservationGranted),
+        "reservation_released" => Some(MailEventKind::ReservationReleased),
+        "agent_registered" => Some(MailEventKind::AgentRegistered),
+        "http_request" => Some(MailEventKind::HttpRequest),
+        "health_pulse" => Some(MailEventKind::HealthPulse),
+        "server_started" => Some(MailEventKind::ServerStarted),
+        "server_shutdown" => Some(MailEventKind::ServerShutdown),
+        _ => None,
+    }
+}
+
+const fn event_source_token(source: EventSource) -> &'static str {
+    match source {
+        EventSource::Tooling => "tooling",
+        EventSource::Http => "http",
+        EventSource::Mail => "mail",
+        EventSource::Reservations => "reservations",
+        EventSource::Lifecycle => "lifecycle",
+        EventSource::Database => "database",
+        EventSource::Unknown => "unknown",
+    }
+}
+
+fn parse_event_source_token(token: &str) -> Option<EventSource> {
+    match token {
+        "tooling" => Some(EventSource::Tooling),
+        "http" => Some(EventSource::Http),
+        "mail" => Some(EventSource::Mail),
+        "reservations" => Some(EventSource::Reservations),
+        "lifecycle" => Some(EventSource::Lifecycle),
+        "database" => Some(EventSource::Database),
+        "unknown" => Some(EventSource::Unknown),
+        _ => None,
+    }
+}
+
+const fn verbosity_token(verbosity: VerbosityTier) -> &'static str {
+    match verbosity {
+        VerbosityTier::Minimal => "minimal",
+        VerbosityTier::Standard => "standard",
+        VerbosityTier::Verbose => "verbose",
+        VerbosityTier::All => "all",
+    }
+}
+
+fn parse_verbosity_token(token: &str) -> Option<VerbosityTier> {
+    match token {
+        "minimal" => Some(VerbosityTier::Minimal),
+        "standard" => Some(VerbosityTier::Standard),
+        "verbose" => Some(VerbosityTier::Verbose),
+        "all" => Some(VerbosityTier::All),
+        _ => None,
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
@@ -1263,6 +1655,109 @@ const fn source_badge(src: EventSource) -> &'static str {
         EventSource::Database => " DB ",
         EventSource::Unknown => " ?? ",
     }
+}
+
+fn centered_overlay_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
+    let width = area
+        .width
+        .saturating_mul(width_percent)
+        .saturating_div(100)
+        .clamp(34, area.width.saturating_sub(2));
+    let height = height.clamp(6, area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn render_save_preset_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    name: &str,
+    description: &str,
+    active_field: SavePresetField,
+) {
+    if area.width < 36 || area.height < 8 {
+        return;
+    }
+    let overlay = centered_overlay_rect(area, 64, 9);
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Save Timeline Preset")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().bg(tp.bg_overlay));
+    let inner = block.inner(overlay);
+    block.render(overlay, frame);
+    if inner.height == 0 {
+        return;
+    }
+    let name_marker = if active_field == SavePresetField::Name {
+        ">"
+    } else {
+        " "
+    };
+    let desc_marker = if active_field == SavePresetField::Description {
+        ">"
+    } else {
+        " "
+    };
+    let description = if description.is_empty() {
+        "<optional>".to_string()
+    } else {
+        description.to_string()
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            "Enter to save · Tab to switch field · Esc to cancel",
+            crate::tui_theme::text_meta(&tp),
+        )),
+        Line::from(Span::raw(format!("{name_marker} Name: {name}"))),
+        Line::from(Span::raw(format!(
+            "{desc_marker} Description: {description}"
+        ))),
+    ];
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+fn render_load_preset_dialog(frame: &mut Frame<'_>, area: Rect, names: &[String], cursor: usize) {
+    if area.width < 36 || area.height < 8 {
+        return;
+    }
+    let overlay = centered_overlay_rect(area, 64, 12);
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Load Timeline Preset")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().bg(tp.bg_overlay));
+    let inner = block.inner(overlay);
+    block.render(overlay, frame);
+    if inner.height == 0 {
+        return;
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "Enter apply · Del delete · j/k move · Esc cancel",
+        crate::tui_theme::text_meta(&tp),
+    ))];
+    if names.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No saved presets for Timeline.",
+            crate::tui_theme::text_warning(&tp),
+        )));
+    } else {
+        let visible_rows = usize::from(inner.height.saturating_sub(2)).max(1);
+        let start = cursor.saturating_sub(visible_rows.saturating_sub(1));
+        let end = (start + visible_rows).min(names.len());
+        for (idx, name) in names.iter().enumerate().take(end).skip(start) {
+            let marker = if idx == cursor {
+                crate::tui_theme::SELECTION_PREFIX
+            } else {
+                crate::tui_theme::SELECTION_PREFIX_EMPTY
+            };
+            lines.push(Line::from(Span::raw(format!("{marker}{name}"))));
+        }
+    }
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
 }
 
 /// Render the timeline pane into the given area using `VirtualizedList`.
@@ -3452,5 +3947,92 @@ mod tests {
         assert!(!pane.follow());
         assert_eq!(pane.cursor(), 0);
         assert_eq!(pane.total_ingested, 0);
+    }
+
+    #[test]
+    fn preset_tokens_round_trip() {
+        assert_eq!(
+            parse_event_kind_token(event_kind_token(MailEventKind::MessageSent)),
+            Some(MailEventKind::MessageSent)
+        );
+        assert_eq!(
+            parse_event_source_token(event_source_token(EventSource::Reservations)),
+            Some(EventSource::Reservations)
+        );
+        assert_eq!(
+            parse_verbosity_token(verbosity_token(VerbosityTier::Verbose)),
+            Some(VerbosityTier::Verbose)
+        );
+    }
+
+    #[test]
+    fn timeline_presets_save_load_delete_lifecycle() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("screen_filter_presets.json");
+        let mut screen = TimelineScreen::with_filter_presets_path_for_test(path.clone());
+
+        screen.pane.verbosity = VerbosityTier::Minimal;
+        screen.pane.kind_filter.insert(MailEventKind::HttpRequest);
+        screen.pane.source_filter.insert(EventSource::Http);
+        assert!(screen.save_named_preset(
+            "Errors".to_string(),
+            Some("Only error-ish traffic".to_string())
+        ));
+
+        assert!(path.exists());
+        let loaded = crate::tui_persist::load_screen_filter_presets(&path).expect("load presets");
+        assert_eq!(
+            loaded.list_names(TIMELINE_PRESET_SCREEN_ID),
+            vec!["Errors".to_string()]
+        );
+
+        screen.pane.clear_filters();
+        assert_eq!(screen.pane.verbosity, VerbosityTier::Standard);
+        assert!(screen.pane.kind_filter.is_empty());
+        assert!(screen.pane.source_filter.is_empty());
+
+        assert!(screen.apply_named_preset("Errors"));
+        assert_eq!(screen.pane.verbosity, VerbosityTier::Minimal);
+        assert!(
+            screen
+                .pane
+                .kind_filter
+                .contains(&MailEventKind::HttpRequest)
+        );
+        assert!(screen.pane.source_filter.contains(&EventSource::Http));
+
+        assert!(screen.remove_named_preset("Errors"));
+        assert!(screen.preset_names().is_empty());
+    }
+
+    #[test]
+    fn ctrl_shortcuts_drive_save_and_load_dialogs() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("screen_filter_presets.json");
+        let mut screen = TimelineScreen::with_filter_presets_path_for_test(path);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let ctrl_s =
+            Event::Key(ftui::KeyEvent::new(KeyCode::Char('s')).with_modifiers(Modifiers::CTRL));
+        screen.update(&ctrl_s, &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::Save);
+
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        screen.update(&enter, &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
+        assert!(!screen.preset_names().is_empty());
+
+        let ctrl_l =
+            Event::Key(ftui::KeyEvent::new(KeyCode::Char('l')).with_modifiers(Modifiers::CTRL));
+        screen.update(&ctrl_l, &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::Load);
+
+        let delete = Event::Key(ftui::KeyEvent::new(KeyCode::Delete));
+        screen.update(&delete, &state);
+        assert!(screen.preset_names().is_empty());
+
+        let escape = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        screen.update(&escape, &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
     }
 }

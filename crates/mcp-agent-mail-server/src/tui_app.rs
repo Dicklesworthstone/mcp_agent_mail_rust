@@ -7996,30 +7996,33 @@ mod tests {
 
     #[test]
     fn toast_entrance_slide_progresses_over_four_ticks() {
-        assert_eq!(entrance_slide_columns(0), 8);
-        assert_eq!(entrance_slide_columns(1), 6);
-        assert_eq!(entrance_slide_columns(2), 4);
-        assert_eq!(entrance_slide_columns(3), 2);
-        assert_eq!(entrance_slide_columns(4), 0);
-        assert_eq!(entrance_slide_columns(9), 0);
+        // TOAST_ENTRANCE_TICKS=20, formula: (20 - age) * 2
+        assert_eq!(entrance_slide_columns(0), 40);
+        assert_eq!(entrance_slide_columns(1), 38);
+        assert_eq!(entrance_slide_columns(2), 36);
+        assert_eq!(entrance_slide_columns(3), 34);
+        assert_eq!(entrance_slide_columns(4), 32);
+        assert_eq!(entrance_slide_columns(9), 22);
     }
 
     #[test]
     fn toast_exit_fade_levels_progress_over_three_ticks() {
+        // TOAST_EXIT_TICKS=15, formula: 15 - remaining + 1 (if 1..=15)
         assert_eq!(exit_fade_level(None), 0);
-        assert_eq!(exit_fade_level(Some(9)), 0);
-        assert_eq!(exit_fade_level(Some(3)), 1);
-        assert_eq!(exit_fade_level(Some(2)), 2);
-        assert_eq!(exit_fade_level(Some(1)), 3);
+        assert_eq!(exit_fade_level(Some(9)), 7);   // 15-9+1
+        assert_eq!(exit_fade_level(Some(3)), 13);  // 15-3+1
+        assert_eq!(exit_fade_level(Some(2)), 14);  // 15-2+1
+        assert_eq!(exit_fade_level(Some(1)), 15);  // 15-1+1
         assert_eq!(exit_fade_level(Some(0)), 0);
     }
 
     #[test]
     fn toast_remaining_ticks_rounds_up() {
+        // TICK_INTERVAL=16ms, formula: ceil(ms / 16)
         assert_eq!(remaining_ticks_from_duration(Duration::from_millis(1)), 1);
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 1);
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 1);
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 2);
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 7);   // ceil(99/16)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 7);  // ceil(100/16)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 7);  // ceil(101/16)
     }
 
     #[test]
