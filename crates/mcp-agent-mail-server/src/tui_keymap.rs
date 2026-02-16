@@ -11,7 +11,7 @@ use ftui::KeyCode;
 use serde::{Deserialize, Serialize};
 
 use crate::tui_screens::{
-    ALL_SCREEN_IDS, ScreenCategory, jump_key_label_for_screen, jump_key_legend, screen_meta,
+    jump_key_label_for_screen, jump_key_legend, screen_meta, ScreenCategory, ALL_SCREEN_IDS,
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -102,6 +102,11 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
         text_suppressible: false,
     },
     GlobalBinding {
+        label: "F12",
+        action: "Toggle inspector (debug mode)",
+        text_suppressible: false,
+    },
+    GlobalBinding {
         label: "Esc",
         action: "Dismiss overlay / Quit (press twice)",
         text_suppressible: false,
@@ -128,6 +133,7 @@ pub fn label_to_keycodes(label: &str) -> Vec<KeyCode> {
         "PageDown" => vec![KeyCode::PageDown],
         "Home" => vec![KeyCode::Home],
         "End" => vec![KeyCode::End],
+        "F12" => vec![KeyCode::F(12)],
         // Ranges
         "1-9" => (1..=9)
             .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap()))
@@ -306,6 +312,12 @@ fn vim_profile_bindings() -> Vec<ProfileBinding> {
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
         pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
         pb(
+            "toggle_inspector",
+            "F12",
+            "Toggle inspector (debug mode)",
+            false,
+        ),
+        pb(
             "dismiss",
             "Esc",
             "Dismiss overlay / Quit (press twice)",
@@ -333,6 +345,12 @@ fn emacs_profile_bindings() -> Vec<ProfileBinding> {
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
         pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
         pb(
+            "toggle_inspector",
+            "F12",
+            "Toggle inspector (debug mode)",
+            false,
+        ),
+        pb(
             "dismiss",
             "Esc",
             "Dismiss overlay / Quit (press twice)",
@@ -353,6 +371,12 @@ fn minimal_profile_bindings() -> Vec<ProfileBinding> {
         pb("toggle_help", "?", "Toggle help", true),
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
         pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
+        pb(
+            "toggle_inspector",
+            "F12",
+            "Toggle inspector (debug mode)",
+            false,
+        ),
         pb(
             "dismiss",
             "Esc",
@@ -391,6 +415,7 @@ fn action_id_for_label(label: &str) -> &'static str {
         "q" => "quit",
         "Ctrl+C" => "quit_ctrl",
         "Ctrl+D" => "detach_tui",
+        "F12" => "toggle_inspector",
         "Esc" => "dismiss",
         _ => "unknown",
     }
@@ -715,10 +740,10 @@ impl HelpSection {
 mod tests {
     use super::*;
     use crate::tui_screens::{
-        ALL_SCREEN_IDS, MailScreen, agents::AgentsScreen, dashboard::DashboardScreen,
-        messages::MessageBrowserScreen, reservations::ReservationsScreen,
-        system_health::SystemHealthScreen, threads::ThreadExplorerScreen, timeline::TimelineScreen,
-        tool_metrics::ToolMetricsScreen,
+        agents::AgentsScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen,
+        reservations::ReservationsScreen, system_health::SystemHealthScreen,
+        threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+        MailScreen, ALL_SCREEN_IDS,
     };
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -747,6 +772,7 @@ mod tests {
         assert_eq!(label_to_keycodes("Tab"), vec![KeyCode::Tab]);
         assert_eq!(label_to_keycodes("Esc"), vec![KeyCode::Escape]);
         assert_eq!(label_to_keycodes("Enter"), vec![KeyCode::Enter]);
+        assert_eq!(label_to_keycodes("F12"), vec![KeyCode::F(12)]);
     }
 
     #[test]
@@ -905,7 +931,7 @@ mod tests {
     fn text_suppressible_flag_correctness() {
         for binding in GLOBAL_BINDINGS {
             match binding.label {
-                "Tab" | "Shift+Tab" | "Esc" | "Ctrl+P" => {
+                "Tab" | "Shift+Tab" | "Esc" | "Ctrl+P" | "F12" => {
                     assert!(
                         !binding.text_suppressible,
                         "{} should NOT be text-suppressible",
