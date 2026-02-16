@@ -12,32 +12,32 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    DocKind, PlanMethod, PlanParam, SearchCursor, SearchQuery, SearchResponse, SearchResult,
-    plan_search,
+    plan_search, DocKind, PlanMethod, PlanParam, SearchCursor, SearchQuery, SearchResponse,
+    SearchResult,
 };
 use crate::search_scope::{
-    RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
+    apply_scope, RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult,
 };
 use crate::tracking::record_query;
 use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
-use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
+use mcp_agent_mail_core::{append_evidence_entry_if_configured, EvidenceLedgerEntry};
 
 use asupersync::{Cx, Outcome};
 #[cfg(feature = "hybrid")]
 use half::f16;
-use mcp_agent_mail_search_core::{
-    CandidateBudget, CandidateBudgetConfig, CandidateBudgetDecision, CandidateBudgetDerivation,
-    CandidateHit, CandidateMode, CandidateStageCounts, QueryAssistance, QueryClass,
-    parse_query_assistance, prepare_candidates,
-};
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
-    DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
-    EmbeddingRequest, EmbeddingResult, FsScoredResult, HashEmbedder, JobMetricsSnapshot, ModelInfo,
-    ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult,
-    SearchPhase, TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter,
-    VectorIndex, VectorIndexConfig, fs, get_two_tier_context,
+    fs, get_two_tier_context, DocKind as SearchDocKind, Embedder, EmbeddingJobConfig,
+    EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest, EmbeddingResult, FsScoredResult,
+    HashEmbedder, JobMetricsSnapshot, ModelInfo, ModelRegistry, ModelTier, QueueStats,
+    RefreshWorkerConfig, RegistryConfig, ScoredResult, SearchPhase, TwoTierAvailability,
+    TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex, VectorIndexConfig,
+};
+use mcp_agent_mail_search_core::{
+    parse_query_assistance, prepare_candidates, CandidateBudget, CandidateBudgetConfig,
+    CandidateBudgetDecision, CandidateBudgetDerivation, CandidateHit, CandidateMode,
+    CandidateStageCounts, QueryAssistance, QueryClass,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
@@ -525,6 +525,36 @@ where
 }
 
 #[cfg(feature = "hybrid")]
+fn select_fast_first_two_tier_results<I>(phases: I) -> Option<Vec<ScoredResult>>
+where
+    I: IntoIterator<Item = SearchPhase>,
+{
+    for phase in phases {
+        match phase {
+            SearchPhase::Initial { results, .. } => {
+                if !results.is_empty() {
+                    return Some(results);
+                }
+            }
+            SearchPhase::Refined { results, .. } => {
+                if !results.is_empty() {
+                    return Some(results);
+                }
+            }
+            SearchPhase::RefinementFailed { error } => {
+                tracing::debug!(
+                    target: "search.semantic",
+                    error = %error,
+                    "two-tier refinement failed during fast-first selection"
+                );
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "hybrid")]
 const fn convert_planner_doc_kind(kind: DocKind) -> SearchDocKind {
     match kind {
         DocKind::Message => SearchDocKind::Message,
@@ -710,6 +740,44 @@ impl TwoTierBridge {
     /// This returns the best available phase: refined results when quality
     /// refinement succeeds, otherwise the initial fast phase.
     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
+        self.search_with_policy(query, limit, false)
+    }
+
+    /// Budget-aware two-tier search that can prefer fast-first selection.
+    ///
+    /// When remaining request budget is tight, this path keeps latency bounded by
+    /// selecting the earliest non-empty phase instead of waiting for refinement.
+    pub fn search_with_cx(&self, cx: &Cx, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
+        if cx.checkpoint().is_err() {
+            tracing::debug!(
+                target: "search.semantic",
+                "two-tier search cancelled before dispatch"
+            );
+            return Vec::new();
+        }
+
+        let remaining_ms = cx.budget().remaining_cost().unwrap_or(u64::MAX);
+        let fast_first_budget_ms = two_tier_fast_first_budget_ms();
+        let prefer_fast_first = remaining_ms <= fast_first_budget_ms;
+
+        let results = self.search_with_policy(query, limit, prefer_fast_first);
+        if cx.checkpoint().is_err() {
+            tracing::debug!(
+                target: "search.semantic",
+                "two-tier search cancelled after dispatch"
+            );
+            return Vec::new();
+        }
+
+        results
+    }
+
+    fn search_with_policy(
+        &self,
+        query: &SearchQuery,
+        limit: usize,
+        prefer_fast_first: bool,
+    ) -> Vec<SearchResult> {
         let ctx = get_two_tier_context();
 
         // Two-tier bridge requires fast embeddings for both query and indexed docs.
@@ -721,18 +789,22 @@ impl TwoTierBridge {
             return Vec::new();
         }
 
-        let (best_results, had_searcher) = {
+        let (selected_results, had_searcher) = {
             let index = self.index();
             ctx.create_searcher(&index)
                 .map_or((None, false), |searcher| {
                     (
-                        select_best_two_tier_results(searcher.search(&query.text, limit)),
+                        if prefer_fast_first {
+                            select_fast_first_two_tier_results(searcher.search(&query.text, limit))
+                        } else {
+                            select_best_two_tier_results(searcher.search(&query.text, limit))
+                        },
                         true,
                     )
                 })
         };
 
-        if let Some(results) = best_results {
+        if let Some(results) = selected_results {
             return scored_results_to_search_results(results);
         }
 
@@ -907,12 +979,16 @@ fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchRe
 
 #[cfg(feature = "hybrid")]
 fn try_two_tier_search_with_cx(
-    _cx: &Cx,
+    cx: &Cx,
     query: &SearchQuery,
     limit: usize,
 ) -> Option<Vec<SearchResult>> {
-    // Cx-capable variant currently shares the same two-tier dispatch path.
-    try_two_tier_search(query, limit)
+    let bridge = get_or_init_two_tier_bridge()?;
+    if bridge.is_available() {
+        Some(bridge.search_with_cx(cx, query, limit))
+    } else {
+        None
+    }
 }
 
 #[cfg(feature = "hybrid")]
@@ -931,6 +1007,10 @@ const AM_SEARCH_RERANK_MODEL_DIR_ENV: &str = "AM_SEARCH_RERANK_MODEL_DIR";
 const FRANKENSEARCH_MODEL_DIR_ENV: &str = "FRANKENSEARCH_MODEL_DIR";
 #[cfg(feature = "hybrid")]
 const DEFAULT_RERANK_MODEL_NAME: &str = "flashrank";
+#[cfg(feature = "hybrid")]
+const AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS_ENV: &str = "AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS";
+#[cfg(feature = "hybrid")]
+const DEFAULT_TWO_TIER_FAST_FIRST_BUDGET_MS: u64 = 150;
 
 #[cfg(feature = "hybrid")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1028,6 +1108,15 @@ fn env_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
 }
 
 #[cfg(feature = "hybrid")]
+fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+#[cfg(feature = "hybrid")]
 fn hybrid_rerank_config_from_env() -> HybridRerankConfig {
     let default = HybridRerankConfig::default();
     let blend_policy = std::env::var(AM_SEARCH_RERANK_BLEND_POLICY_ENV)
@@ -1053,6 +1142,16 @@ fn hybrid_rerank_config_from_env() -> HybridRerankConfig {
             1.0,
         ),
     }
+}
+
+#[cfg(feature = "hybrid")]
+fn two_tier_fast_first_budget_ms() -> u64 {
+    env_u64(
+        AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS_ENV,
+        DEFAULT_TWO_TIER_FAST_FIRST_BUDGET_MS,
+        1,
+        30_000,
+    )
 }
 
 #[cfg(feature = "hybrid")]
@@ -2238,24 +2337,18 @@ mod tests {
         let explain = build_v3_query_explain(&query, SearchEngine::Hybrid, Some(&rerank_audit));
         assert_eq!(explain.method, "hybrid_v3");
         assert_eq!(explain.facet_count, explain.facets_applied.len());
-        assert!(
-            explain
-                .facets_applied
-                .iter()
-                .any(|facet| facet == "engine:hybrid")
-        );
-        assert!(
-            explain
-                .facets_applied
-                .iter()
-                .any(|facet| facet == "rerank_outcome:applied")
-        );
-        assert!(
-            explain
-                .facets_applied
-                .iter()
-                .any(|facet| facet == "rerank_applied_count:9")
-        );
+        assert!(explain
+            .facets_applied
+            .iter()
+            .any(|facet| facet == "engine:hybrid"));
+        assert!(explain
+            .facets_applied
+            .iter()
+            .any(|facet| facet == "rerank_outcome:applied"));
+        assert!(explain
+            .facets_applied
+            .iter()
+            .any(|facet| facet == "rerank_applied_count:9"));
     }
 
     #[test]
@@ -2434,6 +2527,53 @@ mod tests {
     fn select_best_two_tier_results_none_for_empty_iterator() {
         let phases: Vec<SearchPhase> = Vec::new();
         assert!(select_best_two_tier_results(phases).is_none());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn select_fast_first_two_tier_results_prefers_initial_phase() {
+        let phases = vec![
+            SearchPhase::Initial {
+                results: vec![make_scored(11, 0.7)],
+                latency_ms: 4,
+            },
+            SearchPhase::Refined {
+                results: vec![make_scored(99, 0.99)],
+                latency_ms: 18,
+            },
+        ];
+
+        let selected = select_fast_first_two_tier_results(phases)
+            .expect("fast-first selection should return initial phase");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].doc_id, 11);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn select_fast_first_two_tier_results_falls_back_to_refined_when_initial_empty() {
+        let phases = vec![
+            SearchPhase::Initial {
+                results: Vec::new(),
+                latency_ms: 3,
+            },
+            SearchPhase::Refined {
+                results: vec![make_scored(7, 0.91)],
+                latency_ms: 14,
+            },
+        ];
+
+        let selected = select_fast_first_two_tier_results(phases)
+            .expect("fast-first selection should use refined phase when initial is empty");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].doc_id, 7);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn select_fast_first_two_tier_results_none_for_empty_iterator() {
+        let phases: Vec<SearchPhase> = Vec::new();
+        assert!(select_fast_first_two_tier_results(phases).is_none());
     }
 
     #[cfg(feature = "hybrid")]

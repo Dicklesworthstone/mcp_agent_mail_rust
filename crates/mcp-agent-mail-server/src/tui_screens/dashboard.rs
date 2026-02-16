@@ -7,13 +7,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ftui::Style;
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::Widget;
+use ftui::Style;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_extras::canvas::{Canvas, Mode, Painter};
 use ftui_extras::charts::{LineChart, Series};
@@ -23,8 +23,8 @@ use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{
-    AgentSummary, ContactSummary, DbStatSnapshot, EventLogEntry, EventSeverity, MailEvent,
-    MailEventKind, ProjectSummary, ReservationSnapshot, VerbosityTier, format_event_timestamp,
+    format_event_timestamp, AgentSummary, ContactSummary, DbStatSnapshot, EventLogEntry,
+    EventSeverity, MailEvent, MailEventKind, ProjectSummary, ReservationSnapshot, VerbosityTier,
 };
 use crate::tui_layout::{
     DensityHint, PanelConstraint, PanelPolicy, PanelSlot, ReactiveLayout, SplitAxis, TerminalClass,
@@ -424,6 +424,42 @@ impl DashboardScreen {
             self.last_db_messages = snapshot.messages;
             self.last_db_reservations = snapshot.file_reservations;
             self.last_db_snapshot_micros = snapshot.timestamp_micros;
+            if self.event_log.is_empty() {
+                if snapshot.messages > 0 {
+                    let summary = format!("DB baseline: {} total messages", snapshot.messages);
+                    let synthetic = MailEvent::message_received(
+                        i64::try_from(snapshot.messages).unwrap_or(i64::MAX),
+                        "db-poller",
+                        Vec::new(),
+                        &summary,
+                        "db-snapshot",
+                        "all-projects",
+                    );
+                    if let Some(preview) = RecentMessagePreview::from_event(&synthetic) {
+                        self.recent_message_preview = Some(preview);
+                    }
+                    self.event_log.push(format_event(&synthetic));
+                }
+                if snapshot.file_reservations > 0 {
+                    let path = if snapshot.file_reservations == 1 {
+                        "1 active reservation currently held".to_string()
+                    } else {
+                        format!(
+                            "{} active reservations currently held",
+                            snapshot.file_reservations
+                        )
+                    };
+                    let synthetic = MailEvent::reservation_granted(
+                        "db-poller",
+                        vec![path],
+                        false,
+                        0,
+                        "all-projects",
+                    );
+                    self.event_log.push(format_event(&synthetic));
+                }
+                self.trim_event_log();
+            }
             return;
         }
 
@@ -4113,11 +4149,9 @@ mod tests {
             shimmer.iter().filter(|p| p.is_some()).count(),
             SHIMMER_MAX_ROWS
         );
-        assert!(
-            dashboard_shimmer_progresses(&refs, false)
-                .iter()
-                .all(Option::is_none)
-        );
+        assert!(dashboard_shimmer_progresses(&refs, false)
+            .iter()
+            .all(Option::is_none));
     }
 
     #[test]
@@ -4223,7 +4257,7 @@ mod tests {
         // "café" — 'é' is 2 bytes (0xC3 0xA9); byte offsets: c=0, a=1, f=2, é=3..4
         assert_eq!(truncate("café", 4), "caf"); // byte 4 is mid-'é', backs up to 3
         assert_eq!(truncate("café", 5), "café"); // all 5 bytes fit
-        // Emoji: '🎉' is 4 bytes; "hi🎉bye" = h(0) i(1) 🎉(2..5) b(6) y(7) e(8)
+                                                 // Emoji: '🎉' is 4 bytes; "hi🎉bye" = h(0) i(1) 🎉(2..5) b(6) y(7) e(8)
         assert_eq!(truncate("hi🎉bye", 3), "hi"); // byte 3 mid-emoji, backs up to 2
         assert_eq!(truncate("hi🎉bye", 6), "hi🎉"); // byte 6 = start of 'b'
     }
@@ -4620,8 +4654,11 @@ mod tests {
         });
         screen.tick(1, &state);
         assert!(
-            screen.event_log.is_empty(),
-            "first snapshot should seed baseline"
+            screen.event_log.iter().any(|entry| {
+                entry.kind == MailEventKind::MessageReceived
+                    && entry.summary.contains("DB baseline: 10 total messages")
+            }),
+            "first snapshot should seed baseline message context"
         );
 
         state.update_db_stats(DbStatSnapshot {
@@ -4632,12 +4669,13 @@ mod tests {
         });
         screen.tick(2, &state);
 
-        let entry = screen
-            .event_log
-            .iter()
-            .find(|entry| entry.kind == MailEventKind::MessageReceived)
-            .expect("expected synthetic MessageReceived entry");
-        assert!(entry.summary.contains("DB observed 2 new messages"));
+        assert!(
+            screen.event_log.iter().any(|entry| {
+                entry.kind == MailEventKind::MessageReceived
+                    && entry.summary.contains("DB observed 2 new messages")
+            }),
+            "expected synthetic message-delta entry"
+        );
     }
 
     #[test]
@@ -4662,12 +4700,13 @@ mod tests {
         });
         screen.tick(2, &state);
 
-        let granted = screen
-            .event_log
-            .iter()
-            .find(|entry| entry.kind == MailEventKind::ReservationGranted)
-            .expect("expected synthetic ReservationGranted entry");
-        assert!(granted.summary.contains("active reservations added"));
+        assert!(
+            screen.event_log.iter().any(|entry| {
+                entry.kind == MailEventKind::ReservationGranted
+                    && entry.summary.contains("active reservations added")
+            }),
+            "expected synthetic ReservationGranted delta entry"
+        );
 
         state.update_db_stats(DbStatSnapshot {
             messages: 5,
@@ -4677,12 +4716,46 @@ mod tests {
         });
         screen.tick(3, &state);
 
-        let released = screen
+        assert!(
+            screen.event_log.iter().any(|entry| {
+                entry.kind == MailEventKind::ReservationReleased
+                    && entry.summary.contains("active reservations removed")
+            }),
+            "expected synthetic ReservationReleased delta entry"
+        );
+    }
+
+    #[test]
+    fn dashboard_seeds_baseline_events_when_log_is_empty() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 7,
+            file_reservations: 3,
+            timestamp_micros: 10,
+            ..Default::default()
+        });
+        screen.tick(1, &state);
+
+        let baseline_message = screen
             .event_log
             .iter()
-            .find(|entry| entry.kind == MailEventKind::ReservationReleased)
-            .expect("expected synthetic ReservationReleased entry");
-        assert!(released.summary.contains("active reservations removed"));
+            .find(|entry| entry.kind == MailEventKind::MessageReceived)
+            .expect("expected synthetic baseline message entry");
+        assert!(baseline_message
+            .summary
+            .contains("DB baseline: 7 total messages"));
+
+        let baseline_reservations = screen
+            .event_log
+            .iter()
+            .find(|entry| entry.kind == MailEventKind::ReservationGranted)
+            .expect("expected synthetic baseline reservation entry");
+        assert!(baseline_reservations
+            .summary
+            .contains("active reservations currently held"));
     }
 
     #[test]
@@ -5221,16 +5294,12 @@ mod tests {
 
         // tools -> reservations
         screen.update(&t, &state);
-        assert!(
-            screen
-                .type_filter
-                .contains(&MailEventKind::ReservationGranted)
-        );
-        assert!(
-            screen
-                .type_filter
-                .contains(&MailEventKind::ReservationReleased)
-        );
+        assert!(screen
+            .type_filter
+            .contains(&MailEventKind::ReservationGranted));
+        assert!(screen
+            .type_filter
+            .contains(&MailEventKind::ReservationReleased));
 
         // reservations -> all
         screen.update(&t, &state);
@@ -5255,16 +5324,12 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('4'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::Reservations);
-        assert!(
-            screen
-                .type_filter
-                .contains(&MailEventKind::ReservationGranted)
-        );
-        assert!(
-            screen
-                .type_filter
-                .contains(&MailEventKind::ReservationReleased)
-        );
+        assert!(screen
+            .type_filter
+            .contains(&MailEventKind::ReservationGranted));
+        assert!(screen
+            .type_filter
+            .contains(&MailEventKind::ReservationReleased));
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('1'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::All);
