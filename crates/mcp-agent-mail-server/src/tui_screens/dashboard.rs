@@ -5059,11 +5059,10 @@ mod tests {
 
     #[test]
     fn render_sparkline_all_zeros() {
-        // ftui_widgets::Sparkline renders constant values as middle-height bars (▄)
-        // since there's no variation to show relative height differences.
+        // With .min(0.0), all-zero values are at the minimum so render as spaces.
         let data = vec![0.0, 0.0, 0.0];
         let spark = render_sparkline(&data, 3);
-        assert_eq!(spark, "▄▄▄");
+        assert_eq!(spark, "   ");
     }
 
     #[test]
