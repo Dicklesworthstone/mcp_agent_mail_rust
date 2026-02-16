@@ -584,6 +584,85 @@ pub fn messages_batch_actions(selected_count: usize) -> Vec<ActionEntry> {
     ]
 }
 
+/// Build batch actions for the Reservations screen when multiple rows are selected.
+#[must_use]
+pub fn reservations_batch_actions(
+    selected_count: usize,
+    reservation_ids: &[i64],
+) -> Vec<ActionEntry> {
+    let count = selected_count.max(1);
+    let mut ids: Vec<i64> = reservation_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let ids_csv = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let missing = count.saturating_sub(ids.len());
+    let missing_reason = if missing > 0 {
+        Some(format!(
+            "{missing} selected reservation(s) missing DB id; wait for snapshot refresh",
+        ))
+    } else {
+        None
+    };
+
+    let renew = if missing_reason.is_none() && !ids_csv.is_empty() {
+        ActionEntry::new(
+            format!("Renew selected ({count})"),
+            ActionKind::ConfirmThenExecute {
+                title: "Renew Reservations".into(),
+                message: format!("Renew TTL for {count} selected reservations?"),
+                operation: format!("renew:{ids_csv}"),
+            },
+        )
+        .with_keybinding("n")
+        .with_description("Extend TTL for all selected reservations")
+    } else {
+        ActionEntry::new(
+            format!("Renew selected ({count})"),
+            ActionKind::Execute("renew:pending".to_string()),
+        )
+        .with_keybinding("n")
+        .with_description("Extend TTL for all selected reservations")
+        .disabled(
+            missing_reason
+                .as_deref()
+                .unwrap_or("No selected reservation IDs available"),
+        )
+    };
+
+    let release = if missing_reason.is_none() && !ids_csv.is_empty() {
+        ActionEntry::new(
+            format!("Release selected ({count})"),
+            ActionKind::ConfirmThenExecute {
+                title: "Release Reservations".into(),
+                message: format!("Release {count} selected reservations?"),
+                operation: format!("release:{ids_csv}"),
+            },
+        )
+        .with_keybinding("r")
+        .with_description("Release all selected reservations")
+        .destructive()
+    } else {
+        ActionEntry::new(
+            format!("Release selected ({count})"),
+            ActionKind::Execute("release:pending".to_string()),
+        )
+        .with_keybinding("r")
+        .with_description("Release all selected reservations")
+        .destructive()
+        .disabled(
+            missing_reason
+                .as_deref()
+                .unwrap_or("No selected reservation IDs available"),
+        )
+    };
+
+    vec![renew, release]
+}
+
 /// Build actions for the Reservations screen.
 #[must_use]
 pub fn reservations_actions(
@@ -739,6 +818,32 @@ pub fn timeline_actions(event_kind: &str, event_source: &str) -> Vec<ActionEntry
         ActionEntry::new("Copy event", ActionKind::Execute("copy_event".into()))
             .with_keybinding("c")
             .with_description("Copy event text"),
+    ]
+}
+
+/// Build batch actions for the Timeline screen when multiple rows are selected.
+#[must_use]
+pub fn timeline_batch_actions(selected_count: usize, copy_payload: String) -> Vec<ActionEntry> {
+    let count = selected_count.max(1);
+    if copy_payload.trim().is_empty() {
+        return vec![
+            ActionEntry::new(
+                format!("Copy selected ({count})"),
+                ActionKind::CopyToClipboard(String::new()),
+            )
+            .with_keybinding("y")
+            .with_description("Copy selected timeline entries")
+            .disabled("No selected timeline rows available to copy"),
+        ];
+    }
+
+    vec![
+        ActionEntry::new(
+            format!("Copy selected ({count})"),
+            ActionKind::CopyToClipboard(copy_payload),
+        )
+        .with_keybinding("y")
+        .with_description("Copy selected timeline entries"),
     ]
 }
 
@@ -1175,6 +1280,40 @@ mod tests {
         assert!(ops.iter().any(|op| op == "batch_acknowledge"));
         assert!(ops.iter().any(|op| op == "batch_mark_read"));
         assert!(ops.iter().any(|op| op == "batch_mark_unread"));
+    }
+
+    #[test]
+    fn reservations_batch_actions_encode_id_list_and_confirm() {
+        let actions = reservations_batch_actions(2, &[22, 11]);
+        assert_eq!(actions.len(), 2);
+
+        let release = actions
+            .iter()
+            .find(|entry| entry.label.starts_with("Release selected"))
+            .expect("release action");
+        match &release.action {
+            ActionKind::ConfirmThenExecute { operation, .. } => {
+                assert_eq!(operation, "release:11,22");
+            }
+            other => panic!("expected ConfirmThenExecute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reservations_batch_actions_disable_when_any_id_missing() {
+        let actions = reservations_batch_actions(3, &[1, 2]);
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|entry| !entry.enabled));
+    }
+
+    #[test]
+    fn timeline_batch_actions_copy_payload_wired() {
+        let actions = timeline_batch_actions(2, "line1\nline2".to_string());
+        assert_eq!(actions.len(), 1);
+        match &actions[0].action {
+            ActionKind::CopyToClipboard(payload) => assert!(payload.contains("line1")),
+            other => panic!("expected CopyToClipboard, got {other:?}"),
+        }
     }
 
     #[test]

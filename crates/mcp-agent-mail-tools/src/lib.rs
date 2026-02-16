@@ -278,6 +278,7 @@ pub mod tool_util {
             std::mem::swap(&mut prev, &mut curr);
             curr.fill(0);
         }
+        #[allow(clippy::cast_precision_loss)]
         let lcs_len = prev[n] as f64;
         let Ok(total_u32) = u32::try_from(total) else {
             return 0.0;

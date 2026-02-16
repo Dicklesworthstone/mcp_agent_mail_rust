@@ -1941,16 +1941,10 @@ pub async fn list_thread_messages(
     if let Ok(root_id) = thread_id.parse::<i64>() {
         sql.push_str("(m.id = ? OR m.thread_id = ?)");
         params.push(Value::BigInt(root_id));
-        // Explicitly push the string param here for the second placeholder
-        params.push(Value::Text(thread_id.to_string()));
     } else {
         sql.push_str("m.thread_id = ?");
-        // Push the string param here for the single placeholder
-        params.push(Value::Text(thread_id.to_string()));
     }
-    // Removed the unconditional push which was confusing (though technically correct for the numeric case, it was weird).
-    // Actually, strictly speaking, the previous code WAS correct but hard to read.
-    // However, I will rewrite it to be explicit for clarity.
+    params.push(Value::Text(thread_id.to_string()));
 
     sql.push_str(" ORDER BY m.created_ts ASC");
 

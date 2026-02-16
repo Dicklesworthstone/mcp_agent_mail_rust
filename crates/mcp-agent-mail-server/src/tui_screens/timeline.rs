@@ -22,6 +22,7 @@ use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 
+use crate::tui_action_menu::{ActionEntry, ActionKind, timeline_actions, timeline_batch_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
 use crate::tui_layout::{DockLayout, DockPreset};
@@ -30,7 +31,9 @@ use crate::tui_persist::{
     console_persist_path_from_env_or_default, load_screen_filter_presets_or_default,
     save_screen_filter_presets, screen_filter_presets_path,
 };
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg};
+use crate::tui_screens::{
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, SelectionState,
+};
 
 // Re-use dashboard formatting helpers.
 use super::dashboard::{EventEntry, format_event};
@@ -283,6 +286,40 @@ impl RenderItem for CombinedTimelineRow {
     fn height(&self) -> u16 {
         1
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TimelineSelectionKey {
+    Event {
+        seq: u64,
+    },
+    Commit {
+        project_slug: String,
+        short_sha: String,
+        timestamp_micros: i64,
+    },
+}
+
+impl TimelineSelectionKey {
+    fn for_event(entry: &TimelineEntry) -> Self {
+        Self::Event { seq: entry.seq }
+    }
+
+    fn for_commit(entry: &CommitTimelineEntry) -> Self {
+        Self::Commit {
+            project_slug: entry.project_slug.clone(),
+            short_sha: entry.short_sha.clone(),
+            timestamp_micros: entry.timestamp_micros,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TimelineActionRow {
+    key: TimelineSelectionKey,
+    copy_text: String,
+    event_kind: String,
+    event_source: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -591,6 +628,8 @@ impl TimelineViewMode {
 /// timeline with cursor-based selection and an inspector detail pane.
 pub struct TimelineScreen {
     pane: TimelinePane,
+    /// Multi-selection state across visible timeline rows.
+    selected_timeline_keys: SelectionState<TimelineSelectionKey>,
     /// State for virtualized list rendering (`RefCell` for interior mutability in `view()`).
     list_state: RefCell<VirtualizedListState>,
     /// Dock layout controlling inspector panel position and size.
@@ -635,6 +674,7 @@ impl TimelineScreen {
         let filter_presets = load_screen_filter_presets_or_default(&filter_presets_path);
         Self {
             pane: TimelinePane::new(),
+            selected_timeline_keys: SelectionState::new(),
             list_state: RefCell::new(VirtualizedListState::new().with_persistence_id("timeline")),
             dock,
             dock_drag: DockDragState::Idle,
@@ -723,6 +763,99 @@ impl TimelineScreen {
             .pane
             .cursor
             .min(self.active_row_count().saturating_sub(1));
+    }
+
+    fn visible_action_rows(&self) -> Vec<TimelineActionRow> {
+        match self.view_mode {
+            TimelineViewMode::Events | TimelineViewMode::LogViewer => self
+                .pane
+                .filtered_entries()
+                .into_iter()
+                .map(|entry| TimelineActionRow {
+                    key: TimelineSelectionKey::for_event(entry),
+                    copy_text: entry.display.summary.clone(),
+                    event_kind: entry.display.kind.compact_label().to_ascii_lowercase(),
+                    event_source: source_badge(entry.source).trim().to_ascii_lowercase(),
+                })
+                .collect(),
+            TimelineViewMode::Commits => self
+                .commit_entries
+                .iter()
+                .map(|entry| TimelineActionRow {
+                    key: TimelineSelectionKey::for_commit(entry),
+                    copy_text: entry.detail_summary(),
+                    event_kind: "commit".to_string(),
+                    event_source: "storage".to_string(),
+                })
+                .collect(),
+            TimelineViewMode::Combined => self
+                .combined_rows()
+                .into_iter()
+                .map(|row| match row {
+                    CombinedTimelineRow::Event(entry) => TimelineActionRow {
+                        key: TimelineSelectionKey::for_event(&entry),
+                        copy_text: entry.display.summary.clone(),
+                        event_kind: entry.display.kind.compact_label().to_ascii_lowercase(),
+                        event_source: source_badge(entry.source).trim().to_ascii_lowercase(),
+                    },
+                    CombinedTimelineRow::Commit(entry) => TimelineActionRow {
+                        key: TimelineSelectionKey::for_commit(&entry),
+                        copy_text: entry.detail_summary(),
+                        event_kind: "commit".to_string(),
+                        event_source: "storage".to_string(),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn selected_rows_for_context(&self, rows: &[TimelineActionRow]) -> Vec<TimelineActionRow> {
+        rows.iter()
+            .filter(|row| self.selected_timeline_keys.contains(&row.key))
+            .cloned()
+            .collect()
+    }
+
+    fn prune_selection_to_visible(&mut self) {
+        let visible: HashSet<TimelineSelectionKey> = self
+            .visible_action_rows()
+            .into_iter()
+            .map(|row| row.key)
+            .collect();
+        self.selected_timeline_keys
+            .retain(|key| visible.contains(key));
+    }
+
+    fn clear_timeline_selection(&mut self) {
+        self.selected_timeline_keys.clear();
+    }
+
+    fn toggle_selection_for_cursor(&mut self) {
+        if let Some(key) = self
+            .visible_action_rows()
+            .get(self.pane.cursor)
+            .map(|row| row.key.clone())
+        {
+            self.selected_timeline_keys.toggle(key);
+        }
+    }
+
+    fn select_all_visible_rows(&mut self) {
+        self.selected_timeline_keys
+            .select_all(self.visible_action_rows().into_iter().map(|row| row.key));
+    }
+
+    fn extend_visual_selection_to_cursor(&mut self) {
+        if !self.selected_timeline_keys.visual_mode() {
+            return;
+        }
+        if let Some(key) = self
+            .visible_action_rows()
+            .get(self.pane.cursor)
+            .map(|row| row.key.clone())
+        {
+            self.selected_timeline_keys.select(key);
+        }
     }
 
     fn refresh_commit_entries(&mut self, tick_count: u64, state: &TuiSharedState) {
@@ -933,6 +1066,7 @@ impl TimelineScreen {
             }
         }
         self.clamp_cursor_for_mode();
+        self.prune_selection_to_visible();
         self.sync_list_state();
     }
 
@@ -1086,22 +1220,40 @@ impl MailScreen for TimelineScreen {
 
                 match key.code {
                     // Cursor navigation
-                    KeyCode::Char('j') | KeyCode::Down => self.cursor_down(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.cursor_up(1),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.cursor_down(1);
+                        self.extend_visual_selection_to_cursor();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.cursor_up(1);
+                        self.extend_visual_selection_to_cursor();
+                    }
                     KeyCode::PageDown | KeyCode::Char('d') => {
                         self.cursor_down(PAGE_SIZE);
+                        self.extend_visual_selection_to_cursor();
                     }
                     KeyCode::PageUp | KeyCode::Char('u') => {
                         self.cursor_up(PAGE_SIZE);
+                        self.extend_visual_selection_to_cursor();
                     }
-                    KeyCode::Char('G') | KeyCode::End => self.cursor_end(),
-                    KeyCode::Char('g') | KeyCode::Home => self.cursor_home(),
+                    KeyCode::Char('G') | KeyCode::End => {
+                        self.cursor_end();
+                        self.extend_visual_selection_to_cursor();
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => {
+                        self.cursor_home();
+                        self.extend_visual_selection_to_cursor();
+                    }
+                    KeyCode::Char(' ') => self.toggle_selection_for_cursor(),
+                    KeyCode::Char('A') => self.select_all_visible_rows(),
+                    KeyCode::Char('C') => self.clear_timeline_selection(),
 
                     // Follow mode
                     KeyCode::Char('f') => {
                         self.pane.toggle_follow();
                         if self.pane.follow {
                             self.cursor_end();
+                            self.extend_visual_selection_to_cursor();
                         }
                     }
 
@@ -1109,33 +1261,43 @@ impl MailScreen for TimelineScreen {
                     KeyCode::Char('V') => {
                         self.view_mode = self.view_mode.next_primary();
                         self.clamp_cursor_for_mode();
+                        self.prune_selection_to_visible();
                     }
 
-                    // Keep lowercase `v` available for future visual-selection workflows.
-                    KeyCode::Char('v') => {}
+                    // Lowercase `v` toggles visual selection mode.
+                    KeyCode::Char('v') => {
+                        let enabled = self.selected_timeline_keys.toggle_visual_mode();
+                        if enabled {
+                            self.extend_visual_selection_to_cursor();
+                        }
+                    }
 
                     // Cycle verbosity tier.
                     KeyCode::Char('Z') => {
                         self.pane.verbosity = self.pane.verbosity.next();
                         self.clamp_cursor_for_mode();
+                        self.prune_selection_to_visible();
                     }
 
                     // Cycle kind filter
                     KeyCode::Char('t') => {
                         cycle_kind_filter(&mut self.pane.kind_filter);
                         self.clamp_cursor_for_mode();
+                        self.prune_selection_to_visible();
                     }
 
                     // Cycle source filter
                     KeyCode::Char('s') => {
                         cycle_source_filter(&mut self.pane.source_filter);
                         self.clamp_cursor_for_mode();
+                        self.prune_selection_to_visible();
                     }
 
                     // Clear all filters
                     KeyCode::Char('c') => {
                         self.pane.clear_filters();
                         self.clamp_cursor_for_mode();
+                        self.prune_selection_to_visible();
                     }
 
                     // Toggle inspector panel (dock)
@@ -1235,6 +1397,7 @@ impl MailScreen for TimelineScreen {
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         self.pane.ingest(state);
         self.refresh_commit_entries(tick_count, state);
+        self.prune_selection_to_visible();
         // Sync list state after ingesting new events.
         self.sync_list_state();
         // Flush debounced preference save.
@@ -1262,6 +1425,12 @@ impl MailScreen for TimelineScreen {
         self.last_area.set(area);
         let split = self.dock.split(area);
         let effects_enabled = state.config_snapshot().tui_effects;
+        let selected_key_set: HashSet<TimelineSelectionKey> = self
+            .selected_timeline_keys
+            .selected_items()
+            .into_iter()
+            .collect();
+        let selected_count = selected_key_set.len();
         let mut combined_selected_event: Option<MailEvent> = None;
         match self.view_mode {
             TimelineViewMode::Events => {
@@ -1273,6 +1442,8 @@ impl MailScreen for TimelineScreen {
                     self.dock,
                     &mut list_state,
                     effects_enabled,
+                    &selected_key_set,
+                    selected_count,
                 );
             }
             TimelineViewMode::Commits => {
@@ -1286,6 +1457,8 @@ impl MailScreen for TimelineScreen {
                     self.pane.follow,
                     self.dock,
                     &mut list_state,
+                    &selected_key_set,
+                    selected_count,
                 );
             }
             TimelineViewMode::Combined => {
@@ -1304,6 +1477,8 @@ impl MailScreen for TimelineScreen {
                     self.pane.follow,
                     self.dock,
                     &mut list_state,
+                    &selected_key_set,
+                    selected_count,
                 );
             }
             TimelineViewMode::LogViewer => {
@@ -1354,6 +1529,14 @@ impl MailScreen for TimelineScreen {
             HelpEntry {
                 key: "G/g",
                 action: "End / Home",
+            },
+            HelpEntry {
+                key: "Space",
+                action: "Toggle selected row",
+            },
+            HelpEntry {
+                key: "v / A / C",
+                action: "Visual mode, select all, clear selection",
             },
             HelpEntry {
                 key: "f",
@@ -1416,28 +1599,60 @@ impl MailScreen for TimelineScreen {
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some(
-            "Timeline views: V cycles events/commits/combined. Ctrl+S saves and Ctrl+L loads screen-scoped filter presets.",
+            "Timeline views: V cycles modes while v controls visual selection. Space/v/A/C manage multi-select; Ctrl+S/Ctrl+L manage presets.",
         )
     }
 
-    fn copyable_content(&self) -> Option<String> {
-        match self.view_mode {
-            TimelineViewMode::Events | TimelineViewMode::LogViewer => {
-                let entry = self.pane.selected_entry()?;
-                Some(entry.display.summary.clone())
-            }
-            TimelineViewMode::Commits => self
-                .commit_entries
-                .get(self.pane.cursor)
-                .map(CommitTimelineEntry::detail_summary),
-            TimelineViewMode::Combined => {
-                let rows = self.combined_rows();
-                rows.get(self.pane.cursor).map(|row| match row {
-                    CombinedTimelineRow::Event(entry) => entry.display.summary.clone(),
-                    CombinedTimelineRow::Commit(entry) => entry.detail_summary(),
-                })
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        let rows = self.visible_action_rows();
+        let current = rows.get(self.pane.cursor)?;
+        let selected_rows = self.selected_rows_for_context(&rows);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let anchor_row = (self.pane.cursor as u16).saturating_add(2);
+
+        if selected_rows.len() > 1 {
+            let copy_payload = selected_rows
+                .iter()
+                .map(|row| row.copy_text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let actions = timeline_batch_actions(selected_rows.len(), copy_payload);
+            let context_id = format!("batch:{}", selected_rows.len());
+            return Some((actions, anchor_row, context_id));
+        }
+
+        let mut actions = timeline_actions(&current.event_kind, &current.event_source);
+        for entry in &mut actions {
+            if entry.label == "Copy event" {
+                entry.action = ActionKind::CopyToClipboard(current.copy_text.clone());
+                entry.keybinding = Some("y".to_string());
             }
         }
+        let context_id = match &current.key {
+            TimelineSelectionKey::Event { seq } => format!("event:{seq}"),
+            TimelineSelectionKey::Commit {
+                project_slug,
+                short_sha,
+                timestamp_micros,
+            } => format!("commit:{project_slug}:{short_sha}:{timestamp_micros}"),
+        };
+        Some((actions, anchor_row, context_id))
+    }
+
+    fn copyable_content(&self) -> Option<String> {
+        let rows = self.visible_action_rows();
+        let selected_rows = self.selected_rows_for_context(&rows);
+        if selected_rows.len() > 1 {
+            return Some(
+                selected_rows
+                    .iter()
+                    .map(|row| row.copy_text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        rows.get(self.pane.cursor).map(|row| row.copy_text.clone())
     }
 
     fn title(&self) -> &'static str {
@@ -1769,6 +1984,8 @@ fn render_timeline(
     dock: DockLayout,
     list_state: &mut VirtualizedListState,
     effects_enabled: bool,
+    selected_keys: &HashSet<TimelineSelectionKey>,
+    selected_count: usize,
 ) {
     let inner_height = area.height.saturating_sub(2) as usize; // borders
     if inner_height == 0 {
@@ -1787,6 +2004,14 @@ fn render_timeline(
             );
         }
     }
+    for entry in &mut filtered {
+        let marker = if selected_keys.contains(&TimelineSelectionKey::for_event(entry)) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        entry.display.summary = format!("{marker} {}", entry.display.summary);
+    }
     let total = filtered.len();
     let cursor = pane.cursor.min(total.saturating_sub(1));
 
@@ -1804,7 +2029,13 @@ fn render_timeline(
     } else {
         String::new()
     };
-    let title = format!("Timeline ({pos}){follow_tag}{verbosity_tag}{filter_tag}{dock_tag}");
+    let selected_tag = if selected_count > 0 {
+        format!(" [selected:{selected_count}]")
+    } else {
+        String::new()
+    };
+    let title =
+        format!("Timeline ({pos}){follow_tag}{verbosity_tag}{filter_tag}{selected_tag}{dock_tag}",);
 
     // Render block/border first.
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -1840,7 +2071,18 @@ fn render_commit_timeline(
     follow: bool,
     dock: DockLayout,
     list_state: &mut VirtualizedListState,
+    selected_keys: &HashSet<TimelineSelectionKey>,
+    selected_count: usize,
 ) {
+    let mut render_commits: Vec<CommitTimelineEntry> = commits.to_vec();
+    for row in &mut render_commits {
+        let marker = if selected_keys.contains(&TimelineSelectionKey::for_commit(row)) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        row.subject = format!("{marker} {}", row.subject);
+    }
     let pos = if commits.is_empty() {
         "empty".to_string()
     } else {
@@ -1856,13 +2098,18 @@ fn render_commit_timeline(
     } else {
         String::new()
     };
-    let title = format!("Timeline Commits ({pos}){follow_tag}{dock_tag}");
+    let selected_tag = if selected_count > 0 {
+        format!(" [selected:{selected_count}]")
+    } else {
+        String::new()
+    };
+    let title = format!("Timeline Commits ({pos}){follow_tag}{selected_tag}{dock_tag}");
     let summary = stats.summary_line();
 
     render_virtualized_rows(
         frame,
         area,
-        commits,
+        &render_commits,
         cursor,
         &title,
         Some(&summary),
@@ -1879,7 +2126,30 @@ fn render_combined_timeline(
     follow: bool,
     dock: DockLayout,
     list_state: &mut VirtualizedListState,
+    selected_keys: &HashSet<TimelineSelectionKey>,
+    selected_count: usize,
 ) {
+    let mut render_rows: Vec<CombinedTimelineRow> = rows.to_vec();
+    for row in &mut render_rows {
+        match row {
+            CombinedTimelineRow::Event(entry) => {
+                let marker = if selected_keys.contains(&TimelineSelectionKey::for_event(entry)) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                entry.display.summary = format!("{marker} {}", entry.display.summary);
+            }
+            CombinedTimelineRow::Commit(entry) => {
+                let marker = if selected_keys.contains(&TimelineSelectionKey::for_commit(entry)) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                entry.subject = format!("{marker} {}", entry.subject);
+            }
+        }
+    }
     let pos = if rows.is_empty() {
         "empty".to_string()
     } else {
@@ -1895,13 +2165,18 @@ fn render_combined_timeline(
     } else {
         String::new()
     };
-    let title = format!("Timeline Combined ({pos}){follow_tag}{dock_tag}");
+    let selected_tag = if selected_count > 0 {
+        format!(" [selected:{selected_count}]")
+    } else {
+        String::new()
+    };
+    let title = format!("Timeline Combined ({pos}){follow_tag}{selected_tag}{dock_tag}");
     let summary = stats.summary_line();
 
     render_virtualized_rows(
         frame,
         area,
-        rows,
+        &render_rows,
         cursor,
         &title,
         Some(&summary),
@@ -2668,6 +2943,8 @@ mod tests {
             dock,
             &mut list_state,
             false,
+            &HashSet::new(),
+            0,
         );
     }
 
@@ -2699,6 +2976,8 @@ mod tests {
             dock,
             &mut list_state,
             false,
+            &HashSet::new(),
+            0,
         );
     }
 
@@ -2716,6 +2995,8 @@ mod tests {
             dock,
             &mut list_state,
             false,
+            &HashSet::new(),
+            0,
         );
     }
 
@@ -2953,13 +3234,74 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_v_is_reserved_noop_for_future_visual_selection() {
+    fn lowercase_v_toggles_visual_selection_mode() {
         let mut screen = TimelineScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            2,
+            MailEvent::http_request("GET", "/two", 200, 1, "127.0.0.1"),
+        );
+        screen.pane.verbosity = VerbosityTier::All;
+        screen.pane.cursor = 0;
 
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
         screen.update(&key, &state);
-        assert_eq!(screen.view_mode, TimelineViewMode::Events);
+        assert!(screen.selected_timeline_keys.visual_mode());
+        assert_eq!(screen.selected_timeline_keys.len(), 1);
+    }
+
+    #[test]
+    fn visual_mode_extends_selection_when_cursor_moves() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            2,
+            MailEvent::http_request("GET", "/two", 200, 1, "127.0.0.1"),
+        );
+        screen.pane.verbosity = VerbosityTier::All;
+        screen.pane.cursor = 0;
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('v'))), &state);
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Down)), &state);
+
+        assert_eq!(screen.selected_timeline_keys.len(), 2);
+    }
+
+    #[test]
+    fn shift_a_and_shift_c_manage_timeline_selection() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            2,
+            MailEvent::http_request("GET", "/two", 200, 1, "127.0.0.1"),
+        );
+        screen.pane.verbosity = VerbosityTier::All;
+        screen.pane.cursor = 0;
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('A'))), &state);
+        assert_eq!(screen.selected_timeline_keys.len(), 2);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('C'))), &state);
+        assert!(screen.selected_timeline_keys.is_empty());
+        assert!(!screen.selected_timeline_keys.visual_mode());
     }
 
     #[test]
@@ -2989,6 +3331,65 @@ mod tests {
                 .contains(&MailEventKind::HttpRequest)
         );
         assert!(screen.pane.source_filter.contains(&EventSource::Http));
+    }
+
+    #[test]
+    fn contextual_actions_switch_to_batch_copy_for_multi_selected_rows() {
+        let mut screen = TimelineScreen::new();
+        screen.pane.verbosity = VerbosityTier::All;
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            2,
+            MailEvent::http_request("GET", "/two", 200, 1, "127.0.0.1"),
+        );
+        screen
+            .selected_timeline_keys
+            .select(TimelineSelectionKey::Event { seq: 1 });
+        screen
+            .selected_timeline_keys
+            .select(TimelineSelectionKey::Event { seq: 2 });
+
+        let (actions, _, ctx) = screen
+            .contextual_actions()
+            .expect("contextual actions should exist");
+        assert!(ctx.starts_with("batch:"));
+        assert_eq!(actions.len(), 1);
+        match &actions[0].action {
+            ActionKind::CopyToClipboard(payload) => {
+                assert!(payload.contains("/one") || payload.contains("/two"));
+            }
+            other => panic!("expected CopyToClipboard action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copyable_content_joins_multi_selected_rows() {
+        let mut screen = TimelineScreen::new();
+        screen.pane.verbosity = VerbosityTier::All;
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            2,
+            MailEvent::http_request("GET", "/two", 200, 1, "127.0.0.1"),
+        );
+        screen
+            .selected_timeline_keys
+            .select(TimelineSelectionKey::Event { seq: 1 });
+        screen
+            .selected_timeline_keys
+            .select(TimelineSelectionKey::Event { seq: 2 });
+
+        let payload = screen.copyable_content().expect("copy payload");
+        assert!(payload.contains('\n'));
     }
 
     #[test]
@@ -3651,6 +4052,8 @@ mod tests {
             dock,
             &mut list_state,
             false,
+            &HashSet::new(),
+            0,
         );
     }
 
@@ -3669,6 +4072,8 @@ mod tests {
             dock,
             &mut list_state,
             false,
+            &HashSet::new(),
+            0,
         );
     }
 

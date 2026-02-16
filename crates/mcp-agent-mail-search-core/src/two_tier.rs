@@ -390,7 +390,7 @@ impl TwoTierIndex {
 
     /// Get the count of documents with quality embeddings.
     #[must_use]
-    pub fn quality_count(&self) -> usize {
+    pub const fn quality_count(&self) -> usize {
         self.quality_doc_count
     }
 

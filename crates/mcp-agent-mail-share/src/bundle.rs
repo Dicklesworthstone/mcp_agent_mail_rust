@@ -97,7 +97,7 @@ pub fn bundle_attachments(
         },
     )?;
 
-    let rows = conn
+    let _rows = conn
         .query_sync(
             "SELECT id, attachments \
              FROM messages \

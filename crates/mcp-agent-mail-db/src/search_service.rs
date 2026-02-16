@@ -1581,6 +1581,7 @@ impl Default for HybridRerankConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct HybridRerankAudit {
     enabled: bool,
     attempted: bool,
@@ -2009,6 +2010,7 @@ async fn maybe_apply_hybrid_rerank(
             doc_id: result.id.to_string(),
             score: result.score.unwrap_or(0.0) as f32,
             source: fs::core::types::ScoreSource::Hybrid,
+            index: None,
             fast_score: None,
             quality_score: None,
             lexical_score: result.score.map(|score| score as f32),

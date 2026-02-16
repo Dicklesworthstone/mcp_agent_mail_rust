@@ -49,12 +49,10 @@ pub fn micros_to_naive(micros: i64) -> NaiveDateTime {
     let nsecs = u32::try_from(sub_micros * 1000).unwrap_or(0);
     Utc.timestamp_opt(secs, nsecs)
         .single()
-        .unwrap_or_else(|| {
-            if micros < 0 {
-                chrono::DateTime::<Utc>::MIN_UTC
-            } else {
-                chrono::DateTime::<Utc>::MAX_UTC
-            }
+        .unwrap_or(if micros < 0 {
+            chrono::DateTime::<Utc>::MIN_UTC
+        } else {
+            chrono::DateTime::<Utc>::MAX_UTC
         })
         .naive_utc()
 }

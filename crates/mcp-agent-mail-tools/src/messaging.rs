@@ -895,9 +895,8 @@ pub async fn send_message(
     };
 
     // Validate importance
-    let importance_val = importance
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_else(|| "normal".to_string());
+    let importance_val =
+        importance.map_or_else(|| "normal".to_string(), |s| s.to_ascii_lowercase());
     if !["low", "normal", "high", "urgent"].contains(&importance_val.as_str()) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",

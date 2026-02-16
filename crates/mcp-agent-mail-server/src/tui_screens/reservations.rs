@@ -17,10 +17,10 @@ use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::progress::ProgressBar;
 
-use crate::tui_action_menu::{ActionEntry, reservations_actions};
+use crate::tui_action_menu::{ActionEntry, reservations_actions, reservations_batch_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{DbStatSnapshot, MailEvent, ReservationSnapshot};
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
 
 const COL_AGENT: usize = 0;
 const COL_PATH: usize = 1;
@@ -99,6 +99,8 @@ pub struct ReservationsScreen {
     reservations: HashMap<String, ActiveReservation>,
     /// Sorted display order (keys into `reservations`).
     sorted_keys: Vec<String>,
+    /// Multi-selection state keyed by reservation composite key.
+    selected_reservation_keys: SelectionState<String>,
     sort_col: usize,
     sort_asc: bool,
     show_released: bool,
@@ -126,6 +128,7 @@ impl ReservationsScreen {
             table_state: TableState::default(),
             reservations: HashMap::new(),
             sorted_keys: Vec::new(),
+            selected_reservation_keys: SelectionState::new(),
             sort_col: COL_TTL,
             sort_asc: true,
             show_released: false,
@@ -434,6 +437,7 @@ impl ReservationsScreen {
                 };
             }
         }
+        self.prune_selection_to_visible();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -448,6 +452,67 @@ impl ReservationsScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
+    }
+
+    fn selected_reservation_keys_sorted(&self) -> Vec<String> {
+        let mut keys = self.selected_reservation_keys.selected_items();
+        keys.sort();
+        keys
+    }
+
+    fn selected_reservation_ids_sorted(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .selected_reservation_keys_sorted()
+            .iter()
+            .filter_map(|key| {
+                self.reservations
+                    .get(key)
+                    .and_then(|row| row.reservation_id)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn prune_selection_to_visible(&mut self) {
+        let visible_keys: HashSet<String> = self.sorted_keys.iter().cloned().collect();
+        self.selected_reservation_keys
+            .retain(|key| visible_keys.contains(key));
+    }
+
+    fn clear_reservation_selection(&mut self) {
+        self.selected_reservation_keys.clear();
+    }
+
+    fn toggle_selection_for_cursor(&mut self) {
+        if let Some(key) = self
+            .table_state
+            .selected
+            .and_then(|idx| self.sorted_keys.get(idx))
+            .cloned()
+        {
+            self.selected_reservation_keys.toggle(key);
+        }
+    }
+
+    fn select_all_visible_reservations(&mut self) {
+        self.selected_reservation_keys
+            .select_all(self.sorted_keys.iter().cloned());
+    }
+
+    fn extend_visual_selection_to_cursor(&mut self) {
+        if !self.selected_reservation_keys.visual_mode() {
+            return;
+        }
+        if let Some(key) = self
+            .table_state
+            .selected
+            .and_then(|idx| self.sorted_keys.get(idx))
+            .cloned()
+        {
+            self.selected_reservation_keys.select(key);
+        }
     }
 
     fn summary_counts(&self) -> (usize, usize, usize, usize) {
@@ -501,18 +566,35 @@ impl MailScreen for ReservationsScreen {
         if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Press {
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.move_selection(1);
+                        self.extend_visual_selection_to_cursor();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.move_selection(-1);
+                        self.extend_visual_selection_to_cursor();
+                    }
                     KeyCode::Char('G') | KeyCode::End => {
                         if !self.sorted_keys.is_empty() {
                             self.table_state.selected = Some(self.sorted_keys.len() - 1);
+                            self.extend_visual_selection_to_cursor();
                         }
                     }
                     KeyCode::Char('g') | KeyCode::Home => {
                         if !self.sorted_keys.is_empty() {
                             self.table_state.selected = Some(0);
+                            self.extend_visual_selection_to_cursor();
                         }
                     }
+                    KeyCode::Char(' ') => self.toggle_selection_for_cursor(),
+                    KeyCode::Char('v') => {
+                        let enabled = self.selected_reservation_keys.toggle_visual_mode();
+                        if enabled {
+                            self.extend_visual_selection_to_cursor();
+                        }
+                    }
+                    KeyCode::Char('A') => self.select_all_visible_reservations(),
+                    KeyCode::Char('C') => self.clear_reservation_selection(),
                     KeyCode::Char('s') => {
                         self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
                         self.rebuild_sorted();
@@ -531,11 +613,18 @@ impl MailScreen for ReservationsScreen {
         }
         if let Event::Mouse(mouse) = event {
             match mouse.kind {
-                ftui::MouseEventKind::ScrollDown => self.move_selection(1),
-                ftui::MouseEventKind::ScrollUp => self.move_selection(-1),
+                ftui::MouseEventKind::ScrollDown => {
+                    self.move_selection(1);
+                    self.extend_visual_selection_to_cursor();
+                }
+                ftui::MouseEventKind::ScrollUp => {
+                    self.move_selection(-1);
+                    self.extend_visual_selection_to_cursor();
+                }
                 ftui::MouseEventKind::Down(ftui::MouseButton::Left) => {
                     if let Some(row) = self.row_index_from_mouse(mouse.x, mouse.y) {
                         self.table_state.selected = Some(row);
+                        self.extend_visual_selection_to_cursor();
                     }
                 }
                 _ => {}
@@ -574,22 +663,39 @@ impl MailScreen for ReservationsScreen {
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
-        let selected_idx = self.table_state.selected?;
-        let key = self.sorted_keys.get(selected_idx)?;
+        let cursor_idx = self.table_state.selected?;
+        let key = self.sorted_keys.get(cursor_idx)?;
         let reservation = self.reservations.get(key)?;
+        let selected_keys = self.selected_reservation_keys_sorted();
+        let reservation_ids = self.selected_reservation_ids_sorted();
 
-        let actions = reservations_actions(
-            reservation.reservation_id,
-            &reservation.agent,
-            &reservation.path_pattern,
-        );
+        let actions = if selected_keys.len() > 1 {
+            reservations_batch_actions(selected_keys.len(), &reservation_ids)
+        } else {
+            reservations_actions(
+                reservation.reservation_id,
+                &reservation.agent,
+                &reservation.path_pattern,
+            )
+        };
 
         // Anchor row tracks the selected row within the visible viewport.
-        let viewport_row = selected_idx.saturating_sub(self.last_render_offset.get());
+        let viewport_row = cursor_idx.saturating_sub(self.last_render_offset.get());
         let anchor_row = u16::try_from(viewport_row)
             .unwrap_or(u16::MAX)
             .saturating_add(2);
-        let context_id = key.clone();
+        let context_id = if selected_keys.len() > 1 {
+            format!(
+                "batch:{}",
+                selected_keys
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        } else {
+            key.clone()
+        };
 
         Some((actions, anchor_row, context_id))
     }
@@ -624,8 +730,13 @@ impl MailScreen for ReservationsScreen {
         } else {
             ""
         };
+        let selected_label = if self.selected_reservation_keys.is_empty() {
+            String::new()
+        } else {
+            format!("  selected:{}", self.selected_reservation_keys.len())
+        };
         let summary_base = format!(
-            " {active} active  {exclusive} exclusive  {shared} shared   Sort: {sort_label}{sort_indicator} {released_label}",
+            " {active} active  {exclusive} exclusive  {shared} shared{selected_label}   Sort: {sort_label}{sort_indicator} {released_label}",
         );
         let critical_alert = if expired > 0 {
             format!("  CRITICAL: {expired} expired")
@@ -678,6 +789,8 @@ impl MailScreen for ReservationsScreen {
             .enumerate()
             .filter_map(|(i, key)| {
                 let res = self.reservations.get(key)?;
+                let batch_selected = self.selected_reservation_keys.contains(key);
+                let checkbox = if batch_selected { "[x]" } else { "[ ]" };
                 let excl_str = if res.exclusive {
                     "\u{2713}"
                 } else {
@@ -690,11 +803,12 @@ impl MailScreen for ReservationsScreen {
                 ttl_overlay_rows.push(TtlOverlayRow {
                     ratio,
                     label: ttl_text.clone(),
-                    selected: Some(i) == self.table_state.selected,
+                    selected: Some(i) == self.table_state.selected || batch_selected,
                     released: res.released,
                 });
 
-                let style = if Some(i) == self.table_state.selected {
+                let highlighted = Some(i) == self.table_state.selected || batch_selected;
+                let style = if highlighted {
                     Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else if res.released {
                     crate::tui_theme::text_disabled(&tp)
@@ -709,7 +823,7 @@ impl MailScreen for ReservationsScreen {
                 Some(
                     Row::new([
                         res.agent.clone(),
-                        res.path_pattern.clone(),
+                        format!("{checkbox} {}", res.path_pattern),
                         excl_str.to_string(),
                         ttl_text,
                         res.project.clone(),
@@ -785,6 +899,14 @@ impl MailScreen for ReservationsScreen {
                 action: "Navigate reservations",
             },
             HelpEntry {
+                key: "Space",
+                action: "Toggle selected reservation",
+            },
+            HelpEntry {
+                key: "v / A / C",
+                action: "Visual mode, select all, clear selection",
+            },
+            HelpEntry {
                 key: "s",
                 action: "Cycle sort column",
             },
@@ -798,7 +920,7 @@ impl MailScreen for ReservationsScreen {
             },
             HelpEntry {
                 key: ".",
-                action: "Open actions (renew/release/force-release)",
+                action: "Open actions (single or batch)",
             },
             HelpEntry {
                 key: "Mouse",
@@ -808,7 +930,9 @@ impl MailScreen for ReservationsScreen {
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("File reservations held by agents. Use . then f to force-release stale locks.")
+        Some(
+            "File reservations held by agents. Space/v/A/C manage multi-select; use . for single/batch actions.",
+        )
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
@@ -1121,12 +1245,16 @@ mod tests {
     fn keybindings_documented() {
         let screen = ReservationsScreen::new();
         let bindings = screen.keybindings();
-        assert!(bindings.len() >= 3);
+        assert!(bindings.len() >= 5);
+        assert!(bindings.iter().any(|b| b.key == "Space"));
+        assert!(bindings.iter().any(|b| b.key == "v / A / C"));
         assert!(bindings.iter().any(|b| b.key == "x"));
         assert!(bindings.iter().any(|b| b.key == "."));
         assert_eq!(
             screen.context_help_tip(),
-            Some("File reservations held by agents. Use . then f to force-release stale locks.")
+            Some(
+                "File reservations held by agents. Space/v/A/C manage multi-select; use . for single/batch actions.",
+            )
         );
     }
 
@@ -1140,6 +1268,96 @@ mod tests {
         assert!(screen.show_released);
         screen.update(&x, &state);
         assert!(!screen.show_released);
+    }
+
+    #[test]
+    fn space_toggles_reservation_selection() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+        let key = reservation_key("proj", "BlueLake", "src/**");
+        screen.reservations.insert(
+            key.clone(),
+            ActiveReservation {
+                reservation_id: Some(1),
+                agent: "BlueLake".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                granted_ts: 1_000_000,
+                ttl_s: 3600,
+                project: "proj".into(),
+                released: false,
+            },
+        );
+        screen.sorted_keys.push(key.clone());
+        screen.table_state.selected = Some(0);
+
+        let space = Event::Key(ftui::KeyEvent::new(KeyCode::Char(' ')));
+        screen.update(&space, &state);
+        assert!(screen.selected_reservation_keys.contains(&key));
+        screen.update(&space, &state);
+        assert!(!screen.selected_reservation_keys.contains(&key));
+    }
+
+    #[test]
+    fn shift_a_and_shift_c_manage_reservation_selection() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+        for (id, path) in [(1_i64, "src/**"), (2_i64, "tests/**")] {
+            let key = reservation_key("proj", "BlueLake", path);
+            screen.reservations.insert(
+                key.clone(),
+                ActiveReservation {
+                    reservation_id: Some(id),
+                    agent: "BlueLake".into(),
+                    path_pattern: path.into(),
+                    exclusive: true,
+                    granted_ts: 1_000_000,
+                    ttl_s: 3600,
+                    project: "proj".into(),
+                    released: false,
+                },
+            );
+            screen.sorted_keys.push(key);
+        }
+        screen.table_state.selected = Some(0);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('A'))), &state);
+        assert_eq!(screen.selected_reservation_keys.len(), 2);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('C'))), &state);
+        assert!(screen.selected_reservation_keys.is_empty());
+        assert!(!screen.selected_reservation_keys.visual_mode());
+    }
+
+    #[test]
+    fn visual_mode_extends_selection_on_navigation() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+        for (id, path) in [(1_i64, "src/**"), (2_i64, "tests/**")] {
+            let key = reservation_key("proj", "BlueLake", path);
+            screen.reservations.insert(
+                key.clone(),
+                ActiveReservation {
+                    reservation_id: Some(id),
+                    agent: "BlueLake".into(),
+                    path_pattern: path.into(),
+                    exclusive: true,
+                    granted_ts: 1_000_000,
+                    ttl_s: 3600,
+                    project: "proj".into(),
+                    released: false,
+                },
+            );
+            screen.sorted_keys.push(key);
+        }
+        screen.table_state.selected = Some(0);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('v'))), &state);
+        assert!(screen.selected_reservation_keys.visual_mode());
+        assert_eq!(screen.selected_reservation_keys.len(), 1);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Down)), &state);
+        assert_eq!(screen.selected_reservation_keys.len(), 2);
     }
 
     #[test]
@@ -1471,6 +1689,51 @@ mod tests {
                 assert_eq!(op, "release:77");
             }
             other => panic!("expected Execute action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contextual_actions_switch_to_batch_for_multi_selected_rows() {
+        let mut screen = ReservationsScreen::new();
+        for (id, path) in [(22_i64, "src/**"), (11_i64, "tests/**")] {
+            let key = reservation_key("proj", "BlueLake", path);
+            screen.reservations.insert(
+                key.clone(),
+                ActiveReservation {
+                    reservation_id: Some(id),
+                    agent: "BlueLake".into(),
+                    path_pattern: path.into(),
+                    exclusive: true,
+                    granted_ts: 1_000_000,
+                    ttl_s: 3600,
+                    project: "proj".into(),
+                    released: false,
+                },
+            );
+            screen.sorted_keys.push(key.clone());
+            screen.selected_reservation_keys.select(key);
+        }
+        screen.table_state.selected = Some(0);
+
+        let (actions, _, context_id) = screen
+            .contextual_actions()
+            .expect("contextual actions should exist");
+        assert!(context_id.starts_with("batch:"));
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.label.starts_with("Release selected")),
+            "expected batch release action",
+        );
+        let release = actions
+            .iter()
+            .find(|a| a.label.starts_with("Release selected"))
+            .expect("release action");
+        match &release.action {
+            crate::tui_action_menu::ActionKind::ConfirmThenExecute { operation, .. } => {
+                assert_eq!(operation, "release:11,22");
+            }
+            other => panic!("expected ConfirmThenExecute action, got {other:?}"),
         }
     }
 

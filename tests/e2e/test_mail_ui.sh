@@ -296,12 +296,14 @@ http_get_capture() {
     local case_status_file="${case_dir}/status.txt"
     local case_timing_file="${case_dir}/timing.txt"
     local case_curl_stderr_file="${case_dir}/curl_stderr.txt"
+    local case_curl_args_file="${case_dir}/curl_args.txt"
 
     local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
     local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+    local curl_args_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_args.txt"
 
     mkdir -p "${case_dir}"
     e2e_mark_case_start "${case_id}"
@@ -317,6 +319,8 @@ http_get_capture() {
     if [ -n "${auth_header}" ]; then
         args+=(-H "${auth_header}")
     fi
+
+    printf "curl %s\n" "$(printf "%q " "${args[@]}")" > "${case_curl_args_file}"
 
     local start_ns end_ns elapsed_ms
     start_ns="$(date +%s%N)"
@@ -336,6 +340,7 @@ http_get_capture() {
     cp "${case_status_file}" "${status_file}" 2>/dev/null || true
     cp "${case_timing_file}" "${timing_file}" 2>/dev/null || true
     cp "${case_curl_stderr_file}" "${curl_stderr_file}" 2>/dev/null || true
+    cp "${case_curl_args_file}" "${curl_args_file}" 2>/dev/null || true
 
     append_network_trace \
         "${case_id}" "http_get" "GET" "${url}" "${status}" "${expected_status}" "${auth_mode}" "${rc}" "${elapsed_ms}" \

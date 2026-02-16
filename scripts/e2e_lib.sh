@@ -112,6 +112,8 @@ _E2E_TOTAL=0
 
 # Current case (for trace correlation)
 _E2E_CURRENT_CASE=""
+# Active case marker context for e2e_mark_case_start/e2e_mark_case_end dedupe.
+_E2E_MARKER_ACTIVE_CASE=""
 
 # Per-assertion ID tracking (br-1xt0m.1.13.13)
 # Auto-incremented within each case; reset by e2e_case_banner.
@@ -206,6 +208,10 @@ e2e_banner() {
 
 e2e_case_banner() {
     local case_name="$1"
+    if [ -n "${_E2E_MARKER_ACTIVE_CASE:-}" ] && [ "${_E2E_MARKER_ACTIVE_CASE}" != "$case_name" ]; then
+        e2e_mark_case_end "${_E2E_MARKER_ACTIVE_CASE}"
+    fi
+    e2e_mark_case_start "$case_name"
     (( _E2E_TOTAL++ )) || true
     _E2E_CURRENT_CASE="$case_name"
     _E2E_ASSERT_SEQ=0
@@ -2036,6 +2042,20 @@ e2e_stop_server() {
 
 e2e_mark_case_start() {
     local case_name="$1"
+    if [ -z "$case_name" ]; then
+        return 0
+    fi
+
+    # Idempotent for the currently active case (supports manual + auto calls).
+    if [ "${_E2E_MARKER_ACTIVE_CASE:-}" = "$case_name" ]; then
+        return 0
+    fi
+
+    # If another case is still active, close it first.
+    if [ -n "${_E2E_MARKER_ACTIVE_CASE:-}" ] && [ "${_E2E_MARKER_ACTIVE_CASE}" != "$case_name" ]; then
+        e2e_mark_case_end "${_E2E_MARKER_ACTIVE_CASE}"
+    fi
+
     local marker="E2E_CASE_START:${case_name}:$(_e2e_now_rfc3339)"
 
     _E2E_CASE_MARKERS+=("${marker}")
@@ -2046,6 +2066,7 @@ e2e_mark_case_start() {
         _E2E_CASE_LOG_LINE_COUNTS+=("${case_name}:${line_num}")
     fi
 
+    _E2E_MARKER_ACTIVE_CASE="$case_name"
     _e2e_server_log_marker "CASE_START" "$case_name"
 }
 
@@ -2056,7 +2077,13 @@ e2e_mark_case_start() {
 
 e2e_mark_case_end() {
     local case_name="$1"
+    if [ -z "$case_name" ]; then
+        return 0
+    fi
     _e2e_server_log_marker "CASE_END" "$case_name"
+    if [ "${_E2E_MARKER_ACTIVE_CASE:-}" = "$case_name" ]; then
+        _E2E_MARKER_ACTIVE_CASE=""
+    fi
 }
 
 # e2e_extract_case_logs: Extract server logs for a specific test case
@@ -2514,6 +2541,10 @@ e2e_save_db_snapshot() {
 # ---------------------------------------------------------------------------
 
 e2e_summary() {
+    if [ -n "${_E2E_MARKER_ACTIVE_CASE:-}" ]; then
+        e2e_mark_case_end "${_E2E_MARKER_ACTIVE_CASE}"
+    fi
+
     # Stop server before generating summary (ensures logs are complete)
     e2e_stop_server 2>/dev/null || true
 
