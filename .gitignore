@@ -94,3 +94,11 @@ LIST_OF_INPUT_MESSAGES.md
 ci-artifacts/
 proptest-regressions/
 test_meminfo
+
+# Agent session ephemeral files
+SESSION_TODO.md
+SESSION_REPORT.md
+SESSION_*.md
+verify_*.sh
+newfile.txt
+repro_*.rs
