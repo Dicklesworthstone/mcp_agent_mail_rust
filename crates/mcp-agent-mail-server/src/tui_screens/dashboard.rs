@@ -1900,12 +1900,6 @@ fn render_signal_panel(
         pushed += 1;
     }
 
-    if lines.is_empty() {
-        lines.push(Line::from_spans([Span::styled(
-            "No active warnings",
-            crate::tui_theme::text_meta(&tp),
-        )]));
-    }
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
 }
 
