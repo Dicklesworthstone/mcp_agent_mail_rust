@@ -338,12 +338,26 @@ Investigate specific queries before deciding if divergence is acceptable.
 
 ## Steady-State Operations (Post-Cutover)
 
-This section is the operational slice for `br-1x3h5` and is intended to be finalized
-with concrete benchmark/replay evidence once `br-2tnl.7.15` and `br-2tnl.7.16` are complete.
+This section is the operational contract for `br-2tnl.8.5` (steady-state operations +
+verification). It assumes Search V3 is the active serving engine and focuses on
+repeatable verification, incident handling, and evidence capture.
+
+### Operational Guardrails (Source of Truth)
+
+Use `docs/SPEC-search-v3-quality-gates.md` as the canonical threshold source.
+The minimum steady-state guardrails to enforce operationally:
+
+| Signal | Target / Threshold | Response if Breached |
+|--------|--------------------|----------------------|
+| `v3_error_rate` | `< 1%` rolling 15m | Trigger Incident Matrix + open P0 bead |
+| `search_index_health` | `ready` | Run Procedure A (lexical rebuild) |
+| Hybrid p95 latency drift | `< 20%` vs prior weekly baseline | Run load suite + profile/tune semantic path |
+| Relevance drift (weekly) | No sustained regression vs prior artifact set | Open follow-up bead with evidence bundle |
+| Queue pressure (`wbq`, `commit_coalescer`) | No sustained warning state | Investigate storage/DB pressure before user impact |
 
 ### Daily Verification (Operator Checklist)
 
-1. Confirm serving engine and health pulse:
+1. Confirm serving engine + index health:
    ```bash
    curl -sS -X POST http://127.0.0.1:8765/mcp/ \
      -H "Content-Type: application/json" \
@@ -359,6 +373,7 @@ with concrete benchmark/replay evidence once `br-2tnl.7.15` and `br-2tnl.7.16` a
      --json | jq 'length'
    ```
 3. Verify no sustained queue pressure (`queues.wbq.warning=false`, `queues.commit_coalescer.warning=false`).
+4. Record output snapshots in an ops evidence folder (date-stamped) and link them in the active rollout/bead thread.
 
 ### Weekly Verification (Quality + Performance)
 
@@ -366,10 +381,25 @@ with concrete benchmark/replay evidence once `br-2tnl.7.15` and `br-2tnl.7.16` a
    ```bash
    am ci --quick --json --report tests/artifacts/ci/search_v3_weekly.json
    ```
-2. Run Search V3-focused E2E/parity suites when available:
-   - `tests/e2e/test_search_v3_shadow_parity.sh`
+2. Run the Search V3 steady-state suite bundle:
+   - `tests/e2e/test_search_v3_stdio.sh`
+   - `tests/e2e/test_search_v3_http.sh`
    - `tests/e2e/test_search_v3_resilience.sh`
-3. Compare overlap and latency drift versus prior weekly artifact; open a bead if thresholds regress.
+   - `tests/e2e/test_search_v3_load_concurrency.sh`
+3. Validate artifact bundle integrity:
+   ```bash
+   source scripts/e2e_lib.sh
+   e2e_validate_bundle_tree tests/artifacts
+   ```
+4. Compare this week’s latency/relevance artifacts against prior weekly baseline artifacts; open a follow-up bead if any guardrail regresses.
+
+### Post-Cutover Verification Windows
+
+Run this schedule after enabling full Search V3 serving:
+
+1. **T+24h**: `stdio` + `http` + `resilience` suites must pass with complete artifacts.
+2. **T+7d**: repeat weekly bundle and confirm no sustained error/latency drift.
+3. **T+30d**: verify no recurring legacy fallback incidents and confirm operations remain within guardrails.
 
 ### Incident Triage Matrix
 
@@ -413,14 +443,15 @@ Create a new bead immediately when any of the following is observed:
 
 - `v3_error_pct >= 1%` for more than 15 minutes
 - `avg_latency_delta_ms >= 100` sustained across weekly verification
-- `equivalent_pct < 75%` on replay/shadow checks
+- `equivalent_pct < 75%` or measurable relevance regression on weekly replay/verification checks
 - Any cross-project scope or redaction regression in search output
 
 When creating the bead, attach:
 - failing query samples,
 - health snapshot JSON,
 - relevant server log window,
-- command transcript used for reproduction.
+- command transcript used for reproduction,
+- artifact paths under `tests/artifacts/search_v3_*`.
 
 ---
 
@@ -433,6 +464,7 @@ When creating the bead, attach:
 - [ ] Phase 5: FTS5 triggers removed (optional, irreversible)
 - [ ] Daily verification checklist running with retained artifacts
 - [ ] Weekly verification and drift review completed
+- [ ] Post-cutover checks complete at T+24h, T+7d, and T+30d
 - [ ] Incident triage + repair procedures validated by operator dry run
 
 ---

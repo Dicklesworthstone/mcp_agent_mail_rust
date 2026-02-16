@@ -410,10 +410,14 @@ Compatibility-only wrapper behavior:
 
 ### Troubleshooting Suite Map (Use Before Escalation)
 
+Search V3-specific steady-state procedures live in:
+`docs/RUNBOOK-search-v3-migration.md#steady-state-operations-post-cutover`.
+
 | Symptom / Concern | Run This Suite | Expected Artifact Root |
 |-------------------|----------------|------------------------|
 | MCP/API mode drift or deny behavior mismatch | `tests/e2e/test_dual_mode.sh` | `tests/artifacts/dual_mode/<timestamp>/` |
 | TUI startup/bootstrap/token-redaction regressions | `tests/e2e/test_tui_startup.sh` | `tests/artifacts/tui_startup/<timestamp>/` |
+| Search V3 relevance/latency/resilience drift | `tests/e2e/test_search_v3_stdio.sh`, `tests/e2e/test_search_v3_http.sh`, `tests/e2e/test_search_v3_resilience.sh`, `tests/e2e/test_search_v3_load_concurrency.sh` | `tests/artifacts/search_v3_*/<timestamp>/` |
 | Browser/WASM state-sync poll+ingress contract regressions | `tests/e2e/test_tui_wasm.sh` | `tests/artifacts/tui_wasm/<timestamp>/` |
 | Accessibility keyboard/contrast/reduced-motion regressions | `tests/e2e/test_tui_a11y.sh` | `tests/artifacts/tui_a11y/<timestamp>/` |
 | TUI resize/reflow/screen rendering regressions | `tests/e2e/test_tui_compat_matrix.sh` | `tests/artifacts/tui_compat_matrix/<timestamp>/` |

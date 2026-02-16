@@ -274,3 +274,30 @@ Added to the standard `cargo test` suite:
 | Hybrid → HybridRerank | All rerank SLOs (S2.4) + latency SLOs (S3.4) | Manual review + CI green |
 
 Each transition is reversible via `SEARCH_ENGINE` env var.
+
+## 9. Steady-State Verification Mapping
+
+Operational execution for these gates is defined in:
+`docs/RUNBOOK-search-v3-migration.md#steady-state-operations-post-cutover`.
+
+The weekly steady-state bundle must include:
+
+- `tests/e2e/test_search_v3_stdio.sh`
+- `tests/e2e/test_search_v3_http.sh`
+- `tests/e2e/test_search_v3_resilience.sh`
+- `tests/e2e/test_search_v3_load_concurrency.sh`
+
+Artifact integrity validation:
+
+```bash
+source scripts/e2e_lib.sh
+e2e_validate_bundle_tree tests/artifacts
+```
+
+Any guardrail breach (error-rate, latency drift, relevance drift, or
+scope/redaction regression) requires opening a follow-up bead with:
+
+- failing query samples,
+- health snapshot JSON,
+- relevant server log window,
+- artifact paths under `tests/artifacts/search_v3_*`.
