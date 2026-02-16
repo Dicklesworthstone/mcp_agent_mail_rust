@@ -1131,6 +1131,9 @@ fn run_http_server_supervisor_thread(
                 instance = handle_transport_switch(&mut config, tui_state, instance, desired)?;
                 last_restart_sleep_ms = 0;
             }
+            Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(_envelope)) => {
+                // TODO: dispatch envelope to storage layer for async send
+            }
             Ok(tui_bridge::ServerControlMsg::Shutdown)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());

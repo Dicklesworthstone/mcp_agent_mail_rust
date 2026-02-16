@@ -98,11 +98,13 @@ impl TransportBase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerControlMsg {
     Shutdown,
     ToggleTransportBase,
     SetTransportBase(TransportBase),
+    /// Send a composed message from the TUI compose panel.
+    ComposeEnvelope(crate::tui_compose::ComposeEnvelope),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

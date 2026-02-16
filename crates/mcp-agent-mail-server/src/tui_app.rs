@@ -36,6 +36,7 @@ use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
 use crate::tui_bridge::{RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiSharedState};
+use crate::tui_compose::{ComposeAction, ComposePanel, ComposeState};
 use crate::tui_events::MailEvent;
 use crate::tui_focus::{FocusManager, FocusTarget, focus_graph_for_screen, focus_ring_for_screen};
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
@@ -582,12 +583,14 @@ pub enum OverlayLayer {
     MacroPlayback = 4,
     /// Modal dialog (z=4.5). Traps all events.
     Modal = 5,
+    /// Compose message overlay (z=4.7). Traps all events.
+    Compose = 6,
     /// Command palette (z=5). Traps all events.
-    Palette = 6,
+    Palette = 7,
     /// Help overlay (z=6, topmost render). Traps Esc/j/k only.
-    Help = 7,
+    Help = 8,
     /// Debug inspector overlay (z=7, topmost). Traps keyboard/mouse.
-    Inspector = 8,
+    Inspector = 9,
 }
 
 impl OverlayLayer {
@@ -598,6 +601,7 @@ impl OverlayLayer {
         matches!(
             self,
             Self::Palette
+                | Self::Compose
                 | Self::Modal
                 | Self::ActionMenu
                 | Self::ToastFocus
@@ -948,6 +952,8 @@ pub struct MailAppModel {
     quit_confirm_armed_at: Option<Instant>,
     /// Input source that armed quit confirmation.
     quit_confirm_source: Option<QuitConfirmSource>,
+    /// Compose message overlay state (`Ctrl+N` to open, `Esc` to close).
+    compose_state: Option<ComposeState>,
     /// Global widget-tree inspector state (debug-only; gated by `AM_TUI_DEBUG`).
     inspector: InspectorState,
     /// Flattened inspector tree size from the most recent frame.
@@ -1031,6 +1037,7 @@ impl MailAppModel {
             internal_clipboard: None,
             quit_confirm_armed_at: None,
             quit_confirm_source: None,
+            compose_state: None,
             inspector: InspectorState::new(),
             inspector_last_tree_len: Cell::new(0),
             inspector_selected_index: 0,
@@ -2095,6 +2102,9 @@ impl MailAppModel {
         if self.command_palette.is_visible() {
             return OverlayLayer::Palette;
         }
+        if self.compose_state.is_some() {
+            return OverlayLayer::Compose;
+        }
         if self.modal_manager.is_active() {
             return OverlayLayer::Modal;
         }
@@ -2186,6 +2196,53 @@ impl MailAppModel {
         let ranked_actions = self.rank_palette_actions(actions);
         self.command_palette.replace_actions(ranked_actions);
         self.command_palette.open();
+    }
+
+    /// Open the compose message overlay (`Ctrl+N`).
+    fn open_compose(&mut self) {
+        if self.compose_state.is_some() {
+            return; // Already open.
+        }
+        let mut cs = ComposeState::new();
+        // Populate agent list from recent events for recipient auto-complete.
+        let agents: Vec<String> = self
+            .state
+            .events_since(0)
+            .iter()
+            .filter_map(|e| {
+                if let crate::tui_events::MailEvent::AgentRegistered { name, .. } = e {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        cs.set_available_agents(agents);
+        self.compose_state = Some(cs);
+    }
+
+    /// Dispatch a composed message for sending via the server control channel.
+    fn dispatch_compose_send(&mut self, envelope: crate::tui_compose::ComposeEnvelope) -> Cmd<MailMsg> {
+        let recipients = envelope.to.join(", ");
+        if self
+            .state
+            .try_send_server_control(ServerControlMsg::ComposeEnvelope(envelope))
+        {
+            self.notifications.notify(
+                Toast::new(format!("Sending to: {recipients}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(3)),
+            );
+        } else {
+            self.notifications.notify(
+                Toast::new("No server channel — message not sent")
+                    .icon(ToastIcon::Error)
+                    .duration(Duration::from_secs(5)),
+            );
+        }
+        Cmd::none()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2875,12 +2932,49 @@ impl Model for MailAppModel {
                 // Overlay focus trapping: topmost-first precedence.
                 // See `OverlayLayer` for the formal z-order contract.
                 //
-                // Palette (z=6 event priority, traps all)
+                // Palette (z=7 event priority, traps all)
                 if self.command_palette.is_visible() {
                     if let Some(action) = self.command_palette.handle_event(event) {
                         match action {
                             PaletteAction::Execute(id) => return self.dispatch_palette_action(&id),
                             PaletteAction::Dismiss => {}
+                        }
+                    }
+                    return Cmd::none();
+                }
+
+                // Compose overlay (z=6, traps all)
+                if let Some(ref mut compose) = self.compose_state {
+                    if let Event::Key(key) = event {
+                        if key.kind == KeyEventKind::Press {
+                            match compose.handle_key(key) {
+                                ComposeAction::Consumed | ComposeAction::Ignored => {}
+                                ComposeAction::Close => {
+                                    self.compose_state = None;
+                                }
+                                ComposeAction::ConfirmClose => {
+                                    // TODO: show modal confirmation for unsaved changes
+                                    self.compose_state = None;
+                                }
+                                ComposeAction::Send => {
+                                    if let Some(mut cs) = self.compose_state.take() {
+                                        match cs.build_envelope() {
+                                            Ok(envelope) => {
+                                                return self.dispatch_compose_send(envelope);
+                                            }
+                                            Err(err) => {
+                                                // Put state back so user can fix.
+                                                self.compose_state = Some(cs);
+                                                self.notifications.notify(
+                                                    Toast::new(format!("Compose error: {err}"))
+                                                        .icon(ToastIcon::Error)
+                                                        .duration(Duration::from_secs(5)),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     return Cmd::none();
@@ -3060,6 +3154,13 @@ impl Model for MailAppModel {
                             && matches!(key.code, KeyCode::Char('p'));
                         if (is_ctrl_p || matches!(key.code, KeyCode::Char(':'))) && !text_mode {
                             self.open_palette();
+                            return Cmd::none();
+                        }
+                        // Ctrl+N: open compose overlay.
+                        let is_ctrl_n = key.modifiers.contains(Modifiers::CTRL)
+                            && matches!(key.code, KeyCode::Char('n'));
+                        if is_ctrl_n && !text_mode {
+                            self.open_compose();
                             return Cmd::none();
                         }
                         // Ctrl+T: toggle toast focus mode.
@@ -3466,6 +3567,11 @@ impl Model for MailAppModel {
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX);
+        }
+
+        // 4d. Compose overlay (z=4.7, between modal and palette)
+        if let Some(ref compose) = self.compose_state {
+            ComposePanel::new(compose).render(area, frame, &self.state);
         }
 
         // 5. Command palette (z=5, modal)
@@ -5420,6 +5526,73 @@ mod tests {
             rx.try_recv().ok(),
             Some(ServerControlMsg::ToggleTransportBase)
         );
+    }
+
+    // ── Compose overlay wiring tests ────────────────────────────────
+
+    #[test]
+    fn ctrl_n_opens_compose_overlay() {
+        let mut model = test_model();
+        assert!(model.compose_state.is_none());
+        let event = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let _ = model.update(MailMsg::Terminal(event));
+        assert!(model.compose_state.is_some());
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Compose);
+    }
+
+    #[test]
+    fn compose_traps_focus() {
+        assert!(OverlayLayer::Compose.traps_focus());
+    }
+
+    #[test]
+    fn compose_escape_closes_overlay() {
+        let mut model = test_model();
+        // Open compose
+        let open = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let _ = model.update(MailMsg::Terminal(open));
+        assert!(model.compose_state.is_some());
+
+        // Press Escape to close
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        let _ = model.update(MailMsg::Terminal(esc));
+        assert!(model.compose_state.is_none());
+        assert_eq!(model.topmost_overlay(), OverlayLayer::None);
+    }
+
+    #[test]
+    fn compose_overlay_z_order_between_palette_and_modal() {
+        assert!(OverlayLayer::Compose > OverlayLayer::Modal);
+        assert!(OverlayLayer::Compose < OverlayLayer::Palette);
+    }
+
+    #[test]
+    fn compose_does_not_open_twice() {
+        let mut model = test_model();
+        let open = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let _ = model.update(MailMsg::Terminal(open.clone()));
+        assert!(model.compose_state.is_some());
+        // Type something into subject to mark state as modified.
+        let _ = model.update(MailMsg::Terminal(Event::Key(ftui::KeyEvent::new(
+            KeyCode::Char('X'),
+        ))));
+        // Second Ctrl+N should not reset compose state.
+        let _ = model.update(MailMsg::Terminal(open));
+        // Compose is still open (not reset).
+        assert!(model.compose_state.is_some());
+    }
+
+    #[test]
+    fn compose_traps_keys_from_reaching_screen() {
+        let mut model = test_model();
+        let initial_screen = model.active_screen();
+        // Open compose
+        let open = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let _ = model.update(MailMsg::Terminal(open));
+        // Press Tab — should be trapped by compose, not switch screens.
+        let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
+        let _ = model.update(MailMsg::Terminal(tab));
+        assert_eq!(model.active_screen(), initial_screen);
     }
 
     #[test]
@@ -8009,10 +8182,10 @@ mod tests {
     fn toast_exit_fade_levels_progress_over_three_ticks() {
         // TOAST_EXIT_TICKS=15, formula: 15 - remaining + 1 (if 1..=15)
         assert_eq!(exit_fade_level(None), 0);
-        assert_eq!(exit_fade_level(Some(9)), 7);   // 15-9+1
-        assert_eq!(exit_fade_level(Some(3)), 13);  // 15-3+1
-        assert_eq!(exit_fade_level(Some(2)), 14);  // 15-2+1
-        assert_eq!(exit_fade_level(Some(1)), 15);  // 15-1+1
+        assert_eq!(exit_fade_level(Some(9)), 7); // 15-9+1
+        assert_eq!(exit_fade_level(Some(3)), 13); // 15-3+1
+        assert_eq!(exit_fade_level(Some(2)), 14); // 15-2+1
+        assert_eq!(exit_fade_level(Some(1)), 15); // 15-1+1
         assert_eq!(exit_fade_level(Some(0)), 0);
     }
 
@@ -8020,9 +8193,9 @@ mod tests {
     fn toast_remaining_ticks_rounds_up() {
         // TICK_INTERVAL=16ms, formula: ceil(ms / 16)
         assert_eq!(remaining_ticks_from_duration(Duration::from_millis(1)), 1);
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 7);   // ceil(99/16)
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 7);  // ceil(100/16)
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 7);  // ceil(101/16)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 7); // ceil(99/16)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 7); // ceil(100/16)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 7); // ceil(101/16)
     }
 
     #[test]

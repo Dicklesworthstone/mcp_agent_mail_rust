@@ -734,7 +734,7 @@ pub enum ComposeAction {
 ///
 /// Built from a validated [`ComposeState`] via [`ComposeState::build_envelope`].
 /// The caller (typically `tui_app`) passes this to the async send path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposeEnvelope {
     /// Sender agent name (always [`OVERSEER_AGENT_NAME`]).
     pub sender_name: String,
