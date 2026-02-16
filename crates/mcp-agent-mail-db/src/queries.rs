@@ -3562,9 +3562,9 @@ pub async fn release_reservations(
 
     let tracked = tracked(&*conn);
 
-    let mut sql = String::from(
+    let mut sql = format!(
         "UPDATE file_reservations SET released_ts = ? \
-         WHERE project_id = ? AND agent_id = ? AND released_ts IS NULL",
+         WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
     );
     let mut params: Vec<Value> = vec![
         Value::BigInt(now),
@@ -3644,10 +3644,10 @@ pub async fn renew_reservations(
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
     // Fetch candidate reservations first (so tools can report old/new expiry).
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
          FROM file_reservations \
-         WHERE project_id = ? AND agent_id = ? AND released_ts IS NULL",
+         WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
     );
     let mut params: Vec<Value> = vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
 
