@@ -619,23 +619,56 @@ fn scored_results_to_search_results(hits: Vec<ScoredResult>) -> Vec<SearchResult
 }
 
 #[cfg(feature = "hybrid")]
-fn select_best_two_tier_results<I>(phases: I) -> Option<Vec<ScoredResult>>
+#[derive(Debug, Clone, Default)]
+struct TwoTierSearchTelemetry {
+    initial_latency_ms: Option<u64>,
+    refinement_latency_ms: Option<u64>,
+    was_refined: bool,
+    refinement_error: Option<String>,
+    fast_only_mode: bool,
+}
+
+#[cfg(feature = "hybrid")]
+#[derive(Debug, Clone, Default)]
+struct TwoTierSearchOutcome {
+    results: Vec<SearchResult>,
+    telemetry: TwoTierSearchTelemetry,
+}
+
+#[cfg(feature = "hybrid")]
+#[derive(Debug, Clone)]
+struct TwoTierSelectedResults {
+    results: Vec<ScoredResult>,
+    telemetry: TwoTierSearchTelemetry,
+}
+
+#[cfg(feature = "hybrid")]
+fn select_best_two_tier_results<I>(phases: I) -> Option<TwoTierSelectedResults>
 where
     I: IntoIterator<Item = SearchPhase>,
 {
-    let mut best: Option<Vec<ScoredResult>> = None;
+    let mut best: Option<(Vec<ScoredResult>, bool)> = None;
+    let mut telemetry = TwoTierSearchTelemetry::default();
 
     for phase in phases {
         match phase {
-            SearchPhase::Initial { results, .. } => {
+            SearchPhase::Initial {
+                results,
+                latency_ms,
+            } => {
+                telemetry.initial_latency_ms.get_or_insert(latency_ms);
                 if best.is_none() {
-                    best = Some(results);
+                    best = Some((results, false));
                 }
             }
-            SearchPhase::Refined { results, .. } => {
+            SearchPhase::Refined {
+                results,
+                latency_ms,
+            } => {
+                telemetry.refinement_latency_ms = Some(latency_ms);
                 // Keep the initial phase when refinement yields an empty set.
                 if !results.is_empty() || best.is_none() {
-                    best = Some(results);
+                    best = Some((results, true));
                 }
             }
             SearchPhase::RefinementFailed { error } => {
@@ -644,23 +677,46 @@ where
                     error = %error,
                     "two-tier refinement failed; keeping the best available phase"
                 );
+                if telemetry.refinement_error.is_none() {
+                    telemetry.refinement_error = Some(error);
+                }
             }
         }
     }
 
-    best
+    best.map(|(results, was_refined)| {
+        telemetry.was_refined = was_refined;
+        TwoTierSelectedResults { results, telemetry }
+    })
 }
 
 #[cfg(feature = "hybrid")]
-fn select_fast_first_two_tier_results<I>(phases: I) -> Option<Vec<ScoredResult>>
+fn select_fast_first_two_tier_results<I>(phases: I) -> Option<TwoTierSelectedResults>
 where
     I: IntoIterator<Item = SearchPhase>,
 {
+    let mut telemetry = TwoTierSearchTelemetry::default();
+
     for phase in phases {
         match phase {
-            SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+            SearchPhase::Initial {
+                results,
+                latency_ms,
+            } => {
+                telemetry.initial_latency_ms.get_or_insert(latency_ms);
                 if !results.is_empty() {
-                    return Some(results);
+                    telemetry.was_refined = false;
+                    return Some(TwoTierSelectedResults { results, telemetry });
+                }
+            }
+            SearchPhase::Refined {
+                results,
+                latency_ms,
+            } => {
+                telemetry.refinement_latency_ms = Some(latency_ms);
+                if !results.is_empty() {
+                    telemetry.was_refined = true;
+                    return Some(TwoTierSelectedResults { results, telemetry });
                 }
             }
             SearchPhase::RefinementFailed { error } => {
@@ -669,6 +725,47 @@ where
                     error = %error,
                     "two-tier refinement failed during fast-first selection"
                 );
+                if telemetry.refinement_error.is_none() {
+                    telemetry.refinement_error = Some(error);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "hybrid")]
+fn select_initial_two_tier_results<I>(phases: I) -> Option<TwoTierSelectedResults>
+where
+    I: IntoIterator<Item = SearchPhase>,
+{
+    let mut telemetry = TwoTierSearchTelemetry {
+        fast_only_mode: true,
+        ..TwoTierSearchTelemetry::default()
+    };
+
+    for phase in phases {
+        match phase {
+            SearchPhase::Initial {
+                results,
+                latency_ms,
+            } => {
+                telemetry.initial_latency_ms.get_or_insert(latency_ms);
+                telemetry.was_refined = false;
+                return Some(TwoTierSelectedResults { results, telemetry });
+            }
+            SearchPhase::Refined {
+                results,
+                latency_ms,
+            } => {
+                telemetry.refinement_latency_ms = Some(latency_ms);
+                telemetry.was_refined = true;
+                return Some(TwoTierSelectedResults { results, telemetry });
+            }
+            SearchPhase::RefinementFailed { error } => {
+                telemetry.refinement_error = Some(error);
+                return None;
             }
         }
     }
@@ -896,7 +993,7 @@ impl TwoTierBridge {
     /// This returns the best available phase: refined results when quality
     /// refinement succeeds, otherwise the initial fast phase.
     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
-        self.search_with_policy(query, limit, false)
+        self.search_with_policy(query, limit, false).results
     }
 
     /// Budget-aware two-tier search that can prefer fast-first selection.
@@ -904,28 +1001,38 @@ impl TwoTierBridge {
     /// When remaining request budget is tight, this path keeps latency bounded by
     /// selecting the earliest non-empty phase instead of waiting for refinement.
     pub fn search_with_cx(&self, cx: &Cx, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
+        self.search_with_cx_outcome(cx, query, limit).results
+    }
+
+    fn search_with_cx_outcome(
+        &self,
+        cx: &Cx,
+        query: &SearchQuery,
+        limit: usize,
+    ) -> TwoTierSearchOutcome {
         if cx.checkpoint().is_err() {
             tracing::debug!(
                 target: "search.semantic",
                 "two-tier search cancelled before dispatch"
             );
-            return Vec::new();
+            return TwoTierSearchOutcome::default();
         }
 
         let remaining_ms = request_budget_remaining_ms(cx).unwrap_or(u64::MAX);
         let fast_first_budget_ms = two_tier_fast_first_budget_ms();
         let prefer_fast_first = remaining_ms <= fast_first_budget_ms;
 
-        let results = self.search_with_policy(query, limit, prefer_fast_first);
+        let mut outcome = self.search_with_policy(query, limit, prefer_fast_first);
         if cx.checkpoint().is_err() {
             tracing::debug!(
                 target: "search.semantic",
                 "two-tier search cancelled after dispatch"
             );
-            return Vec::new();
+            outcome.results.clear();
+            return outcome;
         }
 
-        results
+        outcome
     }
 
     fn search_with_policy(
@@ -933,8 +1040,13 @@ impl TwoTierBridge {
         query: &SearchQuery,
         limit: usize,
         prefer_fast_first: bool,
-    ) -> Vec<SearchResult> {
+    ) -> TwoTierSearchOutcome {
         let ctx = get_two_tier_context();
+        let force_fast_only = two_tier_fast_only_enabled();
+        let mut fallback_telemetry = TwoTierSearchTelemetry {
+            fast_only_mode: force_fast_only,
+            ..TwoTierSearchTelemetry::default()
+        };
 
         // Two-tier bridge requires fast embeddings for both query and indexed docs.
         if ctx.fast_info().is_none() {
@@ -942,7 +1054,10 @@ impl TwoTierBridge {
                 target: "search.semantic",
                 "fast embedder unavailable, skipping two-tier search"
             );
-            return Vec::new();
+            return TwoTierSearchOutcome {
+                results: Vec::new(),
+                telemetry: fallback_telemetry,
+            };
         }
 
         let (selected_results, had_searcher) = {
@@ -950,7 +1065,9 @@ impl TwoTierBridge {
             ctx.create_searcher(&index)
                 .map_or((None, false), |searcher| {
                     (
-                        if prefer_fast_first {
+                        if force_fast_only {
+                            select_initial_two_tier_results(searcher.search(&query.text, limit))
+                        } else if prefer_fast_first {
                             select_fast_first_two_tier_results(searcher.search(&query.text, limit))
                         } else {
                             select_best_two_tier_results(searcher.search(&query.text, limit))
@@ -960,8 +1077,14 @@ impl TwoTierBridge {
                 })
         };
 
-        if let Some(results) = selected_results {
-            return scored_results_to_search_results(results);
+        if let Some(mut selected) = selected_results {
+            if force_fast_only {
+                selected.telemetry.fast_only_mode = true;
+            }
+            return TwoTierSearchOutcome {
+                results: scored_results_to_search_results(selected.results),
+                telemetry: selected.telemetry,
+            };
         }
 
         if had_searcher {
@@ -978,6 +1101,7 @@ impl TwoTierBridge {
 
         // Deterministic fallback: run plain fast-tier search if progressive path
         // is unavailable or yields no phases.
+        let fallback_start = std::time::Instant::now();
         let embedding = match ctx.embed_fast(&query.text) {
             Ok(emb) => emb,
             Err(e) => {
@@ -986,12 +1110,26 @@ impl TwoTierBridge {
                     error = %e,
                     "failed to embed query with fast tier"
                 );
-                return Vec::new();
+                fallback_telemetry.refinement_error = Some(e.to_string());
+                return TwoTierSearchOutcome {
+                    results: Vec::new(),
+                    telemetry: fallback_telemetry,
+                };
             }
         };
 
         let hits = self.index().search_fast(&embedding, limit);
-        scored_results_to_search_results(hits)
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            fallback_telemetry.initial_latency_ms =
+                Some(fallback_start.elapsed().as_millis() as u64);
+        }
+        fallback_telemetry.was_refined = false;
+
+        TwoTierSearchOutcome {
+            results: scored_results_to_search_results(hits),
+            telemetry: fallback_telemetry,
+        }
     }
 
     /// Add a document to the two-tier index.
@@ -1178,10 +1316,10 @@ fn try_two_tier_search_with_cx(
     cx: &Cx,
     query: &SearchQuery,
     limit: usize,
-) -> Option<Vec<SearchResult>> {
+) -> Option<TwoTierSearchOutcome> {
     let bridge = get_or_init_two_tier_bridge()?;
     if bridge.is_available() {
-        Some(bridge.search_with_cx(cx, query, limit))
+        Some(bridge.search_with_cx_outcome(cx, query, limit))
     } else {
         None
     }
@@ -1207,6 +1345,8 @@ const DEFAULT_RERANK_MODEL_NAME: &str = "flashrank";
 const AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS_ENV: &str = "AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS";
 #[cfg(feature = "hybrid")]
 const DEFAULT_TWO_TIER_FAST_FIRST_BUDGET_MS: u64 = 150;
+#[cfg(feature = "hybrid")]
+const AM_SEARCH_TWO_TIER_FAST_ONLY_ENV: &str = "AM_SEARCH_TWO_TIER_FAST_ONLY";
 const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_ENABLED_ENV: &str =
     "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_ENABLED";
 const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS_ENV: &str =
@@ -1373,6 +1513,11 @@ struct HybridRerankAudit {
     blend_policy: Option<String>,
     blend_weight: Option<f64>,
     applied_count: usize,
+    two_tier_initial_latency_ms: Option<u64>,
+    two_tier_refinement_latency_ms: Option<u64>,
+    two_tier_was_refined: Option<bool>,
+    two_tier_refinement_failed: bool,
+    two_tier_fast_only: bool,
 }
 
 fn parse_env_bool(value: &str) -> Option<bool> {
@@ -1628,6 +1773,11 @@ fn two_tier_fast_first_budget_ms() -> u64 {
 }
 
 #[cfg(feature = "hybrid")]
+fn two_tier_fast_only_enabled() -> bool {
+    env_bool(AM_SEARCH_TWO_TIER_FAST_ONLY_ENV, false)
+}
+
+#[cfg(feature = "hybrid")]
 fn resolve_rerank_model_dir() -> Option<PathBuf> {
     if let Ok(path) = std::env::var(AM_SEARCH_RERANK_MODEL_DIR_ENV) {
         return Some(PathBuf::from(path));
@@ -1734,6 +1884,11 @@ async fn maybe_apply_hybrid_rerank(
         blend_policy: Some(config.blend_policy.as_str().to_string()),
         blend_weight: Some(config.blend_weight),
         applied_count: 0,
+        two_tier_initial_latency_ms: None,
+        two_tier_refinement_latency_ms: None,
+        two_tier_was_refined: None,
+        two_tier_refinement_failed: false,
+        two_tier_fast_only: false,
     };
 
     if !config.enabled {
@@ -1931,6 +2086,11 @@ fn rerank_skip_audit_for_governor(
         blend_policy: None,
         blend_weight: None,
         applied_count: 0,
+        two_tier_initial_latency_ms: None,
+        two_tier_refinement_latency_ms: None,
+        two_tier_was_refined: None,
+        two_tier_refinement_failed: false,
+        two_tier_fast_only: false,
     }
 }
 
@@ -1980,6 +2140,21 @@ fn build_v3_query_explain(
         }
         if let Some(weight) = audit.blend_weight {
             facets_applied.push(format!("rerank_blend_weight:{weight:.3}"));
+        }
+        if let Some(latency_ms) = audit.two_tier_initial_latency_ms {
+            facets_applied.push(format!("two_tier_initial_latency_ms:{latency_ms}"));
+        }
+        if let Some(latency_ms) = audit.two_tier_refinement_latency_ms {
+            facets_applied.push(format!("two_tier_refinement_latency_ms:{latency_ms}"));
+        }
+        if let Some(was_refined) = audit.two_tier_was_refined {
+            facets_applied.push(format!("two_tier_was_refined:{was_refined}"));
+        }
+        if audit.two_tier_refinement_failed {
+            facets_applied.push("two_tier_refinement_failed:true".to_string());
+        }
+        if audit.two_tier_fast_only {
+            facets_applied.push("two_tier_fast_only:true".to_string());
         }
     }
 
@@ -2216,23 +2391,37 @@ pub async fn execute_search(
             // Two-tier semantic candidates are optional; missing bridge degrades
             // to lexical-only while preserving deterministic fusion behavior.
             #[cfg(feature = "hybrid")]
-            let semantic_results = if plan.derivation.budget.semantic_limit == 0 {
-                Vec::new()
-            } else {
-                try_two_tier_search_with_cx(cx, query, plan.derivation.budget.semantic_limit)
-                    .unwrap_or_default()
-            };
+            let (semantic_results, two_tier_telemetry) =
+                if plan.derivation.budget.semantic_limit == 0 {
+                    (Vec::new(), None)
+                } else {
+                    try_two_tier_search_with_cx(cx, query, plan.derivation.budget.semantic_limit)
+                        .map_or((Vec::new(), None), |outcome| {
+                            (outcome.results, Some(outcome.telemetry))
+                        })
+                };
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
 
-            let (mut raw_results, rerank_audit) = orchestrate_hybrid_results_with_optional_rerank(
-                cx,
-                query,
-                &plan,
-                lexical_results,
-                semantic_results,
-            )
-            .await;
+            let (mut raw_results, mut rerank_audit) =
+                orchestrate_hybrid_results_with_optional_rerank(
+                    cx,
+                    query,
+                    &plan,
+                    lexical_results,
+                    semantic_results,
+                )
+                .await;
+            #[cfg(feature = "hybrid")]
+            if let (Some(audit), Some(telemetry)) =
+                (rerank_audit.as_mut(), two_tier_telemetry.as_ref())
+            {
+                audit.two_tier_initial_latency_ms = telemetry.initial_latency_ms;
+                audit.two_tier_refinement_latency_ms = telemetry.refinement_latency_ms;
+                audit.two_tier_was_refined = Some(telemetry.was_refined);
+                audit.two_tier_refinement_failed = telemetry.refinement_error.is_some();
+                audit.two_tier_fast_only = telemetry.fast_only_mode;
+            }
 
             // Hydrate missing details for semantic-only results (which lack body/title in the index)
             let missing_ids: Vec<i64> = raw_results
@@ -3110,6 +3299,11 @@ mod tests {
             blend_policy: Some("weighted".to_string()),
             blend_weight: Some(0.35),
             applied_count: 9,
+            two_tier_initial_latency_ms: Some(4),
+            two_tier_refinement_latency_ms: Some(21),
+            two_tier_was_refined: Some(true),
+            two_tier_refinement_failed: false,
+            two_tier_fast_only: false,
         };
 
         let explain = build_v3_query_explain(&query, SearchEngine::Hybrid, Some(&rerank_audit));
@@ -3132,6 +3326,63 @@ mod tests {
                 .facets_applied
                 .iter()
                 .any(|facet| facet == "rerank_applied_count:9")
+        );
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "two_tier_initial_latency_ms:4")
+        );
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "two_tier_refinement_latency_ms:21")
+        );
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "two_tier_was_refined:true")
+        );
+    }
+
+    #[test]
+    fn build_v3_query_explain_includes_two_tier_failure_and_fast_only_facets() {
+        let query = SearchQuery {
+            text: "outage rollback".to_string(),
+            explain: true,
+            ..SearchQuery::messages("outage rollback", 1)
+        };
+        let rerank_audit = HybridRerankAudit {
+            enabled: false,
+            attempted: false,
+            outcome: "disabled".to_string(),
+            candidate_count: 3,
+            top_k: 0,
+            min_candidates: 0,
+            blend_policy: None,
+            blend_weight: None,
+            applied_count: 0,
+            two_tier_initial_latency_ms: Some(3),
+            two_tier_refinement_latency_ms: None,
+            two_tier_was_refined: Some(false),
+            two_tier_refinement_failed: true,
+            two_tier_fast_only: true,
+        };
+
+        let explain = build_v3_query_explain(&query, SearchEngine::Hybrid, Some(&rerank_audit));
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "two_tier_refinement_failed:true")
+        );
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "two_tier_fast_only:true")
         );
     }
 
@@ -3289,8 +3540,11 @@ mod tests {
 
         let selected =
             select_best_two_tier_results(phases).expect("expected at least one usable phase");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].doc_id, 2);
+        assert_eq!(selected.results.len(), 1);
+        assert_eq!(selected.results[0].doc_id, 2);
+        assert_eq!(selected.telemetry.initial_latency_ms, Some(5));
+        assert_eq!(selected.telemetry.refinement_latency_ms, Some(21));
+        assert!(selected.telemetry.was_refined);
     }
 
     #[cfg(feature = "hybrid")]
@@ -3308,8 +3562,14 @@ mod tests {
 
         let selected =
             select_best_two_tier_results(phases).expect("initial phase should be preserved");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].doc_id, 11);
+        assert_eq!(selected.results.len(), 1);
+        assert_eq!(selected.results[0].doc_id, 11);
+        assert_eq!(selected.telemetry.initial_latency_ms, Some(6));
+        assert_eq!(
+            selected.telemetry.refinement_error.as_deref(),
+            Some("quality embedder unavailable")
+        );
+        assert!(!selected.telemetry.was_refined);
     }
 
     #[cfg(feature = "hybrid")]
@@ -3328,8 +3588,11 @@ mod tests {
 
         let selected =
             select_best_two_tier_results(phases).expect("initial phase should be preserved");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].doc_id, 17);
+        assert_eq!(selected.results.len(), 1);
+        assert_eq!(selected.results[0].doc_id, 17);
+        assert_eq!(selected.telemetry.initial_latency_ms, Some(4));
+        assert_eq!(selected.telemetry.refinement_latency_ms, Some(12));
+        assert!(!selected.telemetry.was_refined);
     }
 
     #[cfg(feature = "hybrid")]
@@ -3355,8 +3618,10 @@ mod tests {
 
         let selected = select_fast_first_two_tier_results(phases)
             .expect("fast-first selection should return initial phase");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].doc_id, 11);
+        assert_eq!(selected.results.len(), 1);
+        assert_eq!(selected.results[0].doc_id, 11);
+        assert_eq!(selected.telemetry.initial_latency_ms, Some(4));
+        assert!(!selected.telemetry.was_refined);
     }
 
     #[cfg(feature = "hybrid")]
@@ -3375,8 +3640,11 @@ mod tests {
 
         let selected = select_fast_first_two_tier_results(phases)
             .expect("fast-first selection should use refined phase when initial is empty");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].doc_id, 7);
+        assert_eq!(selected.results.len(), 1);
+        assert_eq!(selected.results[0].doc_id, 7);
+        assert_eq!(selected.telemetry.initial_latency_ms, Some(3));
+        assert_eq!(selected.telemetry.refinement_latency_ms, Some(14));
+        assert!(selected.telemetry.was_refined);
     }
 
     #[cfg(feature = "hybrid")]
@@ -3384,6 +3652,29 @@ mod tests {
     fn select_fast_first_two_tier_results_none_for_empty_iterator() {
         let phases: Vec<SearchPhase> = Vec::new();
         assert!(select_fast_first_two_tier_results(phases).is_none());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn select_initial_two_tier_results_marks_fast_only_mode() {
+        let phases = vec![
+            SearchPhase::Initial {
+                results: vec![make_scored(5, 0.44)],
+                latency_ms: 2,
+            },
+            SearchPhase::Refined {
+                results: vec![make_scored(99, 0.99)],
+                latency_ms: 19,
+            },
+        ];
+
+        let selected = select_initial_two_tier_results(phases)
+            .expect("fast-only selection should return the initial phase");
+        assert_eq!(selected.results.len(), 1);
+        assert_eq!(selected.results[0].doc_id, 5);
+        assert_eq!(selected.telemetry.initial_latency_ms, Some(2));
+        assert!(selected.telemetry.fast_only_mode);
+        assert!(!selected.telemetry.was_refined);
     }
 
     #[cfg(feature = "hybrid")]

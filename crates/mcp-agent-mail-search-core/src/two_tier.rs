@@ -1383,6 +1383,265 @@ mod tests {
     }
 
     #[test]
+    fn test_progressive_search_emits_initial_then_refined_and_can_rerank() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            quality_weight: 1.0,
+            ..TwoTierConfig::default()
+        };
+
+        let entries = vec![
+            TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(3.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(0.1, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 2,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(2.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(5.0, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 3,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(1.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(4.0, config.quality_dimension),
+                has_quality: true,
+            },
+        ];
+
+        let index = TwoTierIndex::build("fast", "quality", &config, entries).unwrap();
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 3).collect();
+        assert_eq!(phases.len(), 2, "should emit initial and refined phases");
+
+        let (initial_results, initial_latency_ms) = match &phases[0] {
+            SearchPhase::Initial {
+                results,
+                latency_ms,
+            } => (results, *latency_ms),
+            _ => panic!("phase 0 should be Initial"),
+        };
+        let (refined_results, refinement_latency_ms) = match &phases[1] {
+            SearchPhase::Refined {
+                results,
+                latency_ms,
+            } => (results, *latency_ms),
+            _ => panic!("phase 1 should be Refined"),
+        };
+
+        assert_eq!(initial_results[0].doc_id, 1);
+        assert_eq!(
+            refined_results[0].doc_id, 2,
+            "quality refinement should be able to rerank top hit"
+        );
+        assert!(
+            refinement_latency_ms >= initial_latency_ms,
+            "refinement phase should not be faster than initial phase in this deterministic setup"
+        );
+    }
+
+    #[test]
+    fn test_fast_only_search_emits_initial_phase_only() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            fast_only: true,
+            ..TwoTierConfig::default()
+        };
+
+        let entries = vec![
+            TwoTierEntry {
+                doc_id: 10,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(2.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(2.0, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 11,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(1.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(1.0, config.quality_dimension),
+                has_quality: true,
+            },
+        ];
+
+        let index = TwoTierIndex::build("fast", "quality", &config, entries).unwrap();
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
+        assert_eq!(phases.len(), 1, "fast-only should emit only Initial phase");
+        assert!(matches!(phases[0], SearchPhase::Initial { .. }));
+    }
+
+    #[test]
+    fn test_progressive_search_limit_zero_returns_empty_results() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+
+        let entries = vec![TwoTierEntry {
+            doc_id: 1,
+            doc_kind: crate::document::DocKind::Message,
+            project_id: Some(1),
+            fast_embedding: axis_f16_embedding(1.0, config.fast_dimension),
+            quality_embedding: axis_f16_embedding(1.0, config.quality_dimension),
+            has_quality: true,
+        }];
+
+        let index = TwoTierIndex::build("fast", "quality", &config, entries).unwrap();
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 0).collect();
+        assert_eq!(phases.len(), 2);
+        for phase in &phases {
+            match phase {
+                SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+                    assert!(results.is_empty());
+                }
+                SearchPhase::RefinementFailed { .. } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_progressive_search_limit_exceeds_doc_count_caps_results() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+
+        let entries = vec![
+            TwoTierEntry {
+                doc_id: 21,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(3.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(1.0, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 22,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(2.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(2.0, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 23,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(1.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(3.0, config.quality_dimension),
+                has_quality: true,
+            },
+        ];
+
+        let index = TwoTierIndex::build("fast", "quality", &config, entries).unwrap();
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 1000).collect();
+        assert_eq!(phases.len(), 2);
+        let initial_count = match &phases[0] {
+            SearchPhase::Initial { results, .. } => results.len(),
+            _ => panic!("phase 0 should be Initial"),
+        };
+        let refined_count = match &phases[1] {
+            SearchPhase::Refined { results, .. } => results.len(),
+            _ => panic!("phase 1 should be Refined"),
+        };
+        assert_eq!(initial_count, 3);
+        assert_eq!(refined_count, 3);
+    }
+
+    #[test]
+    fn test_refinement_uses_fast_scores_for_docs_without_quality_embeddings() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            quality_weight: 0.7,
+            ..TwoTierConfig::default()
+        };
+
+        let entries = vec![
+            TwoTierEntry {
+                doc_id: 101,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(0.8, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(0.3, config.quality_dimension),
+                has_quality: true,
+            },
+            // Intentionally large quality vector, but has_quality=false means
+            // refinement must ignore this vector and keep fast-only scoring.
+            TwoTierEntry {
+                doc_id: 202,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(0.6, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(50.0, config.quality_dimension),
+                has_quality: false,
+            },
+        ];
+
+        let index = TwoTierIndex::build("fast", "quality", &config, entries).unwrap();
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
+        assert_eq!(phases.len(), 2);
+        let refined = match &phases[1] {
+            SearchPhase::Refined { results, .. } => results,
+            _ => panic!("phase 1 should be Refined"),
+        };
+        assert_eq!(refined.len(), 2);
+        assert_eq!(
+            refined[0].doc_id, 202,
+            "doc without quality embedding should keep fast score and outrank doc 101"
+        );
+    }
+
+    #[test]
     fn test_quality_only_search_emits_refined_phase_first() {
         let config = TwoTierConfig {
             fast_dimension: 2,
