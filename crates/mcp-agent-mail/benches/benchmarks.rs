@@ -1780,6 +1780,7 @@ fn run_share_export_once(
         &fixture.storage_root,
         inline_threshold,
         detach_threshold,
+        true,
     )
     .expect("bundle_attachments");
 

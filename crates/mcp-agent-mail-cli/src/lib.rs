@@ -2025,7 +2025,7 @@ fn kill_port_holder(port: u16) {
                 .status();
 
             // If check fails (exit code 1), it means no processes found -> success
-            if check_result.map_or(false, |s| !s.success()) {
+            if check_result.is_ok_and(|s| !s.success()) {
                 return;
             }
 

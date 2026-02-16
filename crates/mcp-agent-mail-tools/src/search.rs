@@ -147,6 +147,20 @@ fn is_ordered_prefix(s: &str) -> bool {
     matches!(bytes[0], b'1' | b'2' | b'3' | b'4' | b'5') && bytes[1] == b'.'
 }
 
+fn backtick_snippets(s: &str) -> Vec<&str> {
+    let mut snippets = Vec::new();
+    let mut remaining = s;
+    while let Some(start) = remaining.find('`') {
+        let after_start = &remaining[start + 1..];
+        let Some(end) = after_start.find('`') else {
+            break;
+        };
+        snippets.push(&after_start[..end]);
+        remaining = &after_start[end + 1..];
+    }
+    snippets
+}
+
 fn parse_thread_ids(thread_id: &str) -> Vec<String> {
     thread_id
         .split(',')
@@ -261,6 +275,8 @@ pub(crate) fn derive_search_diagnostics(
 pub(crate) fn summarize_messages(
     rows: &[mcp_agent_mail_db::queries::ThreadMessageRow],
 ) -> ThreadSummary {
+    const MENTION_TRIM: &[char] = &['.', ',', ':', ';', '(', ')', '[', ']', '{', '}'];
+
     let mut participants: HashSet<String> = HashSet::with_capacity(rows.len().min(16));
     let mut key_points: Vec<String> = Vec::with_capacity(8);
     let mut action_items: Vec<String> = Vec::with_capacity(8);
@@ -282,8 +298,7 @@ pub(crate) fn summarize_messages(
             // Mentions
             for token in stripped.split_whitespace() {
                 if let Some(rest) = token.strip_prefix('@') {
-                    let name =
-                        rest.trim_matches(&['.', ',', ':', ';', '(', ')', '[', ']', '{', '}'][..]);
+                    let name = rest.trim_matches(MENTION_TRIM);
                     if !name.is_empty() {
                         *mentions.entry(name.to_string()).or_insert(0) += 1;
                     }
@@ -291,23 +306,15 @@ pub(crate) fn summarize_messages(
             }
 
             // Code references in backticks
-            let mut start = 0;
-            while let Some(i) = stripped[start..].find('`') {
-                let i = start + i;
-                if let Some(j_rel) = stripped[i + 1..].find('`') {
-                    let j = i + 1 + j_rel;
-                    let snippet = stripped[i + 1..j].trim();
-                    if (snippet.contains('/')
-                        || snippet.contains(".py")
-                        || snippet.contains(".ts")
-                        || snippet.contains(".md"))
-                        && (1..=120).contains(&snippet.len())
-                    {
-                        code_references.insert(snippet.to_string());
-                    }
-                    start = j + 1;
-                } else {
-                    break;
+            for snippet in backtick_snippets(stripped) {
+                let snippet = snippet.trim();
+                if (snippet.contains('/')
+                    || snippet.contains(".py")
+                    || snippet.contains(".ts")
+                    || snippet.contains(".md"))
+                    && (1..=120).contains(&snippet.len())
+                {
+                    code_references.insert(snippet.to_string());
                 }
             }
 

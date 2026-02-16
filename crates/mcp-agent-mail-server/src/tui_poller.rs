@@ -68,9 +68,9 @@ impl<'a> DbStatQueryBatcher<'a> {
         Self { conn }
     }
 
-    fn fetch_snapshot(&self) -> DbStatSnapshot {
+    fn fetch_snapshot(&self) -> Option<DbStatSnapshot> {
         let counts = self.fetch_counts();
-        DbStatSnapshot {
+        Some(DbStatSnapshot {
             projects: counts.projects,
             agents: counts.agents,
             messages: counts.messages,
@@ -82,7 +82,7 @@ impl<'a> DbStatQueryBatcher<'a> {
             contacts_list: fetch_contacts_list(self.conn),
             reservation_snapshots: fetch_reservation_snapshots(self.conn),
             timestamp_micros: now_micros(),
-        }
+        })
     }
 
     fn fetch_counts(&self) -> DbSnapshotCounts {
@@ -129,29 +129,40 @@ impl<'a> DbStatQueryBatcher<'a> {
 
     fn fetch_counts_fallback(&self) -> DbSnapshotCounts {
         DbSnapshotCounts {
-            projects: self.run_count_query("SELECT COUNT(*) AS c FROM projects"),
-            agents: self.run_count_query("SELECT COUNT(*) AS c FROM agents"),
-            messages: self.run_count_query("SELECT COUNT(*) AS c FROM messages"),
+            projects: self
+                .run_count_query("SELECT COUNT(*) AS c FROM projects")
+                .unwrap_or(0),
+            agents: self
+                .run_count_query("SELECT COUNT(*) AS c FROM agents")
+                .unwrap_or(0),
+            messages: self
+                .run_count_query("SELECT COUNT(*) AS c FROM messages")
+                .unwrap_or(0),
             file_reservations: self.run_count_query(&format!(
                 "SELECT COUNT(*) AS c FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})"
-            )),
-            contact_links: self.run_count_query("SELECT COUNT(*) AS c FROM agent_links"),
-            ack_pending: self.run_count_query(
-                "SELECT COUNT(*) AS c FROM message_recipients mr \
-                 JOIN messages m ON m.id = mr.message_id \
-                 WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
-            ),
+            ))
+            .unwrap_or(0),
+            contact_links: self
+                .run_count_query("SELECT COUNT(*) AS c FROM agent_links")
+                .unwrap_or(0),
+            ack_pending: self
+                .run_count_query(
+                    "SELECT COUNT(*) AS c FROM message_recipients mr \
+                     JOIN messages m ON m.id = mr.message_id \
+                     WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
+                )
+                .unwrap_or(0),
         }
     }
 
-    fn run_count_query(&self, sql: &str) -> u64 {
+    fn run_count_query(&self, sql: &str) -> Option<u64> {
         self.conn
             .query_sync(sql, &[])
-            .ok()
-            .and_then(|rows| rows.into_iter().next())
+            .ok()?
+            .into_iter()
+            .next()
             .and_then(|row| row.get_named::<i64>("c").ok())
             .and_then(|v| u64::try_from(v).ok())
-            .unwrap_or(0)
     }
 }
 
@@ -284,7 +295,7 @@ impl Drop for DbPollerHandle {
 /// previous snapshot instead of clearing existing data.
 fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
     let conn = open_sync_connection(database_url)?;
-    Some(DbStatQueryBatcher::new(&conn).fetch_snapshot())
+    DbStatQueryBatcher::new(&conn).fetch_snapshot()
 }
 
 /// Open a sync `SQLite` connection from a database URL.
@@ -471,9 +482,9 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
     let rows = match conn.query_sync(&sql, &[]) {
         Ok(rows) => rows,
         Err(err) => {
-            tracing::warn!(
+            tracing::debug!(
                 error = ?err,
-                "tui_poller.fetch_reservation_snapshots query failed; returning empty snapshot set"
+                "tui_poller.fetch_reservation_snapshots query failed"
             );
             return Vec::new();
         }

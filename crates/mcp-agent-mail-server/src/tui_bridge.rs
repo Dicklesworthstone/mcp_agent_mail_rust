@@ -6,7 +6,7 @@ use crate::tui_events::{
 };
 use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +15,44 @@ const REQUEST_SPARKLINE_CAPACITY: usize = 60;
 const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4096;
 /// Max console log entries in the ring buffer.
 const CONSOLE_LOG_CAPACITY: usize = 2000;
+
+#[derive(Debug)]
+struct AtomicSparkline {
+    data: [AtomicU64; REQUEST_SPARKLINE_CAPACITY],
+    head: AtomicUsize,
+}
+
+impl AtomicSparkline {
+    fn new() -> Self {
+        Self {
+            data: std::array::from_fn(|_| AtomicU64::new(0)),
+            head: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, value: f64) {
+        let idx = self.head.fetch_add(1, Ordering::Relaxed) % REQUEST_SPARKLINE_CAPACITY;
+        self.data[idx].store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Vec<f64> {
+        let head = self.head.load(Ordering::Relaxed);
+        let mut result = Vec::with_capacity(REQUEST_SPARKLINE_CAPACITY);
+        let count = head.min(REQUEST_SPARKLINE_CAPACITY);
+        let start_idx = if head > REQUEST_SPARKLINE_CAPACITY {
+            head % REQUEST_SPARKLINE_CAPACITY
+        } else {
+            0
+        };
+
+        for i in 0..count {
+            let idx = (start_idx + i) % REQUEST_SPARKLINE_CAPACITY;
+            let bits = self.data[idx].load(Ordering::Relaxed);
+            result.push(f64::from_bits(bits));
+        }
+        result
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportBase {
@@ -144,7 +182,7 @@ pub struct TuiSharedState {
     detach_headless: AtomicBool,
     config_snapshot: Mutex<ConfigSnapshot>,
     db_stats: Mutex<DbStatSnapshot>,
-    sparkline_data: Mutex<VecDeque<f64>>,
+    sparkline_data: AtomicSparkline,
     remote_terminal_events: Mutex<VecDeque<RemoteTerminalEvent>>,
     server_control_tx: Mutex<Option<Sender<ServerControlMsg>>>,
     /// Console log ring buffer: `(seq, text)` pairs for tool call cards etc.
@@ -172,7 +210,7 @@ impl TuiSharedState {
             detach_headless: AtomicBool::new(false),
             config_snapshot: Mutex::new(ConfigSnapshot::from_config(config)),
             db_stats: Mutex::new(DbStatSnapshot::default()),
-            sparkline_data: Mutex::new(VecDeque::with_capacity(REQUEST_SPARKLINE_CAPACITY)),
+            sparkline_data: AtomicSparkline::new(),
             remote_terminal_events: Mutex::new(VecDeque::with_capacity(
                 REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY,
             )),
@@ -228,13 +266,7 @@ impl TuiSharedState {
             _ => {}
         }
 
-        if let Ok(mut sparkline) = self.sparkline_data.try_lock() {
-            if sparkline.len() >= REQUEST_SPARKLINE_CAPACITY {
-                let _ = sparkline.pop_front();
-            }
-            let duration_u32 = u32::try_from(duration_ms).unwrap_or(u32::MAX);
-            sparkline.push_back(f64::from(duration_u32));
-        }
+        self.sparkline_data.push(duration_ms as f64);
     }
 
     pub fn update_db_stats(&self, stats: DbStatSnapshot) {
@@ -354,11 +386,7 @@ impl TuiSharedState {
 
     #[must_use]
     pub fn sparkline_snapshot(&self) -> Vec<f64> {
-        let sparkline = self
-            .sparkline_data
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sparkline.iter().copied().collect()
+        self.sparkline_data.snapshot()
     }
 
     #[must_use]

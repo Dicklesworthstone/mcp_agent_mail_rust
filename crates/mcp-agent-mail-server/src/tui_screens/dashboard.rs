@@ -4,7 +4,7 @@
 //! responsive layout that adapts from 80×24 to 200×50+.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ftui::Style;
@@ -209,7 +209,7 @@ pub(crate) struct DetectedAnomaly {
 #[allow(clippy::struct_excessive_bools)]
 pub struct DashboardScreen {
     /// Cached event log lines (rendered from `MailEvent`s).
-    event_log: Vec<EventEntry>,
+    event_log: VecDeque<EventEntry>,
     /// Last sequence number consumed from the ring buffer.
     last_seq: u64,
     /// Scroll offset from the bottom (0 = auto-follow).
@@ -394,7 +394,7 @@ impl DashboardScreen {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            event_log: Vec::with_capacity(EVENT_LOG_CAPACITY),
+            event_log: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
             last_seq: 0,
             scroll_offset: 0,
             auto_follow: true,
@@ -438,7 +438,7 @@ impl DashboardScreen {
             if let Some(preview) = RecentMessagePreview::from_event(event) {
                 self.recent_message_preview = Some(preview);
             }
-            self.event_log.push(format_event(event));
+            self.event_log.push_back(format_event(event));
         }
         self.trim_event_log();
     }
@@ -474,7 +474,7 @@ impl DashboardScreen {
                     if let Some(preview) = RecentMessagePreview::from_event(&synthetic) {
                         self.recent_message_preview = Some(preview);
                     }
-                    self.event_log.push(format_event(&synthetic));
+                    self.event_log.push_back(format_event(&synthetic));
                 }
                 if snapshot.file_reservations > 0 {
                     let mut path = if snapshot.file_reservations == 1 {
@@ -496,7 +496,7 @@ impl DashboardScreen {
                         0,
                         "all-projects",
                     );
-                    self.event_log.push(format_event(&synthetic));
+                    self.event_log.push_back(format_event(&synthetic));
                 }
                 self.trim_event_log();
             }
@@ -524,7 +524,7 @@ impl DashboardScreen {
             if let Some(preview) = RecentMessagePreview::from_event(&synthetic) {
                 self.recent_message_preview = Some(preview);
             }
-            self.event_log.push(format_event(&synthetic));
+            self.event_log.push_back(format_event(&synthetic));
         }
 
         if snapshot.file_reservations > self.last_db_reservations {
@@ -542,7 +542,7 @@ impl DashboardScreen {
             }
             let synthetic =
                 MailEvent::reservation_granted("db-poller", vec![path], false, 0, "all-projects");
-            self.event_log.push(format_event(&synthetic));
+            self.event_log.push_back(format_event(&synthetic));
         } else if snapshot.file_reservations < self.last_db_reservations {
             let delta = self
                 .last_db_reservations
@@ -558,7 +558,7 @@ impl DashboardScreen {
             }
             let synthetic =
                 MailEvent::reservation_released("db-poller", vec![path], "all-projects");
-            self.event_log.push(format_event(&synthetic));
+            self.event_log.push_back(format_event(&synthetic));
         }
 
         self.last_db_messages = snapshot.messages;
@@ -568,9 +568,8 @@ impl DashboardScreen {
     }
 
     fn trim_event_log(&mut self) {
-        if self.event_log.len() > EVENT_LOG_CAPACITY {
-            let excess = self.event_log.len() - EVENT_LOG_CAPACITY;
-            self.event_log.drain(..excess);
+        while self.event_log.len() > EVENT_LOG_CAPACITY {
+            self.event_log.pop_front();
         }
     }
 
@@ -1904,7 +1903,7 @@ fn render_insight_rail(
     entries: &[&EventEntry],
     percentile_history: &[PercentileSample],
     throughput_history: &[f64],
-    event_log: &[EventEntry],
+    event_log: &VecDeque<EventEntry>,
 ) {
     if area.width < 24 || area.height < 8 {
         return;
@@ -3020,136 +3019,6 @@ fn render_signal_panel(
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn render_event_mix_panel(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    entries: &[&EventEntry],
-    query_text: &str,
-) {
-    if area.width < 18 || area.height < 3 {
-        return;
-    }
-    let query_terms = parse_query_terms(query_text);
-    let filtered: Vec<&EventEntry> = entries
-        .iter()
-        .copied()
-        .filter(|entry| event_entry_matches_query(entry, &query_terms))
-        .collect();
-
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Event Mix · {}", filtered.len());
-    let block = Block::default()
-        .title(&title)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    if filtered.is_empty() {
-        Paragraph::new("No matching events")
-            .style(crate::tui_theme::text_meta(&tp))
-            .render(inner, frame);
-        return;
-    }
-
-    let mut by_kind: HashMap<MailEventKind, usize> = HashMap::new();
-    let mut msg = 0usize;
-    let mut tool = 0usize;
-    let mut reservation = 0usize;
-    let mut http = 0usize;
-    let mut lifecycle = 0usize;
-    let mut warn = 0usize;
-    let mut error = 0usize;
-
-    for entry in &filtered {
-        *by_kind.entry(entry.kind).or_insert(0) += 1;
-        if matches!(entry.severity, EventSeverity::Warn) {
-            warn += 1;
-        }
-        if matches!(entry.severity, EventSeverity::Error) {
-            error += 1;
-        }
-        match entry.kind {
-            MailEventKind::MessageSent | MailEventKind::MessageReceived => msg += 1,
-            MailEventKind::ToolCallStart | MailEventKind::ToolCallEnd => tool += 1,
-            MailEventKind::ReservationGranted | MailEventKind::ReservationReleased => {
-                reservation += 1;
-            }
-            MailEventKind::HttpRequest => http += 1,
-            MailEventKind::ServerStarted
-            | MailEventKind::ServerShutdown
-            | MailEventKind::HealthPulse
-            | MailEventKind::AgentRegistered => lifecycle += 1,
-        }
-    }
-
-    let mut top_kinds = by_kind.into_iter().collect::<Vec<_>>();
-    top_kinds.sort_by_key(|pair| std::cmp::Reverse(pair.1));
-
-    let hint_rows = usize::from(inner.height >= 5);
-    let content_area = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner
-            .height
-            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
-    );
-    let content_rows = usize::from(content_area.height);
-    let mut lines = Vec::new();
-    if content_rows >= 1 {
-        lines.push(Line::from_spans([Span::styled(
-            format!("total:{} warn:{} err:{}", filtered.len(), warn, error),
-            Style::default().fg(tp.text_primary).bold(),
-        )]));
-    }
-    if content_rows >= 2 {
-        lines.push(Line::from_spans([Span::styled(
-            format!("msg:{msg} tool:{tool} res:{reservation} http:{http} sys:{lifecycle}"),
-            crate::tui_theme::text_meta(&tp),
-        )]));
-    }
-    if lines.len() < content_rows {
-        if let Some((kind, count)) = top_kinds.first() {
-            lines.push(Line::from_spans([
-                Span::styled("top ", crate::tui_theme::text_meta(&tp)),
-                Span::styled(
-                    format!("{} ({count})", kind.compact_label()),
-                    Style::default().fg(tp.metric_requests),
-                ),
-            ]));
-        }
-    }
-    if lines.len() < content_rows {
-        if let Some((kind, count)) = top_kinds.get(1) {
-            lines.push(Line::from_spans([
-                Span::styled("next ", crate::tui_theme::text_meta(&tp)),
-                Span::styled(
-                    format!("{} ({count})", kind.compact_label()),
-                    Style::default().fg(tp.text_primary),
-                ),
-            ]));
-        }
-    }
-
-    let content_area = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner
-            .height
-            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
-    );
-    render_lines_with_columns(frame, content_area, &lines, 44, 2);
-    if hint_rows == 1 {
-        render_panel_hint_line(frame, inner, "mix reflects current query + quick filter");
-    }
-}
-
 #[derive(Default)]
 struct ToolAgg {
     calls: usize,
@@ -3326,6 +3195,175 @@ fn render_tool_latency_panel(
             frame,
             inner,
             "ranked by p95; fleet-avg weighted by call count",
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_event_mix_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entries: &[&EventEntry],
+    query_text: &str,
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let filtered = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            text_matches_query_terms(
+                &format!("{} {}", entry.kind.compact_label(), entry.summary),
+                &query_terms,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Event Mix · {}", filtered.len());
+    let block = Block::default()
+        .title(&title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if filtered.is_empty() {
+        Paragraph::new("No matching events")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let mut kind_counts: HashMap<String, usize> = HashMap::new();
+    let mut trace_count = 0usize;
+    let mut debug_count = 0usize;
+    let mut info_count = 0usize;
+    let mut warn_count = 0usize;
+    let mut error_count = 0usize;
+    let mut recent_badges: VecDeque<String> = VecDeque::with_capacity(8);
+
+    for entry in &filtered {
+        *kind_counts
+            .entry(entry.kind.compact_label().to_string())
+            .or_insert(0) += 1;
+        match entry.severity {
+            EventSeverity::Trace => trace_count += 1,
+            EventSeverity::Debug => debug_count += 1,
+            EventSeverity::Info => info_count += 1,
+            EventSeverity::Warn => warn_count += 1,
+            EventSeverity::Error => error_count += 1,
+        }
+    }
+    for entry in filtered.iter().rev().take(8) {
+        recent_badges.push_front(entry.severity.badge().to_string());
+    }
+
+    let mut kind_ranked = kind_counts.into_iter().collect::<Vec<_>>();
+    kind_ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let hint_rows = usize::from(inner.height >= 5);
+    let content_rows = usize::from(inner.height).saturating_sub(hint_rows);
+    let mut lines = Vec::new();
+    let total = u64::try_from(filtered.len()).unwrap_or(0).max(1);
+    let trace_u64 = u64::try_from(trace_count).unwrap_or(0);
+    let debug_u64 = u64::try_from(debug_count).unwrap_or(0);
+    let info_u64 = u64::try_from(info_count).unwrap_or(0);
+    let warn_u64 = u64::try_from(warn_count).unwrap_or(0);
+    let err_u64 = u64::try_from(error_count).unwrap_or(0);
+
+    lines.push(Line::from_spans([
+        Span::styled("ERR", Style::default().fg(tp.severity_error).bold()),
+        Span::raw(":"),
+        Span::styled(err_u64.to_string(), Style::default().fg(tp.severity_error)),
+        Span::raw(" "),
+        Span::styled("WRN", Style::default().fg(tp.severity_warn).bold()),
+        Span::raw(":"),
+        Span::styled(warn_u64.to_string(), Style::default().fg(tp.severity_warn)),
+        Span::raw(" "),
+        Span::styled("INF", Style::default().fg(tp.metric_requests).bold()),
+        Span::raw(":"),
+        Span::styled(
+            info_u64.to_string(),
+            Style::default().fg(tp.metric_requests),
+        ),
+    ]));
+
+    if content_rows >= 2 {
+        lines.push(Line::from_spans([
+            Span::styled("E", Style::default().fg(tp.severity_error)),
+            Span::styled(
+                ratio_bar(err_u64, total, 5),
+                Style::default().fg(tp.severity_error),
+            ),
+            Span::raw(" "),
+            Span::styled("W", Style::default().fg(tp.severity_warn)),
+            Span::styled(
+                ratio_bar(warn_u64, total, 5),
+                Style::default().fg(tp.severity_warn),
+            ),
+            Span::raw(" "),
+            Span::styled("I", Style::default().fg(tp.metric_requests)),
+            Span::styled(
+                ratio_bar(info_u64, total, 5),
+                Style::default().fg(tp.metric_requests),
+            ),
+            Span::raw(" "),
+            Span::styled("D", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                ratio_bar(debug_u64.saturating_add(trace_u64), total, 5),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+
+    if content_rows >= 3 {
+        lines.push(Line::from_spans([
+            Span::styled("Recent ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                recent_badges
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Style::default().fg(tp.text_primary),
+            ),
+        ]));
+    }
+
+    let list_budget = content_rows.saturating_sub(lines.len());
+    for (kind, count) in kind_ranked.into_iter().take(list_budget) {
+        let count_u64 = u64::try_from(count).unwrap_or(0);
+        let pct = count_u64
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0);
+        lines.push(Line::from_spans([
+            Span::styled("• ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                truncate(&kind, 12),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(count.to_string(), Style::default().fg(tp.metric_requests)),
+            Span::raw(" "),
+            Span::styled(format!("{pct}%"), crate::tui_theme::text_meta(&tp)),
+        ]));
+    }
+
+    let visible = lines.into_iter().take(content_rows).collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible)).render(inner, frame);
+    if hint_rows == 1 {
+        render_panel_hint_line(
+            frame,
+            inner,
+            "severity bars + top event kinds for current filter",
         );
     }
 }
@@ -3823,7 +3861,7 @@ fn render_trend_panel(
     area: Rect,
     percentile_history: &[PercentileSample],
     throughput_history: &[f64],
-    event_log: &[EventEntry],
+    event_log: &VecDeque<EventEntry>,
 ) {
     if area.width < 10 || area.height < 6 {
         return;
@@ -3952,7 +3990,7 @@ const fn heatmap_kind_index(kind: MailEventKind) -> usize {
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-fn render_activity_heatmap(frame: &mut Frame<'_>, area: Rect, event_log: &[EventEntry]) {
+fn render_activity_heatmap(frame: &mut Frame<'_>, area: Rect, event_log: &VecDeque<EventEntry>) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Activity Heatmap")
@@ -5343,7 +5381,7 @@ mod tests {
         let mut screen = DashboardScreen::new();
         // Set verbosity to All so type filter is the only variable
         screen.verbosity = VerbosityTier::All;
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::HttpRequest,
             severity: EventSeverity::Debug,
             seq: 1,
@@ -5352,7 +5390,7 @@ mod tests {
             icon: '↔',
             summary: "GET /".to_string(),
         });
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,
             seq: 2,
@@ -5399,7 +5437,7 @@ mod tests {
     fn live_query_filters_visible_entries() {
         let mut screen = DashboardScreen::new();
         screen.verbosity = VerbosityTier::All;
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::HttpRequest,
             severity: EventSeverity::Debug,
             seq: 1,
@@ -5408,7 +5446,7 @@ mod tests {
             icon: '↔',
             summary: "alpha endpoint".to_string(),
         });
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,
             seq: 2,
@@ -5447,7 +5485,7 @@ mod tests {
         let mut screen = DashboardScreen::new();
         screen.verbosity = VerbosityTier::All;
 
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::HttpRequest,
             severity: EventSeverity::Debug,
             seq: 1,
@@ -5456,7 +5494,7 @@ mod tests {
             icon: '↔',
             summary: "GET /".to_string(),
         });
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,
             seq: 2,
@@ -5497,7 +5535,7 @@ mod tests {
     fn verbosity_tiers_filter_correctly() {
         let mut screen = DashboardScreen::new();
         // Add events at different severities
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::HealthPulse,
             severity: EventSeverity::Trace,
             seq: 1,
@@ -5506,7 +5544,7 @@ mod tests {
             icon: '♥',
             summary: "pulse".to_string(),
         });
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,
             seq: 2,
@@ -5515,7 +5553,7 @@ mod tests {
             icon: '⚙',
             summary: "tool done".to_string(),
         });
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::MessageSent,
             severity: EventSeverity::Info,
             seq: 3,
@@ -5524,7 +5562,7 @@ mod tests {
             icon: '✉',
             summary: "msg sent".to_string(),
         });
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::ServerShutdown,
             severity: EventSeverity::Warn,
             seq: 4,
@@ -5533,7 +5571,7 @@ mod tests {
             icon: '⏹',
             summary: "shutdown".to_string(),
         });
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::HttpRequest,
             severity: EventSeverity::Error,
             seq: 5,
@@ -5607,7 +5645,7 @@ mod tests {
     fn verbosity_and_type_filter_combine() {
         let mut screen = DashboardScreen::new();
         // Add an Info-level message and a Debug-level tool end
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::MessageSent,
             severity: EventSeverity::Info,
             seq: 1,
@@ -5616,7 +5654,7 @@ mod tests {
             icon: '✉',
             summary: "msg".to_string(),
         });
-        screen.event_log.push(EventEntry {
+        screen.event_log.push_back(EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,
             seq: 2,
@@ -5697,7 +5735,7 @@ mod tests {
 
         // Add some events
         for _ in 0..20 {
-            screen.event_log.push(EventEntry {
+            screen.event_log.push_back(EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: EventSeverity::Debug,
                 seq: 0,

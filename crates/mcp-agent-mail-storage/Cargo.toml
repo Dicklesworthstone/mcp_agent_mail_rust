@@ -26,6 +26,7 @@ tracing.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "../mcp-agent-mail-db" }
 fastmcp-core.workspace = true
+mime_guess = "2.0"
 
 [dev-dependencies]
 tempfile = "3"

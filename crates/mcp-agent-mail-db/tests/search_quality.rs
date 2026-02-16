@@ -939,55 +939,56 @@ fn evaluate_query_with_mode(
     let text = bq.text.to_string();
     let importance = bq.importance.clone();
 
-    let (ranked_titles, explain_meta, scored_rows): QueryEvalOutput = block_on(move |cx| async move {
-        let mut query = SearchQuery {
-            text,
-            doc_kind: DocKind::Message,
-            project_id: Some(pid),
-            importance,
-            explain: true,
-            limit: Some(20),
-            ranking: RankingMode::Relevance,
-            ..SearchQuery::default()
-        };
-        query.limit = Some(20);
+    let (ranked_titles, explain_meta, scored_rows): QueryEvalOutput =
+        block_on(move |cx| async move {
+            let mut query = SearchQuery {
+                text,
+                doc_kind: DocKind::Message,
+                project_id: Some(pid),
+                importance,
+                explain: true,
+                limit: Some(20),
+                ranking: RankingMode::Relevance,
+                ..SearchQuery::default()
+            };
+            query.limit = Some(20);
 
-        if mode == SearchQualityMode::Legacy {
-            let resp = match execute_search_simple(&cx, &p, &query).await {
-                Outcome::Ok(resp) => resp,
-                other => panic!("search failed for '{}': {other:?}", bq.label),
-            };
-            let titles = resp.results.iter().map(|r| r.title.clone()).collect();
-            let rows = resp
-                .results
-                .iter()
-                .map(|r| (r.title.clone(), r.score))
-                .collect();
-            (titles, resp.explain, rows)
-        } else {
-            let opts = SearchOptions {
-                scope_ctx: None,
-                redaction_policy: None,
-                track_telemetry: false,
-                search_engine: Some(mode.engine()),
-            };
-            let resp = match execute_search(&cx, &p, &query, &opts).await {
-                Outcome::Ok(resp) => resp,
-                other => panic!("v3 search failed for '{}': {other:?}", bq.label),
-            };
-            let titles = resp
-                .results
-                .iter()
-                .map(|r| r.result.title.clone())
-                .collect::<Vec<_>>();
-            let rows = resp
-                .results
-                .iter()
-                .map(|r| (r.result.title.clone(), r.result.score))
-                .collect::<Vec<_>>();
-            (titles, resp.explain, rows)
-        }
-    });
+            if mode == SearchQualityMode::Legacy {
+                let resp = match execute_search_simple(&cx, &p, &query).await {
+                    Outcome::Ok(resp) => resp,
+                    other => panic!("search failed for '{}': {other:?}", bq.label),
+                };
+                let titles = resp.results.iter().map(|r| r.title.clone()).collect();
+                let rows = resp
+                    .results
+                    .iter()
+                    .map(|r| (r.title.clone(), r.score))
+                    .collect();
+                (titles, resp.explain, rows)
+            } else {
+                let opts = SearchOptions {
+                    scope_ctx: None,
+                    redaction_policy: None,
+                    track_telemetry: false,
+                    search_engine: Some(mode.engine()),
+                };
+                let resp = match execute_search(&cx, &p, &query, &opts).await {
+                    Outcome::Ok(resp) => resp,
+                    other => panic!("v3 search failed for '{}': {other:?}", bq.label),
+                };
+                let titles = resp
+                    .results
+                    .iter()
+                    .map(|r| r.result.title.clone())
+                    .collect::<Vec<_>>();
+                let rows = resp
+                    .results
+                    .iter()
+                    .map(|r| (r.result.title.clone(), r.result.score))
+                    .collect::<Vec<_>>();
+                (titles, resp.explain, rows)
+            }
+        });
 
     // Build relevance map from judgments.
     let judgment_map: HashMap<&str, Relevance> = bq.judgments.iter().copied().collect();

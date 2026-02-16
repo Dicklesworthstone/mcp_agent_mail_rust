@@ -15,7 +15,7 @@ use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::PathBuf;
 
@@ -312,6 +312,7 @@ pub async fn file_reservation_paths(
     )?;
 
     let mut paths_to_grant: SmallVec<[&str; 8]> = SmallVec::new();
+    let mut granted_patterns: HashSet<String> = HashSet::new();
 
     let mut pending_conflicts: Vec<PendingReservationConflict> = Vec::new();
 
@@ -343,11 +344,19 @@ pub async fn file_reservation_paths(
         .collect();
 
     for (path, path_pat) in normalized_paths.iter().zip(requested_compiled.iter()) {
+        // Check conflicts with existing reservations
         let conflict_refs = index.find_conflicts(path_pat);
 
-        if conflict_refs.is_empty() {
+        // Check conflicts with previously granted paths in this same request (self-conflict/dedup)
+        let self_conflict = granted_patterns.contains(path)
+            || granted_patterns
+                .iter()
+                .any(|granted| crate::patterns_overlap(granted, path));
+
+        if conflict_refs.is_empty() && !self_conflict {
             paths_to_grant.push(path);
-        } else {
+            granted_patterns.insert(path.to_string());
+        } else if !conflict_refs.is_empty() {
             // Deterministic ordering keeps API output stable across runs
             // even when the index scans hash buckets in different orders.
             let mut holders: Vec<PendingConflictHolder> = conflict_refs
@@ -371,6 +380,7 @@ pub async fn file_reservation_paths(
                 holders,
             });
         }
+        // If self_conflict is true but conflict_refs is empty, we silently skip (deduplication behavior)
     }
 
     // Only resolve agent names if there were actual conflicts.

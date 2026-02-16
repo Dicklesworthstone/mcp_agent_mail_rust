@@ -746,15 +746,13 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             return Vec::new();
         };
-        let escaped_slug = project_slug.replace('\'', "''");
-        let sql = format!(
-            "SELECT a.name AS name \
+        let sql = "SELECT a.name AS name \
              FROM agents a \
              JOIN projects p ON p.id = a.project_id \
-             WHERE p.slug = '{escaped_slug}' \
-             ORDER BY a.name"
-        );
-        conn.query_sync(&sql, &[])
+             WHERE p.slug = ? \
+             ORDER BY a.name";
+        let params = vec![Value::Text(project_slug.to_string())];
+        conn.query_sync(sql, &params)
             .ok()
             .map(|rows| {
                 rows.into_iter()
@@ -801,10 +799,9 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             return Err("Database connection unavailable".to_string());
         };
-        let escaped_slug = project_slug.replace('\'', "''");
-        let project_sql = format!("SELECT id FROM projects WHERE slug = '{escaped_slug}' LIMIT 1");
+        let project_sql = "SELECT id FROM projects WHERE slug = ? LIMIT 1";
         let project_id = conn
-            .query_sync(&project_sql, &[])
+            .query_sync(project_sql, &[Value::Text(project_slug.to_string())])
             .map_err(|e| format!("Failed to resolve project: {e}"))?
             .into_iter()
             .next()
@@ -1754,10 +1751,15 @@ fn fetch_recent_messages(
     project_filter: Option<&str>,
     show_project: bool,
 ) -> (Vec<MessageEntry>, usize) {
-    let where_clause = project_filter.map_or_else(String::new, |slug| {
-        let escaped_slug = slug.replace('\'', "''");
-        format!("WHERE p.slug = '{escaped_slug}'")
-    });
+    let (where_clause, params) = project_filter.map_or_else(
+        || (String::new(), Vec::new()),
+        |slug| {
+            (
+                "WHERE p.slug = ?".to_string(),
+                vec![Value::Text(slug.to_string())],
+            )
+        },
+    );
 
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
@@ -1777,7 +1779,7 @@ fn fetch_recent_messages(
     );
 
     let total = count_messages(conn, project_filter);
-    let results = query_messages(conn, &sql, show_project);
+    let results = query_messages(conn, &sql, &params, show_project);
     (results, total)
 }
 
@@ -1795,97 +1797,96 @@ fn search_messages_fts(
 ) -> (Vec<MessageEntry>, usize, SearchMethod) {
     // Use the robust sanitizer from the DB crate
     let sanitized = mcp_agent_mail_db::queries::sanitize_fts_query(query);
-    if sanitized.is_none() {
-        return (Vec::new(), 0, SearchMethod::LikeFallback);
-    }
-    let fts_query = sanitized.unwrap();
 
-    // Build project filter for SQL
-    let project_condition = project_filter.map_or_else(String::new, |slug| {
-        let escaped_slug = slug.replace('\'', "''");
-        format!("AND p.slug = '{escaped_slug}'")
-    });
+    if let Some(fts_query) = sanitized {
+        // Build FTS query with parameters
+        let mut params = vec![Value::Text(fts_query)];
+        let project_condition = if let Some(slug) = project_filter {
+            params.push(Value::Text(slug.to_string()));
+            "AND p.slug = ?"
+        } else {
+            ""
+        };
 
-    let sql = format!(
-        "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
-         m.created_ts, \
-         a_sender.name AS sender_name, \
-         p.slug AS project_slug, \
-         COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
-         FROM fts_messages fts \
-         JOIN messages m ON m.id = fts.message_id \
-         JOIN agents a_sender ON a_sender.id = m.sender_id \
-         JOIN projects p ON p.id = m.project_id \
-         LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-         LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-         WHERE fts_messages MATCH ? {project_condition} \
-         GROUP BY m.id \
-         ORDER BY rank \
-         LIMIT {limit}"
-    );
+        let sql = format!(
+            "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
+             m.created_ts, \
+             a_sender.name AS sender_name, \
+             p.slug AS project_slug, \
+             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+             FROM fts_messages fts \
+             JOIN messages m ON m.id = fts.message_id \
+             JOIN agents a_sender ON a_sender.id = m.sender_id \
+             JOIN projects p ON p.id = m.project_id \
+             LEFT JOIN message_recipients mr ON mr.message_id = m.id \
+             LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
+             WHERE fts_messages MATCH ? {project_condition} \
+             GROUP BY m.id \
+             ORDER BY rank \
+             LIMIT {limit}"
+        );
 
-    // Try FTS first, fall back to LIKE
-    // Use parameter for the match expression
-    let params = vec![Value::Text(fts_query)];
-
-    let rows_result = conn.query_sync(&sql, &params);
-    let results = rows_result.map_or_else(
-        |_| Vec::new(),
-        |rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let created_ts = row.get_named::<i64>("created_ts").ok()?;
-                    Some(MessageEntry {
-                        id: row.get_named::<i64>("id").ok()?,
-                        subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
-                        from_agent: row
-                            .get_named::<String>("sender_name")
-                            .ok()
-                            .unwrap_or_default(),
-                        to_agents: row
-                            .get_named::<String>("to_agents")
-                            .ok()
-                            .unwrap_or_default(),
-                        project_slug: row
-                            .get_named::<String>("project_slug")
-                            .ok()
-                            .unwrap_or_default(),
-                        thread_id: row
-                            .get_named::<String>("thread_id")
-                            .ok()
-                            .unwrap_or_default(),
-                        timestamp_iso: micros_to_iso(created_ts),
-                        timestamp_micros: created_ts,
-                        body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
-                        importance: row
-                            .get_named::<String>("importance")
-                            .ok()
-                            .unwrap_or_else(|| "normal".to_string()),
-                        ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
-                        show_project,
+        let rows_result = conn.query_sync(&sql, &params);
+        let results = rows_result.map_or_else(
+            |_| Vec::new(),
+            |rows| {
+                rows.into_iter()
+                    .filter_map(|row| {
+                        let created_ts = row.get_named::<i64>("created_ts").ok()?;
+                        Some(MessageEntry {
+                            id: row.get_named::<i64>("id").ok()?,
+                            subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                            from_agent: row
+                                .get_named::<String>("sender_name")
+                                .ok()
+                                .unwrap_or_default(),
+                            to_agents: row
+                                .get_named::<String>("to_agents")
+                                .ok()
+                                .unwrap_or_default(),
+                            project_slug: row
+                                .get_named::<String>("project_slug")
+                                .ok()
+                                .unwrap_or_default(),
+                            thread_id: row
+                                .get_named::<String>("thread_id")
+                                .ok()
+                                .unwrap_or_default(),
+                            timestamp_iso: micros_to_iso(created_ts),
+                            timestamp_micros: created_ts,
+                            body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
+                            importance: row
+                                .get_named::<String>("importance")
+                                .ok()
+                                .unwrap_or_else(|| "normal".to_string()),
+                            ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0)
+                                != 0,
+                            show_project,
+                        })
                     })
-                })
-                .collect()
-        },
-    );
+                    .collect()
+            },
+        );
 
-    if !results.is_empty() {
-        let total = results.len();
-        return (results, total, SearchMethod::Fts);
+        if !results.is_empty() {
+            let total = results.len();
+            return (results, total, SearchMethod::Fts);
+        }
     }
 
     // LIKE fallback
-    let escaped = query.replace('\'', "''");
-    let like_where = project_filter.map_or_else(
-        || format!("WHERE m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%'"),
-        |slug| {
-            let escaped_slug = slug.replace('\'', "''");
-            format!(
-                "WHERE (m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%') \
-                 AND p.slug = '{escaped_slug}'"
-            )
-        },
-    );
+    // Matches if query is substring of subject or body
+    let mut params = Vec::new();
+    let like_term = format!("%{query}%");
+    params.push(Value::Text(like_term.clone())); // subject
+    params.push(Value::Text(like_term)); // body
+
+    let like_where = if let Some(slug) = project_filter {
+        params.push(Value::Text(slug.to_string()));
+        "WHERE (m.subject LIKE ? OR m.body_md LIKE ?) AND p.slug = ?"
+    } else {
+        "WHERE m.subject LIKE ? OR m.body_md LIKE ?"
+    };
 
     let like_sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
@@ -1904,14 +1905,19 @@ fn search_messages_fts(
          LIMIT {limit}"
     );
 
-    let results = query_messages(conn, &like_sql, show_project);
+    let results = query_messages(conn, &like_sql, &params, show_project);
     let total = results.len();
     (results, total, SearchMethod::LikeFallback)
 }
 
 /// Execute a message query and extract rows into `MessageEntry` structs.
-fn query_messages(conn: &DbConn, sql: &str, show_project: bool) -> Vec<MessageEntry> {
-    conn.query_sync(sql, &[])
+fn query_messages(
+    conn: &DbConn,
+    sql: &str,
+    params: &[Value],
+    show_project: bool,
+) -> Vec<MessageEntry> {
+    conn.query_sync(sql, params)
         .ok()
         .map(|rows| {
             rows.into_iter()
@@ -1954,19 +1960,18 @@ fn query_messages(conn: &DbConn, sql: &str, show_project: bool) -> Vec<MessageEn
 
 /// Count total messages, optionally filtered by project.
 fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
-    let sql = project_filter.map_or_else(
-        || "SELECT COUNT(*) AS c FROM messages".to_string(),
-        |slug| {
-            let escaped_slug = slug.replace('\'', "''");
-            format!(
-                "SELECT COUNT(*) AS c FROM messages m \
-                 JOIN projects p ON p.id = m.project_id \
-                 WHERE p.slug = '{escaped_slug}'"
-            )
-        },
-    );
+    let (sql, params) = if let Some(slug) = project_filter {
+        (
+            "SELECT COUNT(*) AS c FROM messages m \
+             JOIN projects p ON p.id = m.project_id \
+             WHERE p.slug = ?",
+            vec![Value::Text(slug.to_string())],
+        )
+    } else {
+        ("SELECT COUNT(*) AS c FROM messages", Vec::new())
+    };
 
-    conn.query_sync(&sql, &[])
+    conn.query_sync(sql, &params)
         .ok()
         .and_then(|rows| rows.into_iter().next())
         .and_then(|row| row.get_named::<i64>("c").ok())

@@ -24,6 +24,7 @@ use ftui_widgets::tree::{Tree, TreeGuides, TreeNode};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_bridge::TuiSharedState;
@@ -1227,15 +1228,15 @@ impl MailScreen for ThreadExplorerScreen {
 
 /// Fetch thread summaries grouped by `thread_id`, sorted by last activity.
 fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary> {
-    let filter_clause = if filter.is_empty() {
-        String::new()
+    let (filter_clause, params) = if filter.is_empty() {
+        (String::new(), Vec::new())
     } else {
-        let escaped = filter.replace('\'', "''");
-        format!(
-            "WHERE m.thread_id LIKE '%{escaped}%' \
-             OR m.subject LIKE '%{escaped}%' \
-             OR a_sender.name LIKE '%{escaped}%'"
-        )
+        let like_term = format!("%{filter}%");
+        let clause = "WHERE m.thread_id LIKE ? \
+             OR m.subject LIKE ? \
+             OR a_sender.name LIKE ?";
+        let p = Value::Text(like_term);
+        (clause.to_string(), vec![p.clone(), p.clone(), p])
     };
 
     let sql = format!(
@@ -1258,7 +1259,7 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
          LIMIT {limit}"
     );
 
-    let rows = conn.query_sync(&sql, &[]).ok().unwrap_or_default();
+    let rows = conn.query_sync(&sql, &params).ok().unwrap_or_default();
 
     let mut threads: Vec<ThreadSummary> = rows
         .into_iter()
@@ -1314,17 +1315,14 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
 
     // Fetch the latest subject + sender for each thread in a second pass.
     for thread in &mut threads {
-        let detail_sql = format!(
-            "SELECT m.subject, a_sender.name AS sender_name \
+        let detail_sql = "SELECT m.subject, a_sender.name AS sender_name \
              FROM messages m \
              JOIN agents a_sender ON a_sender.id = m.sender_id \
-             WHERE m.thread_id = '{}' \
+             WHERE m.thread_id = ? \
              ORDER BY m.created_ts DESC \
-             LIMIT 1",
-            thread.thread_id.replace('\'', "''")
-        );
+             LIMIT 1";
         if let Some(row) = conn
-            .query_sync(&detail_sql, &[])
+            .query_sync(detail_sql, &[Value::Text(thread.thread_id.clone())])
             .ok()
             .and_then(|mut rows| rows.pop())
         {
@@ -1341,10 +1339,9 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
 
 /// Get the total count of messages in a thread.
 fn fetch_thread_message_count(conn: &DbConn, thread_id: &str) -> usize {
-    let escaped = thread_id.replace('\'', "''");
-    let sql = format!("SELECT COUNT(*) AS cnt FROM messages WHERE thread_id = '{escaped}'");
+    let sql = "SELECT COUNT(*) AS cnt FROM messages WHERE thread_id = ?";
 
-    conn.query_sync(&sql, &[])
+    conn.query_sync(sql, &[Value::Text(thread_id.to_string())])
         .ok()
         .and_then(|mut rows| rows.pop())
         .and_then(|row| row.get_named::<i64>("cnt").ok())
@@ -1361,8 +1358,6 @@ fn fetch_thread_messages_paginated(
     limit: usize,
     offset: usize,
 ) -> (Vec<ThreadMessage>, usize) {
-    let escaped = thread_id.replace('\'', "''");
-
     // We want the most recent `limit` messages, but displayed in chronological order.
     // So we fetch by DESC, then reverse the result.
     // For "load older", we use offset to skip the most recent ones.
@@ -1374,14 +1369,14 @@ fn fetch_thread_messages_paginated(
          JOIN agents a_sender ON a_sender.id = m.sender_id \
          LEFT JOIN message_recipients mr ON mr.message_id = m.id \
          LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-         WHERE m.thread_id = '{escaped}' \
+         WHERE m.thread_id = ? \
          GROUP BY m.id \
          ORDER BY m.created_ts DESC \
          LIMIT {limit} OFFSET {offset}"
     );
 
     let mut messages: Vec<ThreadMessage> = conn
-        .query_sync(&sql, &[])
+        .query_sync(&sql, &[Value::Text(thread_id.to_string())])
         .ok()
         .map(|rows| {
             rows.into_iter()

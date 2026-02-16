@@ -279,7 +279,10 @@ fn render_guard_plugin_script(
 ) -> String {
     // Real guard plugin: checks active file reservations against staged changes.
     // Uses the `am` CLI binary to query reservations and compare against `git diff --cached`.
-    let db_fallback = default_db_path.unwrap_or("");
+    let db_fallback_json =
+        serde_json::to_string(default_db_path.unwrap_or("")).unwrap_or_else(|_| "\"\"".to_string());
+    let project_json = serde_json::to_string(project).unwrap_or_else(|_| "\"\"".to_string());
+
     format!(
         r#"#!/usr/bin/env python3
 # mcp-agent-mail guard plugin ({hook_name})
@@ -292,10 +295,10 @@ import subprocess
 import sys
 from fnmatch import fnmatch
 
-PROJECT = "{project}"
+PROJECT = {project_json}
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
 GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
-DEFAULT_DB_PATH = "{db_fallback}"
+DEFAULT_DB_PATH = {db_fallback_json}
 
 def get_staged_files():
     """Get list of staged files from git."""

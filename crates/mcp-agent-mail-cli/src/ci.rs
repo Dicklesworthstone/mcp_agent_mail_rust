@@ -442,8 +442,12 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
 
 /// Extracts file paths mentioned in stderr output.
 fn extract_affected_files(stderr: &str) -> Vec<String> {
-    // Pattern for Rust file references: path/to/file.rs:line:col
-    let file_pattern = regex::Regex::new(r"(?:^|\s)([\w./\-]+\.rs):(\d+)").ok();
+    // Pattern for file references: path/to/file.ext:line:col
+    // Captures common source/config extensions to support polyglot error reporting.
+    let file_pattern = regex::Regex::new(
+        r"(?:^|\s)([\w./\-]+\.(?:rs|py|js|ts|tsx|jsx|md|toml|json|yaml|yml|sh|sql|css|html)):(\d+)",
+    )
+    .ok();
 
     let mut files = std::collections::HashSet::new();
 
