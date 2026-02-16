@@ -2134,7 +2134,7 @@ pub async fn execute_search(
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
 
-            let (raw_results, rerank_audit) = orchestrate_hybrid_results_with_optional_rerank(
+            let (mut raw_results, rerank_audit) = orchestrate_hybrid_results_with_optional_rerank(
                 cx,
                 query,
                 &plan,
@@ -2142,6 +2142,43 @@ pub async fn execute_search(
                 semantic_results,
             )
             .await;
+
+            // Hydrate missing details for semantic-only results (which lack body/title in the index)
+            let missing_ids: Vec<i64> = raw_results
+                .iter()
+                .filter(|r| r.title.is_empty())
+                .map(|r| r.id)
+                .collect();
+
+            if !missing_ids.is_empty() {
+                match crate::queries::get_messages_details_by_ids(cx, pool, &missing_ids).await {
+                    Outcome::Ok(details) => {
+                        let details_map: std::collections::HashMap<
+                            i64,
+                            crate::queries::ThreadMessageRow,
+                        > = details.into_iter().map(|d| (d.id, d)).collect();
+
+                        for r in &mut raw_results {
+                            if r.title.is_empty() {
+                                if let Some(d) = details_map.get(&r.id) {
+                                    r.title = d.subject.clone();
+                                    r.body = d.body_md.clone();
+                                    r.importance = Some(d.importance.clone());
+                                    r.ack_required = Some(d.ack_required != 0);
+                                    r.created_ts = Some(d.created_ts);
+                                    r.thread_id = d.thread_id.clone();
+                                    r.from_agent = Some(d.from.clone());
+                                    r.project_id = Some(d.project_id);
+                                }
+                            }
+                        }
+                    }
+                    Outcome::Err(e) => {
+                        tracing::warn!("failed to hydrate semantic search results: {e}");
+                    }
+                    _ => {}
+                }
+            }
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, rerank_audit.as_ref()))
             } else {

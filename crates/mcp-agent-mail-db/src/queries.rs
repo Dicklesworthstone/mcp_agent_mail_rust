@@ -426,7 +426,7 @@ fn find_agent_by_name(rows: &[SqlRow], name: &str) -> Option<AgentRow> {
     for r in rows {
         // Use indexed access since raw SQL has explicit column order
         let row = decode_agent_row_indexed(r);
-        if row.name == name {
+        if row.name.eq_ignore_ascii_case(name) {
             return Some(row);
         }
     }
@@ -1310,6 +1310,70 @@ pub async fn list_agents(
     }
 }
 
+/// Get agents by ids (cache-first).
+pub async fn get_agents_by_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_ids: &[i64],
+) -> Outcome<Vec<AgentRow>, DbError> {
+    if agent_ids.is_empty() {
+        return Outcome::Ok(vec![]);
+    }
+
+    // Try to serve from cache first
+    let mut out = Vec::with_capacity(agent_ids.len());
+    let mut missing_ids = Vec::with_capacity(agent_ids.len());
+
+    let cache = crate::cache::read_cache();
+    for id in agent_ids {
+        if let Some(cached) = cache.get_agent_by_id(*id) {
+            out.push(cached);
+        } else {
+            missing_ids.push(*id);
+        }
+    }
+
+    if missing_ids.is_empty() {
+        return Outcome::Ok(out);
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let placeholders = placeholders(missing_ids.len());
+    let sql = format!(
+        "SELECT id, project_id, name, program, model, task_description, \
+         inception_ts, last_active_ts, attachments_policy, contact_policy \
+         FROM agents WHERE id IN ({placeholders})"
+    );
+
+    let capped_ids = &missing_ids[..missing_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
+    let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len());
+    for id in capped_ids {
+        params.push(Value::BigInt(*id));
+    }
+
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            for row in rows {
+                let agent = decode_agent_row_indexed(&row);
+                crate::cache::read_cache().put_agent(&agent);
+                out.push(agent);
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// Touch agent (deferred).
 ///
 /// Enqueues a `last_active_ts` update into the in-memory batch queue.
@@ -1771,6 +1835,111 @@ pub async fn create_message_with_recipients(
     }
 
     Outcome::Ok(row)
+}
+
+/// Fetch detailed message information for a batch of message IDs.
+///
+/// Used for hydrating search results (e.g. from vector search) where
+/// the index does not store full content.
+pub async fn get_messages_details_by_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    message_ids: &[i64],
+) -> Outcome<Vec<ThreadMessageRow>, DbError> {
+    if message_ids.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let placeholders = placeholders(message_ids.len());
+    let sql = format!(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+                m.importance, m.ack_required, m.created_ts, m.attachments, a.name as from_name \
+         FROM messages m \
+         JOIN agents a ON a.id = m.sender_id \
+         WHERE m.id IN ({placeholders})"
+    );
+
+    let capped_ids = &message_ids[..message_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
+    let params: Vec<Value> = capped_ids.iter().map(|&id| Value::BigInt(id)).collect();
+
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: i64 = match row.get_named("id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let project_id: i64 = match row.get_named("project_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let sender_id: i64 = match row.get_named("sender_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let thread_id: Option<String> = match row.get_named("thread_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let subject: String = match row.get_named("subject") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let body_md: String = match row.get_named("body_md") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let importance: String = match row.get_named("importance") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let ack_required: i64 = match row.get_named("ack_required") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let created_ts: i64 = match row.get_named("created_ts") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let attachments: String = match row.get_named("attachments") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let from: String = match row.get_named("from_name") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                out.push(ThreadMessageRow {
+                    id,
+                    project_id,
+                    sender_id,
+                    thread_id,
+                    subject,
+                    body_md,
+                    importance,
+                    ack_required,
+                    created_ts,
+                    attachments,
+                    from,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// List messages for a thread.

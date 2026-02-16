@@ -47,7 +47,7 @@ use std::time::{Instant, SystemTime};
 /// Override via `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` env vars.
 pub const DEFAULT_POOL_SIZE: usize = 25;
 pub const DEFAULT_MAX_OVERFLOW: usize = 75;
-pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 15_000;
+pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_POOL_RECYCLE_MS: u64 = 30 * 60 * 1000; // 30 minutes
 
 /// Auto-detect a reasonable pool size from available CPU parallelism.

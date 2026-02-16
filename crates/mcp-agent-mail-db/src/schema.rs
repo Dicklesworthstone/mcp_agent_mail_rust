@@ -893,6 +893,19 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v10: Case-insensitive unique index on agents ────────────────
+    //
+    // Enforce case-insensitive uniqueness for agent names per project.
+    // This prevents "BlueLake" and "bluelake" from coexisting.
+    migrations.push(Migration::new(
+        "v10_idx_agents_project_name_nocase".to_string(),
+        "create unique index on agents(project_id, name COLLATE NOCASE)".to_string(),
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_project_name_nocase \
+         ON agents(project_id, name COLLATE NOCASE)"
+            .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
