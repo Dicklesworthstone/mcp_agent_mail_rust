@@ -16,6 +16,7 @@
 //!    deterministically sorted by `fused_hit_cmp`).
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use serde::{Deserialize, Serialize};
 
@@ -84,13 +85,12 @@ impl DiversityConfig {
     pub fn from_env() -> Self {
         let enabled = std::env::var(DIVERSITY_ENABLED_ENV)
             .ok()
-            .map(|v| {
+            .map_or(true, |v| {
                 !matches!(
                     v.to_ascii_lowercase().as_str(),
                     "0" | "false" | "off" | "no"
                 )
-            })
-            .unwrap_or(true);
+            });
 
         let max_per_thread = std::env::var(DIVERSITY_MAX_PER_THREAD_ENV)
             .ok()
@@ -166,9 +166,9 @@ pub struct DiversityResult {
 /// # Returns
 /// `DiversityResult` with reordered hits and demotion count.
 #[must_use]
-pub fn diversify(
+pub fn diversify<S: BuildHasher>(
     hits: Vec<FusedHit>,
-    metadata: &HashMap<i64, DiversityMeta>,
+    metadata: &HashMap<i64, DiversityMeta, S>,
     config: &DiversityConfig,
 ) -> DiversityResult {
     if !config.enabled || hits.is_empty() {
@@ -195,7 +195,6 @@ pub fn diversify(
 
     for position in 0..window {
         let mut best_idx: Option<usize> = None;
-        let mut best_is_demoted = false;
 
         for (idx, hit) in window_hits.iter().enumerate() {
             if placed[idx] {
@@ -211,12 +210,9 @@ pub fn diversify(
             let should_skip = would_violate && is_near_tied;
 
             if best_idx.is_none() || !should_skip {
-                if best_idx.is_none() || !best_is_demoted || !should_skip {
-                    best_idx = Some(idx);
-                    best_is_demoted = should_skip;
-                    if !should_skip {
-                        break; // Found a non-violating candidate — take it
-                    }
+                best_idx = Some(idx);
+                if !should_skip {
+                    break; // Found a non-violating candidate — take it
                 }
             }
         }
@@ -333,7 +329,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = diversify(hits.clone(), &meta, &config);
+        let result = diversify(hits, &meta, &config);
         assert_eq!(result.hits.len(), 2);
         assert_eq!(result.hits[0].doc_id, 1);
         assert_eq!(result.hits[1].doc_id, 2);
@@ -613,11 +609,11 @@ mod tests {
 
     #[test]
     fn deterministic_across_100_runs() {
-        let hits: Vec<_> = (1..=10)
-            .map(|i| make_hit(i, 0.030 - (i as f64) * 0.0001))
+        let hits: Vec<_> = (1_u32..=10)
+            .map(|i| make_hit(i64::from(i), f64::from(i).mul_add(-0.0001, 0.030)))
             .collect();
         let mut meta = HashMap::new();
-        for i in 1..=10 {
+        for i in 1_i64..=10 {
             let thread = if i <= 5 { "thread-A" } else { "thread-B" };
             meta.insert(i, make_meta(Some(thread), Some("agent-x")));
         }
