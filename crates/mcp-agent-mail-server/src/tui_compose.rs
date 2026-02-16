@@ -1969,4 +1969,324 @@ mod tests {
         let env = s.build_envelope().unwrap();
         assert_eq!(env.importance, "normal");
     }
+
+    // ── Edge-case: body backspace joins lines ─────────────────
+
+    #[test]
+    fn body_backspace_at_line_start_joins_lines() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "hello\nworld".into();
+        s.body_cursor_line = 1;
+        s.body_cursor_col = 0;
+
+        s.handle_key(&make_key(KeyCode::Backspace));
+        assert_eq!(s.body, "helloworld");
+        assert_eq!(s.body_cursor_line, 0);
+        // After removing '\n', the joined line is "helloworld" (len 10),
+        // and cursor_col is set to the full line length.
+        assert_eq!(s.body_cursor_col, 10);
+    }
+
+    #[test]
+    fn body_backspace_at_start_does_nothing() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "hello".into();
+        s.body_cursor_line = 0;
+        s.body_cursor_col = 0;
+
+        s.handle_key(&make_key(KeyCode::Backspace));
+        assert_eq!(s.body, "hello");
+    }
+
+    // ── Edge-case: body cursor wrapping at line ends ──────────
+
+    #[test]
+    fn body_left_at_line_start_wraps_to_prev_line_end() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "abc\nde".into();
+        s.body_cursor_line = 1;
+        s.body_cursor_col = 0;
+
+        s.handle_key(&make_key(KeyCode::Left));
+        assert_eq!(s.body_cursor_line, 0);
+        assert_eq!(s.body_cursor_col, 3); // end of "abc"
+    }
+
+    #[test]
+    fn body_right_at_line_end_wraps_to_next_line() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "abc\nde".into();
+        s.body_cursor_line = 0;
+        s.body_cursor_col = 3;
+
+        s.handle_key(&make_key(KeyCode::Right));
+        assert_eq!(s.body_cursor_line, 1);
+        assert_eq!(s.body_cursor_col, 0);
+    }
+
+    #[test]
+    fn body_right_at_last_line_end_stays() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "abc".into();
+        s.body_cursor_line = 0;
+        s.body_cursor_col = 3;
+
+        s.handle_key(&make_key(KeyCode::Right));
+        // No next line, stay put
+        assert_eq!(s.body_cursor_line, 0);
+        assert_eq!(s.body_cursor_col, 3);
+    }
+
+    // ── Edge-case: subject delete key ─────────────────────────
+
+    #[test]
+    fn subject_delete_removes_char_at_cursor() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Subject;
+        s.subject = "Hello".into();
+        s.subject_cursor = 2;
+        s.handle_key(&make_key(KeyCode::Delete));
+        assert_eq!(s.subject, "Helo");
+        assert_eq!(s.subject_cursor, 2);
+    }
+
+    #[test]
+    fn subject_delete_at_end_does_nothing() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Subject;
+        s.subject = "Hi".into();
+        s.subject_cursor = 2;
+        s.handle_key(&make_key(KeyCode::Delete));
+        assert_eq!(s.subject, "Hi");
+    }
+
+    // ── Edge-case: thread ID field ────────────────────────────
+
+    #[test]
+    fn thread_id_typing() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::ThreadId;
+        s.handle_key(&make_key(KeyCode::Char('b')));
+        s.handle_key(&make_key(KeyCode::Char('r')));
+        s.handle_key(&make_key(KeyCode::Char('-')));
+        s.handle_key(&make_key(KeyCode::Char('1')));
+        assert_eq!(s.thread_id, "br-1");
+        assert_eq!(s.thread_id_cursor, 4);
+    }
+
+    #[test]
+    fn thread_id_cursor_navigation() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::ThreadId;
+        s.thread_id = "br-123".into();
+        s.thread_id_cursor = 3;
+
+        s.handle_key(&make_key(KeyCode::Home));
+        assert_eq!(s.thread_id_cursor, 0);
+
+        s.handle_key(&make_key(KeyCode::End));
+        assert_eq!(s.thread_id_cursor, 6);
+    }
+
+    // ── Edge-case: importance from Enter/Right ────────────────
+
+    #[test]
+    fn importance_cycles_on_enter() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Importance;
+        assert_eq!(s.importance, Importance::Normal);
+
+        s.handle_key(&make_key(KeyCode::Enter));
+        assert_eq!(s.importance, Importance::High);
+    }
+
+    #[test]
+    fn importance_cycles_on_right() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Importance;
+        s.handle_key(&make_key(KeyCode::Right));
+        assert_eq!(s.importance, Importance::High);
+    }
+
+    // ── Edge-case: body at max length ─────────────────────────
+
+    #[test]
+    fn body_rejects_input_at_max_length() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "x".repeat(MAX_BODY_LEN);
+        s.body_cursor_col = MAX_BODY_LEN;
+        s.handle_key(&make_key(KeyCode::Char('a')));
+        assert_eq!(s.body.len(), MAX_BODY_LEN);
+    }
+
+    #[test]
+    fn body_rejects_newline_at_max_length() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "x".repeat(MAX_BODY_LEN);
+        s.body_cursor_col = MAX_BODY_LEN;
+        s.handle_key(&make_key(KeyCode::Enter));
+        assert_eq!(s.body.len(), MAX_BODY_LEN);
+    }
+
+    // ── Edge-case: overlay area extremes ──────────────────────
+
+    #[test]
+    fn overlay_area_large_terminal() {
+        let terminal = Rect::new(0, 0, 300, 100);
+        let area = ComposePanel::overlay_area(terminal);
+        assert_eq!(area.width, 210);
+        assert_eq!(area.height, 80);
+        // Centered
+        assert_eq!(area.x, 45);
+        assert_eq!(area.y, 10);
+    }
+
+    #[test]
+    fn overlay_area_very_small_terminal() {
+        let terminal = Rect::new(0, 0, 20, 5);
+        let area = ComposePanel::overlay_area(terminal);
+        // Min dimensions should be clamped to terminal size
+        assert!(area.width <= terminal.width);
+        assert!(area.height <= terminal.height);
+    }
+
+    // ── Edge-case: recipient cursor bounds ────────────────────
+
+    #[test]
+    fn recipient_cursor_stays_at_zero_on_up() {
+        let mut s = state_with_agents(&["A", "B"]);
+        s.active_field = ComposeField::Recipients;
+        s.recipient_cursor = 0;
+        s.handle_key(&make_key(KeyCode::Up));
+        assert_eq!(s.recipient_cursor, 0);
+    }
+
+    #[test]
+    fn recipient_cursor_stays_at_end_on_down() {
+        let mut s = state_with_agents(&["A", "B"]);
+        s.active_field = ComposeField::Recipients;
+        s.recipient_cursor = 1;
+        s.handle_key(&make_key(KeyCode::Down));
+        assert_eq!(s.recipient_cursor, 1);
+    }
+
+    // ── Edge-case: multiple recipients same kind ──────────────
+
+    #[test]
+    fn envelope_multiple_to_recipients() {
+        let mut s = state_with_agents(&["RedLake", "BluePeak", "GoldFox"]);
+        s.recipients[0].selected = true;
+        s.recipients[1].selected = true;
+        s.recipients[2].selected = true;
+        // All default to To
+        s.subject = "Group msg".into();
+        s.body = "Hello all".into();
+
+        let env = s.build_envelope().unwrap();
+        assert_eq!(env.to, vec!["RedLake", "BluePeak", "GoldFox"]);
+        assert!(env.cc.is_empty());
+        assert!(env.bcc.is_empty());
+    }
+
+    // ── Edge-case: ctrl+a select all, ctrl+d clear all via keys ──
+
+    #[test]
+    fn ctrl_a_selects_all_recipients() {
+        let mut s = state_with_agents(&["A", "B", "C"]);
+        s.active_field = ComposeField::Recipients;
+        s.handle_key(&make_key_ctrl(KeyCode::Char('a')));
+        assert!(s.recipients.iter().all(|r| r.selected));
+    }
+
+    #[test]
+    fn ctrl_d_clears_all_recipients() {
+        let mut s = state_with_agents(&["A", "B"]);
+        s.active_field = ComposeField::Recipients;
+        s.recipients[0].selected = true;
+        s.recipients[1].selected = true;
+        s.handle_key(&make_key_ctrl(KeyCode::Char('d')));
+        assert!(s.recipients.iter().all(|r| !r.selected));
+    }
+
+    // ── Edge-case: default impl ───────────────────────────────
+
+    #[test]
+    fn compose_state_default_matches_new() {
+        let d = ComposeState::default();
+        let n = ComposeState::new();
+        assert_eq!(d.active_field, n.active_field);
+        assert_eq!(d.subject, n.subject);
+        assert_eq!(d.body, n.body);
+        assert_eq!(d.importance, n.importance);
+    }
+
+    // ── Edge-case: body_offset past all lines ─────────────────
+
+    #[test]
+    fn body_offset_past_end_returns_body_len() {
+        let mut s = ComposeState::new();
+        s.body = "ab\ncd".into();
+        s.body_cursor_line = 5; // way past end
+        s.body_cursor_col = 0;
+        assert_eq!(s.body_offset(), s.body.len());
+    }
+
+    // ── Edge-case: empty body operations ──────────────────────
+
+    #[test]
+    fn body_up_on_empty_body_does_nothing() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.handle_key(&make_key(KeyCode::Up));
+        assert_eq!(s.body_cursor_line, 0);
+        assert_eq!(s.body_cursor_col, 0);
+    }
+
+    #[test]
+    fn body_down_on_empty_body_does_nothing() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.handle_key(&make_key(KeyCode::Down));
+        assert_eq!(s.body_cursor_line, 0);
+    }
+
+    // ── Edge-case: render with error state ────────────────────
+
+    #[test]
+    fn render_with_error_does_not_panic() {
+        let mut state = ComposeState::new();
+        state.error = Some("Something went wrong".into());
+        let panel = ComposePanel::new(&state);
+        let config = mcp_agent_mail_core::Config::default();
+        let shared = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        let terminal = Rect::new(0, 0, 80, 24);
+        panel.render(terminal, &mut frame, &shared);
+    }
+
+    // ── Edge-case: render with sending state ──────────────────
+
+    #[test]
+    fn render_while_sending_does_not_panic() {
+        let mut state = state_with_agents(&["RedLake"]);
+        state.recipients[0].selected = true;
+        state.subject = "Test".into();
+        state.body = "Body".into();
+        state.sending = true;
+        let panel = ComposePanel::new(&state);
+        let config = mcp_agent_mail_core::Config::default();
+        let shared = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        let terminal = Rect::new(0, 0, 80, 24);
+        panel.render(terminal, &mut frame, &shared);
+    }
 }
