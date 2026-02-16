@@ -5289,6 +5289,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
 
+    /// Serializes tests that rely on the global [`PALETTE_DB_CACHE`] singleton.
+    static PALETTE_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_model() -> MailAppModel {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
@@ -6797,6 +6800,13 @@ mod tests {
 
     #[test]
     fn palette_db_cache_respects_ttl() {
+        let _serial = PALETTE_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Reset global cache to avoid test-order dependence.
+        let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
+        if let Ok(mut guard) = cache.lock() {
+            *guard = PaletteDbCache::default();
+        }
+
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         let bridge_state = palette_cache_bridge_state(&state);
@@ -6841,6 +6851,13 @@ mod tests {
 
     #[test]
     fn palette_db_cache_invalidates_when_bridge_snapshot_changes() {
+        let _serial = PALETTE_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Reset global cache to avoid test-order dependence.
+        let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
+        if let Ok(mut guard) = cache.lock() {
+            *guard = PaletteDbCache::default();
+        }
+
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         let bridge_state = palette_cache_bridge_state(&state);
