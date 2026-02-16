@@ -4680,6 +4680,7 @@ name = "mcp-agent-mail-search-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "criterion",
  "dirs 5.0.1",
  "fastembed",
  "frankensearch",

@@ -62,6 +62,13 @@ hybrid = ["tantivy-engine", "semantic"]
 [dev-dependencies]
 tempfile.workspace = true
 tantivy.workspace = true
+criterion.workspace = true
+half.workspace = true
+
+[[bench]]
+name = "two_tier_bench"
+harness = false
+required-features = ["semantic"]
 
 [lints]
 workspace = true

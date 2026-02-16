@@ -1387,7 +1387,7 @@ mod tests {
     fn graph_layout_includes_agents_seen_only_in_recent_events() {
         let state = test_state();
         let mut screen = ContactsScreen::new();
-        state.push_event(MailEvent::message_sent(
+        let _ = state.push_event(MailEvent::message_sent(
             1,
             "OnlyInEvents",
             vec!["Beta".to_string()],
@@ -1409,7 +1409,7 @@ mod tests {
         let state = test_state();
         let mut screen = ContactsScreen::new();
         screen.view_mode = ViewMode::Graph;
-        state.push_event(MailEvent::message_sent(
+        let _ = state.push_event(MailEvent::message_sent(
             1,
             "GraphAgent",
             vec!["Peer".to_string()],
