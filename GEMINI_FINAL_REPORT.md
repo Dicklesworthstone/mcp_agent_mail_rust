@@ -1,37 +1,36 @@
-# Gemini Final Code Review & Remediation Report
+# Gemini Final Report - 2026-02-16
 
-Date: 2026-02-16
+## Executive Summary
+I have conducted a deep, first-principles review of the `mcp-agent-mail` codebase, focusing on security, data integrity, and cross-platform reliability. Five critical issues were identified and remediated, ranging from git history falsification under load to security policy bypasses in messaging.
 
-I have performed a comprehensive, first-principles review of the `mcp-agent-mail` codebase, focusing on reliability, performance, correctness, and security. Below is a summary of the issues identified and the fixes applied.
+## Critical Remediation Actions
 
-## 1. Data Persistence Reliability (Critical)
-**Issue:** The server shutdown sequence (`run_http` and `run_http_with_tui`) in `crates/mcp-agent-mail-server/src/lib.rs` failed to flush pending git commits. While `wbq_shutdown()` drained the write-behind queue, the resulting commit operations were enqueued into the `CommitCoalescer` but not guaranteed to complete before process exit, leading to potential data loss (files written to disk but not committed to git history).
-**Fix:** Added `mcp_agent_mail_storage::flush_async_commits()` immediately after `wbq_shutdown()` in all server shutdown paths. This forces a synchronization of the commit queue before the server exits.
+### 1. Security Policy Enforcement (`crates/mcp-agent-mail-tools`)
+*   **Vulnerability:** The `reply_message` tool completely bypassed contact enforcement policies and recipient auto-registration. An agent could message blocked recipients simply by "replying", and new recipients (e.g. CCs) would cause tool failures instead of being registered.
+*   **Fix:** Refactored `reply_message` to share the rigorous validation pipeline of `send_message`, ensuring all contact policies (block/allow/handshake) are enforced and new agents are properly onboarded.
 
-## 2. Messaging Efficiency
-**Issue:** In `crates/mcp-agent-mail-tools/src/messaging.rs`, `send_message` and `reply_message` would trigger duplicate archive write operations if a recipient was listed in multiple fields (e.g., both `To` and `CC`). This caused redundant I/O and duplicate entries in the git commit path list.
-**Fix:** Added deduplication logic to the recipient list before invoking the archive write function.
+### 2. Data Integrity in Git Storage (`crates/mcp-agent-mail-storage`)
+*   **Vulnerability:** The `CommitCoalescer` (high-performance write-behind queue) batched commit requests purely by count (up to 10), ignoring the git author. If multiple agents enqueued writes simultaneously, they would be combined into a single commit attributed to the *first* agent, falsifying the git history for the others.
+*   **Fix:** Updated the worker loop to inspect the author of every pending request. Batches are now strictly segmented by author (name + email), guaranteeing accurate provenance in the git log.
 
-## 3. Async Runtime Safety
-**Issue:** In `crates/mcp-agent-mail-db/src/queries.rs`, the function `set_agent_contact_policy_by_name` used a blocking `execute_sync` call inside an async function. This could stall the async executor thread, degrading server responsiveness under load.
-**Fix:** Replaced the blocking call with the asynchronous `traw_execute` helper.
+### 3. Git Hook Consistency (`crates/mcp-agent-mail-guard`)
+*   **Bug:** The Rust-based CLI guard (`am guard check`) used shell-style glob matching (where `*` stops at slashes), while the generated Python git hook used standard `fnmatch` (where `*` matches everything). This caused divergence where the CLI would report "clean" but the git hook would block commits (or vice-versa).
+*   **Fix:** Injected a custom regex-based glob matcher into the generated Python script to strictly emulate Rust's shell-style behavior. Added missing reverse-prefix checks to detect directory-level conflicts.
 
-## 4. Guard Hook Robustness
-**Issue:** The pre-commit guard hook installed by `am guard install` relied on environment variables (`AGENT_MAIL_DB`) to locate the database. If these variables were missing (common in IDEs or GUI git clients), the hook would fail.
-**Fix:** Updated `crates/mcp-agent-mail-guard/src/lib.rs` to accept a default database path during generation. Updated the CLI and tool handlers to resolve the absolute path from the current configuration and bake it into the generated Python hook script as a fallback.
+### 4. Production Security Configuration (`crates/mcp-agent-mail-share`)
+*   **Bug:** The `bundle_attachments` function hardcoded absolute path logic, ignoring the `allow_absolute_attachment_paths` setting. This meant production environments (where this setting defaults to `false`) were not actually protected against absolute path usage in exports.
+*   **Fix:** Propagated the configuration value from the CLI/Config layer down to the sharing logic and enforced it in `resolve_attachment_path`.
 
-## 5. Share Export Functionality
-**Issue:** In `crates/mcp-agent-mail-share/src/bundle.rs`, the `resolve_attachment_path` helper strictly enforced that attachment paths must be inside the storage root. This prevented bundling valid external files (like source code from the project repo) even when `allow_absolute_paths` was enabled.
-**Fix:** Modified `resolve_attachment_path` to allow relative paths that resolve outside the storage root if `allow_absolute_paths` is true, enabling reliable sharing of project source files.
+### 5. Cross-Platform Path Handling (`crates/mcp-agent-mail-db`)
+*   **Bug:** The `ensure_project` query validated absolute paths using `starts_with('/')`, causing failures on Windows (`C:\...`).
+*   **Fix:** Switched to `std::path::Path::new(...).is_absolute()` for correct behavior on all platforms.
 
-## Deep Dive Reviews (No Issues Found)
-I also performed deep dives into the following areas and found them to be robust:
-- **Crypto:** `crates/mcp-agent-mail-share/src/crypto.rs` (Ed25519 signing, Age encryption).
-- **Caching:** `crates/mcp-agent-mail-db/src/cache.rs` (S3-FIFO eviction, invalidation logic).
-- **Coalescing:** `crates/mcp-agent-mail-db/src/coalesce.rs` (Read singleflight) and `crates/mcp-agent-mail-storage/src/lib.rs` (Commit coalescer).
-- **Products:** `crates/mcp-agent-mail-tools/src/products.rs` (Cross-project search/inbox).
-- **Static Render:** `crates/mcp-agent-mail-share/src/static_render.rs` (Static site generation with defense-in-depth redaction).
-- **Search Service:** `crates/mcp-agent-mail-db/src/search_service.rs` (Hybrid search orchestration, fallback logic, hydration).
+## Validated Subsystems
+The following subsystems were reviewed and found to be robust:
+*   **`mcp-agent-mail-search-core`**: The two-tier (fast + quality) search engine with RRF fusion is well-structured and thread-safe.
+*   **`mcp-agent-mail-server`**: TUI rendering logic handles resizing and focus management correctly.
+*   **`mcp-agent-mail-core`**: Global lock hierarchy (`lock_order.rs`) correctly prevents deadlocks via debug assertions.
+*   **`mcp-agent-mail-agent-detect`**: Probe logic handles home directory resolution safely.
 
-## Conclusion
-The codebase is now in a significantly more robust state. The critical persistence gap on shutdown has been closed, and several reliability/performance issues have been resolved.
+## Operational Note
+Due to instability in the shell execution environment (`Signal 1` / `SIGHUP` on `run_shell_command`), all verification was performed via static analysis, code reading, and unit test inspection. The applied fixes are logic-based and self-contained.

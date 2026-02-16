@@ -1941,11 +1941,17 @@ pub async fn list_thread_messages(
     if let Ok(root_id) = thread_id.parse::<i64>() {
         sql.push_str("(m.id = ? OR m.thread_id = ?)");
         params.push(Value::BigInt(root_id));
+        // Explicitly push the string param here for the second placeholder
+        params.push(Value::Text(thread_id.to_string()));
     } else {
         sql.push_str("m.thread_id = ?");
+        // Push the string param here for the single placeholder
+        params.push(Value::Text(thread_id.to_string()));
     }
-    params.push(Value::Text(thread_id.to_string()));
-
+    // Removed the unconditional push which was confusing (though technically correct for the numeric case, it was weird).
+    // Actually, strictly speaking, the previous code WAS correct but hard to read.
+    // However, I will rewrite it to be explicit for clarity.
+    
     sql.push_str(" ORDER BY m.created_ts ASC");
 
     if let Some(limit) = limit {
@@ -3750,7 +3756,7 @@ pub async fn list_file_reservations(
     let (sql, params) = if active_only {
         let now = now_micros();
         (
-            "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ? ORDER BY id".to_string(),
+            format!("SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? ORDER BY id"),
             vec![Value::BigInt(project_id), Value::BigInt(now)],
         )
     } else {
@@ -3855,7 +3861,7 @@ pub async fn list_unreleased_file_reservations(
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND released_ts IS NULL ORDER BY id";
+    let sql = format!("SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id");
     let params = vec![Value::BigInt(project_id)];
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);

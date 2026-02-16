@@ -100,8 +100,7 @@ fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
     let ring = state.event_ring_stats();
     let mut events = state.events_since(since);
     if events.len() > limit {
-        let keep_from = events.len().saturating_sub(limit);
-        events.drain(..keep_from);
+        events.truncate(limit);
     }
     let to_seq = events.last().map_or(since, MailEvent::seq);
 
@@ -253,11 +252,11 @@ mod tests {
         assert_eq!(payload["event_count"], 2);
 
         let to_seq = payload["to_seq"].as_u64().expect("to_seq");
-        let last_seq = events
-            .last()
-            .and_then(|event| event["seq"].as_u64())
-            .expect("event seq");
+        let first_seq = events.first().and_then(|e| e["seq"].as_u64()).expect("first seq");
+        let last_seq = events.last().and_then(|e| e["seq"].as_u64()).expect("last seq");
+        
         assert_eq!(to_seq, last_seq);
-        assert!(to_seq >= since);
+        assert_eq!(first_seq, since + 1, "should start immediately after 'since'");
+        assert_eq!(last_seq, since + 2, "should end at since + limit");
     }
 }

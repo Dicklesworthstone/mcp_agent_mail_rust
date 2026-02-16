@@ -49,7 +49,13 @@ pub fn micros_to_naive(micros: i64) -> NaiveDateTime {
     let nsecs = u32::try_from(sub_micros * 1000).unwrap_or(0);
     Utc.timestamp_opt(secs, nsecs)
         .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap())
+        .unwrap_or_else(|| {
+            if micros < 0 {
+                chrono::DateTime::<Utc>::MIN_UTC
+            } else {
+                chrono::DateTime::<Utc>::MAX_UTC
+            }
+        })
         .naive_utc()
 }
 
@@ -250,16 +256,22 @@ mod tests {
     #[test]
     fn test_extreme_values_no_panic() {
         // These extreme values are outside chrono's representable range.
-        // Before the fix, this would panic with "valid timestamp".
-        // After the fix, it returns Unix epoch as a safe fallback.
-        let epoch =
-            NaiveDateTime::parse_from_str("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        // Before the fix, this would panic or return epoch.
+        // After the fix, it saturates to MIN/MAX.
 
-        let dt = micros_to_naive(i64::MAX);
-        assert_eq!(dt, epoch);
+        let dt_min = micros_to_naive(i64::MIN);
+        // chrono::NaiveDateTime::MIN is approx year -262144
+        assert!(
+            dt_min.year() < -200_000,
+            "i64::MIN micros should saturate to ancient past, got {dt_min:?}"
+        );
 
-        let dt = micros_to_naive(i64::MIN);
-        assert_eq!(dt, epoch);
+        let dt_max = micros_to_naive(i64::MAX);
+        // chrono::NaiveDateTime::MAX is approx year +262143
+        assert!(
+            dt_max.year() > 200_000,
+            "i64::MAX micros should saturate to far future, got {dt_max:?}"
+        );
     }
 
     #[test]

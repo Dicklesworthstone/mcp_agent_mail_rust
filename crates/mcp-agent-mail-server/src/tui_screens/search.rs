@@ -1509,7 +1509,8 @@ impl SearchCockpitScreen {
         } else {
             usize::from(area.height.saturating_sub(3))
         };
-        let total = estimate_search_detail_lines(entry);
+        let width = if area.width == 0 { 80 } else { area.width };
+        let total = estimate_search_detail_lines(entry, width);
         total.saturating_sub(visible)
     }
 
@@ -3234,7 +3235,7 @@ fn render_results(
 
 #[allow(clippy::cast_possible_truncation)]
 /// Estimate the number of lines in the search detail panel for a result entry.
-fn estimate_search_detail_lines(entry: &ResultEntry) -> usize {
+fn estimate_search_detail_lines(entry: &ResultEntry, width: u16) -> usize {
     // Type, Title = 2
     let mut count: usize = 2;
     if entry.from_agent.is_some() {
@@ -3259,7 +3260,12 @@ fn estimate_search_detail_lines(entry: &ResultEntry) -> usize {
     count += 2; // Separator + body header
     // Body lines
     let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
-    count += body.lines().count().max(1);
+    let avail_width = usize::from(width.saturating_sub(2)).max(1);
+    let body_lines = body.lines().map(|line| {
+        let len = ftui::text::display_width(line);
+        if len == 0 { 1 } else { len.div_ceil(avail_width) }
+    }).sum::<usize>().max(1);
+    count += body_lines;
     count
 }
 
@@ -3513,17 +3519,16 @@ fn render_detail(
         return;
     }
 
-    // Apply scroll and render only the visible content lines.
-    let total_lines = lines.len();
+    // Apply scroll using Paragraph's internal wrapping support.
+    let total_estimated = estimate_search_detail_lines(entry, content_area.width);
     let visible = usize::from(content_h);
-    let max_scroll = total_lines.saturating_sub(visible);
+    let max_scroll = total_estimated.saturating_sub(visible);
     let clamped_scroll = scroll.min(max_scroll);
-    let visible_lines: Vec<Line> = lines
-        .into_iter()
-        .skip(clamped_scroll)
-        .take(visible)
-        .collect();
-    Paragraph::new(Text::from_lines(visible_lines)).render(content_area, frame);
+
+    Paragraph::new(Text::from_lines(lines))
+        .wrap(ftui::text::WrapMode::Word)
+        .scroll((clamped_scroll as u16, 0))
+        .render(content_area, frame);
 
     if let Some(bar_area) = scrollbar_area {
         render_vertical_scrollbar(
@@ -3531,7 +3536,7 @@ fn render_detail(
             bar_area,
             clamped_scroll,
             visible,
-            total_lines,
+            total_estimated,
             focused,
         );
     }

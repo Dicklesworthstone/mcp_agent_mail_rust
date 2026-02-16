@@ -48,6 +48,9 @@ pub fn parse_remote_terminal_events(body: &[u8]) -> Result<ParsedRemoteEvents, S
     if body.is_empty() {
         return Err("Request body must not be empty".to_string());
     }
+    if body.len() > 512 * 1024 {
+        return Err("Request body too large (max 512KB)".to_string());
+    }
 
     let envelope: IngressEnvelope = serde_json::from_slice(body)
         .map_err(|err| format!("Invalid /mail/ws-input payload: {err}"))?;

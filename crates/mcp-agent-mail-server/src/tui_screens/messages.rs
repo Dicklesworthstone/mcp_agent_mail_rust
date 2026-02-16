@@ -2372,7 +2372,8 @@ fn render_detail_panel(
         || "Detail".to_string(),
         |msg| {
             let viewport = usize::from(area.height.saturating_sub(2)).max(1);
-            let total = estimate_message_detail_lines(msg);
+            let width = if area.width == 0 { 80 } else { area.width };
+            let total = estimate_message_detail_lines(msg, width);
             let max_scroll = total.saturating_sub(viewport);
             let clamped = scroll.min(max_scroll);
             format!("Detail [{clamped}/{max_scroll}]")
@@ -2435,8 +2436,12 @@ fn render_detail_panel(
     lines.push(String::new()); // Blank separator
     lines.push("--- Body ---".to_string());
 
-    // Render message body: JSON bodies get syntax-colored spans,
-    // everything else gets GFM markdown rendering.
+    // Combine header and body into one Text for unified scrolling
+    let mut combined_lines = Vec::new();
+    for line in lines {
+        combined_lines.push(Line::raw(line));
+    }
+
     let body_text = if looks_like_json(&msg.body_md) {
         colorize_json_body(&msg.body_md, &tp)
     } else {
@@ -2449,67 +2454,23 @@ fn render_detail_panel(
         let md_theme = crate::tui_theme::markdown_theme();
         crate::tui_markdown::render_body(&body_md, &md_theme)
     };
-    let body_height = body_text.height();
 
-    // Build header as plain text lines
-    let header_height = lines.len();
-
-    // Apply scroll offset across combined header + body
-    let visible_height = content_inner.height as usize;
-    if visible_height == 0 {
-        return;
+    for line in body_text.lines() {
+        combined_lines.push(line.clone());
     }
-    let total_lines = header_height.saturating_add(body_height.max(1));
-    let max_scroll = total_lines.saturating_sub(visible_height);
+
+    let combined_text = Text::from_lines(combined_lines);
+
+    // Apply scroll using Paragraph's internal wrapping support
+    let total_estimated = estimate_message_detail_lines(msg, content_inner.width);
+    let visible_height = usize::from(content_inner.height);
+    let max_scroll = total_estimated.saturating_sub(visible_height);
     let clamped_scroll = scroll.min(max_scroll);
 
-    if clamped_scroll < header_height {
-        // Some header lines visible
-        let header_visible: Vec<&str> = lines
-            .iter()
-            .skip(clamped_scroll)
-            .take(visible_height)
-            .map(String::as_str)
-            .collect();
-        let header_text = header_visible.join("\n");
-
-        let header_rows = header_visible.len().min(visible_height);
-        let header_area = Rect::new(
-            content_inner.x,
-            content_inner.y,
-            content_inner.width,
-            header_rows as u16,
-        );
-        let p = Paragraph::new(header_text).wrap(ftui::text::WrapMode::Word);
-        p.render(header_area, frame);
-
-        // Render body in remaining space
-        let body_rows = visible_height.saturating_sub(header_rows);
-        if body_rows > 0 {
-            let body_area = Rect::new(
-                content_inner.x,
-                content_inner.y + header_rows as u16,
-                content_inner.width,
-                body_rows as u16,
-            );
-            let p = Paragraph::new(body_text).wrap(ftui::text::WrapMode::Word);
-            p.render(body_area, frame);
-        }
-    } else {
-        // Scrolled past header — only body visible
-        let body_scroll = clamped_scroll - header_height;
-        // Extract visible portion of body text by skipping lines
-        let all_lines = body_text.lines();
-        let visible_body: Vec<_> = all_lines
-            .iter()
-            .skip(body_scroll)
-            .take(visible_height)
-            .cloned()
-            .collect();
-        let text = ftui::text::Text::from_lines(visible_body);
-        let p = Paragraph::new(text).wrap(ftui::text::WrapMode::Word);
-        p.render(content_inner, frame);
-    }
+    Paragraph::new(combined_text)
+        .wrap(ftui::text::WrapMode::Word)
+        .scroll((clamped_scroll as u16, 0))
+        .render(content_inner, frame);
 
     if let Some(bar_area) = scrollbar_area {
         render_vertical_scrollbar(
@@ -2517,7 +2478,7 @@ fn render_detail_panel(
             bar_area,
             clamped_scroll,
             visible_height,
-            total_lines,
+            total_estimated,
             focused,
         );
     }
