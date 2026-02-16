@@ -12295,13 +12295,8 @@ mod tests {
             text: payload.to_string(),
         }];
 
-        let events = derive_domain_events_from_tool_contents(
-            "send_message",
-            None,
-            &contents,
-            None,
-            None,
-        );
+        let events =
+            derive_domain_events_from_tool_contents("send_message", None, &contents, None, None);
         assert_eq!(events.len(), 1);
         match &events[0] {
             tui_events::MailEvent::MessageSent { id, subject, .. } => {
