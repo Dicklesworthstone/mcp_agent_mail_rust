@@ -861,12 +861,12 @@ impl MailEvent {
                 id,
                 ..
             } => {
-                let recipients = if to.len() > 2 {
-                    format!("{}, {} +{}", to[0], to[1], to.len() - 2)
-                } else if to.len() == 2 {
-                    format!("{} +1", to[0])
-                } else {
-                    to.join(", ")
+                let recipients = match to.len().cmp(&2) {
+                    std::cmp::Ordering::Greater => {
+                        format!("{}, {} +{}", to[0], to[1], to.len() - 2)
+                    }
+                    std::cmp::Ordering::Equal => format!("{} +1", to[0]),
+                    std::cmp::Ordering::Less => to.join(", "),
                 };
                 format!(
                     "#{id} {from} → {recipients}: {}",
@@ -1178,7 +1178,12 @@ impl EventRingBuffer {
         event.set_seq(seq);
         event.set_timestamp_if_unset(chrono::Utc::now().timestamp_micros());
         if inner.events.len() >= inner.capacity {
-            let _ = inner.events.pop_front();
+            let drop_idx = inner
+                .events
+                .iter()
+                .position(|existing| existing.severity() < EventSeverity::Info)
+                .unwrap_or(0);
+            let _ = inner.events.remove(drop_idx);
         }
         inner.events.push_back(event);
         inner.total_pushed = inner.total_pushed.saturating_add(1);
@@ -2015,6 +2020,63 @@ mod tests {
         assert_eq!(stats.len, 3);
         assert_eq!(stats.total_pushed, 5);
         assert_eq!(stats.dropped_overflow, 2);
+    }
+
+    #[test]
+    fn ring_buffer_prefers_evicting_low_severity_first() {
+        let ring = EventRingBuffer::with_capacity(3);
+        let _ = ring.push(MailEvent::message_sent(
+            1,
+            "A",
+            vec!["B".to_string()],
+            "m1",
+            "t1",
+            "p",
+        ));
+        let _ = ring.push(MailEvent::message_sent(
+            2,
+            "A",
+            vec!["B".to_string()],
+            "m2",
+            "t2",
+            "p",
+        ));
+        let _ = ring.push(MailEvent::tool_call_start(
+            "fetch_inbox",
+            Value::Null,
+            None,
+            None,
+        ));
+        let _ = ring.push(MailEvent::message_received(
+            3,
+            "B",
+            vec!["A".to_string()],
+            "m3",
+            "t3",
+            "p",
+        ));
+
+        let kinds: Vec<MailEventKind> = ring.iter_recent(10).iter().map(MailEvent::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MailEventKind::MessageSent,
+                MailEventKind::MessageSent,
+                MailEventKind::MessageReceived
+            ]
+        );
+    }
+
+    #[test]
+    fn ring_buffer_evicts_oldest_when_only_high_severity_events_exist() {
+        let ring = EventRingBuffer::with_capacity(3);
+        let _ = ring.push(MailEvent::message_sent(1, "A", vec![], "m1", "t1", "p"));
+        let _ = ring.push(MailEvent::message_sent(2, "A", vec![], "m2", "t2", "p"));
+        let _ = ring.push(MailEvent::message_sent(3, "A", vec![], "m3", "t3", "p"));
+        let _ = ring.push(MailEvent::message_received(4, "B", vec![], "m4", "t4", "p"));
+
+        let seqs: Vec<u64> = ring.iter_recent(10).iter().map(MailEvent::seq).collect();
+        assert_eq!(seqs, vec![2, 3, 4]);
     }
 
     #[test]

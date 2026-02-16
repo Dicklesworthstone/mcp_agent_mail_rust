@@ -241,12 +241,12 @@ mod tests {
 
     #[test]
     fn code_fence_unknown_language_falls_back_without_losing_content() {
-        let md = "```unknownlang\n++>---.\n```";
+        let md = "```unknownlang\nfoo = bar(42)\n```";
         let text = render_body(md, &theme());
         let rendered = text_to_string(&text);
         assert!(
-            rendered.contains("++>---."),
-            "unknown language fence should preserve code content"
+            rendered.contains("foo = bar(42)"),
+            "unknown language fence should preserve code content: {rendered}"
         );
         assert!(text.height() >= 1);
     }

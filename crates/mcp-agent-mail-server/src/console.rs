@@ -3150,7 +3150,8 @@ mod tests {
         pane.push("[00:00:00.001] DEBUG ToolCallEnd   send_message (12ms)");
         pane.push("[00:00:00.002] WARN  ResReleased   GoldFox src/**");
 
-        pane.set_filter(Some(r"^\[\d{2}:\d{2}:\d{2}\.\d{3}\]\s+WARN\s+ResReleased"));
+        // LogViewer.set_filter uses literal substring matching (not regex).
+        pane.set_filter(Some("WARN"));
         assert_eq!(pane.search("ResReleased"), 1);
         assert_eq!(pane.search("MessageSent"), 0);
 

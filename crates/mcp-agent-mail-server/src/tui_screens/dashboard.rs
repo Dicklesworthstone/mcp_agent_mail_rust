@@ -1599,6 +1599,7 @@ fn render_dashboard_query_bar(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn render_insight_rail(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2050,7 +2051,7 @@ fn render_project_load_panel(
             (project, load_score)
         })
         .collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|pair| std::cmp::Reverse(pair.1));
 
     if rows.is_empty() {
         Paragraph::new("No matching projects")
@@ -2548,6 +2549,14 @@ fn render_event_mix_panel(
     Paragraph::new(Text::from_lines(visible)).render(inner, frame);
 }
 
+#[derive(Default)]
+struct ToolAgg {
+    calls: usize,
+    total_ms: u64,
+    max_ms: u64,
+    samples: Vec<u64>,
+}
+
 fn render_tool_latency_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2567,14 +2576,6 @@ fn render_tool_latency_panel(
     block.render(area, frame);
     if inner.width == 0 || inner.height == 0 {
         return;
-    }
-
-    #[derive(Default)]
-    struct ToolAgg {
-        calls: usize,
-        total_ms: u64,
-        max_ms: u64,
-        samples: Vec<u64>,
     }
 
     let query_terms = parse_query_terms(query_text);
