@@ -41,9 +41,31 @@ pub struct SearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistance: Option<mcp_agent_mail_db::QueryAssistance>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<mcp_agent_mail_db::search_planner::ZeroResultGuidance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub explain: Option<mcp_agent_mail_db::search_planner::QueryExplain>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SearchDiagnostics>,
+}
+
+/// Deterministic degraded-mode diagnostics extracted from explain metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchDiagnostics {
+    pub degraded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_remaining_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_exhausted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation_hints: Vec<String>,
 }
 
 /// Mention count entry
@@ -132,6 +154,103 @@ fn parse_thread_ids(thread_id: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn explain_facet_value<'a>(
+    explain: &'a mcp_agent_mail_db::search_planner::QueryExplain,
+    key: &str,
+) -> Option<&'a str> {
+    explain.facets_applied.iter().find_map(|facet| {
+        let (facet_key, facet_value) = facet.split_once(':')?;
+        if facet_key.eq_ignore_ascii_case(key) {
+            Some(facet_value)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_budget_tier_from_rerank_outcome(rerank_outcome: &str) -> Option<&str> {
+    rerank_outcome
+        .strip_prefix("skipped_by_budget_governor_")
+        .filter(|tier| !tier.is_empty())
+}
+
+pub(crate) fn derive_search_diagnostics(
+    explain: Option<&mcp_agent_mail_db::search_planner::QueryExplain>,
+) -> Option<SearchDiagnostics> {
+    let explain = explain?;
+    let mut diagnostics = SearchDiagnostics {
+        degraded: false,
+        fallback_mode: None,
+        timeout_stage: None,
+        budget_tier: None,
+        budget_remaining_ms: None,
+        budget_exhausted: None,
+        remediation_hints: Vec::new(),
+    };
+
+    if explain.used_like_fallback || explain.method.eq_ignore_ascii_case("like_fallback") {
+        diagnostics.degraded = true;
+        diagnostics.fallback_mode = Some("like_fallback".to_string());
+        diagnostics.remediation_hints.push(
+            "FTS syntax was not usable; simplify operators or use quoted phrases.".to_string(),
+        );
+    }
+
+    if let Some(outcome) = explain_facet_value(explain, "rerank_outcome") {
+        if let Some(tier) = parse_budget_tier_from_rerank_outcome(outcome) {
+            diagnostics.degraded = true;
+            diagnostics.fallback_mode.get_or_insert_with(|| {
+                "hybrid_budget_governor".to_string()
+            });
+            diagnostics.budget_tier = Some(tier.to_string());
+            diagnostics.budget_exhausted = Some(tier.eq_ignore_ascii_case("critical"));
+            diagnostics
+                .remediation_hints
+                .push("Reduce `limit` or narrow filters to avoid budget pressure.".to_string());
+        } else if outcome.to_ascii_lowercase().contains("timeout") {
+            diagnostics.degraded = true;
+            diagnostics.fallback_mode.get_or_insert_with(|| "rerank_timeout".to_string());
+            diagnostics.timeout_stage = Some("rerank".to_string());
+            diagnostics
+                .remediation_hints
+                .push("Retry with tighter filters or switch to lexical mode.".to_string());
+        } else if outcome.to_ascii_lowercase().contains("failed") {
+            diagnostics.degraded = true;
+            diagnostics.fallback_mode.get_or_insert_with(|| "rerank_failed".to_string());
+            diagnostics
+                .remediation_hints
+                .push("Hybrid refinement failed; retry or use lexical mode.".to_string());
+        }
+    }
+
+    if let Some(remaining_ms) = explain_facet_value(explain, "governor_remaining_budget_ms")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        diagnostics.budget_remaining_ms = Some(remaining_ms);
+    }
+
+    if let Some(tier) = explain_facet_value(explain, "governor_tier") {
+        diagnostics.budget_tier = Some(tier.to_string());
+        if diagnostics.budget_exhausted.is_none() {
+            diagnostics.budget_exhausted = Some(tier.eq_ignore_ascii_case("critical"));
+        }
+    }
+
+    if let Some(stage) = explain_facet_value(explain, "timeout_stage") {
+        diagnostics.degraded = true;
+        diagnostics.timeout_stage = Some(stage.to_string());
+        diagnostics
+            .remediation_hints
+            .push("Search timed out in one stage; narrow query scope and retry.".to_string());
+    }
+
+    if diagnostics.degraded {
+        Some(diagnostics)
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -490,12 +609,13 @@ pub(crate) fn parse_time_range_with_aliases(
 /// - `date_from`, `after`, `since`: Aliases of `date_start`
 /// - `date_to`, `before`, `until`: Aliases of `date_end`
 /// - `explain`: Include query plan explain metadata (default: false)
+/// - `diagnostics`: Optional degraded-mode metadata for budget/fallback/timeout signals
 ///
 /// # Returns
 /// List of matching message summaries
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 #[tool(
-    description = "Full-text search over subject and body for a project.\n\nTips\n----\n- SQLite FTS5 syntax supported: phrases (\"build plan\"), prefix (mig*), boolean (plan AND users)\n- Results are ordered by bm25 score (best matches first) unless ranking=\"recency\"\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (BM25, default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, explain?, next_cursor? }\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
+    description = "Full-text search over subject and body for a project.\n\nTips\n----\n- SQLite FTS5 syntax supported: phrases (\"build plan\"), prefix (mig*), boolean (plan AND users)\n- Results are ordered by bm25 score (best matches first) unless ranking=\"recency\"\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (BM25, default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`diagnostics` is present when degraded-mode signals are detected (fallback, budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
 )]
 pub async fn search_messages(
     ctx: &McpContext,
@@ -530,8 +650,10 @@ pub async fn search_messages(
         let response = SearchResponse {
             result: Vec::new(),
             assistance: None,
+            guidance: None,
             explain: None,
             next_cursor: None,
+            diagnostics: None,
         };
         return serde_json::to_string(&response)
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
@@ -582,7 +704,9 @@ pub async fn search_messages(
         ranking: ranking_mode,
         limit: Some(max_results),
         cursor: None,
-        explain: want_explain,
+        // Always collect explain internally so degraded diagnostics remain deterministic
+        // even when `explain=false` for the caller.
+        explain: true,
         ..Default::default()
     };
 
@@ -620,11 +744,18 @@ pub async fn search_messages(
         results.len()
     );
 
+    let diagnostics = derive_search_diagnostics(planner_response.explain.as_ref());
     let response = SearchResponse {
         result: results,
         assistance: planner_response.assistance,
-        explain: planner_response.explain,
+        guidance: planner_response.guidance,
+        explain: if want_explain {
+            planner_response.explain
+        } else {
+            None
+        },
         next_cursor: planner_response.next_cursor,
+        diagnostics,
     };
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
@@ -1081,13 +1212,17 @@ mod tests {
         let resp = SearchResponse {
             result: Vec::new(),
             assistance: None,
+            guidance: None,
             explain: None,
             next_cursor: None,
+            diagnostics: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize search response");
         assert!(!json.contains("assistance"));
+        assert!(!json.contains("guidance"));
         assert!(!json.contains("explain"));
         assert!(!json.contains("next_cursor"));
+        assert!(!json.contains("diagnostics"));
     }
 
     #[test]
@@ -1099,12 +1234,66 @@ mod tests {
                 applied_filter_hints: Vec::new(),
                 did_you_mean: Vec::new(),
             }),
+            guidance: None,
             explain: None,
             next_cursor: None,
+            diagnostics: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize assisted search response");
         assert!(json.contains("assistance"));
         assert!(json.contains("thread:br-123"));
+    }
+
+    #[test]
+    fn derive_search_diagnostics_detects_like_fallback() {
+        let explain = mcp_agent_mail_db::search_planner::QueryExplain {
+            method: "like_fallback".to_string(),
+            normalized_query: Some("broken query".to_string()),
+            used_like_fallback: true,
+            facet_count: 0,
+            facets_applied: Vec::new(),
+            sql: "SELECT ...".to_string(),
+            scope_policy: "unrestricted".to_string(),
+            denied_count: 0,
+            redacted_count: 0,
+        };
+        let diagnostics = derive_search_diagnostics(Some(&explain)).expect("diagnostics");
+        assert!(diagnostics.degraded);
+        assert_eq!(diagnostics.fallback_mode.as_deref(), Some("like_fallback"));
+        assert!(
+            diagnostics
+                .remediation_hints
+                .iter()
+                .any(|hint| hint.contains("FTS syntax"))
+        );
+    }
+
+    #[test]
+    fn derive_search_diagnostics_detects_budget_governor_signal() {
+        let explain = mcp_agent_mail_db::search_planner::QueryExplain {
+            method: "hybrid_v3".to_string(),
+            normalized_query: Some("deploy".to_string()),
+            used_like_fallback: false,
+            facet_count: 3,
+            facets_applied: vec![
+                "engine:Hybrid".to_string(),
+                "rerank_outcome:skipped_by_budget_governor_critical".to_string(),
+                "governor_remaining_budget_ms:12".to_string(),
+            ],
+            sql: "-- v3 pipeline".to_string(),
+            scope_policy: "unrestricted".to_string(),
+            denied_count: 0,
+            redacted_count: 0,
+        };
+        let diagnostics = derive_search_diagnostics(Some(&explain)).expect("diagnostics");
+        assert!(diagnostics.degraded);
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("hybrid_budget_governor")
+        );
+        assert_eq!(diagnostics.budget_tier.as_deref(), Some("critical"));
+        assert_eq!(diagnostics.budget_remaining_ms, Some(12));
+        assert_eq!(diagnostics.budget_exhausted, Some(true));
     }
 
     #[test]

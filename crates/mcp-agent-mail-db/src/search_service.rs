@@ -12,8 +12,8 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    DocKind, PlanMethod, PlanParam, SearchCursor, SearchQuery, SearchResponse, SearchResult,
-    plan_search,
+    DocKind, PlanMethod, PlanParam, RecoverySuggestion, SearchCursor, SearchQuery, SearchResponse,
+    SearchResult, ZeroResultGuidance, plan_search,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -87,6 +87,9 @@ pub struct ScopedSearchResponse {
     /// Query-assistance metadata (`did_you_mean`, parsed hint tokens, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistance: Option<QueryAssistance>,
+    /// Zero-result recovery guidance (populated when results are empty or very low).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<crate::search_planner::ZeroResultGuidance>,
 }
 
 /// Lightweight response for simple (unscoped) searches.
@@ -128,6 +131,110 @@ fn query_assistance_payload(query: &SearchQuery) -> Option<QueryAssistance> {
     } else {
         Some(assistance)
     }
+}
+
+/// Generate zero-result recovery guidance based on query facets and result count.
+///
+/// Only produces guidance when `result_count` is 0. Suggestions are deterministic
+/// and derived solely from the query structure — no restricted data is leaked.
+fn generate_zero_result_guidance(
+    query: &SearchQuery,
+    result_count: usize,
+    assistance: &Option<QueryAssistance>,
+) -> Option<ZeroResultGuidance> {
+    if result_count > 0 {
+        return None;
+    }
+
+    let mut suggestions = Vec::new();
+
+    // Suggest broadening date range if time_range is active
+    if !query.time_range.is_empty() {
+        suggestions.push(RecoverySuggestion {
+            kind: "broaden_date_range".to_string(),
+            label: "Broaden date range".to_string(),
+            detail: Some("Remove or widen the date filter to include more results.".to_string()),
+        });
+    }
+
+    // Suggest dropping importance filter
+    if !query.importance.is_empty() {
+        let levels: Vec<&str> = query.importance.iter().map(|i| i.as_str()).collect();
+        suggestions.push(RecoverySuggestion {
+            kind: "drop_importance_filter".to_string(),
+            label: "Remove importance filter".to_string(),
+            detail: Some(format!(
+                "Currently filtering to [{}]. Try removing the importance constraint.",
+                levels.join(", ")
+            )),
+        });
+    }
+
+    // Suggest dropping agent/sender filter
+    if query.agent_name.is_some() {
+        suggestions.push(RecoverySuggestion {
+            kind: "drop_agent_filter".to_string(),
+            label: "Remove sender/agent filter".to_string(),
+            detail: Some("Search across all agents instead of a specific sender.".to_string()),
+        });
+    }
+
+    // Suggest dropping thread filter
+    if query.thread_id.is_some() {
+        suggestions.push(RecoverySuggestion {
+            kind: "drop_thread_filter".to_string(),
+            label: "Remove thread filter".to_string(),
+            detail: Some("Search across all threads instead of a single thread.".to_string()),
+        });
+    }
+
+    // Suggest dropping ack_required filter
+    if query.ack_required.is_some() {
+        suggestions.push(RecoverySuggestion {
+            kind: "drop_ack_filter".to_string(),
+            label: "Remove ack-required filter".to_string(),
+            detail: None,
+        });
+    }
+
+    // Surface did_you_mean hints from query assistance
+    if let Some(assist) = assistance {
+        for hint in &assist.did_you_mean {
+            suggestions.push(RecoverySuggestion {
+                kind: "fix_typo".to_string(),
+                label: format!("Did you mean \"{}:{}\"?", hint.suggested_field, hint.value),
+                detail: Some(format!(
+                    "\"{}\" is not a recognized field. Try \"{}\" instead.",
+                    hint.token, hint.suggested_field
+                )),
+            });
+        }
+    }
+
+    // Suggest simplifying the query text if no other suggestions were generated
+    if suggestions.is_empty() && !query.text.trim().is_empty() {
+        suggestions.push(RecoverySuggestion {
+            kind: "simplify_query".to_string(),
+            label: "Simplify search terms".to_string(),
+            detail: Some("Try fewer or broader keywords.".to_string()),
+        });
+    }
+
+    let filter_count = suggestions.len();
+    let summary = if filter_count == 0 {
+        "No results found. Try a different search query.".to_string()
+    } else {
+        format!(
+            "No results found. {count} suggestion{s} available to broaden your search.",
+            count = filter_count,
+            s = if filter_count == 1 { "" } else { "s" }
+        )
+    };
+
+    Some(ZeroResultGuidance {
+        summary,
+        suggestions,
+    })
 }
 
 async fn acquire_conn(
@@ -2079,6 +2186,7 @@ pub async fn execute_search(
         } else {
             None
         };
+        let guidance = generate_zero_result_guidance(query, 0, &assistance);
         return Outcome::Ok(ScopedSearchResponse {
             results: Vec::new(),
             next_cursor: None,
@@ -2086,6 +2194,7 @@ pub async fn execute_search(
             audit_summary: None,
             sql_row_count: 0,
             assistance,
+            guidance,
         });
     }
 
@@ -2174,6 +2283,8 @@ pub async fn execute_search(
         None
     };
 
+    let guidance = generate_zero_result_guidance(query, scoped_results.len(), &assistance);
+
     Outcome::Ok(ScopedSearchResponse {
         results: scoped_results,
         next_cursor,
@@ -2181,6 +2292,7 @@ pub async fn execute_search(
         audit_summary: audit,
         sql_row_count,
         assistance,
+        guidance,
     })
 }
 
@@ -2205,6 +2317,7 @@ fn finish_scoped_response(
         recipient_map: Vec::new(),
     });
     let (scoped_results, audit_summary) = apply_scope(raw_results, &scope_ctx, &redaction);
+    let guidance = generate_zero_result_guidance(query, scoped_results.len(), &assistance);
     let explain = if query.explain {
         explain.map(|mut value| {
             value.denied_count = audit_summary.denied_count;
@@ -2229,6 +2342,7 @@ fn finish_scoped_response(
         audit_summary: audit,
         sql_row_count,
         assistance,
+        guidance,
     })
 }
 
@@ -2258,11 +2372,13 @@ pub async fn execute_search_simple(
         } else {
             None
         };
+        let guidance = generate_zero_result_guidance(query, 0, &assistance);
         return Outcome::Ok(SearchResponse {
             results: Vec::new(),
             next_cursor: None,
             explain,
             assistance,
+            guidance,
             audit: Vec::new(),
         });
     }
@@ -2308,11 +2424,14 @@ pub async fn execute_search_simple(
         None
     };
 
+    let guidance = generate_zero_result_guidance(query, raw_results.len(), &assistance);
+
     Outcome::Ok(SearchResponse {
         results: raw_results,
         next_cursor,
         explain,
         assistance,
+        guidance,
         audit: Vec::new(),
     })
 }

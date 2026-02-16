@@ -1199,6 +1199,7 @@ fn render_search(
                     next_cursor: None,
                     explain: None,
                     assistance: None,
+                    guidance: None,
                     audit: Vec::new(),
                 }
             }

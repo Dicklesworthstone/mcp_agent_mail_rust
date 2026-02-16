@@ -49,6 +49,8 @@ const LATENCY_HISTORY: usize = 30;
 
 /// Max percentile samples kept for the global latency ribbon.
 const PERCENTILE_HISTORY: usize = 60;
+/// Reload persisted tool metrics every ~3s as a startup/live fallback.
+const PERSISTED_HYDRATE_INTERVAL_TICKS: u64 = 30;
 /// Chart transition duration for latency bars.
 const CHART_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 
@@ -257,6 +259,53 @@ impl ToolStats {
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ms_f64_to_u64(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        value.round() as u64
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn total_duration_ms_from_avg(avg_ms: f64, calls: u64) -> u64 {
+    if calls == 0 {
+        return 0;
+    }
+    let total = avg_ms * calls as f64;
+    ms_f64_to_u64(total)
+}
+
+fn synthesize_recent_latency_samples(
+    avg_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+) -> VecDeque<u64> {
+    let mut out = VecDeque::with_capacity(LATENCY_HISTORY);
+    let mut seeds = [
+        ms_f64_to_u64(p50_ms),
+        ms_f64_to_u64(avg_ms),
+        ms_f64_to_u64(p95_ms),
+        ms_f64_to_u64(p99_ms),
+    ];
+    if seeds.iter().all(|v| *v == 0) {
+        seeds = [1, 1, 1, 1];
+    }
+    while out.len() < LATENCY_HISTORY {
+        for value in &seeds {
+            if out.len() >= LATENCY_HISTORY {
+                break;
+            }
+            out.push_back(*value);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 struct LatencyRibbonRow {
     name: String,
@@ -295,6 +344,8 @@ pub struct ToolMetricsScreen {
     percentile_samples: VecDeque<PercentileSample>,
     /// Tick counter for periodic percentile snapshot.
     snapshot_tick: u64,
+    /// Last tick where persisted metrics fallback was attempted.
+    last_persisted_hydrate_tick: u64,
     /// Animated latency rows consumed by the bar-chart ribbon.
     latency_ribbon_rows: Vec<LatencyRibbonRow>,
     /// Transition state for latency chart values.
@@ -327,6 +378,7 @@ impl ToolMetricsScreen {
             view_mode: ViewMode::Table,
             percentile_samples: VecDeque::with_capacity(PERCENTILE_HISTORY),
             snapshot_tick: 0,
+            last_persisted_hydrate_tick: 0,
             latency_ribbon_rows: Vec::new(),
             latency_chart_transition: ChartTransition::new(CHART_TRANSITION_DURATION),
             chart_animations_enabled: chart_animations_enabled(),
@@ -408,6 +460,36 @@ impl ToolMetricsScreen {
                     });
                 }
             }
+        }
+    }
+
+    fn hydrate_from_persisted_metrics(&mut self, state: &TuiSharedState) {
+        let cfg = state.config_snapshot();
+        let persisted = crate::tool_metrics::load_latest_persisted_metrics(&cfg.raw_database_url, 512);
+        if persisted.is_empty() {
+            return;
+        }
+
+        let mut updated = false;
+        for metric in &persisted {
+            let stats = self
+                .tool_map
+                .entry(metric.tool_name.clone())
+                .or_insert_with(|| ToolStats::new(metric.tool_name.clone()));
+            if stats.calls > metric.calls {
+                continue;
+            }
+
+            stats.calls = metric.calls;
+            stats.errors = metric.errors.min(metric.calls);
+            stats.total_duration_ms = total_duration_ms_from_avg(metric.avg_ms, metric.calls);
+            stats.recent_latencies =
+                synthesize_recent_latency_samples(metric.avg_ms, metric.p50_ms, metric.p95_ms, metric.p99_ms);
+            updated = true;
+        }
+
+        if updated {
+            self.rebuild_sorted();
         }
     }
 
@@ -1064,6 +1146,13 @@ impl MailScreen for ToolMetricsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        if self.tool_map.is_empty()
+            || tick_count.wrapping_sub(self.last_persisted_hydrate_tick)
+                >= PERSISTED_HYDRATE_INTERVAL_TICKS
+        {
+            self.hydrate_from_persisted_metrics(state);
+            self.last_persisted_hydrate_tick = tick_count;
+        }
         self.ingest_events(state);
         if tick_count % 10 == 0 {
             self.rebuild_sorted();
@@ -1149,9 +1238,19 @@ impl MailScreen for ToolMetricsScreen {
 mod tests {
     use super::*;
     use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_db::DbConn;
+    use mcp_agent_mail_db::sqlmodel::Value;
 
     fn test_state() -> std::sync::Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
+    }
+
+    fn test_state_with_database_url(database_url: String) -> std::sync::Arc<TuiSharedState> {
+        let config = Config {
+            database_url,
+            ..Config::default()
+        };
+        TuiSharedState::new(&config)
     }
 
     #[test]
@@ -1161,6 +1260,71 @@ mod tests {
         assert_eq!(screen.sort_col, COL_CALLS);
         assert!(!screen.sort_asc);
         assert_eq!(screen.view_mode, ViewMode::Table);
+    }
+
+    #[test]
+    fn tick_hydrates_from_persisted_metrics_when_events_are_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tool_metrics_hydration.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS tool_metrics_snapshots (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 collected_ts INTEGER NOT NULL, \
+                 tool_name TEXT NOT NULL, \
+                 calls INTEGER NOT NULL DEFAULT 0, \
+                 errors INTEGER NOT NULL DEFAULT 0, \
+                 cluster TEXT NOT NULL DEFAULT '', \
+                 capabilities_json TEXT NOT NULL DEFAULT '[]', \
+                 complexity TEXT NOT NULL DEFAULT 'unknown', \
+                 latency_avg_ms REAL, \
+                 latency_min_ms REAL, \
+                 latency_max_ms REAL, \
+                 latency_p50_ms REAL, \
+                 latency_p95_ms REAL, \
+                 latency_p99_ms REAL, \
+                 latency_is_slow INTEGER NOT NULL DEFAULT 0\
+             )",
+            &[],
+        )
+        .expect("create metrics table");
+        conn.execute_sync(
+            "INSERT INTO tool_metrics_snapshots (\
+                 collected_ts, tool_name, calls, errors, cluster, capabilities_json, complexity, \
+                 latency_avg_ms, latency_min_ms, latency_max_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms, latency_is_slow\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1_700_000_000_000_000),
+                Value::Text("send_message".to_string()),
+                Value::BigInt(42),
+                Value::BigInt(5),
+                Value::Text("messaging".to_string()),
+                Value::Text("[]".to_string()),
+                Value::Text("medium".to_string()),
+                Value::Double(180.0),
+                Value::Double(20.0),
+                Value::Double(950.0),
+                Value::Double(120.0),
+                Value::Double(640.0),
+                Value::Double(950.0),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert metrics row");
+
+        let database_url = format!("sqlite://{}", db_path.display());
+        let state = test_state_with_database_url(database_url);
+        let mut screen = ToolMetricsScreen::new();
+        screen.tick(0, &state);
+
+        let stats = screen
+            .tool_map
+            .get("send_message")
+            .expect("persisted metrics should hydrate tool stats");
+        assert_eq!(stats.calls, 42);
+        assert_eq!(stats.errors, 5);
+        assert!(!stats.recent_latencies.is_empty());
     }
 
     #[test]

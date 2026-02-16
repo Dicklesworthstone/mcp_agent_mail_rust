@@ -11,8 +11,14 @@
 
 #![forbid(unsafe_code)]
 
-use mcp_agent_mail_core::Config;
-use mcp_agent_mail_tools::{reset_tool_latencies, slow_tools, tool_metrics_snapshot};
+use mcp_agent_mail_core::{Config, kpi_record_sample};
+use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::sqlmodel::Value;
+use mcp_agent_mail_db::timestamps::now_micros;
+use mcp_agent_mail_tools::{
+    MetricsSnapshotEntry, reset_tool_latencies, slow_tools, tool_metrics_snapshot,
+};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
@@ -22,6 +28,25 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Worker handle for join-on-shutdown.
 static WORKER: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+
+const TOOL_METRICS_SNAPSHOTS_TABLE: &str = "tool_metrics_snapshots";
+const METRICS_RETENTION_DAYS: i64 = 30;
+const PRUNE_INTERVAL_TICKS: u64 = 60;
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedToolMetric {
+    pub tool_name: String,
+    pub calls: u64,
+    pub errors: u64,
+    pub cluster: String,
+    pub complexity: String,
+    pub avg_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub is_slow: bool,
+    pub collected_ts: i64,
+}
 
 /// Start the tool metrics emit worker (if enabled).
 ///
@@ -48,6 +73,11 @@ pub fn shutdown() {
 
 fn metrics_loop(config: &Config) {
     let interval = std::time::Duration::from_secs(config.tool_metrics_emit_interval_seconds.max(5));
+    let mut conn = open_metrics_connection(&config.database_url);
+    if let Some(db) = conn.as_ref() {
+        ensure_metrics_schema(db);
+    }
+    let mut tick_index: u64 = 0;
 
     info!(
         interval_secs = interval.as_secs(),
@@ -60,9 +90,14 @@ fn metrics_loop(config: &Config) {
             return;
         }
 
+        // Record KPI samples continuously so analytics has baseline data,
+        // even during low/no tool-call periods.
+        kpi_record_sample();
+
         // Take a snapshot and emit if non-empty (legacy: only log if snapshot is truthy).
         let snapshot = tool_metrics_snapshot();
         if !snapshot.is_empty() {
+            let collected_ts = now_micros();
             // Serialize snapshot to JSON for structured logging.
             // Matches legacy: structlog.get_logger("tool.metrics").info("tool_metrics_snapshot", tools=snapshot)
             match serde_json::to_value(&snapshot) {
@@ -83,6 +118,24 @@ fn metrics_loop(config: &Config) {
                         tool_count = snapshot.len(),
                         "tool metrics snapshot (serialization failed)"
                     );
+                }
+            }
+
+            if conn.is_none() && tick_index % 12 == 0 {
+                conn = open_metrics_connection(&config.database_url);
+                if let Some(db) = conn.as_ref() {
+                    ensure_metrics_schema(db);
+                }
+            }
+            if let Some(db) = conn.as_ref() {
+                if let Err(err) = persist_snapshot_rows(db, collected_ts, &snapshot) {
+                    warn!(
+                        target: "tool.metrics",
+                        error = %err,
+                        "failed persisting tool metrics snapshot"
+                    );
+                } else if tick_index % PRUNE_INTERVAL_TICKS == 0 {
+                    prune_old_snapshot_rows(db, collected_ts);
                 }
             }
 
@@ -120,7 +173,199 @@ fn metrics_loop(config: &Config) {
             std::thread::sleep(chunk);
             remaining = remaining.saturating_sub(chunk);
         }
+        tick_index = tick_index.saturating_add(1);
     }
+}
+
+fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg.sqlite_path().ok()?;
+    DbConn::open_file(&path).ok()
+}
+
+fn ensure_metrics_schema(conn: &DbConn) {
+    let _ = conn.execute_sync(
+        "CREATE TABLE IF NOT EXISTS tool_metrics_snapshots (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             collected_ts INTEGER NOT NULL, \
+             tool_name TEXT NOT NULL, \
+             calls INTEGER NOT NULL DEFAULT 0, \
+             errors INTEGER NOT NULL DEFAULT 0, \
+             cluster TEXT NOT NULL DEFAULT '', \
+             capabilities_json TEXT NOT NULL DEFAULT '[]', \
+             complexity TEXT NOT NULL DEFAULT 'unknown', \
+             latency_avg_ms REAL, \
+             latency_min_ms REAL, \
+             latency_max_ms REAL, \
+             latency_p50_ms REAL, \
+             latency_p95_ms REAL, \
+             latency_p99_ms REAL, \
+             latency_is_slow INTEGER NOT NULL DEFAULT 0\
+         )",
+        &[],
+    );
+    let _ = conn.execute_sync(
+        "CREATE INDEX IF NOT EXISTS idx_tool_metrics_snapshots_tool_ts \
+         ON tool_metrics_snapshots(tool_name, collected_ts DESC)",
+        &[],
+    );
+    let _ = conn.execute_sync(
+        "CREATE INDEX IF NOT EXISTS idx_tool_metrics_snapshots_collected_ts \
+         ON tool_metrics_snapshots(collected_ts)",
+        &[],
+    );
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn i64_from_u64_saturating(value: u64) -> i64 {
+    if value > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        value as i64
+    }
+}
+
+fn persist_snapshot_rows(
+    conn: &DbConn,
+    collected_ts: i64,
+    snapshot: &[MetricsSnapshotEntry],
+) -> Result<(), String> {
+    if snapshot.is_empty() {
+        return Ok(());
+    }
+    let sql = "INSERT INTO tool_metrics_snapshots (\
+                 collected_ts, tool_name, calls, errors, cluster, capabilities_json, complexity, \
+                 latency_avg_ms, latency_min_ms, latency_max_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms, latency_is_slow\
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    for entry in snapshot {
+        let capabilities_json =
+            serde_json::to_string(&entry.capabilities).unwrap_or_else(|_| "[]".to_string());
+        let latency = entry.latency.as_ref();
+        let params = vec![
+            Value::BigInt(collected_ts),
+            Value::Text(entry.name.clone()),
+            Value::BigInt(i64_from_u64_saturating(entry.calls)),
+            Value::BigInt(i64_from_u64_saturating(entry.errors)),
+            Value::Text(entry.cluster.clone()),
+            Value::Text(capabilities_json),
+            Value::Text(entry.complexity.clone()),
+            latency.map_or(Value::Null, |lat| Value::Double(lat.avg_ms)),
+            latency.map_or(Value::Null, |lat| Value::Double(lat.min_ms)),
+            latency.map_or(Value::Null, |lat| Value::Double(lat.max_ms)),
+            latency.map_or(Value::Null, |lat| Value::Double(lat.p50_ms)),
+            latency.map_or(Value::Null, |lat| Value::Double(lat.p95_ms)),
+            latency.map_or(Value::Null, |lat| Value::Double(lat.p99_ms)),
+            Value::BigInt(i64::from(latency.is_some_and(|lat| lat.is_slow))),
+        ];
+        conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn prune_old_snapshot_rows(conn: &DbConn, collected_ts: i64) {
+    let cutoff = collected_ts.saturating_sub(METRICS_RETENTION_DAYS * 86_400_000_000);
+    let _ = conn.execute_sync(
+        "DELETE FROM tool_metrics_snapshots WHERE collected_ts < ?",
+        &[Value::BigInt(cutoff)],
+    );
+}
+
+fn decode_metric_row(row: &mcp_agent_mail_db::sqlmodel_core::Row) -> Option<PersistedToolMetric> {
+    let tool_name = row.get_named::<String>("tool_name").ok()?;
+    let calls = row
+        .get_named::<i64>("calls")
+        .ok()
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(0);
+    let errors = row
+        .get_named::<i64>("errors")
+        .ok()
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(0);
+    let cluster = row
+        .get_named::<String>("cluster")
+        .ok()
+        .unwrap_or_else(|| "unknown".to_string());
+    let complexity = row
+        .get_named::<String>("complexity")
+        .ok()
+        .unwrap_or_else(|| "unknown".to_string());
+    let avg_ms = row.get_named::<f64>("latency_avg_ms").ok().unwrap_or(0.0);
+    let p50_ms = row.get_named::<f64>("latency_p50_ms").ok().unwrap_or(0.0);
+    let p95_ms = row.get_named::<f64>("latency_p95_ms").ok().unwrap_or(0.0);
+    let p99_ms = row.get_named::<f64>("latency_p99_ms").ok().unwrap_or(0.0);
+    let is_slow = row
+        .get_named::<i64>("latency_is_slow")
+        .ok()
+        .is_some_and(|v| v != 0);
+    let collected_ts = row.get_named::<i64>("collected_ts").ok().unwrap_or(0);
+
+    Some(PersistedToolMetric {
+        tool_name,
+        calls,
+        errors,
+        cluster,
+        complexity,
+        avg_ms,
+        p50_ms,
+        p95_ms,
+        p99_ms,
+        is_slow,
+        collected_ts,
+    })
+}
+
+#[must_use]
+pub(crate) fn load_latest_persisted_metrics(
+    database_url: &str,
+    limit: usize,
+) -> Vec<PersistedToolMetric> {
+    let Some(conn) = open_metrics_connection(database_url) else {
+        return Vec::new();
+    };
+    ensure_metrics_schema(&conn);
+
+    let limit_i64 = i64::try_from(limit.clamp(1, 2_000)).unwrap_or(200);
+    let sql = "SELECT s.tool_name, s.calls, s.errors, s.cluster, s.complexity, \
+                      s.latency_avg_ms, s.latency_p50_ms, s.latency_p95_ms, s.latency_p99_ms, \
+                      s.latency_is_slow, s.collected_ts \
+               FROM tool_metrics_snapshots s \
+               JOIN ( \
+                    SELECT tool_name, MAX(collected_ts) AS max_ts \
+                    FROM tool_metrics_snapshots \
+                    GROUP BY tool_name \
+               ) latest \
+                 ON latest.tool_name = s.tool_name AND latest.max_ts = s.collected_ts \
+               ORDER BY s.calls DESC, s.tool_name ASC \
+               LIMIT ?";
+    conn.query_sync(sql, &[Value::BigInt(limit_i64)])
+        .ok()
+        .map(|rows| rows.iter().filter_map(decode_metric_row).collect())
+        .unwrap_or_default()
+}
+
+#[must_use]
+pub(crate) fn persisted_metric_store_size(database_url: &str) -> u64 {
+    let Some(conn) = open_metrics_connection(database_url) else {
+        return 0;
+    };
+    ensure_metrics_schema(&conn);
+    conn.query_sync(
+        &format!("SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}"),
+        &[],
+    )
+    .ok()
+    .and_then(|rows| rows.into_iter().next())
+    .and_then(|row| row.get_named::<i64>("c").ok())
+    .and_then(|v| u64::try_from(v).ok())
+    .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -386,5 +631,55 @@ mod tests {
             "expected at least {expected_errors} errors, got {}",
             entry.errors
         );
+    }
+
+    #[test]
+    fn persists_and_loads_latest_snapshots() {
+        let _guard = lock_metrics_test();
+        reset_tool_metrics();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tool_metrics_snapshots.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open metrics sqlite");
+        ensure_metrics_schema(&conn);
+
+        record_call("send_message");
+        record_call("send_message");
+        record_error("send_message");
+        record_latency("send_message", 800_000);
+
+        let snapshot = tool_metrics_snapshot();
+        persist_snapshot_rows(&conn, now_micros(), &snapshot).expect("persist snapshot");
+
+        let rows = load_latest_persisted_metrics(&database_url, 50);
+        let row = rows
+            .iter()
+            .find(|r| r.tool_name == "send_message")
+            .expect("send_message persisted");
+        assert!(row.calls >= 2);
+        assert!(row.errors >= 1);
+        assert!(row.p95_ms >= 500.0);
+        assert!(row.collected_ts > 0);
+    }
+
+    #[test]
+    fn persisted_store_size_counts_rows() {
+        let _guard = lock_metrics_test();
+        reset_tool_metrics();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tool_metrics_store_size.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open metrics sqlite");
+        ensure_metrics_schema(&conn);
+
+        record_call("health_check");
+        record_latency("health_check", 10_000);
+        let snapshot = tool_metrics_snapshot();
+        persist_snapshot_rows(&conn, now_micros(), &snapshot).expect("persist snapshot");
+
+        let count = persisted_metric_store_size(&database_url);
+        assert!(count >= 1);
     }
 }

@@ -849,6 +849,50 @@ pub fn schema_migrations() -> Vec<Migration> {
     // ── v8: Search recipes and query history ──────────────────────
     migrations.extend(crate::search_recipes::recipe_migrations());
 
+    // ── v9: Persisted tool metrics snapshots ───────────────────────
+    //
+    // Stores periodic per-tool metric snapshots emitted by the server worker.
+    // This enables TUI hydration after restart (tool metrics + analytics).
+    migrations.push(Migration::new(
+        "v9_create_tool_metrics_snapshots".to_string(),
+        "create persisted per-tool metrics snapshot table".to_string(),
+        "CREATE TABLE IF NOT EXISTS tool_metrics_snapshots (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             collected_ts INTEGER NOT NULL, \
+             tool_name TEXT NOT NULL, \
+             calls INTEGER NOT NULL DEFAULT 0, \
+             errors INTEGER NOT NULL DEFAULT 0, \
+             cluster TEXT NOT NULL DEFAULT '', \
+             capabilities_json TEXT NOT NULL DEFAULT '[]', \
+             complexity TEXT NOT NULL DEFAULT 'unknown', \
+             latency_avg_ms REAL, \
+             latency_min_ms REAL, \
+             latency_max_ms REAL, \
+             latency_p50_ms REAL, \
+             latency_p95_ms REAL, \
+             latency_p99_ms REAL, \
+             latency_is_slow INTEGER NOT NULL DEFAULT 0\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v9_idx_tool_metrics_snapshots_tool_ts".to_string(),
+        "index tool_metrics_snapshots by tool_name + collected_ts desc".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_tool_metrics_snapshots_tool_ts \
+         ON tool_metrics_snapshots(tool_name, collected_ts DESC)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v9_idx_tool_metrics_snapshots_collected_ts".to_string(),
+        "index tool_metrics_snapshots by collected_ts for retention pruning".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_tool_metrics_snapshots_collected_ts \
+         ON tool_metrics_snapshots(collected_ts)"
+            .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -2042,6 +2086,15 @@ mod tests {
             )
             .expect("fts_agents search for old term");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn schema_migrations_include_tool_metrics_snapshot_table() {
+        let ids: std::collections::HashSet<String> =
+            schema_migrations().into_iter().map(|m| m.id).collect();
+        assert!(ids.contains("v9_create_tool_metrics_snapshots"));
+        assert!(ids.contains("v9_idx_tool_metrics_snapshots_tool_ts"));
+        assert!(ids.contains("v9_idx_tool_metrics_snapshots_collected_ts"));
     }
 
     #[test]

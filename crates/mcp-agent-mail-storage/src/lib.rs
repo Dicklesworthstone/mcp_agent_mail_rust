@@ -2474,11 +2474,12 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
     // Check PID-based ownership first
     let owner_path = repo_root.join(".git").join("index.lock.owner");
     if let Ok(content) = fs::read_to_string(&owner_path) {
-        let mut lines = content.lines();
-        if let Some(pid_str) = lines.next() {
+        let lines: Vec<&str> = content.lines().collect();
+        if let Some(pid_str) = lines.first() {
             if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                let has_start_ticks_field = lines.get(2).is_some();
                 let owner_start_ticks = lines
-                    .nth(1)
+                    .get(2)
                     .and_then(|line| line.trim().parse::<u64>().ok())
                     .filter(|ticks| *ticks > 0);
                 if is_pid_alive(pid) {
@@ -2497,12 +2498,18 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                         }
                     }
 
-                    // Legacy owner files (without start ticks) can stick forever on
-                    // PID reuse. If the lock is old enough, treat as stale.
-                    if owner_start_ticks.is_none()
-                        && lock_file_age_seconds(&lock_path)
-                            .is_some_and(|age| age > max_age_seconds)
-                    {
+                    // New-format owner files may carry "unknown" start ticks (e.g., non-Linux).
+                    // Be conservative: never remove an alive-PID lock in that case.
+                    if has_start_ticks_field {
+                        tracing::debug!(
+                            "[git-lock] index.lock held by alive PID {pid} (start ticks unavailable), not removing"
+                        );
+                        return false;
+                    }
+
+                    // Legacy owner files (no start-tick field) can stick forever on PID reuse.
+                    // If the lock is sufficiently old, treat as stale.
+                    if lock_file_age_seconds(&lock_path).is_some_and(|age| age > max_age_seconds) {
                         tracing::info!(
                             "[git-lock] legacy owner format with alive PID {pid} and stale age, removing lock"
                         );
@@ -9478,6 +9485,35 @@ mod tests {
         let removed = try_clean_stale_git_lock(&archive.repo_root, 0.0);
         assert!(removed, "should remove lock owned by dead PID");
         assert!(!lock_path.exists(), "lock file should be removed");
+    }
+
+    #[test]
+    fn stale_lock_cleanup_alive_pid_unknown_start_ticks_not_removed() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "alive-unknown-start").unwrap();
+
+        let lock_path = archive.repo_root.join(".git/index.lock");
+        fs::write(&lock_path, "fake lock").unwrap();
+
+        let owner_path = archive.repo_root.join(".git/index.lock.owner");
+        let pid = std::process::id();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Simulate a new-format owner file where start ticks are unavailable.
+        fs::write(&owner_path, format!("{pid}\n{now}\n0\n")).unwrap();
+
+        let removed = try_clean_stale_git_lock(&archive.repo_root, 0.0);
+        assert!(
+            !removed,
+            "must not remove lock owned by alive PID when start ticks are unknown"
+        );
+        assert!(lock_path.exists(), "lock file should still exist");
+
+        fs::remove_file(&lock_path).ok();
+        remove_lock_owner(&archive.repo_root);
     }
 
     #[cfg(target_os = "linux")]

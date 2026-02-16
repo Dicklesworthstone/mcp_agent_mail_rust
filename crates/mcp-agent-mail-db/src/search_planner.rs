@@ -451,9 +451,41 @@ pub struct SearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistance: Option<QueryAssistance>,
 
+    /// Zero-result recovery guidance (populated when results are empty or very low).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<ZeroResultGuidance>,
+
     /// Audit log of denied/redacted results (empty when scope is unrestricted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audit: Vec<SearchAuditEntry>,
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Zero-result recovery guidance
+// ────────────────────────────────────────────────────────────────────
+
+/// Actionable guidance for recovering from zero or low-result searches.
+///
+/// Generated deterministically from query facets — never leaks restricted data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZeroResultGuidance {
+    /// Human-readable summary of why results may be empty.
+    pub summary: String,
+    /// Ordered list of concrete recovery suggestions.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub suggestions: Vec<RecoverySuggestion>,
+}
+
+/// A single actionable suggestion for recovering from a failed search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverySuggestion {
+    /// Machine-stable kind (e.g. `broaden_date_range`, `drop_filter`, `switch_mode`).
+    pub kind: String,
+    /// Human-readable label for the suggestion.
+    pub label: String,
+    /// Optional description with more detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1870,6 +1902,7 @@ mod tests {
             next_cursor: None,
             explain: None,
             assistance: None,
+            guidance: None,
             audit: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -1883,6 +1916,7 @@ mod tests {
             next_cursor: None,
             explain: None,
             assistance: None,
+            guidance: None,
             audit: vec![SearchAuditEntry {
                 action: AuditAction::Redacted,
                 doc_kind: DocKind::Message,
