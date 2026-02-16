@@ -1,5 +1,6 @@
 //! Reservations screen — active file reservations with TTL progress bars.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use ftui::layout::Constraint;
@@ -28,6 +29,8 @@ const COL_TTL: usize = 3;
 const COL_PROJECT: usize = 4;
 
 const SORT_LABELS: &[&str] = &["Agent", "Path", "Excl", "TTL", "Project"];
+/// Number of empty DB snapshots tolerated before pruning active rows.
+const EMPTY_SNAPSHOT_HOLD_CYCLES: u8 = 1;
 
 /// Tracked reservation state from events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,8 +99,14 @@ pub struct ReservationsScreen {
     last_seq: u64,
     /// Timestamp of the last DB snapshot consumed by this screen.
     last_snapshot_micros: i64,
+    /// Consecutive empty DB snapshots seen while active rows exist.
+    empty_snapshot_streak: u8,
     /// Synthetic event for the focused reservation (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
+    /// Last table scroll offset computed during render.
+    last_render_offset: Cell<usize>,
+    /// Last rendered table area for mouse hit-testing.
+    last_table_area: Cell<Rect>,
 }
 
 impl ReservationsScreen {
@@ -112,7 +121,10 @@ impl ReservationsScreen {
             show_released: false,
             last_seq: 0,
             last_snapshot_micros: 0,
+            empty_snapshot_streak: 0,
             focused_synthetic: None,
+            last_render_offset: Cell::new(0),
+            last_table_area: Cell::new(Rect::new(0, 0, 0, 0)),
         }
     }
 
@@ -258,6 +270,18 @@ impl ReservationsScreen {
         }
         self.last_snapshot_micros = snapshot.timestamp_micros;
 
+        let had_active_before = self.reservations.values().any(|res| !res.released);
+        let hold_active_rows = if snapshot.reservation_snapshots.is_empty() && had_active_before {
+            let hold = self.empty_snapshot_streak < EMPTY_SNAPSHOT_HOLD_CYCLES;
+            self.empty_snapshot_streak = self.empty_snapshot_streak.saturating_add(1);
+            hold
+        } else {
+            self.empty_snapshot_streak = 0;
+            false
+        };
+        let snapshot_truncated = snapshot.file_reservations
+            > u64::try_from(snapshot.reservation_snapshots.len()).unwrap_or(u64::MAX);
+
         let mut seen_active: HashSet<String> = HashSet::new();
         let mut next = self.reservations.clone();
         for row in &snapshot.reservation_snapshots {
@@ -277,10 +301,30 @@ impl ReservationsScreen {
             };
             next.insert(key, reservation);
         }
-        // Keep released history rows for operator visibility and keep very
-        // recent event-only grants that may race a stale DB snapshot.
+        // Keep released history rows for operator visibility.
+        //
+        // Also keep:
+        // 1) one-cycle transient empty snapshots to prevent flash-empty glitches,
+        // 2) rows outside truncated DB snapshot windows,
+        // 3) event-only grants until TTL expiry (ID may arrive later).
         next.retain(|key, res| {
-            seen_active.contains(key) || res.released || res.granted_ts > snapshot.timestamp_micros
+            if seen_active.contains(key) || res.released {
+                return true;
+            }
+            if hold_active_rows {
+                return true;
+            }
+            if snapshot_truncated && !res.released {
+                return true;
+            }
+            if res.reservation_id.is_none() {
+                let ttl_micros = i64::try_from(res.ttl_s)
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(1_000_000);
+                let expires_micros = res.granted_ts.saturating_add(ttl_micros);
+                return snapshot.timestamp_micros < expires_micros;
+            }
+            false
         });
 
         if self.reservations == next {
@@ -359,6 +403,24 @@ impl ReservationsScreen {
         }
         (active, exclusive, shared, expired)
     }
+
+    fn row_index_from_mouse(&self, x: u16, y: u16) -> Option<usize> {
+        let table = self.last_table_area.get();
+        if table.width < 3 || table.height < 4 {
+            return None;
+        }
+        if x <= table.x || x >= table.right().saturating_sub(1) {
+            return None;
+        }
+        let first_data_row = table.y.saturating_add(2); // border + header row
+        let last_data_row_exclusive = table.bottom().saturating_sub(1); // exclude bottom border
+        if y < first_data_row || y >= last_data_row_exclusive {
+            return None;
+        }
+        let visual_row = usize::from(y.saturating_sub(first_data_row));
+        let absolute_row = self.last_render_offset.get().saturating_add(visual_row);
+        (absolute_row < self.sorted_keys.len()).then_some(absolute_row)
+    }
 }
 
 impl Default for ReservationsScreen {
@@ -400,6 +462,18 @@ impl MailScreen for ReservationsScreen {
                 }
             }
         }
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                ftui::MouseEventKind::ScrollDown => self.move_selection(1),
+                ftui::MouseEventKind::ScrollUp => self.move_selection(-1),
+                ftui::MouseEventKind::Down(ftui::MouseButton::Left) => {
+                    if let Some(row) = self.row_index_from_mouse(mouse.x, mouse.y) {
+                        self.table_state.selected = Some(row);
+                    }
+                }
+                _ => {}
+            }
+        }
         Cmd::None
     }
 
@@ -424,18 +498,17 @@ impl MailScreen for ReservationsScreen {
         let key = self.sorted_keys.get(selected_idx)?;
         let reservation = self.reservations.get(key)?;
 
-        // Get actions for this reservation (reservation_id is not available,
-        // so we use the path pattern as a pseudo-id)
-        #[allow(clippy::cast_possible_wrap)]
         let actions = reservations_actions(
-            selected_idx as i64, // Use index as pseudo-id for now
+            reservation.reservation_id,
             &reservation.agent,
             &reservation.path_pattern,
         );
 
-        // Anchor row is the selected row + header offset
-        #[allow(clippy::cast_possible_truncation)]
-        let anchor_row = (selected_idx as u16).saturating_add(2);
+        // Anchor row tracks the selected row within the visible viewport.
+        let viewport_row = selected_idx.saturating_sub(self.last_render_offset.get());
+        let anchor_row = u16::try_from(viewport_row)
+            .unwrap_or(u16::MAX)
+            .saturating_add(2);
         let context_id = key.clone();
 
         Some((actions, anchor_row, context_id))
@@ -444,6 +517,8 @@ impl MailScreen for ReservationsScreen {
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 3 || area.width < 30 {
+            self.last_table_area.set(Rect::new(0, 0, 0, 0));
+            self.last_render_offset.set(0);
             return;
         }
         let tp = crate::tui_theme::TuiThemePalette::current();
@@ -454,6 +529,7 @@ impl MailScreen for ReservationsScreen {
         let table_h = area.height.saturating_sub(header_h);
         let header_area = Rect::new(area.x, area.y, area.width, header_h);
         let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
+        self.last_table_area.set(table_area);
 
         // Summary line
         let (active, exclusive, shared, expired) = self.summary_counts();
@@ -579,6 +655,7 @@ impl MailScreen for ReservationsScreen {
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);
+        self.last_render_offset.set(ts.offset);
         render_ttl_overlays(frame, table_area, &ttl_overlay_rows, &tp);
     }
 
@@ -599,6 +676,10 @@ impl MailScreen for ReservationsScreen {
             HelpEntry {
                 key: "x",
                 action: "Toggle show released",
+            },
+            HelpEntry {
+                key: "Mouse",
+                action: "Wheel/Click navigate rows",
             },
         ]
     }
@@ -1066,6 +1147,84 @@ mod tests {
         );
         let (active, _, _, _) = screen.summary_counts();
         assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn apply_db_snapshot_holds_rows_for_one_transient_empty_cycle() {
+        let mut screen = ReservationsScreen::new();
+
+        assert!(screen.apply_db_snapshot(&DbStatSnapshot {
+            reservation_snapshots: vec![ReservationSnapshot {
+                id: 10,
+                project_slug: "proj".into(),
+                agent_name: "BlueLake".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                granted_ts: 2_000_000,
+                expires_ts: 8_000_000,
+                released_ts: None,
+            }],
+            file_reservations: 1,
+            timestamp_micros: 100,
+            ..Default::default()
+        }));
+        assert_eq!(screen.reservations.len(), 1);
+
+        // First empty snapshot is treated as transient to avoid flash-empty UI.
+        let first_empty_changed = screen.apply_db_snapshot(&DbStatSnapshot {
+            reservation_snapshots: vec![],
+            file_reservations: 0,
+            timestamp_micros: 101,
+            ..Default::default()
+        });
+        assert!(!first_empty_changed);
+        assert_eq!(screen.reservations.len(), 1);
+
+        // Second consecutive empty snapshot confirms the clear.
+        let second_empty_changed = screen.apply_db_snapshot(&DbStatSnapshot {
+            reservation_snapshots: vec![],
+            file_reservations: 0,
+            timestamp_micros: 102,
+            ..Default::default()
+        });
+        assert!(second_empty_changed);
+        assert!(screen.reservations.is_empty());
+    }
+
+    #[test]
+    fn contextual_actions_use_reservation_id_in_operation_payload() {
+        let mut screen = ReservationsScreen::new();
+        let key = reservation_key("proj", "BlueLake", "src/**");
+        screen.reservations.insert(
+            key.clone(),
+            ActiveReservation {
+                reservation_id: Some(77),
+                agent: "BlueLake".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                granted_ts: 1_000_000,
+                ttl_s: 3600,
+                project: "proj".into(),
+                released: false,
+            },
+        );
+        screen.sorted_keys.push(key);
+        screen.table_state.selected = Some(0);
+
+        let (actions, _, _) = screen
+            .contextual_actions()
+            .expect("contextual actions should exist");
+
+        let release = actions
+            .iter()
+            .find(|action| action.label == "Release")
+            .expect("release action");
+        match &release.action {
+            crate::tui_action_menu::ActionKind::Execute(op) => {
+                assert_eq!(op, "release:77");
+            }
+            other => panic!("expected Execute action, got {other:?}"),
+        }
     }
 
     #[test]

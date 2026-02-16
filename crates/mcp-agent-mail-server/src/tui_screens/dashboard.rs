@@ -1186,6 +1186,37 @@ fn parse_tool_end_duration(summary: &str) -> Option<(String, u64)> {
     Some((tool_name.to_string(), duration_ms))
 }
 
+fn ratio_bar(value: u64, max: u64, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+    let filled = if max == 0 {
+        0usize
+    } else {
+        let numerator = u128::from(value).saturating_mul(u128::try_from(cells).unwrap_or(0));
+        let denom = u128::from(max).max(1);
+        usize::try_from(numerator / denom)
+            .unwrap_or(cells)
+            .min(cells)
+    };
+    let mut out = String::with_capacity(cells);
+    for idx in 0..cells {
+        out.push(if idx < filled { '█' } else { '░' });
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn format_sample_with_overflow(samples: &[String], total: usize) -> String {
+    if total == 0 || samples.is_empty() {
+        return "none".to_string();
+    }
+    if total > samples.len() {
+        return format!("{} +{}", samples.join(", "), total - samples.len());
+    }
+    samples.join(", ")
+}
+
 fn format_relative_micros(timestamp_micros: i64, now_micros: i64) -> String {
     if timestamp_micros <= 0 {
         return "n/a".to_string();
@@ -2062,6 +2093,7 @@ fn render_project_load_panel(
 
     let mut lines = Vec::new();
     let total_score = rows.iter().map(|(_, score)| *score).sum::<u64>();
+    let max_score = rows.first().map_or(1, |(_, score)| (*score).max(1));
     lines.push(Line::from_spans([
         Span::styled("score ", crate::tui_theme::text_meta(&tp)),
         Span::styled(
@@ -2079,11 +2111,14 @@ fn render_project_load_panel(
         .iter()
         .take(usize::from(inner.height).saturating_sub(1))
     {
+        let bar = ratio_bar(*score, max_score, 8);
         lines.push(Line::from_spans([
             Span::styled(
                 truncate(&project.slug, 14),
                 Style::default().fg(tp.text_primary).bold(),
             ),
+            Span::raw(" "),
+            Span::styled(bar, Style::default().fg(tp.metric_requests)),
             Span::raw(" "),
             Span::styled(
                 format!(
@@ -2210,6 +2245,7 @@ fn render_reservation_watch_panel(
     Paragraph::new(Text::from_lines(lines)).render(list_area, frame);
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_reservation_ttl_buckets_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2278,6 +2314,9 @@ fn render_reservation_ttl_buckets_panel(
             long += 1;
         }
     }
+    let soon = expired + s60 + m5;
+    let soon_u64 = u64::try_from(soon).unwrap_or(u64::MAX);
+    let filtered_u64 = u64::try_from(filtered.len()).unwrap_or(u64::MAX).max(1);
 
     let mut lines = Vec::new();
     lines.push(Line::from_spans([Span::styled(
@@ -2288,6 +2327,18 @@ fn render_reservation_ttl_buckets_panel(
         format!("exp:{expired} <=60s:{s60} <=5m:{m5} <=30m:{m30} >30m:{long}"),
         crate::tui_theme::text_meta(&tp),
     )]));
+    lines.push(Line::from_spans([
+        Span::styled("soon ", crate::tui_theme::text_meta(&tp)),
+        Span::styled(
+            ratio_bar(soon_u64, filtered_u64, 10),
+            Style::default().fg(tp.ttl_warning),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{soon}/{}", filtered.len()),
+            crate::tui_theme::text_meta(&tp),
+        ),
+    ]));
 
     let soonest = filtered
         .iter()
@@ -2557,6 +2608,16 @@ struct ToolAgg {
     samples: Vec<u64>,
 }
 
+#[allow(dead_code)]
+struct ToolLatencyRow {
+    tool_name: String,
+    calls: usize,
+    avg_ms: u64,
+    p95_ms: u64,
+    max_ms: u64,
+}
+
+#[allow(clippy::too_many_lines)]
 fn render_tool_latency_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2600,47 +2661,73 @@ fn render_tool_latency_panel(
         return;
     }
 
-    let mut rows = by_tool.into_iter().collect::<Vec<_>>();
+    let mut rows = by_tool
+        .into_iter()
+        .map(|(tool_name, mut stats)| {
+            stats.samples.sort_unstable();
+            let p95_idx =
+                (stats.samples.len() * 95 / 100).min(stats.samples.len().saturating_sub(1));
+            let p95_ms = stats.samples[p95_idx];
+            let calls_u64 = u64::try_from(stats.calls).unwrap_or(1).max(1);
+            let avg_ms = stats.total_ms.checked_div(calls_u64).unwrap_or(0);
+            ToolLatencyRow {
+                tool_name,
+                calls: stats.calls,
+                avg_ms,
+                p95_ms,
+                max_ms: stats.max_ms,
+            }
+        })
+        .collect::<Vec<_>>();
     rows.sort_by(|a, b| {
-        b.1.calls
-            .cmp(&a.1.calls)
-            .then_with(|| b.1.max_ms.cmp(&a.1.max_ms))
+        b.p95_ms
+            .cmp(&a.p95_ms)
+            .then_with(|| b.calls.cmp(&a.calls))
+            .then_with(|| b.max_ms.cmp(&a.max_ms))
     });
 
-    let total_calls = rows.iter().map(|(_, stats)| stats.calls).sum::<usize>();
+    let total_calls = rows.iter().map(|stats| stats.calls).sum::<usize>();
     let avg_latency = rows
         .iter()
-        .map(|(_, stats)| stats.total_ms)
+        .map(|stats| stats.avg_ms)
         .sum::<u64>()
-        .checked_div(u64::try_from(total_calls).unwrap_or(1))
+        .checked_div(u64::try_from(rows.len()).unwrap_or(1).max(1))
         .unwrap_or(0);
+    let max_p95 = rows
+        .iter()
+        .map(|stats| stats.p95_ms)
+        .max()
+        .unwrap_or(1)
+        .max(1);
 
     let mut lines = Vec::new();
     lines.push(Line::from_spans([Span::styled(
         format!(
-            "calls:{total_calls} tools:{} avg:{avg_latency}ms",
-            rows.len()
+            "tools:{} calls:{total_calls} fleet-avg:{avg_latency}ms",
+            rows.len(),
         ),
         Style::default().fg(tp.text_primary).bold(),
     )]));
 
-    for (tool_name, stats) in rows
+    for stats in rows
         .iter()
         .take(usize::from(inner.height).saturating_sub(1))
     {
-        let mut samples = stats.samples.clone();
-        samples.sort_unstable();
-        let p95 = samples[(samples.len() * 95 / 100).min(samples.len().saturating_sub(1))];
-        let calls_u64 = u64::try_from(stats.calls).unwrap_or(1);
-        let avg = stats.total_ms.checked_div(calls_u64).unwrap_or(0);
+        let calls_u64 = u64::try_from(stats.calls).unwrap_or(0);
+        let bar = ratio_bar(stats.p95_ms, max_p95, 8);
         lines.push(Line::from_spans([
             Span::styled(
-                truncate(tool_name, 16),
+                truncate(&stats.tool_name, 14),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
+            Span::styled(bar, Style::default().fg(tp.metric_latency)),
+            Span::raw(" "),
             Span::styled(
-                format!("c:{} avg:{avg} p95:{p95} max:{}", stats.calls, stats.max_ms),
+                format!(
+                    "p95:{} avg:{} max:{} c:{calls_u64}",
+                    stats.p95_ms, stats.avg_ms, stats.max_ms
+                ),
                 crate::tui_theme::text_meta(&tp),
             ),
         ]));
@@ -2759,17 +2846,33 @@ fn render_message_flow_panel(
         .count();
     let delta =
         i128::try_from(sent).unwrap_or(i128::MAX) - i128::try_from(recv).unwrap_or(i128::MAX);
+    let total_msgs = u64::try_from(sent + recv).unwrap_or(0).max(1);
+    let sent_u64 = u64::try_from(sent).unwrap_or(0);
+    let recv_u64 = u64::try_from(recv).unwrap_or(0);
 
     let mut lines = Vec::new();
     lines.push(Line::from_spans([Span::styled(
         format!("sent:{sent} recv:{recv} Δ:{delta:+}"),
         Style::default().fg(tp.text_primary).bold(),
     )]));
+    lines.push(Line::from_spans([
+        Span::styled("↑", Style::default().fg(tp.metric_messages)),
+        Span::styled(
+            ratio_bar(sent_u64, total_msgs, 6),
+            Style::default().fg(tp.metric_messages),
+        ),
+        Span::raw(" "),
+        Span::styled("↓", Style::default().fg(tp.metric_requests)),
+        Span::styled(
+            ratio_bar(recv_u64, total_msgs, 6),
+            Style::default().fg(tp.metric_requests),
+        ),
+    ]));
 
     for entry in filtered
         .iter()
         .rev()
-        .take(usize::from(inner.height).saturating_sub(1))
+        .take(usize::from(inner.height).saturating_sub(2))
     {
         let marker = if entry.kind == MailEventKind::MessageSent {
             "↑"
@@ -2840,28 +2943,34 @@ fn render_query_matches_panel(
             crate::tui_theme::text_meta(&tp),
         )]));
     } else {
-        let matched_agents: Vec<String> = db_snapshot
-            .agents_list
-            .iter()
-            .filter(|agent| {
-                text_matches_query_terms(&format!("{} {}", agent.name, agent.program), &query_terms)
-            })
-            .take(TOP_MATCH_SAMPLE_CAP)
-            .map(|agent| agent.name.clone())
-            .collect();
-        let matched_projects: Vec<String> = db_snapshot
-            .projects_list
-            .iter()
-            .filter(|project| {
-                text_matches_query_terms(
-                    &format!("{} {}", project.slug, project.human_key),
-                    &query_terms,
-                )
-            })
-            .take(TOP_MATCH_SAMPLE_CAP)
-            .map(|project| project.slug.clone())
-            .collect();
-        let matched_paths: Vec<String> = db_snapshot
+        let mut matched_agents = Vec::new();
+        let mut matched_agents_total = 0usize;
+        for agent in db_snapshot.agents_list.iter().filter(|agent| {
+            text_matches_query_terms(&format!("{} {}", agent.name, agent.program), &query_terms)
+        }) {
+            matched_agents_total += 1;
+            if matched_agents.len() < TOP_MATCH_SAMPLE_CAP {
+                matched_agents.push(agent.name.clone());
+            }
+        }
+
+        let mut matched_projects = Vec::new();
+        let mut matched_projects_total = 0usize;
+        for project in db_snapshot.projects_list.iter().filter(|project| {
+            text_matches_query_terms(
+                &format!("{} {}", project.slug, project.human_key),
+                &query_terms,
+            )
+        }) {
+            matched_projects_total += 1;
+            if matched_projects.len() < TOP_MATCH_SAMPLE_CAP {
+                matched_projects.push(project.slug.clone());
+            }
+        }
+
+        let mut matched_paths = Vec::new();
+        let mut matched_paths_total = 0usize;
+        for reservation in db_snapshot
             .reservation_snapshots
             .iter()
             .filter(|reservation| {
@@ -2873,9 +2982,12 @@ fn render_query_matches_panel(
                     &query_terms,
                 )
             })
-            .take(TOP_MATCH_SAMPLE_CAP)
-            .map(|reservation| reservation.path_pattern.clone())
-            .collect();
+        {
+            matched_paths_total += 1;
+            if matched_paths.len() < TOP_MATCH_SAMPLE_CAP {
+                matched_paths.push(reservation.path_pattern.clone());
+            }
+        }
 
         lines.push(Line::from_spans([
             Span::styled("Query ", crate::tui_theme::text_meta(&tp)),
@@ -2888,42 +3000,30 @@ fn render_query_matches_panel(
             format!(
                 "Matches · events:{} agents:{} projects:{} reservations:{}",
                 entries.len(),
-                matched_agents.len(),
-                matched_projects.len(),
-                matched_paths.len()
+                matched_agents_total,
+                matched_projects_total,
+                matched_paths_total
             ),
             crate::tui_theme::text_meta(&tp),
         )]));
         lines.push(Line::from_spans([Span::styled(
             format!(
                 "Agents: {}",
-                if matched_agents.is_empty() {
-                    "none".to_string()
-                } else {
-                    matched_agents.join(", ")
-                }
+                format_sample_with_overflow(&matched_agents, matched_agents_total)
             ),
             crate::tui_theme::text_meta(&tp),
         )]));
         lines.push(Line::from_spans([Span::styled(
             format!(
                 "Projects: {}",
-                if matched_projects.is_empty() {
-                    "none".to_string()
-                } else {
-                    matched_projects.join(", ")
-                }
+                format_sample_with_overflow(&matched_projects, matched_projects_total)
             ),
             crate::tui_theme::text_meta(&tp),
         )]));
         lines.push(Line::from_spans([Span::styled(
             format!(
                 "Paths: {}",
-                if matched_paths.is_empty() {
-                    "none".to_string()
-                } else {
-                    matched_paths.join(", ")
-                }
+                format_sample_with_overflow(&matched_paths, matched_paths_total)
             ),
             crate::tui_theme::text_meta(&tp),
         )]));
@@ -3828,6 +3928,24 @@ mod tests {
         // Emoji: '🎉' is 4 bytes; "hi🎉bye" = h(0) i(1) 🎉(2..5) b(6) y(7) e(8)
         assert_eq!(truncate("hi🎉bye", 3), "hi"); // byte 3 mid-emoji, backs up to 2
         assert_eq!(truncate("hi🎉bye", 6), "hi🎉"); // byte 6 = start of 'b'
+    }
+
+    #[test]
+    fn ratio_bar_handles_zero_and_partial_fill() {
+        assert_eq!(ratio_bar(0, 100, 8), "░░░░░░░░");
+        assert_eq!(ratio_bar(50, 100, 8), "████░░░░");
+        assert_eq!(ratio_bar(120, 100, 8), "████████");
+    }
+
+    #[test]
+    fn format_sample_with_overflow_appends_remaining_count() {
+        let sample = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        assert_eq!(format_sample_with_overflow(&sample, 3), "A, B, C");
+        assert_eq!(format_sample_with_overflow(&sample, 7), "A, B, C +4");
+        assert_eq!(
+            format_sample_with_overflow(&Vec::<String>::new(), 5),
+            "none"
+        );
     }
 
     #[test]

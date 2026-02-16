@@ -561,34 +561,74 @@ pub fn messages_actions(
 /// Build actions for the Reservations screen.
 #[must_use]
 pub fn reservations_actions(
-    reservation_id: i64,
+    reservation_id: Option<i64>,
     agent_name: &str,
     path_pattern: &str,
 ) -> Vec<ActionEntry> {
+    let id_missing_reason = "Reservation ID unavailable; wait for DB snapshot";
+    let renew_action = reservation_id.map_or_else(
+        || {
+            ActionEntry::new("Renew", ActionKind::Execute("renew:pending".to_string()))
+                .with_keybinding("r")
+                .with_description("Extend reservation TTL")
+                .disabled(id_missing_reason)
+        },
+        |id| {
+            ActionEntry::new("Renew", ActionKind::Execute(format!("renew:{id}")))
+                .with_keybinding("r")
+                .with_description("Extend reservation TTL")
+        },
+    );
+    let release_action = reservation_id.map_or_else(
+        || {
+            ActionEntry::new(
+                "Release",
+                ActionKind::Execute("release:pending".to_string()),
+            )
+            .with_keybinding("e")
+            .with_description("Release this reservation")
+            .disabled(id_missing_reason)
+        },
+        |id| {
+            ActionEntry::new("Release", ActionKind::Execute(format!("release:{id}")))
+                .with_keybinding("e")
+                .with_description("Release this reservation")
+        },
+    );
+    let force_release_action = reservation_id.map_or_else(
+        || {
+            ActionEntry::new(
+                "Force-release",
+                ActionKind::ConfirmThenExecute {
+                    title: "Force Release".into(),
+                    message: format!("Force-release reservation on {path_pattern}?"),
+                    operation: "force_release:pending".into(),
+                },
+            )
+            .with_keybinding("f")
+            .with_description("Force-release (destructive)")
+            .destructive()
+            .disabled(id_missing_reason)
+        },
+        |id| {
+            ActionEntry::new(
+                "Force-release",
+                ActionKind::ConfirmThenExecute {
+                    title: "Force Release".into(),
+                    message: format!("Force-release reservation on {path_pattern}?"),
+                    operation: format!("force_release:{id}"),
+                },
+            )
+            .with_keybinding("f")
+            .with_description("Force-release (destructive)")
+            .destructive()
+        },
+    );
+
     vec![
-        ActionEntry::new(
-            "Renew",
-            ActionKind::Execute(format!("renew:{reservation_id}")),
-        )
-        .with_keybinding("r")
-        .with_description("Extend reservation TTL"),
-        ActionEntry::new(
-            "Release",
-            ActionKind::Execute(format!("release:{reservation_id}")),
-        )
-        .with_keybinding("e")
-        .with_description("Release this reservation"),
-        ActionEntry::new(
-            "Force-release",
-            ActionKind::ConfirmThenExecute {
-                title: "Force Release".into(),
-                message: format!("Force-release reservation on {path_pattern}?"),
-                operation: format!("force_release:{reservation_id}"),
-            },
-        )
-        .with_keybinding("f")
-        .with_description("Force-release (destructive)")
-        .destructive(),
+        renew_action,
+        release_action,
+        force_release_action,
         ActionEntry::new(
             "View holder",
             ActionKind::DeepLink(DeepLinkTarget::AgentByName(agent_name.to_string())),
@@ -797,10 +837,29 @@ mod tests {
 
     #[test]
     fn test_reservations_actions_destructive_flag() {
-        let actions = reservations_actions(456, "TestAgent", "src/**");
+        let actions = reservations_actions(Some(456), "TestAgent", "src/**");
         let force_release = actions.iter().find(|a| a.label == "Force-release");
         assert!(force_release.is_some());
         assert!(force_release.unwrap().is_destructive);
+    }
+
+    #[test]
+    fn test_reservations_actions_without_id_disable_mutating_ops() {
+        let actions = reservations_actions(None, "TestAgent", "src/**");
+
+        for label in ["Renew", "Release", "Force-release"] {
+            let entry = actions
+                .iter()
+                .find(|a| a.label == label)
+                .expect("missing reservation action");
+            assert!(!entry.enabled, "{label} should be disabled without id");
+        }
+
+        let holder = actions
+            .iter()
+            .find(|a| a.label == "View holder")
+            .expect("missing view holder action");
+        assert!(holder.enabled);
     }
 
     #[test]
