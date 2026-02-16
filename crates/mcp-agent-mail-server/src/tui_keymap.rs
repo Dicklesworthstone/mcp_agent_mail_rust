@@ -11,7 +11,7 @@ use ftui::KeyCode;
 use serde::{Deserialize, Serialize};
 
 use crate::tui_screens::{
-    jump_key_label_for_screen, jump_key_legend, screen_meta, ScreenCategory, ALL_SCREEN_IDS,
+    ALL_SCREEN_IDS, ScreenCategory, jump_key_label_for_screen, jump_key_legend, screen_meta,
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -740,10 +740,10 @@ impl HelpSection {
 mod tests {
     use super::*;
     use crate::tui_screens::{
-        agents::AgentsScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen,
-        reservations::ReservationsScreen, system_health::SystemHealthScreen,
-        threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
-        MailScreen, ALL_SCREEN_IDS,
+        ALL_SCREEN_IDS, MailScreen, agents::AgentsScreen, dashboard::DashboardScreen,
+        messages::MessageBrowserScreen, reservations::ReservationsScreen,
+        system_health::SystemHealthScreen, threads::ThreadExplorerScreen, timeline::TimelineScreen,
+        tool_metrics::ToolMetricsScreen,
     };
     use std::collections::HashSet;
     use std::sync::Arc;

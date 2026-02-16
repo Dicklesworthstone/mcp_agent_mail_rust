@@ -171,6 +171,20 @@ pub enum RemoteTerminalEvent {
     Resize { cols: u16, rows: u16 },
 }
 
+/// Shared snapshot for mouse drag-and-drop of messages across TUI screens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageDragSnapshot {
+    pub message_id: i64,
+    pub subject: String,
+    pub source_thread_id: String,
+    pub source_project_slug: String,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub hovered_thread_id: Option<String>,
+    pub hovered_is_valid: bool,
+    pub invalid_hover: bool,
+}
+
 #[derive(Debug)]
 pub struct TuiSharedState {
     events: EventRingBuffer,
@@ -186,6 +200,7 @@ pub struct TuiSharedState {
     db_stats: Mutex<DbStatSnapshot>,
     sparkline_data: AtomicSparkline,
     remote_terminal_events: Mutex<VecDeque<RemoteTerminalEvent>>,
+    message_drag: Mutex<Option<MessageDragSnapshot>>,
     server_control_tx: Mutex<Option<Sender<ServerControlMsg>>>,
     /// Console log ring buffer: `(seq, text)` pairs for tool call cards etc.
     console_log: Mutex<VecDeque<(u64, String)>>,
@@ -216,6 +231,7 @@ impl TuiSharedState {
             remote_terminal_events: Mutex::new(VecDeque::with_capacity(
                 REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY,
             )),
+            message_drag: Mutex::new(None),
             server_control_tx: Mutex::new(None),
             console_log: Mutex::new(VecDeque::with_capacity(CONSOLE_LOG_CAPACITY)),
             console_log_seq: AtomicU64::new(0),
@@ -320,6 +336,27 @@ impl TuiSharedState {
         if let Ok(mut guard) = self.config_snapshot.lock() {
             *guard = snapshot;
         }
+    }
+
+    /// Snapshot the active message drag state, if any.
+    #[must_use]
+    pub fn message_drag_snapshot(&self) -> Option<MessageDragSnapshot> {
+        self.message_drag
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Replace the active message drag state.
+    pub fn set_message_drag_snapshot(&self, drag: Option<MessageDragSnapshot>) {
+        if let Ok(mut guard) = self.message_drag.lock() {
+            *guard = drag;
+        }
+    }
+
+    /// Clear any active message drag state.
+    pub fn clear_message_drag_snapshot(&self) {
+        self.set_message_drag_snapshot(None);
     }
 
     pub fn set_server_control_sender(&self, tx: Sender<ServerControlMsg>) {
@@ -954,6 +991,30 @@ mod tests {
         let drained = state.drain_remote_terminal_events(0);
         assert!(drained.is_empty());
         assert_eq!(state.remote_terminal_queue_len(), 1);
+    }
+
+    #[test]
+    fn message_drag_snapshot_round_trip() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(state.message_drag_snapshot().is_none());
+
+        let snapshot = MessageDragSnapshot {
+            message_id: 42,
+            subject: "Move me".to_string(),
+            source_thread_id: "thread-a".to_string(),
+            source_project_slug: "proj".to_string(),
+            cursor_x: 12,
+            cursor_y: 8,
+            hovered_thread_id: Some("thread-b".to_string()),
+            hovered_is_valid: true,
+            invalid_hover: false,
+        };
+        state.set_message_drag_snapshot(Some(snapshot.clone()));
+        assert_eq!(state.message_drag_snapshot(), Some(snapshot));
+
+        state.clear_message_drag_snapshot();
+        assert!(state.message_drag_snapshot().is_none());
     }
 
     #[test]

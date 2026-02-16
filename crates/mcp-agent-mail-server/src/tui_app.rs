@@ -31,6 +31,7 @@ use ftui::{
 use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
+use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
@@ -1330,6 +1331,80 @@ impl MailAppModel {
             .notify(Toast::new(message).icon(icon).duration(duration));
     }
 
+    fn execute_rethread_message(&mut self, message_id: i64, target_thread_id: &str) {
+        let target_thread_id = target_thread_id.trim();
+        if target_thread_id.is_empty() {
+            return;
+        }
+
+        let snapshot = self.state.config_snapshot();
+        let cfg = DbPoolConfig {
+            database_url: snapshot.raw_database_url,
+            ..Default::default()
+        };
+        let Ok(path) = cfg.sqlite_path() else {
+            self.record_action_outcome(ActionOutcome::Failure {
+                operation: "rethread_message".to_string(),
+                error: "failed to resolve sqlite path".to_string(),
+            });
+            return;
+        };
+        let Ok(conn) = DbConn::open_file(&path) else {
+            self.record_action_outcome(ActionOutcome::Failure {
+                operation: "rethread_message".to_string(),
+                error: format!("failed to open database at {path}"),
+            });
+            return;
+        };
+
+        let lookup_sql = "SELECT thread_id FROM messages WHERE id = ? LIMIT 1";
+        let current_thread_id = match conn.query_sync(lookup_sql, &[Value::BigInt(message_id)]) {
+            Ok(rows) => rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.get_named::<String>("thread_id").ok()),
+            Err(e) => {
+                self.record_action_outcome(ActionOutcome::Failure {
+                    operation: "rethread_message".to_string(),
+                    error: format!("query failed: {e}"),
+                });
+                return;
+            }
+        };
+
+        let Some(current_thread_id) = current_thread_id else {
+            self.notifications.notify(
+                Toast::new(format!("Message {message_id} not found"))
+                    .icon(ToastIcon::Warning)
+                    .duration(Duration::from_secs(3)),
+            );
+            return;
+        };
+        if current_thread_id == target_thread_id {
+            return;
+        }
+
+        let update_sql = "UPDATE messages SET thread_id = ? WHERE id = ?";
+        if let Err(e) = conn.execute_sync(
+            update_sql,
+            &[
+                Value::Text(target_thread_id.to_string()),
+                Value::BigInt(message_id),
+            ],
+        ) {
+            self.record_action_outcome(ActionOutcome::Failure {
+                operation: "rethread_message".to_string(),
+                error: format!("update failed: {e}"),
+            });
+            return;
+        }
+
+        self.record_action_outcome(ActionOutcome::Success {
+            operation: "rethread_message".to_string(),
+            summary: format!("Moved #{message_id} to thread {target_thread_id}"),
+        });
+    }
+
     /// Copy text to the terminal clipboard via OSC 52, with system and
     /// internal fallbacks. Shows a toast with a preview of the copied content.
     fn copy_to_clipboard(&mut self, text: &str) {
@@ -1424,6 +1499,18 @@ impl MailAppModel {
             }
             "compose_result" => {
                 self.notify_compose_result(arg == "ok", context);
+                Cmd::none()
+            }
+            "rethread_message" => {
+                if let Some((message_id, target_thread_id)) = parse_rethread_operation_arg(arg) {
+                    self.execute_rethread_message(message_id, &target_thread_id);
+                } else {
+                    self.notifications.notify(
+                        Toast::new(format!("Invalid rethread operation: {operation}"))
+                            .icon(ToastIcon::Warning)
+                            .duration(Duration::from_secs(3)),
+                    );
+                }
                 Cmd::none()
             }
 
@@ -3286,6 +3373,7 @@ impl Model for MailAppModel {
                 self.screen_panics.borrow_mut().insert(active_screen, msg);
             }
         }
+        render_message_drag_ghost(&self.state, area, frame);
         content_render_us = content_started
             .elapsed()
             .as_micros()
@@ -4682,6 +4770,40 @@ fn set_focus_cell(frame: &mut Frame, x: u16, y: u16, symbol: char, color: Packed
     }
 }
 
+fn render_message_drag_ghost(state: &TuiSharedState, area: Rect, frame: &mut Frame) {
+    let Some(drag) = state.message_drag_snapshot() else {
+        return;
+    };
+    if area.width < 6 || area.height == 0 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let label = format!(" \u{21a6} {} ", truncate_subject(&drag.subject, 40));
+    let width = u16::try_from(display_width(&label)).unwrap_or(area.width);
+    let render_width = width.min(area.width);
+    if render_width == 0 {
+        return;
+    }
+
+    let max_x = area
+        .x
+        .saturating_add(area.width)
+        .saturating_sub(render_width);
+    let x = drag.cursor_x.saturating_add(1).min(max_x);
+    let max_y = area.y.saturating_add(area.height).saturating_sub(1);
+    let y = drag.cursor_y.saturating_add(1).min(max_y);
+    let ghost_area = Rect::new(x, y, render_width, 1);
+    Paragraph::new(label)
+        .style(
+            Style::default()
+                .fg(tp.selection_fg)
+                .bg(tp.panel_border_dim)
+                .dim(),
+        )
+        .render(ghost_area, frame);
+}
+
 /// Draw a focused-panel outline using the theme's focused border color.
 fn render_panel_focus_outline(area: Rect, frame: &mut Frame) {
     if area.width < 2 || area.height < 2 {
@@ -4960,6 +5082,16 @@ fn extract_numeric_id(context: &str) -> Option<i64> {
         }
     }
     None
+}
+
+fn parse_rethread_operation_arg(arg: &str) -> Option<(i64, String)> {
+    let (id_part, target_thread_id) = arg.split_once(':')?;
+    let message_id = id_part.parse::<i64>().ok()?;
+    let target_thread_id = target_thread_id.trim();
+    if target_thread_id.is_empty() {
+        return None;
+    }
+    Some((message_id, target_thread_id.to_string()))
 }
 
 fn extract_reservation_agent(event: &MailEvent) -> Option<&str> {
@@ -8864,7 +8996,11 @@ mod tests {
             0,
             0,
         );
-        let child_names: Vec<&str> = tree.children.iter().map(|child| child.name.as_str()).collect();
+        let child_names: Vec<&str> = tree
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
         let expected_screen_name = format!(
             "Screen {}",
             crate::tui_screens::screen_meta(MailScreenId::Messages).short_label
@@ -9043,6 +9179,21 @@ mod tests {
         assert_eq!(extract_numeric_id("a:b:123"), Some(123));
     }
 
+    #[test]
+    fn parse_rethread_operation_arg_valid() {
+        assert_eq!(
+            parse_rethread_operation_arg("55:br-123"),
+            Some((55, "br-123".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_rethread_operation_arg_rejects_invalid_shapes() {
+        assert_eq!(parse_rethread_operation_arg("55"), None);
+        assert_eq!(parse_rethread_operation_arg("abc:br-1"), None);
+        assert_eq!(parse_rethread_operation_arg("55:   "), None);
+    }
+
     // ── dispatch_execute_operation tests ─────────────────────────
 
     #[test]
@@ -9068,6 +9219,15 @@ mod tests {
         let cmd = model.dispatch_execute_operation("acknowledge", "msg:55");
         // Should produce a Cmd::Msg with ActionExecute and a toast.
         assert!(matches!(cmd, Cmd::Msg(_)));
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > 0);
+    }
+
+    #[test]
+    fn dispatch_execute_rethread_invalid_args_shows_warning() {
+        let mut model = test_model();
+        let cmd = model.dispatch_execute_operation("rethread_message:not-a-shape", "");
+        assert!(matches!(cmd, Cmd::None));
         model.notifications.tick(Duration::from_millis(16));
         assert!(model.notifications.visible_count() > 0);
     }

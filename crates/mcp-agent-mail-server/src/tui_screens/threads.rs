@@ -5,7 +5,7 @@
 //! and a conversation detail panel on the right showing chronological messages
 //! within the selected thread.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -16,7 +16,10 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Buffer, Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui::{
+    Buffer, Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind,
+    PackedRgba, Style,
+};
 use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPolicy};
 use ftui_extras::{mermaid_layout, mermaid_render};
 use ftui_runtime::program::Cmd;
@@ -27,7 +30,7 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{MessageDragSnapshot, TuiSharedState};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::{MermaidThreadMessage, generate_thread_flow_mermaid};
 
@@ -49,6 +52,7 @@ const DEFAULT_THREAD_PAGE_SIZE: usize = 20;
 const LOAD_OLDER_BATCH_SIZE: usize = 15;
 const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
 const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
+const MESSAGE_DRAG_HOLD_DELAY: Duration = Duration::from_millis(200);
 
 /// Color palette for deterministic per-agent coloring in thread cards.
 fn agent_color_palette() -> [PackedRgba; 8] {
@@ -278,6 +282,44 @@ enum Focus {
     DetailPanel,
 }
 
+#[derive(Debug, Clone)]
+enum MessageDragState {
+    Idle,
+    Pending(PendingMessageDrag),
+    Active(ActiveMessageDrag),
+}
+
+#[derive(Debug, Clone)]
+struct PendingMessageDrag {
+    message_id: i64,
+    source_thread_id: String,
+    source_project_slug: String,
+    subject: String,
+    started_at: Instant,
+    cursor_x: u16,
+    cursor_y: u16,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveMessageDrag {
+    message_id: i64,
+    source_thread_id: String,
+    source_project_slug: String,
+    subject: String,
+    cursor_x: u16,
+    cursor_y: u16,
+    hovered_thread_id: Option<String>,
+    hovered_is_valid: bool,
+    invalid_hover: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThreadDropVisual<'a> {
+    source_thread_id: &'a str,
+    hovered_thread_id: Option<&'a str>,
+    invalid_hover: bool,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // ThreadExplorerScreen
 // ──────────────────────────────────────────────────────────────────────
@@ -341,6 +383,12 @@ pub struct ThreadExplorerScreen {
     mermaid_cache: RefCell<Option<MermaidPanelCache>>,
     /// Last Mermaid re-render timestamp for debounce.
     mermaid_last_render_at: RefCell<Option<Instant>>,
+    /// Pointer drag state for message re-thread operations.
+    message_drag: MessageDragState,
+    /// Last rendered thread list panel area (for mouse hit testing).
+    last_list_area: Cell<Rect>,
+    /// Last rendered thread detail panel area (for mouse hit testing).
+    last_detail_area: Cell<Rect>,
 }
 
 impl ThreadExplorerScreen {
@@ -375,6 +423,9 @@ impl ThreadExplorerScreen {
             show_mermaid_panel: false,
             mermaid_cache: RefCell::new(None),
             mermaid_last_render_at: RefCell::new(None),
+            message_drag: MessageDragState::Idle,
+            last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
         }
     }
 
@@ -583,6 +634,148 @@ impl ThreadExplorerScreen {
             .find(|message| message.id == selected_id)
     }
 
+    fn thread_index_at_list_y(&self, y: u16) -> Option<usize> {
+        let area = self.last_list_area.get();
+        let inner = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        if !point_in_rect(inner, inner.x, y) {
+            return None;
+        }
+        if self.threads.is_empty() || inner.height == 0 {
+            return None;
+        }
+        let rel_y = usize::from(y.saturating_sub(inner.y));
+        let visible_height = inner.height as usize;
+        let total = self.threads.len();
+        let cursor_clamped = self.cursor.min(total.saturating_sub(1));
+        let (start, end) = viewport_range(total, visible_height, cursor_clamped);
+        let viewport_len = end.saturating_sub(start);
+        let show_subject = visible_height > viewport_len * 2 || viewport_len <= 5;
+        let idx = if show_subject {
+            start.saturating_add(rel_y / 2)
+        } else {
+            start.saturating_add(rel_y)
+        };
+        (idx < end).then_some(idx)
+    }
+
+    fn begin_pending_message_drag_from_selected_message(&mut self, mouse_x: u16, mouse_y: u16) {
+        let Some(message) = self.selected_message() else {
+            return;
+        };
+        let source_thread_id = self
+            .threads
+            .get(self.cursor)
+            .map(|thread| thread.thread_id.clone())
+            .unwrap_or_default();
+        self.message_drag = MessageDragState::Pending(PendingMessageDrag {
+            message_id: message.id,
+            source_thread_id,
+            source_project_slug: self
+                .threads
+                .get(self.cursor)
+                .map(|thread| thread.project_slug.clone())
+                .unwrap_or_default(),
+            subject: message.subject.clone(),
+            started_at: Instant::now(),
+            cursor_x: mouse_x,
+            cursor_y: mouse_y,
+        });
+    }
+
+    fn promote_pending_message_drag_if_due(&mut self, state: &TuiSharedState) {
+        let MessageDragState::Pending(pending) = &self.message_drag else {
+            return;
+        };
+        if pending.started_at.elapsed() < MESSAGE_DRAG_HOLD_DELAY {
+            return;
+        }
+        self.message_drag = MessageDragState::Active(ActiveMessageDrag {
+            message_id: pending.message_id,
+            source_thread_id: pending.source_thread_id.clone(),
+            source_project_slug: pending.source_project_slug.clone(),
+            subject: pending.subject.clone(),
+            cursor_x: pending.cursor_x,
+            cursor_y: pending.cursor_y,
+            hovered_thread_id: None,
+            hovered_is_valid: false,
+            invalid_hover: true,
+        });
+        self.publish_active_drag_snapshot(state);
+    }
+
+    fn publish_active_drag_snapshot(&self, state: &TuiSharedState) {
+        if let MessageDragState::Active(active) = &self.message_drag {
+            state.set_message_drag_snapshot(Some(MessageDragSnapshot {
+                message_id: active.message_id,
+                subject: active.subject.clone(),
+                source_thread_id: active.source_thread_id.clone(),
+                source_project_slug: active.source_project_slug.clone(),
+                cursor_x: active.cursor_x,
+                cursor_y: active.cursor_y,
+                hovered_thread_id: active.hovered_thread_id.clone(),
+                hovered_is_valid: active.hovered_is_valid,
+                invalid_hover: active.invalid_hover,
+            }));
+        }
+    }
+
+    fn update_active_message_drag(&mut self, state: &TuiSharedState, cursor_x: u16, cursor_y: u16) {
+        self.promote_pending_message_drag_if_due(state);
+        let hovered_thread_id = if point_in_rect(self.last_list_area.get(), cursor_x, cursor_y) {
+            self.thread_index_at_list_y(cursor_y)
+                .and_then(|idx| self.threads.get(idx).map(|t| t.thread_id.clone()))
+        } else {
+            None
+        };
+        if let MessageDragState::Active(active) = &mut self.message_drag {
+            active.cursor_x = cursor_x;
+            active.cursor_y = cursor_y;
+            active.hovered_thread_id = hovered_thread_id.clone();
+            active.hovered_is_valid = hovered_thread_id
+                .as_deref()
+                .is_some_and(|tid| tid != active.source_thread_id);
+            active.invalid_hover = !active.hovered_is_valid;
+            self.publish_active_drag_snapshot(state);
+        }
+    }
+
+    fn clear_message_drag_state(&mut self, state: &TuiSharedState) {
+        self.message_drag = MessageDragState::Idle;
+        state.clear_message_drag_snapshot();
+    }
+
+    fn finish_message_drag(&mut self, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        let cmd = if let MessageDragState::Active(active) = &self.message_drag {
+            if active.hovered_is_valid {
+                if let Some(target_thread_id) = active.hovered_thread_id.as_deref() {
+                    if !target_thread_id.is_empty() && target_thread_id != active.source_thread_id {
+                        let op =
+                            format!("rethread_message:{}:{target_thread_id}", active.message_id);
+                        Cmd::msg(MailScreenMsg::ActionExecute(
+                            op,
+                            active.source_thread_id.clone(),
+                        ))
+                    } else {
+                        Cmd::None
+                    }
+                } else {
+                    Cmd::None
+                }
+            } else {
+                Cmd::None
+            }
+        } else {
+            Cmd::None
+        };
+        self.clear_message_drag_state(state);
+        cmd
+    }
+
     fn clamp_detail_cursor_to_tree_rows(&mut self) {
         let row_count = self.detail_tree_rows().len();
         if row_count == 0 {
@@ -725,7 +918,43 @@ impl Default for ThreadExplorerScreen {
 
 impl MailScreen for ThreadExplorerScreen {
     #[allow(clippy::too_many_lines)]
-    fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+    fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if point_in_rect(self.last_list_area.get(), mouse.x, mouse.y) {
+                        self.focus = Focus::ThreadList;
+                        if let Some(idx) = self.thread_index_at_list_y(mouse.y) {
+                            self.cursor = idx;
+                            self.refresh_detail_if_needed();
+                        }
+                        return Cmd::None;
+                    }
+                    if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
+                        self.focus = Focus::DetailPanel;
+                        self.begin_pending_message_drag_from_selected_message(mouse.x, mouse.y);
+                        return Cmd::None;
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.update_active_message_drag(state, mouse.x, mouse.y);
+                    if !matches!(self.message_drag, MessageDragState::Idle) {
+                        return Cmd::None;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if !matches!(self.message_drag, MessageDragState::Idle) {
+                        return self.finish_message_drag(state);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !matches!(event, Event::Mouse(_)) && !matches!(self.message_drag, MessageDragState::Idle)
+        {
+            self.clear_message_drag_state(state);
+        }
+
         if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Press {
                 // Filter editing mode
@@ -971,6 +1200,7 @@ impl MailScreen for ThreadExplorerScreen {
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         self.urgent_pulse_on =
             self.reduced_motion || ((tick_count / URGENT_PULSE_HALF_PERIOD_TICKS) % 2) == 0;
+        self.promote_pending_message_drag_if_due(state);
         // Initial load or dirty flag
         if self.list_dirty {
             self.refresh_thread_list(state);
@@ -1034,6 +1264,14 @@ impl MailScreen for ThreadExplorerScreen {
         );
 
         let content_area = Rect::new(area.x, area.y + filter_height, area.width, content_height);
+        let drop_visual = match &self.message_drag {
+            MessageDragState::Active(active) => Some(ThreadDropVisual {
+                source_thread_id: active.source_thread_id.as_str(),
+                hovered_thread_id: active.hovered_thread_id.as_deref(),
+                invalid_hover: active.invalid_hover,
+            }),
+            _ => None,
+        };
 
         // Split content: thread list (left) + detail (right) if wide enough
         if content_area.width >= 80 {
@@ -1051,6 +1289,8 @@ impl MailScreen for ThreadExplorerScreen {
                 detail_width,
                 content_area.height,
             );
+            self.last_list_area.set(list_area);
+            self.last_detail_area.set(detail_area);
 
             render_thread_list(
                 frame,
@@ -1061,6 +1301,7 @@ impl MailScreen for ThreadExplorerScreen {
                 self.view_lens,
                 self.sort_mode,
                 self.urgent_pulse_on,
+                drop_visual,
             );
             if self.show_mermaid_panel {
                 self.render_mermaid_panel(
@@ -1089,6 +1330,8 @@ impl MailScreen for ThreadExplorerScreen {
         } else {
             // Narrow: show active pane unless Mermaid panel is toggled.
             if self.show_mermaid_panel {
+                self.last_list_area.set(Rect::new(0, 0, 0, 0));
+                self.last_detail_area.set(content_area);
                 self.render_mermaid_panel(
                     frame,
                     content_area,
@@ -1097,6 +1340,8 @@ impl MailScreen for ThreadExplorerScreen {
             } else {
                 match self.focus {
                     Focus::ThreadList => {
+                        self.last_list_area.set(content_area);
+                        self.last_detail_area.set(Rect::new(0, 0, 0, 0));
                         render_thread_list(
                             frame,
                             content_area,
@@ -1106,9 +1351,12 @@ impl MailScreen for ThreadExplorerScreen {
                             self.view_lens,
                             self.sort_mode,
                             self.urgent_pulse_on,
+                            drop_visual,
                         );
                     }
                     Focus::DetailPanel => {
+                        self.last_list_area.set(Rect::new(0, 0, 0, 0));
+                        self.last_detail_area.set(content_area);
                         render_thread_detail(
                             frame,
                             content_area,
@@ -1156,6 +1404,10 @@ impl MailScreen for ThreadExplorerScreen {
             HelpEntry {
                 key: "Tab",
                 action: "Toggle tree/preview focus",
+            },
+            HelpEntry {
+                key: "Mouse",
+                action: "Drag message to thread row",
             },
             HelpEntry {
                 key: "Left/Right",
@@ -1467,6 +1719,7 @@ fn render_thread_list(
     view_lens: ViewLens,
     sort_mode: SortMode,
     urgent_pulse_on: bool,
+    drop_visual: Option<ThreadDropVisual<'_>>,
 ) {
     let focus_tag = if focused { "" } else { " (inactive)" };
     let escalated = threads.iter().filter(|t| t.has_escalation).count();
@@ -1483,10 +1736,21 @@ fn render_thread_list(
         sort_mode.label(),
     );
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let hovered_valid_drop = drop_visual.is_some_and(|drag| {
+        drag.hovered_thread_id
+            .is_some_and(|tid| tid != drag.source_thread_id)
+    });
+    let border_color = if drop_visual.is_some_and(|drag| drag.invalid_hover) {
+        tp.severity_warn
+    } else if hovered_valid_drop {
+        tp.panel_border_focused
+    } else {
+        crate::tui_theme::focus_border_color(&tp, focused)
+    };
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1514,7 +1778,18 @@ fn render_thread_list(
     for (view_idx, thread) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
         let is_selected = abs_idx == cursor_clamped;
-        let marker = if is_selected { ">" } else { " " };
+        let valid_drop_zone =
+            drop_visual.is_some_and(|drag| thread.thread_id != drag.source_thread_id);
+        let hovered_here = drop_visual
+            .and_then(|drag| drag.hovered_thread_id)
+            .is_some_and(|tid| tid == thread.thread_id);
+        let marker = if hovered_here && valid_drop_zone {
+            "\u{25b8}"
+        } else if is_selected {
+            ">"
+        } else {
+            " "
+        };
 
         let esc_badge = if thread.has_escalation {
             if urgent_pulse_on { "!" } else { "\u{00b7}" }
@@ -1599,6 +1874,17 @@ fn render_thread_list(
         ]);
         if is_selected {
             primary.apply_base_style(cursor_style);
+        } else if hovered_here && valid_drop_zone {
+            primary.apply_base_style(
+                Style::default()
+                    .fg(tp.selection_fg)
+                    .bg(tp.selection_bg)
+                    .bold(),
+            );
+        } else if hovered_here {
+            primary.apply_base_style(Style::default().fg(tp.severity_warn).bold());
+        } else if valid_drop_zone {
+            primary.apply_base_style(Style::default().bg(tp.selection_bg));
         }
         text_lines.push(primary);
 
@@ -1626,6 +1912,19 @@ fn render_thread_list(
                     ),
                 ])
             };
+            let mut subj_line = subj_line;
+            if !is_selected && hovered_here && valid_drop_zone {
+                subj_line.apply_base_style(
+                    Style::default()
+                        .fg(tp.selection_fg)
+                        .bg(tp.selection_bg)
+                        .bold(),
+                );
+            } else if !is_selected && hovered_here {
+                subj_line.apply_base_style(Style::default().fg(tp.severity_warn).bold());
+            } else if !is_selected && valid_drop_zone {
+                subj_line.apply_base_style(Style::default().bg(tp.selection_bg));
+            }
             text_lines.push(subj_line);
         }
     }
@@ -2007,6 +2306,13 @@ fn blit_buffer_to_frame(frame: &mut Frame<'_>, area: Rect, buffer: &Buffer) {
 // Utility helpers
 // ──────────────────────────────────────────────────────────────────────
 
+const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
+}
+
 /// Compute the viewport [start, end) to keep cursor visible.
 fn viewport_range(total: usize, height: usize, cursor: usize) -> (usize, usize) {
     if total <= height {
@@ -2165,6 +2471,15 @@ mod tests {
     use super::*;
     use ftui_harness::buffer_to_text;
 
+    fn mouse_event(kind: MouseEventKind, x: u16, y: u16) -> Event {
+        Event::Mouse(ftui::MouseEvent {
+            kind,
+            x,
+            y,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
     // ── Construction ────────────────────────────────────────────────
 
     #[test]
@@ -2230,6 +2545,67 @@ mod tests {
         let l = Event::Key(ftui::KeyEvent::new(KeyCode::Char('l')));
         screen.update(&l, &state);
         assert!(matches!(screen.focus, Focus::DetailPanel));
+    }
+
+    #[test]
+    fn mouse_drop_on_different_thread_dispatches_rethread_action() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.threads.push(make_thread("t2", 2, 2));
+        screen.detail_messages.push(make_message(77));
+        screen.focus = Focus::DetailPanel;
+        screen.last_list_area.set(Rect::new(0, 1, 40, 10));
+        screen.last_detail_area.set(Rect::new(40, 1, 40, 10));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 45, 3);
+        let _ = screen.update(&down, &state);
+        assert!(matches!(screen.message_drag, MessageDragState::Pending(_)));
+        if let MessageDragState::Pending(pending) = &mut screen.message_drag {
+            pending.started_at =
+                Instant::now() - MESSAGE_DRAG_HOLD_DELAY - Duration::from_millis(1);
+        }
+
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 2, 4);
+        let _ = screen.update(&drag, &state);
+        let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 2, 4);
+        let cmd = screen.update(&up, &state);
+        match cmd {
+            Cmd::Msg(MailScreenMsg::ActionExecute(op, ctx)) => {
+                assert_eq!(op, "rethread_message:77:t2");
+                assert_eq!(ctx, "t1");
+            }
+            _ => panic!("expected ActionExecute command"),
+        }
+        assert!(matches!(screen.message_drag, MessageDragState::Idle));
+        assert!(state.message_drag_snapshot().is_none());
+    }
+
+    #[test]
+    fn mouse_drop_on_same_thread_is_noop() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.threads.push(make_thread("t2", 2, 2));
+        screen.detail_messages.push(make_message(88));
+        screen.focus = Focus::DetailPanel;
+        screen.last_list_area.set(Rect::new(0, 1, 40, 10));
+        screen.last_detail_area.set(Rect::new(40, 1, 40, 10));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 45, 3);
+        let _ = screen.update(&down, &state);
+        if let MessageDragState::Pending(pending) = &mut screen.message_drag {
+            pending.started_at =
+                Instant::now() - MESSAGE_DRAG_HOLD_DELAY - Duration::from_millis(1);
+        }
+
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 2, 2);
+        let _ = screen.update(&drag, &state);
+        let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 2, 2);
+        let cmd = screen.update(&up, &state);
+        assert!(matches!(cmd, Cmd::None));
+        assert!(matches!(screen.message_drag, MessageDragState::Idle));
+        assert!(state.message_drag_snapshot().is_none());
     }
 
     #[test]
