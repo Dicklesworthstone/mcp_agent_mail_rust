@@ -1131,8 +1131,8 @@ fn run_http_server_supervisor_thread(
                 instance = handle_transport_switch(&mut config, tui_state, instance, desired)?;
                 last_restart_sleep_ms = 0;
             }
-            Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(_envelope)) => {
-                // TODO: dispatch envelope to storage layer for async send
+            Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(envelope)) => {
+                dispatch_compose_envelope(&config.database_url, tui_state, envelope);
             }
             Ok(tui_bridge::ServerControlMsg::Shutdown)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1189,6 +1189,170 @@ fn handle_transport_switch(
             Ok(rollback_instance)
         }
     }
+}
+
+/// Dispatch a compose envelope from the TUI to the database via sync SQLite.
+///
+/// Opens a one-shot connection, resolves (or auto-creates) the overseer agent,
+/// inserts the message + recipients, and pushes a `MessageSent` event.
+fn dispatch_compose_envelope(
+    database_url: &str,
+    tui_state: &tui_bridge::TuiSharedState,
+    envelope: tui_compose::ComposeEnvelope,
+) {
+    use mcp_agent_mail_db::timestamps::now_micros;
+    use mcp_agent_mail_db::sqlmodel_core::Value;
+
+    let conn = match tui_poller::open_sync_connection_pub(database_url) {
+        Some(c) => c,
+        None => {
+            tracing::warn!("compose: cannot open DB for send");
+            return;
+        }
+    };
+
+    // 1. Find the first project (TUI operates on a single project).
+    let project_row = conn
+        .query_sync("SELECT id FROM projects ORDER BY id LIMIT 1", &[])
+        .ok()
+        .and_then(|rows| rows.into_iter().next());
+    let project_id: i64 = match project_row {
+        Some(row) => row.get_named::<i64>("id").unwrap_or(0),
+        None => {
+            tracing::warn!("compose: no projects in database");
+            return;
+        }
+    };
+
+    // 2. Resolve or auto-register the sender agent (HumanOverseer).
+    let sender_name = &envelope.sender_name;
+    let now = now_micros();
+    let sender_id: i64 = {
+        let rows = conn
+            .query_sync(
+                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
+                &[Value::BigInt(project_id), Value::Text(sender_name.clone())],
+            )
+            .unwrap_or_default();
+        if let Some(row) = rows.into_iter().next() {
+            row.get_named::<i64>("id").unwrap_or(0)
+        } else {
+            // Auto-register the overseer agent.
+            let _ = conn.execute_sync(
+                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+                 VALUES (?1, ?2, 'tui-overseer', 'human', 'Human operator via TUI', ?3, ?3)",
+                &[
+                    Value::BigInt(project_id),
+                    Value::Text(sender_name.clone()),
+                    Value::BigInt(now),
+                ],
+            );
+            conn.query_sync(
+                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
+                &[Value::BigInt(project_id), Value::Text(sender_name.clone())],
+            )
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|row| row.get_named::<i64>("id").ok())
+            .unwrap_or(0)
+        }
+    };
+
+    if sender_id == 0 {
+        tracing::warn!("compose: could not resolve sender agent");
+        return;
+    }
+
+    // 3. Insert the message.
+    let thread_id = envelope
+        .thread_id
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    let importance = &envelope.importance;
+    let _ = conn.execute_sync(
+        "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, topic, created_ts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?7)",
+        &[
+            Value::BigInt(project_id),
+            Value::BigInt(sender_id),
+            Value::Text(envelope.subject.clone()),
+            Value::Text(envelope.body_md.clone()),
+            Value::Text(importance.clone()),
+            Value::Text(thread_id),
+            Value::BigInt(now),
+        ],
+    );
+
+    // 4. Get the inserted message ID.
+    let msg_id: i64 = conn
+        .query_sync("SELECT last_insert_rowid() AS id", &[])
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row.get_named::<i64>("id").ok())
+        .unwrap_or(0);
+
+    if msg_id == 0 {
+        tracing::warn!("compose: message insert returned id=0");
+        return;
+    }
+
+    // 5. Insert recipients (To, Cc, Bcc).
+    let mut all_recipients = Vec::new();
+    for name in &envelope.to {
+        all_recipients.push((name.as_str(), "to"));
+    }
+    for name in &envelope.cc {
+        all_recipients.push((name.as_str(), "cc"));
+    }
+    for name in &envelope.bcc {
+        all_recipients.push((name.as_str(), "bcc"));
+    }
+
+    for (recipient_name, kind) in &all_recipients {
+        // Resolve recipient agent ID.
+        let agent_id = conn
+            .query_sync(
+                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
+                &[
+                    Value::BigInt(project_id),
+                    Value::Text((*recipient_name).to_string()),
+                ],
+            )
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|row| row.get_named::<i64>("id").ok());
+
+        if let Some(aid) = agent_id {
+            let _ = conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, ?3)",
+                &[
+                    Value::BigInt(msg_id),
+                    Value::BigInt(aid),
+                    Value::Text((*kind).to_string()),
+                ],
+            );
+        }
+    }
+
+    // 6. Push a MessageSent event to the TUI.
+    let recipient_names: Vec<String> = envelope.to.iter().chain(envelope.cc.iter()).cloned().collect();
+    let thread_str = envelope.thread_id.as_deref().unwrap_or("");
+    let _ = tui_state.push_event(tui_events::MailEvent::message_sent(
+        msg_id,
+        &envelope.sender_name,
+        recipient_names,
+        &envelope.subject,
+        thread_str,
+        "default",
+    ));
+
+    tracing::info!(
+        msg_id,
+        to = ?envelope.to,
+        subject = %envelope.subject,
+        "compose: message sent from TUI"
+    );
 }
 
 /// Run the TUI application on the main thread.

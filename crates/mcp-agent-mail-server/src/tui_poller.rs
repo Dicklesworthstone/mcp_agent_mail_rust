@@ -298,6 +298,11 @@ fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
     Some(DbStatQueryBatcher::new(&conn).fetch_snapshot())
 }
 
+/// Open a sync `SQLite` connection from a database URL (public for compose dispatch).
+pub fn open_sync_connection_pub(database_url: &str) -> Option<DbConn> {
+    open_sync_connection(database_url)
+}
+
 /// Open a sync `SQLite` connection from a database URL.
 fn open_sync_connection(database_url: &str) -> Option<DbConn> {
     // `:memory:` URLs would create a brand-new private DB per poll cycle,
