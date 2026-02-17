@@ -18,6 +18,7 @@ use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
@@ -1040,6 +1041,8 @@ pub struct SearchCockpitScreen {
     last_split_area: Cell<Rect>,
     /// Small animation phase for header/status flourish.
     ui_phase: u8,
+    /// Cached markdown render for selected message bodies, keyed by message id.
+    rendered_markdown_cache: RefCell<HashMap<i64, Arc<Text>>>,
 }
 
 impl SearchCockpitScreen {
@@ -1092,6 +1095,7 @@ impl SearchCockpitScreen {
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_split_area: Cell::new(Rect::new(0, 0, 0, 0)),
             ui_phase: 0,
+            rendered_markdown_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1113,6 +1117,26 @@ impl SearchCockpitScreen {
                 sort_direction: self.sort_direction,
             })
             .collect();
+    }
+
+    /// Return cached markdown render for a message entry, generating lazily.
+    fn cached_rendered_markdown(&self, entry: &ResultEntry) -> Option<Arc<Text>> {
+        if entry.doc_kind != DocKind::Message {
+            return None;
+        }
+        let body = entry
+            .full_body
+            .as_deref()
+            .filter(|raw| !raw.trim().is_empty())?;
+        if let Some(existing) = self.rendered_markdown_cache.borrow().get(&entry.id) {
+            return Some(Arc::clone(existing));
+        }
+        let theme = crate::tui_theme::markdown_theme();
+        let rendered = Arc::new(tui_markdown::render_body(body, &theme));
+        self.rendered_markdown_cache
+            .borrow_mut()
+            .insert(entry.id, Arc::clone(&rendered));
+        Some(rendered)
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected search result.
@@ -1207,6 +1231,7 @@ impl SearchCockpitScreen {
             self.highlight_terms.clear();
             self.results.clear();
             self.result_rows.clear();
+            self.rendered_markdown_cache.borrow_mut().clear();
             self.total_sql_rows = 0;
             self.guidance = None;
             self.cursor = 0;
@@ -1254,6 +1279,7 @@ impl SearchCockpitScreen {
         }
 
         self.db_conn = Some(conn);
+        self.rendered_markdown_cache.borrow_mut().clear();
 
         // Generate zero-result guidance from TUI facet state
         self.guidance = if self.results.is_empty() && !raw.is_empty() {
@@ -1585,7 +1611,8 @@ impl SearchCockpitScreen {
             usize::from(area.height.saturating_sub(3))
         };
         let width = if area.width == 0 { 80 } else { area.width };
-        let total = estimate_search_detail_lines(entry, width);
+        let rendered_override = self.cached_rendered_markdown(entry);
+        let total = estimate_search_detail_lines(entry, width, rendered_override.as_deref());
         total.saturating_sub(visible)
     }
 
@@ -2360,6 +2387,10 @@ impl MailScreen for SearchCockpitScreen {
             self.guidance.as_ref(),
         );
         if let Some(detail_area) = split.dock {
+            let rendered_body_override = self
+                .results
+                .get(self.cursor)
+                .and_then(|entry| self.cached_rendered_markdown(entry));
             render_detail(
                 frame,
                 detail_area,
@@ -2367,6 +2398,7 @@ impl MailScreen for SearchCockpitScreen {
                 self.detail_scroll,
                 &self.highlight_terms,
                 self.last_diagnostics.as_ref(),
+                rendered_body_override.as_deref(),
                 !matches!(self.focus, Focus::QueryBar),
             );
         }
@@ -2718,7 +2750,7 @@ fn markdown_to_searchable_plain(markdown: &str) -> String {
     for line in markdown.lines() {
         // Remove leading markdown decoration while preserving sentence content.
         let stripped = line
-            .trim_start_matches(|c: char| matches!(c, '#' | '>' | '-' | '*' | '+' | '|' | '`'))
+            .trim_start_matches(['#', '>', '-', '*', '+', '|', '`'])
             .trim();
         if !stripped.is_empty() {
             if !raw.is_empty() {
@@ -3418,6 +3450,7 @@ fn render_results(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    fill_rect(frame, inner, tp.panel_bg);
 
     if rows.is_empty() {
         if let Some(guide) = guidance {
@@ -3444,7 +3477,11 @@ fn render_results(
 
 #[allow(clippy::cast_possible_truncation)]
 /// Estimate the number of lines in the search detail panel for a result entry.
-fn estimate_search_detail_lines(entry: &ResultEntry, width: u16) -> usize {
+fn estimate_search_detail_lines(
+    entry: &ResultEntry,
+    width: u16,
+    rendered_body_override: Option<&Text>,
+) -> usize {
     // Type, Title = 2
     let mut count: usize = 2;
     if entry.from_agent.is_some() {
@@ -3469,37 +3506,39 @@ fn estimate_search_detail_lines(entry: &ResultEntry, width: u16) -> usize {
     count += 2; // Separator + body header
     // Body lines
     let avail_width = usize::from(width.saturating_sub(2)).max(1);
-    let body_lines = entry.rendered_body.as_ref().map_or_else(
-        || {
-            let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
-            body.lines()
-                .map(|line| {
-                    let len = ftui::text::display_width(line);
-                    if len == 0 {
-                        1
-                    } else {
-                        len.div_ceil(avail_width)
-                    }
-                })
-                .sum::<usize>()
-                .max(1)
-        },
-        |rendered| {
-            rendered
-                .lines()
-                .iter()
-                .map(|line| {
-                    let len = ftui::text::display_width(line.to_plain_text().as_str());
-                    if len == 0 {
-                        1
-                    } else {
-                        len.div_ceil(avail_width)
-                    }
-                })
-                .sum::<usize>()
-                .max(1)
-        },
-    );
+    let body_lines = rendered_body_override
+        .or(entry.rendered_body.as_ref())
+        .map_or_else(
+            || {
+                let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
+                body.lines()
+                    .map(|line| {
+                        let len = ftui::text::display_width(line);
+                        if len == 0 {
+                            1
+                        } else {
+                            len.div_ceil(avail_width)
+                        }
+                    })
+                    .sum::<usize>()
+                    .max(1)
+            },
+            |rendered| {
+                rendered
+                    .lines()
+                    .iter()
+                    .map(|line| {
+                        let len = ftui::text::display_width(line.to_plain_text().as_str());
+                        if len == 0 {
+                            1
+                        } else {
+                            len.div_ceil(avail_width)
+                        }
+                    })
+                    .sum::<usize>()
+                    .max(1)
+            },
+        );
     count += body_lines;
     count
 }
@@ -3533,7 +3572,7 @@ fn render_guidance(
     Paragraph::new(text).render(area, frame);
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_detail(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3541,6 +3580,7 @@ fn render_detail(
     scroll: usize,
     highlight_terms: &[QueryTerm],
     diagnostics: Option<&SearchDegradedDiagnostics>,
+    rendered_body_override: Option<&Text>,
     focused: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -3554,6 +3594,7 @@ fn render_detail(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    fill_rect(frame, inner, tp.panel_bg);
 
     let (content_inner, scrollbar_area) = if inner.width > 6 {
         (
@@ -3759,7 +3800,7 @@ fn render_detail(
 
     // Markdown preview section (messages with full body) or plain preview fallback.
     lines.push(Line::raw(String::new()));
-    if let Some(rendered) = entry.rendered_body.as_ref() {
+    if let Some(rendered) = rendered_body_override.or(entry.rendered_body.as_ref()) {
         lines.push(Line::styled(
             "\u{2500}\u{2500}\u{2500} Body \u{2500}\u{2500}\u{2500}".to_string(),
             label_style,
@@ -3795,7 +3836,8 @@ fn render_detail(
     }
 
     // Apply scroll using Paragraph's internal wrapping support.
-    let total_estimated = estimate_search_detail_lines(entry, content_area.width);
+    let total_estimated =
+        estimate_search_detail_lines(entry, content_area.width, rendered_body_override);
     let visible = usize::from(content_h);
     let max_scroll = total_estimated.saturating_sub(visible);
     let clamped_scroll = scroll.min(max_scroll);
@@ -4995,6 +5037,7 @@ mod tests {
             0,
             &[],
             None,
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -5026,6 +5069,7 @@ mod tests {
             0,
             &[],
             None,
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -5045,6 +5089,7 @@ mod tests {
             None,
             0,
             &[],
+            None,
             None,
             true,
         );
@@ -5381,6 +5426,7 @@ mod tests {
             0,
             &[],
             None,
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -5406,6 +5452,7 @@ mod tests {
             Some(&entry),
             0,
             &terms,
+            None,
             None,
             true,
         );

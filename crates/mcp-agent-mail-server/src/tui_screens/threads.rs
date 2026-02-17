@@ -57,6 +57,8 @@ const THREAD_SPLIT_WIDTH_THRESHOLD: u16 = 80;
 const THREAD_STACKED_MIN_HEIGHT: u16 = 14;
 const THREAD_STACKED_LIST_PERCENT: u16 = 42;
 const THREAD_COMPACT_HINT_MIN_HEIGHT: u16 = 7;
+const THREAD_DETAIL_PANE_GAP_THRESHOLD: u16 = 72;
+const THREAD_DETAIL_MIN_PREVIEW_WIDTH: u16 = 16;
 
 /// Color palette for deterministic per-agent coloring in thread cards.
 fn agent_color_palette() -> [PackedRgba; 8] {
@@ -933,6 +935,7 @@ impl ThreadExplorerScreen {
         if inner.width < 4 || inner.height < 4 {
             return;
         }
+        clear_rect(frame, inner, tp.panel_bg);
 
         let mermaid_messages = self.thread_mermaid_messages();
         let source = generate_thread_flow_mermaid(&mermaid_messages);
@@ -2324,20 +2327,38 @@ fn render_thread_detail(
         return;
     }
 
-    let min_preview_width = 8_u16;
-    let max_tree_width = body_area.width.saturating_sub(min_preview_width);
+    let pane_gap = u16::from(body_area.width >= THREAD_DETAIL_PANE_GAP_THRESHOLD);
+    let available_width = body_area.width.saturating_sub(pane_gap);
+    let min_preview_width =
+        THREAD_DETAIL_MIN_PREVIEW_WIDTH.min(available_width.saturating_sub(1).max(1));
+    let max_tree_width = available_width.saturating_sub(min_preview_width);
     let min_tree_width = 12_u16.min(max_tree_width.max(1));
     let preferred_tree_width = ((u32::from(body_area.width) * 60) / 100) as u16;
     let tree_width = preferred_tree_width.max(min_tree_width).min(max_tree_width);
-    let preview_width = body_area.width.saturating_sub(tree_width);
+    let preview_width = available_width.saturating_sub(tree_width);
 
     let tree_area = Rect::new(body_area.x, body_area.y, tree_width, body_area.height);
     let preview_area = Rect::new(
-        body_area.x + tree_width,
+        body_area
+            .x
+            .saturating_add(tree_width)
+            .saturating_add(pane_gap),
         body_area.y,
         preview_width,
         body_area.height,
     );
+    if pane_gap > 0 {
+        clear_rect(
+            frame,
+            Rect::new(
+                body_area.x.saturating_add(tree_width),
+                body_area.y,
+                pane_gap,
+                body_area.height,
+            ),
+            tp.panel_bg,
+        );
+    }
 
     let tree_title_raw = if focused && tree_focus {
         if tree_area.width < 18 {
@@ -2432,7 +2453,15 @@ fn render_thread_detail(
     if preview_inner.width == 0 || preview_inner.height == 0 {
         return;
     }
-    let preview_content = if preview_inner.width > 2 {
+    clear_rect(frame, preview_inner, tp.panel_bg);
+    let preview_content = if preview_inner.width > 2 && preview_inner.height > 1 {
+        Rect::new(
+            preview_inner.x.saturating_add(1),
+            preview_inner.y.saturating_add(1),
+            preview_inner.width.saturating_sub(2),
+            preview_inner.height.saturating_sub(1),
+        )
+    } else if preview_inner.width > 2 {
         Rect::new(
             preview_inner.x.saturating_add(1),
             preview_inner.y,
@@ -2510,12 +2539,11 @@ fn render_thread_detail(
         preview_lines.push(first);
     }
 
-    let visible_preview = preview_lines
-        .into_iter()
-        .skip(scroll)
-        .take(preview_content.height as usize)
-        .collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible_preview)).render(preview_content, frame);
+    let scroll_rows = u16::try_from(scroll).unwrap_or(u16::MAX);
+    Paragraph::new(Text::from_lines(preview_lines))
+        .wrap(ftui::text::WrapMode::Word)
+        .scroll((scroll_rows, 0))
+        .render(preview_content, frame);
 }
 
 fn stable_hash<T: Hash>(value: T) -> u64 {

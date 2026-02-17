@@ -194,7 +194,16 @@ END;
 /// - `temp_store=MEMORY`: temp tables and indices stay in RAM (never hit disk)
 /// - `threads=4`: allow `SQLite` to parallelize sorting and other internal work
 /// - `journal_size_limit=64MB`: cap WAL file size to prevent unbounded growth
+/// - `foreign_keys=OFF`: the statically linked `SQLite` is compiled with
+///   `SQLITE_DEFAULT_FOREIGN_KEYS` which enables FK enforcement by default.
+///   We must explicitly disable it because: (a) our schema uses `REFERENCES`
+///   for documentation only, not for runtime enforcement; (b) FK checks on
+///   every INSERT/UPDATE cause cascading failures when orphan data exists
+///   (e.g. agents referencing deleted projects); (c) FK enforcement must be
+///   the FIRST pragma since it is per-connection and must be set before any
+///   DML.
 pub const PRAGMA_SETTINGS_SQL: &str = r"
+PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -208,6 +217,7 @@ PRAGMA journal_size_limit = 67108864;
 
 /// Database-wide initialization PRAGMAs (applied once per sqlite file).
 pub const PRAGMA_DB_INIT_SQL: &str = r"
+PRAGMA foreign_keys = OFF;
 PRAGMA journal_mode = WAL;
 ";
 
@@ -216,6 +226,7 @@ PRAGMA journal_mode = WAL;
 /// WAL mode is intentionally avoided here to prevent mixed-runtime corruption
 /// and malformed-image scenarios when the server process is terminated abruptly.
 pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
+PRAGMA foreign_keys = OFF;
 PRAGMA journal_mode = DELETE;
 ";
 
@@ -224,6 +235,7 @@ PRAGMA journal_mode = DELETE;
 /// IMPORTANT: `busy_timeout` must be first so lock waits apply to any
 /// subsequent PRAGMA that may need a write lock.
 pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
+PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;
@@ -257,6 +269,7 @@ pub fn build_conn_pragmas(max_connections: usize) -> String {
 
     format!(
         "\
+PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;

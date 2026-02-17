@@ -389,7 +389,7 @@ pub fn handle_upgrade(args: UpgradeArgs) -> CliResult<()> {
         }
     }
 
-    let receipt = execute_import(plan, false)?;
+    let receipt = execute_import(plan, true)?;
     report.action = "legacy import completed and setup refresh attempted".to_string();
     report.import_receipt = Some(receipt);
     output::emit_output(&report, fmt, || {

@@ -171,10 +171,10 @@ impl AnalyticsScreen {
         if self.feed.cards.is_empty() {
             if let Some(state) = state {
                 let persisted = build_persisted_insight_feed(state);
-                if !persisted.cards.is_empty() {
-                    self.feed = persisted;
-                } else {
+                if persisted.cards.is_empty() {
                     self.feed = build_runtime_insight_feed(state);
+                } else {
+                    self.feed = persisted;
                 }
             }
         }
@@ -666,6 +666,7 @@ fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn build_runtime_insight_feed(state: &TuiSharedState) -> InsightFeed {
     let snapshot = build_runtime_viz_snapshot(state);
     let mut alerts = Vec::new();
@@ -684,7 +685,7 @@ fn build_runtime_insight_feed(state: &TuiSharedState) -> InsightFeed {
             AnomalySeverity::Medium
         };
         alerts.push(AnomalyAlert {
-            kind: AnomalyKind::ErrorRateSpike,
+            kind: AnomalyKind::HighErrorRate,
             severity,
             score: (error_rate / 100.0).clamp(0.1, 1.0),
             current_value: error_rate,
@@ -740,12 +741,12 @@ fn build_runtime_insight_feed(state: &TuiSharedState) -> InsightFeed {
     }
 
     if alerts.is_empty() {
-        let lead = snapshot
-            .top_call_tools
-            .first()
-            .map_or_else(|| "none".to_string(), |(name, calls)| format!("{name} ({calls:.0})"));
+        let lead = snapshot.top_call_tools.first().map_or_else(
+            || "none".to_string(),
+            |(name, calls)| format!("{name} ({calls:.0})"),
+        );
         alerts.push(AnomalyAlert {
-            kind: AnomalyKind::MessageVolumeDrop,
+            kind: AnomalyKind::ThroughputDrop,
             severity: AnomalySeverity::Low,
             score: 0.2,
             current_value: snapshot.total_calls as f64,
@@ -764,14 +765,13 @@ fn build_runtime_insight_feed(state: &TuiSharedState) -> InsightFeed {
 
 fn build_bootstrap_card() -> InsightCard {
     let primary_alert = AnomalyAlert {
-        kind: AnomalyKind::MessageVolumeDrop,
+        kind: AnomalyKind::ThroughputDrop,
         severity: AnomalySeverity::Low,
         score: 0.42,
         current_value: 0.0,
         threshold: 1.0,
         baseline_value: Some(1.0),
-        explanation: "Telemetry stream initialized; awaiting richer runtime variance."
-            .to_string(),
+        explanation: "Telemetry stream initialized; awaiting richer runtime variance.".to_string(),
         suggested_action: "Keep the analytics panel open while tools execute.".to_string(),
     };
     InsightCard {
@@ -786,7 +786,10 @@ fn build_bootstrap_card() -> InsightCard {
             "Keep this screen open while tools execute.".to_string(),
             "Use 'r' to force refresh after burst activity.".to_string(),
         ],
-        deep_links: vec!["screen:tool_metrics".to_string(), "screen:dashboard".to_string()],
+        deep_links: vec![
+            "screen:tool_metrics".to_string(),
+            "screen:dashboard".to_string(),
+        ],
         primary_alert,
         supporting_trends: Vec::new(),
         supporting_correlations: Vec::new(),
@@ -847,7 +850,8 @@ fn render_card_list(
     let compact_columns = area.width < 62;
     let narrow_columns = area.width < 84;
     let header = if compact_columns {
-        Row::new(vec![" ", "Sev", "Headline"]).style(crate::tui_theme::text_title(&tp).bg(header_bg))
+        Row::new(vec![" ", "Sev", "Headline"])
+            .style(crate::tui_theme::text_title(&tp).bg(header_bg))
     } else {
         Row::new(vec![" ", "Sev", "Conf", "Headline"])
             .style(crate::tui_theme::text_title(&tp).bg(header_bg))
@@ -1647,7 +1651,7 @@ impl MailScreen for AnalyticsScreen {
         }
 
         let active_cards = self.active_cards();
-        if self.feed.cards.is_empty() || active_cards.is_empty() {
+        if self.feed.cards.is_empty() {
             if viz_band_h == 0 {
                 render_runtime_viz_fallback(
                     frame,
@@ -1657,10 +1661,30 @@ impl MailScreen for AnalyticsScreen {
                     self.severity_filter,
                     self.sort_mode,
                 );
-            } else if cards_area.height > 0 {
-                Paragraph::new("No anomaly cards match filters; telemetry viz remains live above.")
-                    .style(crate::tui_theme::text_hint(&tp))
-                    .render(cards_area, frame);
+            }
+            if cards_area.height > 0 {
+                render_empty_state(frame, cards_area);
+            }
+            return;
+        }
+        if active_cards.is_empty() {
+            if viz_band_h == 0 {
+                render_runtime_viz_fallback(
+                    frame,
+                    area,
+                    state,
+                    self.focus,
+                    self.severity_filter,
+                    self.sort_mode,
+                );
+            }
+            if cards_area.height > 0 {
+                render_filtered_empty_state(
+                    frame,
+                    cards_area,
+                    self.severity_filter,
+                    self.sort_mode,
+                );
             }
             return;
         }

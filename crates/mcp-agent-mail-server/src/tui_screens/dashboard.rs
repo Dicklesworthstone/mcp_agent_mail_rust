@@ -57,6 +57,7 @@ const STAT_REFRESH_TICKS: u64 = 10;
 const fn summary_band_height(tc: TerminalClass) -> u16 {
     match tc {
         TerminalClass::Tiny => 1,
+        TerminalClass::UltraWide => 3,
         _ => 2,
     }
 }
@@ -69,6 +70,7 @@ const fn anomaly_rail_height(tc: TerminalClass, anomaly_count: usize) -> u16 {
     match tc {
         TerminalClass::Tiny => 0,
         TerminalClass::Compact => 2, // show 1 card, condensed
+        TerminalClass::UltraWide => 4,
         _ => 3,
     }
 }
@@ -104,9 +106,9 @@ const ULTRAWIDE_BOTTOM_MIN_WIDTH: u16 = 112;
 const ULTRAWIDE_BOTTOM_MIN_HEIGHT: u16 = 7;
 const SUPERGRID_INSIGHT_MIN_WIDTH: u16 = 146;
 const SUPERGRID_INSIGHT_MIN_HEIGHT: u16 = 16;
-const SUPERGRID_BOTTOM_MIN_WIDTH: u16 = 154;
+const SUPERGRID_BOTTOM_MIN_WIDTH: u16 = 140;
 const SUPERGRID_BOTTOM_MIN_HEIGHT: u16 = 8;
-const MEGAGRID_BOTTOM_MIN_WIDTH: u16 = 188;
+const MEGAGRID_BOTTOM_MIN_WIDTH: u16 = 170;
 const MEGAGRID_BOTTOM_MIN_HEIGHT: u16 = 12;
 
 /// Anomaly thresholds.
@@ -867,7 +869,7 @@ impl DashboardScreen {
 }
 
 const fn should_force_dense_dashboard_surface(main_area: Rect) -> bool {
-    main_area.width >= 140 && main_area.height >= 22
+    main_area.width >= 128 && main_area.height >= 20
 }
 
 impl Default for DashboardScreen {
@@ -5123,13 +5125,13 @@ mod tests {
     #[test]
     fn dense_surface_breakpoint_detects_large_main_canvas() {
         assert!(!should_force_dense_dashboard_surface(Rect::new(
-            0, 0, 139, 22
+            0, 0, 127, 20
         )));
         assert!(!should_force_dense_dashboard_surface(Rect::new(
-            0, 0, 140, 21
+            0, 0, 128, 19
         )));
         assert!(should_force_dense_dashboard_surface(Rect::new(
-            0, 0, 140, 22
+            0, 0, 128, 20
         )));
         assert!(should_force_dense_dashboard_surface(Rect::new(
             0, 0, 220, 40
@@ -5262,13 +5264,13 @@ mod tests {
         assert_eq!(summary_band_height(TerminalClass::Compact), 2);
         assert_eq!(summary_band_height(TerminalClass::Normal), 2);
         assert_eq!(summary_band_height(TerminalClass::Wide), 2);
-        assert_eq!(summary_band_height(TerminalClass::UltraWide), 2);
+        assert_eq!(summary_band_height(TerminalClass::UltraWide), 3);
 
         assert_eq!(anomaly_rail_height(TerminalClass::Tiny, 2), 0);
         assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 2);
         assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 3);
         assert_eq!(anomaly_rail_height(TerminalClass::Wide, 2), 3);
-        assert_eq!(anomaly_rail_height(TerminalClass::UltraWide, 2), 3);
+        assert_eq!(anomaly_rail_height(TerminalClass::UltraWide, 2), 4);
 
         assert_eq!(footer_bar_height(TerminalClass::Tiny), 0);
         assert_eq!(footer_bar_height(TerminalClass::Compact), 0);
