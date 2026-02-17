@@ -7,7 +7,7 @@
 # - Message body sanitization neutralizes common XSS payloads (no javascript: URLs / event handlers)
 #
 # Artifacts:
-# - Server logs: tests/artifacts/mail_ui/<timestamp>/server.log
+# - Server logs: tests/artifacts/mail_ui/<timestamp>/logs/server_mail_ui.log
 # - Per-route HTML/JSON responses + headers + curl stderr
 # - Network traces: tests/artifacts/mail_ui/<timestamp>/network_trace.jsonl
 # - Policy traces: tests/artifacts/mail_ui/<timestamp>/policy_trace.json
@@ -36,57 +36,20 @@ DB_PATH="${WORK}/db.sqlite3"
 STORAGE_ROOT="${WORK}/storage_root"
 TOKEN="e2e-token"
 
-PORT="$(
-python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-)"
-
-BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
-SERVER_LOG="${E2E_ARTIFACT_DIR}/server.log"
-
-e2e_log "Starting server:"
-e2e_log "  bin:   ${BIN}"
-e2e_log "  host:  127.0.0.1"
-e2e_log "  port:  ${PORT}"
-e2e_log "  db:    ${DB_PATH}"
-e2e_log "  store: ${STORAGE_ROOT}"
-
-(
-    export DATABASE_URL="sqlite:////${DB_PATH}"
-    export STORAGE_ROOT="${STORAGE_ROOT}"
-    export HTTP_HOST="127.0.0.1"
-    export HTTP_PORT="${PORT}"
-    export HTTP_PATH="/api"
-    export HTTP_BEARER_TOKEN="${TOKEN}"
-    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
-    export HTTP_RBAC_ENABLED="0"
-    export HTTP_RATE_LIMIT_ENABLED="0"
-    "${BIN}" serve --host 127.0.0.1 --port "${PORT}"
-) >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-
-cleanup_server() {
-    if kill -0 "${SERVER_PID}" 2>/dev/null; then
-        kill "${SERVER_PID}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${SERVER_PID}" 2>/dev/null || true
-    fi
-}
-trap cleanup_server EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT}" 10; then
+if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "mail_ui" \
+    "HTTP_PATH=/api" \
+    "HTTP_BEARER_TOKEN=${TOKEN}" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0"; then
     e2e_fail "server failed to start (port not open)"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
+trap 'e2e_stop_server || true' EXIT
 
-API_URL="http://127.0.0.1:${PORT}/api/"
+API_URL="${E2E_SERVER_URL%/mcp/}/api/"
 NETWORK_TRACE_FILE="${E2E_ARTIFACT_DIR}/network_trace.jsonl"
 POLICY_TRACE_FILE="${E2E_ARTIFACT_DIR}/policy_trace.json"
 touch "${NETWORK_TRACE_FILE}"
@@ -384,7 +347,7 @@ e2e_pass "seeded project=${PROJECT_SLUG}"
 # Fetch pages (/mail/*)
 # ---------------------------------------------------------------------------
 
-BASE_URL="http://127.0.0.1:${PORT}"
+BASE_URL="${API_URL%/api/}"
 
 e2e_case_banner "GET /mail (index)"
 http_get "mail_index" "${BASE_URL}/mail" || true

@@ -78,7 +78,11 @@ wait_for_git_clean() {
     local deadline=$(( $(date +%s) + timeout_s ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         local status
-        status="$(git -C "$repo" status --porcelain 2>/dev/null || true)"
+        status="$(
+            git -C "$repo" status --porcelain 2>/dev/null \
+                | grep -vE '^\?\? search_index/?$' \
+                || true
+        )"
         if [ -z "$status" ]; then
             return 0
         fi
@@ -196,59 +200,21 @@ STORAGE_ROOT="${WORK}/storage_root"
 SIGNALS_DIR="${WORK}/signals"
 TOKEN="e2e-token"
 
-PORT="$(
-python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-)"
-
-BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
-SERVER_LOG="${E2E_ARTIFACT_DIR}/server.log"
-
-e2e_log "Starting server:"
-e2e_log "  bin:      ${BIN}"
-e2e_log "  host:     127.0.0.1"
-e2e_log "  port:     ${PORT}"
-e2e_log "  db:       ${DB_PATH}"
-e2e_log "  store:    ${STORAGE_ROOT}"
-e2e_log "  signals:  ${SIGNALS_DIR}"
-
-(
-    export DATABASE_URL="sqlite:////${DB_PATH}"
-    export STORAGE_ROOT="${STORAGE_ROOT}"
-    export HTTP_HOST="127.0.0.1"
-    export HTTP_PORT="${PORT}"
-    export HTTP_PATH="/api"
-    export HTTP_BEARER_TOKEN="${TOKEN}"
-    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
-    export HTTP_RBAC_ENABLED="0"
-    export HTTP_RATE_LIMIT_ENABLED="0"
-    export NOTIFICATIONS_ENABLED="1"
-    export NOTIFICATIONS_SIGNALS_DIR="${SIGNALS_DIR}"
-    export NOTIFICATIONS_INCLUDE_METADATA="1"
-    export NOTIFICATIONS_DEBOUNCE_MS="0"
-    "${BIN}" serve --host 127.0.0.1 --port "${PORT}"
-) >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-
-cleanup_server() {
-    if kill -0 "${SERVER_PID}" 2>/dev/null; then
-        kill "${SERVER_PID}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${SERVER_PID}" 2>/dev/null || true
-    fi
-}
-trap cleanup_server EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT}" 10; then
+if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "archive" \
+    "HTTP_PATH=/api" \
+    "HTTP_BEARER_TOKEN=${TOKEN}" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "NOTIFICATIONS_ENABLED=1" \
+    "NOTIFICATIONS_SIGNALS_DIR=${SIGNALS_DIR}" \
+    "NOTIFICATIONS_INCLUDE_METADATA=1" \
+    "NOTIFICATIONS_DEBOUNCE_MS=0"; then
     e2e_fatal "server failed to start (port not open)"
 fi
+trap 'e2e_stop_server || true' EXIT
 
-API_URL="http://127.0.0.1:${PORT}/api/"
+API_URL="${E2E_SERVER_URL%/mcp/}/api/"
 
 e2e_case_banner "ensure_project + register agents"
 PROJECT_DIR="$(e2e_mktemp "e2e_archive_project")"

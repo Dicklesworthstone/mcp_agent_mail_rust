@@ -8,8 +8,8 @@
 # - Header normalization: missing Content-Type is tolerated (server injects application/json)
 #
 # Artifacts:
-# - Server logs: tests/artifacts/http_streamable/<timestamp>/server.log
-# - Per-case transcripts: *_status.txt, *_headers.txt, *_body.json, *_curl_stderr.txt
+# - Server logs: tests/artifacts/http_streamable/<timestamp>/logs/server_*.log
+# - Per-case directories: <case_id>/{request,response,headers,status,timing}.*
 # - Raw HTTP transcripts for missing Content-Type case
 
 set -euo pipefail
@@ -41,16 +41,6 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 0
 fi
 
-pick_port() {
-python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-}
-
 fail_fast_if_needed() {
     if [ "${_E2E_FAIL}" -gt 0 ]; then
         e2e_log "Fail-fast: exiting after first failure"
@@ -65,32 +55,22 @@ http_post_json() {
     local url="$2"
     local payload="$3"
     shift 3
-
     local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
-    local request_file="${E2E_ARTIFACT_DIR}/${case_id}_request.json"
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+    local flat_curl_args="${E2E_ARTIFACT_DIR}/${case_id}_curl_args.txt"
 
-    e2e_mark_case_start "${case_id}"
     if ! e2e_rpc_call_raw "${case_id}" "${url}" "${payload}" "$@"; then
         :
     fi
 
-    cp "${case_dir}/request.json" "${request_file}" 2>/dev/null || e2e_save_artifact "${case_id}_request.json" "${payload}"
-    cp "${case_dir}/headers.txt" "${headers_file}" 2>/dev/null || true
-    cp "${case_dir}/response.json" "${body_file}" 2>/dev/null || true
-    cp "${case_dir}/status.txt" "${status_file}" 2>/dev/null || true
-    cp "${case_dir}/timing.txt" "${timing_file}" 2>/dev/null || true
-    cp "${case_dir}/curl_stderr.txt" "${curl_stderr_file}" 2>/dev/null || true
-
-    # Record curl args for auditability.
-    e2e_save_artifact "${case_id}_curl_args.txt" "curl -X POST ${url} -H 'content-type: application/json' --data '<payload>'"
+    # Preserve legacy flat artifact path by mirroring helper-generated args.
+    if [ -f "${case_dir}/curl_args.txt" ]; then
+        cp "${case_dir}/curl_args.txt" "${flat_curl_args}" 2>/dev/null || true
+    else
+        e2e_save_artifact "${case_id}_curl_args.txt" "curl -X POST ${url} -H 'content-type: application/json' --data '<payload>'"
+    fi
 
     local status
-    status="$(cat "${status_file}" 2>/dev/null || echo "")"
+    status="$(e2e_rpc_read_status "${case_id}")"
     if [ -z "${status}" ] || [ "${status}" = "000" ]; then
         e2e_fail "${case_id}: curl failed (status=${status:-missing})"
         return 1
@@ -199,6 +179,11 @@ print(hashlib.sha256(canonical).hexdigest())
 PY
 }
 
+case_headers() {
+    local case_id="$1"
+    cat "${E2E_ARTIFACT_DIR}/${case_id}/headers.txt" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Setup: temp workspace + server
 # ---------------------------------------------------------------------------
@@ -208,49 +193,24 @@ DB_PATH="${WORK}/db.sqlite3"
 STORAGE_ROOT="${WORK}/storage_root"
 TOKEN="e2e-token"
 
-PORT="$(pick_port)"
-
-# e2e_ensure_binary is verbose (logs to stdout); take the last line as the path.
-BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
-SERVER_LOG="${E2E_ARTIFACT_DIR}/server.log"
-
-e2e_log "Starting server:"
-e2e_log "  bin:   ${BIN}"
-e2e_log "  host:  127.0.0.1"
-e2e_log "  port:  ${PORT}"
-e2e_log "  base:  /api and /api/"
-
-(
-    export DATABASE_URL="sqlite:////${DB_PATH}"
-    export STORAGE_ROOT="${STORAGE_ROOT}"
-    export HTTP_BEARER_TOKEN="${TOKEN}"
-    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="1"
-    export HTTP_RBAC_ENABLED="0"
-    export HTTP_RATE_LIMIT_ENABLED="0"
-    export HTTP_JWT_ENABLED="0"
-    "${BIN}" serve --host 127.0.0.1 --port "${PORT}"
-) >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-
-cleanup_server() {
-    if kill -0 "${SERVER_PID}" 2>/dev/null; then
-        kill "${SERVER_PID}" 2>/dev/null || true
-        # Give it a moment to exit cleanly.
-        sleep 0.2
-        kill -9 "${SERVER_PID}" 2>/dev/null || true
-    fi
-}
-trap cleanup_server EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT}" 10; then
-    e2e_fail "server failed to start (port not open)"
+if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "http_streamable" \
+    "HTTP_BEARER_TOKEN=${TOKEN}" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "HTTP_JWT_ENABLED=0"; then
+    e2e_fail "server failed to start"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
+trap 'e2e_stop_server || true' EXIT
 
-URL_BASE="http://127.0.0.1:${PORT}/api"
-URL_SLASH="http://127.0.0.1:${PORT}/api/"
+# e2e_start_server_with_logs sets /mcp/ by default; this suite targets /api and /api/.
+URL_BASE="${E2E_SERVER_URL%/mcp/}/api"
+URL_SLASH="${URL_BASE}/"
+PORT="${URL_BASE#http://127.0.0.1:}"
+PORT="${PORT%%/*}"
 TOOLS_LIST='{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}'
 NOTIF='{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
 
@@ -260,26 +220,26 @@ NOTIF='{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
 
 e2e_case_banner "POST /api/ tools/list returns JSON-RPC result"
 http_post_json "case1_post_slash" "${URL_SLASH}" "${TOOLS_LIST}"
-e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case1_post_slash_status.txt")"
-e2e_assert_contains "content-type application/json" "$(cat "${E2E_ARTIFACT_DIR}/case1_post_slash_headers.txt" 2>/dev/null || true)" "application/json"
-e2e_assert_contains "response contains result" "$(cat "${E2E_ARTIFACT_DIR}/case1_post_slash_body.json" 2>/dev/null || true)" "\"result\""
+e2e_assert_eq "HTTP 200" "200" "$(e2e_rpc_read_status "case1_post_slash")"
+e2e_assert_contains "content-type application/json" "$(case_headers "case1_post_slash")" "application/json"
+e2e_assert_contains "response contains result" "$(e2e_rpc_read_response "case1_post_slash")" "\"result\""
 fail_fast_if_needed
 
 e2e_case_banner "POST /api tools/list works (no redirect) and matches /api/"
 http_post_json "case2_post_base" "${URL_BASE}" "${TOOLS_LIST}"
-e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case2_post_base_status.txt")"
-e2e_assert_contains "content-type application/json" "$(cat "${E2E_ARTIFACT_DIR}/case2_post_base_headers.txt" 2>/dev/null || true)" "application/json"
+e2e_assert_eq "HTTP 200" "200" "$(e2e_rpc_read_status "case2_post_base")"
+e2e_assert_contains "content-type application/json" "$(case_headers "case2_post_base")" "application/json"
 
-SHA_BASE="$(json_canonical_sha "${E2E_ARTIFACT_DIR}/case2_post_base_body.json")"
-SHA_SLASH="$(json_canonical_sha "${E2E_ARTIFACT_DIR}/case1_post_slash_body.json")"
+SHA_BASE="$(json_canonical_sha "${E2E_ARTIFACT_DIR}/case2_post_base/response.json")"
+SHA_SLASH="$(json_canonical_sha "${E2E_ARTIFACT_DIR}/case1_post_slash/response.json")"
 e2e_assert_eq "canonical JSON sha256 matches" "${SHA_SLASH}" "${SHA_BASE}"
 fail_fast_if_needed
 
 e2e_case_banner "Notification returns 202 Accepted with empty body"
 http_post_json "case3_notification" "${URL_BASE}" "${NOTIF}"
-e2e_assert_eq "HTTP 202" "202" "$(cat "${E2E_ARTIFACT_DIR}/case3_notification_status.txt")"
-e2e_assert_contains "content-type application/json" "$(cat "${E2E_ARTIFACT_DIR}/case3_notification_headers.txt" 2>/dev/null || true)" "application/json"
-BODY_SZ="$(stat --format='%s' "${E2E_ARTIFACT_DIR}/case3_notification_body.json" 2>/dev/null || stat -f '%z' "${E2E_ARTIFACT_DIR}/case3_notification_body.json" 2>/dev/null || echo "?")"
+e2e_assert_eq "HTTP 202" "202" "$(e2e_rpc_read_status "case3_notification")"
+e2e_assert_contains "content-type application/json" "$(case_headers "case3_notification")" "application/json"
+BODY_SZ="$(stat --format='%s' "${E2E_ARTIFACT_DIR}/case3_notification/response.json" 2>/dev/null || stat -f '%z' "${E2E_ARTIFACT_DIR}/case3_notification/response.json" 2>/dev/null || echo "?")"
 e2e_assert_eq "notification body is empty" "0" "${BODY_SZ}"
 fail_fast_if_needed
 

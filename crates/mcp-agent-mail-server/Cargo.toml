@@ -23,6 +23,7 @@ ftui.workspace = true
 ftui-extras.workspace = true
 ftui-render.workspace = true
 ftui-runtime = { workspace = true, features = ["stdio-capture"] }
+ftui-tty.workspace = true
 ftui-widgets.workspace = true
 fastmcp.workspace = true
 fastmcp-core.workspace = true

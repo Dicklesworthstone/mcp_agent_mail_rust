@@ -54,6 +54,12 @@ const COMMIT_REFRESH_EVERY_TICKS: u64 = 20;
 const COMMIT_LIMIT_PER_PROJECT: usize = 200;
 const TIMELINE_PRESET_SCREEN_ID: &str = "timeline";
 
+/// Result of a background commit refresh operation.
+struct CommitRefreshResult {
+    commits: Vec<CommitTimelineEntry>,
+    stats: CommitTimelineStats,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // TimelinePane
 // ──────────────────────────────────────────────────────────────────────
@@ -647,6 +653,8 @@ pub struct TimelineScreen {
     commit_stats: CommitTimelineStats,
     /// Last tick when commit rows were refreshed from storage.
     last_commit_refresh_tick: u64,
+    /// Receiver for background commit refresh results (non-blocking).
+    commit_refresh_rx: Option<std::sync::mpsc::Receiver<CommitRefreshResult>>,
     /// Log viewer pane used when `view_mode == LogViewer`.
     log_viewer: RefCell<crate::console::LogPane>,
     /// Debounced preference persister (auto-saves dock layout to envfile).
@@ -683,6 +691,7 @@ impl TimelineScreen {
             commit_entries: Vec::new(),
             commit_stats: CommitTimelineStats::default(),
             last_commit_refresh_tick: 0,
+            commit_refresh_rx: None,
             log_viewer: RefCell::new(crate::console::LogPane::new()),
             persister,
             filter_presets_path,
@@ -859,6 +868,31 @@ impl TimelineScreen {
     }
 
     fn refresh_commit_entries(&mut self, tick_count: u64, state: &TuiSharedState) {
+        // Check for completed background refresh first.
+        if let Some(ref rx) = self.commit_refresh_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.commit_entries = result.commits;
+                    self.commit_stats = result.stats;
+                    self.commit_refresh_rx = None;
+                    if self.pane.follow {
+                        self.cursor_end();
+                    } else {
+                        self.clamp_cursor_for_mode();
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still running in background, skip.
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Worker thread panicked or dropped; allow retry.
+                    self.commit_refresh_rx = None;
+                }
+            }
+        }
+
+        // Debounce: skip if recently refreshed and data exists.
         if !self.commit_entries.is_empty()
             && tick_count.saturating_sub(self.last_commit_refresh_tick) < COMMIT_REFRESH_EVERY_TICKS
         {
@@ -885,52 +919,55 @@ impl TimelineScreen {
             return;
         }
 
-        let root = Path::new(&cfg.storage_root);
-        let mut commits = Vec::new();
-        let mut refresh_errors = 0usize;
-        for slug in project_slugs {
-            match mcp_agent_mail_storage::get_timeline_commits(
-                root,
-                &slug,
-                COMMIT_LIMIT_PER_PROJECT,
-            ) {
-                Ok(rows) => {
-                    commits.extend(
-                        rows.into_iter()
-                            .map(|entry| CommitTimelineEntry::from_storage(slug.clone(), entry)),
-                    );
+        // Spawn the heavy git work on a background thread.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let storage_root = cfg.storage_root.clone();
+        std::thread::Builder::new()
+            .name("timeline-commit-refresh".to_string())
+            .spawn(move || {
+                let root = Path::new(&storage_root);
+                let mut commits = Vec::new();
+                let mut refresh_errors = 0usize;
+                for slug in project_slugs {
+                    match mcp_agent_mail_storage::get_timeline_commits(
+                        root,
+                        &slug,
+                        COMMIT_LIMIT_PER_PROJECT,
+                    ) {
+                        Ok(rows) => {
+                            commits.extend(
+                                rows.into_iter()
+                                    .map(|entry| CommitTimelineEntry::from_storage(slug.clone(), entry)),
+                            );
+                        }
+                        Err(_) => {
+                            refresh_errors = refresh_errors.saturating_add(1);
+                        }
+                    }
                 }
-                Err(_) => {
-                    refresh_errors = refresh_errors.saturating_add(1);
+
+                commits.sort_by_key(|entry| entry.timestamp_micros);
+                if commits.len() > TIMELINE_CAPACITY {
+                    let keep_from = commits.len() - TIMELINE_CAPACITY;
+                    commits.drain(..keep_from);
                 }
-            }
-        }
 
-        commits.sort_by_key(|entry| entry.timestamp_micros);
-        if commits.len() > TIMELINE_CAPACITY {
-            let keep_from = commits.len() - TIMELINE_CAPACITY;
-            commits.drain(..keep_from);
-        }
+                let mut stats = CommitTimelineStats::from_entries(&commits, refresh_errors);
+                let churn_limit = commits.len().max(COMMIT_LIMIT_PER_PROJECT);
+                match mcp_agent_mail_storage::get_recent_commits_extended(root, churn_limit) {
+                    Ok(churn_rows) => {
+                        stats.churn_insertions = churn_rows.iter().map(|c| c.insertions).sum();
+                        stats.churn_deletions = churn_rows.iter().map(|c| c.deletions).sum();
+                    }
+                    Err(_) => {
+                        stats.refresh_errors = stats.refresh_errors.saturating_add(1);
+                    }
+                }
 
-        let mut commit_stats = CommitTimelineStats::from_entries(&commits, refresh_errors);
-        let churn_limit = commits.len().max(COMMIT_LIMIT_PER_PROJECT);
-        match mcp_agent_mail_storage::get_recent_commits_extended(root, churn_limit) {
-            Ok(churn_rows) => {
-                commit_stats.churn_insertions = churn_rows.iter().map(|c| c.insertions).sum();
-                commit_stats.churn_deletions = churn_rows.iter().map(|c| c.deletions).sum();
-            }
-            Err(_) => {
-                commit_stats.refresh_errors = commit_stats.refresh_errors.saturating_add(1);
-            }
-        }
-
-        self.commit_entries = commits;
-        self.commit_stats = commit_stats;
-        if self.pane.follow {
-            self.cursor_end();
-        } else {
-            self.clamp_cursor_for_mode();
-        }
+                let _ = tx.send(CommitRefreshResult { commits, stats });
+            })
+            .ok();
+        self.commit_refresh_rx = Some(rx);
     }
 
     fn combined_rows(&self) -> Vec<CombinedTimelineRow> {

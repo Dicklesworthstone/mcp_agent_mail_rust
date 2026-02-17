@@ -78,64 +78,18 @@ s.close()
 PY
 }
 
-start_server() {
-    local label="$1" port="$2" db_path="$3" storage_root="$4" bin="$5"
-    shift 5
-    local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
-    search_v3_log "Starting server (${label}): 127.0.0.1:${port}"
-    (
-        export DATABASE_URL="sqlite:////${db_path}"
-        export STORAGE_ROOT="${storage_root}"
-        export HTTP_HOST="127.0.0.1"
-        export HTTP_PORT="${port}"
-        export HTTP_RBAC_ENABLED="0"
-        export HTTP_RATE_LIMIT_ENABLED="0"
-        export HTTP_JWT_ENABLED="0"
-        export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
-        export HTTP_BEARER_TOKEN=""
-        export WORKTREES_ENABLED="true"
-        while [ $# -gt 0 ]; do export "$1"; shift; done
-        "${bin}" serve --host 127.0.0.1 --port "${port}"
-    ) >"${server_log}" 2>&1 &
-    echo $!
-}
-
-stop_server() {
-    local pid="$1"
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill "${pid}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${pid}" 2>/dev/null || true
-    fi
-}
-
 # HTTP POST JSON and capture response
 http_post() {
     local case_id="$1" url="$2" payload="$3"
     shift 3
-
-    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
-    local request_file="${E2E_ARTIFACT_DIR}/${case_id}_request.json"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
 
     e2e_mark_case_start "${case_id}"
     if ! e2e_rpc_call_raw "${case_id}" "${url}" "${payload}" "$@"; then
         :
     fi
 
-    cp "${case_dir}/request.json" "${request_file}" 2>/dev/null || e2e_save_artifact "${case_id}_request.json" "${payload}"
-    cp "${case_dir}/headers.txt" "${headers_file}" 2>/dev/null || true
-    cp "${case_dir}/response.json" "${body_file}" 2>/dev/null || true
-    cp "${case_dir}/status.txt" "${status_file}" 2>/dev/null || true
-    cp "${case_dir}/timing.txt" "${timing_file}" 2>/dev/null || true
-    cp "${case_dir}/curl_stderr.txt" "${curl_stderr_file}" 2>/dev/null || true
-
     local status
-    status="$(cat "${status_file}" 2>/dev/null || echo "")"
+    status="$(e2e_rpc_read_status "${case_id}")"
     echo "${status}"
 }
 
@@ -156,15 +110,24 @@ print(json.dumps({
 
 # Extract tool response text from JSON-RPC response file
 get_tool_text() {
-    local body_file="$1"
+    local case_id="$1"
+    local response_json
+    response_json="$(e2e_rpc_read_response "${case_id}")"
     python3 -c "
 import json, sys
-d = json.load(open(sys.argv[1]))
+if not sys.argv[1]:
+    sys.exit(0)
+d = json.loads(sys.argv[1])
 r = d.get('result', {})
 content = r.get('content', [])
 if content and content[0].get('type') == 'text':
     print(content[0]['text'])
-" "$body_file" 2>/dev/null
+" "$response_json" 2>/dev/null
+}
+
+case_headers() {
+    local case_id="$1"
+    cat "${E2E_ARTIFACT_DIR}/${case_id}/headers.txt" 2>/dev/null || echo ""
 }
 
 # Parse search results from tool text
@@ -228,7 +191,7 @@ do_search() {
     payload="$(rpc_call "search_messages" "{\"project_key\":\"$project\",\"query\":\"$query\"$limit_arg}")"
     http_post "$case_id" "$API_URL" "$payload" "$AUTHZ" >/dev/null
     local tool_text
-    tool_text="$(get_tool_text "${E2E_ARTIFACT_DIR}/${case_id}_body.json")"
+    tool_text="$(get_tool_text "${case_id}")"
     e2e_save_artifact "${case_id}_tool_text.json" "$tool_text"
     echo "$tool_text"
 }
@@ -250,14 +213,16 @@ AUTHZ="Authorization: Bearer ${TOKEN}"
 PROJECT_PATH="/tmp/e2e_search_v3_http_$$"
 PROJECT_BETA="/tmp/e2e_search_v3_http_beta_$$"
 
-PID="$(start_server "search_v3" "${PORT}" "${DB}" "${STORAGE}" "${BIN}" \
+if ! HTTP_PORT="${PORT}" e2e_start_server_with_logs "${DB}" "${STORAGE}" "search_v3" \
     "HTTP_BEARER_TOKEN=${TOKEN}" \
-)"
-trap 'stop_server "${PID}" || true' EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT}" 10; then
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "HTTP_JWT_ENABLED=0" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0" \
+    "WORKTREES_ENABLED=true"; then
     e2e_fatal "server failed to start (port not open)"
 fi
+trap 'e2e_stop_server || true' EXIT
 e2e_pass "setup: HTTP server started on port ${PORT}"
 
 # Seed project, agents, messages
@@ -332,7 +297,7 @@ else
     e2e_fail "auth: expected 200 (got $AUTH_STATUS)"
 fi
 
-AUTH_TEXT="$(get_tool_text "${E2E_ARTIFACT_DIR}/auth_search_body.json")"
+AUTH_TEXT="$(get_tool_text "auth_search")"
 AUTH_P="$(parse_search "$AUTH_TEXT")"
 AUTH_COUNT="$(jget "$AUTH_P" count)"
 
@@ -857,7 +822,7 @@ else
     e2e_fail "product search: expected 200 (got $PROD_STATUS)"
 fi
 
-PROD_TEXT="$(get_tool_text "${E2E_ARTIFACT_DIR}/product_search_body.json")"
+PROD_TEXT="$(get_tool_text "product_search")"
 PROD_P="$(parse_search "$PROD_TEXT")"
 PROD_COUNT="$(jget "$PROD_P" count)"
 
@@ -892,7 +857,7 @@ http_post "cross_product" "$API_URL" \
     "$(rpc_call "search_messages_product" "{\"product_key\":\"test-search-v3-http-product\",\"query\":\"search\"}")" \
     "$AUTHZ" >/dev/null
 
-CROSS_TEXT="$(get_tool_text "${E2E_ARTIFACT_DIR}/cross_product_body.json")"
+CROSS_TEXT="$(get_tool_text "cross_product")"
 CROSS_P="$(parse_search "$CROSS_TEXT")"
 CROSS_COUNT="$(jget "$CROSS_P" count)"
 
@@ -1002,7 +967,7 @@ e2e_case_banner "JSON-RPC 2.0 envelope validation"
 
 ENVELOPE="$(python3 -c "
 import json
-d = json.load(open('${E2E_ARTIFACT_DIR}/basic_body.json'))
+d = json.load(open('${E2E_ARTIFACT_DIR}/basic/response.json'))
 has_jsonrpc = d.get('jsonrpc') == '2.0'
 has_id = 'id' in d
 has_result = 'result' in d
@@ -1038,7 +1003,7 @@ search_v3_case_summary "envelope" "pass"
 # ===========================================================================
 e2e_case_banner "Content-Type header validation"
 
-CT_HEADERS="$(cat "${E2E_ARTIFACT_DIR}/basic_headers.txt" 2>/dev/null || echo "")"
+CT_HEADERS="$(case_headers "basic")"
 
 if echo "$CT_HEADERS" | grep -qi "content-type.*application/json"; then
     e2e_pass "Content-Type: response is application/json"
@@ -1150,9 +1115,9 @@ else
     e2e_fail "malformed: unexpected"
 fi
 
-MALFORMED2_STATUS="$(http_post "malformed2" "$API_URL" 'not-json-at-all' "$AUTHZ")"
+MALFORMED2_STATUS="$(http_post "malformed2" "$API_URL" '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":"not-an-object"}' "$AUTHZ")"
 if [ "$MALFORMED2_STATUS" != "200" ] || [ "$MALFORMED2_STATUS" = "200" ]; then
-    e2e_pass "malformed: invalid JSON handled (status=$MALFORMED2_STATUS)"
+    e2e_pass "malformed: invalid JSON-RPC shape handled (status=$MALFORMED2_STATUS)"
 else
     e2e_fail "malformed: unexpected"
 fi
@@ -1286,7 +1251,7 @@ else
     e2e_fail "product limit: expected 200 (got $PLIM_STATUS)"
 fi
 
-PLIM_TEXT="$(get_tool_text "${E2E_ARTIFACT_DIR}/prod_limit_body.json")"
+PLIM_TEXT="$(get_tool_text "prod_limit")"
 PLIM_P="$(parse_search "$PLIM_TEXT")"
 PLIM_COUNT="$(jget "$PLIM_P" count)"
 
@@ -1301,7 +1266,7 @@ search_v3_case_summary "product_limit" "pass"
 # ===========================================================================
 # Cleanup & Summary
 # ===========================================================================
-stop_server "${PID}" || true
+e2e_stop_server || true
 trap - EXIT
 
 search_v3_suite_summary || true

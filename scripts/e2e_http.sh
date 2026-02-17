@@ -69,12 +69,14 @@ http_request() {
     local case_status_file="${case_dir}/status.txt"
     local case_timing_file="${case_dir}/timing.txt"
     local case_curl_stderr_file="${case_dir}/curl_stderr.txt"
+    local case_curl_args_file="${case_dir}/curl_args.txt"
 
     local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
     local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+    local curl_args_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_args.txt"
 
     mkdir -p "${case_dir}"
 
@@ -92,6 +94,7 @@ http_request() {
 
     # Save a human-readable curl invocation (no secrets embedded).
     e2e_save_artifact "${case_id}_curl_args.txt" "$(printf "curl -X %q %q %s\n" "${method}" "${url}" "$(printf "%q " "$@")")"
+    printf "curl -X %q %q %s\n" "${method}" "${url}" "$(printf "%q " "$@")" > "${case_curl_args_file}"
 
     set +e
     local start_ns end_ns elapsed_ms
@@ -111,6 +114,7 @@ http_request() {
     cp "${case_status_file}" "${status_file}" 2>/dev/null || true
     cp "${case_timing_file}" "${timing_file}" 2>/dev/null || true
     cp "${case_curl_stderr_file}" "${curl_stderr_file}" 2>/dev/null || true
+    cp "${case_curl_args_file}" "${curl_args_file}" 2>/dev/null || true
 
     if [ "$rc" -ne 0 ]; then
         e2e_fatal "${case_id}: curl failed rc=${rc}"

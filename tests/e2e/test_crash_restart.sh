@@ -118,33 +118,6 @@ same_process_alive() {
     kill -0 "${pid}" 2>/dev/null
 }
 
-# Build a JSON-RPC payload file for a tool call.
-# Writes to a temp file and prints the path.
-build_payload() {
-    local tool_name="$1"
-    local args_json="${2}"
-    : "${args_json:="{}"}"
-    local id="${3:-1}"
-    local tmpfile
-    tmpfile="$(mktemp)"
-python3 - "$tool_name" "$args_json" "$id" "$tmpfile" <<'PYEOF'
-import json, sys
-tool = sys.argv[1]
-args = json.loads(sys.argv[2])
-rid = int(sys.argv[3])
-out = sys.argv[4]
-payload = json.dumps({
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "id": rid,
-    "params": {"name": tool, "arguments": args},
-}, separators=(",", ":"))
-with open(out, "w") as f:
-    f.write(payload)
-PYEOF
-    echo "$tmpfile"
-}
-
 # Send a tool call and return the body
 rpc_call() {
     local url="$1"
@@ -157,22 +130,9 @@ rpc_call() {
     RPC_CALL_SEQ=$((RPC_CALL_SEQ + 1))
 
     local case_id="rpc_${RPC_CALL_SEQ}_${tool}"
-    local payload
-    payload="$(python3 -c "
-import json, sys
-tool = sys.argv[1]
-args = json.loads(sys.argv[2])
-rid = int(sys.argv[3])
-print(json.dumps({
-  'jsonrpc': '2.0',
-  'method': 'tools/call',
-  'id': rid,
-  'params': { 'name': tool, 'arguments': args }
-}, separators=(',', ':')))
-" "$tool" "$args" "$id")"
 
     e2e_mark_case_start "${case_id}"
-    if ! e2e_rpc_call_raw "${case_id}" "${url}" "${payload}"; then
+    if ! e2e_rpc_call "${case_id}" "${url}" "${tool}" "${args}"; then
         :
     fi
 
@@ -191,58 +151,15 @@ rpc_call_bg() {
     local tool="$2"
     local args="${3}"
     : "${args:="{}"}"
-    local id="${4:-1}"
+    local _id="${4:-1}"
     local label="${5:-bg}"
-    local pfile payload
-    pfile="$(build_payload "$tool" "$args" "$id")"
-    payload="$(cat "${pfile}" 2>/dev/null || echo "")"
-    rm -f "$pfile"
 
     (
         e2e_mark_case_start "${label}"
-        if ! e2e_rpc_call_raw "${label}" "${url}" "${payload}"; then
+        if ! e2e_rpc_call "${label}" "${url}" "${tool}" "${args}"; then
             :
         fi
-        cp "${E2E_ARTIFACT_DIR}/${label}/response.json" "${E2E_ARTIFACT_DIR}/${label}_resp.json" 2>/dev/null || true
     ) &
-}
-
-start_server() {
-    local label="$1"
-    local port="$2"
-    local db_path="$3"
-    local storage_root="$4"
-    local bin="$5"
-
-    local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
-    e2e_log "Starting server (${label}): 127.0.0.1:${port}"
-
-    (
-        export DATABASE_URL="sqlite:////${db_path}"
-        export STORAGE_ROOT="${storage_root}"
-        export HTTP_HOST="127.0.0.1"
-        export HTTP_PORT="${port}"
-        export HTTP_RBAC_ENABLED="0"
-        export HTTP_RATE_LIMIT_ENABLED="0"
-        export HTTP_JWT_ENABLED="0"
-        export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="1"
-        export INTEGRITY_CHECK_ON_STARTUP="true"
-        export GIT_AUTHOR_NAME="E2E Crash Test"
-        export GIT_AUTHOR_EMAIL="crash@test.local"
-
-        exec "${bin}" serve --host 127.0.0.1 --port "${port}"
-    ) >"${server_log}" 2>&1 &
-    echo $!
-}
-
-stop_server() {
-    local pid="$1"
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill "${pid}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${pid}" 2>/dev/null || true
-    fi
-    wait "${pid}" 2>/dev/null || true
 }
 
 # Extract a JSON field using python3
@@ -344,15 +261,20 @@ e2e_log "Port: ${PORT}"
 
 e2e_case_banner "Phase 1: Start server and build up state"
 
-PID="$(start_server "run1" "${PORT}" "${DB}" "${STORAGE}" "${BIN}")"
-e2e_log "Server PID: ${PID}"
-
-if ! e2e_wait_port 127.0.0.1 "${PORT}" 15; then
+if ! HTTP_PORT="${PORT}" e2e_start_server_with_logs "${DB}" "${STORAGE}" "run1" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "HTTP_JWT_ENABLED=0" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1" \
+    "INTEGRITY_CHECK_ON_STARTUP=true" \
+    "GIT_AUTHOR_NAME=E2E Crash Test" \
+    "GIT_AUTHOR_EMAIL=crash@test.local"; then
     e2e_fail "Server failed to start"
-    stop_server "${PID}"
     e2e_summary
     exit 1
 fi
+PID="${E2E_SERVER_PID:-}"
+e2e_log "Server PID: ${PID}"
 e2e_pass "Server started"
 PID_START_TICKS="$(pid_start_ticks "${PID}")"
 e2e_save_artifact "server_run1_pid.txt" "pid=${PID} start_ticks=${PID_START_TICKS:-unknown}"
@@ -499,16 +421,22 @@ e2e_case_banner "Phase 4: Restart server on same DB + storage"
 PORT2="$(pick_port)"
 URL2="http://127.0.0.1:${PORT2}/api/"
 
-PID2="$(start_server "run2" "${PORT2}" "${DB}" "${STORAGE}" "${BIN}")"
-e2e_log "Restarted server PID: ${PID2}"
-
-if e2e_wait_port 127.0.0.1 "${PORT2}" 15; then
+if HTTP_PORT="${PORT2}" e2e_start_server_with_logs "${DB}" "${STORAGE}" "run2" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "HTTP_JWT_ENABLED=0" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1" \
+    "INTEGRITY_CHECK_ON_STARTUP=true" \
+    "GIT_AUTHOR_NAME=E2E Crash Test" \
+    "GIT_AUTHOR_EMAIL=crash@test.local"; then
+    PID2="${E2E_SERVER_PID:-}"
+    e2e_log "Restarted server PID: ${PID2}"
     e2e_pass "Server restarted after crash (integrity check passed)"
 else
     e2e_fail "Server failed to restart after crash"
     # Dump server log for debugging
-    e2e_copy_artifact "${E2E_ARTIFACT_DIR}/server_run2.log" "server_run2_failed.log"
-    stop_server "${PID2}"
+    e2e_copy_artifact "${E2E_ARTIFACT_DIR}/logs/server_run2.log" "server_run2_failed.log"
+    e2e_stop_server
     e2e_summary
     exit 1
 fi
@@ -611,7 +539,7 @@ fi
 # Cleanup
 # ---------------------------------------------------------------------------
 
-stop_server "${PID2}"
+e2e_stop_server
 e2e_log "Server stopped cleanly"
 
 # ---------------------------------------------------------------------------

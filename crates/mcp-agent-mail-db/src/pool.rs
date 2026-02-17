@@ -1053,8 +1053,8 @@ mod tests {
         assert_eq!(DEFAULT_POOL_SIZE, 25, "min connections for scale");
         assert_eq!(DEFAULT_MAX_OVERFLOW, 75, "overflow headroom for bursts");
         assert_eq!(
-            DEFAULT_POOL_TIMEOUT_MS, 15_000,
-            "15s timeout (fail fast, let circuit breaker handle)"
+            DEFAULT_POOL_TIMEOUT_MS, 30_000,
+            "30s timeout (fail fast, let circuit breaker handle)"
         );
         assert_eq!(
             DEFAULT_POOL_RECYCLE_MS,

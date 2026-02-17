@@ -185,48 +185,20 @@ http_get_capture() {
 
 e2e_case_banner "Seed mailbox via HTTP server"
 
-PORT="$(
-python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-)"
-
 TOKEN="e2e-share-token"
-SERVER_LOG="${E2E_ARTIFACT_DIR}/server.log"
 
-(
-    export DATABASE_URL="sqlite:////${DB_PATH}"
-    export STORAGE_ROOT="${STORAGE_ROOT}"
-    export HTTP_HOST="127.0.0.1"
-    export HTTP_PORT="${PORT}"
-    export HTTP_PATH="/api"
-    export HTTP_BEARER_TOKEN="${TOKEN}"
-    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
-    export HTTP_RBAC_ENABLED="0"
-    export HTTP_RATE_LIMIT_ENABLED="0"
-    export NOTIFICATIONS_ENABLED="0"
-    "${MCP_BIN}" serve --host 127.0.0.1 --port "${PORT}"
-) >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-
-cleanup_server() {
-    if kill -0 "${SERVER_PID}" 2>/dev/null; then
-        kill "${SERVER_PID}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${SERVER_PID}" 2>/dev/null || true
-    fi
-}
-trap cleanup_server EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT}" 10; then
+if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "share" \
+    "HTTP_PATH=/api" \
+    "HTTP_BEARER_TOKEN=${TOKEN}" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "NOTIFICATIONS_ENABLED=0"; then
     e2e_fatal "server failed to start (port not open)"
 fi
+trap 'e2e_stop_server || true' EXIT
 
-API_URL="http://127.0.0.1:${PORT}/api/"
+API_URL="${E2E_SERVER_URL%/mcp/}/api/"
 
 rpc_call() {
     local case_id="$1"
@@ -336,7 +308,7 @@ print(json.dumps({
 e2e_pass "seeded mailbox (3 messages + 1 reply + 1 ack)"
 
 # Stop server (we only need the seeded DB from here)
-cleanup_server
+e2e_stop_server || true
 trap - EXIT
 
 # Give storage writes a moment to flush

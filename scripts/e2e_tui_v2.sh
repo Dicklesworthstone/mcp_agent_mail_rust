@@ -66,7 +66,7 @@ e2e_log "Using binary: ${BIN}"
 WORK="$(e2e_mktemp "e2e_tui_v2")"
 DB_PATH="${WORK}/storage.sqlite3"
 STORAGE_ROOT="${WORK}/archive"
-SERVER_LOG="${E2E_ARTIFACT_DIR}/server.log"
+SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_tui_v2.log"
 PORT="$(pick_port)"
 PROJECT_KEY="${WORK}/test_project"
 
@@ -74,38 +74,23 @@ mkdir -p "${STORAGE_ROOT}" "${PROJECT_KEY}"
 
 e2e_log "Starting MCP server: port=${PORT}"
 
-(
-    export DATABASE_URL="sqlite:///${DB_PATH}"
-    export STORAGE_ROOT="${STORAGE_ROOT}"
-    export HTTP_HOST="127.0.0.1"
-    export HTTP_PORT="${PORT}"
-    export HTTP_RBAC_ENABLED="0"
-    export HTTP_RATE_LIMIT_ENABLED="0"
-    export HTTP_JWT_ENABLED="0"
-    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="1"
-    export AM_TUI_TOAST_SEVERITY="debug"
-    timeout 300s "${BIN}" serve --host 127.0.0.1 --port "${PORT}" --no-tui
-) >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-
-cleanup_server() {
-    if kill -0 "${SERVER_PID}" 2>/dev/null; then
-        kill "${SERVER_PID}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${SERVER_PID}" 2>/dev/null || true
-    fi
-}
-trap cleanup_server EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT}" 15; then
+if ! HTTP_PORT="${PORT}" e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "tui_v2" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "HTTP_JWT_ENABLED=0" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1" \
+    "AM_TUI_TOAST_SEVERITY=debug" \
+    "TUI_ENABLED=false"; then
     e2e_fail "server failed to start (port not open after 15s)"
     e2e_save_artifact "server_startup_fail.log" "$(tail -100 "${SERVER_LOG}" 2>/dev/null || echo 'no log')"
     e2e_summary
     exit 1
 fi
+SERVER_PID="${E2E_SERVER_PID:-}"
+trap 'e2e_stop_server || true' EXIT
 e2e_pass "server started on port ${PORT}"
 
-URL="http://127.0.0.1:${PORT}/mcp/"
+URL="${E2E_SERVER_URL:-http://127.0.0.1:${PORT}/mcp/}"
 MCP_LAST_CASE_ID=""
 
 # ---------------------------------------------------------------------------

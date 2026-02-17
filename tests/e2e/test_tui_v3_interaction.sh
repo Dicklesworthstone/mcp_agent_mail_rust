@@ -25,6 +25,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_BASENAME="$(basename "${PROJECT_ROOT}")"
+RCH_WORKSPACE_ROOT="${E2E_RCH_WORKSPACE_ROOT:-$(cd "${PROJECT_ROOT}/.." && pwd)}"
+RCH_MANIFEST_PATH="${E2E_RCH_MANIFEST_PATH:-${REPO_BASENAME}/Cargo.toml}"
+
 # Use a suite-specific target dir to avoid lock contention with other agents.
 if [ -z "${CARGO_TARGET_DIR:-}" ] || [ "${CARGO_TARGET_DIR}" = "/data/tmp/cargo-target" ]; then
     export CARGO_TARGET_DIR="/data/tmp/cargo-target-${E2E_SUITE}-$$"
@@ -34,6 +39,8 @@ fi
 e2e_init_artifacts
 e2e_banner "TUI V3 Interaction E2E Suite (br-1ssy6)"
 e2e_log "cargo target dir: ${CARGO_TARGET_DIR}"
+e2e_log "rch workspace root: ${RCH_WORKSPACE_ROOT}"
+e2e_log "rch manifest path: ${RCH_MANIFEST_PATH}"
 
 TIMING_REPORT="${E2E_ARTIFACT_DIR}/interaction_timing.tsv"
 {
@@ -50,6 +57,10 @@ _SCENARIO_DIAG_START_MS=0
 _SCENARIO_DIAG_FAIL_BASE=0
 _SCENARIO_DIAG_REASON_CODE="OK"
 _SCENARIO_DIAG_REASON="completed"
+_SUITE_STOP_REMAINING=0
+_SUITE_STOP_REASON_CODE=""
+_SUITE_STOP_REASON=""
+_SUITE_STOP_EVIDENCE=""
 
 diag_rel_path() {
     local path="$1"
@@ -84,7 +95,9 @@ scenario_diag_finish() {
     status="pass"
     reason_code="${_SCENARIO_DIAG_REASON_CODE}"
     reason="${_SCENARIO_DIAG_REASON}"
-    if [ "${reason_code}" != "OK" ] || [ "${fail_delta}" -gt 0 ]; then
+    if [[ "${reason_code}" == SKIP_* ]]; then
+        status="skip"
+    elif [ "${reason_code}" != "OK" ] || [ "${fail_delta}" -gt 0 ]; then
         status="fail"
         if [ "${reason_code}" = "OK" ] && [ "${fail_delta}" -gt 0 ]; then
             reason_code="ASSERTION_FAILURE"
@@ -158,8 +171,23 @@ run_cargo_with_rch_only() {
     local out_file="$2"
     shift 2
     local -a cargo_args=("$@")
-    local command_str="cargo ${cargo_args[*]}"
+    local subcommand="${cargo_args[0]}"
+    local -a sub_args=("${cargo_args[@]:1}")
+    local command_str="(cd ${RCH_WORKSPACE_ROOT} && cargo ${subcommand} --manifest-path ${RCH_MANIFEST_PATH} ${sub_args[*]})"
     local started_ms ended_ms elapsed_ms rc
+
+    if [ ! -f "${RCH_WORKSPACE_ROOT}/${RCH_MANIFEST_PATH}" ]; then
+        {
+            echo "[error] manifest not found at ${RCH_WORKSPACE_ROOT}/${RCH_MANIFEST_PATH}"
+            echo "[hint] set E2E_RCH_WORKSPACE_ROOT and/or E2E_RCH_MANIFEST_PATH"
+        } >>"${out_file}"
+        rc=2
+        started_ms="$(_e2e_now_ms)"
+        ended_ms="$(_e2e_now_ms)"
+        elapsed_ms=$((ended_ms - started_ms))
+        append_cargo_diag "${case_id}" "${command_str}" "${rc}" "${elapsed_ms}" "${out_file}"
+        return "${rc}"
+    fi
 
     started_ms="$(_e2e_now_ms)"
     {
@@ -177,8 +205,11 @@ run_cargo_with_rch_only() {
     fi
 
     set +e
-    timeout "${E2E_RCH_TIMEOUT_SECONDS:-300}" \
-        rch exec -- cargo "${cargo_args[@]}" >>"${out_file}" 2>&1
+    (
+        cd "${RCH_WORKSPACE_ROOT}" || exit 2
+        timeout "${E2E_RCH_TIMEOUT_SECONDS:-300}" \
+            rch exec -- cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
+    ) >>"${out_file}" 2>&1
     rc=$?
     set -e
 
@@ -209,6 +240,28 @@ run_interaction_case() {
     local fixture_file="${E2E_ARTIFACT_DIR}/${case_id}_fixture.txt"
     local expected_file="${E2E_ARTIFACT_DIR}/${case_id}_expected.txt"
     local start_ms end_ms elapsed_ms
+
+    if [ "${_SUITE_STOP_REMAINING}" -eq 1 ]; then
+        echo -e "${case_id}\t0" >> "${TIMING_REPORT}"
+        e2e_skip "${description} (${_SUITE_STOP_REASON})"
+        scenario_diag_mark_reason "${_SUITE_STOP_REASON_CODE}" "${_SUITE_STOP_REASON}"
+        if [ -n "${_SUITE_STOP_EVIDENCE}" ]; then
+            scenario_diag_finish \
+                "${fixture_file}" \
+                "${expected_file}" \
+                "${_SUITE_STOP_EVIDENCE}" \
+                "${CARGO_DIAG_FILE}" \
+                "${TIMING_REPORT}"
+        else
+            scenario_diag_finish \
+                "${fixture_file}" \
+                "${expected_file}" \
+                "${CARGO_DIAG_FILE}" \
+                "${TIMING_REPORT}"
+        fi
+        return 0
+    fi
+
     start_ms="$(_e2e_now_ms)"
 
     if run_cargo_with_rch_only "${case_id}" "${out_file}" "${cargo_args[@]}"; then
@@ -229,6 +282,13 @@ run_interaction_case() {
         scenario_fail "CARGO_COMMAND_FAILED" "${description}"
         e2e_log "command failed for ${case_id}; tail follows"
         tail -n 160 "${out_file}" 2>/dev/null || true
+        if grep -q "error: could not compile \`" "${out_file}"; then
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_SYSTEMIC_COMPILE_FAILURE"
+            _SUITE_STOP_REASON="skipped after systemic compile failure in earlier case"
+            _SUITE_STOP_EVIDENCE="${out_file}"
+            e2e_log "systemic compile failure detected; remaining cases will be skipped"
+        fi
     fi
 
     scenario_diag_finish \

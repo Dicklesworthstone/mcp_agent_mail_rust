@@ -1367,7 +1367,7 @@ fn run_tui_main_thread(
 
     let tui_config = ftui_runtime::program::ProgramConfig::fullscreen().with_mouse();
 
-    let mut program = Program::with_config(model, tui_config)?;
+    let mut program = Program::with_native_backend(model, tui_config)?;
     program.run()
 }
 
@@ -1896,7 +1896,12 @@ impl StartupDashboard {
         let handle = std::thread::Builder::new()
             .name("mcp-agent-mail-dashboard-input".to_string())
             .spawn(move || {
-                let Ok(session) = ftui::TerminalSession::minimal() else {
+                use ftui_runtime::BackendEventSource;
+                let Ok(mut backend) = ftui_tty::TtyBackend::open(
+                    0,
+                    0,
+                    ftui_tty::TtySessionOptions::default(),
+                ) else {
                     this.log_line("Console interactive mode: failed to enter raw mode");
                     return;
                 };
@@ -1906,18 +1911,19 @@ impl StartupDashboard {
                 );
 
                 while !this.stop.load(Ordering::Relaxed) {
-                    if !session
+                    if !backend
                         .poll_event(std::time::Duration::from_millis(100))
                         .unwrap_or(false)
                     {
                         continue;
                     }
 
-                    while let Ok(Some(event)) = session.read_event() {
-                        if this.handle_console_event(&session, &event) {
+                    while let Ok(Some(event)) = backend.read_event() {
+                        let term_size = backend.size().unwrap_or((80, 24));
+                        if this.handle_console_event(term_size, &event) {
                             break;
                         }
-                        if !session
+                        if !backend
                             .poll_event(std::time::Duration::from_millis(0))
                             .unwrap_or(false)
                         {
@@ -1925,7 +1931,7 @@ impl StartupDashboard {
                         }
                     }
                 }
-                drop(session);
+                drop(backend);
             });
 
         if let Ok(join) = handle {
@@ -1933,7 +1939,7 @@ impl StartupDashboard {
         }
     }
 
-    fn handle_console_event(&self, session: &ftui::TerminalSession, event: &ftui::Event) -> bool {
+    fn handle_console_event(&self, term_size: (u16, u16), event: &ftui::Event) -> bool {
         use ftui::widgets::command_palette::PaletteAction;
         use ftui::{Event, KeyCode, KeyEventKind, Modifiers};
 
@@ -1946,7 +1952,12 @@ impl StartupDashboard {
 
         // Ensure Ctrl+C still terminates the process even if raw-mode disables ISIG.
         if key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Char('c')) {
-            ftui::core::terminal_session::best_effort_cleanup_for_exit();
+            let _ = ftui_tty::write_cleanup_sequence(
+                &ftui_runtime::BackendFeatures::default(),
+                false,
+                &mut std::io::stdout(),
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             std::process::exit(130);
         }
 
@@ -1958,7 +1969,7 @@ impl StartupDashboard {
                     drop(palette); // release lock before dispatch
                     match action {
                         PaletteAction::Execute(id) => {
-                            self.dispatch_palette_action(&id, session);
+                            self.dispatch_palette_action(&id, term_size);
                         }
                         PaletteAction::Dismiss => {}
                     }
@@ -2018,7 +2029,7 @@ impl StartupDashboard {
             return false;
         }
 
-        let (term_width, term_height) = session.size().unwrap_or((80, 24));
+        let (term_width, term_height) = term_size;
         self.apply_console_layout(term_width, term_height);
         self.persist_console_settings();
 
@@ -2048,7 +2059,7 @@ impl StartupDashboard {
 
     /// Dispatch a command palette action by ID.
     #[allow(clippy::too_many_lines)]
-    fn dispatch_palette_action(&self, id: &str, session: &ftui::TerminalSession) {
+    fn dispatch_palette_action(&self, id: &str, term_size: (u16, u16)) {
         use console::action_ids as aid;
 
         let mut layout_changed = false;
@@ -2201,7 +2212,7 @@ impl StartupDashboard {
         }
 
         if layout_changed {
-            let (term_width, term_height) = session.size().unwrap_or((80, 24));
+            let (term_width, term_height) = term_size;
             self.apply_console_layout(term_width, term_height);
             self.persist_console_settings();
         }

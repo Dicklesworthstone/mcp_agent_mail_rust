@@ -42,10 +42,11 @@ sqlmodel-pool = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-po
 sqlmodel-sqlite = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
 sqlmodel-frankensqlite = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
 
-ftui = { version = "0.2.0", path = "../frankentui/crates/ftui", features = ["crossterm"] }
-ftui-runtime = { version = "0.2.0", path = "../frankentui/crates/ftui-runtime", features = ["crossterm-compat"] }
+ftui = { version = "0.2.0", path = "../frankentui/crates/ftui" }
+ftui-runtime = { version = "0.2.0", path = "../frankentui/crates/ftui-runtime", features = ["native-backend"] }
 ftui-extras = { version = "0.2.0", path = "../frankentui/crates/ftui-extras", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
 ftui-widgets = { version = "0.2.0", path = "../frankentui/crates/ftui-widgets", features = ["debug-overlay", "regex-search"] }
+ftui-tty = { version = "0.2.0", path = "../frankentui/crates/ftui-tty" }
 ftui-harness = { version = "0.2.0", path = "../frankentui/crates/ftui-harness" }
 ftui-render = { version = "0.2.0", path = "../frankentui/crates/ftui-render" }
 beads_rust = { path = "../beads_rust" }

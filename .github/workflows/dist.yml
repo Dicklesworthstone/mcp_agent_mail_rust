@@ -1,0 +1,145 @@
+name: dist
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --lib
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (Linux musl builds)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p mcp-agent-mail -p mcp-agent-mail-cli
+
+      - name: Verify static linking (Linux musl)
+        if: contains(matrix.target, 'musl')
+        run: |
+          file target/${{ matrix.target }}/release/mcp-agent-mail
+          file target/${{ matrix.target }}/release/mcp-agent-mail | grep -qE "statically linked|static-pie linked"
+          file target/${{ matrix.target }}/release/am
+          file target/${{ matrix.target }}/release/am | grep -qE "statically linked|static-pie linked"
+
+      - name: Create tarball (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          TARBALL="mcp-agent-mail-${{ matrix.target }}.tar.xz"
+          cd target/${{ matrix.target }}/release
+          tar -cJf "../../../dist/$TARBALL" mcp-agent-mail am
+          cd ../../../dist
+          shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+
+      - name: Create zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $zipName = "mcp-agent-mail-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/mcp-agent-mail.exe","target/${{ matrix.target }}/release/am.exe" -DestinationPath "dist/$zipName"
+          cd dist
+          $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()
+          "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -laR dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.0.0
+
+      - name: Sign release artifacts (sigstore bundle)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd dist
+          for f in mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip; do
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
+
+      - name: Copy install scripts to dist
+        run: |
+          cp install.sh dist/ 2>/dev/null || echo "No install.sh found"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
