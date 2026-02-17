@@ -13,6 +13,8 @@ A mail-like coordination layer for AI coding agents, exposed as an MCP server wi
 
 **Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
 
+Watch the [23-minute walkthrough](https://youtu.be/68VVcqMEDrs) to see seven AI coding agents send over 1,000 messages to each other while implementing a development plan over two days.
+
 <div align="center">
 <h3>Quick Install</h3>
 
@@ -71,7 +73,25 @@ am robot reservations --project /abs/path --agent BlueLake --conflicts
 
 ## Why This Exists
 
-One disciplined hour of AI coding agents often produces 10-20 "human hours" of work because the agents reason and type at machine speed. Agent Mail multiplies that advantage by keeping independent agents aligned without babysitting:
+Modern projects often run multiple coding agents at once -- backend, frontend, scripts, infra. Without a shared coordination fabric, agents overwrite each other's edits, miss critical context from parallel workstreams, and require humans to relay messages across tools and teams.
+
+Agent Mail was the first open-source agent coordination system that works across providers (Claude Code, Codex CLI, Gemini CLI, etc.), available since October 2025. You're going to hear about a lot of agent communication systems because it's such an obviously good idea, but Agent Mail sidesteps all the footguns that a naive implementation falls prey to. Combined with [Beads](https://github.com/Dicklesworthstone/beads_rust) and [bv](https://github.com/Dicklesworthstone/beads_viewer), it unlocks truly insane productivity gains.
+
+### The Footguns Agent Mail Avoids
+
+**No "broadcast to all" mode.** Agents are lazy and will default to broadcasting everything to everyone if you let them. That's like your email system at work defaulting to reply-all every time -- it spams every agent with mostly irrelevant information and burns precious context.
+
+**Obsessively refined API ergonomics.** Bad MCP documentation and poor agent ergonomics are the silent killers. It takes a huge amount of careful iteration, observation, and refinement to get the balance so tools just work reliably without wasting tokens. Agent Mail's 34 tool definitions have been through hundreds of rounds of real-world tuning.
+
+**No git worktrees.** Worktrees demolish development velocity and create debt you need to pay later when the agents diverge. Working in one shared space surfaces conflicts immediately so you can deal with them, which is easy when agents can communicate. Instead of isolating agents, Agent Mail coordinates them.
+
+**Advisory file reservations instead of hard locks.** There's a much better way to prevent conflicts than worktrees: agents call dibs temporarily on files while they're working on them, but it's not rigorously enforced, and reservations expire. Agents can observe if reserved files haven't been touched recently and reclaim them. This is critical because you want a system that's robust to agents suddenly dying or getting their memory wiped -- that happens all the time. Hard locks would deadlock.
+
+**Semi-persistent identity.** An identity that can last for the duration of a discrete task (for the purpose of coordination), but one that can also vanish without a trace and not break things. You don't want ringleader agents whose death takes down the whole system. Agent Mail identities are memorable (e.g., `GreenCastle`), but ephemeral by design.
+
+**Graph-aware task selection.** If you have 200-500 tasks, you don't want agents randomly choosing them or wasting context communicating about what to do. There's usually a "right answer" for what each agent should work on, and that right answer comes from the dependency structure of the tasks. That's what [bv](https://github.com/Dicklesworthstone/beads_viewer) computes using graph theory -- like a compass that tells each agent which direction will unlock the most work overall.
+
+### What Agent Mail Gives You
 
 - **Prevents conflicts:** Explicit file reservations (leases) for files/globs prevent agents from overwriting each other
 - **Eliminates human liaisons:** Agents send messages directly to each other with threaded conversations, acknowledgments, and priority levels
@@ -88,15 +108,21 @@ One disciplined hour of AI coding agents often produces 10-20 "human hours" of w
 - Searching and summarizing long technical discussions as threads evolve
 - Running agent swarms with [Beads](https://github.com/Dicklesworthstone/beads_rust) task tracking for dependency-aware work selection
 
+### Productivity Math
+
+One disciplined hour of AI coding agents often produces 10-20 "human hours" of work because the agents reason and type at machine speed. Agent Mail multiplies that advantage: you invest 1-2 hours of human supervision, but dozens of agent-hours execute in parallel with clear audit trails and conflict-avoidance baked in. The result is that a single developer with Agent Mail + Beads + bv can ship what would normally take a team of engineers weeks.
+
 ---
 
 ## Design Philosophy
 
-**Mail metaphor, not chat.** Agents send discrete messages with subjects, recipients, and thread IDs. This maps cleanly to how work coordination actually happens: structured communication with clear intent, not a firehose of chat messages.
+**Mail metaphor, not chat.** Agents send discrete messages with subjects, recipients, and thread IDs. This maps cleanly to how work coordination actually happens: structured communication with clear intent, not a firehose of chat messages. It would be like if your email system at work defaulted to reply-all every time -- that's what chat-based coordination does, and it burns context fast.
 
 **Git as the source of truth.** Every message, agent profile, and reservation artifact lives as a file in a per-project Git repository. This makes the entire communication history human-auditable, diffable, and recoverable. SQLite is the fast index, not the authority.
 
-**Advisory, not mandatory.** File reservations are advisory leases, not hard locks. The pre-commit guard enforces them at commit time, but agents can always override with `--no-verify` if needed. This prevents deadlocks while still catching accidental conflicts.
+**Advisory, not mandatory.** File reservations are advisory leases, not hard locks. The pre-commit guard enforces them at commit time, but agents can always override if needed. This prevents deadlocks while still catching accidental conflicts. Reservations expire on a TTL, so crashed agents don't hold files hostage forever.
+
+**Resilient to agent death.** Agents die all the time -- context windows overflow, sessions crash, memory gets wiped. Agent Mail is designed so that any agent can vanish without breaking the system. No ringleader agents, no single points of failure. Semi-persistent identities exist for coordination but don't create hard dependencies.
 
 **Dual persistence.** Human-readable Markdown in Git for auditability; SQLite with FTS5 for sub-millisecond queries, search, and directory lookups. Both stay in sync through the write pipeline.
 
