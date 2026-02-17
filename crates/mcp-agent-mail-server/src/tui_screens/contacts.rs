@@ -19,11 +19,15 @@ use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPoli
 use ftui_extras::{mermaid_layout, mermaid_render};
 use ftui_runtime::program::Cmd;
 
+use ftui::PackedRgba;
+
 use crate::tui_action_menu::{ActionEntry, contacts_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{ContactSummary, MailEvent};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::generate_contact_graph_mermaid;
+use crate::tui_widgets::{MetricTile, MetricTrend};
 
 /// Column indices for sorting.
 const COL_FROM: usize = 0;
@@ -139,6 +143,8 @@ pub struct ContactsScreen {
     show_mermaid_panel: bool,
     mermaid_cache: RefCell<Option<MermaidPanelCache>>,
     mermaid_last_render_at: RefCell<Option<Instant>>,
+    /// Previous contact counts for `MetricTrend` computation.
+    prev_contact_counts: (u64, u64, u64, u64),
 }
 
 impl ContactsScreen {
@@ -158,6 +164,7 @@ impl ContactsScreen {
             show_mermaid_panel: false,
             mermaid_cache: RefCell::new(None),
             mermaid_last_render_at: RefCell::new(None),
+            prev_contact_counts: (0, 0, 0, 0),
         }
     }
 
@@ -225,7 +232,7 @@ impl ContactsScreen {
             }
             for to in recipients {
                 if !to.trim().is_empty() {
-                    agents.insert(to.to_string());
+                    agents.insert(to.clone());
                 }
             }
         }
@@ -287,6 +294,112 @@ impl ContactsScreen {
             .get(self.graph_selected_idx)
             .map(|(name, _, _)| name.as_str())
     }
+
+    fn handle_filter_key(&mut self, key_code: KeyCode, state: &TuiSharedState) {
+        match key_code {
+            KeyCode::Escape | KeyCode::Enter => {
+                self.filter_active = false;
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.rebuild_from_state(state);
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.rebuild_from_state(state);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key(&mut self, key_code: KeyCode, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        match key_code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.move_graph_selection(1);
+                } else {
+                    self.move_selection(1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.move_graph_selection(-1);
+                } else {
+                    self.move_selection(-1);
+                }
+            }
+            KeyCode::Left => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.move_graph_selection(-1);
+                }
+            }
+            KeyCode::Right => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.move_graph_selection(1);
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.graph_selected_idx = self.graph_nodes.len().saturating_sub(1);
+                } else if !self.contacts.is_empty() {
+                    self.table_state.selected = Some(self.contacts.len() - 1);
+                }
+            }
+            KeyCode::Home => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.graph_selected_idx = 0;
+                } else if !self.contacts.is_empty() {
+                    self.table_state.selected = Some(0);
+                }
+            }
+            KeyCode::Enter => {
+                if self.view_mode == ViewMode::Graph
+                    && !self.show_mermaid_panel
+                    && let Some(agent) = self.selected_graph_agent()
+                {
+                    return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::AgentByName(
+                        agent.to_string(),
+                    )));
+                }
+            }
+            KeyCode::Char('g') => {
+                self.show_mermaid_panel = !self.show_mermaid_panel;
+            }
+            KeyCode::Char('/') => {
+                self.filter_active = true;
+                self.filter.clear();
+            }
+            KeyCode::Char('f') => {
+                self.status_filter = self.status_filter.next();
+                self.rebuild_from_state(state);
+            }
+            KeyCode::Char('n') => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Table => ViewMode::Graph,
+                    ViewMode::Graph => ViewMode::Table,
+                };
+                self.graph_selected_idx = 0;
+            }
+            KeyCode::Char('s') => {
+                self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                self.rebuild_from_state(state);
+            }
+            KeyCode::Char('S') => {
+                self.sort_asc = !self.sort_asc;
+                self.rebuild_from_state(state);
+            }
+            KeyCode::Escape => {
+                if self.show_mermaid_panel {
+                    self.show_mermaid_panel = false;
+                } else if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.rebuild_from_state(state);
+                }
+            }
+            _ => {}
+        }
+        Cmd::None
+    }
 }
 
 impl Default for ContactsScreen {
@@ -297,135 +410,63 @@ impl Default for ContactsScreen {
 
 impl MailScreen for ContactsScreen {
     fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                // Filter mode: capture text input
-                if self.filter_active {
-                    match key.code {
-                        KeyCode::Escape | KeyCode::Enter => {
-                            self.filter_active = false;
-                        }
-                        KeyCode::Backspace => {
-                            self.filter.pop();
-                            self.rebuild_from_state(state);
-                        }
-                        KeyCode::Char(c) => {
-                            self.filter.push(c);
-                            self.rebuild_from_state(state);
-                        }
-                        _ => {}
-                    }
-                    return Cmd::None;
-                }
-
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                            self.move_graph_selection(1);
-                        } else {
-                            self.move_selection(1);
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                            self.move_graph_selection(-1);
-                        } else {
-                            self.move_selection(-1);
-                        }
-                    }
-                    KeyCode::Left => {
-                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                            self.move_graph_selection(-1);
-                        }
-                    }
-                    KeyCode::Right => {
-                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                            self.move_graph_selection(1);
-                        }
-                    }
-                    KeyCode::Char('G') | KeyCode::End => {
-                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                            self.graph_selected_idx = self.graph_nodes.len().saturating_sub(1);
-                        } else if !self.contacts.is_empty() {
-                            self.table_state.selected = Some(self.contacts.len() - 1);
-                        }
-                    }
-                    KeyCode::Home => {
-                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                            self.graph_selected_idx = 0;
-                        } else if !self.contacts.is_empty() {
-                            self.table_state.selected = Some(0);
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                            if let Some(agent) = self.selected_graph_agent() {
-                                return Cmd::msg(MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::AgentByName(agent.to_string()),
-                                ));
-                            }
-                        }
-                    }
-                    KeyCode::Char('g') => {
-                        self.show_mermaid_panel = !self.show_mermaid_panel;
-                    }
-                    KeyCode::Char('/') => {
-                        self.filter_active = true;
-                        self.filter.clear();
-                    }
-                    KeyCode::Char('f') => {
-                        self.status_filter = self.status_filter.next();
-                        self.rebuild_from_state(state);
-                    }
-                    KeyCode::Char('n') => {
-                        self.view_mode = match self.view_mode {
-                            ViewMode::Table => ViewMode::Graph,
-                            ViewMode::Graph => ViewMode::Table,
-                        };
-                        self.graph_selected_idx = 0;
-                    }
-                    KeyCode::Char('s') => {
-                        self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
-                        self.rebuild_from_state(state);
-                    }
-                    KeyCode::Char('S') => {
-                        self.sort_asc = !self.sort_asc;
-                        self.rebuild_from_state(state);
-                    }
-                    KeyCode::Escape => {
-                        if self.show_mermaid_panel {
-                            self.show_mermaid_panel = false;
-                        } else if !self.filter.is_empty() {
-                            self.filter.clear();
-                            self.rebuild_from_state(state);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        let Event::Key(key) = event else {
+            return Cmd::None;
+        };
+        if key.kind != KeyEventKind::Press {
+            return Cmd::None;
         }
-        Cmd::None
+        if self.filter_active {
+            self.handle_filter_key(key.code, state);
+            return Cmd::None;
+        }
+        self.handle_key(key.code, state)
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         // Rebuild every 5 seconds (contacts change infrequently)
         if tick_count % 50 == 0 {
+            // Save previous counts for trend computation before rebuild
+            self.prev_contact_counts = self.contact_counts();
             self.rebuild_from_state(state);
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 3 || area.width < 20 {
             return;
         }
 
-        let header_h = 1_u16;
-        let table_h = area.height.saturating_sub(header_h);
+        let is_table_mode = self.view_mode == ViewMode::Table && !self.show_mermaid_panel;
 
-        let header_area = Rect::new(area.x, area.y, area.width, header_h);
-        let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
+        // Layout depends on mode: Table gets summary band + footer, Graph/Mermaid maximize canvas
+        let summary_h: u16 = if is_table_mode && area.height >= 10 {
+            2
+        } else {
+            0
+        };
+        let header_h: u16 = 1;
+        let footer_h: u16 = u16::from(is_table_mode && area.height >= 6);
+        let table_h = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
 
-        // Render header info line
+        let mut y = area.y;
+
+        // ── Summary band (Table view only) ─────────────────────────────
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        // ── Info header ────────────────────────────────────────────────
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
+
         let sort_indicator = if self.sort_asc {
             " \u{25b2}"
         } else {
@@ -450,6 +491,10 @@ impl MailScreen for ContactsScreen {
         let p = Paragraph::new(info);
         p.render(header_area, frame);
 
+        // ── Main content area ──────────────────────────────────────────
+        let content_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
+
         let graph_mode_active = self.view_mode == ViewMode::Graph || self.show_mermaid_panel;
         let recent_events = if graph_mode_active {
             state.recent_events(GRAPH_EVENTS_WINDOW)
@@ -459,14 +504,20 @@ impl MailScreen for ContactsScreen {
         let metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
 
         if self.show_mermaid_panel {
-            self.render_mermaid_panel(frame, table_area, &recent_events);
+            self.render_mermaid_panel(frame, content_area, &recent_events);
         } else if self.view_mode == ViewMode::Graph
-            && table_area.width >= GRAPH_MIN_WIDTH
-            && table_area.height >= GRAPH_MIN_HEIGHT
+            && content_area.width >= GRAPH_MIN_WIDTH
+            && content_area.height >= GRAPH_MIN_HEIGHT
         {
-            self.render_graph(frame, table_area, &metrics);
+            self.render_graph(frame, content_area, &metrics);
         } else {
-            self.render_table(frame, table_area);
+            self.render_table(frame, content_area);
+        }
+
+        // ── Footer summary (Table view only) ───────────────────────────
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
         }
     }
 
@@ -610,7 +661,7 @@ impl ContactsScreen {
                 let y2 = (end.2 * h).round() as i32;
 
                 let weight = metrics.edge_weight(&contact.from_agent, &contact.to_agent);
-                let thickness = scaled_level(weight, max_edge_weight, 1, 3) as i32;
+                let thickness = scaled_level(weight, max_edge_weight, 1, 3);
                 draw_weighted_line(&mut painter, x1, y1, x2, y2, thickness, color);
                 draw_arrow_head(&mut painter, x1, y1, x2, y2, color);
             }
@@ -622,7 +673,7 @@ impl ContactsScreen {
             let x = (nx * w).round() as i32;
             let y = (ny * h).round() as i32;
             let node_volume = metrics.node_total(name);
-            let radius = scaled_level(node_volume, max_node_volume, 1, 3) as i32;
+            let radius = scaled_level(node_volume, max_node_volume, 1, 3);
             let selected = idx == self.graph_selected_idx;
             let node_color = if selected {
                 tp.panel_border_focused
@@ -746,47 +797,199 @@ impl ContactsScreen {
         self.graph_nodes.iter().find(|n| n.0 == name)
     }
 
+    /// Count contacts by status (total, approved, pending, blocked).
+    fn contact_counts(&self) -> (u64, u64, u64, u64) {
+        let total = self.contacts.len() as u64;
+        let approved = self
+            .contacts
+            .iter()
+            .filter(|c| c.status == "approved")
+            .count() as u64;
+        let pending = self
+            .contacts
+            .iter()
+            .filter(|c| c.status == "pending")
+            .count() as u64;
+        let blocked = self
+            .contacts
+            .iter()
+            .filter(|c| c.status == "blocked")
+            .count() as u64;
+        (total, approved, pending, blocked)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (total, approved, pending, blocked) = self.contact_counts();
+        let (prev_total, prev_approved, prev_pending, prev_blocked) = self.prev_contact_counts;
+
+        let total_str = total.to_string();
+        let approved_str = approved.to_string();
+        let pending_str = pending.to_string();
+        let blocked_str = blocked.to_string();
+
+        let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = vec![
+            (
+                "Contacts",
+                &total_str,
+                trend_for(total, prev_total),
+                tp.metric_agents,
+            ),
+            (
+                "Approved",
+                &approved_str,
+                trend_for(approved, prev_approved),
+                tp.contact_approved,
+            ),
+            (
+                "Pending",
+                &pending_str,
+                trend_for(pending, prev_pending),
+                tp.contact_pending,
+            ),
+            (
+                "Blocked",
+                &blocked_str,
+                trend_for(blocked, prev_blocked),
+                tp.contact_blocked,
+            ),
+        ];
+
+        let tile_count = tiles.len();
+        if tile_count == 0 || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let tile_w = area.width / tile_count as u16;
+
+        for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+            let x = area.x + (i as u16) * tile_w;
+            let w = if i == tile_count - 1 {
+                area.width.saturating_sub(x - area.x)
+            } else {
+                tile_w
+            };
+            let tile_area = Rect::new(x, area.y, w, area.height);
+            let tile = MetricTile::new(label, value, *trend)
+                .value_color(*color)
+                .sparkline_color(*color);
+            tile.render(tile_area, frame);
+        }
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (total, approved, pending, blocked) = self.contact_counts();
+
+        let total_str = total.to_string();
+        let approved_str = approved.to_string();
+        let pending_str = pending.to_string();
+        let blocked_str = blocked.to_string();
+
+        let items: Vec<(&str, &str, PackedRgba)> = vec![
+            (&*total_str, "contacts", tp.metric_agents),
+            (&*approved_str, "approved", tp.contact_approved),
+            (&*pending_str, "pending", tp.contact_pending),
+            (&*blocked_str, "blocked", tp.contact_blocked),
+        ];
+
+        SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+    }
+
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
-        // Build table rows
-        let header = Row::new(["From", "To", "Status", "Reason", "Updated", "Expires"])
-            .style(Style::default().bold());
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
+
+        // Responsive columns
+        let (header_cells, widths): (Vec<&str>, Vec<Constraint>) = if narrow {
+            // < 80: From, To, Status only
+            (
+                vec!["From", "To", "Status"],
+                vec![
+                    Constraint::Percentage(38.0),
+                    Constraint::Percentage(38.0),
+                    Constraint::Percentage(24.0),
+                ],
+            )
+        } else if wide {
+            // >= 120: all columns
+            (
+                vec!["From", "To", "Status", "Reason", "Updated", "Expires"],
+                vec![
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(15.0),
+                    Constraint::Percentage(15.0),
+                ],
+            )
+        } else {
+            // 80–119: hide Reason column
+            (
+                vec!["From", "To", "Status", "Updated", "Expires"],
+                vec![
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(14.0),
+                    Constraint::Percentage(21.0),
+                    Constraint::Percentage(21.0),
+                ],
+            )
+        };
+
+        let header = Row::new(header_cells).style(Style::default().bold());
 
         let rows: Vec<Row> = self
             .contacts
             .iter()
             .enumerate()
             .map(|(i, contact)| {
-                let updated_str = format_relative_ts(contact.updated_ts);
-                let expires_str = contact
-                    .expires_ts
-                    .map_or_else(|| "never".to_string(), format_relative_ts);
                 let status_style = status_color(&contact.status);
                 let row_style = if Some(i) == self.table_state.selected {
                     Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else {
                     status_style
                 };
-                Row::new([
-                    contact.from_agent.clone(),
-                    contact.to_agent.clone(),
-                    contact.status.clone(),
-                    truncate_str(&contact.reason, 20),
-                    updated_str,
-                    expires_str,
-                ])
-                .style(row_style)
+
+                if narrow {
+                    Row::new([
+                        contact.from_agent.clone(),
+                        contact.to_agent.clone(),
+                        contact.status.clone(),
+                    ])
+                    .style(row_style)
+                } else if wide {
+                    let updated_str = format_relative_ts(contact.updated_ts);
+                    let expires_str = contact
+                        .expires_ts
+                        .map_or_else(|| "never".to_string(), format_relative_ts);
+                    Row::new([
+                        contact.from_agent.clone(),
+                        contact.to_agent.clone(),
+                        contact.status.clone(),
+                        truncate_str(&contact.reason, 20),
+                        updated_str,
+                        expires_str,
+                    ])
+                    .style(row_style)
+                } else {
+                    let updated_str = format_relative_ts(contact.updated_ts);
+                    let expires_str = contact
+                        .expires_ts
+                        .map_or_else(|| "never".to_string(), format_relative_ts);
+                    Row::new([
+                        contact.from_agent.clone(),
+                        contact.to_agent.clone(),
+                        contact.status.clone(),
+                        updated_str,
+                        expires_str,
+                    ])
+                    .style(row_style)
+                }
             })
             .collect();
-
-        let widths = [
-            Constraint::Percentage(18.0),
-            Constraint::Percentage(18.0),
-            Constraint::Percentage(12.0),
-            Constraint::Percentage(22.0),
-            Constraint::Percentage(15.0),
-            Constraint::Percentage(15.0),
-        ];
 
         let block = Block::default()
             .title("Contacts")
@@ -822,10 +1025,10 @@ fn build_graph_flow_metrics(contacts: &[ContactSummary], events: &[MailEvent]) -
             }
             *metrics
                 .edge_volume
-                .entry((from.to_string(), to.to_string()))
+                .entry((from.to_string(), to.clone()))
                 .or_insert(0) += 1;
             *metrics.node_sent.entry(from.to_string()).or_insert(0) += 1;
-            *metrics.node_received.entry(to.to_string()).or_insert(0) += 1;
+            *metrics.node_received.entry(to.clone()).or_insert(0) += 1;
         }
     }
 
@@ -858,14 +1061,15 @@ fn message_flow_iter(events: &[MailEvent]) -> impl Iterator<Item = (&str, &[Stri
     })
 }
 
-fn scaled_level(value: u32, max_value: u32, min: u32, max: u32) -> u32 {
+fn scaled_level(value: u32, max_value: u32, min: i32, max: i32) -> i32 {
     if min >= max || max_value == 0 {
         return min;
     }
     let clamped = value.min(max_value);
-    let range = max - min;
-    let scaled = min + (clamped.saturating_mul(range) + (max_value / 2)) / max_value;
-    scaled.clamp(min, max)
+    let range = i64::from(max - min);
+    let scaled = i64::from(min)
+        + ((i64::from(clamped) * range) + i64::from(max_value / 2)) / i64::from(max_value);
+    i32::try_from(scaled.clamp(i64::from(min), i64::from(max))).unwrap_or(max)
 }
 
 fn draw_weighted_line(
@@ -907,7 +1111,7 @@ fn draw_arrow_head(
 ) {
     let vx = f64::from(x2 - x1);
     let vy = f64::from(y2 - y1);
-    let len = (vx * vx + vy * vy).sqrt();
+    let len = vx.hypot(vy);
     if len < 1.0 {
         return;
     }
@@ -915,16 +1119,23 @@ fn draw_arrow_head(
     let uy = vy / len;
     let arrow_len = 3.0;
     let wing = 1.6;
-    let base_x = f64::from(x2) - ux * arrow_len;
-    let base_y = f64::from(y2) - uy * arrow_len;
+    let base_x = ux.mul_add(-arrow_len, f64::from(x2));
+    let base_y = uy.mul_add(-arrow_len, f64::from(y2));
     let perp_x = -uy;
     let perp_y = ux;
-    let left_x = (base_x + perp_x * wing).round() as i32;
-    let left_y = (base_y + perp_y * wing).round() as i32;
-    let right_x = (base_x - perp_x * wing).round() as i32;
-    let right_y = (base_y - perp_y * wing).round() as i32;
+    let left_x = round_to_i32(perp_x.mul_add(wing, base_x));
+    let left_y = round_to_i32(perp_y.mul_add(wing, base_y));
+    let right_x = round_to_i32(perp_x.mul_add(-wing, base_x));
+    let right_y = round_to_i32(perp_y.mul_add(-wing, base_y));
     painter.line_colored(x2, y2, left_x, left_y, Some(color));
     painter.line_colored(x2, y2, right_x, right_y, Some(color));
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn round_to_i32(value: f64) -> i32 {
+    value
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 fn stable_hash<T: Hash>(value: T) -> u64 {
@@ -1054,6 +1265,16 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_len - 3).collect();
         format!("{truncated}...")
+    }
+}
+
+const fn trend_for(current: u64, previous: u64) -> MetricTrend {
+    if current > previous {
+        MetricTrend::Up
+    } else if current < previous {
+        MetricTrend::Down
+    } else {
+        MetricTrend::Flat
     }
 }
 

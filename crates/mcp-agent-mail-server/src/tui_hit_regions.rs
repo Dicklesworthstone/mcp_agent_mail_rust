@@ -284,6 +284,17 @@ impl MouseDispatcher {
         }
     }
 
+    /// Clear all cached tab slots.
+    ///
+    /// This should be called once per frame before writing visible tab
+    /// slots so stale positions from prior terminal widths do not remain
+    /// clickable.
+    pub fn clear_tab_slots(&self) {
+        for slot in &self.tab_slots {
+            slot.set(TabHitSlot::default());
+        }
+    }
+
     /// Return a tab slot's position as `(x_start, x_end, y)`, if registered.
     pub fn tab_slot(&self, index: usize) -> Option<(u16, u16, u16)> {
         self.tab_slots.get(index).and_then(|cell| {

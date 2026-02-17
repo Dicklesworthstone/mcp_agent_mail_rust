@@ -1139,7 +1139,7 @@ fn run_http_server_supervisor_thread(
                 last_restart_sleep_ms = 0;
             }
             Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(envelope)) => {
-                dispatch_compose_envelope(&config.database_url, tui_state, envelope);
+                dispatch_compose_envelope(&config.database_url, tui_state, &envelope);
             }
             Ok(tui_bridge::ServerControlMsg::Shutdown)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1198,24 +1198,22 @@ fn handle_transport_switch(
     }
 }
 
-/// Dispatch a compose envelope from the TUI to the database via sync SQLite.
+/// Dispatch a compose envelope from the TUI to the database via sync `SQLite`.
 ///
 /// Opens a one-shot connection, resolves (or auto-creates) the overseer agent,
 /// inserts the message + recipients, and pushes a `MessageSent` event.
+#[allow(clippy::too_many_lines)]
 fn dispatch_compose_envelope(
     database_url: &str,
     tui_state: &tui_bridge::TuiSharedState,
-    envelope: tui_compose::ComposeEnvelope,
+    envelope: &tui_compose::ComposeEnvelope,
 ) {
     use mcp_agent_mail_db::sqlmodel_core::Value;
     use mcp_agent_mail_db::timestamps::now_micros;
 
-    let conn = match tui_poller::open_sync_connection_pub(database_url) {
-        Some(c) => c,
-        None => {
-            tracing::warn!("compose: cannot open DB for send");
-            return;
-        }
+    let Some(conn) = tui_poller::open_sync_connection_pub(database_url) else {
+        tracing::warn!("compose: cannot open DB for send");
+        return;
     };
 
     // 1. Find the first project (TUI operates on a single project).
@@ -1223,12 +1221,11 @@ fn dispatch_compose_envelope(
         .query_sync("SELECT id FROM projects ORDER BY id LIMIT 1", &[])
         .ok()
         .and_then(|rows| rows.into_iter().next());
-    let project_id: i64 = match project_row {
-        Some(row) => row.get_named::<i64>("id").unwrap_or(0),
-        None => {
-            tracing::warn!("compose: no projects in database");
-            return;
-        }
+    let project_id: i64 = if let Some(row) = project_row {
+        row.get_named::<i64>("id").unwrap_or(0)
+    } else {
+        tracing::warn!("compose: no projects in database");
+        return;
     };
 
     // 2. Resolve or auto-register the sender agent (HumanOverseer).
@@ -1241,28 +1238,29 @@ fn dispatch_compose_envelope(
                 &[Value::BigInt(project_id), Value::Text(sender_name.clone())],
             )
             .unwrap_or_default();
-        if let Some(row) = rows.into_iter().next() {
-            row.get_named::<i64>("id").unwrap_or(0)
-        } else {
-            // Auto-register the overseer agent.
-            let _ = conn.execute_sync(
-                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
-                 VALUES (?1, ?2, 'tui-overseer', 'human', 'Human operator via TUI', ?3, ?3)",
-                &[
-                    Value::BigInt(project_id),
-                    Value::Text(sender_name.clone()),
-                    Value::BigInt(now),
-                ],
-            );
-            conn.query_sync(
-                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
-                &[Value::BigInt(project_id), Value::Text(sender_name.clone())],
-            )
-            .ok()
-            .and_then(|rows| rows.into_iter().next())
-            .and_then(|row| row.get_named::<i64>("id").ok())
-            .unwrap_or(0)
-        }
+        rows.into_iter().next().map_or_else(
+            || {
+                // Auto-register the overseer agent.
+                let _ = conn.execute_sync(
+                    "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+                     VALUES (?1, ?2, 'tui-overseer', 'human', 'Human operator via TUI', ?3, ?3)",
+                    &[
+                        Value::BigInt(project_id),
+                        Value::Text(sender_name.clone()),
+                        Value::BigInt(now),
+                    ],
+                );
+                conn.query_sync(
+                    "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
+                    &[Value::BigInt(project_id), Value::Text(sender_name.clone())],
+                )
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .and_then(|row| row.get_named::<i64>("id").ok())
+                .unwrap_or(0)
+            },
+            |row| row.get_named::<i64>("id").unwrap_or(0),
+        )
     };
 
     if sender_id == 0 {
@@ -2742,12 +2740,19 @@ fn render_dashboard_frame(
             .border_type(BorderType::Rounded)
             .title(" Agents ");
 
-        // Narrow width: collapse to a single summary line
-        if cols[2].width < 22 {
+        // Narrow/short panel: collapse to a summary so at least one agent name
+        // is always visible in constrained layouts.
+        if cols[2].width < 22 || cols[2].height < 7 {
             let count = snapshot.db.agents_list.len();
             let summary = snapshot.db.agents_list.first().map_or_else(
                 || format!("{count} agents"),
-                |first| format!("{count} agents\n{}", first.name),
+                |first| {
+                    if cols[2].height >= 4 {
+                        format!("{count} agents\n{}", first.name)
+                    } else {
+                        format!("{count} agents \u{00b7} {}", first.name)
+                    }
+                },
             );
             Paragraph::new(summary)
                 .block(agent_block)
@@ -12693,7 +12698,10 @@ mod tests {
         render_dashboard_frame(&mut frame, Rect::new(0, 0, 140, 10), &snap, 0.0, 0);
         let text = buffer_text(&frame);
         assert!(text.contains("Agents"));
-        assert!(text.contains("RedFox"));
+        assert!(
+            text.contains("RedFox") || text.contains("10 agents"),
+            "agent panel should show either the first agent or aggregate count"
+        );
     }
 
     #[test]

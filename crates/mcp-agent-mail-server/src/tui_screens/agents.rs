@@ -175,7 +175,7 @@ pub struct AgentsScreen {
     reduced_motion: bool,
     /// Synthetic event for the focused agent (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
-    /// Sparkline: messages per tick, bounded to SPARKLINE_CAP samples.
+    /// Sparkline: messages per tick, bounded to `SPARKLINE_CAP` samples.
     msg_rate_history: VecDeque<f64>,
     /// Previous total message count for trend computation.
     prev_total_msgs: u64,
@@ -401,8 +401,8 @@ impl AgentsScreen {
         if self.msg_rate_history.len() >= SPARKLINE_CAP {
             self.msg_rate_history.pop_front();
         }
-        self.msg_rate_history
-            .push_back(self.total_msgs_this_tick as f64);
+        let sparkline_sample = u32::try_from(self.total_msgs_this_tick).unwrap_or(u32::MAX);
+        self.msg_rate_history.push_back(f64::from(sparkline_sample));
         self.total_msgs_this_tick = 0;
     }
 
@@ -566,7 +566,7 @@ impl MailScreen for AgentsScreen {
         // Layout: summary(2) + header(1) + table(remainder) + footer(1)
         let summary_h: u16 = if area.height >= 8 { 2 } else { 0 };
         let header_h: u16 = 1;
-        let footer_h: u16 = if area.height >= 6 { 1 } else { 0 };
+        let footer_h = u16::from(area.height >= 6);
         let table_h = area
             .height
             .saturating_sub(summary_h)

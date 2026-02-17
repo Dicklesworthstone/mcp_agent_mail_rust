@@ -13,22 +13,15 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEvent, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_theme::TuiThemePalette;
+use crate::tui_widgets::fancy::SummaryFooter;
 
-// ──────────────────────────────────────────────────────────────────────
-// Color constants (ANSI-approximate RGB values)
-// ──────────────────────────────────────────────────────────────────────
-
-const COLOR_DIR: PackedRgba = PackedRgba::rgb(100, 149, 237); // cornflower blue
-const COLOR_JSON: PackedRgba = PackedRgba::rgb(229, 192, 80); // yellow
-const COLOR_MARKDOWN: PackedRgba = PackedRgba::rgb(80, 200, 120); // green
-const COLOR_CONFIG: PackedRgba = PackedRgba::rgb(186, 120, 200); // magenta
-const COLOR_DIM: PackedRgba = PackedRgba::rgb(110, 110, 110); // dark gray
-const COLOR_FILTER: PackedRgba = PackedRgba::rgb(229, 192, 80); // yellow
+const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
 
 // ──────────────────────────────────────────────────────────────────────
 // Archive Entry types
@@ -90,11 +83,31 @@ fn format_file_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
+        let mut whole = bytes / 1024;
+        let mut tenths = ((bytes % 1024) * 10 + 512) / 1024;
+        if tenths == 10 {
+            whole += 1;
+            tenths = 0;
+        }
+        format!("{whole}.{tenths} KB")
     } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        let divider = 1024 * 1024;
+        let mut whole = bytes / divider;
+        let mut tenths = ((bytes % divider) * 10 + (divider / 2)) / divider;
+        if tenths == 10 {
+            whole += 1;
+            tenths = 0;
+        }
+        format!("{whole}.{tenths} MB")
     } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        let divider = 1024 * 1024 * 1024;
+        let mut whole = bytes / divider;
+        let mut hundredths = ((bytes % divider) * 100 + (divider / 2)) / divider;
+        if hundredths == 100 {
+            whole += 1;
+            hundredths = 0;
+        }
+        format!("{whole}.{hundredths:02} GB")
     }
 }
 
@@ -116,13 +129,13 @@ impl ContentType {
             "md" | "markdown" => Self::Markdown,
             "toml" => Self::Toml,
             "yml" | "yaml" => Self::Yaml,
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" => Self::Binary,
-            "sqlite" | "db" | "sqlite3" => Self::Binary,
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "sqlite" | "db"
+            | "sqlite3" => Self::Binary,
             _ => Self::PlainText,
         }
     }
 
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Json => "JSON",
             Self::Markdown => "Markdown",
@@ -137,6 +150,21 @@ impl ContentType {
 // ──────────────────────────────────────────────────────────────────────
 // Archive Browser Screen
 // ──────────────────────────────────────────────────────────────────────
+
+/// Theme-aware file-type color lookup, replacing former hardcoded COLOR_* constants.
+const fn file_type_color(ct: ContentType, is_dir: bool, tp: &TuiThemePalette) -> PackedRgba {
+    if is_dir {
+        tp.metric_agents // blue (was COLOR_DIR)
+    } else {
+        match ct {
+            ContentType::Json => tp.metric_reservations, // yellow (was COLOR_JSON)
+            ContentType::Markdown => tp.activity_active, // green (was COLOR_MARKDOWN)
+            ContentType::Toml | ContentType::Yaml => tp.severity_warn, // magenta-ish (was COLOR_CONFIG)
+            ContentType::Binary => tp.text_muted,                      // gray (was COLOR_DIM)
+            ContentType::PlainText => tp.text_primary,
+        }
+    }
+}
 
 /// Two-pane archive browser: directory tree (left) + file preview (right).
 pub struct ArchiveBrowserScreen {
@@ -208,7 +236,9 @@ impl ArchiveBrowserScreen {
         self.selected_project = Some(slug.clone());
 
         let archive_path = PathBuf::from(storage_root).join(&slug).join(".archive");
-        if !archive_path.is_dir() {
+        if archive_path.is_dir() {
+            self.archive_root = Some(archive_path);
+        } else {
             // Try without .archive suffix (some layouts use project root directly)
             let alt_path = PathBuf::from(storage_root).join(&slug);
             if alt_path.is_dir() {
@@ -218,8 +248,6 @@ impl ArchiveBrowserScreen {
                 self.entries.clear();
                 return;
             }
-        } else {
-            self.archive_root = Some(archive_path);
         }
 
         // Build flattened visible tree
@@ -266,7 +294,7 @@ impl ArchiveBrowserScreen {
             let size = if is_dir {
                 0
             } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
+                entry.metadata().map_or(0, |metadata| metadata.len())
             };
 
             // Apply filter (only to files; always show dirs that might contain matches)
@@ -290,7 +318,7 @@ impl ArchiveBrowserScreen {
         for (is_dir, name, path, size) in items {
             let rel_path = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
             let child_count = if is_dir {
-                std::fs::read_dir(&path).map(|rd| rd.count()).unwrap_or(0)
+                std::fs::read_dir(&path).map_or(0, std::iter::Iterator::count)
             } else {
                 0
             };
@@ -299,7 +327,7 @@ impl ArchiveBrowserScreen {
             let expanded = entries
                 .iter()
                 .find(|e| e.rel_path == rel_path)
-                .map_or(false, |e| e.expanded);
+                .is_some_and(|e| e.expanded);
 
             entries.push(ArchiveEntry {
                 name,
@@ -356,7 +384,6 @@ impl ArchiveBrowserScreen {
         }
 
         // Read file content with size limit (max 512 KB)
-        const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
         if entry.size > MAX_PREVIEW_BYTES {
             self.preview_content = Some(format!(
                 "[File too large for preview: {} — {}]\n\nShowing first {} of content...",
@@ -366,7 +393,8 @@ impl ArchiveBrowserScreen {
             ));
             // Read partial
             if let Ok(content) = std::fs::read_to_string(&full_path) {
-                let truncated: String = content.chars().take(MAX_PREVIEW_BYTES as usize).collect();
+                let max_chars = usize::try_from(MAX_PREVIEW_BYTES).unwrap_or(usize::MAX);
+                let truncated: String = content.chars().take(max_chars).collect();
                 self.preview_content = Some(truncated);
             }
             return;
@@ -464,7 +492,7 @@ impl ArchiveBrowserScreen {
             let size = if is_dir {
                 0
             } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
+                entry.metadata().map_or(0, |metadata| metadata.len())
             };
 
             if !filter.is_empty()
@@ -486,19 +514,15 @@ impl ArchiveBrowserScreen {
         for (is_dir, name, path, size) in items {
             let rel_path = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
             let child_count = if is_dir {
-                std::fs::read_dir(&path).map(|rd| rd.count()).unwrap_or(0)
+                std::fs::read_dir(&path).map_or(0, std::iter::Iterator::count)
             } else {
                 0
             };
 
-            let expanded = if is_dir {
-                expanded_state
+            let expanded = is_dir
+                && expanded_state
                     .iter()
-                    .find(|(p, _)| *p == rel_path)
-                    .map_or(false, |(_, e)| *e)
-            } else {
-                false
-            };
+                    .any(|(p, expanded)| *p == rel_path && *expanded);
 
             entries.push(ArchiveEntry {
                 name,
@@ -527,10 +551,10 @@ impl ArchiveBrowserScreen {
     fn render_tree(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         let tp = crate::tui_theme::TuiThemePalette::current();
 
-        let border_style = if !self.preview_focused {
-            Style::default().fg(tp.panel_border_focused)
-        } else {
+        let border_style = if self.preview_focused {
             Style::default().fg(tp.panel_border_dim)
+        } else {
+            Style::default().fg(tp.panel_border_focused)
         };
 
         let project_label = self.selected_project.as_deref().unwrap_or("(no project)");
@@ -551,7 +575,7 @@ impl ArchiveBrowserScreen {
             } else {
                 "Archive directory is empty."
             };
-            let p = Paragraph::new(empty_msg).style(Style::default().fg(COLOR_DIM));
+            let p = Paragraph::new(empty_msg).style(Style::default().fg(tp.text_muted));
             p.render(inner, frame);
             return;
         }
@@ -566,17 +590,12 @@ impl ArchiveBrowserScreen {
                 let label = entry.display_label();
                 let size = entry.display_size();
 
+                let ct = ContentType::from_path(&entry.rel_path);
+                let fg = file_type_color(ct, entry.is_dir, &tp);
                 let name_style = if entry.is_dir {
-                    Style::default().fg(COLOR_DIR).bold()
+                    Style::default().fg(fg).bold()
                 } else {
-                    let ct = ContentType::from_path(&entry.rel_path);
-                    match ct {
-                        ContentType::Json => Style::default().fg(COLOR_JSON),
-                        ContentType::Markdown => Style::default().fg(COLOR_MARKDOWN),
-                        ContentType::Toml | ContentType::Yaml => Style::default().fg(COLOR_CONFIG),
-                        ContentType::Binary => Style::default().fg(COLOR_DIM),
-                        ContentType::PlainText => Style::default(),
-                    }
+                    Style::default().fg(fg)
                 };
 
                 let selected = self.tree_state.selected == Some(i);
@@ -648,6 +667,166 @@ impl ArchiveBrowserScreen {
             .style(Style::default());
         p.render(inner, frame);
     }
+
+    fn handle_filter_key(
+        &mut self,
+        key_code: KeyCode,
+        state: &TuiSharedState,
+    ) -> Cmd<MailScreenMsg> {
+        match key_code {
+            KeyCode::Escape => {
+                self.filter_active = false;
+                self.filter.clear();
+                self.refresh_entries(state);
+            }
+            KeyCode::Enter => {
+                self.filter_active = false;
+                self.refresh_entries(state);
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.refresh_entries(state);
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.refresh_entries(state);
+            }
+            _ => {}
+        }
+        Cmd::None
+    }
+
+    fn handle_preview_key(&mut self, key: &KeyEvent) -> Cmd<MailScreenMsg> {
+        match key.code {
+            KeyCode::Tab | KeyCode::Escape => {
+                self.preview_focused = false;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.preview_scroll = self.preview_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.preview_scroll = self.preview_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(Modifiers::CTRL) => {
+                self.preview_scroll = self.preview_scroll.saturating_add(20);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(Modifiers::CTRL) => {
+                self.preview_scroll = self.preview_scroll.saturating_sub(20);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.preview_scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                if let Some(content) = &self.preview_content {
+                    let line_count = content.lines().count();
+                    let clamped = line_count.saturating_sub(10);
+                    self.preview_scroll = u16::try_from(clamped).unwrap_or(u16::MAX);
+                }
+            }
+            _ => {}
+        }
+        Cmd::None
+    }
+
+    fn handle_tree_key(&mut self, key_code: KeyCode, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        match key_code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_selection(1);
+                self.load_preview();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_selection(-1);
+                self.load_preview();
+            }
+            KeyCode::PageDown => {
+                self.move_selection(20);
+                self.load_preview();
+            }
+            KeyCode::PageUp => {
+                self.move_selection(-20);
+                self.load_preview();
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                if !self.entries.is_empty() {
+                    self.tree_state.selected = Some(0);
+                    self.load_preview();
+                }
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                if !self.entries.is_empty() {
+                    self.tree_state.selected = Some(self.entries.len() - 1);
+                    self.load_preview();
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(sel) = self.tree_state.selected {
+                    if let Some(entry) = self.entries.get(sel) {
+                        if entry.is_dir {
+                            self.toggle_expand();
+                        } else {
+                            self.load_preview();
+                            self.preview_focused = true;
+                        }
+                    }
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(sel) = self.tree_state.selected {
+                    if let Some(entry) = self.entries.get(sel) {
+                        if entry.is_dir && entry.expanded {
+                            self.toggle_expand();
+                        } else if entry.depth > 0 {
+                            for i in (0..sel).rev() {
+                                if self.entries[i].is_dir && self.entries[i].depth < entry.depth {
+                                    self.tree_state.selected = Some(i);
+                                    self.load_preview();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Tab => {
+                self.preview_focused = true;
+            }
+            KeyCode::Char('/') => {
+                self.filter_active = true;
+            }
+            KeyCode::Char('r') => {
+                self.refresh_entries(state);
+            }
+            _ => {}
+        }
+        Cmd::None
+    }
+}
+
+impl ArchiveBrowserScreen {
+    /// Compute summary stats: `(file_count, dir_count, total_bytes)`.
+    fn archive_stats(&self) -> (u64, u64, u64) {
+        let files = self.entries.iter().filter(|e| !e.is_dir).count() as u64;
+        let dirs = self.entries.iter().filter(|e| e.is_dir).count() as u64;
+        let total_bytes: u64 = self.entries.iter().map(|e| e.size).sum();
+        (files, dirs, total_bytes)
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = TuiThemePalette::current();
+        let (files, dirs, total_bytes) = self.archive_stats();
+
+        let files_str = files.to_string();
+        let dirs_str = dirs.to_string();
+        let size_str = format_file_size(total_bytes);
+
+        let items: Vec<(&str, &str, PackedRgba)> = vec![
+            (&*files_str, "files", tp.metric_messages),
+            (&*dirs_str, "dirs", tp.metric_agents),
+            (&*size_str, "total", tp.metric_latency),
+        ];
+
+        SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+    }
 }
 
 /// Add line numbers to text content.
@@ -672,175 +851,97 @@ impl MailScreen for ArchiveBrowserScreen {
     fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Press {
-                // Filter mode: capture text input
                 if self.filter_active {
-                    match key.code {
-                        KeyCode::Escape => {
-                            self.filter_active = false;
-                            self.filter.clear();
-                            self.refresh_entries(state);
-                        }
-                        KeyCode::Enter => {
-                            self.filter_active = false;
-                            self.refresh_entries(state);
-                        }
-                        KeyCode::Backspace => {
-                            self.filter.pop();
-                            self.refresh_entries(state);
-                        }
-                        KeyCode::Char(c) => {
-                            self.filter.push(c);
-                            self.refresh_entries(state);
-                        }
-                        _ => {}
-                    }
-                    return Cmd::None;
+                    return self.handle_filter_key(key.code, state);
                 }
-
-                // Preview pane navigation
                 if self.preview_focused {
-                    match key.code {
-                        KeyCode::Tab => {
-                            self.preview_focused = false;
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            self.preview_scroll = self.preview_scroll.saturating_add(1);
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            self.preview_scroll = self.preview_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Char('d') if key.modifiers.contains(Modifiers::CTRL) => {
-                            self.preview_scroll = self.preview_scroll.saturating_add(20);
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(Modifiers::CTRL) => {
-                            self.preview_scroll = self.preview_scroll.saturating_sub(20);
-                        }
-                        KeyCode::Home | KeyCode::Char('g') => {
-                            self.preview_scroll = 0;
-                        }
-                        KeyCode::End | KeyCode::Char('G') => {
-                            // Scroll to end (approximate)
-                            if let Some(content) = &self.preview_content {
-                                let line_count = content.lines().count();
-                                self.preview_scroll = line_count.saturating_sub(10) as u16;
-                            }
-                        }
-                        KeyCode::Escape => {
-                            self.preview_focused = false;
-                        }
-                        _ => {}
-                    }
-                    return Cmd::None;
+                    return self.handle_preview_key(key);
                 }
-
-                // Tree pane navigation
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        self.move_selection(1);
-                        self.load_preview();
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.move_selection(-1);
-                        self.load_preview();
-                    }
-                    KeyCode::PageDown => {
-                        self.move_selection(20);
-                        self.load_preview();
-                    }
-                    KeyCode::PageUp => {
-                        self.move_selection(-20);
-                        self.load_preview();
-                    }
-                    KeyCode::Home | KeyCode::Char('g') => {
-                        if !self.entries.is_empty() {
-                            self.tree_state.selected = Some(0);
-                            self.load_preview();
-                        }
-                    }
-                    KeyCode::End | KeyCode::Char('G') => {
-                        if !self.entries.is_empty() {
-                            self.tree_state.selected = Some(self.entries.len() - 1);
-                            self.load_preview();
-                        }
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        // Expand directory or load file preview
-                        if let Some(sel) = self.tree_state.selected {
-                            if let Some(entry) = self.entries.get(sel) {
-                                if entry.is_dir {
-                                    self.toggle_expand();
-                                } else {
-                                    self.load_preview();
-                                    self.preview_focused = true;
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        // Collapse directory or go to parent
-                        if let Some(sel) = self.tree_state.selected {
-                            if let Some(entry) = self.entries.get(sel) {
-                                if entry.is_dir && entry.expanded {
-                                    self.toggle_expand();
-                                } else if entry.depth > 0 {
-                                    // Find parent directory
-                                    for i in (0..sel).rev() {
-                                        if self.entries[i].is_dir
-                                            && self.entries[i].depth < entry.depth
-                                        {
-                                            self.tree_state.selected = Some(i);
-                                            self.load_preview();
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Tab => {
-                        self.preview_focused = true;
-                    }
-                    KeyCode::Char('/') => {
-                        self.filter_active = true;
-                    }
-                    KeyCode::Char('r') => {
-                        // Refresh
-                        self.refresh_entries(state);
-                    }
-                    _ => {}
-                }
+                return self.handle_tree_key(key.code, state);
             }
         }
         Cmd::None
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
-        // Two-pane layout: tree (40%) | preview (60%)
-        let chunks = Flex::horizontal()
-            .constraints([Constraint::Percentage(40.0), Constraint::Percentage(60.0)])
-            .split(area);
+        // Layout: [tree | preview](dynamic) + footer(1)
+        let footer_h: u16 = u16::from(area.height >= 6);
+        let content_h = area.height.saturating_sub(footer_h);
+        let content_area = Rect::new(area.x, area.y, area.width, content_h);
 
-        // Handle filter bar at the bottom of the tree pane
-        if self.filter_active {
-            let tree_chunks = Flex::vertical()
-                .constraints([Constraint::Min(3), Constraint::Fixed(3)])
-                .split(chunks[0]);
+        // Responsive tree/preview split
+        let wide = area.width >= 120;
+        let narrow = area.width < 60;
 
-            self.render_tree(frame, tree_chunks[0], state);
-
-            // Filter bar
-            let filter_block = Block::bordered()
-                .title(" Filter: ")
-                .border_style(Style::default().fg(COLOR_FILTER));
-            let inner = filter_block.inner(tree_chunks[1]);
-            filter_block.render(tree_chunks[1], frame);
-            let filter_text = Paragraph::new(format!("{}\u{258e}", self.filter));
-            filter_text.render(inner, frame);
+        let (tree_pct, preview_pct) = if narrow {
+            // Very narrow: tree only, no preview
+            (100.0, 0.0)
+        } else if wide {
+            // Wide: tree 35%, preview 65%
+            (35.0, 65.0)
         } else {
-            self.render_tree(frame, chunks[0], state);
+            // Medium: tree 40%, preview 60% (original)
+            (40.0, 60.0)
+        };
+
+        if narrow {
+            // Tree only mode
+            if self.filter_active {
+                let tree_chunks = Flex::vertical()
+                    .constraints([Constraint::Min(3), Constraint::Fixed(3)])
+                    .split(content_area);
+
+                self.render_tree(frame, tree_chunks[0], state);
+
+                // Filter bar
+                let tp = TuiThemePalette::current();
+                let filter_block = Block::bordered()
+                    .title(" Filter: ")
+                    .border_style(Style::default().fg(tp.metric_reservations));
+                let inner = filter_block.inner(tree_chunks[1]);
+                filter_block.render(tree_chunks[1], frame);
+                let filter_text = Paragraph::new(format!("{}\u{258e}", self.filter));
+                filter_text.render(inner, frame);
+            } else {
+                self.render_tree(frame, content_area, state);
+            }
+        } else {
+            // Two-pane layout
+            let chunks = Flex::horizontal()
+                .constraints([
+                    Constraint::Percentage(tree_pct),
+                    Constraint::Percentage(preview_pct),
+                ])
+                .split(content_area);
+
+            if self.filter_active {
+                let tree_chunks = Flex::vertical()
+                    .constraints([Constraint::Min(3), Constraint::Fixed(3)])
+                    .split(chunks[0]);
+
+                self.render_tree(frame, tree_chunks[0], state);
+
+                // Filter bar
+                let tp = TuiThemePalette::current();
+                let filter_block = Block::bordered()
+                    .title(" Filter: ")
+                    .border_style(Style::default().fg(tp.metric_reservations));
+                let inner = filter_block.inner(tree_chunks[1]);
+                filter_block.render(tree_chunks[1], frame);
+                let filter_text = Paragraph::new(format!("{}\u{258e}", self.filter));
+                filter_text.render(inner, frame);
+            } else {
+                self.render_tree(frame, chunks[0], state);
+            }
+
+            self.render_preview(frame, chunks[1]);
         }
 
-        self.render_preview(frame, chunks[1]);
+        // ── Footer summary ─────────────────────────────────────────────
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, area.y + content_h, area.width, footer_h);
+            self.render_footer(frame, footer_area);
+        }
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {

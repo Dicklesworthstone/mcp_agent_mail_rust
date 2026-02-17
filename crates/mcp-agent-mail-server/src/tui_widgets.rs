@@ -29,6 +29,7 @@ use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text, display_width};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
+use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Cell, Frame, PackedRgba, Style};
 use ftui_extras::canvas::Mode;
@@ -121,24 +122,49 @@ fn render_state_placeholder(
     if !frame.buffer.degradation.render_content() {
         return;
     }
-    let text = format!("{icon} {message}");
-    let truncated: String = text.chars().take(area.width as usize).collect();
-    // Center vertically.
-    let y = area.y + area.height / 2;
-    // Center horizontally.
-    #[allow(clippy::cast_possible_truncation)]
-    let text_len = truncated.chars().count() as u16;
-    let x = area.x + area.width.saturating_sub(text_len) / 2;
-    let line = Line::from_spans([Span::styled(truncated, Style::new().fg(color))]);
-    Paragraph::new(line).render(
-        Rect {
-            x,
-            y,
-            width: area.width.saturating_sub(x - area.x),
-            height: 1,
-        },
-        frame,
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    if area.width < 8 || area.height < 2 {
+        let compact = format!(
+            "{icon} {}",
+            message
+                .chars()
+                .take(area.width as usize)
+                .collect::<String>()
+        );
+        Paragraph::new(compact)
+            .style(Style::new().fg(color).bg(tp.panel_bg))
+            .render(area, frame);
+        return;
+    }
+
+    let border = crate::tui_theme::lerp_color(tp.panel_border, color, 0.62);
+    let bg = crate::tui_theme::lerp_color(tp.panel_bg, color, 0.10);
+    let block = Block::default()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border))
+        .style(Style::new().bg(bg));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let icon_bg = crate::tui_theme::lerp_color(color, tp.help_key_fg, 0.20);
+    let icon_span = Span::styled(
+        format!(" {icon} "),
+        Style::new().fg(tp.help_bg).bg(icon_bg).bold(),
     );
+    let msg_max = usize::from(inner.width.saturating_sub(5));
+    let truncated: String = message.chars().take(msg_max).collect();
+    let line = Line::from_spans([
+        icon_span,
+        Span::styled(" ", Style::new().bg(bg)),
+        Span::styled(truncated, Style::new().fg(tp.text_secondary).bg(bg)),
+    ]);
+    let y = inner.y + inner.height / 2;
+    Paragraph::new(line)
+        .style(Style::new().bg(bg))
+        .render(Rect::new(inner.x, y, inner.width, 1), frame);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1070,6 +1096,11 @@ impl Widget for AnomalyCard<'_> {
 
         let no_styling =
             frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let card_bg = crate::tui_theme::lerp_color(tp.panel_bg, self.severity.color(), 0.08);
+        Paragraph::new("")
+            .style(Style::new().bg(card_bg))
+            .render(inner, frame);
 
         let mut y = inner.y;
 
@@ -1082,7 +1113,7 @@ impl Widget for AnomalyCard<'_> {
             let badge_span = if no_styling {
                 Span::raw(badge)
             } else {
-                Span::styled(badge, Style::new().fg(sev_color))
+                Span::styled(badge, Style::new().fg(tp.help_bg).bg(sev_color).bold())
             };
 
             let headline_max = (inner.width as usize).saturating_sub(sev_label.len() + 4);
@@ -1093,7 +1124,7 @@ impl Widget for AnomalyCard<'_> {
                 Span::raw(" "),
                 Span::styled(
                     truncated_headline,
-                    Style::new().fg(PackedRgba::rgb(240, 240, 240)),
+                    Style::new().fg(tp.text_primary).bg(card_bg).bold(),
                 ),
             ]);
 
@@ -1127,11 +1158,11 @@ impl Widget for AnomalyCard<'_> {
             let empty = bar_width.saturating_sub(filled);
 
             let conf_color = if self.confidence >= 0.8 {
-                PackedRgba::rgb(80, 200, 80)
+                tp.severity_ok
             } else if self.confidence >= 0.5 {
-                PackedRgba::rgb(220, 180, 50)
+                tp.severity_warn
             } else {
-                PackedRgba::rgb(200, 100, 100)
+                tp.severity_error
             };
 
             let spans = if no_styling {
@@ -1144,12 +1175,16 @@ impl Widget for AnomalyCard<'_> {
                 vec![
                     Span::styled(
                         format!("Conf: {conf_pct:>3}% "),
-                        Style::new().fg(PackedRgba::rgb(160, 160, 160)),
+                        Style::new().fg(tp.text_secondary).bg(card_bg),
                     ),
                     Span::styled("\u{2588}".repeat(filled), Style::new().fg(conf_color)),
                     Span::styled(
                         "\u{2591}".repeat(empty),
-                        Style::new().fg(PackedRgba::rgb(60, 60, 60)),
+                        Style::new().fg(crate::tui_theme::lerp_color(
+                            card_bg,
+                            tp.text_disabled,
+                            0.55,
+                        )),
                     ),
                 ]
             };
@@ -1174,7 +1209,7 @@ impl Widget for AnomalyCard<'_> {
         if let Some(rationale) = self.rationale {
             let max_chars = inner.width as usize;
             let truncated: String = rationale.chars().take(max_chars).collect();
-            let line = Line::styled(truncated, Style::new().fg(PackedRgba::rgb(160, 160, 160)));
+            let line = Line::styled(truncated, Style::new().fg(tp.text_secondary).bg(card_bg));
             Paragraph::new(line).render(
                 Rect {
                     x: inner.x,
@@ -1195,7 +1230,16 @@ impl Widget for AnomalyCard<'_> {
                 }
                 let bullet = format!("\u{2022} {step}");
                 let truncated: String = bullet.chars().take(inner.width as usize).collect();
-                let line = Line::styled(truncated, Style::new().fg(PackedRgba::rgb(140, 180, 220)));
+                let line = Line::styled(
+                    truncated,
+                    Style::new()
+                        .fg(crate::tui_theme::lerp_color(
+                            tp.status_accent,
+                            tp.text_primary,
+                            0.22,
+                        ))
+                        .bg(card_bg),
+                );
                 Paragraph::new(line).render(
                     Rect {
                         x: inner.x,
@@ -1361,12 +1405,28 @@ impl Widget for MetricTile<'_> {
 
         let no_styling =
             frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let trend_color = if no_styling {
+            tp.text_primary
+        } else {
+            self.trend.color()
+        };
+        let tile_bg = crate::tui_theme::lerp_color(tp.panel_bg, self.value_color, 0.09);
+        Paragraph::new("")
+            .style(Style::new().bg(tile_bg))
+            .render(inner, frame);
 
         // Line 1: label.
         let label_truncated: String = self.label.chars().take(inner.width as usize).collect();
         let label_line = Line::styled(
             label_truncated,
-            Style::new().fg(PackedRgba::rgb(160, 160, 160)),
+            Style::new()
+                .fg(crate::tui_theme::lerp_color(
+                    tp.text_muted,
+                    trend_color,
+                    0.30,
+                ))
+                .bg(tile_bg),
         );
         Paragraph::new(label_line).render(
             Rect {
@@ -1384,16 +1444,17 @@ impl Widget for MetricTile<'_> {
 
         // Line 2: value + trend.
         let trend_str = self.trend.indicator();
-        let trend_color = if no_styling {
-            PackedRgba::rgb(200, 200, 200)
-        } else {
-            self.trend.color()
-        };
 
         let spans = vec![
-            Span::styled(self.value.to_string(), Style::new().fg(self.value_color)),
-            Span::raw(" "),
-            Span::styled(trend_str.to_string(), Style::new().fg(trend_color)),
+            Span::styled(
+                self.value.to_string(),
+                Style::new().fg(self.value_color).bg(tile_bg).bold(),
+            ),
+            Span::styled(" ", Style::new().bg(tile_bg)),
+            Span::styled(
+                trend_str.to_string(),
+                Style::new().fg(trend_color).bg(tile_bg).bold(),
+            ),
         ];
 
         let value_w = display_width(self.value);
@@ -1435,7 +1496,7 @@ impl Widget for MetricTile<'_> {
 
                 Sparkline::new(slice)
                     .min(0.0)
-                    .style(Style::new().fg(self.sparkline_color))
+                    .style(Style::new().fg(self.sparkline_color).bg(tile_bg))
                     .render(spark_rect, frame);
             }
         }

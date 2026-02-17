@@ -33,7 +33,7 @@ use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 use mcp_agent_mail_db::{DbConn, QueryAssistance, parse_query_assistance};
 
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_layout::DockLayout;
+use crate::tui_layout::{DockLayout, DockPosition};
 use crate::tui_markdown;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
@@ -46,6 +46,10 @@ const MAX_RESULTS: usize = 200;
 
 /// Debounce delay in ticks. Zero means immediate search-as-you-type.
 const DEBOUNCE_TICKS: u8 = 0;
+const SEARCH_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
+const SEARCH_STACKED_WIDTH_THRESHOLD: u16 = 60;
+const SEARCH_STACKED_MIN_HEIGHT: u16 = 12;
+const SEARCH_STACKED_DOCK_RATIO: f32 = 0.38;
 
 /// Max chars for the message snippet shown in the detail pane.
 const MAX_SNIPPET_CHARS: usize = 180;
@@ -2190,8 +2194,46 @@ impl MailScreen for SearchCockpitScreen {
         self.last_query_area.set(query_area);
         self.last_screen_area.set(area);
 
-        let layout_label = if self.dock.visible {
-            self.dock.state_label()
+        // Body: facet rail (left) + dock-split content area (results/detail)
+        let min_remaining_for_results: u16 = 26;
+        let max_facet_w = body_area.width.saturating_sub(min_remaining_for_results);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let computed_facet_w = ((f32::from(body_area.width) * 0.2).round() as u16).clamp(12, 28);
+        let facet_w_raw: u16 = if body_area.width <= min_remaining_for_results {
+            0
+        } else {
+            computed_facet_w.min(max_facet_w).min(body_area.width)
+        };
+        let facet_w = if facet_w_raw < 12 { 0 } else { facet_w_raw };
+        let facet_area = Rect::new(body_area.x, body_area.y, facet_w, body_area.height);
+        let split_area = Rect::new(
+            body_area.x + facet_w,
+            body_area.y,
+            body_area.width.saturating_sub(facet_w),
+            body_area.height,
+        );
+
+        let mut dock = self.dock;
+        let mut stacked_fallback = false;
+        if split_area.height < SEARCH_DOCK_HIDE_HEIGHT_THRESHOLD {
+            dock.visible = false;
+        } else if split_area.width < SEARCH_STACKED_WIDTH_THRESHOLD {
+            if split_area.height >= SEARCH_STACKED_MIN_HEIGHT {
+                stacked_fallback = true;
+                dock.visible = true;
+                dock.position = DockPosition::Bottom;
+                dock.set_ratio(SEARCH_STACKED_DOCK_RATIO);
+            } else {
+                dock.visible = false;
+            }
+        }
+
+        let layout_label = if dock.visible {
+            if stacked_fallback {
+                format!("Stacked {}", dock.state_label())
+            } else {
+                dock.state_label()
+            }
         } else {
             "List only".to_string()
         };
@@ -2207,17 +2249,6 @@ impl MailScreen for SearchCockpitScreen {
             &telemetry,
         );
 
-        // Body: facet rail (left) + dock-split content area (results/detail)
-        let min_remaining_for_results: u16 = 26;
-        let max_facet_w = body_area.width.saturating_sub(min_remaining_for_results);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let computed_facet_w = ((f32::from(body_area.width) * 0.2).round() as u16).clamp(12, 28);
-        let facet_w: u16 = if body_area.width <= min_remaining_for_results {
-            0
-        } else {
-            computed_facet_w.min(max_facet_w).min(body_area.width)
-        };
-        let facet_area = Rect::new(body_area.x, body_area.y, facet_w, body_area.height);
         self.last_facet_area.set(facet_area);
         if facet_area.width > 0 {
             render_facet_rail(
@@ -2228,27 +2259,29 @@ impl MailScreen for SearchCockpitScreen {
             );
         }
 
-        let split_area = Rect::new(
-            body_area.x + facet_w,
-            body_area.y,
-            body_area.width.saturating_sub(facet_w),
-            body_area.height,
-        );
         self.last_split_area.set(split_area);
-
-        let mut dock = self.dock;
-        if split_area.width < 60 || split_area.height < 8 {
-            dock.visible = false;
-        }
         let split = dock.split(split_area);
-        self.last_results_area.set(split.primary);
+        let results_area =
+            if facet_area.width == 0 && split.primary.width >= 24 && split.primary.height >= 3 {
+                let hint_area = Rect::new(split.primary.x, split.primary.y, split.primary.width, 1);
+                render_collapsed_facet_hint(frame, hint_area, self);
+                Rect::new(
+                    split.primary.x,
+                    split.primary.y + 1,
+                    split.primary.width,
+                    split.primary.height.saturating_sub(1),
+                )
+            } else {
+                split.primary
+            };
+        self.last_results_area.set(results_area);
         self.last_detail_area
             .set(split.dock.unwrap_or(Rect::new(0, 0, 0, 0)));
 
         self.sync_list_state();
         render_results(
             frame,
-            split.primary,
+            results_area,
             &self.results,
             &mut self.list_state.borrow_mut(),
             &self.highlight_terms,
@@ -2764,6 +2797,23 @@ fn render_query_bar(
             .style(Style::default().fg(FACET_ACTIVE_FG()))
             .render(telemetry_area, frame);
     }
+}
+
+fn render_collapsed_facet_hint(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitScreen) {
+    if area.width < 16 || area.height == 0 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let hint = format!(
+        " Facets hidden | type:{} imp:{} sort:{} mode:{} | [f] focus facets",
+        screen.doc_kind_filter.label(),
+        screen.importance_filter.label(),
+        screen.sort_direction.label(),
+        screen.search_mode.label(),
+    );
+    Paragraph::new(truncate_str(&hint, area.width as usize))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(area, frame);
 }
 
 fn query_help_popup_rect(area: Rect, query_area: Rect) -> Option<Rect> {
@@ -3532,10 +3582,11 @@ fn render_detail(
     let visible = usize::from(content_h);
     let max_scroll = total_estimated.saturating_sub(visible);
     let clamped_scroll = scroll.min(max_scroll);
+    let scroll_rows = u16::try_from(clamped_scroll).unwrap_or(u16::MAX);
 
     Paragraph::new(Text::from_lines(lines))
         .wrap(ftui::text::WrapMode::Word)
-        .scroll((clamped_scroll as u16, 0))
+        .scroll((scroll_rows, 0))
         .render(content_area, frame);
 
     if let Some(bar_area) = scrollbar_area {
@@ -4118,6 +4169,49 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(50, 20, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 50, 20), &state);
+    }
+
+    #[test]
+    fn narrow_tall_layout_keeps_detail_visible_with_stacked_fallback() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let screen = SearchCockpitScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(50, 20, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 50, 20), &state);
+
+        let detail = screen.last_detail_area.get();
+        let results = screen.last_results_area.get();
+        assert!(
+            detail.width > 0 && detail.height > 0,
+            "stacked fallback should keep detail pane visible at 50x20"
+        );
+        assert_eq!(detail.width, results.width);
+        assert!(detail.y > results.y);
+    }
+
+    #[test]
+    fn narrow_short_layout_hides_detail_when_too_short_for_stack() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let screen = SearchCockpitScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(50, 14, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 50, 14), &state);
+
+        assert_eq!(screen.last_detail_area.get(), Rect::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn facet_rail_collapses_when_width_too_small_for_useful_rail() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let screen = SearchCockpitScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(34, 20, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 34, 20), &state);
+
+        assert_eq!(screen.last_facet_area.get().width, 0);
     }
 
     #[test]

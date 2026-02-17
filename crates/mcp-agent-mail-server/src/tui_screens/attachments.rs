@@ -7,7 +7,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 
 use mcp_agent_mail_db::DbConn;
@@ -17,6 +17,8 @@ use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::fancy::SummaryFooter;
+use crate::tui_widgets::{MetricTile, MetricTrend};
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -177,6 +179,8 @@ pub struct AttachmentExplorerScreen {
 
     /// Synthetic event for the focused attachment's source message.
     focused_synthetic: Option<crate::tui_events::MailEvent>,
+    /// Previous attachment counts for `MetricTrend` computation.
+    prev_attachment_counts: (u64, u64, u64, u64),
 }
 
 impl AttachmentExplorerScreen {
@@ -198,6 +202,7 @@ impl AttachmentExplorerScreen {
             data_dirty: true,
             last_reload_tick: 0,
             focused_synthetic: None,
+            prev_attachment_counts: (0, 0, 0, 0),
         }
     }
 
@@ -439,15 +444,13 @@ impl AttachmentExplorerScreen {
         }
     }
 
-    /// Build table rows from the current display indices.
-    fn build_table_rows(&self) -> Vec<Row> {
+    /// Build table rows with responsive column selection.
+    fn build_table_rows_responsive(&self, wide: bool, narrow: bool) -> Vec<Row> {
         self.display_indices
             .iter()
             .enumerate()
             .map(|(i, &idx)| {
                 let e = &self.entries[idx];
-                let date = micros_to_iso(e.created_ts);
-                let date_short = if date.len() > 19 { &date[..19] } else { &date };
                 let subject_trunc: String = if e.subject.chars().count() > 40 {
                     let head: String = e.subject.chars().take(37).collect();
                     format!("{head}...")
@@ -462,15 +465,38 @@ impl AttachmentExplorerScreen {
                     Style::default()
                 };
 
-                Row::new([
-                    e.type_label().to_string(),
-                    e.size_display(),
-                    e.sender_name.clone(),
-                    subject_trunc,
-                    date_short.to_string(),
-                    e.project_slug.clone(),
-                ])
-                .style(style)
+                if narrow {
+                    Row::new([
+                        e.type_label().to_string(),
+                        e.size_display(),
+                        e.sender_name.clone(),
+                        subject_trunc,
+                    ])
+                    .style(style)
+                } else if wide {
+                    let date = micros_to_iso(e.created_ts);
+                    let date_short = if date.len() > 19 { &date[..19] } else { &date };
+                    Row::new([
+                        e.type_label().to_string(),
+                        e.size_display(),
+                        e.sender_name.clone(),
+                        subject_trunc,
+                        date_short.to_string(),
+                        e.project_slug.clone(),
+                    ])
+                    .style(style)
+                } else {
+                    let date = micros_to_iso(e.created_ts);
+                    let date_short = if date.len() > 19 { &date[..19] } else { &date };
+                    Row::new([
+                        e.type_label().to_string(),
+                        e.size_display(),
+                        e.sender_name.clone(),
+                        subject_trunc,
+                        date_short.to_string(),
+                    ])
+                    .style(style)
+                }
             })
             .collect()
     }
@@ -552,6 +578,109 @@ impl AttachmentExplorerScreen {
             .border_style(Style::default().fg(tp.panel_border));
         let p = Paragraph::new(text).block(block);
         p.render(area, frame);
+    }
+
+    /// Count attachments by type (total, images, docs, other).
+    fn type_counts(&self) -> (u64, u64, u64, u64) {
+        let total = self.display_indices.len() as u64;
+        let images = self
+            .display_indices
+            .iter()
+            .filter(|&&i| self.entries[i].media_type.starts_with("image/"))
+            .count() as u64;
+        let docs = self
+            .display_indices
+            .iter()
+            .filter(|&&i| MediaFilter::Documents.matches(&self.entries[i].media_type))
+            .count() as u64;
+        let other = total.saturating_sub(images).saturating_sub(docs);
+        (total, images, docs, other)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (total, images, docs, other) = self.type_counts();
+        let (prev_total, prev_images, prev_docs, prev_other) = self.prev_attachment_counts;
+
+        let (_, total_bytes) = self.summary();
+        let size_str = Self::format_total_size(total_bytes);
+        let total_str = total.to_string();
+        let images_str = images.to_string();
+        let docs_str = docs.to_string();
+
+        // Use "other" count but show size as 2nd tile instead of "other"
+        let _ = other;
+        let _ = prev_other;
+
+        let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = vec![
+            (
+                "Files",
+                &total_str,
+                trend_for(total, prev_total),
+                tp.metric_messages,
+            ),
+            (
+                "Size",
+                &size_str,
+                trend_for(total_bytes, 0), // size trend not meaningful with prev
+                tp.metric_latency,
+            ),
+            (
+                "Images",
+                &images_str,
+                trend_for(images, prev_images),
+                tp.metric_agents,
+            ),
+            (
+                "Docs",
+                &docs_str,
+                trend_for(docs, prev_docs),
+                tp.metric_projects,
+            ),
+        ];
+
+        let tile_count = tiles.len();
+        if tile_count == 0 || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let tile_w = area.width / tile_count as u16;
+
+        for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+            let x = area.x + (i as u16) * tile_w;
+            let w = if i == tile_count - 1 {
+                area.width.saturating_sub(x - area.x)
+            } else {
+                tile_w
+            };
+            let tile_area = Rect::new(x, area.y, w, area.height);
+            let tile = MetricTile::new(label, value, *trend)
+                .value_color(*color)
+                .sparkline_color(*color);
+            tile.render(tile_area, frame);
+        }
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (total, images, docs, other) = self.type_counts();
+        let (_, total_bytes) = self.summary();
+
+        let total_str = total.to_string();
+        let size_str = Self::format_total_size(total_bytes);
+        let images_str = images.to_string();
+        let docs_str = docs.to_string();
+        let other_str = other.to_string();
+
+        let items: Vec<(&str, &str, PackedRgba)> = vec![
+            (&*total_str, "files", tp.metric_messages),
+            (&*size_str, "", tp.metric_latency),
+            (&*images_str, "images", tp.metric_agents),
+            (&*docs_str, "docs", tp.metric_projects),
+            (&*other_str, "other", tp.text_muted),
+        ];
+
+        SummaryFooter::new(&items, tp.text_muted).render(area, frame);
     }
 }
 
@@ -664,6 +793,8 @@ impl MailScreen for AttachmentExplorerScreen {
         if self.data_dirty
             || tick_count.saturating_sub(self.last_reload_tick) >= RELOAD_INTERVAL_TICKS
         {
+            // Save previous counts for trend computation before reload
+            self.prev_attachment_counts = self.type_counts();
             self.load_attachments(state);
             self.last_reload_tick = tick_count;
         }
@@ -674,28 +805,49 @@ impl MailScreen for AttachmentExplorerScreen {
         self.focused_synthetic.as_ref()
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         if area.height < 3 || area.width < 40 {
             return;
         }
 
-        let header_h = 1_u16;
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
+
+        // Layout: summary_band(2) + header(1) + table(dynamic) + detail(1/3) + footer(1)
+        let summary_h: u16 = if area.height >= 10 { 2 } else { 0 };
+        let header_h: u16 = 1;
+        let footer_h: u16 = u16::from(area.height >= 6);
         let has_detail = self.selected_entry().is_some();
-        let detail_h = if has_detail && area.height > 12 {
-            area.height.min(40) / 3
+        let remaining_for_content = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
+        let detail_h = if has_detail && remaining_for_content > 12 {
+            remaining_for_content.min(40) / 3
         } else {
             0
         };
-        let table_h = area
-            .height
-            .saturating_sub(header_h)
-            .saturating_sub(detail_h);
+        let table_h = remaining_for_content.saturating_sub(detail_h);
 
-        let header_area = Rect::new(area.x, area.y, area.width, header_h);
-        let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
-        let detail_area = Rect::new(area.x, area.y + header_h + table_h, area.width, detail_h);
+        let mut y = area.y;
 
+        // ── Summary band ───────────────────────────────────────────────
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        // ── Info header ────────────────────────────────────────────────
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
         self.render_header(frame, header_area);
+
+        // ── Table ──────────────────────────────────────────────────────
+        let table_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
 
         if let Some(err) = &self.last_error {
             let tp = crate::tui_theme::TuiThemePalette::current();
@@ -705,18 +857,47 @@ impl MailScreen for AttachmentExplorerScreen {
             return;
         }
 
-        let header_row = Row::new(["Type", "Size", "Sender", "Subject", "Date", "Project"])
-            .style(Style::default().bold());
-        let rows = self.build_table_rows();
+        // Responsive column headers and widths
+        let (header_cells, col_widths): (Vec<&str>, Vec<Constraint>) = if narrow {
+            // < 80: Type, Size, Sender, Subject only
+            (
+                vec!["Type", "Size", "Sender", "Subject"],
+                vec![
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(26.0),
+                    Constraint::Percentage(50.0),
+                ],
+            )
+        } else if wide {
+            // >= 120: all 6 columns
+            (
+                vec!["Type", "Size", "Sender", "Subject", "Date", "Project"],
+                vec![
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(15.0),
+                    Constraint::Percentage(30.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(15.0),
+                ],
+            )
+        } else {
+            // 80–119: hide Project column
+            (
+                vec!["Type", "Size", "Sender", "Subject", "Date"],
+                vec![
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(37.0),
+                    Constraint::Percentage(25.0),
+                ],
+            )
+        };
 
-        let widths = [
-            Constraint::Percentage(10.0),
-            Constraint::Percentage(10.0),
-            Constraint::Percentage(15.0),
-            Constraint::Percentage(30.0),
-            Constraint::Percentage(20.0),
-            Constraint::Percentage(15.0),
-        ];
+        let header_row = Row::new(header_cells).style(Style::default().bold());
+        let rows = self.build_table_rows_responsive(wide, narrow);
 
         let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
@@ -724,7 +905,7 @@ impl MailScreen for AttachmentExplorerScreen {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
 
-        let table = Table::new(rows, widths)
+        let table = Table::new(rows, col_widths)
             .header(header_row)
             .block(block)
             .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
@@ -734,10 +915,18 @@ impl MailScreen for AttachmentExplorerScreen {
 
         // ── Detail panel ──────────────────────────────────────────
         if detail_h > 0 {
+            let detail_area = Rect::new(area.x, y, area.width, detail_h);
+            y += detail_h;
             if let Some(entry) = self.selected_entry() {
                 let entry_clone = entry.clone();
                 self.render_detail(frame, detail_area, &entry_clone);
             }
+        }
+
+        // ── Footer summary ─────────────────────────────────────────────
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
         }
     }
 
@@ -817,6 +1006,16 @@ impl MailScreen for AttachmentExplorerScreen {
 
     fn tab_label(&self) -> &'static str {
         "Attach"
+    }
+}
+
+const fn trend_for(current: u64, previous: u64) -> MetricTrend {
+    if current > previous {
+        MetricTrend::Up
+    } else if current < previous {
+        MetricTrend::Down
+    } else {
+        MetricTrend::Flat
     }
 }
 

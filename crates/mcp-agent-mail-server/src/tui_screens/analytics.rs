@@ -4,7 +4,7 @@
 //! badges, confidence scores, rationale, actionable next steps, severity
 //! summary band, colored left borders, and deep link visual affordances.
 
-use ftui::layout::{Constraint, Flex, Rect};
+use ftui::layout::{Constraint, Rect};
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -25,6 +25,98 @@ use crate::tui_widgets::fancy::SummaryFooter;
 /// Refresh the insight feed every N ticks (~100ms each → ~5s).
 const REFRESH_INTERVAL_TICKS: u64 = 50;
 const PERSISTED_TOOL_METRIC_LIMIT: usize = 128;
+const ANALYTICS_SUMMARY_MIN_HEIGHT: u16 = 8;
+const ANALYTICS_WIDE_SPLIT_MIN_WIDTH: u16 = 110;
+const ANALYTICS_WIDE_SPLIT_MIN_HEIGHT: u16 = 10;
+const ANALYTICS_STACKED_MIN_HEIGHT: u16 = 14;
+const ANALYTICS_STACKED_LIST_MIN_HEIGHT: u16 = 6;
+const ANALYTICS_STACKED_DETAIL_MIN_HEIGHT: u16 = 8;
+const ANALYTICS_WIDE_LIST_RATIO_PERCENT: u16 = 38;
+const ANALYTICS_WIDE_LIST_MIN_WIDTH: u16 = 34;
+const ANALYTICS_WIDE_DETAIL_MIN_WIDTH: u16 = 42;
+const ANALYTICS_STATUS_STRIP_MIN_HEIGHT: u16 = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsSeverityFilter {
+    All,
+    HighAndUp,
+    CriticalOnly,
+}
+
+impl AnalyticsSeverityFilter {
+    const fn next(self) -> Self {
+        match self {
+            Self::All => Self::HighAndUp,
+            Self::HighAndUp => Self::CriticalOnly,
+            Self::CriticalOnly => Self::All,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "filter:all",
+            Self::HighAndUp => "filter:high+",
+            Self::CriticalOnly => "filter:crit",
+        }
+    }
+
+    const fn includes(self, severity: AnomalySeverity) -> bool {
+        match self {
+            Self::All => true,
+            Self::HighAndUp => {
+                matches!(severity, AnomalySeverity::Critical | AnomalySeverity::High)
+            }
+            Self::CriticalOnly => matches!(severity, AnomalySeverity::Critical),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsSortMode {
+    Priority,
+    Severity,
+    Confidence,
+}
+
+impl AnalyticsSortMode {
+    const fn next(self) -> Self {
+        match self {
+            Self::Priority => Self::Severity,
+            Self::Severity => Self::Confidence,
+            Self::Confidence => Self::Priority,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Priority => "sort:priority",
+            Self::Severity => "sort:severity",
+            Self::Confidence => "sort:confidence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsFocus {
+    List,
+    Detail,
+}
+
+impl AnalyticsFocus {
+    const fn next(self) -> Self {
+        match self {
+            Self::List => Self::Detail,
+            Self::Detail => Self::List,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::List => "focus:list",
+            Self::Detail => "focus:detail",
+        }
+    }
+}
 
 pub struct AnalyticsScreen {
     feed: InsightFeed,
@@ -32,6 +124,9 @@ pub struct AnalyticsScreen {
     table_state: TableState,
     detail_scroll: u16,
     last_refresh_tick: Option<u64>,
+    severity_filter: AnalyticsSeverityFilter,
+    sort_mode: AnalyticsSortMode,
+    focus: AnalyticsFocus,
 }
 
 impl AnalyticsScreen {
@@ -44,6 +139,9 @@ impl AnalyticsScreen {
             table_state: TableState::default(),
             detail_scroll: 0,
             last_refresh_tick: None,
+            severity_filter: AnalyticsSeverityFilter::All,
+            sort_mode: AnalyticsSortMode::Priority,
+            focus: AnalyticsFocus::List,
         }
     }
 
@@ -57,13 +155,100 @@ impl AnalyticsScreen {
                 }
             }
         }
-        if self.selected >= self.feed.cards.len() && !self.feed.cards.is_empty() {
-            self.selected = self.feed.cards.len() - 1;
-        }
+        self.clamp_selected_to_active_cards();
     }
 
     fn selected_card(&self) -> Option<&InsightCard> {
-        self.feed.cards.get(self.selected)
+        let active_indices = self.active_card_indices();
+        let selected_idx = *active_indices.get(self.selected)?;
+        self.feed.cards.get(selected_idx)
+    }
+
+    const fn severity_rank(severity: AnomalySeverity) -> u8 {
+        match severity {
+            AnomalySeverity::Critical => 4,
+            AnomalySeverity::High => 3,
+            AnomalySeverity::Medium => 2,
+            AnomalySeverity::Low => 1,
+        }
+    }
+
+    fn active_card_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
+            .feed
+            .cards
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, card)| self.severity_filter.includes(card.severity).then_some(idx))
+            .collect();
+
+        match self.sort_mode {
+            AnalyticsSortMode::Priority => {}
+            AnalyticsSortMode::Severity => {
+                indices.sort_by(|left, right| {
+                    let left_card = &self.feed.cards[*left];
+                    let right_card = &self.feed.cards[*right];
+                    Self::severity_rank(right_card.severity)
+                        .cmp(&Self::severity_rank(left_card.severity))
+                        .then_with(|| right_card.confidence.total_cmp(&left_card.confidence))
+                        .then_with(|| left.cmp(right))
+                });
+            }
+            AnalyticsSortMode::Confidence => {
+                indices.sort_by(|left, right| {
+                    let left_card = &self.feed.cards[*left];
+                    let right_card = &self.feed.cards[*right];
+                    right_card
+                        .confidence
+                        .total_cmp(&left_card.confidence)
+                        .then_with(|| {
+                            Self::severity_rank(right_card.severity)
+                                .cmp(&Self::severity_rank(left_card.severity))
+                        })
+                        .then_with(|| left.cmp(right))
+                });
+            }
+        }
+
+        indices
+    }
+
+    fn active_cards(&self) -> Vec<&InsightCard> {
+        self.active_card_indices()
+            .into_iter()
+            .filter_map(|idx| self.feed.cards.get(idx))
+            .collect()
+    }
+
+    fn active_card_count(&self) -> usize {
+        self.active_card_indices().len()
+    }
+
+    fn clamp_selected_to_active_cards(&mut self) {
+        let active_count = self.active_card_count();
+        if active_count == 0 {
+            self.selected = 0;
+            self.detail_scroll = 0;
+            return;
+        }
+        if self.selected >= active_count {
+            self.selected = active_count - 1;
+            self.detail_scroll = 0;
+        }
+    }
+
+    fn cycle_severity_filter(&mut self) {
+        self.severity_filter = self.severity_filter.next();
+        self.clamp_selected_to_active_cards();
+    }
+
+    fn cycle_sort_mode(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        self.clamp_selected_to_active_cards();
+    }
+
+    const fn toggle_focus(&mut self) {
+        self.focus = self.focus.next();
     }
 
     #[allow(clippy::missing_const_for_fn)] // stateful runtime helper
@@ -75,7 +260,8 @@ impl AnalyticsScreen {
     }
 
     fn move_down(&mut self) {
-        if !self.feed.cards.is_empty() && self.selected < self.feed.cards.len() - 1 {
+        let active_count = self.active_card_count();
+        if active_count > 0 && self.selected + 1 < active_count {
             self.selected += 1;
             self.detail_scroll = 0;
         }
@@ -141,6 +327,7 @@ impl AnalyticsScreen {
     }
 
     /// Count cards by severity level.
+    #[cfg(test)]
     fn severity_counts(&self) -> (u64, u64, u64, u64) {
         let mut crit = 0u64;
         let mut high = 0u64;
@@ -391,19 +578,29 @@ fn render_severity_summary(frame: &mut Frame<'_>, area: Rect, feed: &InsightFeed
     SummaryFooter::new(&items, tp.text_muted).render(area, frame);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_card_list(
     frame: &mut Frame<'_>,
     area: Rect,
-    feed: &InsightFeed,
+    cards: &[&InsightCard],
     selected: usize,
     table_state: &mut TableState,
+    severity_filter: AnalyticsSeverityFilter,
+    sort_mode: AnalyticsSortMode,
+    alerts_processed: usize,
+    detail_visible: bool,
+    focus: AnalyticsFocus,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let header =
-        Row::new(vec![" ", "Sev", "Conf", "Headline"]).style(crate::tui_theme::text_title(&tp));
+    let compact_columns = area.width < 62;
+    let narrow_columns = area.width < 84;
+    let header = if compact_columns {
+        Row::new(vec![" ", "Sev", "Headline"]).style(crate::tui_theme::text_title(&tp))
+    } else {
+        Row::new(vec![" ", "Sev", "Conf", "Headline"]).style(crate::tui_theme::text_title(&tp))
+    };
 
-    let rows: Vec<Row> = feed
-        .cards
+    let rows: Vec<Row> = cards
         .iter()
         .enumerate()
         .map(|(i, card)| {
@@ -415,49 +612,101 @@ fn render_card_list(
             } else {
                 severity_style(card.severity)
             };
-            Row::new(vec![
-                border_char.to_string(),
-                sev_text.to_string(),
-                conf_text,
-                card.headline.clone(),
-            ])
-            .style(style)
+            if compact_columns {
+                Row::new(vec![
+                    border_char.to_string(),
+                    sev_text.to_string(),
+                    format!("{} ({conf_text})", card.headline),
+                ])
+                .style(style)
+            } else {
+                Row::new(vec![
+                    border_char.to_string(),
+                    sev_text.to_string(),
+                    conf_text,
+                    card.headline.clone(),
+                ])
+                .style(style)
+            }
         })
         .collect();
 
-    let widths = [
-        Constraint::Fixed(1),
-        Constraint::Fixed(5),
-        Constraint::Fixed(5),
-        Constraint::Percentage(100.0),
-    ];
+    let widths = if compact_columns {
+        [
+            Constraint::Fixed(1),
+            Constraint::Fixed(5),
+            Constraint::Percentage(100.0),
+            Constraint::Fixed(0),
+        ]
+    } else if narrow_columns {
+        [
+            Constraint::Fixed(1),
+            Constraint::Fixed(5),
+            Constraint::Fixed(6),
+            Constraint::Percentage(100.0),
+        ]
+    } else {
+        [
+            Constraint::Fixed(1),
+            Constraint::Fixed(5),
+            Constraint::Fixed(12),
+            Constraint::Percentage(100.0),
+        ]
+    };
 
     // Position indicator in title: [3/12]
-    let position = if feed.cards.is_empty() {
+    let position = if cards.is_empty() {
         String::new()
     } else {
-        format!(" [{}/{}]", selected + 1, feed.cards.len())
+        format!(" [{}/{}]", selected + 1, cards.len())
+    };
+    let compact_suffix = if detail_visible {
+        ""
+    } else {
+        " · detail:hidden"
     };
     let title = format!(
-        " Insight Feed{} (from {} alerts) ",
-        position, feed.alerts_processed
+        " Insight Feed{} · {} · {} · alerts:{}{} ",
+        position,
+        severity_filter.label(),
+        sort_mode.label(),
+        alerts_processed,
+        compact_suffix
     );
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(
-            Block::new()
-                .title(title.as_str())
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(tp.panel_border)),
-        )
-        .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
+    let table = Table::new(
+        rows,
+        if compact_columns {
+            vec![widths[0], widths[1], widths[2]]
+        } else {
+            vec![widths[0], widths[1], widths[2], widths[3]]
+        },
+    )
+    .header(header)
+    .block(
+        Block::new()
+            .title(title.as_str())
+            .border_type(BorderType::Rounded)
+            .border_style(if focus == AnalyticsFocus::List {
+                Style::default().fg(tp.selection_fg)
+            } else {
+                Style::default().fg(tp.panel_border)
+            }),
+    )
+    .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
     table_state.select(Some(selected));
     StatefulWidget::render(&table, area, frame, table_state);
 }
 
-fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scroll: u16) {
+#[allow(clippy::too_many_lines)]
+fn render_card_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    card: &InsightCard,
+    scroll: u16,
+    focus: AnalyticsFocus,
+) {
     use ftui::text::{Line, Span, Text};
 
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -472,6 +721,10 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
         Span::raw("  "),
     ]));
     lines.push(confidence_bar_colored(card.confidence, card.severity));
+    lines.push(Line::styled(
+        "Navigate: Tab focus • j/k active panel • J/K fast scroll • s/o modes • Enter deep-link",
+        crate::tui_theme::text_hint(&tp),
+    ));
     lines.push(Line::raw(""));
 
     // Headline
@@ -567,9 +820,104 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
         Block::new()
             .title(" Card Detail ")
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border)),
+            .border_style(if focus == AnalyticsFocus::Detail {
+                Style::default().fg(tp.selection_fg)
+            } else {
+                Style::default().fg(tp.panel_border)
+            }),
     );
     para.render(area, frame);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_status_strip(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    focus: AnalyticsFocus,
+    filter: AnalyticsSeverityFilter,
+    sort_mode: AnalyticsSortMode,
+    active_count: usize,
+    total_count: usize,
+    detail_visible: bool,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let detail_state = if detail_visible {
+        "detail:visible"
+    } else {
+        "detail:hidden"
+    };
+    let line = format!(
+        "{} • {} • {} • {} • cards:{active_count}/{total_count} • Tab focus • s/o modes • Enter link",
+        focus.label(),
+        filter.label(),
+        sort_mode.label(),
+        detail_state
+    );
+    Paragraph::new(line)
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(area, frame);
+}
+
+fn render_compact_detail_hint(frame: &mut Frame<'_>, area: Rect, card: &InsightCard) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let first_step = card.next_steps.first().map_or_else(
+        || "No suggested next step".to_string(),
+        |step| format!("Next: {step}"),
+    );
+    let first_link = card.deep_links.first().map_or("none", String::as_str);
+    let status = format!(
+        "Detail hidden on short terminal • {} {}% • {first_step} • Enter:{first_link}",
+        severity_badge(card.severity).trim(),
+        (card.confidence * 100.0).round()
+    );
+    Paragraph::new(status)
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(area, frame);
+}
+
+fn render_filtered_empty_state(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    filter: AnalyticsSeverityFilter,
+    sort_mode: AnalyticsSortMode,
+) {
+    use ftui::text::{Line, Span, Text};
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::bordered()
+        .title(" Insight Feed ")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from_spans(vec![Span::styled(
+            "No cards match the current filter",
+            crate::tui_theme::text_primary(&tp).bold(),
+        )]),
+        Line::raw(""),
+        Line::styled(
+            format!("Active: {} · {}", filter.label(), sort_mode.label()),
+            crate::tui_theme::text_meta(&tp),
+        ),
+        Line::styled(
+            "Press 's' to relax filter, 'o' to change sort, or 'r' to refresh.",
+            crate::tui_theme::text_hint(&tp),
+        ),
+    ];
+
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
 }
 
 fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
@@ -625,6 +973,11 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
         "Metrics are collected as tool calls flow through the server.",
         crate::tui_theme::text_hint(&tp),
     ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Press 'r' to refresh once activity resumes.",
+        crate::tui_theme::text_hint(&tp),
+    ));
 
     let text = Text::from_lines(lines);
     Paragraph::new(text).render(inner, frame);
@@ -643,24 +996,56 @@ impl MailScreen for AnalyticsScreen {
 
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                self.move_down();
+                if self.focus == AnalyticsFocus::List {
+                    self.move_down();
+                } else {
+                    self.scroll_detail_down();
+                }
                 Cmd::None
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.move_up();
+                if self.focus == AnalyticsFocus::List {
+                    self.move_up();
+                } else {
+                    self.scroll_detail_up();
+                }
                 Cmd::None
             }
             KeyCode::Char('J') | KeyCode::PageDown => {
-                self.scroll_detail_down();
+                if self.focus == AnalyticsFocus::List {
+                    for _ in 0..5 {
+                        self.move_down();
+                    }
+                } else {
+                    self.detail_scroll = self.detail_scroll.saturating_add(5);
+                }
                 Cmd::None
             }
             KeyCode::Char('K') | KeyCode::PageUp => {
-                self.scroll_detail_up();
+                if self.focus == AnalyticsFocus::List {
+                    for _ in 0..5 {
+                        self.move_up();
+                    }
+                } else {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(5);
+                }
+                Cmd::None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.toggle_focus();
                 Cmd::None
             }
             KeyCode::Enter => self.navigate_deep_link(),
             KeyCode::Char('r') => {
                 self.refresh_feed(Some(state));
+                Cmd::None
+            }
+            KeyCode::Char('s') => {
+                self.cycle_severity_filter();
+                Cmd::None
+            }
+            KeyCode::Char('o') => {
+                self.cycle_sort_mode();
                 Cmd::None
             }
             KeyCode::Home => {
@@ -669,8 +1054,9 @@ impl MailScreen for AnalyticsScreen {
                 Cmd::None
             }
             KeyCode::End => {
-                if !self.feed.cards.is_empty() {
-                    self.selected = self.feed.cards.len() - 1;
+                let active_count = self.active_card_count();
+                if active_count > 0 {
+                    self.selected = active_count - 1;
                     self.detail_scroll = 0;
                 }
                 Cmd::None
@@ -679,45 +1065,219 @@ impl MailScreen for AnalyticsScreen {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         if self.feed.cards.is_empty() {
             render_empty_state(frame, area);
             return;
         }
-        let selected = self.selected.min(self.feed.cards.len().saturating_sub(1));
+        let active_cards = self.active_cards();
+        if active_cards.is_empty() {
+            render_filtered_empty_state(frame, area, self.severity_filter, self.sort_mode);
+            return;
+        }
 
-        // Layout: severity_summary(1) + card_list(40%) + detail(rest)
-        let summary_h: u16 = if area.height >= 8 { 1 } else { 0 };
-        let remaining_h = area.height.saturating_sub(summary_h);
+        let selected = self.selected.min(active_cards.len().saturating_sub(1));
 
+        let summary_h = u16::from(area.height >= ANALYTICS_SUMMARY_MIN_HEIGHT);
         let mut y = area.y;
-
-        // ── Severity summary band ──────────────────────────────────────
         if summary_h > 0 {
             let summary_area = Rect::new(area.x, y, area.width, summary_h);
             render_severity_summary(frame, summary_area, &self.feed);
             y += summary_h;
         }
 
-        // Split remaining: top 40% for card list, bottom 60% for detail.
-        let list_area_h = remaining_h * 40 / 100;
-        let detail_area_h = remaining_h.saturating_sub(list_area_h);
+        let content_full = Rect::new(area.x, y, area.width, area.height.saturating_sub(summary_h));
+        if content_full.width == 0 || content_full.height == 0 {
+            return;
+        }
 
-        let list_area = Rect::new(area.x, y, area.width, list_area_h);
-        let detail_area = Rect::new(area.x, y + list_area_h, area.width, detail_area_h);
+        let status_h = u16::from(content_full.height >= ANALYTICS_STATUS_STRIP_MIN_HEIGHT);
+        let content = Rect::new(
+            content_full.x,
+            content_full.y,
+            content_full.width,
+            content_full.height.saturating_sub(status_h),
+        );
+        let status_area = Rect::new(
+            content_full.x,
+            content_full.y.saturating_add(content.height),
+            content_full.width,
+            status_h,
+        );
+        if content.width == 0 || content.height == 0 {
+            if status_h > 0 {
+                render_status_strip(
+                    frame,
+                    status_area,
+                    self.focus,
+                    self.severity_filter,
+                    self.sort_mode,
+                    active_cards.len(),
+                    self.feed.cards.len(),
+                    false,
+                );
+            }
+            return;
+        }
 
         let mut table_state = self.table_state.clone();
-        render_card_list(frame, list_area, &self.feed, selected, &mut table_state);
+        let selected_card = active_cards[selected];
 
-        if let Some(card) = self.feed.cards.get(selected) {
-            render_card_detail(frame, detail_area, card, self.detail_scroll);
+        let wide_split = content.width >= ANALYTICS_WIDE_SPLIT_MIN_WIDTH
+            && content.height >= ANALYTICS_WIDE_SPLIT_MIN_HEIGHT;
+        if wide_split {
+            let gap = u16::from(content.width >= 140);
+            let mut list_w = content
+                .width
+                .saturating_mul(ANALYTICS_WIDE_LIST_RATIO_PERCENT)
+                / 100;
+            list_w = list_w.max(ANALYTICS_WIDE_LIST_MIN_WIDTH);
+            let max_list_w = content
+                .width
+                .saturating_sub(ANALYTICS_WIDE_DETAIL_MIN_WIDTH.saturating_add(gap));
+            list_w = list_w.min(max_list_w);
+            if list_w > 0 && list_w < content.width {
+                let detail_w = content.width.saturating_sub(list_w.saturating_add(gap));
+                if detail_w >= ANALYTICS_WIDE_DETAIL_MIN_WIDTH {
+                    let list_area = Rect::new(content.x, content.y, list_w, content.height);
+                    let detail_area = Rect::new(
+                        content.x.saturating_add(list_w).saturating_add(gap),
+                        content.y,
+                        detail_w,
+                        content.height,
+                    );
+                    render_card_list(
+                        frame,
+                        list_area,
+                        &active_cards,
+                        selected,
+                        &mut table_state,
+                        self.severity_filter,
+                        self.sort_mode,
+                        self.feed.alerts_processed,
+                        true,
+                        self.focus,
+                    );
+                    render_card_detail(
+                        frame,
+                        detail_area,
+                        selected_card,
+                        self.detail_scroll,
+                        self.focus,
+                    );
+                    if status_h > 0 {
+                        render_status_strip(
+                            frame,
+                            status_area,
+                            self.focus,
+                            self.severity_filter,
+                            self.sort_mode,
+                            active_cards.len(),
+                            self.feed.cards.len(),
+                            true,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
+        let stacked_detail = content.height >= ANALYTICS_STACKED_MIN_HEIGHT
+            && content.height
+                >= ANALYTICS_STACKED_LIST_MIN_HEIGHT
+                    .saturating_add(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT);
+        if stacked_detail {
+            let mut list_h = content.height.saturating_mul(38) / 100;
+            list_h = list_h.max(ANALYTICS_STACKED_LIST_MIN_HEIGHT);
+            let max_list_h = content
+                .height
+                .saturating_sub(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT);
+            list_h = list_h.min(max_list_h);
+
+            let list_area = Rect::new(content.x, content.y, content.width, list_h);
+            let detail_area = Rect::new(
+                content.x,
+                content.y.saturating_add(list_h),
+                content.width,
+                content.height.saturating_sub(list_h),
+            );
+            render_card_list(
+                frame,
+                list_area,
+                &active_cards,
+                selected,
+                &mut table_state,
+                self.severity_filter,
+                self.sort_mode,
+                self.feed.alerts_processed,
+                true,
+                self.focus,
+            );
+            render_card_detail(
+                frame,
+                detail_area,
+                selected_card,
+                self.detail_scroll,
+                self.focus,
+            );
+            if status_h > 0 {
+                render_status_strip(
+                    frame,
+                    status_area,
+                    self.focus,
+                    self.severity_filter,
+                    self.sort_mode,
+                    active_cards.len(),
+                    self.feed.cards.len(),
+                    true,
+                );
+            }
+            return;
+        }
+
+        let hint_h = u16::from(content.height >= 4);
+        let list_h = content.height.saturating_sub(hint_h).max(1);
+        let list_area = Rect::new(content.x, content.y, content.width, list_h);
+        render_card_list(
+            frame,
+            list_area,
+            &active_cards,
+            selected,
+            &mut table_state,
+            self.severity_filter,
+            self.sort_mode,
+            self.feed.alerts_processed,
+            false,
+            self.focus,
+        );
+        if hint_h > 0 {
+            let hint_area = Rect::new(
+                content.x,
+                content.y.saturating_add(list_h),
+                content.width,
+                hint_h,
+            );
+            render_compact_detail_hint(frame, hint_area, selected_card);
+        }
+        if status_h > 0 {
+            render_status_strip(
+                frame,
+                status_area,
+                self.focus,
+                self.severity_filter,
+                self.sort_mode,
+                active_cards.len(),
+                self.feed.cards.len(),
+                false,
+            );
         }
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        let should_refresh = self.last_refresh_tick.map_or(true, |last| {
-            tick_count.wrapping_sub(last) >= REFRESH_INTERVAL_TICKS
-        });
+        let should_refresh = self
+            .last_refresh_tick
+            .is_none_or(|last| tick_count.wrapping_sub(last) >= REFRESH_INTERVAL_TICKS);
         if should_refresh {
             self.refresh_feed(Some(state));
             self.last_refresh_tick = Some(tick_count);
@@ -728,11 +1288,15 @@ impl MailScreen for AnalyticsScreen {
         vec![
             HelpEntry {
                 key: "j/k",
-                action: "Navigate cards",
+                action: "Move focused panel",
             },
             HelpEntry {
                 key: "J/K",
-                action: "Scroll detail",
+                action: "Fast scroll focused panel",
+            },
+            HelpEntry {
+                key: "Tab/Shift+Tab",
+                action: "Focus list/detail",
             },
             HelpEntry {
                 key: "Enter",
@@ -741,6 +1305,14 @@ impl MailScreen for AnalyticsScreen {
             HelpEntry {
                 key: "r",
                 action: "Refresh feed",
+            },
+            HelpEntry {
+                key: "s",
+                action: "Cycle severity filter",
+            },
+            HelpEntry {
+                key: "o",
+                action: "Cycle sort mode",
             },
             HelpEntry {
                 key: "Home/End",
@@ -772,6 +1344,48 @@ impl MailScreen for AnalyticsScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame_text(frame: &Frame<'_>) -> String {
+        let mut text = String::new();
+        for y in 0..frame.buffer.height() {
+            for x in 0..frame.buffer.width() {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    if let Some(ch) = cell.content.as_char() {
+                        text.push(ch);
+                    } else if !cell.is_continuation() {
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn sample_card(id: &str, severity: AnomalySeverity, confidence: f64) -> InsightCard {
+        InsightCard {
+            id: id.to_string(),
+            confidence,
+            severity,
+            headline: format!("{id} headline"),
+            rationale: format!("{id} rationale"),
+            likely_cause: Some(format!("{id} cause")),
+            next_steps: vec![format!("{id} step")],
+            deep_links: vec!["screen:dashboard".to_string()],
+            primary_alert: AnomalyAlert {
+                kind: AnomalyKind::LatencySpike,
+                severity,
+                score: confidence,
+                current_value: 10.0,
+                threshold: 1.0,
+                baseline_value: Some(2.0),
+                explanation: "sample".to_string(),
+                suggested_action: "inspect".to_string(),
+            },
+            supporting_trends: Vec::new(),
+            supporting_correlations: Vec::new(),
+        }
+    }
 
     #[test]
     fn analytics_screen_new_does_not_panic() {
@@ -878,7 +1492,46 @@ mod tests {
         let bindings = screen.keybindings();
         assert!(!bindings.is_empty());
         assert!(bindings.iter().any(|b| b.key == "j/k"));
+        assert!(bindings.iter().any(|b| b.key == "Tab/Shift+Tab"));
         assert!(bindings.iter().any(|b| b.key == "Enter"));
+        assert!(bindings.iter().any(|b| b.key == "s"));
+        assert!(bindings.iter().any(|b| b.key == "o"));
+    }
+
+    #[test]
+    fn tab_cycles_focus_between_list_and_detail() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = AnalyticsScreen::new();
+        assert_eq!(screen.focus, AnalyticsFocus::List);
+
+        let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
+        screen.update(&tab, &state);
+        assert_eq!(screen.focus, AnalyticsFocus::Detail);
+
+        let back_tab = Event::Key(ftui::KeyEvent::new(KeyCode::BackTab));
+        screen.update(&back_tab, &state);
+        assert_eq!(screen.focus, AnalyticsFocus::List);
+    }
+
+    #[test]
+    fn detail_focus_routes_jk_to_detail_scroll() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![sample_card("card", AnomalySeverity::High, 0.88)],
+            alerts_processed: 1,
+            cards_produced: 1,
+        };
+        screen.focus = AnalyticsFocus::Detail;
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('j'))), &state);
+        assert_eq!(screen.selected, 0);
+        assert_eq!(screen.detail_scroll, 1);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('k'))), &state);
+        assert_eq!(screen.detail_scroll, 0);
     }
 
     #[test]
@@ -922,5 +1575,85 @@ mod tests {
         let line = confidence_bar_colored(0.75, AnomalySeverity::High);
         // Should produce a line with spans, not panic
         assert!(!line.spans().is_empty());
+    }
+
+    #[test]
+    fn severity_filter_clamps_selected_to_visible_range() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![
+                sample_card("critical", AnomalySeverity::Critical, 0.9),
+                sample_card("high", AnomalySeverity::High, 0.8),
+                sample_card("low", AnomalySeverity::Low, 0.7),
+            ],
+            alerts_processed: 3,
+            cards_produced: 3,
+        };
+        screen.selected = 2;
+        screen.severity_filter = AnalyticsSeverityFilter::CriticalOnly;
+        screen.clamp_selected_to_active_cards();
+        assert_eq!(screen.active_card_count(), 1);
+        assert_eq!(screen.selected, 0);
+        assert!(
+            screen
+                .selected_card()
+                .is_some_and(|card| card.severity == AnomalySeverity::Critical)
+        );
+    }
+
+    #[test]
+    fn confidence_sort_orders_cards_descending() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![
+                sample_card("a", AnomalySeverity::Medium, 0.3),
+                sample_card("b", AnomalySeverity::High, 0.9),
+                sample_card("c", AnomalySeverity::Low, 0.5),
+            ],
+            alerts_processed: 3,
+            cards_produced: 3,
+        };
+        screen.sort_mode = AnalyticsSortMode::Confidence;
+        let active = screen.active_cards();
+        assert_eq!(active.len(), 3);
+        assert_eq!(active[0].id, "b");
+        assert_eq!(active[1].id, "c");
+        assert_eq!(active[2].id, "a");
+    }
+
+    #[test]
+    fn compact_layout_surfaces_detail_hint_when_space_is_short() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![sample_card("card", AnomalySeverity::High, 0.88)],
+            alerts_processed: 1,
+            cards_produced: 1,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 9, &mut pool);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.view(&mut frame, Rect::new(0, 0, 80, 9), &state);
+        let text = frame_text(&frame);
+        assert!(text.contains("Detail hidden on short terminal"));
+        assert!(text.contains("focus:list"));
+    }
+
+    #[test]
+    fn wide_layout_renders_list_and_detail_panels() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![sample_card("card", AnomalySeverity::High, 0.88)],
+            alerts_processed: 1,
+            cards_produced: 1,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(140, 20, &mut pool);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.view(&mut frame, Rect::new(0, 0, 140, 20), &state);
+        let text = frame_text(&frame);
+        assert!(text.contains("card headline"));
+        assert!(text.contains("card rationale"));
     }
 }

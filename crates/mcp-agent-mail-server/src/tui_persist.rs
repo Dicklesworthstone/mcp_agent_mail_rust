@@ -291,8 +291,7 @@ pub fn load_dismissed_hints_or_default(path: &Path) -> std::collections::HashSet
 #[must_use]
 pub fn default_console_persist_path() -> PathBuf {
     std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+        .map_or_else(|_| PathBuf::from("."), PathBuf::from)
         .join(".config")
         .join("mcp-agent-mail")
         .join("config.env")
@@ -308,14 +307,11 @@ pub fn console_persist_path_from_env_or_default() -> PathBuf {
         .filter(|v| !v.is_empty());
     if let Some(value) = candidate {
         if value == "~" {
-            return std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."));
+            return std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from);
         }
         if let Some(rest) = value.strip_prefix("~/") {
             return std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
+                .map_or_else(|_| PathBuf::from("."), PathBuf::from)
                 .join(rest);
         }
         return PathBuf::from(value);

@@ -87,6 +87,185 @@ const fn category_key_color(
     }
 }
 
+#[inline]
+const fn tab_icon(id: MailScreenId) -> &'static str {
+    match id {
+        MailScreenId::Dashboard => "\u{25c8}",
+        MailScreenId::Messages => "\u{2709}",
+        MailScreenId::Threads => "\u{25cd}",
+        MailScreenId::Agents => "\u{2699}",
+        MailScreenId::Search => "\u{2315}",
+        MailScreenId::Reservations => "\u{26bf}",
+        MailScreenId::ToolMetrics => "\u{25f4}",
+        MailScreenId::SystemHealth => "\u{2665}",
+        MailScreenId::Timeline => "\u{25f7}",
+        MailScreenId::Projects => "\u{25a3}",
+        MailScreenId::Contacts => "\u{25c9}",
+        MailScreenId::Explorer => "\u{25b3}",
+        MailScreenId::Analytics => "\u{2207}",
+        MailScreenId::Attachments => "\u{29c9}",
+        MailScreenId::ArchiveBrowser => "\u{25a4}",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TabWindowPlan {
+    start: usize,
+    end: usize,
+    show_left_indicator: bool,
+    show_right_indicator: bool,
+}
+
+#[inline]
+const fn tab_density_mode(available: u16) -> (bool, bool) {
+    // - Ultra-compact (< 40): key only, no label
+    // - Compact (< 60): short labels
+    // - Normal (>= 60): full titles
+    (available < 40, available < 60)
+}
+
+#[inline]
+const fn tab_label_for_mode(
+    meta: &crate::tui_screens::MailScreenMeta,
+    ultra_compact: bool,
+    compact: bool,
+) -> &str {
+    if ultra_compact {
+        ""
+    } else if compact {
+        meta.short_label
+    } else {
+        meta.title
+    }
+}
+
+#[inline]
+fn tab_slot_width(index: usize, label: &str, show_icon: bool) -> u16 {
+    let key_str = format!("{}", index + 1);
+    let key_w = u16::try_from(display_width(key_str.as_str())).unwrap_or(u16::MAX);
+    let label_w = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
+    if label.is_empty() {
+        // Ultra-compact: " 1 "
+        1_u16.saturating_add(key_w).saturating_add(1)
+    } else if show_icon {
+        // " 1◇ Label "
+        1_u16
+            .saturating_add(key_w)
+            .saturating_add(1)
+            .saturating_add(1)
+            .saturating_add(label_w)
+            .saturating_add(1)
+    } else {
+        // " 1· Label "
+        1_u16
+            .saturating_add(key_w)
+            .saturating_add(1)
+            .saturating_add(1)
+            .saturating_add(label_w)
+            .saturating_add(1)
+    }
+}
+
+#[inline]
+fn tab_core_width(widths: &[u16], start: usize, end: usize) -> u16 {
+    if start >= end {
+        return 0;
+    }
+    let tabs = widths[start..end]
+        .iter()
+        .fold(0_u16, |acc, w| acc.saturating_add(*w));
+    let separators = u16::try_from(end.saturating_sub(start).saturating_sub(1)).unwrap_or(u16::MAX);
+    tabs.saturating_add(separators)
+}
+
+fn compute_tab_window_plan(active: MailScreenId, available: u16) -> TabWindowPlan {
+    if MAIL_SCREEN_REGISTRY.is_empty() || available == 0 {
+        return TabWindowPlan {
+            start: 0,
+            end: 0,
+            show_left_indicator: false,
+            show_right_indicator: false,
+        };
+    }
+
+    let (ultra_compact, compact) = tab_density_mode(available);
+    let widths: Vec<u16> = MAIL_SCREEN_REGISTRY
+        .iter()
+        .enumerate()
+        .map(|(i, meta)| {
+            let label = tab_label_for_mode(meta, ultra_compact, compact);
+            let show_icon = !compact && !label.is_empty();
+            tab_slot_width(i, label, show_icon)
+        })
+        .collect();
+
+    let active_index = MAIL_SCREEN_REGISTRY
+        .iter()
+        .position(|meta| meta.id == active)
+        .unwrap_or(0);
+
+    // Build a centered-ish window around the active screen and expand
+    // both directions while staying within terminal width.
+    let mut start = active_index;
+    let mut end = active_index + 1;
+    let mut prefer_right = true;
+    loop {
+        let mut grew = false;
+        for _ in 0..2 {
+            if prefer_right {
+                if end < widths.len() {
+                    let proposed_width = tab_core_width(&widths, start, end + 1);
+                    if proposed_width <= available {
+                        end += 1;
+                        grew = true;
+                    }
+                }
+            } else if start > 0 {
+                let proposed_width = tab_core_width(&widths, start - 1, end);
+                if proposed_width <= available {
+                    start -= 1;
+                    grew = true;
+                }
+            }
+            prefer_right = !prefer_right;
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let core_width = tab_core_width(&widths, start, end);
+    let spare = available.saturating_sub(core_width);
+    let hidden_left = start > 0;
+    let hidden_right = end < widths.len();
+    let mut show_left_indicator = false;
+    let mut show_right_indicator = false;
+    let mut remaining_spare = spare;
+
+    if hidden_left && remaining_spare > 0 {
+        show_left_indicator = true;
+        remaining_spare -= 1;
+    }
+    if hidden_right && remaining_spare > 0 {
+        show_right_indicator = true;
+    }
+    // If only one cell is available, bias right-overflow discoverability.
+    if !show_left_indicator && !show_right_indicator && spare > 0 {
+        if hidden_right {
+            show_right_indicator = true;
+        } else if hidden_left {
+            show_left_indicator = true;
+        }
+    }
+
+    TabWindowPlan {
+        start,
+        end,
+        show_left_indicator,
+        show_right_indicator,
+    }
+}
+
 /// Render the tab bar into a 1-row area.
 #[allow(clippy::too_many_lines)]
 pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut Frame, area: Rect) {
@@ -99,55 +278,56 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
     let bg_style = Style::default().bg(tp.tab_inactive_bg);
     Paragraph::new("").style(bg_style).render(area, frame);
 
-    let mut x = area.x;
     let available = area.width;
+    let plan = compute_tab_window_plan(active, available);
+    let (ultra_compact, compact) = tab_density_mode(available);
+    let mut x = area.x + u16::from(plan.show_left_indicator);
 
-    // Determine width mode:
-    // - Ultra-compact (< 40): key only, no label
-    // - Compact (< 60): short labels
-    // - Normal (>= 60): full titles
-    let ultra_compact = available < 40;
-    let compact = available < 60;
+    if plan.show_left_indicator {
+        let indicator_area = Rect::new(area.x, area.y, 1, 1);
+        Paragraph::new("<")
+            .style(
+                Style::default()
+                    .fg(tp.tab_key_fg)
+                    .bg(tp.tab_inactive_bg)
+                    .bold(),
+            )
+            .render(indicator_area, frame);
+    }
+    if plan.show_right_indicator {
+        let indicator_x = area.x + available.saturating_sub(1);
+        let indicator_area = Rect::new(indicator_x, area.y, 1, 1);
+        Paragraph::new(">")
+            .style(
+                Style::default()
+                    .fg(tp.tab_key_fg)
+                    .bg(tp.tab_inactive_bg)
+                    .bold(),
+            )
+            .render(indicator_area, frame);
+    }
 
-    // Track previous category for inter-category separator.
-    let mut prev_category: Option<crate::tui_screens::ScreenCategory> = None;
-
-    for (i, meta) in MAIL_SCREEN_REGISTRY.iter().enumerate() {
+    for i in plan.start..plan.end {
+        let meta = &MAIL_SCREEN_REGISTRY[i];
         let number = i + 1;
-        let label = if ultra_compact {
-            "" // Key number only
-        } else if compact {
-            meta.short_label
-        } else {
-            meta.title
-        };
+        let label = tab_label_for_mode(meta, ultra_compact, compact);
         let is_active = meta.id == active;
-        let category_changed = prev_category.map_or(i > 0, |c| c != meta.category);
+        let category_changed =
+            i > plan.start && MAIL_SCREEN_REGISTRY[i - 1].category != meta.category;
 
         // " 1:Label " — each tab has fixed structure
         let key_str = format!("{number}");
-        let key_w = u16::try_from(display_width(key_str.as_str())).unwrap_or(u16::MAX);
-        let label_w = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
-        // Width: indicator + space + key + colon? + label? + space
         let has_label = !label.is_empty();
-        let tab_width = if has_label {
-            1_u16
-                .saturating_add(key_w)
-                .saturating_add(1)
-                .saturating_add(label_w)
-                .saturating_add(1)
-        } else {
-            // Ultra-compact: " 1 " (space + key + space)
-            1_u16.saturating_add(key_w).saturating_add(1)
-        };
+        let show_icon = has_label && !compact;
+        let tab_width = tab_slot_width(i, label, show_icon);
 
-        // Inter-tab separator (heavier between categories, lighter within)
-        if i > 0 && x < area.x + available {
+        // Inter-tab separator (heavier between categories, lighter within).
+        if i > plan.start && x < area.x + available {
             let (sep_char, sep_fg) = if category_changed {
                 // Wider gap between categories: dim separator
-                ("┃", tp.text_muted)
+                ("╎", tp.text_muted)
             } else {
-                ("│", tp.tab_inactive_fg)
+                ("\u{00b7}", tp.tab_inactive_fg)
             };
             let sep_area = Rect::new(x, area.y, 1, 1);
             Paragraph::new(sep_char)
@@ -156,14 +336,25 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
             x += 1;
         }
 
-        if x + tab_width > area.x + available {
-            break; // Don't overflow
-        }
-
+        let category_accent = category_key_color(meta.category, &tp);
         let (fg, bg) = if is_active {
-            (tp.tab_active_fg, tp.tab_active_bg)
+            (
+                tp.tab_active_fg,
+                crate::tui_theme::lerp_color(
+                    tp.tab_active_bg,
+                    category_accent,
+                    if effects_enabled { 0.38 } else { 0.26 },
+                ),
+            )
         } else {
-            (tp.tab_inactive_fg, tp.tab_inactive_bg)
+            (
+                tp.tab_inactive_fg,
+                crate::tui_theme::lerp_color(
+                    tp.tab_inactive_bg,
+                    category_accent,
+                    if effects_enabled { 0.15 } else { 0.09 },
+                ),
+            )
         };
 
         let tab_area = Rect::new(x, area.y, tab_width, 1);
@@ -190,13 +381,19 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
         };
 
         // Use category-specific color for the key number to aid wayfinding.
-        let key_fg = category_key_color(meta.category, &tp);
+        let key_fg = category_accent;
 
-        // Active tab indicator: bold key with underline for strong contrast.
+        // Active tab indicator: vivid keycap inside the accent-tinted tab.
         let key_style = if is_active {
-            Style::default().fg(key_fg).bg(bg).bold().underline()
+            Style::default()
+                .fg(tp.tab_active_fg)
+                .bg(crate::tui_theme::lerp_color(bg, key_fg, 0.6))
+                .bold()
         } else {
-            Style::default().fg(key_fg).bg(bg)
+            Style::default()
+                .fg(key_fg)
+                .bg(crate::tui_theme::lerp_color(bg, key_fg, 0.25))
+                .bold()
         };
 
         let mut spans = vec![
@@ -204,10 +401,18 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
             Span::styled(key_str.as_str(), key_style),
         ];
         if has_label {
-            spans.push(Span::styled(
-                ":",
-                Style::default().fg(tp.tab_inactive_fg).bg(bg),
-            ));
+            if show_icon {
+                spans.push(Span::styled(
+                    tab_icon(meta.id),
+                    Style::default().fg(key_fg).bg(bg).bold(),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "\u{00b7}",
+                    Style::default().fg(tp.tab_inactive_fg).bg(bg),
+                ));
+            }
+            spans.push(Span::styled(" ", Style::default().bg(bg)));
             spans.push(label_span);
         }
         spans.push(Span::styled(" ", Style::default().bg(bg)));
@@ -219,15 +424,13 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
                 ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.text_secondary)]);
             let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX);
             let key_width = u16::try_from(key_str.len()).unwrap_or(u16::MAX);
-            let label_x = x + 1 + key_width + 1;
+            let label_x = x + 1 + key_width + 2;
             StyledText::new(label)
                 .effect(TextEffect::HorizontalGradient { gradient })
                 .base_color(tp.status_accent)
                 .bold()
                 .render(Rect::new(label_x, area.y, label_width, 1), frame);
         }
-
-        prev_category = Some(meta.category);
         x += tab_width;
     }
 }
@@ -236,42 +439,31 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
 ///
 /// This mirrors the tab-width logic from [`render_tab_bar`] so that
 /// mouse click coordinates can be mapped back to the correct screen.
-pub fn record_tab_hit_slots(area: Rect, dispatcher: &crate::tui_hit_regions::MouseDispatcher) {
+pub fn record_tab_hit_slots(
+    area: Rect,
+    active: MailScreenId,
+    dispatcher: &crate::tui_hit_regions::MouseDispatcher,
+) {
+    dispatcher.clear_tab_slots();
+
     let available = area.width;
-    let ultra_compact = available < 40;
-    let compact = available < 60;
-    let mut x = area.x;
+    let (ultra_compact, compact) = tab_density_mode(available);
+    let plan = compute_tab_window_plan(active, available);
+    let mut x = area.x + u16::from(plan.show_left_indicator);
 
-    for (i, meta) in MAIL_SCREEN_REGISTRY.iter().enumerate() {
-        let number = i + 1;
-        let key_str = format!("{number}");
-        let key_w = u16::try_from(display_width(key_str.as_str())).unwrap_or(u16::MAX);
-        let label = if ultra_compact {
-            ""
-        } else if compact {
-            meta.short_label
-        } else {
-            meta.title
-        };
-        let label_w = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
-        let has_label = !label.is_empty();
-        let tab_width: u16 = if has_label {
-            1_u16
-                .saturating_add(key_w)
-                .saturating_add(1)
-                .saturating_add(label_w)
-                .saturating_add(1)
-        } else {
-            1_u16.saturating_add(key_w).saturating_add(1)
-        };
+    for (i, meta) in MAIL_SCREEN_REGISTRY
+        .iter()
+        .enumerate()
+        .take(plan.end)
+        .skip(plan.start)
+    {
+        let label = tab_label_for_mode(meta, ultra_compact, compact);
+        let show_icon = !compact && !label.is_empty();
+        let tab_width = tab_slot_width(i, label, show_icon);
 
-        // Separator before each tab except the first.
-        if i > 0 && x < area.x + available {
+        // Separator before each tab except the first visible tab.
+        if i > plan.start && x < area.x + available {
             x += 1;
-        }
-
-        if x + tab_width > area.x + available {
-            break;
         }
 
         dispatcher.record_tab_slot(i, meta.id, x, x + tab_width, area.y);
@@ -321,6 +513,32 @@ struct StatusSegment {
     fg: PackedRgba,
     bold: bool,
     effect: StatusEffect,
+}
+
+fn status_segment_style(
+    seg: &StatusSegment,
+    tp: &crate::tui_theme::TuiThemePalette,
+    effect_enabled: bool,
+) -> Style {
+    let base = match seg.role {
+        StatusRole::PaletteToggle | StatusRole::HelpToggle => tp.tab_key_fg,
+        StatusRole::Normal => seg.fg,
+    };
+    let blend = match seg.priority {
+        StatusPriority::Critical => 0.40,
+        StatusPriority::High => 0.32,
+        StatusPriority::Medium => 0.24,
+        StatusPriority::Low => 0.16,
+    };
+    let mut style = Style::default().fg(seg.fg).bg(crate::tui_theme::lerp_color(
+        tp.status_bg,
+        base,
+        if effect_enabled { blend } else { blend * 0.7 },
+    ));
+    if seg.bold {
+        style = style.bold();
+    }
+    style
 }
 
 fn status_group_width(segments: &[StatusSegment], separated: bool) -> u16 {
@@ -708,10 +926,7 @@ pub fn render_status_line(
 
     // Left segments
     for seg in &left {
-        let mut style = Style::default().fg(seg.fg).bg(tp.status_bg);
-        if seg.bold {
-            style = style.bold();
-        }
+        let style = status_segment_style(seg, &tp, effects_enabled);
         spans.push(Span::styled(seg.text.as_str(), style));
         cursor_x = cursor_x.saturating_add(segment_text_width(&seg.text));
     }
@@ -737,19 +952,19 @@ pub fn render_status_line(
     for (i, seg) in center.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(
-                " | ",
+                " \u{00b7} ",
                 Style::default().fg(tp.status_fg).bg(tp.status_bg),
             ));
             cursor_x = cursor_x.saturating_add(3);
         }
         // Key hints get keycap/chip rendering (reverse-video keys).
         if seg.priority == StatusPriority::Low && seg.text.contains('\x01') {
-            push_keycap_chip_spans(&mut spans, &seg.text, &tp);
+            let chip_bg = status_segment_style(seg, &tp, effects_enabled)
+                .bg
+                .unwrap_or(tp.status_bg);
+            push_keycap_chip_spans(&mut spans, &seg.text, &tp, chip_bg);
         } else {
-            let mut style = Style::default().fg(seg.fg).bg(tp.status_bg);
-            if seg.bold {
-                style = style.bold();
-            }
+            let style = status_segment_style(seg, &tp, effects_enabled);
             spans.push(Span::styled(seg.text.as_str(), style));
         }
         cursor_x = cursor_x.saturating_add(segment_text_width(&seg.text));
@@ -767,10 +982,7 @@ pub fn render_status_line(
 
     // Right segments
     for seg in &right {
-        let mut style = Style::default().fg(seg.fg).bg(tp.status_bg);
-        if seg.bold {
-            style = style.bold();
-        }
+        let style = status_segment_style(seg, &tp, effects_enabled);
         let seg_width = segment_text_width(&seg.text);
         if effects_enabled && seg.effect != StatusEffect::None && seg_width > 0 {
             effect_overlays.push((cursor_x, seg_width, seg.effect, seg.fg, seg.text.clone()));
@@ -851,8 +1063,14 @@ pub fn render_help_overlay_sections(
     let inner = block.inner(overlay_area);
     block.render(overlay_area, frame);
 
-    let key_col = 14u16;
-    let col_width = inner.width.saturating_sub(1);
+    let key_col = if inner.width >= 70 {
+        20
+    } else if inner.width >= 54 {
+        16
+    } else {
+        12
+    };
+    let col_width = inner.width.saturating_sub(2);
     let mut line_idx: u16 = 0;
     let max_scroll = total_lines.saturating_sub(usize::from(inner.height));
     let clamped_scroll = usize::from(scroll_offset).min(max_scroll);
@@ -861,17 +1079,25 @@ pub fn render_help_overlay_sections(
     let mut y_pos = 0u16;
 
     for (si, section) in sections.iter().enumerate() {
-        // Blank separator between sections (except before the first).
+        // Divider between sections.
         if si > 0 {
+            if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
+                let divider = "\u{2500}".repeat(usize::from(col_width.max(1)));
+                Paragraph::new(divider)
+                    .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg))
+                    .render(Rect::new(inner.x + 1, inner.y + y_pos, col_width, 1), frame);
+                y_pos += 1;
+            }
             line_idx += 1;
         }
 
         // Section header.
         if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
-            let header = Paragraph::new(section.title.as_str()).style(
+            let header_bg = crate::tui_theme::lerp_color(tp.help_bg, tp.help_category_fg, 0.15);
+            let header = Paragraph::new(format!(" {} ", section.title)).style(
                 Style::default()
                     .fg(tp.help_category_fg)
-                    .bg(tp.help_bg)
+                    .bg(header_bg)
                     .bold(),
             );
             header.render(Rect::new(inner.x + 1, inner.y + y_pos, col_width, 1), frame);
@@ -882,8 +1108,12 @@ pub fn render_help_overlay_sections(
         // Optional context description.
         if let Some(ref desc) = section.description {
             if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
-                let desc_para = Paragraph::new(desc.as_str())
-                    .style(Style::default().fg(tp.status_fg).bg(tp.help_bg).italic());
+                let desc_para = Paragraph::new(desc.as_str()).style(
+                    Style::default()
+                        .fg(tp.text_secondary)
+                        .bg(tp.help_bg)
+                        .italic(),
+                );
                 desc_para.render(
                     Rect::new(inner.x + 2, inner.y + y_pos, col_width.saturating_sub(1), 1),
                     frame,
@@ -894,13 +1124,14 @@ pub fn render_help_overlay_sections(
         }
 
         // Entries.
-        for (key, action) in &section.entries {
+        for (entry_idx, (key, action)) in section.entries.iter().enumerate() {
             if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
                 render_keybinding_line_themed(
                     key,
                     action,
                     Rect::new(inner.x + 1, inner.y + y_pos, col_width, 1),
                     key_col,
+                    entry_idx,
                     &tp,
                     frame,
                 );
@@ -914,8 +1145,8 @@ pub fn render_help_overlay_sections(
 /// Compute the centered help-overlay rectangle for a terminal frame area.
 #[must_use]
 pub fn help_overlay_rect(area: Rect) -> Rect {
-    let overlay_width = (u32::from(area.width) * 60 / 100).clamp(36, 72) as u16;
-    let overlay_height = (u32::from(area.height) * 60 / 100).clamp(10, 28) as u16;
+    let overlay_width = (u32::from(area.width) * 72 / 100).clamp(40, 90) as u16;
+    let overlay_height = (u32::from(area.height) * 68 / 100).clamp(12, 32) as u16;
     let overlay_width = overlay_width.min(area.width.saturating_sub(2));
     let overlay_height = overlay_height.min(area.height.saturating_sub(2));
 
@@ -1067,10 +1298,23 @@ fn render_keybinding_line_themed(
     action: &str,
     area: Rect,
     key_col: u16,
+    row_idx: usize,
     tp: &crate::tui_theme::TuiThemePalette,
     frame: &mut Frame,
 ) {
     use ftui::text::{Line, Span, Text};
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let row_bg = if row_idx % 2 == 0 {
+        crate::tui_theme::lerp_color(tp.help_bg, tp.bg_surface, 0.18)
+    } else {
+        crate::tui_theme::lerp_color(tp.help_bg, tp.bg_surface, 0.10)
+    };
+    Paragraph::new("")
+        .style(Style::default().bg(row_bg))
+        .render(area, frame);
 
     let keycap = format!(" {key} ");
     // Total width of leading space + keycap
@@ -1079,13 +1323,21 @@ fn render_keybinding_line_themed(
     let pad_len = key_col.saturating_sub(key_len) as usize;
     let padding = " ".repeat(pad_len);
 
-    let keycap_style = Style::default().fg(tp.help_bg).bg(tp.help_key_fg).bold();
+    let keycap_style = Style::default()
+        .fg(tp.help_bg)
+        .bg(crate::tui_theme::lerp_color(
+            tp.help_key_fg,
+            tp.help_category_fg,
+            0.24,
+        ))
+        .bold();
+    let action_style = Style::default().fg(tp.help_fg).bg(row_bg);
 
     let spans = vec![
-        Span::styled("  ", Style::default().bg(tp.help_bg)),
+        Span::styled("  ", Style::default().bg(row_bg)),
         Span::styled(keycap, keycap_style),
-        Span::styled(padding, Style::default().bg(tp.help_bg)),
-        Span::styled(action, Style::default().fg(tp.help_fg).bg(tp.help_bg)),
+        Span::styled(padding, Style::default().bg(row_bg)),
+        Span::styled(action, action_style),
     ];
 
     let line = Line::from_spans(spans);
@@ -1237,12 +1489,13 @@ fn push_keycap_chip_spans<'a>(
     spans: &mut Vec<ftui::text::Span<'a>>,
     hints: &'a str,
     tp: &crate::tui_theme::TuiThemePalette,
+    bg: PackedRgba,
 ) {
     use ftui::text::Span;
 
     let keycap_style = Style::default().fg(tp.status_bg).bg(tp.tab_key_fg).bold();
-    let action_style = Style::default().fg(tp.status_fg).bg(tp.status_bg);
-    let sep_style = Style::default().fg(tp.tab_inactive_fg).bg(tp.status_bg);
+    let action_style = Style::default().fg(tp.status_fg).bg(bg);
+    let sep_style = Style::default().fg(tp.tab_inactive_fg).bg(bg);
 
     let mut rest = hints;
     while !rest.is_empty() {
@@ -1291,7 +1544,7 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
 
     let mut spans = Vec::new();
     spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
-    push_keycap_chip_spans(&mut spans, &hints, &tp);
+    push_keycap_chip_spans(&mut spans, &hints, &tp, tp.status_bg);
 
     let line = Line::from_spans(spans);
     Paragraph::new(Text::from_lines([line])).render(area, frame);
@@ -1409,7 +1662,7 @@ mod tests {
             80,
         );
         let mut spans: Vec<Span<'_>> = Vec::new();
-        push_keycap_chip_spans(&mut spans, &hints, &tp);
+        push_keycap_chip_spans(&mut spans, &hints, &tp, tp.status_bg);
         // Should produce at least keycap + action spans for each chip
         assert!(spans.len() >= 4, "expected >= 4 spans, got {}", spans.len());
         // First keycap span should be bold (reverse-video keycap)
@@ -1697,7 +1950,7 @@ mod tests {
     fn tab_hit_slots_cover_all_visible_tabs_normal_width() {
         let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
         let area = Rect::new(0, 0, 240, 1); // Wide enough for all 15 tabs
-        record_tab_hit_slots(area, &dispatcher);
+        record_tab_hit_slots(area, MailScreenId::Dashboard, &dispatcher);
         let mut found = 0;
         for i in 0..ALL_SCREEN_IDS.len() {
             if dispatcher.tab_slot(i).is_some() {
@@ -1716,10 +1969,10 @@ mod tests {
         // At 40 cols, compact mode shows short labels; at 30 cols, ultra-compact
         // shows key-only. Ultra-compact should fit more tabs.
         let d_compact = crate::tui_hit_regions::MouseDispatcher::new();
-        record_tab_hit_slots(Rect::new(0, 0, 50, 1), &d_compact);
+        record_tab_hit_slots(Rect::new(0, 0, 50, 1), MailScreenId::Dashboard, &d_compact);
 
         let d_ultra = crate::tui_hit_regions::MouseDispatcher::new();
-        record_tab_hit_slots(Rect::new(0, 0, 30, 1), &d_ultra);
+        record_tab_hit_slots(Rect::new(0, 0, 30, 1), MailScreenId::Dashboard, &d_ultra);
 
         let count = |d: &crate::tui_hit_regions::MouseDispatcher| -> usize {
             (0..ALL_SCREEN_IDS.len())
@@ -1737,7 +1990,11 @@ mod tests {
     #[test]
     fn tab_hit_slots_no_overlap() {
         let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
-        record_tab_hit_slots(Rect::new(0, 0, 200, 1), &dispatcher);
+        record_tab_hit_slots(
+            Rect::new(0, 0, 200, 1),
+            MailScreenId::Dashboard,
+            &dispatcher,
+        );
 
         let mut prev_end: u16 = 0;
         for i in 0..ALL_SCREEN_IDS.len() {
@@ -1750,6 +2007,25 @@ mod tests {
                 prev_end = x_end;
             }
         }
+    }
+
+    #[test]
+    fn tab_hit_slots_keep_active_tab_visible_on_narrow_width() {
+        let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
+        record_tab_hit_slots(
+            Rect::new(0, 0, 44, 1),
+            MailScreenId::ArchiveBrowser,
+            &dispatcher,
+        );
+
+        let active_index = MAIL_SCREEN_REGISTRY
+            .iter()
+            .position(|meta| meta.id == MailScreenId::ArchiveBrowser)
+            .expect("archive browser screen should be registered");
+        assert!(
+            dispatcher.tab_slot(active_index).is_some(),
+            "active tab should always have a hit slot in narrow mode"
+        );
     }
 
     // ── Status segment discoverability tests (br-1xt0m.1.12.1) ──

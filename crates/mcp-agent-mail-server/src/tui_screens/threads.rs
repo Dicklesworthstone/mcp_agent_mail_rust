@@ -53,6 +53,10 @@ const LOAD_OLDER_BATCH_SIZE: usize = 15;
 const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
 const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
 const MESSAGE_DRAG_HOLD_DELAY: Duration = Duration::from_millis(200);
+const THREAD_SPLIT_WIDTH_THRESHOLD: u16 = 80;
+const THREAD_STACKED_MIN_HEIGHT: u16 = 14;
+const THREAD_STACKED_LIST_PERCENT: u16 = 42;
+const THREAD_COMPACT_HINT_MIN_HEIGHT: u16 = 7;
 
 /// Color palette for deterministic per-agent coloring in thread cards.
 fn agent_color_palette() -> [PackedRgba; 8] {
@@ -735,7 +739,7 @@ impl ThreadExplorerScreen {
         if let MessageDragState::Active(active) = &mut self.message_drag {
             active.cursor_x = cursor_x;
             active.cursor_y = cursor_y;
-            active.hovered_thread_id = hovered_thread_id.clone();
+            active.hovered_thread_id.clone_from(&hovered_thread_id);
             active.hovered_is_valid = hovered_thread_id
                 .as_deref()
                 .is_some_and(|tid| tid != active.source_thread_id);
@@ -752,20 +756,25 @@ impl ThreadExplorerScreen {
     fn finish_message_drag(&mut self, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         let cmd = if let MessageDragState::Active(active) = &self.message_drag {
             if active.hovered_is_valid {
-                if let Some(target_thread_id) = active.hovered_thread_id.as_deref() {
-                    if !target_thread_id.is_empty() && target_thread_id != active.source_thread_id {
-                        let op =
-                            format!("rethread_message:{}:{target_thread_id}", active.message_id);
-                        Cmd::msg(MailScreenMsg::ActionExecute(
-                            op,
-                            active.source_thread_id.clone(),
-                        ))
-                    } else {
-                        Cmd::None
-                    }
-                } else {
-                    Cmd::None
-                }
+                active.hovered_thread_id.as_deref().map_or_else(
+                    || Cmd::None,
+                    |target_thread_id| {
+                        if !target_thread_id.is_empty()
+                            && target_thread_id != active.source_thread_id
+                        {
+                            let op = format!(
+                                "rethread_message:{}:{target_thread_id}",
+                                active.message_id
+                            );
+                            Cmd::msg(MailScreenMsg::ActionExecute(
+                                op,
+                                active.source_thread_id.clone(),
+                            ))
+                        } else {
+                            Cmd::None
+                        }
+                    },
+                )
             } else {
                 Cmd::None
             }
@@ -1328,8 +1337,8 @@ impl MailScreen for ThreadExplorerScreen {
         };
         let keyboard_move = state.keyboard_move_snapshot();
 
-        // Split content: thread list (left) + detail (right) if wide enough
-        if content_area.width >= 80 {
+        // Wide: split content (list left, detail right).
+        if content_area.width >= THREAD_SPLIT_WIDTH_THRESHOLD {
             let list_width = content_area.width * 40 / 100;
             let detail_width = content_area.width - list_width;
             let list_area = Rect::new(
@@ -1383,24 +1392,102 @@ impl MailScreen for ThreadExplorerScreen {
                     self.detail_tree_focus,
                 );
             }
-        } else {
-            // Narrow: show active pane unless Mermaid panel is toggled.
+        } else if content_area.height >= THREAD_STACKED_MIN_HEIGHT {
+            // Narrow but tall: stacked fallback preserves both list and detail.
+            let min_list_h: u16 = 4;
+            let min_detail_h: u16 = 6;
+            let raw_list_h = content_area
+                .height
+                .saturating_mul(THREAD_STACKED_LIST_PERCENT)
+                / 100;
+            let list_h = raw_list_h.clamp(
+                min_list_h,
+                content_area
+                    .height
+                    .saturating_sub(min_detail_h)
+                    .max(min_list_h),
+            );
+            let detail_h = content_area.height.saturating_sub(list_h);
+
+            let list_area = Rect::new(content_area.x, content_area.y, content_area.width, list_h);
+            let detail_area = Rect::new(
+                content_area.x,
+                content_area.y + list_h,
+                content_area.width,
+                detail_h,
+            );
+            self.last_list_area.set(list_area);
+            self.last_detail_area.set(detail_area);
+
+            render_thread_list(
+                frame,
+                list_area,
+                &self.threads,
+                self.cursor,
+                matches!(self.focus, Focus::ThreadList),
+                self.view_lens,
+                self.sort_mode,
+                self.urgent_pulse_on,
+                drop_visual,
+                keyboard_move.as_ref(),
+            );
             if self.show_mermaid_panel {
-                self.last_list_area.set(Rect::new(0, 0, 0, 0));
-                self.last_detail_area.set(content_area);
                 self.render_mermaid_panel(
                     frame,
-                    content_area,
+                    detail_area,
+                    matches!(self.focus, Focus::DetailPanel),
+                );
+            } else {
+                render_thread_detail(
+                    frame,
+                    detail_area,
+                    &self.detail_messages,
+                    self.threads.get(self.cursor),
+                    self.detail_scroll,
+                    self.detail_cursor,
+                    &self.expanded_message_ids,
+                    &self.collapsed_tree_ids,
+                    self.has_older_messages(),
+                    self.remaining_older_count(),
+                    self.loaded_message_count,
+                    self.total_thread_messages,
+                    matches!(self.focus, Focus::DetailPanel),
+                    self.detail_tree_focus,
+                );
+            }
+        } else {
+            // Tight layout: show active pane with explicit focus-switch hint.
+            let (pane_area, hint_area) = if content_area.height >= THREAD_COMPACT_HINT_MIN_HEIGHT {
+                let pane_h = content_area.height.saturating_sub(1);
+                (
+                    Rect::new(content_area.x, content_area.y, content_area.width, pane_h),
+                    Some(Rect::new(
+                        content_area.x,
+                        content_area.y + pane_h,
+                        content_area.width,
+                        1,
+                    )),
+                )
+            } else {
+                (content_area, None)
+            };
+
+            if self.show_mermaid_panel {
+                self.last_list_area.set(Rect::new(0, 0, 0, 0));
+                self.last_detail_area.set(pane_area);
+                self.render_mermaid_panel(
+                    frame,
+                    pane_area,
                     matches!(self.focus, Focus::DetailPanel),
                 );
             } else {
                 match self.focus {
                     Focus::ThreadList => {
-                        self.last_list_area.set(content_area);
+                        self.last_list_area.set(pane_area);
                         self.last_detail_area.set(Rect::new(0, 0, 0, 0));
                         render_thread_list(
                             frame,
-                            content_area,
+                            pane_area,
                             &self.threads,
                             self.cursor,
                             true,
@@ -1413,10 +1500,10 @@ impl MailScreen for ThreadExplorerScreen {
                     }
                     Focus::DetailPanel => {
                         self.last_list_area.set(Rect::new(0, 0, 0, 0));
-                        self.last_detail_area.set(content_area);
+                        self.last_detail_area.set(pane_area);
                         render_thread_detail(
                             frame,
-                            content_area,
+                            pane_area,
                             &self.detail_messages,
                             self.threads.get(self.cursor),
                             self.detail_scroll,
@@ -1432,6 +1519,10 @@ impl MailScreen for ThreadExplorerScreen {
                         );
                     }
                 }
+            }
+
+            if let Some(hint_area) = hint_area {
+                render_compact_focus_hint(frame, hint_area, self.focus, self.show_mermaid_panel);
             }
         }
     }
@@ -1767,6 +1858,30 @@ fn render_filter_bar(
         ]);
         Paragraph::new(Text::from_line(line)).render(area, frame);
     }
+}
+
+fn render_compact_focus_hint(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    focus: Focus,
+    mermaid_active: bool,
+) {
+    if area.width < 12 || area.height == 0 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let hint = if mermaid_active {
+        " g:close mermaid | Enter/Esc: switch panes"
+    } else {
+        match focus {
+            Focus::ThreadList => " Enter/l: detail | Esc/h: list | Tab: tree/preview",
+            Focus::DetailPanel => " Esc/h: list | Enter/l: detail | Tab: tree/preview",
+        }
+    };
+
+    Paragraph::new(truncate_str(hint, area.width as usize))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(area, frame);
 }
 
 /// Render the thread list panel.
@@ -2650,8 +2765,10 @@ mod tests {
         let _ = screen.update(&down, &state);
         assert!(matches!(screen.message_drag, MessageDragState::Pending(_)));
         if let MessageDragState::Pending(pending) = &mut screen.message_drag {
-            pending.started_at =
-                Instant::now() - MESSAGE_DRAG_HOLD_DELAY - Duration::from_millis(1);
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
         }
 
         let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 2, 4);
@@ -2683,8 +2800,10 @@ mod tests {
         let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 45, 3);
         let _ = screen.update(&down, &state);
         if let MessageDragState::Pending(pending) = &mut screen.message_drag {
-            pending.started_at =
-                Instant::now() - MESSAGE_DRAG_HOLD_DELAY - Duration::from_millis(1);
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
         }
 
         let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 2, 2);
@@ -3265,6 +3384,8 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(40, 10, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 40, 10), &state);
+        assert_eq!(screen.last_detail_area.get(), Rect::new(0, 0, 0, 0));
+        assert!(screen.last_list_area.get().width > 0);
     }
 
     #[test]
@@ -3275,6 +3396,26 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(40, 10, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 40, 10), &state);
+        assert_eq!(screen.last_list_area.get(), Rect::new(0, 0, 0, 0));
+        assert!(screen.last_detail_area.get().width > 0);
+    }
+
+    #[test]
+    fn narrow_tall_layout_keeps_list_and_detail_visible() {
+        let screen = ThreadExplorerScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(60, 20, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 60, 20), &state);
+
+        let list = screen.last_list_area.get();
+        let detail = screen.last_detail_area.get();
+        assert!(
+            list.width > 0 && detail.width > 0,
+            "stacked fallback should keep both panes visible"
+        );
+        assert_eq!(list.width, detail.width);
+        assert!(detail.y > list.y);
     }
 
     #[test]

@@ -299,6 +299,7 @@ fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
 }
 
 /// Open a sync `SQLite` connection from a database URL (public for compose dispatch).
+#[must_use]
 pub fn open_sync_connection_pub(database_url: &str) -> Option<DbConn> {
     open_sync_connection(database_url)
 }

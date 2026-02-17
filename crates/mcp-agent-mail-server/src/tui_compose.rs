@@ -1376,13 +1376,9 @@ mod tests {
         KeyEvent::new(code).with_modifiers(Modifiers::CTRL)
     }
 
-    fn make_key_shift(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code).with_modifiers(Modifiers::SHIFT)
-    }
-
     fn state_with_agents(names: &[&str]) -> ComposeState {
         let mut s = ComposeState::new();
-        s.set_available_agents(names.iter().map(|n| n.to_string()).collect());
+        s.set_available_agents(names.iter().map(std::string::ToString::to_string).collect());
         s
     }
 

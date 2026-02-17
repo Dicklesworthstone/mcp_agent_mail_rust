@@ -6,6 +6,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -942,6 +943,7 @@ impl ScreenManager {
 ///
 /// Owns all screen instances and dispatches events to the active screen
 /// after processing global keybindings.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MailAppModel {
     state: Arc<TuiSharedState>,
     screen_manager: ScreenManager,
@@ -1514,6 +1516,7 @@ impl MailAppModel {
         );
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     fn open_export_menu(&mut self) {
         self.help_visible = false;
         self.help_scroll = 0;
@@ -1544,7 +1547,7 @@ impl MailAppModel {
         }
     }
 
-    fn resolve_export_dir(&self) -> PathBuf {
+    fn resolve_export_dir() -> PathBuf {
         let env_export = std::env::var("AM_EXPORT_DIR").ok();
         let home = std::env::var_os("HOME").map(PathBuf::from);
         resolve_export_dir_from_sources(env_export.as_deref(), home.as_deref())
@@ -1578,7 +1581,7 @@ impl MailAppModel {
     }
 
     fn export_current_snapshot(&mut self, format: ExportFormat) {
-        let export_dir = self.resolve_export_dir();
+        let export_dir = Self::resolve_export_dir();
         match self.export_snapshot_to_dir(format, &export_dir) {
             Ok(path) => {
                 self.notifications.notify(
@@ -2089,6 +2092,7 @@ impl MailAppModel {
         }
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     fn is_inspector_toggle_key(key: &ftui::KeyEvent) -> bool {
         matches!(key.code, KeyCode::F(12))
             || (matches!(key.code, KeyCode::Char('i' | 'I'))
@@ -2102,10 +2106,12 @@ impl MailAppModel {
             self.inspector_selected_index = 0;
             return;
         }
-        let current = self.inspector_selected_index.min(len - 1) as isize;
-        let max = (len - 1) as isize;
-        let next = (current + delta).clamp(0, max);
-        self.inspector_selected_index = usize::try_from(next).unwrap_or(0);
+        let current = self.inspector_selected_index.min(len - 1);
+        self.inspector_selected_index = if delta >= 0 {
+            current.saturating_add(delta.unsigned_abs()).min(len - 1)
+        } else {
+            current.saturating_sub(delta.unsigned_abs())
+        };
     }
 
     fn handle_inspector_event(&mut self, event: &Event) -> bool {
@@ -2140,7 +2146,7 @@ impl MailAppModel {
     fn build_inspector_widget_tree(
         &self,
         area: Rect,
-        chrome: crate::tui_chrome::ChromeAreas,
+        chrome: &crate::tui_chrome::ChromeAreas,
         active_screen: MailScreenId,
         tab_render_us: u64,
         content_render_us: u64,
@@ -3593,10 +3599,6 @@ impl Model for MailAppModel {
         self.mouse_dispatcher
             .update_chrome_areas(chrome.tab_bar, chrome.status_line);
 
-        let tab_render_us;
-        let content_render_us;
-        let status_render_us;
-        let toast_render_us;
         let mut action_menu_render_us = 0_u64;
         let mut modal_render_us = 0_u64;
         let mut palette_render_us = 0_u64;
@@ -3606,14 +3608,14 @@ impl Model for MailAppModel {
         let effects_enabled = self.state.config_snapshot().tui_effects;
         let tab_started = Instant::now();
         tui_chrome::render_tab_bar(active_screen, effects_enabled, frame, chrome.tab_bar);
-        tab_render_us = tab_started
+        let tab_render_us = tab_started
             .elapsed()
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
 
         // Record per-tab hit slots for mouse dispatch.
-        tui_chrome::record_tab_hit_slots(chrome.tab_bar, &self.mouse_dispatcher);
+        tui_chrome::record_tab_hit_slots(chrome.tab_bar, active_screen, &self.mouse_dispatcher);
 
         // Register per-tab hit regions in the frame's hit grid.
         for (i, meta) in crate::tui_screens::MAIL_SCREEN_REGISTRY.iter().enumerate() {
@@ -3644,7 +3646,7 @@ impl Model for MailAppModel {
             }
         }
         render_message_drag_ghost(&self.state, area, frame);
-        content_render_us = content_started
+        let content_render_us = content_started
             .elapsed()
             .as_micros()
             .try_into()
@@ -3683,7 +3685,7 @@ impl Model for MailAppModel {
             frame,
             chrome.status_line,
         );
-        status_render_us = status_started
+        let status_render_us = status_started
             .elapsed()
             .as_micros()
             .try_into()
@@ -3710,7 +3712,7 @@ impl Model for MailAppModel {
                 frame,
             );
         }
-        toast_render_us = toast_started
+        let toast_render_us = toast_started
             .elapsed()
             .as_micros()
             .try_into()
@@ -3782,7 +3784,7 @@ impl Model for MailAppModel {
         if self.inspector.is_active() {
             let tree = self.build_inspector_widget_tree(
                 area,
-                chrome,
+                &chrome,
                 active_screen,
                 tab_render_us,
                 content_render_us,
@@ -3889,7 +3891,7 @@ fn flatten_inspector_rows(widget: &WidgetInfo, rows: &mut Vec<InspectorTreeRow>)
         widget.area.x, widget.area.y, widget.area.width, widget.area.height
     );
     if let Some(render_us) = widget.render_time_us {
-        label.push_str(&format!(" [{render_us}us]"));
+        let _ = write!(label, " [{render_us}us]");
     }
     rows.push(InspectorTreeRow {
         label,
@@ -7204,7 +7206,7 @@ mod tests {
     fn palette_db_cache_respects_ttl() {
         let _serial = PALETTE_CACHE_TEST_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Reset global cache to avoid test-order dependence.
         let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
         if let Ok(mut guard) = cache.lock() {
@@ -7257,7 +7259,7 @@ mod tests {
     fn palette_db_cache_invalidates_when_bridge_snapshot_changes() {
         let _serial = PALETTE_CACHE_TEST_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Reset global cache to avoid test-order dependence.
         let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
         if let Ok(mut guard) = cache.lock() {
@@ -9580,11 +9582,15 @@ mod tests {
 
         let area = Rect::new(0, 0, 120, 40);
         let chrome = crate::tui_chrome::chrome_layout(area);
-        crate::tui_chrome::record_tab_hit_slots(chrome.tab_bar, &model.mouse_dispatcher);
+        crate::tui_chrome::record_tab_hit_slots(
+            chrome.tab_bar,
+            model.active_screen(),
+            &model.mouse_dispatcher,
+        );
 
         let tree = model.build_inspector_widget_tree(
             area,
-            chrome,
+            &chrome,
             MailScreenId::Messages,
             11,
             22,

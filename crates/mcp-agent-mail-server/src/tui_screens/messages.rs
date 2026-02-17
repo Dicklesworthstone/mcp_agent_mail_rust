@@ -36,7 +36,7 @@ use mcp_agent_mail_db::timestamps::micros_to_iso;
 use crate::tui_action_menu::{ActionEntry, messages_actions, messages_batch_actions};
 use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
-use crate::tui_layout::DockLayout;
+use crate::tui_layout::{DockLayout, DockPosition};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -59,6 +59,10 @@ const COMPOSE_BODY_MIN_ROWS: u16 = 10;
 const COMPOSE_SENDER_NAME: &str = "HumanOverseer";
 const COMPOSE_IMPORTANCE_LEVELS: [&str; 3] = ["normal", "high", "urgent"];
 const MESSAGE_DRAG_HOLD_DELAY: Duration = Duration::from_millis(200);
+const MESSAGE_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
+const MESSAGE_STACKED_WIDTH_THRESHOLD: u16 = 68;
+const MESSAGE_STACKED_MIN_HEIGHT: u16 = 12;
+const MESSAGE_STACKED_DOCK_RATIO: f32 = 0.38;
 
 /// Max body preview length in the results list (used for future
 /// inline preview in narrow mode).
@@ -182,7 +186,7 @@ impl RenderItem for MessageEntry {
 }
 
 impl MessageEntry {
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn render_row(
         &self,
         area: Rect,
@@ -199,6 +203,13 @@ impl MessageEntry {
         }
         let inner_w = area.width as usize;
         let tp = crate::tui_theme::TuiThemePalette::current();
+        let row_bg = if selected {
+            tp.selection_bg
+        } else if self.id.rem_euclid(2) == 0 {
+            crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.20)
+        } else {
+            crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.10)
+        };
 
         // Marker for selected row
         let marker = if selected {
@@ -208,43 +219,66 @@ impl MessageEntry {
         };
         let batch_marker = if batch_selected { "[x]" } else { "[ ]" };
         let batch_marker_style = if batch_selected {
-            Style::default().fg(tp.selection_indicator).bold()
+            Style::default()
+                .fg(tp.selection_indicator)
+                .bg(row_bg)
+                .bold()
         } else {
-            crate::tui_theme::text_meta(&tp)
+            crate::tui_theme::text_meta(&tp).bg(row_bg)
         };
         let cursor_style = Style::default()
             .fg(tp.selection_fg)
             .bg(tp.selection_bg)
             .bold();
+        let row_default_style = Style::default().fg(tp.text_primary).bg(row_bg);
 
         // Importance badge
         let pulse_on = MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed);
         let (badge, badge_style) = match self.importance.as_str() {
-            "high" => ("!", crate::tui_theme::text_warning(&tp)),
+            "high" => (
+                "!\u{2219}",
+                Style::default().fg(tp.help_bg).bg(tp.severity_warn).bold(),
+            ),
             "urgent" => {
                 let fg = if pulse_on {
                     tp.badge_urgent_bg
                 } else {
                     crate::tui_theme::lerp_color(tp.badge_urgent_bg, tp.text_disabled, 0.5)
                 };
-                ("!!", Style::default().fg(fg).bold())
+                ("!!", Style::default().fg(tp.badge_urgent_fg).bg(fg).bold())
             }
-            _ => (" ", Style::default()),
+            _ => (
+                "\u{00b7}\u{00b7}",
+                Style::default()
+                    .fg(tp.text_disabled)
+                    .bg(crate::tui_theme::lerp_color(row_bg, tp.bg_overlay, 0.22)),
+            ),
         };
 
         // Ack-required indicator
-        let ack_badge = if self.ack_required { "@" } else { " " };
+        let ack_badge = if self.ack_required { "@" } else { "\u{00b7}" };
         let ack_style = if self.ack_required {
-            crate::tui_theme::text_accent(&tp)
+            Style::default()
+                .fg(tp.badge_info_fg)
+                .bg(tp.badge_info_bg)
+                .bold()
         } else {
             Style::default()
+                .fg(tp.text_disabled)
+                .bg(crate::tui_theme::lerp_color(row_bg, tp.bg_overlay, 0.18))
         };
 
         // ID or "LIVE" marker with distinct styling
         let (id_str, id_style) = if self.id >= 0 {
-            (format!("#{}", self.id), crate::tui_theme::text_meta(&tp))
+            (
+                format!("#{}", self.id),
+                crate::tui_theme::text_meta(&tp).bg(row_bg),
+            )
         } else {
-            ("LIVE".to_string(), crate::tui_theme::text_accent(&tp))
+            (
+                "LIVE".to_string(),
+                crate::tui_theme::text_accent(&tp).bg(row_bg).bold(),
+            )
         };
 
         // Compact timestamp (HH:MM:SS from ISO string)
@@ -253,12 +287,12 @@ impl MessageEntry {
         } else {
             &self.timestamp_iso
         };
-        let time_style = crate::tui_theme::text_meta(&tp);
+        let time_style = crate::tui_theme::text_meta(&tp).bg(row_bg);
 
         // Sender (truncated to 12 chars, Unicode-safe).
         let sender_end = char_index_to_byte_offset(&self.from_agent, 12);
         let sender = &self.from_agent[..sender_end];
-        let sender_style = Style::default().fg(tp.text_secondary);
+        let sender_style = Style::default().fg(tp.text_secondary).bg(row_bg);
 
         // Project badge (only in Global mode)
         let project_badge = if self.show_project && !self.project_slug.is_empty() {
@@ -289,25 +323,37 @@ impl MessageEntry {
         let remaining = inner_w.saturating_sub(fixed_len);
         let subj = truncate_str(&self.subject, remaining);
 
+        let project_style = Style::default()
+            .fg(tp.status_accent)
+            .bg(crate::tui_theme::lerp_color(row_bg, tp.status_accent, 0.18))
+            .bold();
         let mut spans = vec![
             Span::styled(batch_marker, batch_marker_style),
-            Span::raw(" "),
-            Span::raw(marker),
+            Span::styled(" ", Style::default().bg(row_bg)),
+            Span::styled(marker, Style::default().bg(row_bg)),
             Span::styled(format!("{badge:>2}"), badge_style),
             Span::styled(ack_badge, ack_style),
-            Span::raw(" "),
+            Span::styled(" ", Style::default().bg(row_bg)),
             Span::styled(format!("{id_str:>6}"), id_style),
-            Span::raw(" "),
+            Span::styled(" ", Style::default().bg(row_bg)),
             Span::styled(time_short, time_style),
-            Span::raw(" "),
+            Span::styled(" ", Style::default().bg(row_bg)),
             Span::styled(format!("{sender:<12}"), sender_style),
-            Span::raw(format!(" {project_badge}")),
+            Span::styled(" ", Style::default().bg(row_bg)),
+            Span::styled(project_badge, project_style),
             Span::styled(
                 moving_badge,
-                Style::default().fg(tp.selection_indicator).bold(),
+                Style::default()
+                    .fg(tp.selection_indicator)
+                    .bg(row_bg)
+                    .bold(),
             ),
         ];
-        let base_subject_style = Style::default().fg(tp.text_primary);
+        let base_subject_style = if matches!(self.importance.as_str(), "high" | "urgent") {
+            Style::default().fg(tp.text_primary).bg(row_bg).bold()
+        } else {
+            Style::default().fg(tp.text_primary).bg(row_bg)
+        };
         if let Some(progress) = shimmer_progress.filter(|_| !selected) {
             if let Some((start_char, end_char)) =
                 subject_shimmer_window(&subj, progress, SHIMMER_HIGHLIGHT_WIDTH)
@@ -339,6 +385,7 @@ impl MessageEntry {
         if selected {
             line.apply_base_style(cursor_style);
         } else {
+            line.apply_base_style(row_default_style);
             let drop_style = match drop_zone {
                 MessageDropZoneState::None => None,
                 MessageDropZoneState::Valid => Some(Style::default().bg(tp.selection_bg)),
@@ -778,7 +825,8 @@ pub struct MessageBrowserScreen {
     last_detail_area: Cell<Rect>,
     /// Message compose modal state (when active).
     compose_form: Option<ComposeFormState>,
-    /// Cache for rendered message body with inline images: (message_id, width, rendered_content).
+    /// Cache for rendered message body with inline images:
+    /// (`message_id`, `width`, `rendered_content`).
     detail_cache: RefCell<Option<(i64, u16, String)>>,
 }
 
@@ -1264,7 +1312,7 @@ impl MessageBrowserScreen {
         if let MessageDragState::Active(active) = &mut self.message_drag {
             active.cursor_x = cursor_x;
             active.cursor_y = cursor_y;
-            active.hovered_thread_id = hovered_thread_id.clone();
+            active.hovered_thread_id.clone_from(&hovered_thread_id);
             active.hovered_is_valid = hovered_thread_id
                 .as_deref()
                 .is_some_and(|tid| tid != active.source_thread_id);
@@ -1281,20 +1329,25 @@ impl MessageBrowserScreen {
     fn finish_message_drag(&mut self, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         let cmd = if let MessageDragState::Active(active) = &self.message_drag {
             if active.hovered_is_valid {
-                if let Some(target_thread_id) = active.hovered_thread_id.as_deref() {
-                    if !target_thread_id.is_empty() && target_thread_id != active.source_thread_id {
-                        let op =
-                            format!("rethread_message:{}:{target_thread_id}", active.message_id);
-                        Cmd::msg(MailScreenMsg::ActionExecute(
-                            op,
-                            active.source_thread_id.clone(),
-                        ))
-                    } else {
-                        Cmd::None
-                    }
-                } else {
-                    Cmd::None
-                }
+                active.hovered_thread_id.as_deref().map_or_else(
+                    || Cmd::None,
+                    |target_thread_id| {
+                        if !target_thread_id.is_empty()
+                            && target_thread_id != active.source_thread_id
+                        {
+                            let op = format!(
+                                "rethread_message:{}:{target_thread_id}",
+                                active.message_id
+                            );
+                            Cmd::msg(MailScreenMsg::ActionExecute(
+                                op,
+                                active.source_thread_id.clone(),
+                            ))
+                        } else {
+                            Cmd::None
+                        }
+                    },
+                )
             } else {
                 Cmd::None
             }
@@ -1915,6 +1968,7 @@ impl MailScreen for MessageBrowserScreen {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 3 || area.width < 12 {
             let tp = crate::tui_theme::TuiThemePalette::current();
@@ -1961,8 +2015,26 @@ impl MailScreen for MessageBrowserScreen {
             ""
         };
         let mode_label = self.inbox_mode.label();
-        let layout_label = if self.dock.visible {
-            self.dock.state_label()
+        let mut dock = self.dock;
+        let mut stacked_fallback = false;
+        if content_area.height < MESSAGE_DOCK_HIDE_HEIGHT_THRESHOLD {
+            dock.visible = false;
+        } else if content_area.width < MESSAGE_STACKED_WIDTH_THRESHOLD {
+            if content_area.height >= MESSAGE_STACKED_MIN_HEIGHT {
+                stacked_fallback = true;
+                dock.visible = true;
+                dock.position = DockPosition::Bottom;
+                dock.set_ratio(MESSAGE_STACKED_DOCK_RATIO);
+            } else {
+                dock.visible = false;
+            }
+        }
+        let layout_label = if dock.visible {
+            if stacked_fallback {
+                format!("Stacked {}", dock.state_label())
+            } else {
+                dock.state_label()
+            }
         } else {
             "List only".to_string()
         };
@@ -1982,10 +2054,6 @@ impl MailScreen for MessageBrowserScreen {
             &telemetry,
         );
 
-        let mut dock = self.dock;
-        if content_area.width < 68 || content_area.height < 8 {
-            dock.visible = false;
-        }
         let split = dock.split(content_area);
         self.last_results_area.set(split.primary);
         self.last_detail_area
@@ -2456,7 +2524,16 @@ fn render_search_bar(
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::lerp_color(
+            crate::tui_theme::focus_border_color(&tp, focused),
+            tp.status_accent,
+            0.45,
+        )))
+        .style(Style::default().bg(crate::tui_theme::lerp_color(
+            tp.panel_bg,
+            tp.status_accent,
+            0.08,
+        )));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -2485,6 +2562,7 @@ fn render_search_bar(
 }
 
 /// Render the results list using `VirtualizedList`.
+#[allow(clippy::too_many_arguments)]
 fn render_results_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2520,7 +2598,12 @@ fn render_results_list(
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(crate::tui_theme::lerp_color(
+            tp.panel_bg,
+            tp.selection_indicator,
+            0.07,
+        )));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -2855,14 +2938,36 @@ fn render_detail_panel(
             let total = estimate_message_detail_lines(msg, width);
             let max_scroll = total.saturating_sub(viewport);
             let clamped = scroll.min(max_scroll);
-            format!("Detail [{clamped}/{max_scroll}]")
+            let importance = match msg.importance.as_str() {
+                "urgent" => "!!",
+                "high" => "!",
+                _ => "\u{00b7}",
+            };
+            format!("Detail {importance} [{clamped}/{max_scroll}]")
         },
     );
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let accent = entry.map_or(tp.panel_border_focused, |msg| {
+        match msg.importance.as_str() {
+            "urgent" => tp.severity_error,
+            "high" => tp.severity_warn,
+            _ => tp.status_accent,
+        }
+    });
+    let border_color = if focused {
+        crate::tui_theme::lerp_color(
+            crate::tui_theme::focus_border_color(&tp, true),
+            accent,
+            0.55,
+        )
+    } else {
+        crate::tui_theme::lerp_color(tp.panel_border_dim, accent, 0.30)
+    };
     let block = Block::default()
         .title(&detail_title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.08)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -2937,9 +3042,7 @@ fn render_detail_panel(
             None
         };
 
-        let body_str = if let Some(body) = cached_body {
-            body
-        } else {
+        let body_str = cached_body.unwrap_or_else(|| {
             let mut body_md = msg.body_md.clone();
             let image_block = build_inline_image_block(&msg.body_md, width);
             if !image_block.is_empty() {
@@ -2948,7 +3051,7 @@ fn render_detail_panel(
             }
             *cached = Some((msg.id, width, body_md.clone()));
             body_md
-        };
+        });
 
         let md_theme = crate::tui_theme::markdown_theme();
         crate::tui_markdown::render_body(&body_str, &md_theme)
@@ -3924,8 +4027,10 @@ mod tests {
         let _ = screen.update(&down, &state);
         assert!(matches!(screen.message_drag, MessageDragState::Pending(_)));
         if let MessageDragState::Pending(pending) = &mut screen.message_drag {
-            pending.started_at =
-                Instant::now() - MESSAGE_DRAG_HOLD_DELAY - Duration::from_millis(1);
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
         }
 
         screen.tick(1, &state);
@@ -3949,8 +4054,10 @@ mod tests {
         let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5);
         let _ = screen.update(&down, &state);
         if let MessageDragState::Pending(pending) = &mut screen.message_drag {
-            pending.started_at =
-                Instant::now() - MESSAGE_DRAG_HOLD_DELAY - Duration::from_millis(1);
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
         }
 
         let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 2, 6);
@@ -3980,8 +4087,10 @@ mod tests {
         let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5);
         let _ = screen.update(&down, &state);
         if let MessageDragState::Pending(pending) = &mut screen.message_drag {
-            pending.started_at =
-                Instant::now() - MESSAGE_DRAG_HOLD_DELAY - Duration::from_millis(1);
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
         }
 
         let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 2, 5);
@@ -4529,6 +4638,46 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(40, 10, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 40, 10), &state);
+    }
+
+    #[test]
+    fn narrow_tall_layout_keeps_detail_visible_with_stacked_fallback() {
+        let screen = MessageBrowserScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(60, 20, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 60, 20), &state);
+
+        let detail = screen.last_detail_area.get();
+        let content = screen.last_content_area.get();
+        assert!(
+            detail.width > 0 && detail.height > 0,
+            "stacked fallback should keep detail panel visible at 60x20"
+        );
+        assert_eq!(
+            detail.width, content.width,
+            "stacked fallback should preserve full-width detail panel"
+        );
+        assert!(
+            detail.y > content.y,
+            "stacked fallback detail should appear below list content"
+        );
+    }
+
+    #[test]
+    fn narrow_short_layout_hides_detail_when_vertical_space_is_too_small() {
+        let screen = MessageBrowserScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(60, 10, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 60, 10), &state);
+
+        let detail = screen.last_detail_area.get();
+        assert_eq!(
+            detail,
+            Rect::new(0, 0, 0, 0),
+            "detail should be hidden when narrow layout is too short for a usable stack"
+        );
     }
 
     #[test]

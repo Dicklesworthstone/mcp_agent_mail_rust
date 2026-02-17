@@ -727,6 +727,7 @@ impl DashboardScreen {
     /// - Optional trend panel (right rail)
     /// - Optional bottom rail (preview/query/activity)
     /// - Optional console log panel (bottom sidebar)
+    #[allow(clippy::fn_params_excessive_bools)]
     fn main_content_layout(
         show_trend_panel: bool,
         show_log_panel: bool,
@@ -1059,6 +1060,7 @@ impl MailScreen for DashboardScreen {
             .sample_values(now, self.reduced_motion || !self.chart_animations_enabled);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         let tc = TerminalClass::from_rect(area);
         let density = DensityHint::from_terminal_class(tc);
@@ -1576,6 +1578,43 @@ fn render_gradient_title(frame: &mut Frame<'_>, area: Rect, effects_enabled: boo
     Paragraph::new(line).render(title_area, frame);
 }
 
+const fn summary_tile_min_width(density: DensityHint) -> u16 {
+    match density {
+        DensityHint::Minimal | DensityHint::Compact => 9,
+        DensityHint::Normal => 11,
+        DensityHint::Detailed => 12,
+    }
+}
+
+fn summary_tile_grid_plan(
+    area: Rect,
+    tile_count: usize,
+    density: DensityHint,
+) -> (usize, usize, usize) {
+    if tile_count == 0 || area.width == 0 || area.height == 0 {
+        return (0, 0, 0);
+    }
+
+    let min_tile_w = summary_tile_min_width(density).max(1);
+    let max_cols = usize::from((area.width / min_tile_w).max(1));
+    let cols = max_cols.min(tile_count).max(1);
+    let row_budget = usize::from(area.height.max(1));
+    let mut rows = tile_count.div_ceil(cols);
+    if rows > row_budget {
+        rows = row_budget;
+    }
+
+    let visible_tiles = cols.saturating_mul(rows).min(tile_count);
+    (cols, rows, visible_tiles)
+}
+
+fn summary_overflow_label(total_tiles: usize, visible_tiles: usize) -> Option<String> {
+    if visible_tiles == 0 || total_tiles <= visible_tiles {
+        return None;
+    }
+    Some(format!("+{}", total_tiles - visible_tiles))
+}
+
 /// Render the summary band using `MetricTile` widgets.
 ///
 /// Adapts tile count to terminal density: 3 tiles at Minimal/Compact, up to 6 at Detailed.
@@ -1705,31 +1744,79 @@ fn render_summary_band(
         ],
     };
 
-    let max_tiles_by_width = usize::from((area.width / 12).max(1));
-    if tiles.len() > max_tiles_by_width {
-        tiles.truncate(max_tiles_by_width);
-    }
-
-    let tile_count = tiles.len();
-    if tile_count == 0 || area.width == 0 || area.height == 0 {
+    let total_tiles = tiles.len();
+    let (cols, rows, visible_tiles) = summary_tile_grid_plan(area, total_tiles, density);
+    if visible_tiles == 0 {
         return;
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let tile_w = area.width / tile_count as u16;
+    let overflow_label = summary_overflow_label(total_tiles, visible_tiles);
+    tiles.truncate(visible_tiles);
+    if let Some(label) = overflow_label.as_ref() {
+        let overflow_idx = visible_tiles.saturating_sub(1);
+        tiles[overflow_idx] = ("More", label.as_str(), MetricTrend::Flat, tp.text_muted);
+    }
 
-    for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+    #[allow(clippy::cast_possible_truncation)]
+    let rows_u16 = rows as u16;
+    let base_row_h = (area.height / rows_u16).max(1);
+    let mut rendered = 0usize;
+    let mut y = area.y;
+
+    for row_idx in 0..rows {
+        let remaining = visible_tiles.saturating_sub(rendered);
+        if remaining == 0 {
+            break;
+        }
+
+        let row_cols = cols.min(remaining);
         #[allow(clippy::cast_possible_truncation)]
-        let x = area.x + (i as u16) * tile_w;
-        let w = if i == tile_count - 1 {
-            area.width.saturating_sub(x - area.x)
+        let row_cols_u16 = row_cols as u16;
+        let row_h = if row_idx + 1 == rows {
+            area.height.saturating_sub(y.saturating_sub(area.y))
         } else {
-            tile_w
+            base_row_h
         };
-        let tile_area = Rect::new(x, area.y, w, area.height);
-        let tile = MetricTile::new(label, value, *trend)
-            .value_color(*color)
-            .sparkline_color(*color);
-        tile.render(tile_area, frame);
+        let mut x = area.x;
+        let base_col_w = (area.width / row_cols_u16).max(1);
+
+        for col_idx in 0..row_cols {
+            let w = if col_idx + 1 == row_cols {
+                area.width.saturating_sub(x.saturating_sub(area.x))
+            } else {
+                base_col_w
+            };
+            let tile_area = Rect::new(x, y, w, row_h);
+            let (label, value, trend, color) = tiles[rendered];
+            let mut tile = MetricTile::new(label, value, trend)
+                .value_color(color)
+                .sparkline_color(color);
+            if tile_area.height >= 3 && tile_area.width >= 12 {
+                let border_hint = match trend {
+                    MetricTrend::Up => tp.severity_ok,
+                    MetricTrend::Down => tp.severity_warn,
+                    MetricTrend::Flat => color,
+                };
+                tile = tile.block(
+                    Block::default()
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(crate::tui_theme::lerp_color(
+                            tp.panel_border,
+                            border_hint,
+                            0.55,
+                        )))
+                        .style(Style::default().bg(crate::tui_theme::lerp_color(
+                            tp.panel_bg,
+                            border_hint,
+                            0.08,
+                        ))),
+                );
+            }
+            tile.render(tile_area, frame);
+            rendered += 1;
+            x = x.saturating_add(w);
+        }
+
+        y = y.saturating_add(row_h);
     }
 }
 
@@ -1738,6 +1825,7 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
     if anomalies.is_empty() || area.width == 0 || area.height == 0 {
         return;
     }
+    let tp = crate::tui_theme::TuiThemePalette::current();
     // Adaptive card count: 1 on narrow terminals, up to 3 on wide.
     let max_cards = if area.width < 80 { 1 } else { 3 };
     let visible = anomalies.len().min(max_cards);
@@ -1752,10 +1840,39 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
             card_w
         };
         let card_area = Rect::new(x, area.y, w, area.height);
+        let accent = anomaly.severity.color();
         let card = AnomalyCard::new(anomaly.severity, anomaly.confidence, &anomaly.headline)
-            .rationale(&anomaly.rationale);
+            .rationale(&anomaly.rationale)
+            .selected(i == 0)
+            .block(
+                Block::default()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(crate::tui_theme::lerp_color(
+                        tp.panel_border,
+                        accent,
+                        0.62,
+                    )))
+                    .style(Style::default().bg(crate::tui_theme::lerp_color(
+                        tp.panel_bg,
+                        accent,
+                        0.08,
+                    ))),
+            );
         card.render(card_area, frame);
     }
+}
+
+fn accent_panel_block(title: &str, accent: PackedRgba) -> Block<'_> {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    Block::default()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::lerp_color(
+            tp.panel_border,
+            accent,
+            0.58,
+        )))
+        .style(Style::default().bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.07)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2956,10 +3073,7 @@ fn render_signal_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Signals · anomalies:{}", anomalies.len());
-    let block = Block::default()
-        .title(&title)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
+    let block = accent_panel_block(&title, tp.status_accent);
     let inner = block.inner(area);
     block.render(area, frame);
     if inner.width == 0 || inner.height == 0 {
@@ -3127,10 +3241,7 @@ fn render_tool_latency_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Tool Latency · {}", by_tool.len());
-    let block = Block::default()
-        .title(&title)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
+    let block = accent_panel_block(&title, tp.metric_latency);
     let inner = block.inner(area);
     block.render(area, frame);
     if inner.width == 0 || inner.height == 0 {
@@ -3949,18 +4060,10 @@ fn render_trend_panel(
     if percentile_history.len() >= 2 {
         let ribbon = PercentileRibbon::new(percentile_history)
             .label("Latency")
-            .block(
-                Block::default()
-                    .title("Latency P50/P95/P99")
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(tp.panel_border)),
-            );
+            .block(accent_panel_block("Latency P50/P95/P99", tp.metric_latency));
         ribbon.render(ribbon_area, frame);
     } else {
-        let block = Block::default()
-            .title("Latency (collecting...)")
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
+        let block = accent_panel_block("Latency (collecting...)", tp.metric_latency);
         Paragraph::new("Awaiting data...")
             .block(block)
             .render(ribbon_area, frame);
@@ -3968,10 +4071,7 @@ fn render_trend_panel(
 
     // Throughput LineChart (br-3q8v0: replaced Sparkline with ftui_extras LineChart)
     if throughput_history.len() >= 2 {
-        let block = Block::default()
-            .title("Throughput (req/interval)")
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
+        let block = accent_panel_block("Throughput (req/interval)", tp.metric_requests);
         let inner = block.inner(activity_area);
         block.render(activity_area, frame);
 
@@ -4004,10 +4104,7 @@ fn render_trend_panel(
             chart.render(inner, frame);
         }
     } else {
-        let block = Block::default()
-            .title("Throughput (collecting...)")
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
+        let block = accent_panel_block("Throughput (collecting...)", tp.metric_requests);
         Paragraph::new("Awaiting data...")
             .block(block)
             .render(activity_area, frame);
@@ -4055,10 +4152,7 @@ const fn heatmap_kind_index(kind: MailEventKind) -> usize {
 )]
 fn render_activity_heatmap(frame: &mut Frame<'_>, area: Rect, event_log: &VecDeque<EventEntry>) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Activity Heatmap")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
+    let block = accent_panel_block("Activity Heatmap", tp.metric_messages);
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -4185,10 +4279,7 @@ fn render_recent_message_preview_panel(
     }
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .title("Recent Message Preview")
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
+    let block = accent_panel_block("Recent Message Preview", tp.metric_messages);
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -4243,7 +4334,7 @@ fn pulsing_severity_badge(
 }
 
 /// Render the scrollable event log.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_event_log(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -6323,6 +6414,45 @@ mod tests {
         // Compact: Msg, Locks, Req.
         let compact_labels = ["Msg", "Locks", "Req"];
         assert_eq!(compact_labels[0], "Msg", "messages must lead in compact");
+    }
+
+    #[test]
+    fn summary_tile_grid_plan_wraps_when_width_is_tight() {
+        let (cols, rows, visible) =
+            summary_tile_grid_plan(Rect::new(0, 0, 40, 2), 8, DensityHint::Detailed);
+        assert_eq!(cols, 3);
+        assert_eq!(rows, 2);
+        assert_eq!(visible, 6);
+    }
+
+    #[test]
+    fn summary_tile_grid_plan_stays_single_row_when_width_is_wide() {
+        let (cols, rows, visible) =
+            summary_tile_grid_plan(Rect::new(0, 0, 160, 2), 8, DensityHint::Detailed);
+        assert_eq!(cols, 8);
+        assert_eq!(rows, 1);
+        assert_eq!(visible, 8);
+    }
+
+    #[test]
+    fn summary_tile_grid_plan_handles_empty_area() {
+        let (cols, rows, visible) =
+            summary_tile_grid_plan(Rect::new(0, 0, 0, 0), 8, DensityHint::Normal);
+        assert_eq!(cols, 0);
+        assert_eq!(rows, 0);
+        assert_eq!(visible, 0);
+    }
+
+    #[test]
+    fn summary_overflow_label_none_when_all_tiles_visible() {
+        assert_eq!(summary_overflow_label(8, 8), None);
+        assert_eq!(summary_overflow_label(8, 9), None);
+        assert_eq!(summary_overflow_label(8, 0), None);
+    }
+
+    #[test]
+    fn summary_overflow_label_reports_hidden_tile_count() {
+        assert_eq!(summary_overflow_label(12, 7), Some("+5".to_string()));
     }
 
     // ── Event salience tests ────────────────────────────────────

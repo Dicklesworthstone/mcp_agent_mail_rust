@@ -46,7 +46,7 @@ pub struct ProjectsScreen {
     last_seq: u64,
     /// Per-project last activity timestamp (slug → micros).
     project_activity: HashMap<String, i64>,
-    /// Previous totals for MetricTrend computation.
+    /// Previous totals for `MetricTrend` computation.
     prev_totals: (u64, u64, u64, u64),
 }
 
@@ -283,7 +283,7 @@ impl MailScreen for ProjectsScreen {
         // Layout: summary_band(2) + header(1) + table(remainder) + footer(1)
         let summary_h: u16 = if area.height >= 8 { 2 } else { 0 };
         let header_h: u16 = 1;
-        let footer_h: u16 = if area.height >= 6 { 1 } else { 0 };
+        let footer_h = u16::from(area.height >= 6);
         let table_h = area
             .height
             .saturating_sub(summary_h)

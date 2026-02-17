@@ -295,11 +295,11 @@ where
         self.visual_mode
     }
 
-    pub fn set_visual_mode(&mut self, enabled: bool) {
+    pub const fn set_visual_mode(&mut self, enabled: bool) {
         self.visual_mode = enabled;
     }
 
-    pub fn toggle_visual_mode(&mut self) -> bool {
+    pub const fn toggle_visual_mode(&mut self) -> bool {
         self.visual_mode = !self.visual_mode;
         self.visual_mode
     }

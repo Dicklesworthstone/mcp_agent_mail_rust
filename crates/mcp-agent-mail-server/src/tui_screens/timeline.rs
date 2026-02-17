@@ -307,7 +307,7 @@ enum TimelineSelectionKey {
 }
 
 impl TimelineSelectionKey {
-    fn for_event(entry: &TimelineEntry) -> Self {
+    const fn for_event(entry: &TimelineEntry) -> Self {
         Self::Event { seq: entry.seq }
     }
 
@@ -705,10 +705,10 @@ impl TimelineScreen {
     }
 
     #[cfg(test)]
-    fn with_filter_presets_path_for_test(path: PathBuf) -> Self {
+    fn with_filter_presets_path_for_test(path: &Path) -> Self {
         let mut screen = Self::build(DockLayout::right_40(), None);
-        screen.filter_presets_path = path.clone();
-        screen.filter_presets = load_screen_filter_presets_or_default(&path);
+        screen.filter_presets_path = path.to_path_buf();
+        screen.filter_presets = load_screen_filter_presets_or_default(path);
         screen
     }
 
@@ -753,12 +753,12 @@ impl TimelineScreen {
         self.pane.cursor = (self.pane.cursor + n).min(max);
     }
 
-    fn cursor_up(&mut self, n: usize) {
+    const fn cursor_up(&mut self, n: usize) {
         self.pane.cursor = self.pane.cursor.saturating_sub(n);
         self.pane.follow = false;
     }
 
-    fn cursor_home(&mut self) {
+    const fn cursor_home(&mut self) {
         self.pane.cursor = 0;
         self.pane.follow = false;
     }
@@ -921,7 +921,7 @@ impl TimelineScreen {
 
         // Spawn the heavy git work on a background thread.
         let (tx, rx) = std::sync::mpsc::channel();
-        let storage_root = cfg.storage_root.clone();
+        let storage_root = cfg.storage_root;
         std::thread::Builder::new()
             .name("timeline-commit-refresh".to_string())
             .spawn(move || {
@@ -951,19 +951,23 @@ impl TimelineScreen {
                     commits.drain(..keep_from);
                 }
 
-                let mut stats = CommitTimelineStats::from_entries(&commits, refresh_errors);
+                let mut commit_stats = CommitTimelineStats::from_entries(&commits, refresh_errors);
                 let churn_limit = commits.len().max(COMMIT_LIMIT_PER_PROJECT);
                 match mcp_agent_mail_storage::get_recent_commits_extended(root, churn_limit) {
                     Ok(churn_rows) => {
-                        stats.churn_insertions = churn_rows.iter().map(|c| c.insertions).sum();
-                        stats.churn_deletions = churn_rows.iter().map(|c| c.deletions).sum();
+                        commit_stats.churn_insertions =
+                            churn_rows.iter().map(|c| c.insertions).sum();
+                        commit_stats.churn_deletions = churn_rows.iter().map(|c| c.deletions).sum();
                     }
                     Err(_) => {
-                        stats.refresh_errors = stats.refresh_errors.saturating_add(1);
+                        commit_stats.refresh_errors = commit_stats.refresh_errors.saturating_add(1);
                     }
                 }
 
-                let _ = tx.send(CommitRefreshResult { commits, stats });
+                let _ = tx.send(CommitRefreshResult {
+                    commits,
+                    stats: commit_stats,
+                });
             })
             .ok();
         self.commit_refresh_rx = Some(rx);
@@ -1047,7 +1051,7 @@ impl TimelineScreen {
         values
     }
 
-    fn save_named_preset(&mut self, name: String, description: Option<String>) -> bool {
+    fn save_named_preset(&mut self, name: &str, description: Option<String>) -> bool {
         let trimmed_name = name.trim();
         if trimmed_name.is_empty() {
             return false;
@@ -1162,10 +1166,9 @@ impl TimelineScreen {
                 }
             },
             KeyCode::Enter => {
-                if self.save_named_preset(
-                    self.save_preset_name.clone(),
-                    Some(self.save_preset_description.clone()),
-                ) {
+                let preset_name = self.save_preset_name.clone();
+                if self.save_named_preset(&preset_name, Some(self.save_preset_description.clone()))
+                {
                     self.preset_dialog_mode = PresetDialogMode::None;
                 }
             }
@@ -1224,6 +1227,7 @@ impl Default for TimelineScreen {
 }
 
 impl MailScreen for TimelineScreen {
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         let dock_before = self.dock;
         match event {
@@ -2013,6 +2017,7 @@ fn render_load_preset_dialog(frame: &mut Frame<'_>, area: Rect, names: &[String]
 }
 
 /// Render the timeline pane into the given area using `VirtualizedList`.
+#[allow(clippy::too_many_arguments)]
 fn render_timeline(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2098,6 +2103,7 @@ fn render_timeline(
     StatefulWidget::render(&list, inner_area, frame, list_state);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_commit_timeline(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2153,6 +2159,7 @@ fn render_commit_timeline(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_combined_timeline(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2237,8 +2244,7 @@ fn render_virtualized_rows<T: RenderItem>(
     let inner_area = block.inner(area);
     block.render(area, frame);
 
-    let mut list_area = inner_area;
-    if let Some(summary) = summary_line.filter(|line| !line.is_empty()) {
+    let list_area = if let Some(summary) = summary_line.filter(|line| !line.is_empty()) {
         if inner_area.height == 0 {
             return;
         }
@@ -2249,13 +2255,15 @@ fn render_virtualized_rows<T: RenderItem>(
             summary_style,
         ))))
         .render(summary_area, frame);
-        list_area = Rect::new(
+        Rect::new(
             inner_area.x,
             inner_area.y.saturating_add(1),
             inner_area.width,
             inner_area.height.saturating_sub(1),
-        );
-    }
+        )
+    } else {
+        inner_area
+    };
 
     if list_area.height == 0 {
         return;
@@ -4411,15 +4419,12 @@ mod tests {
     fn timeline_presets_save_load_delete_lifecycle() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("screen_filter_presets.json");
-        let mut screen = TimelineScreen::with_filter_presets_path_for_test(path.clone());
+        let mut screen = TimelineScreen::with_filter_presets_path_for_test(&path);
 
         screen.pane.verbosity = VerbosityTier::Minimal;
         screen.pane.kind_filter.insert(MailEventKind::HttpRequest);
         screen.pane.source_filter.insert(EventSource::Http);
-        assert!(screen.save_named_preset(
-            "Errors".to_string(),
-            Some("Only error-ish traffic".to_string())
-        ));
+        assert!(screen.save_named_preset("Errors", Some("Only error-ish traffic".to_string())));
 
         assert!(path.exists());
         let loaded = crate::tui_persist::load_screen_filter_presets(&path).expect("load presets");
@@ -4451,7 +4456,7 @@ mod tests {
     fn ctrl_shortcuts_drive_save_and_load_dialogs() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("screen_filter_presets.json");
-        let mut screen = TimelineScreen::with_filter_presets_path_for_test(path);
+        let mut screen = TimelineScreen::with_filter_presets_path_for_test(&path);
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
         let ctrl_s =

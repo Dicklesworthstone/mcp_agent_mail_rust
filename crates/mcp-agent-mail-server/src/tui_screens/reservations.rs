@@ -21,6 +21,8 @@ use crate::tui_action_menu::{ActionEntry, reservations_actions, reservations_bat
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{DbStatSnapshot, MailEvent, ReservationSnapshot};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
+use crate::tui_widgets::fancy::SummaryFooter;
+use crate::tui_widgets::{MetricTile, MetricTrend};
 
 const COL_AGENT: usize = 0;
 const COL_PATH: usize = 1;
@@ -119,6 +121,8 @@ pub struct ReservationsScreen {
     fallback_issue: Option<String>,
     /// Tick index of the last direct fallback probe.
     last_fallback_probe_tick: u64,
+    /// Previous summary counts for `MetricTrend` computation.
+    prev_counts: (u64, u64, u64, u64),
 }
 
 impl ReservationsScreen {
@@ -140,6 +144,7 @@ impl ReservationsScreen {
             last_table_area: Cell::new(Rect::new(0, 0, 0, 0)),
             fallback_issue: None,
             last_fallback_probe_tick: 0,
+            prev_counts: (0, 0, 0, 0),
         }
     }
 
@@ -536,6 +541,84 @@ impl ReservationsScreen {
         (active, exclusive, shared, expired)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (active, exclusive, shared, expired) = self.summary_counts();
+        let (prev_active, prev_excl, prev_shared, prev_expired) = self.prev_counts;
+
+        let active_str = active.to_string();
+        let excl_str = exclusive.to_string();
+        let shared_str = shared.to_string();
+        let expired_str = expired.to_string();
+
+        let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = vec![
+            (
+                "Active",
+                &active_str,
+                trend_for(active as u64, prev_active),
+                tp.ttl_healthy,
+            ),
+            (
+                "Exclusive",
+                &excl_str,
+                trend_for(exclusive as u64, prev_excl),
+                tp.metric_reservations,
+            ),
+            (
+                "Shared",
+                &shared_str,
+                trend_for(shared as u64, prev_shared),
+                tp.metric_agents,
+            ),
+            (
+                "Expired",
+                &expired_str,
+                trend_for(expired as u64, prev_expired),
+                tp.ttl_danger,
+            ),
+        ];
+
+        let tile_count = tiles.len();
+        if tile_count == 0 || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let tile_w = area.width / tile_count as u16;
+
+        for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+            let x = area.x + (i as u16) * tile_w;
+            let w = if i == tile_count - 1 {
+                area.width.saturating_sub(x - area.x)
+            } else {
+                tile_w
+            };
+            let tile_area = Rect::new(x, area.y, w, area.height);
+            let tile = MetricTile::new(label, value, *trend)
+                .value_color(*color)
+                .sparkline_color(*color);
+            tile.render(tile_area, frame);
+        }
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (active, exclusive, shared, expired) = self.summary_counts();
+
+        let active_str = active.to_string();
+        let excl_str = exclusive.to_string();
+        let shared_str = shared.to_string();
+        let expired_str = expired.to_string();
+
+        let items: Vec<(&str, &str, PackedRgba)> = vec![
+            (&*active_str, "active", tp.ttl_healthy),
+            (&*excl_str, "exclusive", tp.metric_reservations),
+            (&*shared_str, "shared", tp.metric_agents),
+            (&*expired_str, "expired", tp.ttl_danger),
+        ];
+
+        SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+    }
+
     fn row_index_from_mouse(&self, x: u16, y: u16) -> Option<usize> {
         let table = self.last_table_area.get();
         if table.width < 3 || table.height < 4 {
@@ -653,6 +736,9 @@ impl MailScreen for ReservationsScreen {
             changed |= self.refresh_from_db_fallback(state);
         }
         if changed || tick_count % 10 == 0 {
+            // Save previous counts for trend computation before rebuild
+            let (a, e, s, x) = self.summary_counts();
+            self.prev_counts = (a as u64, e as u64, s as u64, x as u64);
             self.rebuild_sorted();
         }
         self.sync_focused_event();
@@ -700,7 +786,7 @@ impl MailScreen for ReservationsScreen {
         Some((actions, anchor_row, context_id))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 3 || area.width < 30 {
             self.last_table_area.set(Rect::new(0, 0, 0, 0));
@@ -710,12 +796,31 @@ impl MailScreen for ReservationsScreen {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let effects_enabled = state.config_snapshot().tui_effects;
         let animation_time = state.uptime().as_secs_f64();
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
 
-        let header_h = 1_u16;
-        let table_h = area.height.saturating_sub(header_h);
-        let header_area = Rect::new(area.x, area.y, area.width, header_h);
-        let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
-        self.last_table_area.set(table_area);
+        // Layout: summary_band(2) + header(1) + table(remainder) + footer(1)
+        let summary_h: u16 = if area.height >= 10 { 2 } else { 0 };
+        let header_h: u16 = 1;
+        let footer_h = u16::from(area.height >= 6);
+        let table_h = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
+
+        let mut y = area.y;
+
+        // ── Summary band (MetricTile row) ──────────────────────────────
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        // ── Info header ────────────────────────────────────────────────
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
 
         // Summary line
         let (active, exclusive, shared, expired) = self.summary_counts();
@@ -774,9 +879,50 @@ impl MailScreen for ReservationsScreen {
             }
         }
 
-        // Table rows
-        let header = Row::new(["Agent", "Path Pattern", "Excl", "TTL Remaining", "Project"])
-            .style(Style::default().bold());
+        // ── Table ──────────────────────────────────────────────────────
+        let table_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
+        self.last_table_area.set(table_area);
+
+        // Responsive column headers and widths
+        let (header_cells, col_widths): (Vec<&str>, Vec<Constraint>) = if narrow {
+            // < 80: hide Project column, compact
+            (
+                vec!["Agent", "Path Pattern", "Excl", "TTL Remaining"],
+                vec![
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(38.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(30.0),
+                ],
+            )
+        } else if wide {
+            // >= 120: all 5 columns
+            (
+                vec!["Agent", "Path Pattern", "Excl", "TTL Remaining", "Project"],
+                vec![
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(27.0),
+                    Constraint::Percentage(8.0),
+                    Constraint::Percentage(30.0),
+                    Constraint::Percentage(17.0),
+                ],
+            )
+        } else {
+            // 80–119: all 5, reduced Path
+            (
+                vec!["Agent", "Path Pattern", "Excl", "TTL Remaining", "Project"],
+                vec![
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(8.0),
+                    Constraint::Percentage(32.0),
+                    Constraint::Percentage(20.0),
+                ],
+            )
+        };
+
+        let header = Row::new(header_cells).style(Style::default().bold());
         let db_active_total = state
             .db_stats_snapshot()
             .and_then(|snapshot| usize::try_from(snapshot.file_reservations).ok())
@@ -820,16 +966,28 @@ impl MailScreen for ReservationsScreen {
                     Style::default()
                 };
 
-                Some(
-                    Row::new([
-                        res.agent.clone(),
-                        format!("{checkbox} {}", res.path_pattern),
-                        excl_str.to_string(),
-                        ttl_text,
-                        res.project.clone(),
-                    ])
-                    .style(style),
-                )
+                if narrow {
+                    Some(
+                        Row::new([
+                            res.agent.clone(),
+                            format!("{checkbox} {}", res.path_pattern),
+                            excl_str.to_string(),
+                            ttl_text,
+                        ])
+                        .style(style),
+                    )
+                } else {
+                    Some(
+                        Row::new([
+                            res.agent.clone(),
+                            format!("{checkbox} {}", res.path_pattern),
+                            excl_str.to_string(),
+                            ttl_text,
+                            res.project.clone(),
+                        ])
+                        .style(style),
+                    )
+                }
             })
             .collect();
 
@@ -838,18 +996,10 @@ impl MailScreen for ReservationsScreen {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
         let inner = block.inner(table_area);
-        let width_cells = compute_table_widths(inner.width);
-        let widths = [
-            Constraint::Fixed(width_cells[COL_AGENT]),
-            Constraint::Fixed(width_cells[COL_PATH]),
-            Constraint::Fixed(width_cells[COL_EXCLUSIVE]),
-            Constraint::Fixed(width_cells[COL_TTL]),
-            Constraint::Fixed(width_cells[COL_PROJECT]),
-        ];
         let rows_empty = rows.is_empty();
         let row_mismatch = rows_empty && !self.show_released && db_active_total > 0;
 
-        let table = Table::new(rows, widths)
+        let table = Table::new(rows, col_widths)
             .header(header)
             .block(block)
             .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
@@ -857,7 +1007,9 @@ impl MailScreen for ReservationsScreen {
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);
         self.last_render_offset.set(ts.offset);
-        render_ttl_overlays(frame, table_area, &ttl_overlay_rows, ts.offset, &tp);
+        if !narrow {
+            render_ttl_overlays(frame, table_area, &ttl_overlay_rows, ts.offset, &tp);
+        }
         if rows_empty && inner.height > 1 && inner.width > 4 {
             let text = if row_mismatch {
                 let mut message = format!(
@@ -889,6 +1041,12 @@ impl MailScreen for ReservationsScreen {
                 ),
                 frame,
             );
+        }
+
+        // ── Footer summary ─────────────────────────────────────────────
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
         }
     }
 
@@ -1082,6 +1240,16 @@ fn format_ttl(secs: u64) -> String {
         format!("{}m left", secs / 60)
     } else {
         format!("{}h left", secs / 3600)
+    }
+}
+
+const fn trend_for(current: u64, previous: u64) -> MetricTrend {
+    if current > previous {
+        MetricTrend::Up
+    } else if current < previous {
+        MetricTrend::Down
+    } else {
+        MetricTrend::Flat
     }
 }
 
