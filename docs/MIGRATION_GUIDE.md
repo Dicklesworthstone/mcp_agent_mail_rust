@@ -22,6 +22,30 @@ environment variable or flag to override it.
 
 ---
 
+## Legacy Python Data Import
+
+If you are upgrading an existing Python-era installation with mailbox data,
+use the dedicated legacy import runbook:
+
+- `docs/RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md`
+
+Quick path:
+
+```bash
+am legacy detect --json
+am legacy import --auto --dry-run --yes
+am legacy import --auto --yes
+am legacy status --json
+```
+
+Or run the orchestrated upgrade command:
+
+```bash
+am upgrade --yes
+```
+
+---
+
 ## Before/After Command Mapping
 
 ### Starting the server

@@ -12,6 +12,7 @@ use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui_extras::charts::{BarChart, BarDirection, BarGroup, Sparkline};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::{
     AnomalyAlert, AnomalyKind, AnomalySeverity, InsightCard, InsightFeed, build_insight_feed,
@@ -35,6 +36,26 @@ const ANALYTICS_WIDE_LIST_RATIO_PERCENT: u16 = 38;
 const ANALYTICS_WIDE_LIST_MIN_WIDTH: u16 = 34;
 const ANALYTICS_WIDE_DETAIL_MIN_WIDTH: u16 = 42;
 const ANALYTICS_STATUS_STRIP_MIN_HEIGHT: u16 = 7;
+const ANALYTICS_VIZ_TOP_TOOLS: usize = 8;
+const ANALYTICS_VIZ_BAND_MIN_HEIGHT: u16 = 18;
+const ANALYTICS_VIZ_BAND_MIN: u16 = 9;
+const ANALYTICS_VIZ_BAND_MAX: u16 = 16;
+const ANALYTICS_VIZ_BAND_HEIGHT_PERCENT: u16 = 34;
+
+#[derive(Debug, Clone, Default)]
+struct AnalyticsVizSnapshot {
+    total_calls: u64,
+    total_errors: u64,
+    active_tools: usize,
+    slow_tools: usize,
+    avg_latency_ms: f64,
+    p95_latency_ms: f64,
+    p99_latency_ms: f64,
+    persisted_samples: u64,
+    top_call_tools: Vec<(String, f64)>,
+    top_latency_tools: Vec<(String, f64)>,
+    sparkline: Vec<f64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalyticsSeverityFilter {
@@ -152,8 +173,17 @@ impl AnalyticsScreen {
                 let persisted = build_persisted_insight_feed(state);
                 if !persisted.cards.is_empty() {
                     self.feed = persisted;
+                } else {
+                    self.feed = build_runtime_insight_feed(state);
                 }
             }
+        }
+        if self.feed.cards.is_empty() {
+            self.feed = InsightFeed {
+                cards: vec![build_bootstrap_card()],
+                alerts_processed: 0,
+                cards_produced: 1,
+            };
         }
         self.clamp_selected_to_active_cards();
     }
@@ -543,6 +573,226 @@ fn build_persisted_insight_feed(state: &TuiSharedState) -> InsightFeed {
     build_persisted_insight_feed_from_rows(&rows, persisted_samples)
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
+    let cfg = state.config_snapshot();
+    let snapshots = mcp_agent_mail_tools::tool_metrics_snapshot_full();
+    let persisted_samples = crate::tool_metrics::persisted_metric_store_size(&cfg.raw_database_url);
+
+    let active_tools = snapshots.iter().filter(|entry| entry.calls > 0).count();
+    let slow_tools = snapshots
+        .iter()
+        .filter(|entry| entry.latency.as_ref().is_some_and(|lat| lat.is_slow))
+        .count();
+    let total_calls = snapshots.iter().map(|entry| entry.calls).sum::<u64>();
+    let total_errors = snapshots.iter().map(|entry| entry.errors).sum::<u64>();
+
+    let mut weighted_latency_sum = 0.0_f64;
+    let mut weighted_latency_calls = 0.0_f64;
+    let mut p95_latency_ms = 0.0_f64;
+    let mut p99_latency_ms = 0.0_f64;
+    for entry in &snapshots {
+        if let Some(latency) = &entry.latency {
+            p95_latency_ms = p95_latency_ms.max(latency.p95_ms);
+            p99_latency_ms = p99_latency_ms.max(latency.p99_ms);
+            if entry.calls > 0 {
+                weighted_latency_sum += latency.avg_ms * entry.calls as f64;
+                weighted_latency_calls += entry.calls as f64;
+            }
+        }
+    }
+    let avg_latency_ms = if weighted_latency_calls > 0.0 {
+        weighted_latency_sum / weighted_latency_calls
+    } else {
+        0.0
+    };
+
+    let mut call_rank = snapshots.clone();
+    call_rank.sort_by(|left, right| {
+        right
+            .calls
+            .cmp(&left.calls)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let top_call_tools = call_rank
+        .iter()
+        .take(ANALYTICS_VIZ_TOP_TOOLS)
+        .map(|entry| (entry.name.clone(), entry.calls as f64))
+        .collect::<Vec<_>>();
+
+    let mut latency_rank = snapshots
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .latency
+                .as_ref()
+                .map(|latency| (entry.name.clone(), latency.p95_ms))
+        })
+        .collect::<Vec<_>>();
+    latency_rank.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let top_latency_tools = latency_rank
+        .into_iter()
+        .take(ANALYTICS_VIZ_TOP_TOOLS)
+        .collect::<Vec<_>>();
+
+    let mut sparkline = state.sparkline_snapshot();
+    if sparkline.len() > 90 {
+        sparkline = sparkline[sparkline.len() - 90..].to_vec();
+    }
+    if sparkline.is_empty() {
+        sparkline = top_latency_tools.iter().map(|(_, value)| *value).collect();
+    }
+    if sparkline.is_empty() {
+        sparkline = vec![0.0];
+    }
+
+    AnalyticsVizSnapshot {
+        total_calls,
+        total_errors,
+        active_tools,
+        slow_tools,
+        avg_latency_ms,
+        p95_latency_ms,
+        p99_latency_ms,
+        persisted_samples,
+        top_call_tools,
+        top_latency_tools,
+        sparkline,
+    }
+}
+
+fn build_runtime_insight_feed(state: &TuiSharedState) -> InsightFeed {
+    let snapshot = build_runtime_viz_snapshot(state);
+    let mut alerts = Vec::new();
+
+    let error_rate = if snapshot.total_calls > 0 {
+        (snapshot.total_errors as f64 / snapshot.total_calls as f64) * 100.0
+    } else {
+        0.0
+    };
+    if snapshot.total_errors > 0 {
+        let severity = if error_rate >= 8.0 {
+            AnomalySeverity::Critical
+        } else if error_rate >= 3.0 {
+            AnomalySeverity::High
+        } else {
+            AnomalySeverity::Medium
+        };
+        alerts.push(AnomalyAlert {
+            kind: AnomalyKind::ErrorRateSpike,
+            severity,
+            score: (error_rate / 100.0).clamp(0.1, 1.0),
+            current_value: error_rate,
+            threshold: 1.0,
+            baseline_value: Some(0.5),
+            explanation: format!(
+                "runtime error rate {:.2}% across {} calls",
+                error_rate, snapshot.total_calls
+            ),
+            suggested_action: "Inspect failing tools in Tool Metrics.".to_string(),
+        });
+    }
+
+    if snapshot.p95_latency_ms >= 220.0 {
+        let severity = if snapshot.p95_latency_ms >= 1_000.0 {
+            AnomalySeverity::Critical
+        } else if snapshot.p95_latency_ms >= 500.0 {
+            AnomalySeverity::High
+        } else {
+            AnomalySeverity::Medium
+        };
+        alerts.push(AnomalyAlert {
+            kind: AnomalyKind::LatencySpike,
+            severity,
+            score: (snapshot.p95_latency_ms / 1_000.0).clamp(0.1, 1.0),
+            current_value: snapshot.p95_latency_ms,
+            threshold: 220.0,
+            baseline_value: Some(snapshot.avg_latency_ms),
+            explanation: format!(
+                "runtime p95 {:.1}ms, p99 {:.1}ms, avg {:.1}ms",
+                snapshot.p95_latency_ms, snapshot.p99_latency_ms, snapshot.avg_latency_ms
+            ),
+            suggested_action: "Open top latency tools and compare with recent throughput."
+                .to_string(),
+        });
+    }
+
+    if let Some((tool, p95)) = snapshot.top_latency_tools.first() {
+        alerts.push(AnomalyAlert {
+            kind: AnomalyKind::LatencySpike,
+            severity: if *p95 >= 800.0 {
+                AnomalySeverity::High
+            } else {
+                AnomalySeverity::Low
+            },
+            score: (p95 / 1_000.0).clamp(0.08, 0.9),
+            current_value: *p95,
+            threshold: 250.0,
+            baseline_value: Some(snapshot.avg_latency_ms.max(1.0)),
+            explanation: format!("hottest tool: {tool} at p95 {p95:.1}ms"),
+            suggested_action: "Drill into the hottest tool latency timeline.".to_string(),
+        });
+    }
+
+    if alerts.is_empty() {
+        let lead = snapshot
+            .top_call_tools
+            .first()
+            .map_or_else(|| "none".to_string(), |(name, calls)| format!("{name} ({calls:.0})"));
+        alerts.push(AnomalyAlert {
+            kind: AnomalyKind::MessageVolumeDrop,
+            severity: AnomalySeverity::Low,
+            score: 0.2,
+            current_value: snapshot.total_calls as f64,
+            threshold: 1.0,
+            baseline_value: Some((snapshot.total_calls as f64).max(1.0)),
+            explanation: format!(
+                "runtime telemetry healthy: {} active tools, lead volume {}",
+                snapshot.active_tools, lead
+            ),
+            suggested_action: "Use this panel as baseline and watch for deltas.".to_string(),
+        });
+    }
+
+    build_insight_feed(&alerts, &[], &[])
+}
+
+fn build_bootstrap_card() -> InsightCard {
+    let primary_alert = AnomalyAlert {
+        kind: AnomalyKind::MessageVolumeDrop,
+        severity: AnomalySeverity::Low,
+        score: 0.42,
+        current_value: 0.0,
+        threshold: 1.0,
+        baseline_value: Some(1.0),
+        explanation: "Telemetry stream initialized; awaiting richer runtime variance."
+            .to_string(),
+        suggested_action: "Keep the analytics panel open while tools execute.".to_string(),
+    };
+    InsightCard {
+        id: "analytics-bootstrap".to_string(),
+        confidence: 0.42,
+        severity: AnomalySeverity::Low,
+        headline: "Telemetry stream initialized".to_string(),
+        rationale: "Waiting for enough runtime variance to emit stronger anomaly cards."
+            .to_string(),
+        likely_cause: Some("No significant drift detected yet".to_string()),
+        next_steps: vec![
+            "Keep this screen open while tools execute.".to_string(),
+            "Use 'r' to force refresh after burst activity.".to_string(),
+        ],
+        deep_links: vec!["screen:tool_metrics".to_string(), "screen:dashboard".to_string()],
+        primary_alert,
+        supporting_trends: Vec::new(),
+        supporting_correlations: Vec::new(),
+    }
+}
+
 /// Render the severity summary band above the card list.
 fn render_severity_summary(frame: &mut Frame<'_>, area: Rect, feed: &InsightFeed) {
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -579,6 +829,7 @@ fn render_severity_summary(frame: &mut Frame<'_>, area: Rect, feed: &InsightFeed
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn render_card_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -592,12 +843,14 @@ fn render_card_list(
     focus: AnalyticsFocus,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let header_bg = crate::tui_theme::lerp_color(tp.bg_surface, tp.bg_overlay, 0.2);
     let compact_columns = area.width < 62;
     let narrow_columns = area.width < 84;
     let header = if compact_columns {
-        Row::new(vec![" ", "Sev", "Headline"]).style(crate::tui_theme::text_title(&tp))
+        Row::new(vec![" ", "Sev", "Headline"]).style(crate::tui_theme::text_title(&tp).bg(header_bg))
     } else {
-        Row::new(vec![" ", "Sev", "Conf", "Headline"]).style(crate::tui_theme::text_title(&tp))
+        Row::new(vec![" ", "Sev", "Conf", "Headline"])
+            .style(crate::tui_theme::text_title(&tp).bg(header_bg))
     };
 
     let rows: Vec<Row> = cards
@@ -607,10 +860,15 @@ fn render_card_list(
             let sev_text = severity_badge(card.severity);
             let conf_text = format!("{:3.0}%", card.confidence * 100.0);
             let border_char = "\u{2590}"; // ▐ colored left border
+            let row_bg = if i % 2 == 0 {
+                crate::tui_theme::lerp_color(tp.bg_surface, tp.bg_overlay, 0.08)
+            } else {
+                crate::tui_theme::lerp_color(tp.bg_surface, tp.bg_overlay, 0.18)
+            };
             let style = if i == selected {
                 severity_style(card.severity).bg(tp.selection_bg)
             } else {
-                severity_style(card.severity)
+                severity_style(card.severity).bg(row_bg)
             };
             if compact_columns {
                 Row::new(vec![
@@ -881,6 +1139,7 @@ fn render_compact_detail_hint(frame: &mut Frame<'_>, area: Rect, card: &InsightC
         .render(area, frame);
 }
 
+#[allow(dead_code)]
 fn render_filtered_empty_state(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -920,6 +1179,7 @@ fn render_filtered_empty_state(
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
 }
 
+#[allow(dead_code)]
 fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
     use ftui::text::{Line, Span, Text};
 
@@ -981,6 +1241,290 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
 
     let text = Text::from_lines(lines);
     Paragraph::new(text).render(inner, frame);
+}
+
+fn render_viz_metric_tile(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    value: &str,
+    color: PackedRgba,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::new()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.is_empty() {
+        return;
+    }
+    Paragraph::new(value)
+        .style(crate::tui_theme::text_primary(&tp).bold())
+        .render(inner, frame);
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+fn render_runtime_viz_fallback(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiSharedState,
+    focus: AnalyticsFocus,
+    filter: AnalyticsSeverityFilter,
+    sort_mode: AnalyticsSortMode,
+) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let snapshot = build_runtime_viz_snapshot(state);
+    let title = format!(
+        " Analytics Data Viz · {} · {} · {} ",
+        focus.label(),
+        filter.label(),
+        sort_mode.label()
+    );
+    let shell = Block::new()
+        .title(title.as_str())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border_focused));
+    let inner = shell.inner(area);
+    shell.render(area, frame);
+    if inner.width < 8 || inner.height < 5 {
+        return;
+    }
+
+    if inner.height < 10 {
+        let compact = format!(
+            "calls:{}  errors:{}  avg:{:.1}ms  p95:{:.1}ms  p99:{:.1}ms  tools:{} active / {} slow  persisted:{}",
+            snapshot.total_calls,
+            snapshot.total_errors,
+            snapshot.avg_latency_ms,
+            snapshot.p95_latency_ms,
+            snapshot.p99_latency_ms,
+            snapshot.active_tools,
+            snapshot.slow_tools,
+            snapshot.persisted_samples
+        );
+        Paragraph::new(compact)
+            .style(crate::tui_theme::text_hint(&tp))
+            .render(inner, frame);
+        return;
+    }
+
+    let top_h = 4_u16.min(inner.height.saturating_sub(6)).max(3);
+    let body_h = inner.height.saturating_sub(top_h);
+    let mid_h = (body_h / 2).max(3);
+    let bottom_h = body_h.saturating_sub(mid_h);
+
+    let top = Rect::new(inner.x, inner.y, inner.width, top_h);
+    let mid = Rect::new(inner.x, inner.y + top_h, inner.width, mid_h);
+    let bottom = Rect::new(inner.x, inner.y + top_h + mid_h, inner.width, bottom_h);
+
+    let tile_w = top.width / 4;
+    let tile1 = Rect::new(top.x, top.y, tile_w, top.height);
+    let tile2 = Rect::new(top.x + tile_w, top.y, tile_w, top.height);
+    let tile3 = Rect::new(top.x + tile_w * 2, top.y, tile_w, top.height);
+    let tile4 = Rect::new(
+        top.x + tile_w * 3,
+        top.y,
+        top.width.saturating_sub(tile_w * 3),
+        top.height,
+    );
+    render_viz_metric_tile(
+        frame,
+        tile1,
+        "Total Calls",
+        &format!("{}", snapshot.total_calls),
+        tp.metric_requests,
+    );
+    render_viz_metric_tile(
+        frame,
+        tile2,
+        "Error Rate",
+        &if snapshot.total_calls > 0 {
+            format!(
+                "{:.2}%",
+                (snapshot.total_errors as f64 / snapshot.total_calls as f64) * 100.0
+            )
+        } else {
+            "0.00%".to_string()
+        },
+        if snapshot.total_errors > 0 {
+            tp.severity_error
+        } else {
+            tp.severity_ok
+        },
+    );
+    render_viz_metric_tile(
+        frame,
+        tile3,
+        "Latency",
+        &format!(
+            "avg {:.1}ms / p95 {:.1}ms",
+            snapshot.avg_latency_ms, snapshot.p95_latency_ms
+        ),
+        tp.metric_latency,
+    );
+    render_viz_metric_tile(
+        frame,
+        tile4,
+        "Coverage",
+        &format!(
+            "{} active · {} slow · {} persisted",
+            snapshot.active_tools, snapshot.slow_tools, snapshot.persisted_samples
+        ),
+        tp.metric_messages,
+    );
+
+    if mid.height >= 3 {
+        let gap = u16::from(mid.width >= 120);
+        let spark_w = (mid.width.saturating_mul(38) / 100).max(24);
+        let spark_w = spark_w.min(mid.width.saturating_sub(20 + gap));
+        let spark_area = Rect::new(mid.x, mid.y, spark_w, mid.height);
+        let calls_area = Rect::new(
+            mid.x.saturating_add(spark_w).saturating_add(gap),
+            mid.y,
+            mid.width.saturating_sub(spark_w.saturating_add(gap)),
+            mid.height,
+        );
+
+        let spark_block = Block::new()
+            .title("Activity Signature")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let spark_inner = spark_block.inner(spark_area);
+        spark_block.render(spark_area, frame);
+        if spark_inner.height > 0 && spark_inner.width > 0 {
+            let rows = spark_inner.height;
+            if rows >= 2 {
+                let label_area = Rect::new(spark_inner.x, spark_inner.y, spark_inner.width, 1);
+                Paragraph::new(format!(
+                    "real-time latency track ({})",
+                    if snapshot.sparkline.len() > 1 {
+                        "live"
+                    } else {
+                        "seeded"
+                    }
+                ))
+                .style(crate::tui_theme::text_hint(&tp))
+                .render(label_area, frame);
+                let chart_area = Rect::new(
+                    spark_inner.x,
+                    spark_inner.y + 1,
+                    spark_inner.width,
+                    spark_inner.height.saturating_sub(1),
+                );
+                Sparkline::new(&snapshot.sparkline)
+                    .style(Style::default().fg(tp.chart_series[1]))
+                    .render(chart_area, frame);
+            } else {
+                Sparkline::new(&snapshot.sparkline)
+                    .style(Style::default().fg(tp.chart_series[1]))
+                    .render(spark_inner, frame);
+            }
+        }
+
+        let calls_block = Block::new()
+            .title("Top Tool Volume")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let calls_inner = calls_block.inner(calls_area);
+        calls_block.render(calls_area, frame);
+        if calls_inner.height > 0 && calls_inner.width > 0 {
+            if snapshot.top_call_tools.is_empty() {
+                Paragraph::new("No tool call samples yet.")
+                    .style(crate::tui_theme::text_hint(&tp))
+                    .render(calls_inner, frame);
+            } else {
+                let groups: Vec<BarGroup<'_>> = snapshot
+                    .top_call_tools
+                    .iter()
+                    .map(|(name, value)| BarGroup::new(name, vec![(*value).max(0.0)]))
+                    .collect();
+                BarChart::new(groups)
+                    .direction(BarDirection::Horizontal)
+                    .colors(vec![tp.chart_series[0]])
+                    .bar_width(1)
+                    .bar_gap(0)
+                    .group_gap(1)
+                    .render(calls_inner, frame);
+            }
+        }
+    }
+
+    if bottom.height >= 3 {
+        let gap = u16::from(bottom.width >= 120);
+        let lat_w = (bottom.width.saturating_mul(56) / 100).max(26);
+        let lat_w = lat_w.min(bottom.width.saturating_sub(18 + gap));
+        let lat_area = Rect::new(bottom.x, bottom.y, lat_w, bottom.height);
+        let summary_area = Rect::new(
+            bottom.x.saturating_add(lat_w).saturating_add(gap),
+            bottom.y,
+            bottom.width.saturating_sub(lat_w.saturating_add(gap)),
+            bottom.height,
+        );
+
+        let lat_block = Block::new()
+            .title("Latency Hotspots (p95 ms)")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let lat_inner = lat_block.inner(lat_area);
+        lat_block.render(lat_area, frame);
+        if lat_inner.height > 0 && lat_inner.width > 0 {
+            if snapshot.top_latency_tools.is_empty() {
+                Paragraph::new("No latency samples yet.")
+                    .style(crate::tui_theme::text_hint(&tp))
+                    .render(lat_inner, frame);
+            } else {
+                let groups: Vec<BarGroup<'_>> = snapshot
+                    .top_latency_tools
+                    .iter()
+                    .map(|(name, value)| BarGroup::new(name, vec![*value]))
+                    .collect();
+                BarChart::new(groups)
+                    .direction(BarDirection::Horizontal)
+                    .colors(vec![tp.chart_series[2]])
+                    .bar_width(1)
+                    .bar_gap(0)
+                    .group_gap(1)
+                    .render(lat_inner, frame);
+            }
+        }
+
+        let summary_block = Block::new()
+            .title("Insights")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let summary_inner = summary_block.inner(summary_area);
+        summary_block.render(summary_area, frame);
+        if summary_inner.height > 0 && summary_inner.width > 0 {
+            let mut lines = Vec::new();
+            lines.push("feed: no anomaly cards; showing live telemetry instead".to_string());
+            lines.push(format!(
+                "filter={}  sort={}  focus={}",
+                filter.label(),
+                sort_mode.label(),
+                focus.label()
+            ));
+            if let Some((name, value)) = snapshot.top_latency_tools.first() {
+                lines.push(format!("hottest tool: {name} @ {value:.1}ms p95"));
+            }
+            if let Some((name, value)) = snapshot.top_call_tools.first() {
+                lines.push(format!("busiest tool: {name} @ {:.0} calls", *value));
+            }
+            let content = lines.join("\n");
+            Paragraph::new(content)
+                .style(crate::tui_theme::text_hint(&tp))
+                .render(summary_inner, frame);
+        }
+    }
 }
 
 // ── MailScreen implementation ──────────────────────────────────────────
@@ -1066,28 +1610,77 @@ impl MailScreen for AnalyticsScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
-        if self.feed.cards.is_empty() {
-            render_empty_state(frame, area);
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        if area.width == 0 || area.height == 0 {
             return;
         }
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        Paragraph::new("")
+            .style(Style::default().bg(tp.bg_deep))
+            .render(area, frame);
+
+        let mut cards_area = area;
+        let viz_band_h = if area.height >= ANALYTICS_VIZ_BAND_MIN_HEIGHT {
+            ((u32::from(area.height) * u32::from(ANALYTICS_VIZ_BAND_HEIGHT_PERCENT)) / 100)
+                .try_into()
+                .unwrap_or(ANALYTICS_VIZ_BAND_MAX)
+                .clamp(ANALYTICS_VIZ_BAND_MIN, ANALYTICS_VIZ_BAND_MAX)
+        } else {
+            0
+        };
+        if viz_band_h > 0 {
+            let viz_area = Rect::new(area.x, area.y, area.width, viz_band_h.min(area.height));
+            render_runtime_viz_fallback(
+                frame,
+                viz_area,
+                state,
+                self.focus,
+                self.severity_filter,
+                self.sort_mode,
+            );
+            cards_area = Rect::new(
+                area.x,
+                area.y.saturating_add(viz_area.height),
+                area.width,
+                area.height.saturating_sub(viz_area.height),
+            );
+        }
+
         let active_cards = self.active_cards();
-        if active_cards.is_empty() {
-            render_filtered_empty_state(frame, area, self.severity_filter, self.sort_mode);
+        if self.feed.cards.is_empty() || active_cards.is_empty() {
+            if viz_band_h == 0 {
+                render_runtime_viz_fallback(
+                    frame,
+                    area,
+                    state,
+                    self.focus,
+                    self.severity_filter,
+                    self.sort_mode,
+                );
+            } else if cards_area.height > 0 {
+                Paragraph::new("No anomaly cards match filters; telemetry viz remains live above.")
+                    .style(crate::tui_theme::text_hint(&tp))
+                    .render(cards_area, frame);
+            }
             return;
         }
 
         let selected = self.selected.min(active_cards.len().saturating_sub(1));
 
-        let summary_h = u16::from(area.height >= ANALYTICS_SUMMARY_MIN_HEIGHT);
-        let mut y = area.y;
+        let summary_h = u16::from(cards_area.height >= ANALYTICS_SUMMARY_MIN_HEIGHT);
+        let mut y = cards_area.y;
         if summary_h > 0 {
-            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            let summary_area = Rect::new(cards_area.x, y, cards_area.width, summary_h);
             render_severity_summary(frame, summary_area, &self.feed);
             y += summary_h;
         }
 
-        let content_full = Rect::new(area.x, y, area.width, area.height.saturating_sub(summary_h));
+        let content_full = Rect::new(
+            cards_area.x,
+            y,
+            cards_area.width,
+            cards_area.height.saturating_sub(summary_h),
+        );
         if content_full.width == 0 || content_full.height == 0 {
             return;
         }

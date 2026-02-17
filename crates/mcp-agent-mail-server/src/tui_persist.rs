@@ -159,7 +159,7 @@ pub struct TuiPreferences {
     /// Active dashboard preset name (e.g. "default", "incident-triage").
     #[serde(default = "default_preset_name")]
     pub active_dashboard_preset: String,
-    /// Active theme config name (e.g. "default", "solarized", "dracula", "nord", "gruvbox").
+    /// Active theme config name (e.g. "default", "solarized", "dracula", "nord", "gruvbox", "frankenstein").
     #[serde(default = "default_theme_name")]
     pub active_theme: String,
 }

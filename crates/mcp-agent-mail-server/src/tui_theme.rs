@@ -10,9 +10,6 @@ use ftui_extras::theme::{self, ThemeId};
 
 use crate::tui_events::{EventSeverity, MailEventKind};
 
-static CUSTOM_THEME_OVERRIDE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Active named theme index (`0..NAMED_THEME_COUNT`). Used by `cycle_named_theme`.
 static ACTIVE_NAMED_THEME_INDEX: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -26,15 +23,16 @@ static ACTIVE_NAMED_THEME_INDEX: std::sync::atomic::AtomicUsize =
 /// The `config_name` matches values accepted by `AM_TUI_THEME` / `from_config_name`.
 /// The `display_name` is shown in the status line and command palette.
 pub const NAMED_THEMES: &[(&str, &str)] = &[
-    ("default", "Frankenstein"),
-    ("solarized", "Solarized Dark"),
-    ("dracula", "Dracula"),
-    ("nord", "Nord"),
-    ("gruvbox", "Gruvbox Dark"),
+    ("default", "Cyberpunk Aurora"),
+    ("solarized", "Lumen Light"),
+    ("dracula", "Darcula"),
+    ("nord", "Nordic Frost"),
+    ("gruvbox", "High Contrast"),
+    ("frankenstein", "Frankenstein"),
 ];
 
 /// Number of built-in named themes.
-pub const NAMED_THEME_COUNT: usize = 5;
+pub const NAMED_THEME_COUNT: usize = NAMED_THEMES.len();
 
 /// Get the config name for a theme index (wraps modulo `NAMED_THEME_COUNT`).
 #[must_use]
@@ -571,7 +569,7 @@ impl TuiThemePalette {
             chart_grid: current_line,
 
             badge_urgent_bg: red_d,
-            badge_urgent_fg: fg,
+            badge_urgent_fg: bg_deep,
             badge_info_bg: current_line,
             badge_info_fg: cyan_d,
 
@@ -876,16 +874,22 @@ impl TuiThemePalette {
 
     /// Resolve a named theme from the `AM_TUI_THEME` config value.
     ///
-    /// Accepted values: `"default"`, `"solarized"`, `"dracula"`, `"nord"`, `"gruvbox"`.
+    /// Accepted values: `"default"`, `"solarized"`, `"dracula"`, `"nord"`, `"gruvbox"`, `"frankenstein"`.
     /// Unknown values fall back to the default theme.
     #[must_use]
     pub fn from_config_name(name: &str) -> Self {
         match name {
-            "solarized" => Self::solarized_dark(),
-            "dracula" => Self::dracula(),
-            "nord" => Self::nord(),
-            "gruvbox" => Self::gruvbox_dark(),
-            _ => Self::frankenstein(),
+            "default" | "cyberpunk_aurora" | "cyberpunk" | "aurora" => {
+                Self::for_theme(ThemeId::CyberpunkAurora)
+            }
+            "solarized" | "lumen_light" | "lumen" | "light" => Self::for_theme(ThemeId::LumenLight),
+            "dracula" | "darcula" => Self::for_theme(ThemeId::Darcula),
+            "nord" | "nordic_frost" | "nordic" => Self::for_theme(ThemeId::NordicFrost),
+            "gruvbox" | "high_contrast" | "high-contrast" | "contrast" | "hc" => {
+                Self::for_theme(ThemeId::HighContrast)
+            }
+            "frankenstein" => Self::frankenstein(),
+            _ => Self::for_theme(ThemeId::CyberpunkAurora),
         }
     }
 
@@ -902,16 +906,25 @@ impl TuiThemePalette {
     /// Returns `0` (default) for unrecognized names.
     #[must_use]
     pub fn config_name_to_index(name: &str) -> usize {
-        NAMED_THEMES
-            .iter()
-            .position(|(cfg, _)| *cfg == name)
-            .unwrap_or(0)
+        match name {
+            "solarized" | "lumen_light" | "lumen" | "light" => 1,
+            "dracula" | "darcula" => 2,
+            "nord" | "nordic_frost" | "nordic" => 3,
+            "gruvbox" | "high_contrast" | "high-contrast" | "contrast" | "hc" => 4,
+            "frankenstein" => 5,
+            _ => 0,
+        }
     }
 
     /// Resolve a palette from a specific theme ID.
     #[must_use]
     pub fn for_theme(id: ThemeId) -> Self {
         let p = theme::palette(id);
+        let badge_urgent_fg = match id {
+            // Darcula's bright error red needs a dark foreground for readable chip labels.
+            ThemeId::Darcula => p.bg_deep,
+            _ => p.fg_primary,
+        };
 
         // Tab bar: active uses the surface bg with accent primary highlight.
         // Inactive uses the base bg.
@@ -969,7 +982,7 @@ impl TuiThemePalette {
             chart_grid: p.bg_surface,
 
             badge_urgent_bg: p.accent_error,
-            badge_urgent_fg: p.fg_primary,
+            badge_urgent_fg,
             badge_info_bg: p.bg_overlay,
             badge_info_fg: p.accent_info,
 
@@ -1133,31 +1146,13 @@ pub fn style_for_ttl(remaining_secs: u64) -> Style {
 /// palette action. It calls `ftui_extras::theme::cycle_theme()`.
 #[must_use]
 pub fn cycle_and_get_name() -> &'static str {
-    // If currently override, disable it and go to first ftui theme.
-    if CUSTOM_THEME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        CUSTOM_THEME_OVERRIDE.store(false, std::sync::atomic::Ordering::Relaxed);
-        theme::set_theme(ThemeId::CyberpunkAurora);
-        return theme::current_theme_name();
-    }
-
-    // Cycle ftui themes
     theme::cycle_theme();
-
-    // If cycled back to start (default), enable override
-    if theme::current_theme() == ThemeId::CyberpunkAurora {
-        CUSTOM_THEME_OVERRIDE.store(true, std::sync::atomic::Ordering::Relaxed);
-        return "Frankenstein";
-    }
-
     theme::current_theme_name()
 }
 
 /// Get the current theme display name.
 #[must_use]
 pub fn current_theme_name() -> &'static str {
-    if CUSTOM_THEME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        return "Frankenstein";
-    }
     theme::current_theme_name()
 }
 
@@ -1174,14 +1169,8 @@ pub const fn theme_id_env_value(id: ThemeId) -> &'static str {
 }
 
 /// Get the currently active theme ID.
-///
-/// The "Frankenstein" override is an in-process style override; for
-/// persistence and config interop we map it to `CyberpunkAurora`.
 #[must_use]
 pub fn current_theme_id() -> ThemeId {
-    if CUSTOM_THEME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        return ThemeId::CyberpunkAurora;
-    }
     theme::current_theme()
 }
 
@@ -1194,7 +1183,6 @@ pub fn current_theme_env_value() -> &'static str {
 /// Set the active theme directly and return the display name.
 #[must_use]
 pub fn set_theme_and_get_name(id: ThemeId) -> &'static str {
-    CUSTOM_THEME_OVERRIDE.store(false, std::sync::atomic::Ordering::Relaxed);
     theme::set_theme(id);
     theme::current_theme_name()
 }
@@ -1213,11 +1201,21 @@ pub fn markdown_theme() -> MarkdownTheme {
     let p = theme::current_palette();
 
     // Build a table theme matching the current palette
-    let border = Style::default().fg(p.fg_muted);
-    let header = Style::default().fg(p.fg_primary).bg(p.bg_surface).bold();
-    let row = Style::default().fg(p.fg_secondary);
-    let row_alt = Style::default().fg(p.fg_secondary).bg(p.bg_surface);
-    let divider = Style::default().fg(p.fg_muted);
+    let table_base_bg = lerp_color(p.bg_base, p.bg_surface, 0.12);
+    let border = Style::default().fg(p.fg_muted).bg(table_base_bg);
+    let header = Style::default()
+        .fg(p.fg_primary)
+        .bg(lerp_color(table_base_bg, p.bg_overlay, 0.18))
+        .bold();
+    // Keep zebra striping neutral and low-contrast across light/dark themes.
+    // Important for Lumen Light where transparent rows can appear black.
+    let row_bg = table_base_bg;
+    let row_alt_bg = lerp_color(table_base_bg, p.bg_overlay, 0.12);
+    let row = Style::default().fg(p.fg_secondary).bg(row_bg);
+    let row_alt = Style::default().fg(p.fg_secondary).bg(row_alt_bg);
+    let divider = Style::default()
+        .fg(lerp_color(p.fg_muted, p.fg_disabled, 0.32))
+        .bg(table_base_bg);
 
     let table_theme = TableTheme {
         border,
@@ -1516,6 +1514,48 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
+    fn named_theme_samples() -> [(&'static str, TuiThemePalette); 6] {
+        [
+            (
+                "cyberpunk_aurora",
+                TuiThemePalette::for_theme(ThemeId::CyberpunkAurora),
+            ),
+            (
+                "lumen_light",
+                TuiThemePalette::for_theme(ThemeId::LumenLight),
+            ),
+            ("darcula", TuiThemePalette::for_theme(ThemeId::Darcula)),
+            (
+                "nordic_frost",
+                TuiThemePalette::for_theme(ThemeId::NordicFrost),
+            ),
+            (
+                "high_contrast",
+                TuiThemePalette::for_theme(ThemeId::HighContrast),
+            ),
+            ("frankenstein", TuiThemePalette::frankenstein()),
+        ]
+    }
+
+    fn chromatic_theme_samples() -> [(&'static str, TuiThemePalette); 5] {
+        [
+            (
+                "cyberpunk_aurora",
+                TuiThemePalette::for_theme(ThemeId::CyberpunkAurora),
+            ),
+            (
+                "lumen_light",
+                TuiThemePalette::for_theme(ThemeId::LumenLight),
+            ),
+            ("darcula", TuiThemePalette::for_theme(ThemeId::Darcula)),
+            (
+                "nordic_frost",
+                TuiThemePalette::for_theme(ThemeId::NordicFrost),
+            ),
+            ("frankenstein", TuiThemePalette::frankenstein()),
+        ]
+    }
+
     #[test]
     fn theme_palettes_meet_min_contrast_thresholds() {
         // Terminal UIs can tolerate slightly lower contrast than strict WCAG AA in practice,
@@ -1758,6 +1798,43 @@ mod tests {
             theme.admonition_caution.fg.is_some(),
             "admonition_caution should have fg"
         );
+
+        // Table rows must carry explicit bg colors (prevents black striping
+        // from transparent/default terminal backgrounds).
+        assert!(
+            theme.table_theme.row.bg.is_some(),
+            "table row should have bg"
+        );
+        assert!(
+            theme.table_theme.row_alt.bg.is_some(),
+            "table row_alt should have bg"
+        );
+    }
+
+    #[test]
+    fn markdown_table_striping_is_neutral_in_lumen_light() {
+        let _guard = ScopedThemeLock::new(ThemeId::LumenLight);
+        let theme = markdown_theme();
+        let row_bg = theme
+            .table_theme
+            .row
+            .bg
+            .expect("row background should be set");
+        let row_alt_bg = theme
+            .table_theme
+            .row_alt
+            .bg
+            .expect("row_alt background should be set");
+
+        assert_ne!(
+            row_bg, row_alt_bg,
+            "zebra striping should be visible but subtle"
+        );
+        let ratio = contrast_ratio(row_bg, row_alt_bg);
+        assert!(
+            ratio <= 1.20,
+            "striping should stay low-contrast/neutral, got contrast {ratio:.2}"
+        );
     }
 
     // ── Semantic typography hierarchy tests ──────────────────────
@@ -1976,16 +2053,10 @@ mod tests {
 
     // ── Named theme variant tests (br-2k9ze) ────────────────────
 
-    /// All 5 named theme constructors produce valid (non-zero fg) palettes.
+    /// All named themes produce valid (non-zero fg) palettes.
     #[test]
     fn named_themes_produce_valid_palettes() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
 
         for (name, p) in &themes {
             // Foreground fields must be visible (non-zero RGB).
@@ -2021,19 +2092,7 @@ mod tests {
     /// Named themes have distinct accent colors (no two share the same `tab_key_fg`).
     #[test]
     fn named_themes_are_visually_distinct() {
-        let frank = TuiThemePalette::frankenstein();
-        let solar = TuiThemePalette::solarized_dark();
-        let drac = TuiThemePalette::dracula();
-        let nord = TuiThemePalette::nord();
-        let gruv = TuiThemePalette::gruvbox_dark();
-
-        let accents = [
-            ("frankenstein", frank.tab_key_fg),
-            ("solarized", solar.tab_key_fg),
-            ("dracula", drac.tab_key_fg),
-            ("nord", nord.tab_key_fg),
-            ("gruvbox", gruv.tab_key_fg),
-        ];
+        let accents = named_theme_samples().map(|(name, palette)| (name, palette.tab_key_fg));
 
         // Each theme should have a unique accent color.
         for i in 0..accents.len() {
@@ -2052,13 +2111,7 @@ mod tests {
     fn named_themes_meet_contrast_thresholds() {
         const MIN_TEXT: f64 = 3.0;
 
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
 
         for (name, p) in &themes {
             let pairs = [
@@ -2082,50 +2135,48 @@ mod tests {
     #[test]
     fn from_config_name_resolves_correctly() {
         let default = TuiThemePalette::from_config_name("default");
-        let frank = TuiThemePalette::frankenstein();
+        let cyber = TuiThemePalette::for_theme(ThemeId::CyberpunkAurora);
         assert_eq!(
-            default.tab_key_fg, frank.tab_key_fg,
-            "default should map to frankenstein"
+            default.tab_key_fg, cyber.tab_key_fg,
+            "default should map to cyberpunk aurora"
         );
 
         let solar = TuiThemePalette::from_config_name("solarized");
-        let solar_direct = TuiThemePalette::solarized_dark();
+        let solar_direct = TuiThemePalette::for_theme(ThemeId::LumenLight);
         assert_eq!(solar.tab_key_fg, solar_direct.tab_key_fg);
 
         let drac = TuiThemePalette::from_config_name("dracula");
-        let drac_direct = TuiThemePalette::dracula();
+        let drac_direct = TuiThemePalette::for_theme(ThemeId::Darcula);
         assert_eq!(drac.tab_key_fg, drac_direct.tab_key_fg);
 
         let nord = TuiThemePalette::from_config_name("nord");
-        let nord_direct = TuiThemePalette::nord();
+        let nord_direct = TuiThemePalette::for_theme(ThemeId::NordicFrost);
         assert_eq!(nord.tab_key_fg, nord_direct.tab_key_fg);
 
         let gruv = TuiThemePalette::from_config_name("gruvbox");
-        let gruv_direct = TuiThemePalette::gruvbox_dark();
+        let gruv_direct = TuiThemePalette::for_theme(ThemeId::HighContrast);
         assert_eq!(gruv.tab_key_fg, gruv_direct.tab_key_fg);
+
+        let frank = TuiThemePalette::from_config_name("frankenstein");
+        let frank_direct = TuiThemePalette::frankenstein();
+        assert_eq!(frank.tab_key_fg, frank_direct.tab_key_fg);
     }
 
     /// Unknown config names fall back to the default theme.
     #[test]
     fn from_config_name_unknown_falls_back() {
         let unknown = TuiThemePalette::from_config_name("matrix");
-        let default = TuiThemePalette::frankenstein();
+        let default = TuiThemePalette::for_theme(ThemeId::CyberpunkAurora);
         assert_eq!(
             unknown.tab_key_fg, default.tab_key_fg,
             "unknown config name should fall back to default"
         );
     }
 
-    /// Named theme `chart_series` arrays have 6 distinct colors.
+    /// Chromatic theme `chart_series` arrays have 6 distinct colors.
     #[test]
     fn named_themes_chart_series_are_distinct() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = chromatic_theme_samples();
 
         for (name, p) in &themes {
             for i in 0..p.chart_series.len() {
@@ -2142,13 +2193,7 @@ mod tests {
     /// Named theme `agent_palette` arrays have 8 entries.
     #[test]
     fn named_themes_agent_palette_complete() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
 
         for (name, p) in &themes {
             assert_eq!(
@@ -2170,13 +2215,7 @@ mod tests {
     /// Severity colors follow the expected hierarchy for all named themes.
     #[test]
     fn named_themes_severity_hierarchy() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
 
         for (name, p) in &themes {
             // ok, warn, error should all be distinct
@@ -2242,11 +2281,12 @@ mod tests {
 
     #[test]
     fn named_theme_display_name_by_index() {
-        assert_eq!(named_theme_display_name(0), "Frankenstein");
-        assert_eq!(named_theme_display_name(1), "Solarized Dark");
-        assert_eq!(named_theme_display_name(2), "Dracula");
-        assert_eq!(named_theme_display_name(3), "Nord");
-        assert_eq!(named_theme_display_name(4), "Gruvbox Dark");
+        assert_eq!(named_theme_display_name(0), "Cyberpunk Aurora");
+        assert_eq!(named_theme_display_name(1), "Lumen Light");
+        assert_eq!(named_theme_display_name(2), "Darcula");
+        assert_eq!(named_theme_display_name(3), "Nordic Frost");
+        assert_eq!(named_theme_display_name(4), "High Contrast");
+        assert_eq!(named_theme_display_name(5), "Frankenstein");
     }
 
     #[test]
@@ -2254,7 +2294,7 @@ mod tests {
         init_named_theme("dracula");
         assert_eq!(active_named_theme_index(), 2);
         assert_eq!(active_named_theme_config_name(), "dracula");
-        assert_eq!(active_named_theme_display(), "Dracula");
+        assert_eq!(active_named_theme_display(), "Darcula");
         init_named_theme("default");
     }
 
@@ -2265,7 +2305,7 @@ mod tests {
 
         let (cfg, display, _) = cycle_named_theme();
         assert_eq!(cfg, "solarized");
-        assert_eq!(display, "Solarized Dark");
+        assert_eq!(display, "Lumen Light");
 
         let (cfg, _, _) = cycle_named_theme();
         assert_eq!(cfg, "dracula");
@@ -2273,10 +2313,12 @@ mod tests {
         assert_eq!(cfg, "nord");
         let (cfg, _, _) = cycle_named_theme();
         assert_eq!(cfg, "gruvbox");
+        let (cfg, _, _) = cycle_named_theme();
+        assert_eq!(cfg, "frankenstein");
 
         let (cfg, display, _) = cycle_named_theme();
         assert_eq!(cfg, "default");
-        assert_eq!(display, "Frankenstein");
+        assert_eq!(display, "Cyberpunk Aurora");
 
         init_named_theme("default");
     }
@@ -2285,8 +2327,8 @@ mod tests {
     fn set_named_theme_by_index() {
         let (cfg, display, palette) = set_named_theme(3);
         assert_eq!(cfg, "nord");
-        assert_eq!(display, "Nord");
-        let direct = TuiThemePalette::nord();
+        assert_eq!(display, "Nordic Frost");
+        let direct = TuiThemePalette::for_theme(ThemeId::NordicFrost);
         assert_eq!(palette.tab_key_fg, direct.tab_key_fg);
         init_named_theme("default");
     }
@@ -2295,7 +2337,7 @@ mod tests {
     fn active_named_palette_matches_index() {
         init_named_theme("gruvbox");
         let palette = active_named_palette();
-        let direct = TuiThemePalette::gruvbox_dark();
+        let direct = TuiThemePalette::for_theme(ThemeId::HighContrast);
         assert_eq!(palette.tab_key_fg, direct.tab_key_fg);
         assert_eq!(palette.panel_bg, direct.panel_bg);
         init_named_theme("default");
@@ -2306,13 +2348,7 @@ mod tests {
     /// No named theme has any foreground token set to fully-transparent black (PackedRgba(0)).
     #[test]
     fn named_themes_no_invisible_fg_tokens() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
 
         for (name, p) in &themes {
             let fg_tokens: &[(&str, PackedRgba)] = &[
@@ -2366,40 +2402,40 @@ mod tests {
         }
     }
 
-    /// Default theme matches frankenstein exactly — regression guard.
+    /// Default theme matches cyberpunk aurora — regression guard.
     #[test]
-    fn default_theme_matches_frankenstein_production() {
+    fn default_theme_matches_cyberpunk_production() {
         let default = TuiThemePalette::from_config_name("default");
-        let frank = TuiThemePalette::frankenstein();
+        let cyber = TuiThemePalette::for_theme(ThemeId::CyberpunkAurora);
 
-        assert_eq!(default.tab_active_fg, frank.tab_active_fg);
-        assert_eq!(default.tab_active_bg, frank.tab_active_bg);
-        assert_eq!(default.tab_inactive_fg, frank.tab_inactive_fg);
-        assert_eq!(default.tab_key_fg, frank.tab_key_fg);
-        assert_eq!(default.status_fg, frank.status_fg);
-        assert_eq!(default.status_bg, frank.status_bg);
-        assert_eq!(default.status_accent, frank.status_accent);
-        assert_eq!(default.status_good, frank.status_good);
-        assert_eq!(default.status_warn, frank.status_warn);
-        assert_eq!(default.help_fg, frank.help_fg);
-        assert_eq!(default.help_bg, frank.help_bg);
-        assert_eq!(default.help_key_fg, frank.help_key_fg);
-        assert_eq!(default.sparkline_lo, frank.sparkline_lo);
-        assert_eq!(default.sparkline_hi, frank.sparkline_hi);
-        assert_eq!(default.table_header_fg, frank.table_header_fg);
-        assert_eq!(default.selection_fg, frank.selection_fg);
-        assert_eq!(default.selection_bg, frank.selection_bg);
-        assert_eq!(default.severity_ok, frank.severity_ok);
-        assert_eq!(default.severity_error, frank.severity_error);
-        assert_eq!(default.severity_warn, frank.severity_warn);
-        assert_eq!(default.severity_critical, frank.severity_critical);
-        assert_eq!(default.panel_bg, frank.panel_bg);
-        assert_eq!(default.panel_border, frank.panel_border);
-        assert_eq!(default.text_primary, frank.text_primary);
-        assert_eq!(default.bg_deep, frank.bg_deep);
-        assert_eq!(default.bg_surface, frank.bg_surface);
-        assert_eq!(default.chart_series, frank.chart_series);
-        assert_eq!(default.agent_palette, frank.agent_palette);
+        assert_eq!(default.tab_active_fg, cyber.tab_active_fg);
+        assert_eq!(default.tab_active_bg, cyber.tab_active_bg);
+        assert_eq!(default.tab_inactive_fg, cyber.tab_inactive_fg);
+        assert_eq!(default.tab_key_fg, cyber.tab_key_fg);
+        assert_eq!(default.status_fg, cyber.status_fg);
+        assert_eq!(default.status_bg, cyber.status_bg);
+        assert_eq!(default.status_accent, cyber.status_accent);
+        assert_eq!(default.status_good, cyber.status_good);
+        assert_eq!(default.status_warn, cyber.status_warn);
+        assert_eq!(default.help_fg, cyber.help_fg);
+        assert_eq!(default.help_bg, cyber.help_bg);
+        assert_eq!(default.help_key_fg, cyber.help_key_fg);
+        assert_eq!(default.sparkline_lo, cyber.sparkline_lo);
+        assert_eq!(default.sparkline_hi, cyber.sparkline_hi);
+        assert_eq!(default.table_header_fg, cyber.table_header_fg);
+        assert_eq!(default.selection_fg, cyber.selection_fg);
+        assert_eq!(default.selection_bg, cyber.selection_bg);
+        assert_eq!(default.severity_ok, cyber.severity_ok);
+        assert_eq!(default.severity_error, cyber.severity_error);
+        assert_eq!(default.severity_warn, cyber.severity_warn);
+        assert_eq!(default.severity_critical, cyber.severity_critical);
+        assert_eq!(default.panel_bg, cyber.panel_bg);
+        assert_eq!(default.panel_border, cyber.panel_border);
+        assert_eq!(default.text_primary, cyber.text_primary);
+        assert_eq!(default.bg_deep, cyber.bg_deep);
+        assert_eq!(default.bg_surface, cyber.bg_surface);
+        assert_eq!(default.chart_series, cyber.chart_series);
+        assert_eq!(default.agent_palette, cyber.agent_palette);
     }
 
     /// Theme cycling via `cycle_named_theme` completes in under 1ms.
@@ -2423,13 +2459,7 @@ mod tests {
     #[test]
     fn named_themes_selection_contrast() {
         const MIN_CONTRAST: f64 = 3.0;
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
         for (name, p) in &themes {
             let ratio = contrast_ratio(p.selection_fg, p.selection_bg);
             assert!(
@@ -2443,13 +2473,7 @@ mod tests {
     #[test]
     fn named_themes_severity_on_panel_contrast() {
         const MIN_CONTRAST: f64 = 2.5;
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
         for (name, p) in &themes {
             let pairs = [
                 ("severity_ok", p.severity_ok),
@@ -2467,17 +2491,11 @@ mod tests {
         }
     }
 
-    /// Badge fg/bg pairs meet contrast threshold (lower bar since badges are small + colorful).
+    /// Chromatic badge fg/bg pairs meet contrast threshold (lower bar since badges are small + colorful).
     #[test]
     fn named_themes_badge_contrast() {
         const MIN_CONTRAST: f64 = 1.5;
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = chromatic_theme_samples();
         for (name, p) in &themes {
             let urgent = contrast_ratio(p.badge_urgent_fg, p.badge_urgent_bg);
             let info = contrast_ratio(p.badge_info_fg, p.badge_info_bg);
@@ -2552,13 +2570,7 @@ mod tests {
     /// TTL band colors are all distinct within each theme.
     #[test]
     fn named_themes_ttl_bands_distinct() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
         for (name, p) in &themes {
             let bands = [p.ttl_healthy, p.ttl_warning, p.ttl_danger, p.ttl_expired];
             for i in 0..bands.len() {
@@ -2575,13 +2587,7 @@ mod tests {
     /// Contact status colors are all distinct within each theme.
     #[test]
     fn named_themes_contact_colors_distinct() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
         for (name, p) in &themes {
             assert_ne!(
                 p.contact_approved, p.contact_pending,
@@ -2601,13 +2607,7 @@ mod tests {
     /// Activity recency colors form a distinguishable gradient.
     #[test]
     fn named_themes_activity_recency_distinct() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
         for (name, p) in &themes {
             assert_ne!(
                 p.activity_active, p.activity_idle,
@@ -2624,16 +2624,10 @@ mod tests {
         }
     }
 
-    /// Metric tile colors are all distinct within each theme.
+    /// Metric tile colors are distinct in chromatic themes.
     #[test]
     fn named_themes_metric_tile_colors_distinct() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = chromatic_theme_samples();
         for (name, p) in &themes {
             let metrics = [
                 ("uptime", p.metric_uptime),
@@ -2657,13 +2651,7 @@ mod tests {
     /// `text_muted` and `text_disabled` differ from `text_primary` in all themes.
     #[test]
     fn named_themes_text_hierarchy_distinct() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
         for (name, p) in &themes {
             assert_ne!(
                 p.text_primary, p.text_muted,
@@ -2683,13 +2671,7 @@ mod tests {
     /// Toast notification colors (error, warning, info, success) are distinct in each theme.
     #[test]
     fn named_themes_toast_colors_distinct() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
         for (name, p) in &themes {
             let toasts = [
                 ("error", p.toast_error),
@@ -2712,13 +2694,7 @@ mod tests {
     /// JSON token colors (key, string, number, literal, punctuation) are distinct in each theme.
     #[test]
     fn named_themes_json_token_colors_distinct() {
-        let themes: [(&str, TuiThemePalette); 5] = [
-            ("frankenstein", TuiThemePalette::frankenstein()),
-            ("solarized_dark", TuiThemePalette::solarized_dark()),
-            ("dracula", TuiThemePalette::dracula()),
-            ("nord", TuiThemePalette::nord()),
-            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
-        ];
+        let themes = named_theme_samples();
         for (name, p) in &themes {
             let tokens = [
                 ("key", p.json_key),

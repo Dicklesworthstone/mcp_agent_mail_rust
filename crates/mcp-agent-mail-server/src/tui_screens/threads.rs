@@ -23,7 +23,7 @@ use ftui::{
 use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPolicy};
 use ftui_extras::{mermaid_layout, mermaid_render};
 use ftui_runtime::program::Cmd;
-use ftui_widgets::tree::{Tree, TreeGuides, TreeNode};
+use ftui_widgets::tree::TreeGuides;
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
@@ -102,6 +102,29 @@ fn thread_tree_guides() -> TreeGuides {
         .unwrap_or_else(theme_default_tree_guides)
 }
 
+const fn tree_indent_token(guides: TreeGuides) -> &'static str {
+    match guides {
+        TreeGuides::Ascii => "| ",
+        TreeGuides::Unicode | TreeGuides::Rounded => "│ ",
+        TreeGuides::Bold => "┃ ",
+        TreeGuides::Double => "║ ",
+    }
+}
+
+fn clear_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
+    if area.is_empty() {
+        return;
+    }
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.bg = bg;
+            }
+        }
+    }
+}
+
 fn parse_thread_page_size(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -130,21 +153,6 @@ fn agent_color(name: &str) -> PackedRgba {
 
 fn iso_compact_time(iso: &str) -> &str {
     if iso.len() >= 19 { &iso[11..19] } else { iso }
-}
-
-fn body_preview(body_md: &str, max_len: usize) -> String {
-    let mut compact = String::new();
-    for line in body_md.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if !compact.is_empty() {
-            compact.push(' ');
-        }
-        compact.push_str(line);
-    }
-    if compact.is_empty() {
-        "(empty)".to_string()
-    } else {
-        truncate_str(&compact, max_len)
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -266,6 +274,8 @@ struct ThreadTreeRow {
     message_id: i64,
     has_children: bool,
     is_expanded: bool,
+    depth: usize,
+    label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -907,13 +917,14 @@ impl ThreadExplorerScreen {
 
     fn render_mermaid_panel(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let title = if focused {
+        let raw_title = if focused {
             "Mermaid Thread Flow * [g]"
         } else {
             "Mermaid Thread Flow [g]"
         };
+        let title = fit_panel_title(raw_title, area.width);
         let block = Block::default()
-            .title(title)
+            .title(title.as_str())
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
         let inner = block.inner(area);
@@ -1327,6 +1338,9 @@ impl MailScreen for ThreadExplorerScreen {
         );
 
         let content_area = Rect::new(area.x, area.y + filter_height, area.width, content_height);
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        // Always repaint content background so mode switches never leave stray borders.
+        clear_rect(frame, content_area, tp.bg_deep);
         let drop_visual = match &self.message_drag {
             MessageDragState::Active(active) => Some(ThreadDropVisual {
                 source_thread_id: active.source_thread_id.as_str(),
@@ -1339,8 +1353,10 @@ impl MailScreen for ThreadExplorerScreen {
 
         // Wide: split content (list left, detail right).
         if content_area.width >= THREAD_SPLIT_WIDTH_THRESHOLD {
-            let list_width = content_area.width * 40 / 100;
-            let detail_width = content_area.width - list_width;
+            let pane_gap = u16::from(content_area.width >= 96);
+            let available_width = content_area.width.saturating_sub(pane_gap);
+            let list_width = available_width * 40 / 100;
+            let detail_width = available_width.saturating_sub(list_width);
             let list_area = Rect::new(
                 content_area.x,
                 content_area.y,
@@ -1348,11 +1364,26 @@ impl MailScreen for ThreadExplorerScreen {
                 content_area.height,
             );
             let detail_area = Rect::new(
-                content_area.x + list_width,
+                content_area
+                    .x
+                    .saturating_add(list_width)
+                    .saturating_add(pane_gap),
                 content_area.y,
                 detail_width,
                 content_area.height,
             );
+            if pane_gap > 0 {
+                clear_rect(
+                    frame,
+                    Rect::new(
+                        content_area.x.saturating_add(list_width),
+                        content_area.y,
+                        pane_gap,
+                        content_area.height,
+                    ),
+                    tp.bg_deep,
+                );
+            }
             self.last_list_area.set(list_area);
             self.last_detail_area.set(detail_area);
 
@@ -1838,6 +1869,7 @@ fn render_filter_bar(
     has_filter: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
+    clear_rect(frame, area, tp.panel_bg);
     if !has_filter && !editing {
         // Collapsed state: show discoverable hint
         let line = Line::from_spans([
@@ -1849,12 +1881,13 @@ fn render_filter_bar(
     } else {
         // Active state
         let cursor = if editing { "_" } else { "" };
+        let value = truncate_str(
+            &format!("{text}{cursor}"),
+            area.width.saturating_sub(10) as usize,
+        );
         let line = Line::from_spans([
             Span::styled(" Filter: ", crate::tui_theme::text_meta(&tp)),
-            Span::styled(
-                format!("{text}{cursor}"),
-                Style::default().fg(tp.text_primary),
-            ),
+            Span::styled(value, Style::default().fg(tp.text_primary)),
         ]);
         Paragraph::new(Text::from_line(line)).render(area, frame);
     }
@@ -1915,6 +1948,7 @@ fn render_thread_list(
         view_lens.label(),
         sort_mode.label(),
     );
+    let title = fit_panel_title(&title, area.width);
     let tp = crate::tui_theme::TuiThemePalette::current();
     let hovered_valid_drop = drop_visual.is_some_and(|drag| {
         drag.hovered_thread_id
@@ -1928,7 +1962,7 @@ fn render_thread_list(
         crate::tui_theme::focus_border_color(&tp, focused)
     };
     let block = Block::default()
-        .title(&title)
+        .title(title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
@@ -1938,7 +1972,7 @@ fn render_thread_list(
         return;
     }
     // Clear interior cells each frame to avoid stale glyphs from previous layouts.
-    Paragraph::new("").render(inner, frame);
+    clear_rect(frame, inner, tp.panel_bg);
 
     let visible_height = inner.height as usize;
 
@@ -2160,10 +2194,11 @@ fn render_thread_detail(
             )
         },
     );
+    let title = fit_panel_title(&title, area.width);
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
-        .title(&title)
+        .title(title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
@@ -2173,12 +2208,12 @@ fn render_thread_detail(
         return;
     }
     // Clear interior cells each frame to avoid stale tree/border glyph artifacts.
-    Paragraph::new("").render(inner, frame);
+    clear_rect(frame, inner, tp.panel_bg);
 
     if messages.is_empty() {
         let text = match thread {
             Some(_) => "  No messages in this thread.",
-            None => "  Select a thread to view conversation.",
+            None => "Select a thread to view conversation.",
         };
         let p = Paragraph::new(text);
         p.render(inner, frame);
@@ -2289,8 +2324,11 @@ fn render_thread_detail(
         return;
     }
 
-    let tree_width = ((u32::from(body_area.width) * 60) / 100) as u16;
-    let tree_width = tree_width.clamp(12, body_area.width.saturating_sub(8));
+    let min_preview_width = 8_u16;
+    let max_tree_width = body_area.width.saturating_sub(min_preview_width);
+    let min_tree_width = 12_u16.min(max_tree_width.max(1));
+    let preferred_tree_width = ((u32::from(body_area.width) * 60) / 100) as u16;
+    let tree_width = preferred_tree_width.max(min_tree_width).min(max_tree_width);
     let preview_width = body_area.width.saturating_sub(tree_width);
 
     let tree_area = Rect::new(body_area.x, body_area.y, tree_width, body_area.height);
@@ -2301,13 +2339,20 @@ fn render_thread_detail(
         body_area.height,
     );
 
-    let tree_title = if focused && tree_focus {
-        "Hierarchy *"
+    let tree_title_raw = if focused && tree_focus {
+        if tree_area.width < 18 {
+            "Tree *"
+        } else {
+            "Hierarchy *"
+        }
+    } else if tree_area.width < 18 {
+        "Tree"
     } else {
         "Hierarchy"
     };
+    let tree_title = fit_panel_title(tree_title_raw, tree_area.width);
     let tree_block = Block::default()
-        .title(tree_title)
+        .title(tree_title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(
             &tp,
@@ -2316,24 +2361,67 @@ fn render_thread_detail(
     let tree_inner = tree_block.inner(tree_area);
     tree_block.render(tree_area, frame);
     if tree_inner.width > 0 && tree_inner.height > 0 {
-        let nodes = tree_items
-            .iter()
-            .map(|item| tree_item_to_widget_node(item, collapsed_tree_ids, selected_row.message_id))
-            .collect::<Vec<_>>();
-        let root = TreeNode::new("root").with_children(nodes);
-        Tree::new(root)
-            .with_show_root(false)
-            .with_guides(thread_tree_guides())
-            .render(tree_inner, frame);
+        clear_rect(frame, tree_inner, tp.panel_bg);
+        let guides = thread_tree_guides();
+        let indent_token = tree_indent_token(guides);
+        let marker_len = crate::tui_theme::SELECTION_PREFIX.chars().count();
+        let max_depth = usize::from(tree_inner.width / 3).saturating_sub(1).max(1);
+        let selected_style = Style::default()
+            .fg(tp.selection_fg)
+            .bg(tp.selection_bg)
+            .bold();
+        let (start, end) =
+            viewport_range(tree_rows.len(), tree_inner.height as usize, selected_idx);
+        let rows = &tree_rows[start..end];
+        let mut lines = Vec::with_capacity(rows.len());
+        for row in rows {
+            let is_selected = row.message_id == selected_row.message_id;
+            let marker = if is_selected {
+                crate::tui_theme::SELECTION_PREFIX
+            } else {
+                crate::tui_theme::SELECTION_PREFIX_EMPTY
+            };
+            let depth = row.depth.min(max_depth);
+            let indent = indent_token.repeat(depth);
+            let available = usize::from(tree_inner.width)
+                .saturating_sub(marker_len)
+                .saturating_sub(ftui::text::display_width(indent.as_str()))
+                .saturating_sub(1);
+            let label = truncate_str(&row.label, available);
+            let mut line = Line::from_spans([
+                Span::styled(marker.to_string(), crate::tui_theme::text_meta(&tp)),
+                Span::styled(indent, crate::tui_theme::text_meta(&tp)),
+                Span::styled(
+                    label,
+                    if row.has_children {
+                        crate::tui_theme::text_primary(&tp)
+                    } else {
+                        crate::tui_theme::text_hint(&tp)
+                    },
+                ),
+            ]);
+            if is_selected {
+                line.apply_base_style(selected_style);
+            }
+            lines.push(line);
+        }
+        Paragraph::new(Text::from_lines(lines)).render(tree_inner, frame);
     }
 
-    let preview_title = if focused && !tree_focus {
-        "Preview *"
+    let preview_title_raw = if focused && !tree_focus {
+        if preview_area.width < 18 {
+            "Msg *"
+        } else {
+            "Preview *"
+        }
+    } else if preview_area.width < 18 {
+        "Msg"
     } else {
         "Preview"
     };
+    let preview_title = fit_panel_title(preview_title_raw, preview_area.width);
     let preview_block = Block::default()
-        .title(preview_title)
+        .title(preview_title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(
             &tp,
@@ -2342,6 +2430,19 @@ fn render_thread_detail(
     let preview_inner = preview_block.inner(preview_area);
     preview_block.render(preview_area, frame);
     if preview_inner.width == 0 || preview_inner.height == 0 {
+        return;
+    }
+    let preview_content = if preview_inner.width > 2 {
+        Rect::new(
+            preview_inner.x.saturating_add(1),
+            preview_inner.y,
+            preview_inner.width.saturating_sub(2),
+            preview_inner.height,
+        )
+    } else {
+        preview_inner
+    };
+    if preview_content.width == 0 || preview_content.height == 0 {
         return;
     }
 
@@ -2363,7 +2464,7 @@ fn render_thread_detail(
             " -> {}",
             truncate_str(
                 &selected_message.to_agents,
-                preview_inner.width.saturating_sub(24) as usize
+                preview_content.width.saturating_sub(24) as usize
             )
         )));
     }
@@ -2385,7 +2486,7 @@ fn render_thread_detail(
             Span::styled(
                 truncate_str(
                     &selected_message.subject,
-                    preview_inner.width.saturating_sub(9) as usize,
+                    preview_content.width.saturating_sub(9) as usize,
                 ),
                 Style::default().fg(tp.text_primary),
             ),
@@ -2393,24 +2494,28 @@ fn render_thread_detail(
     }
     preview_lines.push(Line::raw(String::new()));
 
+    let md_theme = crate::tui_theme::markdown_theme();
     if expanded_message_ids.contains(&selected_message.id) {
-        let md_theme = ftui_extras::markdown::MarkdownTheme::default();
         for line in crate::tui_markdown::render_body(&selected_message.body_md, &md_theme).lines() {
             preview_lines.push(line.clone());
         }
     } else {
-        preview_lines.push(Line::raw(body_preview(
-            &selected_message.body_md,
-            preview_inner.width.saturating_sub(2) as usize,
-        )));
+        let rendered = crate::tui_markdown::render_body(&selected_message.body_md, &md_theme);
+        let first = rendered
+            .lines()
+            .iter()
+            .find(|line| !line.to_plain_text().trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| Line::raw("(empty)"));
+        preview_lines.push(first);
     }
 
     let visible_preview = preview_lines
         .into_iter()
         .skip(scroll)
-        .take(preview_inner.height as usize)
+        .take(preview_content.height as usize)
         .collect::<Vec<_>>();
-    Paragraph::new(Text::from_lines(visible_preview)).render(preview_inner, frame);
+    Paragraph::new(Text::from_lines(visible_preview)).render(preview_content, frame);
 }
 
 fn stable_hash<T: Hash>(value: T) -> u64 {
@@ -2605,30 +2710,18 @@ fn build_thread_tree_item_node(
 }
 
 /// Convert a [`ThreadTreeItem`] into a [`TreeNode`] for the ftui tree widget.
-fn tree_item_to_widget_node(
-    item: &crate::tui_widgets::ThreadTreeItem,
-    collapsed_tree_ids: &HashSet<i64>,
-    selected_id: i64,
-) -> TreeNode {
-    let is_expanded = !collapsed_tree_ids.contains(&item.message_id);
-    let label = if item.message_id == selected_id {
-        format!("> {}", item.render_plain_label(is_expanded))
-    } else {
-        format!("  {}", item.render_plain_label(is_expanded))
-    };
-    let children: Vec<TreeNode> = item
-        .children
-        .iter()
-        .map(|child| tree_item_to_widget_node(child, collapsed_tree_ids, selected_id))
-        .collect();
-    TreeNode::new(label)
-        .with_expanded(is_expanded)
-        .with_children(children)
-}
-
 fn flatten_thread_tree_rows(
     nodes: &[crate::tui_widgets::ThreadTreeItem],
     collapsed_tree_ids: &HashSet<i64>,
+    out: &mut Vec<ThreadTreeRow>,
+) {
+    flatten_thread_tree_rows_at_depth(nodes, collapsed_tree_ids, 0, out);
+}
+
+fn flatten_thread_tree_rows_at_depth(
+    nodes: &[crate::tui_widgets::ThreadTreeItem],
+    collapsed_tree_ids: &HashSet<i64>,
+    depth: usize,
     out: &mut Vec<ThreadTreeRow>,
 ) {
     for node in nodes {
@@ -2637,9 +2730,16 @@ fn flatten_thread_tree_rows(
             message_id: node.message_id,
             has_children: !node.children.is_empty(),
             is_expanded,
+            depth,
+            label: node.render_plain_label(is_expanded),
         });
         if is_expanded {
-            flatten_thread_tree_rows(&node.children, collapsed_tree_ids, out);
+            flatten_thread_tree_rows_at_depth(
+                &node.children,
+                collapsed_tree_ids,
+                depth.saturating_add(1),
+                out,
+            );
         }
     }
 }
@@ -2654,6 +2754,16 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let mut result: String = s.chars().take(max_len - 3).collect();
         result.push_str("...");
         result
+    }
+}
+
+/// Fit a block title to a panel width, preserving rounded-border margins.
+fn fit_panel_title(title: &str, panel_width: u16) -> String {
+    let max_len = usize::from(panel_width.saturating_sub(4));
+    if max_len == 0 {
+        String::new()
+    } else {
+        truncate_str(title, max_len)
     }
 }
 

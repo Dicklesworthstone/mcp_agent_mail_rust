@@ -1465,7 +1465,7 @@ impl Config {
             let lower = v.trim().to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "default" | "solarized" | "dracula" | "nord" | "gruvbox"
+                "default" | "solarized" | "dracula" | "nord" | "gruvbox" | "frankenstein"
             ) {
                 config.tui_theme = lower;
             }
@@ -2757,6 +2757,13 @@ mod tests {
         assert_eq!(config.export_dir, PathBuf::from("/tmp/am-exports"));
         assert_eq!(config.tui_tree_style, "double");
         assert_eq!(config.tui_theme, "gruvbox");
+    }
+
+    #[test]
+    fn tui_v3_frankenstein_theme_is_accepted() {
+        let _env = TestEnvOverrideGuard::set(&[("AM_TUI_THEME", "frankenstein")]);
+        let config = Config::from_env();
+        assert_eq!(config.tui_theme, "frankenstein");
     }
 
     #[test]

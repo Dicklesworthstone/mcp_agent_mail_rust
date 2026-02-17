@@ -17,7 +17,6 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_extras::canvas::{Canvas, Mode, Painter};
 use ftui_extras::charts::{LineChart, Series};
-use ftui_extras::markdown::MarkdownTheme;
 use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 
@@ -99,16 +98,16 @@ const RESERVATION_SOON_THRESHOLD_MICROS: i64 = 5 * 60 * 1_000_000;
 const AGENT_ACTIVE_THRESHOLD_MICROS: i64 = 60 * 1_000_000;
 const AGENT_IDLE_THRESHOLD_MICROS: i64 = 5 * 60 * 1_000_000;
 const TOP_MATCH_SAMPLE_CAP: usize = 4;
-const ULTRAWIDE_INSIGHT_MIN_WIDTH: u16 = 120;
-const ULTRAWIDE_INSIGHT_MIN_HEIGHT: u16 = 14;
-const ULTRAWIDE_BOTTOM_MIN_WIDTH: u16 = 130;
-const ULTRAWIDE_BOTTOM_MIN_HEIGHT: u16 = 8;
-const SUPERGRID_INSIGHT_MIN_WIDTH: u16 = 170;
-const SUPERGRID_INSIGHT_MIN_HEIGHT: u16 = 20;
-const SUPERGRID_BOTTOM_MIN_WIDTH: u16 = 180;
-const SUPERGRID_BOTTOM_MIN_HEIGHT: u16 = 9;
-const MEGAGRID_BOTTOM_MIN_WIDTH: u16 = 220;
-const MEGAGRID_BOTTOM_MIN_HEIGHT: u16 = 14;
+const ULTRAWIDE_INSIGHT_MIN_WIDTH: u16 = 98;
+const ULTRAWIDE_INSIGHT_MIN_HEIGHT: u16 = 12;
+const ULTRAWIDE_BOTTOM_MIN_WIDTH: u16 = 112;
+const ULTRAWIDE_BOTTOM_MIN_HEIGHT: u16 = 7;
+const SUPERGRID_INSIGHT_MIN_WIDTH: u16 = 146;
+const SUPERGRID_INSIGHT_MIN_HEIGHT: u16 = 16;
+const SUPERGRID_BOTTOM_MIN_WIDTH: u16 = 154;
+const SUPERGRID_BOTTOM_MIN_HEIGHT: u16 = 8;
+const MEGAGRID_BOTTOM_MIN_WIDTH: u16 = 188;
+const MEGAGRID_BOTTOM_MIN_HEIGHT: u16 = 12;
 
 /// Anomaly thresholds.
 const ACK_PENDING_WARN: u64 = 3;
@@ -716,8 +715,9 @@ impl DashboardScreen {
     fn should_render_bottom_rail(
         quick_query: &str,
         preview: Option<&RecentMessagePreview>,
+        force_dense_surface: bool,
     ) -> bool {
-        !quick_query.trim().is_empty() || preview.is_some()
+        force_dense_surface || !quick_query.trim().is_empty() || preview.is_some()
     }
 
     /// Build the `ReactiveLayout` for the main content area.
@@ -734,6 +734,7 @@ impl DashboardScreen {
         show_footer_panel: bool,
         rich_footer_content: bool,
         console_log_lines: usize,
+        force_dense_surface: bool,
     ) -> ReactiveLayout {
         let mut layout = ReactiveLayout::new()
             // Primary anchor for horizontal splitting (footer rail).
@@ -759,8 +760,8 @@ impl DashboardScreen {
                     SplitAxis::Vertical,
                     PanelConstraint::HIDDEN,
                 )
-                .at(TerminalClass::Wide, PanelConstraint::visible(0.28, 24))
-                .at(TerminalClass::UltraWide, PanelConstraint::visible(0.30, 30)),
+                .at(TerminalClass::Wide, PanelConstraint::visible(0.32, 24))
+                .at(TerminalClass::UltraWide, PanelConstraint::visible(0.38, 32)),
             );
         }
 
@@ -781,9 +782,30 @@ impl DashboardScreen {
         }
 
         if show_footer_panel {
-            let normal_ratio = if rich_footer_content { 0.18 } else { 0.14 };
-            let wide_ratio = if rich_footer_content { 0.22 } else { 0.16 };
-            let ultra_ratio = if rich_footer_content { 0.20 } else { 0.15 };
+            let normal_ratio = if force_dense_surface {
+                0.22
+            } else if rich_footer_content {
+                0.18
+            } else {
+                0.14
+            };
+            let wide_ratio = if force_dense_surface {
+                0.28
+            } else if rich_footer_content {
+                0.22
+            } else {
+                0.16
+            };
+            let ultra_ratio = if force_dense_surface {
+                0.36
+            } else if rich_footer_content {
+                0.23
+            } else {
+                0.18
+            };
+            let normal_min = if force_dense_surface { 6 } else { 4 };
+            let wide_min = if force_dense_surface { 9 } else { 6 };
+            let ultra_min = if force_dense_surface { 12 } else { 7 };
             layout = layout.panel(
                 PanelPolicy::new(
                     PanelSlot::Footer,
@@ -793,12 +815,15 @@ impl DashboardScreen {
                 )
                 .at(
                     TerminalClass::Normal,
-                    PanelConstraint::visible(normal_ratio, 4),
+                    PanelConstraint::visible(normal_ratio, normal_min),
                 )
-                .at(TerminalClass::Wide, PanelConstraint::visible(wide_ratio, 6))
+                .at(
+                    TerminalClass::Wide,
+                    PanelConstraint::visible(wide_ratio, wide_min),
+                )
                 .at(
                     TerminalClass::UltraWide,
-                    PanelConstraint::visible(ultra_ratio, 7),
+                    PanelConstraint::visible(ultra_ratio, ultra_min),
                 ),
             );
         }
@@ -839,6 +864,10 @@ impl DashboardScreen {
         let max_scroll = self.visible_entries().len().saturating_sub(1);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
     }
+}
+
+const fn should_force_dense_dashboard_surface(main_area: Rect) -> bool {
+    main_area.width >= 140 && main_area.height >= 22
 }
 
 impl Default for DashboardScreen {
@@ -1121,15 +1150,18 @@ impl MailScreen for DashboardScreen {
         } else {
             None
         };
-        let show_trend_panel = self.should_render_trend_panel();
-        let show_footer_panel = Self::should_render_bottom_rail(quick_query, preview);
+        let force_dense_surface = should_force_dense_dashboard_surface(main_area);
+        let show_trend_panel = self.should_render_trend_panel() || force_dense_surface;
+        let show_footer_panel =
+            Self::should_render_bottom_rail(quick_query, preview, force_dense_surface);
         let console_log_lines = self.console_log.borrow().len();
         let layout = Self::main_content_layout(
             show_trend_panel,
             self.show_log_panel,
             show_footer_panel,
-            preview.is_some(),
+            preview.is_some() || force_dense_surface,
             console_log_lines,
+            force_dense_surface,
         );
         let comp = layout.compute(main_area);
         // When the anomaly rail is hidden (Tiny), inject an inline annotation
@@ -2200,6 +2232,7 @@ fn render_insight_rail(
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_bottom_rail(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2214,6 +2247,77 @@ fn render_bottom_rail(
 
     if preview.is_none() {
         if query_text.is_empty() {
+            if is_megagrid_bottom_area(area) {
+                let (activity_col, rest) = split_width_ratio_with_gap(area, 0.38, 1);
+                let (analytics_col, ops_col) = split_width_ratio_with_gap(rest, 0.5, 1);
+
+                render_recent_activity_panel(frame, activity_col, entries, query_text);
+
+                let (analytics_top, analytics_bottom) =
+                    split_height_ratio_with_gap(analytics_col, 0.5, 1);
+                render_event_mix_panel(frame, analytics_top, entries, query_text);
+                render_message_flow_panel(frame, analytics_bottom, entries, query_text);
+
+                let (ops_top, ops_bottom) = split_height_ratio_with_gap(ops_col, 0.5, 1);
+                render_tool_latency_panel(frame, ops_top, entries, query_text);
+                render_reservation_ttl_buckets_panel(
+                    frame,
+                    ops_bottom,
+                    &db_snapshot.reservation_snapshots,
+                    query_text,
+                );
+                return;
+            }
+
+            if is_supergrid_bottom_area(area) {
+                if area.height >= 12 {
+                    let (activity_col, rest) = split_width_ratio_with_gap(area, 0.46, 1);
+                    let (top_row, bottom_row) = split_height_ratio_with_gap(rest, 0.5, 1);
+                    let (top_left, top_right) = split_width_ratio_with_gap(top_row, 0.5, 1);
+                    let (bottom_left, bottom_right) =
+                        split_width_ratio_with_gap(bottom_row, 0.5, 1);
+
+                    render_recent_activity_panel(frame, activity_col, entries, query_text);
+                    render_event_mix_panel(frame, top_left, entries, query_text);
+                    render_message_flow_panel(frame, top_right, entries, query_text);
+                    render_tool_latency_panel(frame, bottom_left, entries, query_text);
+                    render_reservation_ttl_buckets_panel(
+                        frame,
+                        bottom_right,
+                        &db_snapshot.reservation_snapshots,
+                        query_text,
+                    );
+                } else {
+                    let (left, right) = split_width_ratio_with_gap(area, 0.62, 1);
+                    let (right_top, right_bottom) = split_height_ratio_with_gap(right, 0.5, 1);
+                    render_recent_activity_panel(frame, left, entries, query_text);
+                    render_event_mix_panel(frame, right_top, entries, query_text);
+                    render_message_flow_panel(frame, right_bottom, entries, query_text);
+                }
+                return;
+            }
+
+            if area.width >= ULTRAWIDE_BOTTOM_MIN_WIDTH
+                && area.height >= ULTRAWIDE_BOTTOM_MIN_HEIGHT
+            {
+                if area.height >= 10 {
+                    let (activity_col, rest) = split_width_ratio_with_gap(area, 0.48, 1);
+                    let (mix_col, right_col) = split_width_ratio_with_gap(rest, 0.5, 1);
+                    let (right_top, right_bottom) = split_height_ratio_with_gap(right_col, 0.5, 1);
+                    render_recent_activity_panel(frame, activity_col, entries, query_text);
+                    render_event_mix_panel(frame, mix_col, entries, query_text);
+                    render_message_flow_panel(frame, right_top, entries, query_text);
+                    render_tool_latency_panel(frame, right_bottom, entries, query_text);
+                } else {
+                    let (left, right) = split_width_ratio_with_gap(area, 0.64, 1);
+                    let (right_top, right_bottom) = split_height_ratio_with_gap(right, 0.5, 1);
+                    render_recent_activity_panel(frame, left, entries, query_text);
+                    render_event_mix_panel(frame, right_top, entries, query_text);
+                    render_message_flow_panel(frame, right_bottom, entries, query_text);
+                }
+                return;
+            }
+
             render_recent_activity_panel(frame, area, entries, query_text);
             return;
         }
@@ -4290,7 +4394,7 @@ fn render_recent_message_preview_panel(
     let text = preview.map_or_else(
         || Text::from("No message traffic yet. Recent sent/received metadata appears here."),
         |preview| {
-            let theme = MarkdownTheme::default();
+            let theme = crate::tui_theme::markdown_theme();
             crate::tui_markdown::render_body(&preview.to_markdown(), &theme)
         },
     );
@@ -5017,6 +5121,31 @@ mod tests {
     }
 
     #[test]
+    fn dense_surface_breakpoint_detects_large_main_canvas() {
+        assert!(!should_force_dense_dashboard_surface(Rect::new(
+            0, 0, 139, 22
+        )));
+        assert!(!should_force_dense_dashboard_surface(Rect::new(
+            0, 0, 140, 21
+        )));
+        assert!(should_force_dense_dashboard_surface(Rect::new(
+            0, 0, 140, 22
+        )));
+        assert!(should_force_dense_dashboard_surface(Rect::new(
+            0, 0, 220, 40
+        )));
+    }
+
+    #[test]
+    fn dense_surface_forces_bottom_rail_visibility_without_query_or_preview() {
+        assert!(!DashboardScreen::should_render_bottom_rail("", None, false));
+        assert!(DashboardScreen::should_render_bottom_rail("", None, true));
+        assert!(DashboardScreen::should_render_bottom_rail(
+            "search", None, false
+        ));
+    }
+
+    #[test]
     fn summarize_recipients_formats_by_count() {
         assert_eq!(summarize_recipients(&[]), "(none)");
         assert_eq!(summarize_recipients(&["A".to_string()]), "A");
@@ -5164,9 +5293,9 @@ mod tests {
 
     #[test]
     fn main_layout_ultrawide_exposes_double_surface_vs_standard() {
-        let standard = DashboardScreen::main_content_layout(true, false, true, true, 0)
+        let standard = DashboardScreen::main_content_layout(true, false, true, true, 0, false)
             .compute(Rect::new(0, 0, 100, 30));
-        let ultra = DashboardScreen::main_content_layout(true, false, true, true, 0)
+        let ultra = DashboardScreen::main_content_layout(true, false, true, true, 0, false)
             .compute(Rect::new(0, 0, 200, 50));
 
         let standard_visible = standard
@@ -5194,7 +5323,7 @@ mod tests {
     fn main_layout_ultrawide_panels_fit_bounds_without_overlap() {
         let area = Rect::new(0, 0, 200, 50);
         let composition =
-            DashboardScreen::main_content_layout(true, false, true, true, 0).compute(area);
+            DashboardScreen::main_content_layout(true, false, true, true, 0, false).compute(area);
         let visible_rects: Vec<Rect> = [
             composition.rect(PanelSlot::Primary),
             composition.rect(PanelSlot::Inspector),
@@ -5229,8 +5358,24 @@ mod tests {
     }
 
     #[test]
+    fn main_layout_dense_surface_allocates_taller_footer() {
+        let area = Rect::new(0, 0, 220, 50);
+        let standard =
+            DashboardScreen::main_content_layout(true, false, true, false, 0, false).compute(area);
+        let dense =
+            DashboardScreen::main_content_layout(true, false, true, false, 0, true).compute(area);
+        let standard_footer = standard
+            .rect(PanelSlot::Footer)
+            .expect("standard footer should exist");
+        let dense_footer = dense
+            .rect(PanelSlot::Footer)
+            .expect("dense footer should exist");
+        assert!(dense_footer.height > standard_footer.height);
+    }
+
+    #[test]
     fn main_layout_hides_trend_panel_when_disabled() {
-        let composition = DashboardScreen::main_content_layout(false, false, true, true, 0)
+        let composition = DashboardScreen::main_content_layout(false, false, true, true, 0, false)
             .compute(Rect::new(0, 0, 200, 50));
         assert!(composition.rect(PanelSlot::Inspector).is_none());
         assert!(composition.rect(PanelSlot::Footer).is_some());
@@ -5238,7 +5383,7 @@ mod tests {
 
     #[test]
     fn main_layout_hides_footer_when_disabled() {
-        let composition = DashboardScreen::main_content_layout(true, false, false, false, 0)
+        let composition = DashboardScreen::main_content_layout(true, false, false, false, 0, false)
             .compute(Rect::new(0, 0, 200, 50));
         assert!(composition.rect(PanelSlot::Footer).is_none());
     }

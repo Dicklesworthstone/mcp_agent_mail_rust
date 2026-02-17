@@ -77,7 +77,7 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
         text_suppressible: true,
     },
     GlobalBinding {
-        label: "T",
+        label: "Ctrl+T",
         action: "Cycle theme",
         text_suppressible: true,
     },
@@ -311,7 +311,7 @@ fn vim_profile_bindings() -> Vec<ProfileBinding> {
         pb("command_palette", ":", "Command palette", true),
         pb("command_palette_ctrl", "Ctrl+P", "Command palette", false),
         pb("export_menu", "Ctrl+E", "Export screen snapshot", false),
-        pb("cycle_theme", "T", "Cycle theme", true),
+        pb("cycle_theme", "Ctrl+T", "Cycle theme", true),
         pb("toggle_help", "?", "Toggle help", true),
         pb("clipboard_yank", "y", "Copy to clipboard", true),
         pb("quit", "q", "Quit", true),
@@ -346,7 +346,7 @@ fn emacs_profile_bindings() -> Vec<ProfileBinding> {
         pb("toggle_mode", "m", "Toggle MCP/API mode", true),
         pb("command_palette", "Ctrl+P", "Command palette", false),
         pb("export_menu", "Ctrl+E", "Export screen snapshot", false),
-        pb("cycle_theme", "T", "Cycle theme", true),
+        pb("cycle_theme", "Ctrl+T", "Cycle theme", true),
         pb("toggle_help", "?", "Toggle help", true),
         pb("quit", "q", "Quit", true),
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
@@ -418,7 +418,7 @@ fn action_id_for_label(label: &str) -> &'static str {
         "Ctrl+P" => "command_palette_ctrl",
         "Ctrl+E" => "export_menu",
         ":" => "command_palette",
-        "T" => "cycle_theme",
+        "Ctrl+T" => "cycle_theme",
         "?" => "toggle_help",
         "y" => "clipboard_yank",
         "q" => "quit",
@@ -947,7 +947,7 @@ mod tests {
                         binding.label
                     );
                 }
-                "q" | "?" | ":" | "m" | "T" | "y" | JUMP_BINDING_LABEL => {
+                "q" | "?" | ":" | "m" | "Ctrl+T" | "y" | JUMP_BINDING_LABEL => {
                     assert!(
                         binding.text_suppressible,
                         "{} should be text-suppressible",

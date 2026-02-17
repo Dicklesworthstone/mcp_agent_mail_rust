@@ -573,16 +573,16 @@ async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcom
 
 /// Commit the current transaction (single fsync in WAL mode).
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
-    match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
-        Outcome::Ok(_) => rebuild_indexes(cx, tracked).await,
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await).map(|_| ())
 }
 
-/// Rebuild indexes to keep C-backed tooling and integrity checks in sync with
-/// pure-Rust runtime writes.
+/// Rebuild indexes via `REINDEX`.
+///
+/// Only needed for explicit repair/recovery paths (e.g. `am doctor repair`).
+/// Regular writes do not need this — `SQLite` maintains indexes automatically.
+/// Calling `REINDEX` after every write is expensive and can trigger UNIQUE
+/// constraint failures from unrelated tables if data inconsistencies exist.
+#[allow(dead_code)]
 async fn rebuild_indexes(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     map_sql_outcome(traw_execute(cx, tracked, "REINDEX", &[]).await).map(|_| ())
 }
@@ -676,12 +676,6 @@ pub async fn ensure_project(
             let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(_) => {
-                    match rebuild_indexes(cx, &tracked).await {
-                        Outcome::Ok(()) => {}
-                        Outcome::Err(e) => return Outcome::Err(e),
-                        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                        Outcome::Panicked(p) => return Outcome::Panicked(p),
-                    }
                     // Re-select just the inserted row
                     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
                         Outcome::Ok(rows) => rows.first().map_or_else(
@@ -934,12 +928,6 @@ pub async fn register_agent(
                 row.attachments_policy = attach_pol.to_string();
                 match map_sql_outcome(update!(&row).execute(cx, &tracked).await) {
                     Outcome::Ok(_) => {
-                        match rebuild_indexes(cx, &tracked).await {
-                            Outcome::Ok(()) => {}
-                            Outcome::Err(e) => return Outcome::Err(e),
-                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                            Outcome::Panicked(p) => return Outcome::Panicked(p),
-                        }
                         crate::cache::read_cache().put_agent(&row);
                         Outcome::Ok(row)
                     }
@@ -963,12 +951,6 @@ pub async fn register_agent(
                 };
                 match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
                     Outcome::Ok(_) => {
-                        match rebuild_indexes(cx, &tracked).await {
-                            Outcome::Ok(()) => {}
-                            Outcome::Err(e) => return Outcome::Err(e),
-                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                            Outcome::Panicked(p) => return Outcome::Panicked(p),
-                        }
                         // Read-back by project and filter in Rust. This avoids
                         // fragile multi-parameter string matching paths.
                         let fetch_sql = "SELECT id, project_id, name, program, model, \
@@ -1037,12 +1019,6 @@ pub async fn register_agent(
                                 found.attachments_policy = attach_pol.to_string();
                                 match map_sql_outcome(update!(&found).execute(cx, &tracked).await) {
                                     Outcome::Ok(_) => {
-                                        match rebuild_indexes(cx, &tracked).await {
-                                            Outcome::Ok(()) => {}
-                                            Outcome::Err(e) => return Outcome::Err(e),
-                                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                                            Outcome::Panicked(p) => return Outcome::Panicked(p),
-                                        }
                                         crate::cache::read_cache().put_agent(&found);
                                         Outcome::Ok(found)
                                     }
@@ -1130,12 +1106,6 @@ pub async fn create_agent(
                     "agent",
                     format!("{name} (project {project_id})"),
                 ));
-            }
-            match rebuild_indexes(cx, &tracked).await {
-                Outcome::Ok(()) => {}
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
             // Read back the inserted row so callers never see a synthetic id=0.
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
@@ -1433,12 +1403,7 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
     }
 
     match map_sql_outcome(traw_execute(cx, &tracked, "COMMIT", &[]).await) {
-        Outcome::Ok(_) => match rebuild_indexes(cx, &tracked).await {
-            Outcome::Ok(()) => Outcome::Ok(()),
-            Outcome::Err(e) => Outcome::Err(e),
-            Outcome::Cancelled(r) => Outcome::Cancelled(r),
-            Outcome::Panicked(p) => Outcome::Panicked(p),
-        },
+        Outcome::Ok(_) => Outcome::Ok(()),
         Outcome::Err(e) => {
             let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
             re_enqueue_touches(&pending);
@@ -1492,12 +1457,6 @@ pub async fn set_agent_contact_policy(
 
     match out {
         Outcome::Ok(_) => {
-            match rebuild_indexes(cx, &tracked).await {
-                Outcome::Ok(()) => {}
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
-            }
             // Fetch updated agent using raw SQL with explicit column order
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                              inception_ts, last_active_ts, attachments_policy, contact_policy \
@@ -1564,13 +1523,6 @@ pub async fn set_agent_contact_policy_by_name(
                     "Agent",
                     format!("{project_id}:{normalized_name}"),
                 ));
-            }
-
-            match rebuild_indexes(cx, &tracked).await {
-                Outcome::Ok(()) => {}
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
 
             // Invalidate stale entry and then re-read the full record from DB.

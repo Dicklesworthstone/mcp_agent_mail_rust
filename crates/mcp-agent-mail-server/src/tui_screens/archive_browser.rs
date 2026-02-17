@@ -111,6 +111,21 @@ fn format_file_size(bytes: u64) -> String {
     }
 }
 
+fn truncate_path_label(path: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let tail: String = path.chars().rev().take(max_chars - 1).collect();
+    let tail: String = tail.chars().rev().collect();
+    format!("…{tail}")
+}
+
 /// Detect content type from file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContentType {
@@ -631,7 +646,12 @@ impl ArchiveBrowserScreen {
         let title = if self.preview_path.is_empty() {
             " Preview ".to_string()
         } else {
-            format!(" {} [{}] ", self.preview_path, type_label)
+            let type_label_chars = u16::try_from(type_label.chars().count()).unwrap_or(u16::MAX);
+            let max_path_chars =
+                area.width
+                    .saturating_sub(type_label_chars.saturating_add(8)) as usize;
+            let path_label = truncate_path_label(&self.preview_path, max_path_chars.max(4));
+            format!(" {path_label} [{type_label}] ")
         };
 
         let block = Block::bordered()
@@ -641,6 +661,19 @@ impl ArchiveBrowserScreen {
 
         let inner = block.inner(area);
         block.render(area, frame);
+        let content_inner = if inner.width > 2 {
+            Rect::new(
+                inner.x.saturating_add(1),
+                inner.y,
+                inner.width.saturating_sub(2),
+                inner.height,
+            )
+        } else {
+            inner
+        };
+        if content_inner.width == 0 || content_inner.height == 0 {
+            return;
+        }
 
         let content = self.preview_content.as_deref().unwrap_or(
             "Select a file to preview its contents.\n\n\
@@ -662,10 +695,19 @@ impl ArchiveBrowserScreen {
             content.to_string()
         };
 
-        let p = Paragraph::new(display_text)
-            .scroll((self.preview_scroll, 0))
-            .style(Style::default());
-        p.render(inner, frame);
+        if self.preview_type == ContentType::Markdown && self.preview_content.is_some() {
+            let md_theme = crate::tui_theme::markdown_theme();
+            let text = crate::tui_markdown::render_body(content, &md_theme);
+            Paragraph::new(text)
+                .scroll((self.preview_scroll, 0))
+                .style(Style::default())
+                .render(content_inner, frame);
+        } else {
+            Paragraph::new(display_text)
+                .scroll((self.preview_scroll, 0))
+                .style(Style::default())
+                .render(content_inner, frame);
+        }
     }
 
     fn handle_filter_key(

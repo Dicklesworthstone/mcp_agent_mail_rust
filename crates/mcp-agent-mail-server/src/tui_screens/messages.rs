@@ -2539,22 +2539,33 @@ fn render_search_bar(
 
     // Render the TextInput inside the block
     if inner.height > 0 && inner.width > 0 {
-        let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
+        let content_inner = if inner.width > 2 {
+            Rect::new(
+                inner.x.saturating_add(1),
+                inner.y,
+                inner.width.saturating_sub(2),
+                inner.height,
+            )
+        } else {
+            inner
+        };
+        let input_area = Rect::new(content_inner.x, content_inner.y, content_inner.width, 1);
         input.render(input_area, frame);
-        if inner.height > 1 {
+        if content_inner.height > 1 {
             let pulse = if pulse_on { "\u{25cf}" } else { "\u{25cb}" };
             let meter = pulse_meter(ui_phase, 10);
             let hint = format!(
                 "{pulse} {meter}  Mouse: click/select, wheel preset/scroll, drag split border   Ops: / j k J K"
             );
-            let hint_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-            Paragraph::new(truncate_str(&hint, inner.width as usize))
+            let hint_area = Rect::new(content_inner.x, content_inner.y + 1, content_inner.width, 1);
+            Paragraph::new(truncate_str(&hint, content_inner.width as usize))
                 .style(crate::tui_theme::text_hint(&tp))
                 .render(hint_area, frame);
         }
-        if inner.height > 2 {
-            let telemetry_area = Rect::new(inner.x, inner.y + 2, inner.width, 1);
-            Paragraph::new(truncate_str(telemetry, inner.width as usize))
+        if content_inner.height > 2 {
+            let telemetry_area =
+                Rect::new(content_inner.x, content_inner.y + 2, content_inner.width, 1);
+            Paragraph::new(truncate_str(telemetry, content_inner.width as usize))
                 .style(Style::default().fg(tp.selection_indicator))
                 .render(telemetry_area, frame);
         }
@@ -2993,9 +3004,19 @@ fn render_detail_panel(
     } else {
         (inner, None)
     };
+    let content_inner = if content_inner.width > 2 {
+        Rect::new(
+            content_inner.x.saturating_add(1),
+            content_inner.y,
+            content_inner.width.saturating_sub(2),
+            content_inner.height,
+        )
+    } else {
+        content_inner
+    };
 
     let Some(msg) = entry else {
-        let p = Paragraph::new("  Select a message to view details.");
+        let p = Paragraph::new("Select a message to view details.");
         p.render(content_inner, frame);
         return;
     };

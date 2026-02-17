@@ -33,6 +33,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Why This Exists](#why-this-exists)
 - [What People Are Saying](#what-people-are-saying)
 - [Design Philosophy](#design-philosophy)
+- [Rust vs. Python: Stress Test Results](#rust-vs-python-stress-test-results)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Agent Configuration](#agent-configuration)
@@ -220,6 +221,45 @@ One disciplined hour of AI coding agents often produces 10-20 "human hours" of w
 **Dual persistence.** Human-readable Markdown in Git for auditability; SQLite with FTS5 for sub-millisecond queries, search, and directory lookups. Both stay in sync through the write pipeline.
 
 **Structured concurrency, no Tokio.** The entire async stack uses [asupersync](https://github.com/Dicklesworthstone/asupersync) with `Cx`-threaded structured concurrency. No orphan tasks, cancel-correct channels, and deterministic testing with virtual time.
+
+---
+
+## Rust vs. Python: Stress Test Results
+
+The Python implementation had three recurring failure modes under real multi-agent workloads: Git lock file contention from concurrent writes, SQLite pool exhaustion under sustained load, and cascading failures when many agents hit the server simultaneously. The Rust rewrite was designed specifically to eliminate these, and a dedicated stress test suite proves it.
+
+### The 10-Test Gauntlet
+
+| Test | Result | Key Metrics |
+|------|--------|-------------|
+| 30-agent message pipeline | PASS | 150/150 success, p99=6.8s, 0 errors |
+| 10-project concurrent ops | PASS | 150/150 success, 0 errors |
+| Commit coalescer batching | PASS | 9.1x batching ratio (100 writes &rarr; 11 commits) |
+| Stale git lock recovery | PASS | Lock detected, cleaned, writes resumed |
+| Mixed reservations + messages | PASS | 80+80 ops, 0 errors |
+| WBQ saturation | PASS | 2000/2000 enqueued, 0 errors, 0 fallbacks |
+| Pool exhaustion (60 threads, pool=15) | PASS | 600/600 success, 0 timeouts, 24 ops/sec |
+| Sustained 30s mixed workload | PASS | 1494 ops, ~49 RPS, p99=2.6s, 0 errors |
+| Thundering herd (50 threads, 1 agent) | PASS | All 50 got same ID, 0 errors |
+| Inbox reads during message storm | PASS | 150 sends + 300 reads, 0 errors |
+
+### Python Problem &rarr; Rust Fix
+
+| Python Failure Mode | What the Rust Tests Exercise | Result |
+|---------------------|------------------------------|--------|
+| **Git lock file contention** | Commit coalescer batching (100 concurrent writes &rarr; 11 commits, 9.1x reduction), stale lock recovery, multi-project isolation | 0 lock errors |
+| **SQLite pool exhaustion** | 60 threads on pool of 15, sustained 50 RPS for 30s, thundering herd (50 threads &rarr; 1 agent) | 0 timeouts, 0 DB errors |
+| **Overloading with many agents** | 30 agents &times; 5 messages, 10 projects &times; 5 agents, 2000 WBQ operations, mixed reservation+message workload | 0 errors across all |
+
+### What Makes the Difference
+
+- **Git lock contention eliminated.** The commit coalescer batches rapid-fire writes into far fewer git commits (9.1x reduction observed). Lock-free git plumbing commits avoid `index.lock` entirely in most cases.
+- **Pool exhaustion handled gracefully.** Even with 4x more threads than pool connections (60 vs 15), all 600 operations succeeded with 0 timeouts. WAL mode + 60s `busy_timeout` lets writers queue rather than fail.
+- **Stale lock recovery works.** Crashed-process lock files are detected via PID checking and cleaned up automatically, so a dead agent never holds the archive hostage.
+- **Write-behind queue backpressure is clean.** 2000 rapid-fire enqueues from 20 threads &mdash; all accepted with 0 fallbacks or errors.
+- **Read/write concurrency is solid.** Concurrent inbox reads and message writes produce 0 errors. WAL mode allows unlimited readers alongside writers.
+
+The stress tests live in `crates/mcp-agent-mail-storage/tests/stress_pipeline.rs` (Rust unit tests targeting the DB+Git pipeline) and `tests/e2e/test_stress_load.sh` (HTTP E2E tests hammering a live server through the full network&rarr;server&rarr;DB&rarr;git pipeline).
 
 ---
 
@@ -985,8 +1025,11 @@ Common pitfalls
 | [OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md) | Deployment, troubleshooting, diagnostics |
 | [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | Dev setup, debugging, testing |
 | [MIGRATION_GUIDE.md](docs/MIGRATION_GUIDE.md) | Python to Rust migration |
+| [RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md](docs/RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md) | `am legacy` / `am upgrade` migration operations |
 | [RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) | Pre-release validation |
 | [ROLLOUT_PLAYBOOK.md](docs/ROLLOUT_PLAYBOOK.md) | Staged rollout strategy |
+| [TEMPLATE_OLD_REPO_RUST_CUTOVER_PR_CHECKLIST.md](docs/TEMPLATE_OLD_REPO_RUST_CUTOVER_PR_CHECKLIST.md) | Canonical old-repo cutover PR checklist |
+| [TEMPLATE_OLD_REPO_RUST_CUTOVER_RELEASE_NOTES.md](docs/TEMPLATE_OLD_REPO_RUST_CUTOVER_RELEASE_NOTES.md) | Release-notes template for Rust cutover |
 | [ADR-001](docs/ADR-001-dual-mode-invariants.md) | Dual-mode interface design |
 | [ADR-002](docs/ADR-002-single-binary-cli-opt-in.md) | Single binary with mode switch |
 | [ADR-003](docs/ADR-003-search-v3-architecture.md) | Search v3 implementation |

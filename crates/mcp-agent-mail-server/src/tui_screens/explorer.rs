@@ -6,6 +6,7 @@
 //! with the MCP tool surface.
 
 use ftui::layout::Rect;
+use ftui::text::{Line, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
@@ -160,6 +161,7 @@ struct DisplayEntry {
     sender_name: String,
     to_agents: String,
     subject: String,
+    body_md: String,
     body_preview: String,
     thread_id: Option<String>,
     importance: String,
@@ -1128,7 +1130,7 @@ impl MailScreen for MailExplorerScreen {
         if entry.body_preview.is_empty() {
             Some(entry.subject.clone())
         } else {
-            Some(format!("{}\n\n{}", entry.subject, entry.body_preview))
+            Some(format!("{}\n\n{}", entry.subject, entry.body_md))
         }
     }
 
@@ -1160,7 +1162,11 @@ impl MailScreen for MailExplorerScreen {
 fn map_entry(row: &Row, direction: Direction) -> Option<DisplayEntry> {
     let message_id: i64 = row.get_named("id").ok()?;
     let body: String = row.get_named("body_md").unwrap_or_default();
-    let preview = truncate_str(&body, 120);
+    let preview = {
+        let theme = crate::tui_theme::markdown_theme();
+        let rendered = crate::tui_markdown::render_body(&body, &theme);
+        truncate_str(&rendered.to_plain_text(), 120)
+    };
 
     Some(DisplayEntry {
         message_id,
@@ -1168,6 +1174,7 @@ fn map_entry(row: &Row, direction: Direction) -> Option<DisplayEntry> {
         sender_name: row.get_named("sender_name").unwrap_or_default(),
         to_agents: row.get_named("to_agents").unwrap_or_default(),
         subject: row.get_named("subject").unwrap_or_default(),
+        body_md: body,
         body_preview: preview,
         thread_id: row.get_named("thread_id").ok(),
         importance: row
@@ -1513,9 +1520,19 @@ fn render_detail(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    let content_inner = if inner.width > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        )
+    } else {
+        inner
+    };
 
     let Some(entry) = entry else {
-        Paragraph::new("  Select a message to view details.").render(inner, frame);
+        Paragraph::new("Select a message to view details.").render(content_inner, frame);
         return;
     };
 
@@ -1525,33 +1542,43 @@ fn render_detail(
         Direction::Outbound => "Outbound",
         Direction::All => "Unknown",
     };
-    lines.push(format!("Dir:     {dir}"));
-    lines.push(format!("Subject: {}", entry.subject));
-    lines.push(format!("From:    {}", entry.sender_name));
-    lines.push(format!("To:      {}", entry.to_agents));
-    lines.push(format!("Project: {}", entry.project_slug));
+    lines.push(Line::raw(format!("Dir:     {dir}")));
+    lines.push(Line::raw(format!("Subject: {}", entry.subject)));
+    lines.push(Line::raw(format!("From:    {}", entry.sender_name)));
+    lines.push(Line::raw(format!("To:      {}", entry.to_agents)));
+    lines.push(Line::raw(format!("Project: {}", entry.project_slug)));
     if let Some(ref tid) = entry.thread_id {
-        lines.push(format!("Thread:  {tid}"));
+        lines.push(Line::raw(format!("Thread:  {tid}")));
     }
-    lines.push(format!("Import.: {}", entry.importance));
+    lines.push(Line::raw(format!("Import.: {}", entry.importance)));
     if entry.ack_required {
         let ack_status = if entry.ack_ts.is_some() {
             "acknowledged"
         } else {
             "pending"
         };
-        lines.push(format!("Ack:     {ack_status}"));
+        lines.push(Line::raw(format!("Ack:     {ack_status}")));
     }
-    lines.push(format!("Time:    {}", micros_to_iso(entry.created_ts)));
+    lines.push(Line::raw(format!(
+        "Time:    {}",
+        micros_to_iso(entry.created_ts)
+    )));
+    lines.push(Line::raw(String::new()));
+    lines.push(Line::raw("--- Body ---"));
 
-    lines.push(String::new());
-    lines.push("--- Preview ---".to_string());
-    lines.push(entry.body_preview.clone());
+    let md_theme = crate::tui_theme::markdown_theme();
+    let rendered = crate::tui_markdown::render_body(&entry.body_md, &md_theme);
+    for line in rendered.lines() {
+        lines.push(line.clone());
+    }
 
-    let skip = scroll.min(lines.len().saturating_sub(1));
-    let visible = &lines[skip..];
-    let text = visible.join("\n");
-    Paragraph::new(text).render(inner, frame);
+    let visible_height = usize::from(content_inner.height).max(1);
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let clamped_scroll = scroll.min(max_scroll);
+    Paragraph::new(Text::from_lines(lines))
+        .wrap(ftui::text::WrapMode::Word)
+        .scroll((clamped_scroll as u16, 0))
+        .render(content_inner, frame);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2249,6 +2276,7 @@ mod tests {
             sender_name: "TestAgent".to_string(),
             to_agents: "OtherAgent".to_string(),
             subject: format!("Subject {id}"),
+            body_md: String::new(),
             body_preview: String::new(),
             thread_id: None,
             importance: "normal".to_string(),
@@ -2352,6 +2380,7 @@ mod tests {
             sender_name: String::new(),
             to_agents: String::new(),
             subject: String::new(),
+            body_md: String::new(),
             body_preview: String::new(),
             thread_id: None,
             importance: String::new(),

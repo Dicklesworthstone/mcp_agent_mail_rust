@@ -977,7 +977,7 @@ pub struct MailAppModel {
     toast_error_dismiss_secs: u64,
     toast_age_ticks: HashMap<ToastId, u8>,
     /// When `Some(idx)`, the toast stack is in focus mode and the
-    /// toast at `idx` has a highlight border. `Ctrl+T` toggles.
+    /// toast at `idx` has a highlight border. `Ctrl+Y` toggles.
     toast_focus_index: Option<usize>,
     /// Modal manager for confirmation dialogs.
     modal_manager: ModalManager,
@@ -1936,8 +1936,32 @@ impl MailAppModel {
         self.state.update_config_snapshot(snapshot);
     }
 
+    fn theme_id_for_named_config(cfg: &str) -> ThemeId {
+        match cfg {
+            "solarized" => ThemeId::LumenLight,
+            "dracula" => ThemeId::Darcula,
+            "nord" => ThemeId::NordicFrost,
+            "gruvbox" => ThemeId::HighContrast,
+            _ => ThemeId::CyberpunkAurora,
+        }
+    }
+
+    const fn named_config_for_theme_id(theme_id: ThemeId) -> &'static str {
+        match theme_id {
+            ThemeId::CyberpunkAurora => "default",
+            ThemeId::Darcula => "dracula",
+            ThemeId::LumenLight => "solarized",
+            ThemeId::NordicFrost => "nord",
+            ThemeId::HighContrast => "gruvbox",
+        }
+    }
+
     fn apply_theme(&mut self, theme_id: ThemeId) -> &'static str {
         let name = crate::tui_theme::set_theme_and_get_name(theme_id);
+        let named_cfg = Self::named_config_for_theme_id(theme_id);
+        let _ = crate::tui_theme::set_named_theme(
+            crate::tui_theme::TuiThemePalette::config_name_to_index(named_cfg),
+        );
         self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
         if theme_id != ThemeId::HighContrast {
             self.last_non_hc_theme = theme_id;
@@ -1948,17 +1972,16 @@ impl MailAppModel {
     }
 
     fn cycle_theme(&mut self) -> &'static str {
-        // Cycle both the ftui console theme and the named palette theme (T14.2).
-        let name = crate::tui_theme::cycle_and_get_name();
-        let _named = crate::tui_theme::cycle_named_theme();
-        let theme_id = crate::tui_theme::current_theme_id();
+        let (cfg, display, _palette) = crate::tui_theme::cycle_named_theme();
+        let theme_id = Self::theme_id_for_named_config(cfg);
+        let _ = crate::tui_theme::set_theme_and_get_name(theme_id);
         self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
         if theme_id != ThemeId::HighContrast {
             self.last_non_hc_theme = theme_id;
         }
         self.sync_theme_snapshot();
         self.persist_appearance_settings();
-        name
+        display
     }
 
     fn toggle_high_contrast_theme(&mut self) -> &'static str {
@@ -2631,6 +2654,25 @@ impl MailAppModel {
                 let name = self.apply_theme(ThemeId::HighContrast);
                 self.notifications.notify(
                     Toast::new(format!("Theme: {name}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                return Cmd::none();
+            }
+            palette_action_ids::THEME_FRANKENSTEIN => {
+                let (cfg, display, _) = crate::tui_theme::set_named_theme(
+                    crate::tui_theme::TuiThemePalette::config_name_to_index("frankenstein"),
+                );
+                let theme_id = Self::theme_id_for_named_config(cfg);
+                let _ = crate::tui_theme::set_theme_and_get_name(theme_id);
+                self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
+                if theme_id != ThemeId::HighContrast {
+                    self.last_non_hc_theme = theme_id;
+                }
+                self.sync_theme_snapshot();
+                self.persist_appearance_settings();
+                self.notifications.notify(
+                    Toast::new(format!("Theme: {display}"))
                         .icon(ToastIcon::Info)
                         .duration(Duration::from_secs(3)),
                 );
@@ -3338,10 +3380,24 @@ impl Model for MailAppModel {
                             self.open_compose();
                             return Cmd::none();
                         }
-                        // Ctrl+T: toggle toast focus mode.
-                        let is_ctrl_t = key.modifiers.contains(Modifiers::CTRL)
-                            && matches!(key.code, KeyCode::Char('t'));
-                        if is_ctrl_t && !text_mode {
+                        // Ctrl+T: cycle theme globally.
+                        let is_ctrl_t = (key.modifiers.contains(Modifiers::CTRL)
+                            && matches!(key.code, KeyCode::Char('t' | 'T')))
+                            // Some terminals emit ASCII control code 0x14 for Ctrl+T.
+                            || matches!(key.code, KeyCode::Char('\u{14}'));
+                        if is_ctrl_t {
+                            let name = self.cycle_theme();
+                            self.notifications.notify(
+                                Toast::new(format!("Theme: {name}"))
+                                    .icon(ToastIcon::Info)
+                                    .duration(Duration::from_secs(3)),
+                            );
+                            return Cmd::none();
+                        }
+                        // Ctrl+Y: toggle toast focus mode.
+                        let is_ctrl_y = key.modifiers.contains(Modifiers::CTRL)
+                            && matches!(key.code, KeyCode::Char('y' | 'Y'));
+                        if is_ctrl_y && !text_mode {
                             if self.toast_focus_index.is_some() {
                                 self.toast_focus_index = None;
                             } else if self.notifications.visible_count() > 0 {
@@ -3934,6 +3990,7 @@ mod palette_action_ids {
     pub const THEME_LUMEN: &str = "theme:lumen_light";
     pub const THEME_NORDIC: &str = "theme:nordic_frost";
     pub const THEME_HIGH_CONTRAST: &str = "theme:high_contrast";
+    pub const THEME_FRANKENSTEIN: &str = "theme:frankenstein";
 
     pub const AGENT_PREFIX: &str = "agent:";
     pub const THREAD_PREFIX: &str = "thread:";
@@ -4073,7 +4130,7 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
 
     out.push(
         ActionItem::new(palette_action_ids::THEME_CYCLE, "Cycle Theme")
-            .with_description("Switch to the next color theme (T)")
+            .with_description("Switch to the next color theme (Ctrl+T)")
             .with_tags(&["theme", "colors", "appearance"])
             .with_category("Appearance"),
     );
@@ -4111,6 +4168,15 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
         )
         .with_description("Set theme to High Contrast")
         .with_tags(&["theme", "colors", "appearance", "a11y"])
+        .with_category("Appearance"),
+    );
+    out.push(
+        ActionItem::new(
+            palette_action_ids::THEME_FRANKENSTEIN,
+            "Theme: Frankenstein",
+        )
+        .with_description("Set theme to Frankenstein (non-default showcase palette)")
+        .with_tags(&["theme", "colors", "appearance"])
         .with_category("Appearance"),
     );
 
@@ -4832,6 +4898,7 @@ fn palette_action_label(id: &str) -> String {
         palette_action_ids::THEME_LUMEN => "Theme: Lumen Light".into(),
         palette_action_ids::THEME_NORDIC => "Theme: Nordic Frost".into(),
         palette_action_ids::THEME_HIGH_CONTRAST => "Theme: High Contrast".into(),
+        palette_action_ids::THEME_FRANKENSTEIN => "Theme: Frankenstein".into(),
         palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION => "Toggle Reduced Motion".into(),
         palette_action_ids::A11Y_TOGGLE_SCREEN_READER => "Toggle Screen Reader Mode".into(),
         palette_action_ids::LAYOUT_RESET => "Reset Layout".into(),
@@ -5400,7 +5467,7 @@ fn render_focus_hint(
     default_y: u16,
     frame: &mut Frame,
 ) {
-    let hint = "Ctrl+T:exit  \u{2191}\u{2193}:nav  Enter:dismiss";
+    let hint = "Ctrl+Y:exit  \u{2191}\u{2193}:nav  Enter:dismiss";
     let hint_y = positions.last().map_or(default_y, |(_, _, py)| {
         let (_, lh) = visible
             .last()
@@ -6924,6 +6991,7 @@ mod tests {
         assert!(ids.contains(&palette_action_ids::THEME_LUMEN));
         assert!(ids.contains(&palette_action_ids::THEME_NORDIC));
         assert!(ids.contains(&palette_action_ids::THEME_HIGH_CONTRAST));
+        assert!(ids.contains(&palette_action_ids::THEME_FRANKENSTEIN));
     }
 
     #[test]
@@ -6938,6 +7006,17 @@ mod tests {
         model.dispatch_palette_action(palette_action_ids::THEME_HIGH_CONTRAST);
         assert_eq!(crate::tui_theme::current_theme_id(), ThemeId::HighContrast);
         assert!(model.accessibility().high_contrast);
+
+        model.dispatch_palette_action(palette_action_ids::THEME_FRANKENSTEIN);
+        assert_eq!(
+            crate::tui_theme::current_theme_id(),
+            ThemeId::CyberpunkAurora
+        );
+        assert_eq!(
+            crate::tui_theme::active_named_theme_config_name(),
+            "frankenstein"
+        );
+        assert!(!model.accessibility().high_contrast);
     }
 
     #[test]
@@ -8113,7 +8192,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_toggles_toast_focus_mode_when_visible_toasts_exist() {
+    fn ctrl_y_toggles_toast_focus_mode_when_visible_toasts_exist() {
         let mut model = test_model();
         model.notifications.notify(
             Toast::new("focus target")
@@ -8124,25 +8203,36 @@ mod tests {
         assert_eq!(model.notifications.visible_count(), 1);
         assert!(model.toast_focus_index.is_none());
 
-        let ctrl_t = Event::Key(KeyEvent::new(KeyCode::Char('t')).with_modifiers(Modifiers::CTRL));
-        let cmd = model.update(MailMsg::Terminal(ctrl_t.clone()));
+        let ctrl_y = Event::Key(KeyEvent::new(KeyCode::Char('y')).with_modifiers(Modifiers::CTRL));
+        let cmd = model.update(MailMsg::Terminal(ctrl_y.clone()));
         assert!(matches!(cmd, Cmd::None));
         assert_eq!(model.toast_focus_index, Some(0));
 
-        let cmd = model.update(MailMsg::Terminal(ctrl_t));
+        let cmd = model.update(MailMsg::Terminal(ctrl_y));
         assert!(matches!(cmd, Cmd::None));
         assert!(model.toast_focus_index.is_none());
     }
 
     #[test]
-    fn ctrl_t_does_not_enter_focus_mode_with_no_visible_toasts() {
+    fn ctrl_y_does_not_enter_focus_mode_with_no_visible_toasts() {
         let mut model = test_model();
         assert_eq!(model.notifications.visible_count(), 0);
 
+        let ctrl_y = Event::Key(KeyEvent::new(KeyCode::Char('y')).with_modifiers(Modifiers::CTRL));
+        let cmd = model.update(MailMsg::Terminal(ctrl_y));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(model.toast_focus_index.is_none());
+    }
+
+    #[test]
+    fn ctrl_t_cycles_theme() {
+        let mut model = test_model();
+        let before = crate::tui_theme::current_theme_id();
         let ctrl_t = Event::Key(KeyEvent::new(KeyCode::Char('t')).with_modifiers(Modifiers::CTRL));
         let cmd = model.update(MailMsg::Terminal(ctrl_t));
         assert!(matches!(cmd, Cmd::None));
-        assert!(model.toast_focus_index.is_none());
+        let after = crate::tui_theme::current_theme_id();
+        assert_ne!(before, after);
     }
 
     #[test]
@@ -8158,8 +8248,8 @@ mod tests {
         model.notifications.tick(Duration::from_millis(16));
         assert_eq!(model.notifications.visible_count(), 3);
 
-        let ctrl_t = Event::Key(KeyEvent::new(KeyCode::Char('t')).with_modifiers(Modifiers::CTRL));
-        model.update(MailMsg::Terminal(ctrl_t));
+        let ctrl_y = Event::Key(KeyEvent::new(KeyCode::Char('y')).with_modifiers(Modifiers::CTRL));
+        model.update(MailMsg::Terminal(ctrl_y));
         assert_eq!(model.toast_focus_index, Some(0));
 
         let down = Event::Key(KeyEvent::new(KeyCode::Down));

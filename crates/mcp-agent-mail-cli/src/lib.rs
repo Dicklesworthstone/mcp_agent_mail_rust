@@ -18,6 +18,7 @@ pub mod context;
 pub mod e2e_artifacts;
 pub mod e2e_runner;
 pub mod golden;
+pub mod legacy;
 pub mod output;
 pub mod robot;
 
@@ -317,6 +318,12 @@ pub enum Commands {
     /// Agent-optimized commands with TOON/JSON/Markdown output.
     #[command(name = "robot")]
     Robot(robot::RobotArgs),
+    /// Legacy Python installation detection, migration/import, and status.
+    #[command(name = "legacy")]
+    Legacy(legacy::LegacyArgs),
+    /// Upgrade helper: detect legacy install, import data, refresh setup.
+    #[command(name = "upgrade")]
+    Upgrade(legacy::UpgradeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1912,6 +1919,8 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Golden { action } => handle_golden(action),
         Commands::FlakeTriage { action } => handle_flake_triage(action),
         Commands::Robot(args) => robot::handle_robot(args),
+        Commands::Legacy(args) => legacy::handle_legacy(args),
+        Commands::Upgrade(args) => legacy::handle_upgrade(args),
     }
 }
 
@@ -3031,7 +3040,7 @@ fn handle_config(action: ConfigCommand) -> CliResult<()> {
     }
 }
 
-fn handle_setup(action: SetupCommand) -> CliResult<()> {
+pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
     use mcp_agent_mail_core::setup;
 
     match action {
@@ -3381,6 +3390,8 @@ fn build_golden_specs(pattern: Option<&glob::Pattern>) -> Vec<golden::GoldenComm
         "archive",
         "projects",
         "file_reservations",
+        "legacy",
+        "upgrade",
     ];
     for subcmd in HELP_SUBCOMMANDS {
         maybe_push(golden::GoldenCommandSpec::new(
@@ -6985,6 +6996,97 @@ fn handle_doctor_check_with(
         "detail": if db_ok { "SQLite database accessible" } else { "Cannot open database" },
     }));
 
+    // Check 1b: DB file sanity (non-zero size + PRAGMA quick_check)
+    {
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: database_url.to_string(),
+            ..Default::default()
+        };
+        if let Ok(db_path) = cfg.sqlite_path() {
+            let path = std::path::Path::new(&db_path);
+            if db_path != ":memory:" && path.exists() {
+                let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                if file_size == 0 {
+                    checks.push(serde_json::json!({
+                        "check": "db_file_sanity",
+                        "status": "fail",
+                        "detail": "Database file is 0 bytes (empty/corrupt)",
+                    }));
+                } else if let Ok(conn) =
+                    mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&db_path)
+                {
+                    let qc_ok = conn
+                        .query_sync("PRAGMA quick_check", &[])
+                        .ok()
+                        .and_then(|rows| {
+                            rows.first()
+                                .and_then(|r| r.get_named::<String>("quick_check").ok())
+                        })
+                        .map(|s| s == "ok")
+                        .unwrap_or(false);
+                    checks.push(serde_json::json!({
+                        "check": "db_file_sanity",
+                        "status": if qc_ok { "ok" } else { "fail" },
+                        "detail": if qc_ok {
+                            format!("quick_check OK ({file_size} bytes)")
+                        } else {
+                            "PRAGMA quick_check failed (possible corruption)".to_string()
+                        },
+                    }));
+                }
+            }
+        }
+    }
+
+    // Check 1c: Pool initialization (including migrations)
+    {
+        let pool_cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: database_url.to_string(),
+            ..Default::default()
+        };
+        match mcp_agent_mail_db::pool::DbPool::new(&pool_cfg) {
+            Ok(pool) => {
+                let pool_result: Result<(), String> = context::run_async(async {
+                    let cx = asupersync::Cx::for_request();
+                    match pool.acquire(&cx).await {
+                        asupersync::Outcome::Ok(_conn) => Ok(()),
+                        asupersync::Outcome::Err(e) => Err(CliError::Other(format!("{e}"))),
+                        asupersync::Outcome::Cancelled(_) => {
+                            Err(CliError::Other("cancelled".to_string()))
+                        }
+                        asupersync::Outcome::Panicked(p) => {
+                            Err(CliError::Other(format!("panic: {}", p.message())))
+                        }
+                    }
+                })
+                .map_err(|e| e.to_string());
+                match pool_result {
+                    Ok(()) => {
+                        checks.push(serde_json::json!({
+                            "check": "pool_init",
+                            "status": "ok",
+                            "detail": "Pool initialization + migrations OK",
+                        }));
+                    }
+                    Err(msg) => {
+                        checks.push(serde_json::json!({
+                            "check": "pool_init",
+                            "status": "fail",
+                            "detail": format!("Pool/migration failure: {msg}"),
+                        }));
+                    }
+                }
+            }
+            Err(e) => {
+                checks.push(serde_json::json!({
+                    "check": "pool_init",
+                    "status": "fail",
+                    "detail": format!("Cannot create pool: {e}"),
+                }));
+            }
+        }
+    }
+
     // Check 2: Storage root exists
     let storage_ok = storage_root.exists();
     checks.push(serde_json::json!({
@@ -7932,21 +8034,42 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 }
 
 /// Resolve a project key to a `ProjectRow` via the async DB layer.
+///
+/// Tries slug lookup, then human_key lookup, then auto-creates if the key is
+/// an absolute path. Distinguishes "not found" errors (which should fall
+/// through to the next lookup) from real DB/connection errors (which surface
+/// immediately so the caller sees the actual problem).
 async fn resolve_project_async(
     cx: &asupersync::Cx,
     pool: &mcp_agent_mail_db::DbPool,
     key: &str,
 ) -> CliResult<mcp_agent_mail_db::ProjectRow> {
     // Try by slug first
-    let by_slug = mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, key).await;
-    if let asupersync::Outcome::Ok(row) = by_slug {
-        return Ok(row);
+    match mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, key).await {
+        asupersync::Outcome::Ok(row) => return Ok(row),
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => { /* fall through */
+        }
+        asupersync::Outcome::Err(e) => return Err(CliError::Other(format!("database error: {e}"))),
+        asupersync::Outcome::Cancelled(_) => {
+            return Err(CliError::Other("request cancelled".into()));
+        }
+        asupersync::Outcome::Panicked(p) => {
+            return Err(CliError::Other(format!("internal panic: {}", p.message())));
+        }
     }
 
     // Try by human_key
-    let by_hk = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, key).await;
-    if let asupersync::Outcome::Ok(row) = by_hk {
-        return Ok(row);
+    match mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, key).await {
+        asupersync::Outcome::Ok(row) => return Ok(row),
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => { /* fall through */
+        }
+        asupersync::Outcome::Err(e) => return Err(CliError::Other(format!("database error: {e}"))),
+        asupersync::Outcome::Cancelled(_) => {
+            return Err(CliError::Other("request cancelled".into()));
+        }
+        asupersync::Outcome::Panicked(p) => {
+            return Err(CliError::Other(format!("internal panic: {}", p.message())));
+        }
     }
 
     // If it looks like an absolute path, auto-create it
@@ -7959,7 +8082,7 @@ async fn resolve_project_async(
             }
             asupersync::Outcome::Cancelled(_) => Err(CliError::Other("request cancelled".into())),
             asupersync::Outcome::Panicked(p) => {
-                return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                Err(CliError::Other(format!("internal panic: {}", p.message())))
             }
         };
     }
@@ -13640,6 +13763,8 @@ mod tests {
             "agents",
             "tooling",
             "golden",
+            "legacy",
+            "upgrade",
         ];
         for cmd in expected {
             assert!(
@@ -13747,6 +13872,47 @@ mod tests {
                 h.contains(cmd),
                 "archive help missing subcommand '{cmd}'\n{h}"
             );
+        }
+    }
+
+    #[test]
+    fn help_legacy_lists_subcommands() {
+        let h = help_text_for(&["am", "legacy", "--help"]);
+        for cmd in ["detect", "import", "status"] {
+            assert!(
+                h.contains(cmd),
+                "legacy help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_legacy_import_lists_flags() {
+        let h = help_text_for(&["am", "legacy", "import", "--help"]);
+        for flag in [
+            "--auto",
+            "--search-root",
+            "--db",
+            "--storage-root",
+            "--in-place",
+            "--copy",
+            "--target-db",
+            "--target-storage-root",
+            "--dry-run",
+            "--yes",
+        ] {
+            assert!(
+                h.contains(flag),
+                "legacy import help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_upgrade_lists_flags() {
+        let h = help_text_for(&["am", "upgrade", "--help"]);
+        for flag in ["--search-root", "--dry-run", "--yes", "--format", "--json"] {
+            assert!(h.contains(flag), "upgrade help missing flag '{flag}'\n{h}");
         }
     }
 
@@ -15886,6 +16052,185 @@ mod tests {
             "BlueLake",
         ]);
         assert!(err.is_err());
+    }
+
+    // ── Legacy/upgrade clap parsing tests ────────────────────────────────
+
+    #[test]
+    fn clap_parses_legacy_detect_defaults() {
+        let cli = Cli::try_parse_from(["am", "legacy", "detect"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Legacy(legacy::LegacyArgs {
+                action:
+                    legacy::LegacyCommand::Detect {
+                        search_root,
+                        format,
+                        json,
+                    },
+            }) => {
+                assert!(search_root.is_none());
+                assert!(format.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected legacy detect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_legacy_import_auto_dry_run() {
+        let cli = Cli::try_parse_from(["am", "legacy", "import", "--auto", "--dry-run", "--yes"])
+            .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Legacy(legacy::LegacyArgs {
+                action:
+                    legacy::LegacyCommand::Import {
+                        auto,
+                        search_root,
+                        db,
+                        storage_root,
+                        in_place,
+                        copy,
+                        target_db,
+                        target_storage_root,
+                        dry_run,
+                        yes,
+                        format,
+                        json,
+                    },
+            }) => {
+                assert!(auto);
+                assert!(search_root.is_none());
+                assert!(db.is_none());
+                assert!(storage_root.is_none());
+                assert!(!in_place);
+                assert!(!copy);
+                assert!(target_db.is_none());
+                assert!(target_storage_root.is_none());
+                assert!(dry_run);
+                assert!(yes);
+                assert!(format.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected legacy import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_legacy_import_copy_with_explicit_targets() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "legacy",
+            "import",
+            "--db",
+            "/tmp/legacy.sqlite3",
+            "--storage-root",
+            "/tmp/legacy-storage",
+            "--copy",
+            "--target-db",
+            "/tmp/rust.sqlite3",
+            "--target-storage-root",
+            "/tmp/rust-storage",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Legacy(legacy::LegacyArgs {
+                action:
+                    legacy::LegacyCommand::Import {
+                        auto,
+                        db,
+                        storage_root,
+                        in_place,
+                        copy,
+                        target_db,
+                        target_storage_root,
+                        json,
+                        ..
+                    },
+            }) => {
+                assert!(!auto);
+                assert_eq!(db, Some(PathBuf::from("/tmp/legacy.sqlite3")));
+                assert_eq!(storage_root, Some(PathBuf::from("/tmp/legacy-storage")));
+                assert!(!in_place);
+                assert!(copy);
+                assert_eq!(target_db, Some(PathBuf::from("/tmp/rust.sqlite3")));
+                assert_eq!(
+                    target_storage_root,
+                    Some(PathBuf::from("/tmp/rust-storage"))
+                );
+                assert!(json);
+            }
+            other => panic!("expected legacy import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_legacy_import_in_place_and_copy() {
+        let err = Cli::try_parse_from(["am", "legacy", "import", "--copy", "--in-place"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_parses_legacy_status() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "legacy",
+            "status",
+            "--search-root",
+            "/tmp/proj",
+            "--storage-root",
+            "/tmp/storage",
+            "--format",
+            "toon",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Legacy(legacy::LegacyArgs {
+                action:
+                    legacy::LegacyCommand::Status {
+                        search_root,
+                        storage_root,
+                        format,
+                        json,
+                    },
+            }) => {
+                assert_eq!(search_root, Some(PathBuf::from("/tmp/proj")));
+                assert_eq!(storage_root, Some(PathBuf::from("/tmp/storage")));
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected legacy status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_upgrade_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "upgrade",
+            "--search-root",
+            "/tmp/proj",
+            "--dry-run",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Upgrade(legacy::UpgradeArgs {
+                search_root,
+                dry_run,
+                yes,
+                format,
+                json,
+            }) => {
+                assert_eq!(search_root, Some(PathBuf::from("/tmp/proj")));
+                assert!(dry_run);
+                assert!(yes);
+                assert!(format.is_none());
+                assert!(json);
+            }
+            other => panic!("expected upgrade command, got {other:?}"),
+        }
     }
 
     // ── Contacts clap parsing tests ──────────────────────────────────────
@@ -18757,6 +19102,15 @@ fn handle_doctor_repair(
             let bak_path = bak_dir.join(&bak_name);
             std::fs::copy(&db_path, &bak_path)?;
             ftui_runtime::ftui_println!("  Backup: {}", bak_path.display());
+
+            // Also create a .bak sibling next to the primary DB so that the
+            // pool's auto-recovery (find_healthy_backup) can discover it.
+            let sibling_bak = format!("{db_path}.bak");
+            if let Err(e) = std::fs::copy(&db_path, &sibling_bak) {
+                ftui_runtime::ftui_eprintln!(
+                    "  Warning: could not create sibling backup {sibling_bak}: {e}"
+                );
+            }
         }
     }
 

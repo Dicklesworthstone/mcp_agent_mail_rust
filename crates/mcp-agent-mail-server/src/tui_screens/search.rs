@@ -18,6 +18,7 @@ use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
@@ -44,8 +45,8 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 /// Max results to display.
 const MAX_RESULTS: usize = 200;
 
-/// Debounce delay in ticks. Zero means immediate search-as-you-type.
-const DEBOUNCE_TICKS: u8 = 0;
+/// Debounce delay in ticks for search-as-you-type.
+const DEBOUNCE_TICKS: u8 = 1;
 const SEARCH_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
 const SEARCH_STACKED_WIDTH_THRESHOLD: u16 = 60;
 const SEARCH_STACKED_MIN_HEIGHT: u16 = 12;
@@ -69,6 +70,20 @@ const RESULTS_MAX_SNIPPET_CHARS_IN_LIST: usize = 60;
 /// Separator between title and snippet in the results list.
 #[allow(dead_code)]
 const RESULTS_SNIPPET_SEP: &str = " | ";
+
+fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
+    if area.is_empty() {
+        return;
+    }
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.bg = bg;
+            }
+        }
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Facet types
@@ -394,8 +409,14 @@ struct ResultEntry {
     doc_kind: DocKind,
     title: String,
     body_preview: String,
-    /// Full message body for markdown preview (messages only, lazy-loaded).
+    /// Context snippet centered around matched terms for list/detail previews.
+    context_snippet: String,
+    /// Approximate number of term matches in the searchable body text.
+    match_count: usize,
+    /// Full message body for markdown preview (messages only).
     full_body: Option<String>,
+    /// Pre-rendered markdown body (messages only) to avoid per-frame markdown parsing.
+    rendered_body: Option<Text>,
     score: Option<f64>,
     importance: Option<String>,
     ack_required: Option<bool>,
@@ -514,13 +535,14 @@ fn derive_tui_degraded_diagnostics(
 #[derive(Debug, Clone)]
 struct SearchResultRow {
     entry: ResultEntry,
-    /// Cached highlight terms for rendering (cloned from screen state).
-    highlight_terms: Vec<QueryTerm>,
+    /// Cached highlight terms for rendering (shared across all rows).
+    highlight_terms: Arc<Vec<QueryTerm>>,
     /// Sort direction for displaying score or date.
     sort_direction: SortDirection,
 }
 
 impl RenderItem for SearchResultRow {
+    #[allow(clippy::too_many_lines)]
     fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
         use ftui::widgets::Widget;
 
@@ -588,14 +610,19 @@ impl RenderItem for SearchResultRow {
         spans.push(Span::styled(imp_badge.to_string(), imp_style));
         spans.push(Span::styled(meta_text, meta_style));
 
+        if self.entry.match_count > 0 && self.entry.doc_kind == DocKind::Message {
+            spans.push(Span::styled(
+                format!("x{} ", self.entry.match_count),
+                crate::tui_theme::text_meta(&tp),
+            ));
+        }
+
         let prefix_len = spans
             .iter()
             .map(|s| s.as_str().chars().count())
             .sum::<usize>();
-
-        // Title with remaining space
-        let title_space = w.saturating_sub(prefix_len);
-        let title = truncate_str(&self.entry.title, title_space);
+        let remaining = w.saturating_sub(prefix_len);
+        let title = truncate_str(&self.entry.title, remaining);
 
         // Title with optional highlighting
         let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
@@ -611,9 +638,31 @@ impl RenderItem for SearchResultRow {
             ));
         }
 
-        let line = Line::from_spans(spans);
+        let mut lines = vec![Line::from_spans(spans)];
+        let snippet_source = if self.entry.context_snippet.is_empty() {
+            self.entry.body_preview.as_str()
+        } else {
+            self.entry.context_snippet.as_str()
+        };
+        let show_context_line = area.height > 1
+            && self.entry.doc_kind == DocKind::Message
+            && !snippet_source.is_empty();
+        if show_context_line {
+            let context_prefix = "  ↳ ";
+            let snippet_width = w.saturating_sub(context_prefix.chars().count());
+            let snippet = truncate_str(snippet_source, snippet_width);
+            let mut context_spans = vec![Span::styled(context_prefix, meta_style)];
+            context_spans.extend(highlight_spans(
+                &snippet,
+                &self.highlight_terms,
+                Some(crate::tui_theme::text_hint(&tp)),
+                highlight_style,
+            ));
+            lines.push(Line::from_spans(context_spans));
+        }
+
         let mut para =
-            ftui::widgets::paragraph::Paragraph::new(ftui::text::Text::from_lines([line]));
+            ftui::widgets::paragraph::Paragraph::new(ftui::text::Text::from_lines(lines));
         if selected {
             para = para.style(cursor_style);
         }
@@ -621,7 +670,11 @@ impl RenderItem for SearchResultRow {
     }
 
     fn height(&self) -> u16 {
-        1
+        if self.entry.doc_kind == DocKind::Message && !self.entry.context_snippet.is_empty() {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -932,6 +985,7 @@ pub struct SearchCockpitScreen {
 
     // Results
     results: Vec<ResultEntry>,
+    result_rows: Vec<SearchResultRow>,
     cursor: usize,
     detail_scroll: usize,
     total_sql_rows: usize,
@@ -1006,6 +1060,7 @@ impl SearchCockpitScreen {
             thread_filter: None,
             highlight_terms: Vec::new(),
             results: Vec::new(),
+            result_rows: Vec::new(),
             cursor: 0,
             detail_scroll: 0,
             total_sql_rows: 0,
@@ -1044,6 +1099,20 @@ impl SearchCockpitScreen {
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
         state.select(Some(self.cursor));
+    }
+
+    fn rebuild_result_rows(&mut self) {
+        let shared_terms = Arc::new(self.highlight_terms.clone());
+        self.result_rows = self
+            .results
+            .iter()
+            .cloned()
+            .map(|entry| SearchResultRow {
+                entry,
+                highlight_terms: Arc::clone(&shared_terms),
+                sort_direction: self.sort_direction,
+            })
+            .collect();
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected search result.
@@ -1137,6 +1206,7 @@ impl SearchCockpitScreen {
             self.query_assistance = None;
             self.highlight_terms.clear();
             self.results.clear();
+            self.result_rows.clear();
             self.total_sql_rows = 0;
             self.guidance = None;
             self.cursor = 0;
@@ -1199,6 +1269,7 @@ impl SearchCockpitScreen {
             self.cursor = self.cursor.min(self.results.len() - 1);
         }
         self.detail_scroll = 0;
+        self.rebuild_result_rows();
         self.search_dirty = false;
         self.record_history();
     }
@@ -2173,9 +2244,7 @@ impl MailScreen for SearchCockpitScreen {
 
         // Always paint the whole area before pane rendering.
         let tp = crate::tui_theme::TuiThemePalette::current();
-        Paragraph::new("")
-            .style(Style::default().bg(tp.bg_deep))
-            .render(area, frame);
+        fill_rect(frame, area, tp.bg_deep);
 
         // Layout: query bar (3-4h) + body
         let query_h: u16 = if area.height >= 20 {
@@ -2282,8 +2351,9 @@ impl MailScreen for SearchCockpitScreen {
         render_results(
             frame,
             results_area,
-            &self.results,
+            &self.result_rows,
             &mut self.list_state.borrow_mut(),
+            self.cursor,
             &self.highlight_terms,
             self.sort_direction,
             matches!(self.focus, Focus::ResultList),
@@ -2484,19 +2554,43 @@ fn query_message_rows(
                 .filter_map(|row| {
                     let id: i64 = row.get_named("id").ok()?;
                     let subject: String = row.get_named("subject").unwrap_or_default();
-                    let body: String = row.get_named("body_md").unwrap_or_default();
-                    let body = collapse_whitespace(&body);
-                    let preview = if highlight_terms.is_empty() {
-                        truncate_str(&body, 120)
+                    let body_md: String = row.get_named("body_md").unwrap_or_default();
+                    // Keep row extraction lightweight: defer rich markdown rendering to detail view.
+                    let subject_text = collapse_whitespace(&subject);
+                    let body_text = markdown_to_searchable_plain(&body_md);
+                    let subject_match_count = count_term_matches(&subject_text, highlight_terms);
+                    let body_match_count = count_term_matches(&body_text, highlight_terms);
+                    let match_count = subject_match_count.saturating_add(body_match_count);
+
+                    let mut preview = if highlight_terms.is_empty() {
+                        truncate_str(&body_text, 120)
+                    } else if body_match_count > 0 {
+                        extract_snippet(&body_text, highlight_terms, MAX_SNIPPET_CHARS)
+                    } else if subject_match_count > 0 {
+                        let subject_snippet =
+                            extract_snippet(&subject_text, highlight_terms, MAX_SNIPPET_CHARS);
+                        format!("subject: {subject_snippet}")
                     } else {
-                        extract_snippet(&body, highlight_terms, MAX_SNIPPET_CHARS)
+                        extract_snippet(&body_text, highlight_terms, MAX_SNIPPET_CHARS)
                     };
+                    if preview.is_empty() {
+                        preview = truncate_str(&subject_text, 120);
+                    }
+                    let body_preview = if body_text.is_empty() {
+                        truncate_str(&subject_text, 320)
+                    } else {
+                        truncate_str(&body_text, 320)
+                    };
+
                     Some(ResultEntry {
                         id,
                         doc_kind: DocKind::Message,
                         title: subject,
-                        body_preview: preview,
-                        full_body: Some(body),
+                        body_preview,
+                        context_snippet: preview,
+                        match_count,
+                        full_body: Some(body_md),
+                        rendered_body: None,
                         score: row.get_named("score").ok(),
                         importance: row.get_named("importance").ok(),
                         ack_required: row.get_named::<i64>("ack_required").ok().map(|v| v != 0),
@@ -2527,7 +2621,10 @@ fn query_agent_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultEnt
                         doc_kind: DocKind::Agent,
                         title: name,
                         body_preview: truncate_str(&desc, 120),
+                        context_snippet: String::new(),
+                        match_count: 0,
                         full_body: None,
+                        rendered_body: None,
                         score: row.get_named("score").ok(),
                         importance: None,
                         ack_required: None,
@@ -2558,7 +2655,10 @@ fn query_project_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultE
                         doc_kind: DocKind::Project,
                         title: slug,
                         body_preview: human_key,
+                        context_snippet: String::new(),
+                        match_count: 0,
                         full_body: None,
+                        rendered_body: None,
                         score: row.get_named("score").ok(),
                         importance: None,
                         ack_required: None,
@@ -2608,6 +2708,52 @@ fn collapse_whitespace(s: &str) -> String {
         out.pop();
     }
     out
+}
+
+fn markdown_to_searchable_plain(markdown: &str) -> String {
+    if markdown.trim().is_empty() {
+        return String::new();
+    }
+    let mut raw = String::new();
+    for line in markdown.lines() {
+        // Remove leading markdown decoration while preserving sentence content.
+        let stripped = line
+            .trim_start_matches(|c: char| matches!(c, '#' | '>' | '-' | '*' | '+' | '|' | '`'))
+            .trim();
+        if !stripped.is_empty() {
+            if !raw.is_empty() {
+                raw.push(' ');
+            }
+            raw.push_str(stripped);
+        }
+    }
+    collapse_whitespace(&raw)
+}
+
+fn count_term_matches(text: &str, terms: &[QueryTerm]) -> usize {
+    if text.is_empty() || terms.is_empty() {
+        return 0;
+    }
+    let hay = text.to_ascii_lowercase();
+    let mut total = 0usize;
+    for term in terms.iter().filter(|term| !term.negated) {
+        if term.text.len() < 2 {
+            continue;
+        }
+        let needle = term.text.to_ascii_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut offset = 0usize;
+        while offset < hay.len() {
+            let Some(pos) = hay[offset..].find(&needle) else {
+                break;
+            };
+            total = total.saturating_add(1);
+            offset = offset.saturating_add(pos.saturating_add(needle.len().max(1)));
+        }
+    }
+    total
 }
 
 fn url_encode_component(s: &str) -> String {
@@ -2705,13 +2851,23 @@ fn render_query_bar(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    let content_inner = if inner.width > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        )
+    } else {
+        inner
+    };
 
-    let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    let input_area = Rect::new(content_inner.x, content_inner.y, content_inner.width, 1);
     input.render(input_area, frame);
 
     // Optional hint line when the query bar has extra height.
-    if inner.height >= 2 {
-        let w = inner.width as usize;
+    if content_inner.height >= 2 {
+        let w = content_inner.width as usize;
         let (hint, style) = screen.last_error.as_ref().map_or_else(
             || {
                 screen
@@ -2765,7 +2921,7 @@ fn render_query_bar(
             |err| (format!("ERR: {err}"), Style::default().fg(ERROR_FG())),
         );
 
-        let hint_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+        let hint_area = Rect::new(content_inner.x, content_inner.y + 1, content_inner.width, 1);
         Paragraph::new(truncate_str(&hint, w))
             .style(style)
             .render(hint_area, frame);
@@ -2775,25 +2931,36 @@ fn render_query_bar(
     // (progressive disclosure — hidden when browsing results with no query)
     let has_active_query = !screen.query_input.value().trim().is_empty();
     let in_query = matches!(screen.focus, Focus::QueryBar);
-    if inner.height >= 3 && (has_active_query || in_query) {
+    if content_inner.height >= 3 && (has_active_query || in_query) {
         let meter = pulse_meter(ui_phase, 8);
+        let state_label = if screen.search_dirty {
+            if screen.debounce_remaining > 0 {
+                format!("pending:{}t", screen.debounce_remaining)
+            } else {
+                "running".to_string()
+            }
+        } else {
+            "ready".to_string()
+        };
         let chips = format!(
-            "{}  scope:{}  type:{}  sort:{}  terms:{}",
+            "{}  state:{}  scope:{}  type:{}  sort:{}  terms:{}",
             meter,
+            state_label,
             screen.scope_mode.label(),
             screen.doc_kind_filter.label(),
             screen.sort_direction.label(),
             screen.highlight_terms.len()
         );
-        let chips_area = Rect::new(inner.x, inner.y + 2, inner.width, 1);
-        Paragraph::new(truncate_str(&chips, inner.width as usize))
+        let chips_area = Rect::new(content_inner.x, content_inner.y + 2, content_inner.width, 1);
+        Paragraph::new(truncate_str(&chips, content_inner.width as usize))
             .style(Style::default().fg(RESULT_CURSOR_FG()))
             .render(chips_area, frame);
     }
 
-    if inner.height >= 4 && (has_active_query || in_query) {
-        let telemetry_area = Rect::new(inner.x, inner.y + 3, inner.width, 1);
-        Paragraph::new(truncate_str(telemetry, inner.width as usize))
+    if content_inner.height >= 4 && (has_active_query || in_query) {
+        let telemetry_area =
+            Rect::new(content_inner.x, content_inner.y + 3, content_inner.width, 1);
+        Paragraph::new(truncate_str(telemetry, content_inner.width as usize))
             .style(Style::default().fg(FACET_ACTIVE_FG()))
             .render(telemetry_area, frame);
     }
@@ -3219,21 +3386,23 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
 fn render_results(
     frame: &mut Frame<'_>,
     area: Rect,
-    results: &[ResultEntry],
+    rows: &[SearchResultRow],
     list_state: &mut VirtualizedListState,
+    cursor: usize,
     highlight_terms: &[QueryTerm],
     sort_direction: SortDirection,
     focused: bool,
     guidance: Option<&ZeroResultGuidance>,
 ) {
     // Show match count and search posture in header.
-    let title = if results.is_empty() {
+    let title = if rows.is_empty() {
         "Results".to_string()
     } else {
-        let count = results.len();
+        let count = rows.len();
         let plural = if count == 1 { "match" } else { "matches" };
+        let active = cursor.min(count.saturating_sub(1)) + 1;
         format!(
-            "Results ({count} {plural} • {} • {} terms)",
+            "Results (active {active}/{count} • {count} {plural} • {} • {} terms)",
             sort_direction.label(),
             highlight_terms.len()
         )
@@ -3250,7 +3419,7 @@ fn render_results(
         return;
     }
 
-    if results.is_empty() {
+    if rows.is_empty() {
         if let Some(guide) = guidance {
             render_guidance(frame, inner, guide, &tp);
         } else {
@@ -3259,18 +3428,8 @@ fn render_results(
         return;
     }
 
-    // Convert ResultEntry to SearchResultRow for RenderItem trait
-    let rows: Vec<SearchResultRow> = results
-        .iter()
-        .map(|entry| SearchResultRow {
-            entry: entry.clone(),
-            highlight_terms: highlight_terms.to_vec(),
-            sort_direction,
-        })
-        .collect();
-
     // Render using VirtualizedList for efficient scrolling
-    let list = VirtualizedList::new(&rows)
+    let list = VirtualizedList::new(rows)
         .style(Style::default())
         .highlight_style(
             Style::default()
@@ -3309,20 +3468,38 @@ fn estimate_search_detail_lines(entry: &ResultEntry, width: u16) -> usize {
     }
     count += 2; // Separator + body header
     // Body lines
-    let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
     let avail_width = usize::from(width.saturating_sub(2)).max(1);
-    let body_lines = body
-        .lines()
-        .map(|line| {
-            let len = ftui::text::display_width(line);
-            if len == 0 {
-                1
-            } else {
-                len.div_ceil(avail_width)
-            }
-        })
-        .sum::<usize>()
-        .max(1);
+    let body_lines = entry.rendered_body.as_ref().map_or_else(
+        || {
+            let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
+            body.lines()
+                .map(|line| {
+                    let len = ftui::text::display_width(line);
+                    if len == 0 {
+                        1
+                    } else {
+                        len.div_ceil(avail_width)
+                    }
+                })
+                .sum::<usize>()
+                .max(1)
+        },
+        |rendered| {
+            rendered
+                .lines()
+                .iter()
+                .map(|line| {
+                    let len = ftui::text::display_width(line.to_plain_text().as_str());
+                    if len == 0 {
+                        1
+                    } else {
+                        len.div_ceil(avail_width)
+                    }
+                })
+                .sum::<usize>()
+                .max(1)
+        },
+    );
     count += body_lines;
     count
 }
@@ -3398,19 +3575,27 @@ fn render_detail(
     };
 
     let Some(entry) = entry else {
-        Paragraph::new("  Select a result to view details.").render(content_inner, frame);
+        Paragraph::new("Select a result to view details.").render(content_inner, frame);
         return;
     };
 
     // Reserve 1 row for action bar at bottom.
     let action_bar_h: u16 = 1;
     let content_h = content_inner.height.saturating_sub(action_bar_h);
-    let content_area = Rect::new(
+    let mut content_area = Rect::new(
         content_inner.x,
         content_inner.y,
         content_inner.width,
         content_h,
     );
+    if content_area.width > 2 {
+        content_area = Rect::new(
+            content_area.x.saturating_add(1),
+            content_area.y,
+            content_area.width.saturating_sub(2),
+            content_area.height,
+        );
+    }
     let action_area = Rect::new(
         content_inner.x,
         content_inner.y + content_h,
@@ -3495,6 +3680,31 @@ fn render_detail(
         lines.push(styled_field("Score:      ", format!("{score:.3}")));
     }
 
+    if !entry.context_snippet.is_empty() {
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::styled(
+            "\u{2500}\u{2500}\u{2500} Active Hit Context \u{2500}\u{2500}\u{2500}".to_string(),
+            label_style,
+        ));
+        let match_label = if entry.match_count == 0 {
+            "no matched terms".to_string()
+        } else if entry.match_count == 1 {
+            "1 match".to_string()
+        } else {
+            format!("{} matches", entry.match_count)
+        };
+        lines.push(styled_field("Matches:    ", match_label));
+        let mut snippet_spans: Vec<Span<'static>> = Vec::new();
+        snippet_spans.push(Span::styled("Snippet:    ".to_string(), label_style));
+        snippet_spans.extend(highlight_spans(
+            &entry.context_snippet,
+            highlight_terms,
+            Some(value_style),
+            highlight_style,
+        ));
+        lines.push(Line::from_spans(snippet_spans));
+    }
+
     // Explain section: reason codes and score factors (when populated).
     if !entry.reason_codes.is_empty() {
         lines.push(Line::raw(String::new()));
@@ -3549,12 +3759,20 @@ fn render_detail(
 
     // Markdown preview section (messages with full body) or plain preview fallback.
     lines.push(Line::raw(String::new()));
-    if let Some(ref body) = entry.full_body {
+    if let Some(rendered) = entry.rendered_body.as_ref() {
         lines.push(Line::styled(
             "\u{2500}\u{2500}\u{2500} Body \u{2500}\u{2500}\u{2500}".to_string(),
             label_style,
         ));
-        let theme = tui_markdown::MarkdownTheme::default();
+        for line in rendered.lines() {
+            lines.push(line.clone());
+        }
+    } else if let Some(ref body) = entry.full_body {
+        lines.push(Line::styled(
+            "\u{2500}\u{2500}\u{2500} Body \u{2500}\u{2500}\u{2500}".to_string(),
+            label_style,
+        ));
+        let theme = crate::tui_theme::markdown_theme();
         let rendered = tui_markdown::render_body(body, &theme);
         for line in rendered.lines() {
             lines.push(line.clone());
@@ -3564,12 +3782,11 @@ fn render_detail(
             "\u{2500}\u{2500}\u{2500} Preview \u{2500}\u{2500}\u{2500}".to_string(),
             label_style,
         ));
-        lines.push(Line::from_spans(highlight_spans(
-            &entry.body_preview,
-            highlight_terms,
-            Some(value_style),
-            highlight_style,
-        )));
+        let theme = crate::tui_theme::markdown_theme();
+        let rendered = tui_markdown::render_body(&entry.body_preview, &theme);
+        for line in rendered.lines() {
+            lines.push(line.clone());
+        }
     }
 
     if content_h == 0 {
@@ -4064,7 +4281,10 @@ mod tests {
             doc_kind: DocKind::Message,
             title: "stale result".to_string(),
             body_preview: String::new(),
+            context_snippet: String::new(),
+            match_count: 0,
             full_body: None,
+            rendered_body: None,
             score: None,
             importance: None,
             ack_required: None,
@@ -4704,12 +4924,18 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────
 
     fn make_msg_entry() -> ResultEntry {
+        let full_body = "# Hello\n\nThis is **bold** markdown.".to_string();
+        let rendered_body =
+            crate::tui_markdown::render_body(&full_body, &crate::tui_theme::markdown_theme());
         ResultEntry {
             id: 42,
             doc_kind: DocKind::Message,
             title: "Test subject".to_string(),
             body_preview: "short preview".to_string(),
-            full_body: Some("# Hello\n\nThis is **bold** markdown.".to_string()),
+            context_snippet: "short preview".to_string(),
+            match_count: 1,
+            full_body: Some(full_body),
+            rendered_body: Some(rendered_body),
             score: Some(0.95),
             importance: Some("normal".to_string()),
             ack_required: Some(false),
@@ -4728,7 +4954,10 @@ mod tests {
             doc_kind: DocKind::Agent,
             title: "GoldFox".to_string(),
             body_preview: "agent task description".to_string(),
+            context_snippet: String::new(),
+            match_count: 0,
             full_body: None,
+            rendered_body: None,
             score: None,
             importance: None,
             ack_required: None,
@@ -5112,7 +5341,10 @@ mod tests {
             doc_kind: DocKind::Message,
             title: "Test".to_string(),
             body_preview: String::new(),
+            context_snippet: String::new(),
+            match_count: 0,
             full_body: None,
+            rendered_body: None,
             score: None,
             importance: Some("urgent".to_string()),
             ack_required: None,
@@ -5125,7 +5357,7 @@ mod tests {
         };
         let row = SearchResultRow {
             entry,
-            highlight_terms: vec![],
+            highlight_terms: Arc::new(Vec::new()),
             sort_direction: SortDirection::NewestFirst,
         };
         let mut pool = ftui::GraphemePool::new();

@@ -502,6 +502,47 @@ impl ToolMetricsScreen {
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn hydrate_from_runtime_snapshot(&mut self) {
+        let runtime = mcp_agent_mail_tools::tool_metrics_snapshot_full();
+        if runtime.is_empty() {
+            return;
+        }
+
+        let mut updated = false;
+        for metric in runtime {
+            let tool_stats = self
+                .tool_map
+                .entry(metric.name.clone())
+                .or_insert_with(|| ToolStats::new(metric.name.clone()));
+
+            if tool_stats.calls > metric.calls && metric.calls > 0 {
+                continue;
+            }
+
+            tool_stats.calls = metric.calls;
+            tool_stats.errors = metric.errors.min(metric.calls);
+            if let Some(latency) = metric.latency {
+                tool_stats.total_duration_ms =
+                    total_duration_ms_from_avg(latency.avg_ms, metric.calls);
+                tool_stats.recent_latencies = synthesize_recent_latency_samples(
+                    latency.avg_ms,
+                    latency.p50_ms,
+                    latency.p95_ms,
+                    latency.p99_ms,
+                );
+            } else if metric.calls == 0 {
+                tool_stats.total_duration_ms = 0;
+                tool_stats.recent_latencies.clear();
+            }
+            updated = true;
+        }
+
+        if updated {
+            self.rebuild_sorted();
+        }
+    }
+
     fn rebuild_sorted(&mut self) {
         let mut tools: Vec<&ToolStats> = self.tool_map.values().collect();
         tools.sort_by(|a, b| {
@@ -728,12 +769,17 @@ impl ToolMetricsScreen {
                 } else {
                     "—".to_string()
                 };
+                let row_bg = if i % 2 == 0 {
+                    crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.14)
+                } else {
+                    crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.24)
+                };
                 let style = if Some(i) == self.table_state.selected {
                     Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else if stats.err_pct() > 5.0 {
-                    Style::default().fg(tp.severity_error)
+                    Style::default().fg(tp.severity_error).bg(row_bg)
                 } else {
-                    Style::default()
+                    Style::default().bg(row_bg)
                 };
                 Some(
                     Row::new([
@@ -779,14 +825,6 @@ impl ToolMetricsScreen {
     /// Render the widget dashboard view.
     #[allow(clippy::cast_precision_loss)]
     fn render_dashboard_view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
-        if self.tool_map.is_empty() {
-            let widget: WidgetState<'_, Paragraph<'_>> = WidgetState::Empty {
-                message: "No tool calls recorded yet",
-            };
-            widget.render(area, frame);
-            return;
-        }
-
         // Layout: tiles (3h) + anomaly (4h) + transparency (3h) + ribbon (8h) + leaderboard (rest)
         let tiles_h = 3_u16.min(area.height);
         let remaining = area.height.saturating_sub(tiles_h);
@@ -1163,6 +1201,9 @@ impl MailScreen for ToolMetricsScreen {
             self.last_persisted_hydrate_tick = tick_count;
         }
         self.ingest_events(state);
+        if self.tool_map.is_empty() || tick_count % 20 == 0 {
+            self.hydrate_from_runtime_snapshot();
+        }
         if tick_count % 10 == 0 {
             self.rebuild_sorted();
             self.snapshot_percentiles();

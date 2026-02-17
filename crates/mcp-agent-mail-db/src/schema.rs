@@ -897,8 +897,23 @@ pub fn schema_migrations() -> Vec<Migration> {
     //
     // Enforce case-insensitive uniqueness for agent names per project.
     // This prevents "BlueLake" and "bluelake" from coexisting.
+    //
+    // v10a: Deduplicate any pre-existing case-duplicate agents before
+    // creating the UNIQUE index. For each (project_id, LOWER(name)) group
+    // with >1 row, keep the one with the lowest id (oldest) and DELETE the rest.
     migrations.push(Migration::new(
-        "v10_idx_agents_project_name_nocase".to_string(),
+        "v10a_dedup_agents_case_insensitive".to_string(),
+        "deduplicate case-duplicate agents before creating unique index".to_string(),
+        "DELETE FROM agents WHERE id NOT IN (\
+             SELECT MIN(id) FROM agents GROUP BY project_id, name COLLATE NOCASE\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    // v10b: Now safe to create the UNIQUE index (no case-duplicates remain).
+    migrations.push(Migration::new(
+        "v10b_idx_agents_project_name_nocase".to_string(),
         "create unique index on agents(project_id, name COLLATE NOCASE)".to_string(),
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_project_name_nocase \
          ON agents(project_id, name COLLATE NOCASE)"
