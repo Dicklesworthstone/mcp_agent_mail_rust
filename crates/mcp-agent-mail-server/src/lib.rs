@@ -792,6 +792,10 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
+    // Force DB initialization (including migrations) during startup so HTTP/TUI
+    // surfaces that open direct sync connections never observe an uninitialized
+    // SQLite file and emit "no such table" query errors.
+    readiness_check(config).map_err(std::io::Error::other)?;
 
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
@@ -871,6 +875,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
+    // Run one readiness init pass before any TUI screen opens raw sync DB
+    // handles; this guarantees schema migrations have been applied first.
+    readiness_check(config).map_err(std::io::Error::other)?;
 
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
