@@ -32,9 +32,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-gnu
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-14
@@ -54,21 +54,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl-tools (Linux musl builds)
-        if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       - name: Build release binaries
         run: |
           cargo build --release --target ${{ matrix.target }} -p mcp-agent-mail -p mcp-agent-mail-cli
-
-      - name: Verify static linking (Linux musl)
-        if: contains(matrix.target, 'musl')
-        run: |
-          file target/${{ matrix.target }}/release/mcp-agent-mail
-          file target/${{ matrix.target }}/release/mcp-agent-mail | grep -qE "statically linked|static-pie linked"
-          file target/${{ matrix.target }}/release/am
-          file target/${{ matrix.target }}/release/am | grep -qE "statically linked|static-pie linked"
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
