@@ -1,7 +1,10 @@
  1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │     
-                                        Agent Mail Dashboard                                        
-Messages            Ack Pend            Agents              Requests            Avg Lat             
-0 ─                 0 ─                 0 ─                 0 ─                 0ms ─               
+Messages    Ack Pend    Locks       Agents      Contacts    Requests    Avg Lat     Error %         
+0 ─         0 ─         0 ─         0 ─         0 ─         0 ─         0ms ─       0.0% ─          
+ [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                                              
+No events yet.                                                                                      
+Waiting for HTTP/tool/message traffic and health pulses.                                            
+Enter opens Timeline/Search context when results are available.                                     
                                                                                                     
                                                                                                     
                                                                                                     
@@ -24,7 +27,4 @@ Messages            Ack Pend            Agents              Requests            
                                                                                                     
                                                                                                     
                                                                                                     
-                                                                                                    
-                                                                                                    
- Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                                      
- Dashboard api up:0m00s    req:0 ok:0 err:0 avg:0ms |  j/k  Scroll event log     ? Cyberpunk Aurora 
+ Dashboard api up:0m00sreq:0 ok:0 err:0 avg:0ms |  j/k  Scroll event loLIVEVE Cyberpunk Aurora [^P] 

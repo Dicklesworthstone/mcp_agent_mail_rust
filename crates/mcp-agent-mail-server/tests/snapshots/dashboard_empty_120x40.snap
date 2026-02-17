@@ -1,17 +1,9 @@
-                                                  Agent Mail Dashboard                                                  
-Messages            Ack Pend            Agents              Requests            Avg Lat             Uptime              
-0 ─                 0 ─                 0 ─                 0 ─                 0ms ─               0s ─                
-                                                                                                                        
-                                                                              Awaiting data...                          
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                              Awaiting data...                          
+Messages    Ack Pend    Locks       Agents      Contacts    Projects    Requests    Avg Lat     Error %     Ring Fill   
+0 ─         0 ─         0 ─         0 ─         0 ─         0 ─         0 ─         0ms ─       0.0% ─      0% ─        
+ [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                                                                  
+No events yet.                                                                                                          
+Waiting for HTTP/tool/message traffic and health pulses.                                                                
+Enter opens Timeline/Search context when results are available.                                                         
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -26,7 +18,15 @@ Messages            Ack Pend            Agents              Requests            
                                                                                                                         
                                                                                                                         
                                                                                                                         
-No message traffic yet. Recent sent/received metadata appears here.                                                     
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

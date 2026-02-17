@@ -1,6 +1,9 @@
-                              Agent Mail Dashboard                              
-Messages        Ack Pend        Agents          Requests        Avg Lat         
-0 ─             0 ─             0 ─             0 ─             0ms ─           
+Messages     Ack Pend     Locks        Agents       Contacts     Requests       
+0 ─          0 ─          0 ─          0 ─          0 ─          0 ─            
+ [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                          
+No events yet.                                                                  
+Waiting for HTTP/tool/message traffic and health pulses.                        
+Enter opens Timeline/Search context when results are available.                 
                                                                                 
                                                                                 
                                                                                 
@@ -19,6 +22,3 @@ Messages        Ack Pend        Agents          Requests        Avg Lat
                                                                                 
                                                                                 
                                                                                 
-                                                                                
-                                                                                
- Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                  
