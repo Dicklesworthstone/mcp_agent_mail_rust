@@ -1,7 +1,8 @@
 //! Analytics screen — insight feed with anomaly explanation cards.
 //!
 //! Renders [`InsightCard`] items from [`quick_insight_feed()`] with severity
-//! badges, confidence scores, rationale, and actionable next steps.
+//! badges, confidence scores, rationale, actionable next steps, severity
+//! summary band, colored left borders, and deep link visual affordances.
 
 use ftui::layout::{Constraint, Flex, Rect};
 use ftui::widgets::StatefulWidget;
@@ -10,7 +11,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::{
     AnomalyAlert, AnomalyKind, AnomalySeverity, InsightCard, InsightFeed, build_insight_feed,
@@ -19,6 +20,7 @@ use mcp_agent_mail_core::{
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg};
+use crate::tui_widgets::fancy::SummaryFooter;
 
 /// Refresh the insight feed every N ticks (~100ms each → ~5s).
 const REFRESH_INTERVAL_TICKS: u64 = 50;
@@ -137,6 +139,23 @@ impl AnalyticsScreen {
         }
         Cmd::None
     }
+
+    /// Count cards by severity level.
+    fn severity_counts(&self) -> (u64, u64, u64, u64) {
+        let mut crit = 0u64;
+        let mut high = 0u64;
+        let mut med = 0u64;
+        let mut low = 0u64;
+        for card in &self.feed.cards {
+            match card.severity {
+                AnomalySeverity::Critical => crit += 1,
+                AnomalySeverity::High => high += 1,
+                AnomalySeverity::Medium => med += 1,
+                AnomalySeverity::Low => low += 1,
+            }
+        }
+        (crit, high, med, low)
+    }
 }
 
 impl Default for AnalyticsScreen {
@@ -152,6 +171,16 @@ fn severity_style(severity: AnomalySeverity) -> Style {
     crate::tui_theme::style_for_anomaly_severity(&tp, severity)
 }
 
+fn severity_color(severity: AnomalySeverity) -> PackedRgba {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    match severity {
+        AnomalySeverity::Critical => tp.severity_critical,
+        AnomalySeverity::High => tp.severity_error,
+        AnomalySeverity::Medium => tp.severity_warn,
+        AnomalySeverity::Low => tp.severity_ok,
+    }
+}
+
 const fn severity_badge(severity: AnomalySeverity) -> &'static str {
     match severity {
         AnomalySeverity::Critical => "CRIT",
@@ -161,6 +190,28 @@ const fn severity_badge(severity: AnomalySeverity) -> &'static str {
     }
 }
 
+fn confidence_bar_colored(confidence: f64, severity: AnomalySeverity) -> ftui::text::Line {
+    use ftui::text::{Line, Span};
+
+    let confidence = confidence.clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let filled = (confidence * 10.0).round() as usize;
+    let filled = filled.min(10);
+    let empty = 10_usize.saturating_sub(filled);
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let bar_color = severity_color(severity);
+    let dim_color = tp.text_muted;
+
+    Line::from_spans(vec![
+        Span::raw("["),
+        Span::styled("\u{2588}".repeat(filled), Style::default().fg(bar_color)),
+        Span::styled("\u{2591}".repeat(empty), Style::default().fg(dim_color)),
+        Span::styled(format!("] {:3.0}%", confidence * 100.0), Style::default()),
+    ])
+}
+
+#[cfg(test)]
 fn confidence_bar(confidence: f64) -> String {
     let confidence = confidence.clamp(0.0, 1.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to [0, 1]
@@ -169,8 +220,8 @@ fn confidence_bar(confidence: f64) -> String {
     let empty = 10_usize.saturating_sub(filled);
     format!(
         "[{}{}] {:3.0}%",
-        "█".repeat(filled),
-        "░".repeat(empty),
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(empty),
         confidence * 100.0
     )
 }
@@ -305,6 +356,41 @@ fn build_persisted_insight_feed(state: &TuiSharedState) -> InsightFeed {
     build_persisted_insight_feed_from_rows(&rows, persisted_samples)
 }
 
+/// Render the severity summary band above the card list.
+fn render_severity_summary(frame: &mut Frame<'_>, area: Rect, feed: &InsightFeed) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
+    let total = feed.cards.len() as u64;
+    let mut crit = 0u64;
+    let mut high = 0u64;
+    let mut med = 0u64;
+    let mut low = 0u64;
+    for card in &feed.cards {
+        match card.severity {
+            AnomalySeverity::Critical => crit += 1,
+            AnomalySeverity::High => high += 1,
+            AnomalySeverity::Medium => med += 1,
+            AnomalySeverity::Low => low += 1,
+        }
+    }
+
+    let total_str = total.to_string();
+    let crit_str = crit.to_string();
+    let high_str = high.to_string();
+    let med_str = med.to_string();
+    let low_str = low.to_string();
+
+    let items: Vec<(&str, &str, PackedRgba)> = vec![
+        (&*total_str, "cards", tp.text_primary),
+        (&*crit_str, "critical", tp.severity_critical),
+        (&*high_str, "high", tp.severity_error),
+        (&*med_str, "medium", tp.severity_warn),
+        (&*low_str, "low", tp.severity_ok),
+    ];
+
+    SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+}
+
 fn render_card_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -313,7 +399,8 @@ fn render_card_list(
     table_state: &mut TableState,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let header = Row::new(vec!["Sev", "Conf", "Headline"]).style(crate::tui_theme::text_title(&tp));
+    let header =
+        Row::new(vec![" ", "Sev", "Conf", "Headline"]).style(crate::tui_theme::text_title(&tp));
 
     let rows: Vec<Row> = feed
         .cards
@@ -322,24 +409,38 @@ fn render_card_list(
         .map(|(i, card)| {
             let sev_text = severity_badge(card.severity);
             let conf_text = format!("{:3.0}%", card.confidence * 100.0);
+            let border_char = "\u{2590}"; // ▐ colored left border
             let style = if i == selected {
                 severity_style(card.severity).bg(tp.selection_bg)
             } else {
                 severity_style(card.severity)
             };
-            Row::new(vec![sev_text.to_string(), conf_text, card.headline.clone()]).style(style)
+            Row::new(vec![
+                border_char.to_string(),
+                sev_text.to_string(),
+                conf_text,
+                card.headline.clone(),
+            ])
+            .style(style)
         })
         .collect();
 
     let widths = [
+        Constraint::Fixed(1),
         Constraint::Fixed(5),
         Constraint::Fixed(5),
         Constraint::Percentage(100.0),
     ];
 
+    // Position indicator in title: [3/12]
+    let position = if feed.cards.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}/{}]", selected + 1, feed.cards.len())
+    };
     let title = format!(
-        " Insight Feed ({} cards from {} alerts) ",
-        feed.cards_produced, feed.alerts_processed
+        " Insight Feed{} (from {} alerts) ",
+        position, feed.alerts_processed
     );
 
     let table = Table::new(rows, widths)
@@ -362,18 +463,15 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     let tp = crate::tui_theme::TuiThemePalette::current();
     let mut lines = Vec::new();
 
-    // Header: severity + confidence
+    // Header: severity + confidence with colored bar
     lines.push(Line::from_spans(vec![
         Span::styled(
             format!(" {} ", severity_badge(card.severity)),
             severity_style(card.severity),
         ),
         Span::raw("  "),
-        Span::styled(
-            confidence_bar(card.confidence),
-            crate::tui_theme::text_accent(&tp),
-        ),
     ]));
+    lines.push(confidence_bar_colored(card.confidence, card.severity));
     lines.push(Line::raw(""));
 
     // Headline
@@ -411,14 +509,22 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
         lines.push(Line::raw(""));
     }
 
-    // Deep links
+    // Deep links with visual affordances
     if !card.deep_links.is_empty() {
         lines.push(Line::styled(
-            "Deep Links (Enter to navigate):",
+            "Deep Links:",
             crate::tui_theme::text_meta(&tp),
         ));
-        for link in &card.deep_links {
-            lines.push(Line::raw(format!("  → {link}")));
+        for (i, link) in card.deep_links.iter().enumerate() {
+            let hint = if i == 0 { " (Enter)" } else { "" };
+            lines.push(Line::from_spans(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("[\u{2192} {link}]"),
+                    crate::tui_theme::text_accent(&tp).underline(),
+                ),
+                Span::styled(hint, crate::tui_theme::text_hint(&tp)),
+            ]));
         }
         lines.push(Line::raw(""));
     }
@@ -450,7 +556,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
         ));
         for corr in &card.supporting_correlations {
             lines.push(Line::raw(format!(
-                "  {} ↔ {} ({})",
+                "  {} \u{2194} {} ({})",
                 corr.metric_a, corr.metric_b, corr.explanation,
             )));
         }
@@ -467,24 +573,61 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
 }
 
 fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
-    use ftui::text::{Line, Text};
+    use ftui::text::{Line, Span, Text};
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let text = Text::from_lines(vec![
-        Line::raw("No anomalies detected."),
-        Line::raw(""),
-        Line::raw("The insight feed monitors real-time KPI metrics and surfaces"),
-        Line::raw("anomaly explanation cards when deviations are detected."),
-        Line::raw(""),
-        Line::raw("Metrics are collected as tool calls flow through the server."),
-    ]);
-    let para = Paragraph::new(text).wrap(ftui::text::WrapMode::Word).block(
-        Block::new()
-            .title(" Insight Feed ")
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border)),
-    );
-    para.render(area, frame);
+    let block = Block::bordered()
+        .title(" Insight Feed ")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Centered icon and structured guidance
+    let mut lines = Vec::new();
+
+    // Center vertically
+    let content_height = 8u16;
+    let pad_top = inner.height.saturating_sub(content_height) / 2;
+    for _ in 0..pad_top {
+        lines.push(Line::raw(""));
+    }
+
+    // Icon
+    let icon_pad = " ".repeat((inner.width.saturating_sub(3) / 2) as usize);
+    lines.push(Line::styled(
+        format!("{icon_pad}\u{2205}"),
+        crate::tui_theme::text_section(&tp),
+    ));
+    lines.push(Line::raw(""));
+
+    // Headline
+    lines.push(Line::from_spans(vec![Span::styled(
+        "No anomalies detected",
+        crate::tui_theme::text_primary(&tp).bold(),
+    )]));
+    lines.push(Line::raw(""));
+
+    // Description
+    lines.push(Line::styled(
+        "The insight feed monitors real-time KPI metrics",
+        crate::tui_theme::text_meta(&tp),
+    ));
+    lines.push(Line::styled(
+        "and surfaces anomaly cards when deviations occur.",
+        crate::tui_theme::text_meta(&tp),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Metrics are collected as tool calls flow through the server.",
+        crate::tui_theme::text_hint(&tp),
+    ));
+
+    let text = Text::from_lines(lines);
+    Paragraph::new(text).render(inner, frame);
 }
 
 // ── MailScreen implementation ──────────────────────────────────────────
@@ -543,16 +686,31 @@ impl MailScreen for AnalyticsScreen {
         }
         let selected = self.selected.min(self.feed.cards.len().saturating_sub(1));
 
-        // Split: top half for card list, bottom half for detail.
-        let chunks = Flex::vertical()
-            .constraints([Constraint::Percentage(40.0), Constraint::Percentage(60.0)])
-            .split(area);
+        // Layout: severity_summary(1) + card_list(40%) + detail(rest)
+        let summary_h: u16 = if area.height >= 8 { 1 } else { 0 };
+        let remaining_h = area.height.saturating_sub(summary_h);
+
+        let mut y = area.y;
+
+        // ── Severity summary band ──────────────────────────────────────
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            render_severity_summary(frame, summary_area, &self.feed);
+            y += summary_h;
+        }
+
+        // Split remaining: top 40% for card list, bottom 60% for detail.
+        let list_area_h = remaining_h * 40 / 100;
+        let detail_area_h = remaining_h.saturating_sub(list_area_h);
+
+        let list_area = Rect::new(area.x, y, area.width, list_area_h);
+        let detail_area = Rect::new(area.x, y + list_area_h, area.width, detail_area_h);
 
         let mut table_state = self.table_state.clone();
-        render_card_list(frame, chunks[0], &self.feed, selected, &mut table_state);
+        render_card_list(frame, list_area, &self.feed, selected, &mut table_state);
 
         if let Some(card) = self.feed.cards.get(selected) {
-            render_card_detail(frame, chunks[1], card, self.detail_scroll);
+            render_card_detail(frame, detail_area, card, self.detail_scroll);
         }
     }
 
@@ -749,5 +907,20 @@ mod tests {
         let screen = AnalyticsScreen::new();
         assert_eq!(screen.title(), "Analytics");
         assert_eq!(screen.tab_label(), "Insight");
+    }
+
+    #[test]
+    fn severity_counts_empty() {
+        let screen = AnalyticsScreen::new();
+        let (c, h, m, l) = screen.severity_counts();
+        // May have cards from quick_insight_feed
+        assert!(c + h + m + l == screen.feed.cards.len() as u64);
+    }
+
+    #[test]
+    fn confidence_bar_colored_renders() {
+        let line = confidence_bar_colored(0.75, AnomalySeverity::High);
+        // Should produce a line with spans, not panic
+        assert!(!line.spans().is_empty());
     }
 }

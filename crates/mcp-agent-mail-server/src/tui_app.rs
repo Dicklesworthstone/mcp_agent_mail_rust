@@ -3593,10 +3593,10 @@ impl Model for MailAppModel {
         self.mouse_dispatcher
             .update_chrome_areas(chrome.tab_bar, chrome.status_line);
 
-        let mut tab_render_us = 0_u64;
-        let mut content_render_us = 0_u64;
-        let mut status_render_us = 0_u64;
-        let mut toast_render_us = 0_u64;
+        let tab_render_us;
+        let content_render_us;
+        let status_render_us;
+        let toast_render_us;
         let mut action_menu_render_us = 0_u64;
         let mut modal_render_us = 0_u64;
         let mut palette_render_us = 0_u64;
@@ -5606,6 +5606,23 @@ mod tests {
         };
         let state = TuiSharedState::new(&config);
         MailAppModel::new(state)
+    }
+
+    fn frame_text(frame: &Frame<'_>) -> String {
+        let mut text = String::new();
+        for y in 0..frame.buffer.height() {
+            for x in 0..frame.buffer.width() {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    if let Some(ch) = cell.content.as_char() {
+                        text.push(ch);
+                    } else if !cell.is_continuation() {
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push('\n');
+        }
+        text
     }
 
     #[test]
@@ -10297,6 +10314,27 @@ mod tests {
             let cell = frame.buffer.get(10, y).expect("right outline");
             assert_eq!(cell.content.as_char().unwrap_or(' '), '│');
         }
+    }
+
+    #[test]
+    fn agents_screen_header_labels_render_without_focus_outline_corruption() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Agents));
+        model.screen_transition = None;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(180, 40, &mut pool);
+        model.view(&mut frame);
+
+        let text = frame_text(&frame);
+        assert!(
+            text.contains("Name"),
+            "expected Name header to render intact; frame dump:\n{text}"
+        );
+        assert!(
+            text.contains("Program"),
+            "expected Program header to render intact; frame dump:\n{text}"
+        );
     }
 
     #[test]

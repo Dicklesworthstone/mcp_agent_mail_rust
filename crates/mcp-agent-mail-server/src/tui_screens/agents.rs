@@ -1,6 +1,7 @@
-//! Agents screen — sortable/filterable roster of registered agents.
+//! Agents screen — sortable/filterable roster of registered agents with
+//! summary band, status badges, sparkline, responsive columns, and footer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
@@ -16,6 +17,8 @@ use ftui_runtime::program::Cmd;
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::fancy::SummaryFooter;
+use crate::tui_widgets::{MetricTile, MetricTrend};
 
 /// Column indices for sorting.
 const COL_NAME: usize = 0;
@@ -30,6 +33,8 @@ const MESSAGE_FLASH_TICKS: u8 = 3;
 const STAGGER_MAX_TICKS: u8 = 10;
 const ACTIVE_WINDOW_MICROS: i64 = 2 * 60 * 1_000_000;
 const IDLE_WINDOW_MICROS: i64 = 15 * 60 * 1_000_000;
+/// Max sparkline history samples.
+const SPARKLINE_CAP: usize = 30;
 
 /// An agent row with computed fields.
 #[derive(Debug, Clone)]
@@ -71,6 +76,14 @@ impl AgentStatus {
             Self::Inactive => tp.activity_stale,
         };
         (c.r(), c.g(), c.b())
+    }
+
+    const fn icon(self) -> &'static str {
+        match self {
+            Self::Active => "\u{25CF}",   // ●
+            Self::Idle => "\u{25D0}",     // ◐
+            Self::Inactive => "\u{25CB}", // ○
+        }
     }
 }
 
@@ -126,6 +139,16 @@ fn reduced_motion_enabled() -> bool {
     env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
 }
 
+const fn trend_for(current: u64, previous: u64) -> MetricTrend {
+    if current > previous {
+        MetricTrend::Up
+    } else if current < previous {
+        MetricTrend::Down
+    } else {
+        MetricTrend::Flat
+    }
+}
+
 pub struct AgentsScreen {
     table_state: TableState,
     agents: Vec<AgentRow>,
@@ -152,6 +175,12 @@ pub struct AgentsScreen {
     reduced_motion: bool,
     /// Synthetic event for the focused agent (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
+    /// Sparkline: messages per tick, bounded to SPARKLINE_CAP samples.
+    msg_rate_history: VecDeque<f64>,
+    /// Previous total message count for trend computation.
+    prev_total_msgs: u64,
+    /// Messages accumulated this tick interval.
+    total_msgs_this_tick: u64,
 }
 
 impl AgentsScreen {
@@ -174,6 +203,9 @@ impl AgentsScreen {
             seen_agents: HashSet::new(),
             reduced_motion: reduced_motion_enabled(),
             focused_synthetic: None,
+            msg_rate_history: VecDeque::with_capacity(SPARKLINE_CAP),
+            prev_total_msgs: 0,
+            total_msgs_this_tick: 0,
         }
     }
 
@@ -253,6 +285,7 @@ impl AgentsScreen {
             match event {
                 MailEvent::MessageSent { from, .. } => {
                     *self.msg_counts.entry(from.clone()).or_insert(0) += 1;
+                    self.total_msgs_this_tick += 1;
                     if !self.reduced_motion {
                         self.message_flash_ticks
                             .insert(from.clone(), MESSAGE_FLASH_TICKS);
@@ -363,6 +396,16 @@ impl AgentsScreen {
         });
     }
 
+    /// Record sparkline data point: messages since last sample.
+    fn record_sparkline_sample(&mut self) {
+        if self.msg_rate_history.len() >= SPARKLINE_CAP {
+            self.msg_rate_history.pop_front();
+        }
+        self.msg_rate_history
+            .push_back(self.total_msgs_this_tick as f64);
+        self.total_msgs_this_tick = 0;
+    }
+
     fn status_color(&self, agent: &AgentRow, now_ts: i64) -> PackedRgba {
         let target = AgentStatus::from_last_active(agent.last_active_ts, now_ts);
         if self.reduced_motion {
@@ -404,6 +447,22 @@ impl AgentsScreen {
             style = style.bg(PackedRgba::rgb(r, g, b)).fg(tp.selection_fg);
         }
         style
+    }
+
+    /// Count agents by status category.
+    fn status_counts(&self) -> (u64, u64, u64) {
+        let now_ts = chrono::Utc::now().timestamp_micros();
+        let mut active = 0u64;
+        let mut idle = 0u64;
+        let mut inactive = 0u64;
+        for agent in &self.agents {
+            match AgentStatus::from_last_active(agent.last_active_ts, now_ts) {
+                AgentStatus::Active => active += 1,
+                AgentStatus::Idle => idle += 1,
+                AgentStatus::Inactive => inactive += 1,
+            }
+        }
+        (active, idle, inactive)
     }
 }
 
@@ -481,8 +540,11 @@ impl MailScreen for AgentsScreen {
             self.advance_message_flashes();
             self.advance_stagger_reveals();
         }
-        // Rebuild every second
+        // Rebuild every second (10 ticks)
         if tick_count % 10 == 0 {
+            let total: u64 = self.msg_counts.values().sum();
+            self.prev_total_msgs = total;
+            self.record_sparkline_sample();
             self.rebuild_from_state(state);
         }
         self.sync_focused_event();
@@ -497,12 +559,37 @@ impl MailScreen for AgentsScreen {
             return;
         }
 
-        // Header bar: 1 line for filter/sort info
-        let header_h = 1_u16;
-        let table_h = area.height.saturating_sub(header_h);
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
 
-        let header_area = Rect::new(area.x, area.y, area.width, header_h);
-        let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
+        // Layout: summary(2) + header(1) + table(remainder) + footer(1)
+        let summary_h: u16 = if area.height >= 8 { 2 } else { 0 };
+        let header_h: u16 = 1;
+        let footer_h: u16 = if area.height >= 6 { 1 } else { 0 };
+        let table_h = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
+
+        let mut y = area.y;
+
+        // ── Summary band ───────────────────────────────────────────────
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        // ── Info header ────────────────────────────────────────────────
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
+
+        // Clear stale glyphs before writing header/status text.
+        Paragraph::new("")
+            .style(Style::default().bg(tp.panel_bg))
+            .render(header_area, frame);
 
         // Render header info line
         let sort_indicator = if self.sort_asc {
@@ -525,53 +612,24 @@ impl MailScreen for AgentsScreen {
             sort_indicator,
             filter_display,
         );
-        let p = Paragraph::new(info);
-        p.render(header_area, frame);
+        Paragraph::new(info).render(header_area, frame);
 
-        // Build table rows
-        let header = Row::new(["Name", "Program", "Model", "Last Active", "Msgs"])
-            .style(Style::default().bold());
-        let now_ts = chrono::Utc::now().timestamp_micros();
+        // ── Table ──────────────────────────────────────────────────────
+        let table_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
 
-        let rows: Vec<Row> = self
-            .agents
-            .iter()
-            .enumerate()
-            .map(|(i, agent)| {
-                let active_str = format_relative_time(agent.last_active_ts);
-                let msg_str = format!("{}", agent.message_count);
-                let style = self.row_style(i, agent, now_ts);
-                Row::new([
-                    agent.name.as_str().to_string(),
-                    agent.program.clone(),
-                    agent.model.clone(),
-                    active_str,
-                    msg_str,
-                ])
-                .style(style)
-            })
-            .collect();
+        // Clear table region each frame to prevent ghost separators from prior layouts.
+        Paragraph::new("")
+            .style(Style::default().bg(tp.panel_bg))
+            .render(table_area, frame);
 
-        let widths = [
-            Constraint::Percentage(25.0),
-            Constraint::Percentage(20.0),
-            Constraint::Percentage(20.0),
-            Constraint::Percentage(20.0),
-            Constraint::Percentage(15.0),
-        ];
+        self.render_table(frame, table_area, wide, narrow);
 
-        let tp = crate::tui_theme::TuiThemePalette::current();
-        let block = Block::default()
-            .title("Agents")
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(block)
-            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
-
-        let mut ts = self.table_state.clone();
-        StatefulWidget::render(&table, table_area, frame, &mut ts);
+        // ── Footer ─────────────────────────────────────────────────────
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
+        }
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -629,6 +687,171 @@ impl MailScreen for AgentsScreen {
 
     fn tab_label(&self) -> &'static str {
         "Agents"
+    }
+}
+
+// ── Rendering helpers ──────────────────────────────────────────────────
+
+impl AgentsScreen {
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let total_agents = self.agents.len() as u64;
+        let (active, idle, _inactive) = self.status_counts();
+        let total_msgs: u64 = self.msg_counts.values().sum();
+
+        let agents_str = total_agents.to_string();
+        let active_str = active.to_string();
+        let idle_str = idle.to_string();
+        let msgs_str = total_msgs.to_string();
+
+        let sparkline_data: Vec<f64> = self.msg_rate_history.iter().copied().collect();
+
+        let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = vec![
+            ("Agents", &agents_str, MetricTrend::Flat, tp.metric_agents),
+            ("Active", &active_str, MetricTrend::Flat, tp.activity_active),
+            ("Idle", &idle_str, MetricTrend::Flat, tp.activity_idle),
+            (
+                "Messages",
+                &msgs_str,
+                trend_for(total_msgs, self.prev_total_msgs),
+                tp.metric_messages,
+            ),
+        ];
+
+        let tile_count = tiles.len();
+        if tile_count == 0 || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let tile_w = area.width / tile_count as u16;
+
+        for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+            let x = area.x + (i as u16) * tile_w;
+            let w = if i == tile_count - 1 {
+                area.width.saturating_sub(x - area.x)
+            } else {
+                tile_w
+            };
+            let tile_area = Rect::new(x, area.y, w, area.height);
+            let mut tile = MetricTile::new(label, value, *trend)
+                .value_color(*color)
+                .sparkline_color(*color);
+            // Add sparkline to Messages tile
+            if *label == "Messages" && !sparkline_data.is_empty() {
+                tile = tile.sparkline(&sparkline_data);
+            }
+            tile.render(tile_area, frame);
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_table(&self, frame: &mut Frame<'_>, area: Rect, wide: bool, narrow: bool) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let now_ts = chrono::Utc::now().timestamp_micros();
+
+        // Responsive columns
+        let (header_cells, widths): (Vec<&str>, Vec<Constraint>) = if narrow {
+            // < 80: Name(+status), Active, Msgs only
+            (
+                vec!["Name", "Last Active", "Msgs"],
+                vec![
+                    Constraint::Percentage(40.0),
+                    Constraint::Percentage(30.0),
+                    Constraint::Percentage(30.0),
+                ],
+            )
+        } else if wide {
+            // >= 120: all columns + status badge
+            (
+                vec!["Name", "Program", "Model", "Last Active", "Msgs"],
+                vec![
+                    Constraint::Percentage(25.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(15.0),
+                ],
+            )
+        } else {
+            // 80–119: hide Model
+            (
+                vec!["Name", "Program", "Last Active", "Msgs"],
+                vec![
+                    Constraint::Percentage(28.0),
+                    Constraint::Percentage(25.0),
+                    Constraint::Percentage(27.0),
+                    Constraint::Percentage(20.0),
+                ],
+            )
+        };
+
+        let header = Row::new(header_cells).style(Style::default().bold());
+
+        let rows: Vec<Row> = self
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(i, agent)| {
+                let active_str = format_relative_time(agent.last_active_ts);
+                let msg_str = agent.message_count.to_string();
+                let style = self.row_style(i, agent, now_ts);
+
+                // Status badge prepended to name
+                let status = AgentStatus::from_last_active(agent.last_active_ts, now_ts);
+                let name_display = format!("{} {}", status.icon(), agent.name);
+
+                if narrow {
+                    Row::new([name_display, active_str, msg_str]).style(style)
+                } else if wide {
+                    Row::new([
+                        name_display,
+                        agent.program.clone(),
+                        agent.model.clone(),
+                        active_str,
+                        msg_str,
+                    ])
+                    .style(style)
+                } else {
+                    Row::new([name_display, agent.program.clone(), active_str, msg_str])
+                        .style(style)
+                }
+            })
+            .collect();
+
+        let block = Block::default()
+            .title("Agents")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(block)
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
+
+        let mut ts = self.table_state.clone();
+        StatefulWidget::render(&table, area, frame, &mut ts);
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let total = self.agents.len() as u64;
+        let (active, idle, inactive) = self.status_counts();
+        let total_msgs: u64 = self.msg_counts.values().sum();
+
+        let total_str = total.to_string();
+        let active_str = active.to_string();
+        let idle_str = idle.to_string();
+        let inactive_str = inactive.to_string();
+        let msgs_str = total_msgs.to_string();
+
+        let items: Vec<(&str, &str, PackedRgba)> = vec![
+            (&*total_str, "agents", tp.metric_agents),
+            (&*active_str, "active", tp.activity_active),
+            (&*idle_str, "idle", tp.activity_idle),
+            (&*inactive_str, "offline", tp.activity_stale),
+            (&*msgs_str, "msgs", tp.metric_messages),
+        ];
+
+        SummaryFooter::new(&items, tp.text_muted).render(area, frame);
     }
 }
 
@@ -697,6 +920,24 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(10, 2, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 10, 2), &state);
+    }
+
+    #[test]
+    fn renders_wide_layout() {
+        let state = test_state();
+        let screen = AgentsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(140, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
+    }
+
+    #[test]
+    fn renders_narrow_layout() {
+        let state = test_state();
+        let screen = AgentsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(60, 20, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 60, 20), &state);
     }
 
     #[test]
@@ -952,5 +1193,31 @@ mod tests {
         screen.table_state.selected = Some(5);
         screen.sync_focused_event();
         assert!(screen.focused_event().is_none());
+    }
+
+    #[test]
+    fn sparkline_records_samples() {
+        let mut screen = AgentsScreen::new();
+        screen.total_msgs_this_tick = 5;
+        screen.record_sparkline_sample();
+        assert_eq!(screen.msg_rate_history.len(), 1);
+        assert!((screen.msg_rate_history[0] - 5.0).abs() < f64::EPSILON);
+        assert_eq!(screen.total_msgs_this_tick, 0);
+    }
+
+    #[test]
+    fn sparkline_bounded_capacity() {
+        let mut screen = AgentsScreen::new();
+        for i in 0..SPARKLINE_CAP + 5 {
+            screen.total_msgs_this_tick = i as u64;
+            screen.record_sparkline_sample();
+        }
+        assert_eq!(screen.msg_rate_history.len(), SPARKLINE_CAP);
+    }
+
+    #[test]
+    fn status_counts_empty() {
+        let screen = AgentsScreen::new();
+        assert_eq!(screen.status_counts(), (0, 0, 0));
     }
 }

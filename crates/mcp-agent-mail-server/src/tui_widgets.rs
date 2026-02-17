@@ -19,6 +19,9 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "tui_widgets/fancy.rs"]
+pub mod fancy;
+
 use std::cell::RefCell;
 use std::fmt::Write;
 

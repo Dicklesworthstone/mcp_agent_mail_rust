@@ -1,7 +1,11 @@
-//! Projects screen — sortable/filterable project browser with per-project stats.
+//! Projects screen — sortable/filterable project browser with per-project stats,
+//! summary band, activity color-coding, responsive columns, and footer summary.
+
+use std::collections::HashMap;
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
+use ftui::text::display_width;
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -12,8 +16,10 @@ use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_events::ProjectSummary;
+use crate::tui_events::{MailEvent, ProjectSummary};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::fancy::SummaryFooter;
+use crate::tui_widgets::{MetricTile, MetricTrend};
 
 /// Column indices for sorting.
 const COL_SLUG: usize = 0;
@@ -25,6 +31,10 @@ const COL_CREATED: usize = 5;
 
 const SORT_LABELS: &[&str] = &["Slug", "Path", "Agents", "Msgs", "Reserv", "Created"];
 
+/// Activity recency thresholds (microseconds).
+const ACTIVE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
+const IDLE_WINDOW_MICROS: i64 = 30 * 60 * 1_000_000;
+
 pub struct ProjectsScreen {
     table_state: TableState,
     projects: Vec<ProjectSummary>,
@@ -32,6 +42,12 @@ pub struct ProjectsScreen {
     sort_asc: bool,
     filter: String,
     filter_active: bool,
+    /// Event tracking sequence number.
+    last_seq: u64,
+    /// Per-project last activity timestamp (slug → micros).
+    project_activity: HashMap<String, i64>,
+    /// Previous totals for MetricTrend computation.
+    prev_totals: (u64, u64, u64, u64),
 }
 
 impl ProjectsScreen {
@@ -44,6 +60,9 @@ impl ProjectsScreen {
             sort_asc: false,
             filter: String::new(),
             filter_active: false,
+            last_seq: 0,
+            project_activity: HashMap::new(),
+            prev_totals: (0, 0, 0, 0),
         }
     }
 
@@ -87,6 +106,22 @@ impl ProjectsScreen {
         }
     }
 
+    fn ingest_events(&mut self, state: &TuiSharedState) {
+        let events = state.events_since(self.last_seq);
+        for event in &events {
+            self.last_seq = event.seq().max(self.last_seq);
+            if let MailEvent::MessageSent {
+                project,
+                timestamp_micros,
+                ..
+            } = event
+            {
+                self.project_activity
+                    .insert(project.clone(), *timestamp_micros);
+            }
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if self.projects.is_empty() {
             return;
@@ -100,11 +135,67 @@ impl ProjectsScreen {
         };
         self.table_state.selected = Some(next);
     }
+
+    /// Compute totals for the summary band.
+    fn compute_totals(&self) -> (u64, u64, u64, u64) {
+        let project_count = self.projects.len() as u64;
+        let total_agents: u64 = self.projects.iter().map(|p| p.agent_count).sum();
+        let total_msgs: u64 = self.projects.iter().map(|p| p.message_count).sum();
+        let total_reserv: u64 = self.projects.iter().map(|p| p.reservation_count).sum();
+        (project_count, total_agents, total_msgs, total_reserv)
+    }
+
+    /// Determine activity status for a project row.
+    fn activity_color(&self, proj: &ProjectSummary) -> ftui::PackedRgba {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let now = chrono::Utc::now().timestamp_micros();
+        let last_ts = self.project_activity.get(&proj.slug).copied().unwrap_or(0);
+
+        if last_ts <= 0 {
+            return tp.activity_stale;
+        }
+        let elapsed = now.saturating_sub(last_ts);
+        if elapsed <= ACTIVE_WINDOW_MICROS {
+            tp.activity_active
+        } else if elapsed <= IDLE_WINDOW_MICROS {
+            tp.activity_idle
+        } else {
+            tp.activity_stale
+        }
+    }
+
+    /// Activity status icon for a project.
+    fn activity_icon(&self, proj: &ProjectSummary) -> &'static str {
+        let now = chrono::Utc::now().timestamp_micros();
+        let last_ts = self.project_activity.get(&proj.slug).copied().unwrap_or(0);
+
+        if last_ts <= 0 {
+            return "\u{25CB}"; // ○
+        }
+        let elapsed = now.saturating_sub(last_ts);
+        if elapsed <= ACTIVE_WINDOW_MICROS {
+            "\u{25CF}" // ●
+        } else if elapsed <= IDLE_WINDOW_MICROS {
+            "\u{25D0}" // ◐
+        } else {
+            "\u{25CB}" // ○
+        }
+    }
 }
 
 impl Default for ProjectsScreen {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+const fn trend_for(current: u64, previous: u64) -> MetricTrend {
+    if current > previous {
+        MetricTrend::Up
+    } else if current < previous {
+        MetricTrend::Down
+    } else {
+        MetricTrend::Flat
     }
 }
 
@@ -170,8 +261,11 @@ impl MailScreen for ProjectsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        self.ingest_events(state);
         // Rebuild every second
         if tick_count % 10 == 0 {
+            // Save previous totals for trend computation
+            self.prev_totals = self.compute_totals();
             self.rebuild_from_state(state);
         }
     }
@@ -182,14 +276,38 @@ impl MailScreen for ProjectsScreen {
             return;
         }
 
-        // Header bar: 1 line for filter/sort info
-        let header_h = 1_u16;
-        let table_h = area.height.saturating_sub(header_h);
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
 
-        let header_area = Rect::new(area.x, area.y, area.width, header_h);
-        let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
+        // Layout: summary_band(2) + header(1) + table(remainder) + footer(1)
+        let summary_h: u16 = if area.height >= 8 { 2 } else { 0 };
+        let header_h: u16 = 1;
+        let footer_h: u16 = if area.height >= 6 { 1 } else { 0 };
+        let table_h = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
 
-        // Render header info line
+        let mut y = area.y;
+
+        // ── Summary band (MetricTile row) ──────────────────────────────
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        // ── Info header ────────────────────────────────────────────────
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
+
+        // Clear header area
+        Paragraph::new("")
+            .style(Style::default().bg(tp.panel_bg))
+            .render(header_area, frame);
+
         let sort_indicator = if self.sort_asc {
             " \u{25b2}"
         } else {
@@ -210,61 +328,24 @@ impl MailScreen for ProjectsScreen {
             sort_indicator,
             filter_display,
         );
-        let p = Paragraph::new(info);
-        p.render(header_area, frame);
+        Paragraph::new(info).render(header_area, frame);
 
-        // Build table rows
-        let header = Row::new(["Slug", "Path", "Agents", "Msgs", "Reserv", "Created"])
-            .style(Style::default().bold());
+        // ── Table ──────────────────────────────────────────────────────
+        let table_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
 
-        let rows: Vec<Row> = self
-            .projects
-            .iter()
-            .enumerate()
-            .map(|(i, proj)| {
-                let created_str = format_created_time(proj.created_at);
-                let tp = crate::tui_theme::TuiThemePalette::current();
-                let style = if Some(i) == self.table_state.selected {
-                    Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
-                } else {
-                    Style::default()
-                };
-                // Truncate human_key to fit
-                let path_display = truncate_path(&proj.human_key, area.width as usize / 4);
-                Row::new([
-                    proj.slug.clone(),
-                    path_display,
-                    proj.agent_count.to_string(),
-                    proj.message_count.to_string(),
-                    proj.reservation_count.to_string(),
-                    created_str,
-                ])
-                .style(style)
-            })
-            .collect();
+        // Clear table region
+        Paragraph::new("")
+            .style(Style::default().bg(tp.panel_bg))
+            .render(table_area, frame);
 
-        let widths = [
-            Constraint::Percentage(20.0),
-            Constraint::Percentage(30.0),
-            Constraint::Percentage(10.0),
-            Constraint::Percentage(10.0),
-            Constraint::Percentage(10.0),
-            Constraint::Percentage(20.0),
-        ];
+        self.render_table(frame, table_area, wide, narrow);
 
-        let tp = crate::tui_theme::TuiThemePalette::current();
-        let block = Block::default()
-            .title("Projects")
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
-
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(block)
-            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
-
-        let mut ts = self.table_state.clone();
-        StatefulWidget::render(&table, table_area, frame, &mut ts);
+        // ── Footer summary ─────────────────────────────────────────────
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
+        }
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -325,6 +406,198 @@ impl MailScreen for ProjectsScreen {
     }
 }
 
+// ── Rendering helpers ──────────────────────────────────────────────────
+
+impl ProjectsScreen {
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (proj_count, total_agents, total_msgs, total_reserv) = self.compute_totals();
+        let (prev_proj, prev_agents, prev_msgs, prev_reserv) = self.prev_totals;
+
+        let proj_str = proj_count.to_string();
+        let agents_str = total_agents.to_string();
+        let msgs_str = total_msgs.to_string();
+        let reserv_str = total_reserv.to_string();
+
+        let tiles: Vec<(&str, &str, MetricTrend, ftui::PackedRgba)> = vec![
+            (
+                "Projects",
+                &proj_str,
+                trend_for(proj_count, prev_proj),
+                tp.metric_projects,
+            ),
+            (
+                "Agents",
+                &agents_str,
+                trend_for(total_agents, prev_agents),
+                tp.metric_agents,
+            ),
+            (
+                "Messages",
+                &msgs_str,
+                trend_for(total_msgs, prev_msgs),
+                tp.metric_messages,
+            ),
+            (
+                "Reserv",
+                &reserv_str,
+                trend_for(total_reserv, prev_reserv),
+                tp.metric_reservations,
+            ),
+        ];
+
+        let tile_count = tiles.len();
+        if tile_count == 0 || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let tile_w = area.width / tile_count as u16;
+
+        for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+            let x = area.x + (i as u16) * tile_w;
+            let w = if i == tile_count - 1 {
+                area.width.saturating_sub(x - area.x)
+            } else {
+                tile_w
+            };
+            let tile_area = Rect::new(x, area.y, w, area.height);
+            let tile = MetricTile::new(label, value, *trend)
+                .value_color(*color)
+                .sparkline_color(*color);
+            tile.render(tile_area, frame);
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_table(&self, frame: &mut Frame<'_>, area: Rect, wide: bool, narrow: bool) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+
+        // Responsive columns
+        let (header_cells, widths): (Vec<&str>, Vec<Constraint>) = if narrow {
+            // < 80: Slug, Agents, Msgs, Reserv only
+            (
+                vec!["Slug", "Agents", "Msgs", "Reserv"],
+                vec![
+                    Constraint::Percentage(40.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(20.0),
+                ],
+            )
+        } else if wide {
+            // >= 120: all columns
+            (
+                vec!["Slug", "Path", "Agents", "Msgs", "Reserv", "Created"],
+                vec![
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(30.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(20.0),
+                ],
+            )
+        } else {
+            // 80–119: hide Created
+            (
+                vec!["Slug", "Path", "Agents", "Msgs", "Reserv"],
+                vec![
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(33.0),
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(15.0),
+                    Constraint::Percentage(18.0),
+                ],
+            )
+        };
+
+        let header = Row::new(header_cells).style(Style::default().bold());
+
+        let rows: Vec<Row> = self
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, proj)| {
+                let activity_color = self.activity_color(proj);
+                let icon = self.activity_icon(proj);
+                let style = if Some(i) == self.table_state.selected {
+                    Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
+                } else {
+                    Style::default().fg(activity_color)
+                };
+
+                let slug_display = format!("{icon}{}", proj.slug);
+
+                if narrow {
+                    Row::new([
+                        slug_display,
+                        proj.agent_count.to_string(),
+                        proj.message_count.to_string(),
+                        proj.reservation_count.to_string(),
+                    ])
+                    .style(style)
+                } else if wide {
+                    let path_display =
+                        truncate_path_front(&proj.human_key, area.width as usize / 4);
+                    let created_str = format_created_time(proj.created_at);
+                    Row::new([
+                        slug_display,
+                        path_display,
+                        proj.agent_count.to_string(),
+                        proj.message_count.to_string(),
+                        proj.reservation_count.to_string(),
+                        created_str,
+                    ])
+                    .style(style)
+                } else {
+                    let path_display =
+                        truncate_path_front(&proj.human_key, area.width as usize / 4);
+                    Row::new([
+                        slug_display,
+                        path_display,
+                        proj.agent_count.to_string(),
+                        proj.message_count.to_string(),
+                        proj.reservation_count.to_string(),
+                    ])
+                    .style(style)
+                }
+            })
+            .collect();
+
+        let block = Block::default()
+            .title("Projects")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(block)
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
+
+        let mut ts = self.table_state.clone();
+        StatefulWidget::render(&table, area, frame, &mut ts);
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (proj_count, total_agents, total_msgs, total_reserv) = self.compute_totals();
+
+        let proj_str = proj_count.to_string();
+        let agents_str = total_agents.to_string();
+        let msgs_str = total_msgs.to_string();
+        let reserv_str = total_reserv.to_string();
+
+        let items: Vec<(&str, &str, ftui::PackedRgba)> = vec![
+            (&*proj_str, "projects", tp.metric_projects),
+            (&*agents_str, "agents", tp.metric_agents),
+            (&*msgs_str, "msgs", tp.metric_messages),
+            (&*reserv_str, "reserv", tp.metric_reservations),
+        ];
+
+        SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+    }
+}
+
 /// Format a creation timestamp as an absolute date/time string.
 fn format_created_time(ts_micros: i64) -> String {
     if ts_micros == 0 {
@@ -338,15 +611,30 @@ fn format_created_time(ts_micros: i64) -> String {
     )
 }
 
-/// Truncate a file path for display, keeping the last `max_len` characters.
-fn truncate_path(path: &str, max_len: usize) -> String {
-    if max_len < 4 {
-        return "...".to_string();
-    }
-    if path.len() <= max_len {
+/// Truncate a file path for display, preserving the beginning.
+///
+/// Shows `/home/user/pro…` instead of `...th/here`.
+fn truncate_path_front(path: &str, max_len: usize) -> String {
+    let w = display_width(path);
+    if w <= max_len {
         return path.to_string();
     }
-    format!("...{}", &path[path.len() - (max_len - 3)..])
+    if max_len < 2 {
+        return "\u{2026}".to_string(); // …
+    }
+    // Keep beginning, add ellipsis
+    let mut result = String::new();
+    let mut width = 0;
+    for ch in path.chars() {
+        let cw = display_width(&ch.to_string());
+        if width + cw + 1 > max_len {
+            break;
+        }
+        result.push(ch);
+        width += cw;
+    }
+    result.push('\u{2026}'); // …
+    result
 }
 
 #[cfg(test)]
@@ -392,6 +680,24 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(10, 2, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 10, 2), &state);
+    }
+
+    #[test]
+    fn renders_wide_layout() {
+        let state = test_state();
+        let screen = ProjectsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(140, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
+    }
+
+    #[test]
+    fn renders_narrow_layout() {
+        let state = test_state();
+        let screen = ProjectsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(60, 20, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 60, 20), &state);
     }
 
     #[test]
@@ -490,10 +796,12 @@ mod tests {
     }
 
     #[test]
-    fn truncate_path_values() {
-        assert_eq!(truncate_path("/short", 20), "/short");
-        assert_eq!(truncate_path("/a/very/long/path/here", 10), "...th/here");
-        assert_eq!(truncate_path("x", 3), "...");
+    fn truncate_path_front_values() {
+        assert_eq!(truncate_path_front("/short", 20), "/short");
+        let truncated = truncate_path_front("/a/very/long/path/here", 10);
+        assert!(truncated.starts_with("/a/very/l"));
+        assert!(truncated.ends_with('\u{2026}'));
+        assert_eq!(truncate_path_front("x", 3), "x");
     }
 
     #[test]
@@ -536,23 +844,7 @@ mod tests {
     #[test]
     fn filter_narrows_results() {
         let mut screen = ProjectsScreen::new();
-        screen.projects.push(ProjectSummary {
-            slug: "alpha".into(),
-            human_key: "/alpha".into(),
-            ..Default::default()
-        });
-        screen.projects.push(ProjectSummary {
-            slug: "beta".into(),
-            human_key: "/beta".into(),
-            ..Default::default()
-        });
         screen.filter = "alpha".to_string();
-
-        let state = test_state();
-        // Populate projects_list in shared state
-        screen.rebuild_from_state(&state);
-        // Without data in shared state, rebuild clears projects. Test filter logic directly.
-        assert!(screen.projects.is_empty()); // No data in shared state
 
         // Test filter with manual data
         screen.projects = vec![
@@ -574,5 +866,36 @@ mod tests {
         });
         assert_eq!(screen.projects.len(), 1);
         assert_eq!(screen.projects[0].slug, "alpha");
+    }
+
+    #[test]
+    fn trend_for_up_down_flat() {
+        assert_eq!(trend_for(10, 5), MetricTrend::Up);
+        assert_eq!(trend_for(5, 10), MetricTrend::Down);
+        assert_eq!(trend_for(5, 5), MetricTrend::Flat);
+    }
+
+    #[test]
+    fn compute_totals_empty() {
+        let screen = ProjectsScreen::new();
+        assert_eq!(screen.compute_totals(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn compute_totals_with_data() {
+        let mut screen = ProjectsScreen::new();
+        screen.projects.push(ProjectSummary {
+            agent_count: 3,
+            message_count: 10,
+            reservation_count: 2,
+            ..Default::default()
+        });
+        screen.projects.push(ProjectSummary {
+            agent_count: 5,
+            message_count: 20,
+            reservation_count: 1,
+            ..Default::default()
+        });
+        assert_eq!(screen.compute_totals(), (2, 8, 30, 3));
     }
 }

@@ -329,18 +329,15 @@ const THREADS_FOCUS: [FocusNodeTemplate; 2] = [
     ),
 ];
 
-const AGENTS_FOCUS: [FocusNodeTemplate; 2] = [
-    tpl("agents.list", FocusTarget::List(0), 0, 0, 0, 430, 1000),
-    tpl(
-        "agents.detail",
-        FocusTarget::DetailPanel,
-        1,
-        430,
-        0,
-        570,
-        1000,
-    ),
-];
+const AGENTS_FOCUS: [FocusNodeTemplate; 1] = [tpl(
+    "agents.list",
+    FocusTarget::List(0),
+    0,
+    0,
+    0,
+    1000,
+    1000,
+)];
 
 const SEARCH_FOCUS: [FocusNodeTemplate; 3] = [
     tpl(
@@ -1451,6 +1448,20 @@ mod tests {
         assert!(graph.node(FocusTarget::DetailPanel).is_none());
         assert!(graph.node(FocusTarget::TextInput(0)).is_some());
         assert!(graph.node(FocusTarget::List(0)).is_some());
+    }
+
+    #[test]
+    fn focus_graph_agents_uses_single_full_width_list_panel() {
+        let area = Rect::new(0, 0, 120, 40);
+        let graph = FocusGraph::for_screen(MailScreenId::Agents, area);
+
+        assert_eq!(graph.nodes().len(), 1);
+        assert!(graph.node(FocusTarget::DetailPanel).is_none());
+
+        let list = graph
+            .node(FocusTarget::List(0))
+            .expect("agents list node should exist");
+        assert_eq!(list.rect, area);
     }
 
     #[test]

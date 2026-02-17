@@ -251,19 +251,19 @@ impl TuiThemePalette {
     #[must_use]
     pub const fn frankenstein() -> Self {
         // Palette:
-        // Dark Green BG: 20, 30, 20
-        // Electric Green FG: 100, 255, 100
-        // Purple Accent: 180, 100, 255
-        // Stitch Gray: 100, 100, 100
-        // Blood Red: 200, 50, 50
+        // Deep Abyss BG: 5, 10, 5 (Darker)
+        // Electric Neon Green FG: 50, 255, 50 (More vibrant)
+        // Hyper Purple Accent: 200, 50, 255 (More vibrant)
+        // Stitch Cyan: 50, 200, 200
+        // Blood Red: 255, 20, 20
 
-        let bg_deep = PackedRgba::rgb(10, 20, 10);
-        let bg_surface = PackedRgba::rgb(20, 40, 20);
-        let fg_primary = PackedRgba::rgb(180, 255, 150);
-        let fg_muted = PackedRgba::rgb(80, 120, 80);
-        let accent = PackedRgba::rgb(180, 80, 220); // Purple stitches
-        let warning = PackedRgba::rgb(220, 200, 50); // Lightning yellow
-        let _error = PackedRgba::rgb(220, 50, 50); // Blood red (reserved for future use)
+        let bg_deep = PackedRgba::rgb(5, 10, 5);
+        let bg_surface = PackedRgba::rgb(15, 25, 15);
+        let fg_primary = PackedRgba::rgb(50, 255, 50); // Electric Green
+        let fg_muted = PackedRgba::rgb(40, 100, 40);
+        let accent = PackedRgba::rgb(200, 50, 255); // Hyper Purple
+        let warning = PackedRgba::rgb(255, 220, 0); // High-voltage Yellow
+        let _error = PackedRgba::rgb(255, 20, 20); // Blood Red
 
         Self {
             tab_active_bg: bg_surface,
@@ -290,91 +290,91 @@ impl TuiThemePalette {
             table_header_fg: accent,
             table_row_alt_bg: bg_surface,
 
-            selection_bg: PackedRgba::rgb(40, 70, 40),
+            selection_bg: PackedRgba::rgb(30, 60, 30),
             selection_fg: fg_primary,
 
-            severity_ok: PackedRgba::rgb(80, 220, 100),
-            severity_error: PackedRgba::rgb(220, 50, 50),
+            severity_ok: PackedRgba::rgb(50, 255, 50),
+            severity_error: PackedRgba::rgb(255, 20, 20),
             severity_warn: warning,
-            severity_critical: PackedRgba::rgb(255, 40, 40),
+            severity_critical: PackedRgba::rgb(255, 0, 0),
 
             panel_border: fg_muted,
             panel_border_focused: accent,
-            panel_border_dim: PackedRgba::rgb(40, 60, 40),
+            panel_border_dim: PackedRgba::rgb(20, 40, 20),
             panel_bg: bg_deep,
             panel_title_fg: fg_primary,
 
             selection_indicator: accent,
-            list_hover_bg: PackedRgba::rgb(30, 50, 30),
+            list_hover_bg: PackedRgba::rgb(20, 40, 20),
 
             chart_series: [
-                PackedRgba::rgb(80, 220, 100),
-                PackedRgba::rgb(100, 180, 255),
-                PackedRgba::rgb(255, 184, 108),
-                PackedRgba::rgb(255, 100, 150),
-                PackedRgba::rgb(180, 80, 220),
-                PackedRgba::rgb(220, 200, 50),
+                PackedRgba::rgb(50, 255, 50),
+                PackedRgba::rgb(50, 200, 255),
+                PackedRgba::rgb(255, 220, 0),
+                PackedRgba::rgb(255, 50, 150),
+                PackedRgba::rgb(200, 50, 255),
+                PackedRgba::rgb(255, 100, 0),
             ],
             chart_axis: fg_muted,
-            chart_grid: PackedRgba::rgb(30, 50, 30),
+            chart_grid: PackedRgba::rgb(20, 40, 20),
 
-            badge_urgent_bg: PackedRgba::rgb(200, 50, 50),
+            badge_urgent_bg: PackedRgba::rgb(200, 0, 0),
             badge_urgent_fg: PackedRgba::rgb(255, 255, 255),
-            badge_info_bg: PackedRgba::rgb(40, 80, 120),
-            badge_info_fg: PackedRgba::rgb(180, 220, 255),
+            badge_info_bg: PackedRgba::rgb(20, 40, 60),
+            badge_info_fg: PackedRgba::rgb(100, 200, 255),
 
-            ttl_healthy: PackedRgba::rgb(80, 220, 100),
+            ttl_healthy: PackedRgba::rgb(50, 255, 50),
             ttl_warning: warning,
-            ttl_danger: PackedRgba::rgb(220, 80, 50),
-            ttl_expired: PackedRgba::rgb(120, 60, 60),
+            ttl_danger: PackedRgba::rgb(255, 50, 0),
+            ttl_expired: PackedRgba::rgb(100, 50, 50),
 
-            metric_uptime: PackedRgba::rgb(80, 220, 100),
-            metric_requests: PackedRgba::rgb(100, 180, 255),
-            metric_latency: PackedRgba::rgb(255, 184, 108),
-            metric_messages: PackedRgba::rgb(180, 140, 255),
-            metric_agents: PackedRgba::rgb(255, 100, 150),
-            metric_ack_ok: PackedRgba::rgb(80, 220, 100),
-            metric_ack_bad: PackedRgba::rgb(220, 50, 50),
-            metric_reservations: PackedRgba::rgb(220, 200, 50),
-            metric_projects: PackedRgba::rgb(120, 200, 220),
+            metric_uptime: PackedRgba::rgb(50, 255, 50),
+            metric_requests: PackedRgba::rgb(50, 200, 255),
+            metric_latency: PackedRgba::rgb(255, 220, 0),
+            metric_messages: PackedRgba::rgb(200, 50, 255),
+            metric_agents: PackedRgba::rgb(255, 50, 150),
+            metric_ack_ok: PackedRgba::rgb(50, 255, 50),
+            metric_ack_bad: PackedRgba::rgb(255, 20, 20),
+            metric_reservations: warning,
+            metric_projects: PackedRgba::rgb(50, 200, 200),
 
             agent_palette: [
-                PackedRgba::rgb(92, 201, 255),
-                PackedRgba::rgb(123, 214, 153),
-                PackedRgba::rgb(255, 184, 108),
-                PackedRgba::rgb(255, 122, 162),
-                PackedRgba::rgb(180, 140, 255),
-                PackedRgba::rgb(100, 220, 220),
-                PackedRgba::rgb(220, 180, 100),
-                PackedRgba::rgb(200, 200, 200),
+                PackedRgba::rgb(50, 200, 255),
+                PackedRgba::rgb(50, 255, 50),
+                PackedRgba::rgb(255, 220, 0),
+                PackedRgba::rgb(255, 50, 150),
+                PackedRgba::rgb(200, 50, 255),
+                PackedRgba::rgb(50, 200, 200),
+                PackedRgba::rgb(255, 150, 50),
+                PackedRgba::rgb(150, 150, 150),
             ],
 
-            contact_approved: PackedRgba::rgb(80, 220, 100),
+            contact_approved: PackedRgba::rgb(50, 255, 50),
             contact_pending: warning,
-            contact_blocked: PackedRgba::rgb(220, 50, 50),
+            contact_blocked: PackedRgba::rgb(255, 20, 20),
 
-            activity_active: PackedRgba::rgb(170, 240, 195),
-            activity_idle: PackedRgba::rgb(120, 170, 145),
-            activity_stale: PackedRgba::rgb(85, 100, 90),
+            activity_active: PackedRgba::rgb(150, 255, 150),
+            activity_idle: PackedRgba::rgb(100, 200, 100),
+            activity_stale: PackedRgba::rgb(60, 80, 60),
 
             text_muted: fg_muted,
             text_primary: fg_primary,
-            text_secondary: PackedRgba::rgb(140, 200, 120),
-            text_disabled: PackedRgba::rgb(50, 70, 50),
+            text_secondary: PackedRgba::rgb(100, 200, 100),
+            text_disabled: PackedRgba::rgb(40, 60, 40),
             bg_deep,
             bg_surface,
-            bg_overlay: PackedRgba::rgb(30, 55, 30),
+            bg_overlay: PackedRgba::rgb(25, 45, 25),
 
-            toast_error: PackedRgba::rgb(255, 100, 100),
-            toast_warning: PackedRgba::rgb(255, 184, 108),
-            toast_info: PackedRgba::rgb(120, 220, 150),
-            toast_success: PackedRgba::rgb(100, 220, 170),
-            toast_focus: PackedRgba::rgb(80, 220, 255),
+            toast_error: PackedRgba::rgb(255, 50, 50),
+            toast_warning: warning,
+            toast_info: PackedRgba::rgb(50, 200, 255),
+            toast_success: PackedRgba::rgb(50, 255, 50),
+            toast_focus: accent,
 
             json_key: accent,
-            json_string: PackedRgba::rgb(80, 220, 100),
-            json_number: PackedRgba::rgb(255, 184, 108),
-            json_literal: PackedRgba::rgb(100, 180, 255),
+            json_string: PackedRgba::rgb(50, 255, 50),
+            json_number: warning,
+            json_literal: PackedRgba::rgb(50, 200, 255),
             json_punctuation: fg_muted,
         }
     }
