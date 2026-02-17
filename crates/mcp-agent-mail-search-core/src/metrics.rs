@@ -647,8 +647,7 @@ mod tests {
                 Some(Arc::new(FixedEmbedder::new("quality", vec![1.0, 0.0]))),
                 config,
             );
-            let phases = searcher.search("hello", 1).collect::<Vec<_>>();
-            assert!(!phases.is_empty());
+            assert!(searcher.search("hello", 1).next().is_some());
         });
 
         let names = capture.names();

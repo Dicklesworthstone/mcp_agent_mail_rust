@@ -1896,9 +1896,11 @@ mod tests {
 
         let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
         assert_eq!(phases.len(), 2);
-        let refined = match &phases[1] {
-            SearchPhase::Refined { results, .. } => results,
-            _ => panic!("phase 1 should be Refined"),
+        let SearchPhase::Refined {
+            results: refined, ..
+        } = &phases[1]
+        else {
+            panic!("phase 1 should be Refined");
         };
         assert_eq!(refined.len(), 2);
         assert_eq!(
