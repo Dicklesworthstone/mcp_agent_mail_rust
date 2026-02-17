@@ -174,6 +174,11 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
         } else {
             Style::default().fg(fg).bg(bg)
         };
+        // Clear each tab slot before drawing text so separators from prior
+        // frames cannot bleed through shorter/shifted labels.
+        Paragraph::new("")
+            .style(Style::default().bg(bg))
+            .render(tab_area, frame);
 
         let label_span = if use_gradient && has_label {
             // Reserve label width in the base tab row; overlay gradient text below.

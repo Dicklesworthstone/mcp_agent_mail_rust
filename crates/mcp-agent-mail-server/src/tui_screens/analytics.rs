@@ -29,7 +29,7 @@ pub struct AnalyticsScreen {
     selected: usize,
     table_state: TableState,
     detail_scroll: u16,
-    last_refresh_tick: u64,
+    last_refresh_tick: Option<u64>,
 }
 
 impl AnalyticsScreen {
@@ -41,7 +41,7 @@ impl AnalyticsScreen {
             selected: 0,
             table_state: TableState::default(),
             detail_scroll: 0,
-            last_refresh_tick: 0,
+            last_refresh_tick: None,
         }
     }
 
@@ -467,12 +467,18 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
 }
 
 fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
+    use ftui::text::{Line, Text};
+
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let text = "No anomalies detected.\n\n\
-                The insight feed monitors real-time KPI metrics and surfaces\n\
-                anomaly explanation cards when deviations are detected.\n\n\
-                Metrics are collected as tool calls flow through the server.";
-    let para = Paragraph::new(text).block(
+    let text = Text::from_lines(vec![
+        Line::raw("No anomalies detected."),
+        Line::raw(""),
+        Line::raw("The insight feed monitors real-time KPI metrics and surfaces"),
+        Line::raw("anomaly explanation cards when deviations are detected."),
+        Line::raw(""),
+        Line::raw("Metrics are collected as tool calls flow through the server."),
+    ]);
+    let para = Paragraph::new(text).wrap(ftui::text::WrapMode::Word).block(
         Block::new()
             .title(" Insight Feed ")
             .border_type(BorderType::Rounded)
@@ -535,6 +541,7 @@ impl MailScreen for AnalyticsScreen {
             render_empty_state(frame, area);
             return;
         }
+        let selected = self.selected.min(self.feed.cards.len().saturating_sub(1));
 
         // Split: top half for card list, bottom half for detail.
         let chunks = Flex::vertical()
@@ -542,23 +549,20 @@ impl MailScreen for AnalyticsScreen {
             .split(area);
 
         let mut table_state = self.table_state.clone();
-        render_card_list(
-            frame,
-            chunks[0],
-            &self.feed,
-            self.selected,
-            &mut table_state,
-        );
+        render_card_list(frame, chunks[0], &self.feed, selected, &mut table_state);
 
-        if let Some(card) = self.selected_card() {
+        if let Some(card) = self.feed.cards.get(selected) {
             render_card_detail(frame, chunks[1], card, self.detail_scroll);
         }
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        if tick_count.wrapping_sub(self.last_refresh_tick) >= REFRESH_INTERVAL_TICKS {
+        let should_refresh = self.last_refresh_tick.map_or(true, |last| {
+            tick_count.wrapping_sub(last) >= REFRESH_INTERVAL_TICKS
+        });
+        if should_refresh {
             self.refresh_feed(Some(state));
-            self.last_refresh_tick = tick_count;
+            self.last_refresh_tick = Some(tick_count);
         }
     }
 
@@ -698,6 +702,16 @@ mod tests {
         // feed is empty in test context (no metrics flowing)
         screen.move_down();
         assert_eq!(screen.selected, 0);
+    }
+
+    #[test]
+    fn first_tick_triggers_refresh_cycle() {
+        let mut screen = AnalyticsScreen::new();
+        assert_eq!(screen.last_refresh_tick, None);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.tick(1, &state);
+        assert_eq!(screen.last_refresh_tick, Some(1));
     }
 
     #[test]

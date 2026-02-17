@@ -1822,6 +1822,8 @@ fn render_thread_list(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    // Clear interior cells each frame to avoid stale glyphs from previous layouts.
+    Paragraph::new("").render(inner, frame);
 
     let visible_height = inner.height as usize;
 
@@ -2055,6 +2057,8 @@ fn render_thread_detail(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    // Clear interior cells each frame to avoid stale tree/border glyph artifacts.
+    Paragraph::new("").render(inner, frame);
 
     if messages.is_empty() {
         let text = match thread {

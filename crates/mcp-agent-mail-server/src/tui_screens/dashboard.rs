@@ -58,7 +58,7 @@ const STAT_REFRESH_TICKS: u64 = 10;
 const fn summary_band_height(tc: TerminalClass) -> u16 {
     match tc {
         TerminalClass::Tiny => 1,
-        _ => 3,
+        _ => 2,
     }
 }
 
@@ -69,25 +69,22 @@ const fn anomaly_rail_height(tc: TerminalClass, anomaly_count: usize) -> u16 {
     }
     match tc {
         TerminalClass::Tiny => 0,
-        TerminalClass::Compact => 3, // show 1 card, condensed
-        _ => 4,
+        TerminalClass::Compact => 2, // show 1 card, condensed
+        _ => 3,
     }
 }
 
 /// Footer height by terminal class.
 const fn footer_bar_height(tc: TerminalClass) -> u16 {
     match tc {
-        TerminalClass::Tiny => 0,
-        _ => 1,
+        TerminalClass::Wide | TerminalClass::UltraWide => 1,
+        _ => 0,
     }
 }
 
 /// Title band height by terminal class (0 on tiny terminals).
-const fn title_band_height(tc: TerminalClass) -> u16 {
-    match tc {
-        TerminalClass::Tiny => 0,
-        _ => 1,
-    }
+const fn title_band_height(_tc: TerminalClass) -> u16 {
+    0
 }
 
 /// Max percentile samples to retain.
@@ -709,14 +706,34 @@ impl DashboardScreen {
         self.console_log.borrow_mut().render(inner, frame);
     }
 
+    fn should_render_trend_panel(&self) -> bool {
+        self.show_trend_panel
+            && (self.percentile_history.len() >= 2
+                || self.animated_throughput_history.len() >= 2
+                || !self.event_log.is_empty())
+    }
+
+    fn should_render_bottom_rail(
+        quick_query: &str,
+        preview: Option<&RecentMessagePreview>,
+    ) -> bool {
+        !quick_query.trim().is_empty() || preview.is_some()
+    }
+
     /// Build the `ReactiveLayout` for the main content area.
     ///
     /// Layout contains:
     /// - Primary event log
     /// - Optional trend panel (right rail)
-    /// - Recent message markdown preview (bottom rail on wide terminals)
+    /// - Optional bottom rail (preview/query/activity)
     /// - Optional console log panel (bottom sidebar)
-    fn main_content_layout(show_trend_panel: bool, show_log_panel: bool) -> ReactiveLayout {
+    fn main_content_layout(
+        show_trend_panel: bool,
+        show_log_panel: bool,
+        show_footer_panel: bool,
+        rich_footer_content: bool,
+        console_log_lines: usize,
+    ) -> ReactiveLayout {
         let mut layout = ReactiveLayout::new()
             // Primary anchor for horizontal splitting (footer rail).
             .panel(PanelPolicy::new(
@@ -741,31 +758,51 @@ impl DashboardScreen {
                     SplitAxis::Vertical,
                     PanelConstraint::HIDDEN,
                 )
-                .at(TerminalClass::Wide, PanelConstraint::visible(0.35, 30))
-                .at(TerminalClass::UltraWide, PanelConstraint::visible(0.40, 40)),
+                .at(TerminalClass::Wide, PanelConstraint::visible(0.28, 24))
+                .at(TerminalClass::UltraWide, PanelConstraint::visible(0.30, 30)),
             );
         }
 
         if show_log_panel {
+            let (log_ratio, log_min) = if console_log_lines >= 80 {
+                (0.34, 10)
+            } else if console_log_lines >= 20 {
+                (0.30, 8)
+            } else {
+                (0.24, 6)
+            };
             layout = layout.panel(PanelPolicy::new(
                 PanelSlot::Sidebar,
                 3,
                 SplitAxis::Horizontal,
-                PanelConstraint::visible(0.45, 10),
+                PanelConstraint::visible(log_ratio, log_min),
             ));
         }
 
-        layout.panel(
-            PanelPolicy::new(
-                PanelSlot::Footer,
-                2,
-                SplitAxis::Horizontal,
-                PanelConstraint::HIDDEN,
-            )
-            .at(TerminalClass::Normal, PanelConstraint::visible(0.22, 5))
-            .at(TerminalClass::Wide, PanelConstraint::visible(0.30, 8))
-            .at(TerminalClass::UltraWide, PanelConstraint::visible(0.28, 9)),
-        )
+        if show_footer_panel {
+            let normal_ratio = if rich_footer_content { 0.18 } else { 0.14 };
+            let wide_ratio = if rich_footer_content { 0.22 } else { 0.16 };
+            let ultra_ratio = if rich_footer_content { 0.20 } else { 0.15 };
+            layout = layout.panel(
+                PanelPolicy::new(
+                    PanelSlot::Footer,
+                    2,
+                    SplitAxis::Horizontal,
+                    PanelConstraint::HIDDEN,
+                )
+                .at(
+                    TerminalClass::Normal,
+                    PanelConstraint::visible(normal_ratio, 4),
+                )
+                .at(TerminalClass::Wide, PanelConstraint::visible(wide_ratio, 6))
+                .at(
+                    TerminalClass::UltraWide,
+                    PanelConstraint::visible(ultra_ratio, 7),
+                ),
+            );
+        }
+
+        layout
     }
 
     fn apply_quick_filter(&mut self, filter: DashboardQuickFilter) {
@@ -1075,7 +1112,23 @@ impl MailScreen for DashboardScreen {
         };
         let visible_entries = self.visible_entries();
         let quick_query = self.quick_query();
-        let layout = Self::main_content_layout(self.show_trend_panel, self.show_log_panel);
+        let preview = if self.quick_filter.includes_messages() {
+            self.recent_message_preview
+                .as_ref()
+                .filter(|preview| !preview.is_stale())
+        } else {
+            None
+        };
+        let show_trend_panel = self.should_render_trend_panel();
+        let show_footer_panel = Self::should_render_bottom_rail(quick_query, preview);
+        let console_log_lines = self.console_log.borrow().len();
+        let layout = Self::main_content_layout(
+            show_trend_panel,
+            self.show_log_panel,
+            show_footer_panel,
+            preview.is_some(),
+            console_log_lines,
+        );
         let comp = layout.compute(main_area);
         // When the anomaly rail is hidden (Tiny), inject an inline annotation
         // so the operator still sees anomaly presence.
@@ -1114,13 +1167,6 @@ impl MailScreen for DashboardScreen {
             );
         }
         if let Some(preview_rect) = comp.rect(PanelSlot::Footer) {
-            let preview = if self.quick_filter.includes_messages() {
-                self.recent_message_preview
-                    .as_ref()
-                    .filter(|preview| !preview.is_stale())
-            } else {
-                None
-            };
             render_bottom_rail(
                 frame,
                 preview_rect,
@@ -1733,10 +1779,9 @@ fn render_primary_cluster(
         return;
     }
 
-    let mut query_h = if area.height >= 15 {
-        3
-    } else if area.height >= 9 {
-        2
+    let query_visible = query_active || !query_text.trim().is_empty();
+    let mut query_h = if query_visible {
+        if area.height >= 15 { 3 } else { 2 }
     } else {
         0
     };
@@ -2047,6 +2092,22 @@ fn render_bottom_rail(
     preview: Option<&RecentMessagePreview>,
 ) {
     if area.width < 24 || area.height < 4 {
+        return;
+    }
+
+    if preview.is_none() {
+        if query_text.is_empty() {
+            render_recent_activity_panel(frame, area, entries, query_text);
+            return;
+        }
+
+        if area.width >= 96 && area.height >= 8 {
+            let (left, right) = split_width_ratio_with_gap(area, 0.55, 1);
+            render_query_matches_panel(frame, left, query_text, db_snapshot, entries);
+            render_recent_activity_panel(frame, right, entries, query_text);
+        } else {
+            render_query_matches_panel(frame, area, query_text, db_snapshot, entries);
+        }
         return;
     }
 
@@ -4270,6 +4331,30 @@ fn render_event_log(
         return;
     }
 
+    if total == 0 {
+        let headline = if quick_filter == DashboardQuickFilter::All {
+            "No events yet."
+        } else {
+            "No events match current filter."
+        };
+        let guidance = if quick_filter == DashboardQuickFilter::All {
+            "Waiting for HTTP/tool/message traffic and health pulses."
+        } else {
+            "Press 1 for All, or use / to broaden the live filter."
+        };
+        let controls = "Enter opens Timeline/Search context when results are available.";
+        let lines = vec![
+            Line::from_spans([Span::styled(
+                headline,
+                Style::default().fg(tp.text_primary).bold(),
+            )]),
+            Line::from_spans([Span::styled(guidance, crate::tui_theme::text_meta(&tp))]),
+            Line::from_spans([Span::styled(controls, crate::tui_theme::text_meta(&tp))]),
+        ];
+        Paragraph::new(Text::from_lines(lines)).render(viewer_area, frame);
+        return;
+    }
+
     let (window_start, window_end) =
         event_log_window_bounds(total, scroll_offset, usize::from(viewer_area.height));
     let window_entries = &entries[window_start..window_end];
@@ -4577,6 +4662,23 @@ mod tests {
             && right.x < left_right
             && left.y < right_bottom
             && right.y < left_bottom
+    }
+
+    fn frame_text(frame: &Frame<'_>) -> String {
+        let mut text = String::new();
+        for y in 0..frame.buffer.height() {
+            for x in 0..frame.buffer.width() {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    if let Some(ch) = cell.content.as_char() {
+                        text.push(ch);
+                    } else if !cell.is_continuation() {
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push('\n');
+        }
+        text
     }
 
     #[test]
@@ -4937,20 +5039,20 @@ mod tests {
     #[test]
     fn panel_budget_heights_match_terminal_classes() {
         assert_eq!(summary_band_height(TerminalClass::Tiny), 1);
-        assert_eq!(summary_band_height(TerminalClass::Compact), 3);
-        assert_eq!(summary_band_height(TerminalClass::Normal), 3);
-        assert_eq!(summary_band_height(TerminalClass::Wide), 3);
-        assert_eq!(summary_band_height(TerminalClass::UltraWide), 3);
+        assert_eq!(summary_band_height(TerminalClass::Compact), 2);
+        assert_eq!(summary_band_height(TerminalClass::Normal), 2);
+        assert_eq!(summary_band_height(TerminalClass::Wide), 2);
+        assert_eq!(summary_band_height(TerminalClass::UltraWide), 2);
 
         assert_eq!(anomaly_rail_height(TerminalClass::Tiny, 2), 0);
-        assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 3);
-        assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 4);
-        assert_eq!(anomaly_rail_height(TerminalClass::Wide, 2), 4);
-        assert_eq!(anomaly_rail_height(TerminalClass::UltraWide, 2), 4);
+        assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 2);
+        assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 3);
+        assert_eq!(anomaly_rail_height(TerminalClass::Wide, 2), 3);
+        assert_eq!(anomaly_rail_height(TerminalClass::UltraWide, 2), 3);
 
         assert_eq!(footer_bar_height(TerminalClass::Tiny), 0);
-        assert_eq!(footer_bar_height(TerminalClass::Compact), 1);
-        assert_eq!(footer_bar_height(TerminalClass::Normal), 1);
+        assert_eq!(footer_bar_height(TerminalClass::Compact), 0);
+        assert_eq!(footer_bar_height(TerminalClass::Normal), 0);
         assert_eq!(footer_bar_height(TerminalClass::Wide), 1);
         assert_eq!(footer_bar_height(TerminalClass::UltraWide), 1);
     }
@@ -4971,10 +5073,10 @@ mod tests {
 
     #[test]
     fn main_layout_ultrawide_exposes_double_surface_vs_standard() {
-        let standard =
-            DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 100, 30));
-        let ultra =
-            DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 200, 50));
+        let standard = DashboardScreen::main_content_layout(true, false, true, true, 0)
+            .compute(Rect::new(0, 0, 100, 30));
+        let ultra = DashboardScreen::main_content_layout(true, false, true, true, 0)
+            .compute(Rect::new(0, 0, 200, 50));
 
         let standard_visible = standard
             .panels
@@ -5000,7 +5102,8 @@ mod tests {
     #[test]
     fn main_layout_ultrawide_panels_fit_bounds_without_overlap() {
         let area = Rect::new(0, 0, 200, 50);
-        let composition = DashboardScreen::main_content_layout(true, false).compute(area);
+        let composition =
+            DashboardScreen::main_content_layout(true, false, true, true, 0).compute(area);
         let visible_rects: Vec<Rect> = [
             composition.rect(PanelSlot::Primary),
             composition.rect(PanelSlot::Inspector),
@@ -5036,10 +5139,17 @@ mod tests {
 
     #[test]
     fn main_layout_hides_trend_panel_when_disabled() {
-        let composition =
-            DashboardScreen::main_content_layout(false, false).compute(Rect::new(0, 0, 200, 50));
+        let composition = DashboardScreen::main_content_layout(false, false, true, true, 0)
+            .compute(Rect::new(0, 0, 200, 50));
         assert!(composition.rect(PanelSlot::Inspector).is_none());
         assert!(composition.rect(PanelSlot::Footer).is_some());
+    }
+
+    #[test]
+    fn main_layout_hides_footer_when_disabled() {
+        let composition = DashboardScreen::main_content_layout(true, false, false, false, 0)
+            .compute(Rect::new(0, 0, 200, 50));
+        assert!(composition.rect(PanelSlot::Footer).is_none());
     }
 
     #[test]
@@ -5095,6 +5205,35 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(120, 30, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+    }
+
+    #[test]
+    fn dashboard_empty_event_log_renders_guidance() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let screen = DashboardScreen::new();
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+        let text = frame_text(&frame);
+        assert!(text.contains("No events yet."));
+        assert!(text.contains("health pulses"));
+    }
+
+    #[test]
+    fn dashboard_filtered_empty_event_log_renders_filter_hint() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.apply_quick_filter(DashboardQuickFilter::Tools);
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+        let text = frame_text(&frame);
+        assert!(text.contains("No events match current filter."));
+        assert!(text.contains("Press 1 for All"));
     }
 
     #[test]
@@ -6300,9 +6439,9 @@ mod tests {
 
     #[test]
     fn anomaly_rail_height_compact_vs_normal() {
-        assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 3);
-        assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 4);
-        assert_eq!(anomaly_rail_height(TerminalClass::Wide, 1), 4);
+        assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 2);
+        assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 3);
+        assert_eq!(anomaly_rail_height(TerminalClass::Wide, 1), 3);
     }
 
     #[test]
@@ -6334,14 +6473,14 @@ mod tests {
     #[test]
     fn footer_bar_hidden_on_tiny() {
         assert_eq!(footer_bar_height(TerminalClass::Tiny), 0);
-        assert_eq!(footer_bar_height(TerminalClass::Compact), 1);
-        assert_eq!(footer_bar_height(TerminalClass::Normal), 1);
+        assert_eq!(footer_bar_height(TerminalClass::Compact), 0);
+        assert_eq!(footer_bar_height(TerminalClass::Normal), 0);
     }
 
     #[test]
     fn title_band_hidden_on_tiny() {
         assert_eq!(title_band_height(TerminalClass::Tiny), 0);
-        assert_eq!(title_band_height(TerminalClass::Compact), 1);
+        assert_eq!(title_band_height(TerminalClass::Compact), 0);
     }
 
     #[test]

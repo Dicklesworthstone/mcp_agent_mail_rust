@@ -935,10 +935,9 @@ impl TimelineScreen {
                         COMMIT_LIMIT_PER_PROJECT,
                     ) {
                         Ok(rows) => {
-                            commits.extend(
-                                rows.into_iter()
-                                    .map(|entry| CommitTimelineEntry::from_storage(slug.clone(), entry)),
-                            );
+                            commits.extend(rows.into_iter().map(|entry| {
+                                CommitTimelineEntry::from_storage(slug.clone(), entry)
+                            }));
                         }
                         Err(_) => {
                             refresh_errors = refresh_errors.saturating_add(1);

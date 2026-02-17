@@ -3649,10 +3649,10 @@ impl Model for MailAppModel {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
-        if active_screen != MailScreenId::Dashboard {
-            if let Some(focused_rect) = self.focused_panel_rect(chrome.content) {
-                render_panel_focus_outline(focused_rect, frame);
-            }
+        if active_screen != MailScreenId::Dashboard
+            && let Some(focused_rect) = self.focused_panel_rect(chrome.content)
+        {
+            render_panel_focus_outline(chrome.content, focused_rect, frame);
         }
 
         // Register pane hit region for the active screen's content area.
@@ -5116,7 +5116,7 @@ fn render_export_format_menu(area: Rect, frame: &mut Frame) {
         .style(Style::default().bg(tp.panel_bg))
         .render(menu, frame);
 
-    render_panel_focus_outline(menu, frame);
+    render_panel_focus_outline(area, menu, frame);
 
     let title_area = Rect::new(menu.x + 2, menu.y + 1, menu.width.saturating_sub(4), 1);
     Paragraph::new("Export screen snapshot")
@@ -5137,34 +5137,109 @@ fn render_export_format_menu(area: Rect, frame: &mut Frame) {
 }
 
 /// Draw a focused-panel outline using the theme's focused border color.
-fn render_panel_focus_outline(area: Rect, frame: &mut Frame) {
+fn render_panel_focus_outline(bounds: Rect, area: Rect, frame: &mut Frame) {
     if area.width < 2 || area.height < 2 {
         return;
     }
 
     let color = crate::tui_theme::TuiThemePalette::current().panel_border_focused;
-    let left = area.x;
-    let top = area.y;
-    let right = area.x.saturating_add(area.width).saturating_sub(1);
-    let bottom = area.y.saturating_add(area.height).saturating_sub(1);
+    let has_top_space = area.y > bounds.y;
+    let has_bottom_space = area.bottom() < bounds.bottom();
+    let has_left_space = area.x > bounds.x;
+    let has_right_space = area.right() < bounds.right();
 
-    set_focus_cell(frame, left, top, '┌', color);
-    set_focus_cell(frame, right, top, '┐', color);
-    set_focus_cell(frame, left, bottom, '└', color);
-    set_focus_cell(frame, right, bottom, '┘', color);
-
-    let mut x = left.saturating_add(1);
-    while x < right {
-        set_focus_cell(frame, x, top, '─', color);
-        set_focus_cell(frame, x, bottom, '─', color);
-        x = x.saturating_add(1);
+    if !has_top_space && !has_bottom_space && !has_left_space && !has_right_space {
+        return;
     }
 
-    let mut y = top.saturating_add(1);
-    while y < bottom {
-        set_focus_cell(frame, left, y, '│', color);
-        set_focus_cell(frame, right, y, '│', color);
-        y = y.saturating_add(1);
+    let top_row = area.y.saturating_sub(1);
+    let bottom_row = area.bottom();
+    let left_col = area.x.saturating_sub(1);
+    let right_col = area.right();
+
+    if has_top_space {
+        let start_x = if has_left_space {
+            left_col.saturating_add(1)
+        } else {
+            area.x
+        };
+        let end_x = if has_right_space {
+            right_col.saturating_sub(1)
+        } else {
+            area.right().saturating_sub(1)
+        };
+        if start_x <= end_x {
+            for x in start_x..=end_x {
+                set_focus_cell(frame, x, top_row, '─', color);
+            }
+        }
+    }
+
+    if has_bottom_space {
+        let start_x = if has_left_space {
+            left_col.saturating_add(1)
+        } else {
+            area.x
+        };
+        let end_x = if has_right_space {
+            right_col.saturating_sub(1)
+        } else {
+            area.right().saturating_sub(1)
+        };
+        if start_x <= end_x {
+            for x in start_x..=end_x {
+                set_focus_cell(frame, x, bottom_row, '─', color);
+            }
+        }
+    }
+
+    if has_left_space {
+        let start_y = if has_top_space {
+            top_row.saturating_add(1)
+        } else {
+            area.y
+        };
+        let end_y = if has_bottom_space {
+            bottom_row.saturating_sub(1)
+        } else {
+            area.bottom().saturating_sub(1)
+        };
+        if start_y <= end_y {
+            for y in start_y..=end_y {
+                set_focus_cell(frame, left_col, y, '│', color);
+            }
+        }
+    }
+
+    if has_right_space {
+        let start_y = if has_top_space {
+            top_row.saturating_add(1)
+        } else {
+            area.y
+        };
+        let end_y = if has_bottom_space {
+            bottom_row.saturating_sub(1)
+        } else {
+            area.bottom().saturating_sub(1)
+        };
+        if start_y <= end_y {
+            for y in start_y..=end_y {
+                set_focus_cell(frame, right_col, y, '│', color);
+            }
+        }
+    }
+
+    if has_top_space && has_left_space {
+        set_focus_cell(frame, left_col, top_row, '┌', color);
+    }
+    if has_top_space && has_right_space {
+        set_focus_cell(frame, right_col, top_row, '┐', color);
+    }
+    if has_bottom_space && has_left_space {
+        set_focus_cell(frame, left_col, bottom_row, '└', color);
+    }
+    if has_bottom_space && has_right_space {
+        set_focus_cell(frame, right_col, bottom_row, '┘', color);
     }
 }
 
@@ -10200,6 +10275,28 @@ mod tests {
 
         model.update(MailMsg::SwitchScreen(MailScreenId::Search));
         assert!(model.help_visible);
+    }
+
+    #[test]
+    fn panel_focus_outline_is_clipped_to_content_bounds() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(20, 8, &mut pool);
+        let content = Rect::new(0, 1, 20, 6);
+        let focused = Rect::new(0, 1, 10, 6);
+
+        render_panel_focus_outline(content, focused, &mut frame);
+
+        for x in 0..20_u16 {
+            let top = frame.buffer.get(x, 0).expect("top row cell");
+            let bottom = frame.buffer.get(x, 7).expect("bottom row cell");
+            assert_eq!(top.content.as_char().unwrap_or(' '), ' ');
+            assert_eq!(bottom.content.as_char().unwrap_or(' '), ' ');
+        }
+
+        for y in 1..=6_u16 {
+            let cell = frame.buffer.get(10, y).expect("right outline");
+            assert_eq!(cell.content.as_char().unwrap_or(' '), '│');
+        }
     }
 
     #[test]
