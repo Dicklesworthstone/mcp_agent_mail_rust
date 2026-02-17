@@ -2056,7 +2056,6 @@ dependencies = [
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-index",
- "frankensearch-lexical",
  "frankensearch-rerank",
  "serde",
  "serde_json",
