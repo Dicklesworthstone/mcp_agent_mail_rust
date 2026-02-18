@@ -5494,8 +5494,8 @@ fn render_focus_hint(
     }
 }
 
-/// Minimum WCAG-like contrast ratio for readable TUI text.
-const MIN_TEXT_CONTRAST_RATIO: f64 = 3.0;
+/// Minimum contrast ratio for readable TUI text.
+const MIN_TEXT_CONTRAST_RATIO: f64 = 4.5;
 
 /// Normalize low-contrast rendered cells to readable theme-safe foreground colors.
 fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiThemePalette) {
@@ -5510,26 +5510,33 @@ fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiTheme
             if cell.is_continuation() {
                 continue;
             }
-            let Some(ch) = cell.content.as_char() else {
-                continue;
-            };
-            if ch.is_whitespace() {
+            if cell.content.as_char().is_some_and(char::is_whitespace) {
                 continue;
             }
 
-            let bg = if cell.bg.a() == 0 {
-                tp.bg_deep
-            } else {
-                cell.bg
-            };
             let fg = if cell.fg.a() == 0 {
                 tp.text_primary
             } else {
                 cell.fg
             };
+            let bg_candidates = if cell.bg.a() == 0 {
+                [tp.panel_bg, tp.bg_surface, tp.bg_deep]
+            } else {
+                [cell.bg, cell.bg, cell.bg]
+            };
 
-            if contrast_ratio(fg, bg) < MIN_TEXT_CONTRAST_RATIO {
-                cell.fg = best_readable_fg(bg, tp);
+            let mut worst_bg = bg_candidates[0];
+            let mut worst_ratio = contrast_ratio(fg, worst_bg);
+            for candidate in bg_candidates.into_iter().skip(1) {
+                let ratio = contrast_ratio(fg, candidate);
+                if ratio < worst_ratio {
+                    worst_ratio = ratio;
+                    worst_bg = candidate;
+                }
+            }
+
+            if worst_ratio < MIN_TEXT_CONTRAST_RATIO {
+                cell.fg = best_readable_fg(worst_bg, tp);
             }
         }
     }
@@ -5544,7 +5551,12 @@ fn best_readable_fg(bg: PackedRgba, tp: &crate::tui_theme::TuiThemePalette) -> P
     let candidates = [
         tp.text_primary,
         tp.text_secondary,
+        tp.text_muted,
+        tp.status_fg,
         tp.selection_fg,
+        tp.status_accent,
+        PackedRgba::rgb(0, 0, 0),
+        PackedRgba::rgb(255, 255, 255),
         fallback,
     ];
 
@@ -5814,6 +5826,31 @@ mod tests {
         assert!(
             contrast_ratio(fixed.fg, fixed.bg) >= MIN_TEXT_CONTRAST_RATIO,
             "contrast guard should enforce minimum readability"
+        );
+    }
+
+    #[test]
+    fn contrast_guard_handles_transparent_background_cells() {
+        let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(6, 2, &mut pool);
+
+        let mut unreadable = ftui::Cell::from_char('X');
+        unreadable.fg = PackedRgba::rgb(255, 255, 255);
+        unreadable.bg = PackedRgba::rgba(0, 0, 0, 0);
+        frame.buffer.set(1, 0, unreadable);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        apply_frame_contrast_guard(&mut frame, &tp);
+
+        let fixed = frame.buffer.get(1, 0).expect("cell exists after guard");
+        let worst_ratio = [tp.panel_bg, tp.bg_surface, tp.bg_deep]
+            .into_iter()
+            .map(|bg| contrast_ratio(fixed.fg, bg))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            worst_ratio >= MIN_TEXT_CONTRAST_RATIO,
+            "contrast guard should enforce minimum readability across transparent backgrounds"
         );
     }
 

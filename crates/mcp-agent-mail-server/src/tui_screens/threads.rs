@@ -2367,7 +2367,10 @@ fn render_thread_detail(
             header_lines.push(Line::from_spans([
                 Span::styled("Agents: ", crate::tui_theme::text_meta(&tp)),
                 Span::styled(
-                    truncate_display_width(&t.participant_names, inner.width.saturating_sub(8) as usize),
+                    truncate_display_width(
+                        &t.participant_names,
+                        inner.width.saturating_sub(8) as usize,
+                    ),
                     Style::default().fg(tp.text_secondary),
                 ),
             ]));

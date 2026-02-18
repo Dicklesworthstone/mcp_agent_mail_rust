@@ -670,6 +670,8 @@ impl RenderItem for SearchResultRow {
             ftui::widgets::paragraph::Paragraph::new(ftui::text::Text::from_lines(lines));
         if selected {
             para = para.style(cursor_style);
+        } else {
+            para = para.style(primary_style);
         }
         para.render(area, frame);
     }
@@ -3593,7 +3595,9 @@ fn render_results(
         if let Some(guide) = guidance {
             render_guidance(frame, inner, guide, &tp);
         } else {
-            Paragraph::new("  No results found.").render(inner, frame);
+            Paragraph::new("  No results found.")
+                .style(crate::tui_theme::text_hint(&tp))
+                .render(inner, frame);
         }
         return;
     }
@@ -3619,9 +3623,12 @@ fn render_results(
             total_matches,
             list_area.height,
         );
-        Paragraph::new(truncate_str(&summary, summary_area.width as usize))
-            .style(crate::tui_theme::text_hint(&tp))
-            .render(summary_area, frame);
+        Paragraph::new(truncate_display_width(
+            &summary,
+            summary_area.width as usize,
+        ))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(summary_area, frame);
 
         let density = rows
             .iter()
@@ -3643,7 +3650,7 @@ fn render_results(
 
     // Render using VirtualizedList for efficient scrolling
     let list = VirtualizedList::new(rows)
-        .style(Style::default())
+        .style(crate::tui_theme::text_primary(&tp))
         .highlight_style(
             Style::default()
                 .fg(tp.selection_fg)
@@ -3749,7 +3756,9 @@ fn render_guidance(
     }
 
     let text = Text::from_iter(lines);
-    Paragraph::new(text).render(area, frame);
+    Paragraph::new(text)
+        .style(crate::tui_theme::text_primary(tp))
+        .render(area, frame);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3796,7 +3805,9 @@ fn render_detail(
     };
 
     let Some(entry) = entry else {
-        Paragraph::new("Select a result to view details.").render(content_inner, frame);
+        Paragraph::new("Select a result to view details.")
+            .style(crate::tui_theme::text_hint(&tp))
+            .render(content_inner, frame);
         return;
     };
 
@@ -4049,6 +4060,7 @@ fn render_detail(
     let scroll_rows = u16::try_from(clamped_scroll).unwrap_or(u16::MAX);
 
     Paragraph::new(Text::from_lines(lines))
+        .style(crate::tui_theme::text_primary(&tp))
         .wrap(ftui::text::WrapMode::Word)
         .scroll((scroll_rows, 0))
         .render(content_area, frame);
