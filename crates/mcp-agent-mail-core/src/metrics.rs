@@ -1422,4 +1422,159 @@ mod tests {
         let json = serde_json::to_value(&snap).expect("should serialize");
         assert!(json.get("search").is_some());
     }
+
+    // ── Counter primitive ─────────────────────────────────────────────
+
+    #[test]
+    fn counter_store_and_load() {
+        let c = Counter::new();
+        assert_eq!(c.load(), 0);
+        c.store(42);
+        assert_eq!(c.load(), 42);
+        c.store(0);
+        assert_eq!(c.load(), 0);
+    }
+
+    #[test]
+    fn counter_inc_and_add() {
+        let c = Counter::new();
+        c.inc();
+        c.inc();
+        assert_eq!(c.load(), 2);
+        c.add(10);
+        assert_eq!(c.load(), 12);
+    }
+
+    // ── GaugeI64 primitive ────────────────────────────────────────────
+
+    #[test]
+    fn gauge_i64_add_set_load() {
+        let g = GaugeI64::new();
+        assert_eq!(g.load(), 0);
+        g.set(100);
+        assert_eq!(g.load(), 100);
+        g.add(-30);
+        assert_eq!(g.load(), 70);
+        g.add(5);
+        assert_eq!(g.load(), 75);
+    }
+
+    #[test]
+    fn gauge_i64_negative_values() {
+        let g = GaugeI64::new();
+        g.set(-50);
+        assert_eq!(g.load(), -50);
+        g.add(-10);
+        assert_eq!(g.load(), -60);
+    }
+
+    // ── GaugeU64 primitive ────────────────────────────────────────────
+
+    #[test]
+    fn gauge_u64_add() {
+        let g = GaugeU64::new();
+        g.add(5);
+        g.add(3);
+        assert_eq!(g.load(), 8);
+    }
+
+    #[test]
+    fn gauge_u64_fetch_max() {
+        let g = GaugeU64::new();
+        g.set(10);
+        g.fetch_max(5); // 5 < 10, no change
+        assert_eq!(g.load(), 10);
+        g.fetch_max(20); // 20 > 10, update
+        assert_eq!(g.load(), 20);
+        g.fetch_max(20); // equal, no change
+        assert_eq!(g.load(), 20);
+    }
+
+    // ── Log2Histogram reset ───────────────────────────────────────────
+
+    #[test]
+    fn histogram_reset_clears_all_state() {
+        let h = Log2Histogram::new();
+        h.record(100);
+        h.record(200);
+        h.record(300);
+        let snap = h.snapshot();
+        assert_eq!(snap.count, 3);
+
+        h.reset();
+        let snap2 = h.snapshot();
+        assert_eq!(snap2.count, 0);
+        assert_eq!(snap2.sum, 0);
+        assert_eq!(snap2.min, 0);
+        assert_eq!(snap2.max, 0);
+    }
+
+    // ── HttpMetrics record + snapshot ─────────────────────────────────
+
+    #[test]
+    fn http_metrics_record_response_and_snapshot() {
+        let m = HttpMetrics::default();
+        m.record_response(200, 1000);
+        m.record_response(201, 2000);
+        m.record_response(404, 500);
+        m.record_response(500, 3000);
+        m.record_response(302, 100); // not 2xx/4xx/5xx
+
+        let snap = m.snapshot();
+        assert_eq!(snap.requests_total, 5);
+        assert_eq!(snap.requests_2xx, 2);
+        assert_eq!(snap.requests_4xx, 1);
+        assert_eq!(snap.requests_5xx, 1);
+        assert_eq!(snap.latency_us.count, 5);
+    }
+
+    #[test]
+    fn http_metrics_inflight_tracking() {
+        let m = HttpMetrics::default();
+        m.requests_inflight.add(1);
+        m.requests_inflight.add(1);
+        m.requests_inflight.add(-1);
+        let snap = m.snapshot();
+        assert_eq!(snap.requests_inflight, 1);
+    }
+
+    // ── DbMetrics snapshot with utilization ───────────────────────────
+
+    #[test]
+    fn db_metrics_snapshot_utilization_pct() {
+        let m = DbMetrics::default();
+        m.pool_total_connections.set(100);
+        m.pool_active_connections.set(75);
+        let snap = m.snapshot();
+        assert_eq!(snap.pool_utilization_pct, 75);
+    }
+
+    #[test]
+    fn db_metrics_snapshot_utilization_zero_total() {
+        let m = DbMetrics::default();
+        // total_connections = 0 → no division by zero
+        let snap = m.snapshot();
+        assert_eq!(snap.pool_utilization_pct, 0);
+    }
+
+    // ── SystemMetrics snapshot ────────────────────────────────────────
+
+    #[test]
+    fn system_metrics_snapshot_round_trip() {
+        let m = SystemMetrics::default();
+        m.disk_storage_free_bytes.set(1_000_000);
+        m.disk_pressure_level.set(2);
+        let snap = m.snapshot();
+        assert_eq!(snap.disk_storage_free_bytes, 1_000_000);
+        assert_eq!(snap.disk_pressure_level, 2);
+    }
+
+    // ── global_metrics() singleton ────────────────────────────────────
+
+    #[test]
+    fn global_metrics_returns_consistent_reference() {
+        let gm1 = super::global_metrics();
+        let gm2 = super::global_metrics();
+        assert!(std::ptr::eq(gm1, gm2));
+    }
 }
