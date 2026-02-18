@@ -1510,4 +1510,205 @@ mod tests {
         assert!(prompt.contains(&format!("action-{last_included}")));
         assert!(!prompt.contains(&format!("action-{MAX_ACTIONS_PER_THREAD}")));
     }
+
+    // ── choose_best_available_model ─────────────────────────────────
+
+    #[test]
+    fn choose_best_model_passthrough_qualified_name() {
+        // Names with / or : are provider-qualified and pass through
+        assert_eq!(
+            choose_best_available_model("openai/gpt-4"),
+            "openai/gpt-4"
+        );
+        assert_eq!(
+            choose_best_available_model("anthropic:claude-3"),
+            "anthropic:claude-3"
+        );
+    }
+
+    #[test]
+    fn choose_best_model_returns_string() {
+        // Can't control env vars in tests, but the function must always
+        // return a non-empty string (either from env or DEFAULT_MODEL).
+        let result = choose_best_available_model("auto");
+        assert!(!result.is_empty());
+    }
+
+    // ── apply_multi_thread_thread_revisions ──────────────────────────
+
+    fn make_thread_entry(id: &str, kp: &[&str], actions: &[&str]) -> ThreadEntry {
+        ThreadEntry {
+            thread_id: id.to_string(),
+            summary: ThreadSummary {
+                participants: vec![],
+                key_points: kp.iter().map(|s| s.to_string()).collect(),
+                action_items: actions.iter().map(|s| s.to_string()).collect(),
+                total_messages: 0,
+                open_actions: 0,
+                done_actions: 0,
+                mentions: vec![],
+                code_references: None,
+            },
+        }
+    }
+
+    #[test]
+    fn apply_revisions_updates_matching_threads() {
+        let mut threads = vec![
+            make_thread_entry("T-1", &["old-kp"], &["old-action"]),
+            make_thread_entry("T-2", &["kp2"], &["action2"]),
+        ];
+        let llm_json = serde_json::json!({
+            "threads": [
+                {
+                    "thread_id": "T-1",
+                    "key_points": ["new-kp-1", "new-kp-2"],
+                    "actions": ["new-action"]
+                }
+            ]
+        });
+        apply_multi_thread_thread_revisions(&mut threads, &llm_json);
+        assert_eq!(threads[0].summary.key_points, vec!["new-kp-1", "new-kp-2"]);
+        assert_eq!(threads[0].summary.action_items, vec!["new-action"]);
+        // T-2 unchanged
+        assert_eq!(threads[1].summary.key_points, vec!["kp2"]);
+    }
+
+    #[test]
+    fn apply_revisions_no_threads_key_is_noop() {
+        let mut threads = vec![make_thread_entry("T-1", &["kp"], &["a"])];
+        let llm_json = serde_json::json!({ "something_else": true });
+        apply_multi_thread_thread_revisions(&mut threads, &llm_json);
+        assert_eq!(threads[0].summary.key_points, vec!["kp"]);
+    }
+
+    #[test]
+    fn apply_revisions_empty_threads_array_is_noop() {
+        let mut threads = vec![make_thread_entry("T-1", &["kp"], &["a"])];
+        let llm_json = serde_json::json!({ "threads": [] });
+        apply_multi_thread_thread_revisions(&mut threads, &llm_json);
+        assert_eq!(threads[0].summary.key_points, vec!["kp"]);
+    }
+
+    #[test]
+    fn apply_revisions_skips_entries_without_thread_id() {
+        let mut threads = vec![make_thread_entry("T-1", &["kp"], &["a"])];
+        let llm_json = serde_json::json!({
+            "threads": [
+                { "key_points": ["new"] }  // no thread_id
+            ]
+        });
+        apply_multi_thread_thread_revisions(&mut threads, &llm_json);
+        assert_eq!(threads[0].summary.key_points, vec!["kp"]);
+    }
+
+    #[test]
+    fn apply_revisions_empty_arrays_preserve_original() {
+        let mut threads = vec![make_thread_entry("T-1", &["kp"], &["action"])];
+        let llm_json = serde_json::json!({
+            "threads": [{
+                "thread_id": "T-1",
+                "key_points": [],
+                "actions": []
+            }]
+        });
+        apply_multi_thread_thread_revisions(&mut threads, &llm_json);
+        // Empty arrays don't overwrite existing data
+        assert_eq!(threads[0].summary.key_points, vec!["kp"]);
+        assert_eq!(threads[0].summary.action_items, vec!["action"]);
+    }
+
+    // ── merge_multi_thread_aggregate ────────────────────────────────
+
+    fn make_aggregate(kp: &[&str], actions: &[&str]) -> AggregateSummary {
+        AggregateSummary {
+            top_mentions: vec![],
+            key_points: kp.iter().map(|s| s.to_string()).collect(),
+            action_items: actions.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn merge_aggregate_overlays_key_points_and_actions() {
+        let heuristic = make_aggregate(&["old-kp"], &["old-action"]);
+        let llm_json = serde_json::json!({
+            "aggregate": {
+                "key_points": ["new-kp"],
+                "action_items": ["new-action"]
+            }
+        });
+        let result = merge_multi_thread_aggregate(&heuristic, &llm_json);
+        assert_eq!(result.key_points, vec!["new-kp"]);
+        assert_eq!(result.action_items, vec!["new-action"]);
+    }
+
+    #[test]
+    fn merge_aggregate_no_aggregate_key_preserves_heuristic() {
+        let heuristic = make_aggregate(&["kp"], &["action"]);
+        let llm_json = serde_json::json!({ "other": "data" });
+        let result = merge_multi_thread_aggregate(&heuristic, &llm_json);
+        assert_eq!(result.key_points, vec!["kp"]);
+        assert_eq!(result.action_items, vec!["action"]);
+    }
+
+    #[test]
+    fn merge_aggregate_top_mentions_as_strings() {
+        let heuristic = make_aggregate(&["kp"], &[]);
+        let llm_json = serde_json::json!({
+            "aggregate": {
+                "top_mentions": ["Alice", "Bob"]
+            }
+        });
+        let result = merge_multi_thread_aggregate(&heuristic, &llm_json);
+        assert_eq!(result.top_mentions.len(), 2);
+        match &result.top_mentions[0] {
+            TopMention::Name(n) => assert_eq!(n, "Alice"),
+            other => panic!("expected Name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_aggregate_top_mentions_as_objects() {
+        let heuristic = make_aggregate(&[], &[]);
+        let llm_json = serde_json::json!({
+            "aggregate": {
+                "top_mentions": [
+                    { "name": "Alice", "count": 5 },
+                    { "name": "Bob" }
+                ]
+            }
+        });
+        let result = merge_multi_thread_aggregate(&heuristic, &llm_json);
+        assert_eq!(result.top_mentions.len(), 2);
+        match &result.top_mentions[0] {
+            TopMention::Count(mc) => {
+                assert_eq!(mc.name, "Alice");
+                assert_eq!(mc.count, 5);
+            }
+            other => panic!("expected Count, got {other:?}"),
+        }
+        match &result.top_mentions[1] {
+            TopMention::Count(mc) => {
+                assert_eq!(mc.name, "Bob");
+                assert_eq!(mc.count, 0); // default when missing
+            }
+            other => panic!("expected Count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_aggregate_empty_arrays_preserve_heuristic() {
+        let heuristic = make_aggregate(&["kp"], &["action"]);
+        let llm_json = serde_json::json!({
+            "aggregate": {
+                "key_points": [],
+                "action_items": [],
+                "top_mentions": []
+            }
+        });
+        let result = merge_multi_thread_aggregate(&heuristic, &llm_json);
+        // Empty arrays don't overwrite
+        assert_eq!(result.key_points, vec!["kp"]);
+        assert_eq!(result.action_items, vec!["action"]);
+    }
 }
