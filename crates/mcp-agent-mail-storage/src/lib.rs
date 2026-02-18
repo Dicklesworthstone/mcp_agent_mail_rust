@@ -1776,12 +1776,11 @@ fn coalescer_pool_worker(
             while batch.len() < COALESCER_MAX_BATCH_SIZE {
                 let next = q.front();
                 if let Some(next_fields) = next {
-                    if let Some(first) = batch.first() {
-                        if next_fields.git_author_name != first.git_author_name
-                            || next_fields.git_author_email != first.git_author_email
-                        {
-                            break;
-                        }
+                    if let Some(first) = batch.first()
+                        && (next_fields.git_author_name != first.git_author_name
+                            || next_fields.git_author_email != first.git_author_email)
+                    {
+                        break;
                     }
                     batch.push(q.pop_front().unwrap());
                 } else {
@@ -2407,10 +2406,10 @@ pub fn commit_lock_path(repo_root: &Path, rel_paths: &[&str]) -> PathBuf {
         }
     }
 
-    if same_project {
-        if let Some(slug) = project_slug {
-            return repo_root.join("projects").join(slug).join(".commit.lock");
-        }
+    if same_project
+        && let Some(slug) = project_slug
+    {
+        return repo_root.join("projects").join(slug).join(".commit.lock");
     }
 
     repo_root.join(".commit.lock")
@@ -2510,73 +2509,72 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
     let owner_path = repo_root.join(".git").join("index.lock.owner");
     if let Ok(content) = fs::read_to_string(&owner_path) {
         let lines: Vec<&str> = content.lines().collect();
-        if let Some(pid_str) = lines.first() {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                let has_start_ticks_field = lines.get(2).is_some();
-                let owner_start_ticks = lines
-                    .get(2)
-                    .and_then(|line| line.trim().parse::<u64>().ok())
-                    .filter(|ticks| *ticks > 0);
-                if is_pid_alive(pid) {
-                    // If PID was recycled, the owner start-ticks will mismatch.
-                    // That means the lock is stale even though the PID exists now.
-                    if let Some(expected_ticks) = owner_start_ticks {
-                        if let Some(actual_ticks) = process_start_ticks(pid) {
-                            if actual_ticks != expected_ticks {
-                                tracing::info!(
-                                    "[git-lock] index.lock owner PID {pid} reused (start ticks mismatch), removing stale lock"
-                                );
-                                let _ = fs::remove_file(&lock_path);
-                                let _ = fs::remove_file(&owner_path);
-                                return true;
-                            }
-                        }
-                    }
+        if let Some(pid_str) = lines.first()
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+        {
+            let has_start_ticks_field = lines.get(2).is_some();
+            let owner_start_ticks = lines
+                .get(2)
+                .and_then(|line| line.trim().parse::<u64>().ok())
+                .filter(|ticks| *ticks > 0);
+            if is_pid_alive(pid) {
+                // If PID was recycled, the owner start-ticks will mismatch.
+                // That means the lock is stale even though the PID exists now.
+                if let Some(expected_ticks) = owner_start_ticks
+                    && let Some(actual_ticks) = process_start_ticks(pid)
+                    && actual_ticks != expected_ticks
+                {
+                    tracing::info!(
+                        "[git-lock] index.lock owner PID {pid} reused (start ticks mismatch), removing stale lock"
+                    );
+                    let _ = fs::remove_file(&lock_path);
+                    let _ = fs::remove_file(&owner_path);
+                    return true;
+                }
 
-                    // New-format owner files may carry "unknown" start ticks (e.g., non-Linux).
-                    // Be conservative: never remove an alive-PID lock in that case.
-                    if has_start_ticks_field {
-                        tracing::debug!(
-                            "[git-lock] index.lock held by alive PID {pid} (start ticks unavailable), not removing"
-                        );
-                        return false;
-                    }
-
-                    // Legacy owner files (no start-tick field) can stick forever on PID reuse.
-                    // If the lock is sufficiently old, treat as stale.
-                    if lock_file_age_seconds(&lock_path).is_some_and(|age| age > max_age_seconds) {
-                        tracing::info!(
-                            "[git-lock] legacy owner format with alive PID {pid} and stale age, removing lock"
-                        );
-                        let _ = fs::remove_file(&lock_path);
-                        let _ = fs::remove_file(&owner_path);
-                        return true;
-                    }
-
-                    tracing::debug!("[git-lock] index.lock held by alive PID {pid}, not removing");
+                // New-format owner files may carry "unknown" start ticks (e.g., non-Linux).
+                // Be conservative: never remove an alive-PID lock in that case.
+                if has_start_ticks_field {
+                    tracing::debug!(
+                        "[git-lock] index.lock held by alive PID {pid} (start ticks unavailable), not removing"
+                    );
                     return false;
                 }
-                // PID is dead — safe to remove lock
-                tracing::info!("[git-lock] index.lock held by dead PID {pid}, removing stale lock");
-                let _ = fs::remove_file(&lock_path);
-                let _ = fs::remove_file(&owner_path);
-                return true;
+
+                // Legacy owner files (no start-tick field) can stick forever on PID reuse.
+                // If the lock is sufficiently old, treat as stale.
+                if lock_file_age_seconds(&lock_path).is_some_and(|age| age > max_age_seconds) {
+                    tracing::info!(
+                        "[git-lock] legacy owner format with alive PID {pid} and stale age, removing lock"
+                    );
+                    let _ = fs::remove_file(&lock_path);
+                    let _ = fs::remove_file(&owner_path);
+                    return true;
+                }
+
+                tracing::debug!("[git-lock] index.lock held by alive PID {pid}, not removing");
+                return false;
             }
+            // PID is dead — safe to remove lock
+            tracing::info!("[git-lock] index.lock held by dead PID {pid}, removing stale lock");
+            let _ = fs::remove_file(&lock_path);
+            let _ = fs::remove_file(&owner_path);
+            return true;
         }
     }
 
     // No owner file or unparseable — fall back to age-based removal
     let age = lock_file_age_seconds(&lock_path);
 
-    if let Some(age) = age {
-        if age > max_age_seconds {
-            tracing::info!(
-                "[git-lock] removing stale index.lock (age={age:.1}s > {max_age_seconds}s)"
-            );
-            let _ = fs::remove_file(&lock_path);
-            let _ = fs::remove_file(&owner_path);
-            return true;
-        }
+    if let Some(age) = age
+        && age > max_age_seconds
+    {
+        tracing::info!(
+            "[git-lock] removing stale index.lock (age={age:.1}s > {max_age_seconds}s)"
+        );
+        let _ = fs::remove_file(&lock_path);
+        let _ = fs::remove_file(&owner_path);
+        return true;
     }
     false
 }
@@ -3317,12 +3315,12 @@ fn validate_repo_relative_path<'a>(kind: &str, raw: &'a str) -> Result<&'a str> 
     }
 
     let p = Path::new(s);
-    if let Some(Component::Normal(first)) = p.components().next() {
-        if first == ".git" {
-            return Err(StorageError::InvalidPath(format!(
-                "{kind} must not reference .git internals"
-            )));
-        }
+    if let Some(Component::Normal(first)) = p.components().next()
+        && first == ".git"
+    {
+        return Err(StorageError::InvalidPath(format!(
+            "{kind} must not reference .git internals"
+        )));
     }
 
     for c in p.components() {
@@ -3573,15 +3571,14 @@ fn parse_message_timestamp(message: &serde_json::Value) -> DateTime<Utc> {
             }
         }
     }
-    if let Some(serde_json::Value::Number(n)) = ts {
-        if let Some(raw) = n.as_i64() {
-            if raw > 0 {
-                let secs = raw / 1_000_000;
-                let micros = raw % 1_000_000;
-                if let Some(dt) = DateTime::from_timestamp(secs, (micros * 1000) as u32) {
-                    return dt;
-                }
-            }
+    if let Some(serde_json::Value::Number(n)) = ts
+        && let Some(raw) = n.as_i64()
+        && raw > 0
+    {
+        let secs = raw / 1_000_000;
+        let micros = raw % 1_000_000;
+        if let Some(dt) = DateTime::from_timestamp(secs, (micros * 1000) as u32) {
+            return dt;
         }
     }
 
@@ -4353,19 +4350,19 @@ pub fn emit_notification_signal(
         "agent": agent_name,
     });
 
-    if config.notifications_include_metadata {
-        if let Some(meta) = message_metadata {
-            let importance = meta
-                .importance
-                .clone()
-                .unwrap_or_else(|| "normal".to_string());
-            signal_data["message"] = serde_json::json!({
-                "id": meta.id,
-                "from": meta.from,
-                "subject": meta.subject,
-                "importance": importance,
-            });
-        }
+    if config.notifications_include_metadata
+        && let Some(meta) = message_metadata
+    {
+        let importance = meta
+            .importance
+            .clone()
+            .unwrap_or_else(|| "normal".to_string());
+        signal_data["message"] = serde_json::json!({
+            "id": meta.id,
+            "from": meta.from,
+            "subject": meta.subject,
+            "importance": importance,
+        });
     }
 
     write_json(&signal_path, &signal_data).is_ok()
@@ -4544,26 +4541,25 @@ fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix
         return tree_contains_prefix(&tree, path_prefix);
     }
 
-    if let Ok(parent) = commit.parent(0) {
-        if let Ok(parent_tree) = parent.tree() {
-            if let Ok(diff) = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None) {
-                let mut found = false;
-                let _ = diff.foreach(
-                    &mut |delta, _progress| {
-                        if let Some(p) = delta.new_file().path() {
-                            if p.to_string_lossy().starts_with(path_prefix) {
-                                found = true;
-                            }
-                        }
-                        true
-                    },
-                    None,
-                    None,
-                    None,
-                );
-                return found;
-            }
-        }
+    if let Ok(parent) = commit.parent(0)
+        && let Ok(parent_tree) = parent.tree()
+        && let Ok(diff) = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)
+    {
+        let mut found = false;
+        let _ = diff.foreach(
+            &mut |delta, _progress| {
+                if let Some(p) = delta.new_file().path()
+                    && p.to_string_lossy().starts_with(path_prefix)
+                {
+                    found = true;
+                }
+                true
+            },
+            None,
+            None,
+            None,
+        );
+        return found;
     }
 
     false
@@ -5248,99 +5244,98 @@ pub fn get_historical_inbox_snapshot(
     let commit = repo.find_commit(closest_oid)?;
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
-    if let Ok(root_tree) = commit.tree() {
-        if let Ok(inbox_entry) = root_tree.get_path(Path::new(&inbox_path)) {
-            if let Ok(inbox_tree) = repo.find_tree(inbox_entry.id()) {
-                let mut stack: Vec<(git2::Oid, usize)> = vec![(inbox_tree.id(), 0)];
-                while let Some((tree_oid, depth)) = stack.pop() {
-                    if messages.len() >= limit || depth > 3 {
-                        continue;
+    if let Ok(root_tree) = commit.tree()
+        && let Ok(inbox_entry) = root_tree.get_path(Path::new(&inbox_path))
+        && let Ok(inbox_tree) = repo.find_tree(inbox_entry.id())
+    {
+        let mut stack: Vec<(git2::Oid, usize)> = vec![(inbox_tree.id(), 0)];
+        while let Some((tree_oid, depth)) = stack.pop() {
+            if messages.len() >= limit || depth > 3 {
+                continue;
+            }
+
+            let tree = match repo.find_tree(tree_oid) {
+                Ok(tree) => tree,
+                Err(_) => continue,
+            };
+
+            for item in tree.iter() {
+                if messages.len() >= limit {
+                    break;
+                }
+
+                match item.kind() {
+                    Some(git2::ObjectType::Tree) if depth < 3 => {
+                        stack.push((item.id(), depth + 1));
                     }
-
-                    let tree = match repo.find_tree(tree_oid) {
-                        Ok(tree) => tree,
-                        Err(_) => continue,
-                    };
-
-                    for item in tree.iter() {
-                        if messages.len() >= limit {
-                            break;
+                    Some(git2::ObjectType::Blob) => {
+                        let Some(name) = item.name() else {
+                            continue;
+                        };
+                        if !name.ends_with(".md") {
+                            continue;
                         }
 
-                        match item.kind() {
-                            Some(git2::ObjectType::Tree) if depth < 3 => {
-                                stack.push((item.id(), depth + 1));
-                            }
-                            Some(git2::ObjectType::Blob) => {
-                                let Some(name) = item.name() else {
-                                    continue;
-                                };
-                                if !name.ends_with(".md") {
-                                    continue;
-                                }
+                        let mut from_agent = "unknown".to_string();
+                        let mut importance = "normal".to_string();
 
-                                let mut from_agent = "unknown".to_string();
-                                let mut importance = "normal".to_string();
+                        let filename = name.strip_suffix(".md").unwrap_or(name);
+                        let parts: Vec<&str> = filename.rsplitn(3, "__").collect();
+                        let (date_str, subject_slug, msg_id) = match parts.as_slice() {
+                            [id, subject, date] => (*date, *subject, *id),
+                            [subject, date] => (*date, *subject, "unknown"),
+                            _ => continue,
+                        };
 
-                                let filename = name.strip_suffix(".md").unwrap_or(name);
-                                let parts: Vec<&str> = filename.rsplitn(3, "__").collect();
-                                let (date_str, subject_slug, msg_id) = match parts.as_slice() {
-                                    [id, subject, date] => (*date, *subject, *id),
-                                    [subject, date] => (*date, *subject, "unknown"),
-                                    _ => continue,
-                                };
+                        let mut subject =
+                            subject_slug.replace(['-', '_'], " ").trim().to_string();
+                        if subject.is_empty() {
+                            subject = "Unknown".to_string();
+                        }
 
-                                let mut subject =
-                                    subject_slug.replace(['-', '_'], " ").trim().to_string();
-                                if subject.is_empty() {
-                                    subject = "Unknown".to_string();
-                                }
-
-                                if let Ok(blob) = repo.find_blob(item.id()) {
-                                    let blob_content =
-                                        String::from_utf8_lossy(blob.content()).to_string();
-                                    if let Some(rest) = blob_content.strip_prefix("---json\n") {
-                                        if let Some(end_idx) = rest.find("\n---\n") {
-                                            let json_str = &rest[..end_idx];
-                                            if let Ok(meta) =
-                                                serde_json::from_str::<serde_json::Value>(json_str)
-                                            {
-                                                if let Some(from) = meta
-                                                    .get("from")
-                                                    .and_then(serde_json::Value::as_str)
-                                                {
-                                                    from_agent = from.to_string();
-                                                }
-                                                if let Some(imp) = meta
-                                                    .get("importance")
-                                                    .and_then(serde_json::Value::as_str)
-                                                {
-                                                    importance = imp.to_string();
-                                                }
-                                                if let Some(subj) = meta
-                                                    .get("subject")
-                                                    .and_then(serde_json::Value::as_str)
-                                                    .map(str::trim)
-                                                    .filter(|s| !s.is_empty())
-                                                {
-                                                    subject = subj.to_string();
-                                                }
-                                            }
-                                        }
+                        if let Ok(blob) = repo.find_blob(item.id()) {
+                            let blob_content =
+                                String::from_utf8_lossy(blob.content()).to_string();
+                            if let Some(rest) = blob_content.strip_prefix("---json\n")
+                                && let Some(end_idx) = rest.find("\n---\n")
+                            {
+                                let json_str = &rest[..end_idx];
+                                if let Ok(meta) =
+                                    serde_json::from_str::<serde_json::Value>(json_str)
+                                {
+                                    if let Some(from) = meta
+                                        .get("from")
+                                        .and_then(serde_json::Value::as_str)
+                                    {
+                                        from_agent = from.to_string();
+                                    }
+                                    if let Some(imp) = meta
+                                        .get("importance")
+                                        .and_then(serde_json::Value::as_str)
+                                    {
+                                        importance = imp.to_string();
+                                    }
+                                    if let Some(subj) = meta
+                                        .get("subject")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        subject = subj.to_string();
                                     }
                                 }
-
-                                messages.push(serde_json::json!({
-                                    "id": msg_id,
-                                    "subject": subject,
-                                    "date": date_str,
-                                    "from": from_agent,
-                                    "importance": importance,
-                                }));
                             }
-                            _ => {}
                         }
+
+                        messages.push(serde_json::json!({
+                            "id": msg_id,
+                            "subject": subject,
+                            "date": date_str,
+                            "from": from_agent,
+                            "importance": importance,
+                        }));
                     }
+                    _ => {}
                 }
             }
         }
@@ -5578,13 +5573,13 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
     let content = fs::read_to_string(path)?;
 
     // Parse ---json frontmatter
-    if let Some(rest) = content.strip_prefix("---json\n") {
-        if let Some(end_idx) = rest.find("\n---\n") {
-            let json_str = &rest[..end_idx];
-            let body = rest[end_idx + 5..].trim().to_string();
-            let frontmatter = serde_json::from_str(json_str)?;
-            return Ok((frontmatter, body));
-        }
+    if let Some(rest) = content.strip_prefix("---json\n")
+        && let Some(end_idx) = rest.find("\n---\n")
+    {
+        let json_str = &rest[..end_idx];
+        let body = rest[end_idx + 5..].trim().to_string();
+        let frontmatter = serde_json::from_str(json_str)?;
+        return Ok((frontmatter, body));
     }
 
     // No frontmatter - treat entire content as body
@@ -5655,10 +5650,10 @@ pub fn list_archive_agents(archive: &ProjectArchive) -> Result<Vec<String>> {
         let entry = entry?;
         if entry.path().is_dir() {
             let profile = entry.path().join("profile.json");
-            if profile.exists() {
-                if let Some(name) = entry.file_name().to_str() {
-                    agents.push(name.to_string());
-                }
+            if profile.exists()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                agents.push(name.to_string());
             }
         }
     }
@@ -5688,10 +5683,10 @@ pub fn read_agent_profile(
 /// Check if a tree has any entry with the given path prefix.
 fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &str) -> bool {
     for entry in tree.iter() {
-        if let Some(name) = entry.name() {
-            if name.starts_with(prefix) || prefix.starts_with(name) {
-                return true;
-            }
+        if let Some(name) = entry.name()
+            && (name.starts_with(prefix) || prefix.starts_with(name))
+        {
+            return true;
         }
     }
     false
@@ -5736,12 +5731,11 @@ pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
 
                 // Check for owner metadata (read directly — avoids TOCTOU with exists())
                 let owner_path = path.with_extension("lock.owner.json");
-                if let Ok(content) = fs::read_to_string(&owner_path) {
-                    if let Ok(owner) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(obj) = locks.last_mut().and_then(|v| v.as_object_mut()) {
-                            obj.insert("owner".to_string(), owner);
-                        }
-                    }
+                if let Ok(content) = fs::read_to_string(&owner_path)
+                    && let Ok(owner) = serde_json::from_str::<serde_json::Value>(&content)
+                    && let Some(obj) = locks.last_mut().and_then(|v| v.as_object_mut())
+                {
+                    obj.insert("owner".to_string(), owner);
                 }
             }
         }
@@ -5949,23 +5943,21 @@ fn append_trailers(message: &str) -> String {
 
     let mut trailers = Vec::new();
 
-    if message.starts_with("mail: ") && !has_agent {
-        if let Some(rest) = message.strip_prefix("mail: ") {
-            if let Some(agent_part) = rest.split("->").next() {
-                let agent = agent_part.trim();
-                if !agent.is_empty() {
-                    trailers.push(format!("Agent: {agent}"));
-                }
-            }
+    if message.starts_with("mail: ") && !has_agent
+        && let Some(rest) = message.strip_prefix("mail: ")
+        && let Some(agent_part) = rest.split("->").next()
+    {
+        let agent = agent_part.trim();
+        if !agent.is_empty() {
+            trailers.push(format!("Agent: {agent}"));
         }
-    } else if message.starts_with("file_reservation: ") && !has_agent {
-        if let Some(rest) = message.strip_prefix("file_reservation: ") {
-            if let Some(agent_part) = rest.split_whitespace().next() {
-                let agent = agent_part.trim();
-                if !agent.is_empty() {
-                    trailers.push(format!("Agent: {agent}"));
-                }
-            }
+    } else if message.starts_with("file_reservation: ") && !has_agent
+        && let Some(rest) = message.strip_prefix("file_reservation: ")
+        && let Some(agent_part) = rest.split_whitespace().next()
+    {
+        let agent = agent_part.trim();
+        if !agent.is_empty() {
+            trailers.push(format!("Agent: {agent}"));
         }
     }
 
@@ -10382,5 +10374,185 @@ mod tests {
              final={final_val} anomalies={anomalies}"
         );
         assert_eq!(anomalies, 0, "no anomalous counter values detected");
+    }
+
+    // -----------------------------------------------------------------------
+    // now_iso() format tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn now_iso_returns_rfc3339_format() {
+        let ts = now_iso();
+        // Must be parseable back as RFC 3339
+        chrono::DateTime::parse_from_rfc3339(&ts)
+            .expect("now_iso() should return valid RFC 3339");
+        // Should contain the year, 'T' separator, and timezone offset
+        assert!(ts.len() >= 20, "timestamp too short: {ts}");
+        assert!(ts.contains('T'), "missing T separator: {ts}");
+    }
+
+    // -----------------------------------------------------------------------
+    // list_message_files tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_message_files_nonexistent_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("does_not_exist");
+        let files = list_message_files(&nonexistent).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn list_message_files_empty_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = list_message_files(dir.path()).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn list_message_files_finds_md_files_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create .md files at multiple levels
+        fs::write(dir.path().join("a.md"), "first").unwrap();
+        let sub = dir.path().join("2026").join("02");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("b.md"), "second").unwrap();
+        // Non-.md file should be excluded
+        fs::write(dir.path().join("c.txt"), "skip").unwrap();
+
+        let files = list_message_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 2, "expected 2 .md files, got {}", files.len());
+        // All returned paths should end in .md
+        for f in &files {
+            assert!(f.extension().is_some_and(|e| e == "md"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_attachment_source_path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_attachment_source_path_empty_string_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let result = resolve_attachment_source_path(dir.path(), &config, "");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("empty"),
+            "error should mention 'empty': {err_msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_attachment_source_path_relative_inside_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        fs::write(dir.path().join("photo.png"), b"img").unwrap();
+        let resolved = resolve_attachment_source_path(dir.path(), &config, "photo.png").unwrap();
+        assert!(resolved.ends_with("photo.png"));
+    }
+
+    #[test]
+    fn resolve_attachment_source_path_traversal_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        // Create a file outside the base dir
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "data").unwrap();
+        // Attempt traversal
+        let result =
+            resolve_attachment_source_path(dir.path(), &config, "../outside/secret.txt");
+        // This should either not find the file or reject the traversal
+        assert!(result.is_err(), "path traversal should be rejected");
+    }
+
+    #[test]
+    fn resolve_attachment_source_path_nonexistent_file_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let result = resolve_attachment_source_path(dir.path(), &config, "no_such_file.txt");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("not found"),
+            "error should mention 'not found': {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_browse_path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_browse_path_rejects_traversal_variants() {
+        assert!(sanitize_browse_path("..").is_err());
+        assert!(sanitize_browse_path("../etc/passwd").is_err());
+        assert!(sanitize_browse_path("foo/../../../etc").is_err());
+        assert!(sanitize_browse_path("/absolute/path").is_err());
+        assert!(sanitize_browse_path("foo/..").is_err());
+    }
+
+    #[test]
+    fn sanitize_browse_path_allows_valid_paths() {
+        assert_eq!(sanitize_browse_path("messages").unwrap(), "messages");
+        assert_eq!(
+            sanitize_browse_path("messages/2026/02").unwrap(),
+            "messages/2026/02"
+        );
+        assert_eq!(sanitize_browse_path("").unwrap(), "");
+    }
+
+    #[test]
+    fn sanitize_browse_path_normalizes_backslashes() {
+        assert_eq!(
+            sanitize_browse_path("messages\\2026\\02").unwrap(),
+            "messages/2026/02"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_archive_consistency edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn consistency_invalid_timestamp_counted_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: "proj".into(),
+            message_id: 1,
+            sender_name: "Agent".into(),
+            subject: "test".into(),
+            created_ts_iso: "not-a-timestamp".into(),
+        }];
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![1]);
+    }
+
+    #[test]
+    fn consistency_missing_ids_capped_at_20() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs: Vec<ConsistencyMessageRef> = (1..=30)
+            .map(|i| ConsistencyMessageRef {
+                project_slug: "proj".into(),
+                message_id: i,
+                sender_name: "Agent".into(),
+                subject: format!("msg-{i}"),
+                created_ts_iso: format!("2026-01-{:02}T00:00:00+00:00", (i % 28) + 1),
+            })
+            .collect();
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 30);
+        assert_eq!(report.missing, 30);
+        assert_eq!(
+            report.missing_ids.len(),
+            20,
+            "missing_ids should be capped at 20"
+        );
     }
 }
