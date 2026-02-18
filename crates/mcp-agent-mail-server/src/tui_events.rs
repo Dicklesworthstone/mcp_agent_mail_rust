@@ -1619,20 +1619,18 @@ impl RenderItem for TimelineRow {
         // Build the line: [seq] [timestamp] [icon] [summary]
         let seq_str = format!("{:>6}", self.seq);
         let severity_style = self.severity.style();
+        let tp = crate::tui_theme::TuiThemePalette::current();
 
         let base_style = if selected {
-            Style::default().bg(ftui::PackedRgba::rgb(50, 50, 80))
+            Style::default().bg(tp.selection_bg)
         } else {
             Style::default()
         };
 
         let line = Line::from_spans([
-            Span::styled(seq_str, base_style.fg(PackedRgba::rgb(100, 100, 120))),
+            Span::styled(seq_str, base_style.fg(tp.text_muted)),
             Span::raw(" "),
-            Span::styled(
-                &self.timestamp,
-                base_style.fg(PackedRgba::rgb(140, 140, 160)),
-            ),
+            Span::styled(&self.timestamp, base_style.fg(tp.text_secondary)),
             Span::raw(" "),
             Span::styled(self.icon.to_string(), severity_style),
             Span::raw(" "),
@@ -1801,41 +1799,30 @@ impl RenderItem for MessageRow {
             return;
         }
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let base_style = if selected {
-            Style::default().bg(PackedRgba::rgb(50, 50, 80))
+            Style::default().bg(tp.selection_bg)
         } else {
             Style::default()
         };
 
         // Importance badge
         let importance_style = match self.importance.as_str() {
-            "urgent" => Style::default().fg(PackedRgba::rgb(255, 100, 100)).bold(),
-            "high" => Style::default().fg(PackedRgba::rgb(255, 184, 108)),
-            _ => Style::default().fg(PackedRgba::rgb(100, 100, 120)),
+            "urgent" => Style::default().fg(tp.severity_critical).bold(),
+            "high" => Style::default().fg(tp.severity_warn),
+            _ => Style::default().fg(tp.text_muted),
         };
 
         let ack_indicator = if self.ack_required { "◉" } else { " " };
 
         let line = Line::from_spans([
-            Span::styled(
-                ack_indicator,
-                Style::default().fg(PackedRgba::rgb(255, 200, 100)),
-            ),
+            Span::styled(ack_indicator, Style::default().fg(tp.severity_warn)),
             Span::raw(" "),
-            Span::styled(
-                &self.timestamp,
-                base_style.fg(PackedRgba::rgb(140, 140, 160)),
-            ),
+            Span::styled(&self.timestamp, base_style.fg(tp.text_secondary)),
             Span::raw(" "),
-            Span::styled(
-                &self.from_agent,
-                base_style.fg(PackedRgba::rgb(100, 200, 230)),
-            ),
+            Span::styled(&self.from_agent, base_style.fg(tp.status_accent)),
             Span::raw(" → "),
-            Span::styled(
-                &self.to_agents,
-                base_style.fg(PackedRgba::rgb(120, 220, 150)),
-            ),
+            Span::styled(&self.to_agents, base_style.fg(tp.status_good)),
             Span::raw(" "),
             Span::styled(&self.importance, importance_style),
             Span::raw(" "),
@@ -1880,8 +1867,9 @@ impl RenderItem for SearchHitRow {
             return;
         }
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let base_style = if selected {
-            Style::default().bg(PackedRgba::rgb(50, 50, 80))
+            Style::default().bg(tp.selection_bg)
         } else {
             Style::default()
         };
@@ -1889,13 +1877,13 @@ impl RenderItem for SearchHitRow {
         let score_str = format!("{:.1}", self.score);
 
         let line = Line::from_spans([
-            Span::styled(&score_str, base_style.fg(PackedRgba::rgb(100, 200, 230))),
+            Span::styled(&score_str, base_style.fg(tp.status_accent)),
             Span::raw(" "),
-            Span::styled(&self.from, base_style.fg(PackedRgba::rgb(140, 180, 220))),
+            Span::styled(&self.from, base_style.fg(tp.text_secondary)),
             Span::raw(": "),
             Span::styled(&self.subject, base_style.bold()),
             Span::raw(" — "),
-            Span::styled(&self.snippet, base_style.fg(PackedRgba::rgb(160, 160, 160))),
+            Span::styled(&self.snippet, base_style.fg(tp.text_muted)),
         ]);
 
         let paragraph = ftui::widgets::paragraph::Paragraph::new(line);
@@ -1938,32 +1926,27 @@ impl RenderItem for ExplorerRow {
             return;
         }
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let base_style = if selected {
-            Style::default().bg(PackedRgba::rgb(50, 50, 80))
+            Style::default().bg(tp.selection_bg)
         } else {
             Style::default()
         };
 
         let direction_style = if self.direction == '↑' {
-            Style::default().fg(PackedRgba::rgb(100, 200, 100))
+            Style::default().fg(tp.status_good)
         } else {
-            Style::default().fg(PackedRgba::rgb(100, 150, 230))
+            Style::default().fg(tp.status_accent)
         };
 
         let line = Line::from_spans([
             Span::styled(self.direction.to_string(), direction_style),
             Span::raw(" "),
-            Span::styled(&self.date, base_style.fg(PackedRgba::rgb(140, 140, 160))),
+            Span::styled(&self.date, base_style.fg(tp.text_secondary)),
             Span::raw(" "),
-            Span::styled(
-                &self.primary_agent,
-                base_style.fg(PackedRgba::rgb(100, 200, 230)),
-            ),
+            Span::styled(&self.primary_agent, base_style.fg(tp.status_accent)),
             Span::raw(" → "),
-            Span::styled(
-                &self.secondary_agent,
-                base_style.fg(PackedRgba::rgb(120, 220, 150)),
-            ),
+            Span::styled(&self.secondary_agent, base_style.fg(tp.status_good)),
             Span::raw(" "),
             Span::styled(&self.subject, base_style),
         ]);

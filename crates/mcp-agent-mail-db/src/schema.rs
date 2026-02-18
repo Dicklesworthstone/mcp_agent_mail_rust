@@ -232,8 +232,9 @@ PRAGMA journal_mode = DELETE;
 
 /// Per-connection PRAGMAs (safe to run on every new connection).
 ///
-/// IMPORTANT: `busy_timeout` must be first so lock waits apply to any
-/// subsequent PRAGMA that may need a write lock.
+/// IMPORTANT: `foreign_keys = OFF` must come first to override the
+/// `SQLITE_DEFAULT_FOREIGN_KEYS` compile-time default before any DML.
+/// `busy_timeout` comes next so lock waits apply to subsequent PRAGMAs.
 pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;

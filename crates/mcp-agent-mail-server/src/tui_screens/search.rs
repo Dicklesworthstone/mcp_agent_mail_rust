@@ -47,7 +47,7 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 const MAX_RESULTS: usize = 200;
 
 /// Debounce delay in ticks for search-as-you-type.
-const DEBOUNCE_TICKS: u8 = 1;
+const DEBOUNCE_TICKS: u8 = 2;
 const SEARCH_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
 const SEARCH_STACKED_WIDTH_THRESHOLD: u16 = 60;
 const SEARCH_STACKED_MIN_HEIGHT: u16 = 12;
@@ -538,6 +538,8 @@ struct SearchResultRow {
     entry: ResultEntry,
     /// Cached highlight terms for rendering (shared across all rows).
     highlight_terms: Arc<Vec<QueryTerm>>,
+    /// Lowercased positive needles cached once per result refresh.
+    highlight_needles: Arc<Vec<String>>,
     /// Sort direction for displaying score or date.
     sort_direction: SortDirection,
 }
@@ -620,7 +622,7 @@ impl RenderItem for SearchResultRow {
 
         let prefix_len = spans
             .iter()
-            .map(|s| s.as_str().chars().count())
+            .map(|s| ftui::text::display_width(s.as_str()))
             .sum::<usize>();
         let remaining = w.saturating_sub(prefix_len);
         let title = truncate_str(&self.entry.title, remaining);
@@ -631,9 +633,9 @@ impl RenderItem for SearchResultRow {
         if self.highlight_terms.is_empty() {
             spans.push(Span::styled(title, primary_style));
         } else {
-            spans.extend(highlight_spans(
+            spans.extend(highlight_spans_with_needles(
                 &title,
-                &self.highlight_terms,
+                &self.highlight_needles,
                 Some(primary_style),
                 highlight_style,
             ));
@@ -650,12 +652,12 @@ impl RenderItem for SearchResultRow {
             && !snippet_source.is_empty();
         if show_context_line {
             let context_prefix = "  ↳ ";
-            let snippet_width = w.saturating_sub(context_prefix.chars().count());
+            let snippet_width = w.saturating_sub(ftui::text::display_width(context_prefix));
             let snippet = truncate_str(snippet_source, snippet_width);
             let mut context_spans = vec![Span::styled(context_prefix, meta_style)];
-            context_spans.extend(highlight_spans(
+            context_spans.extend(highlight_spans_with_needles(
                 &snippet,
-                &self.highlight_terms,
+                &self.highlight_needles,
                 Some(crate::tui_theme::text_hint(&tp)),
                 highlight_style,
             ));
@@ -671,7 +673,9 @@ impl RenderItem for SearchResultRow {
     }
 
     fn height(&self) -> u16 {
-        if self.entry.doc_kind == DocKind::Message && !self.entry.context_snippet.is_empty() {
+        if self.entry.doc_kind == DocKind::Message
+            && (!self.entry.context_snippet.is_empty() || !self.entry.body_preview.is_empty())
+        {
             2
         } else {
             1
@@ -789,6 +793,16 @@ fn extract_query_terms(raw: &str) -> Vec<QueryTerm> {
     terms
 }
 
+fn build_highlight_needles(terms: &[QueryTerm]) -> Vec<String> {
+    terms
+        .iter()
+        .filter(|t| !t.negated)
+        .map(|t| t.text.to_ascii_lowercase())
+        .filter(|t| t.len() >= 2)
+        .take(MAX_HIGHLIGHT_TERMS)
+        .collect()
+}
+
 fn clamp_to_char_boundary(s: &str, mut idx: usize) -> usize {
     idx = idx.min(s.len());
     while idx > 0 && !s.is_char_boundary(idx) {
@@ -845,13 +859,16 @@ fn highlight_spans(
     base_style: Option<Style>,
     highlight_style: Style,
 ) -> Vec<Span<'static>> {
-    let needles: Vec<String> = terms
-        .iter()
-        .filter(|t| !t.negated)
-        .map(|t| t.text.to_ascii_lowercase())
-        .filter(|t| t.len() >= 2)
-        .take(MAX_HIGHLIGHT_TERMS)
-        .collect();
+    let needles = build_highlight_needles(terms);
+    highlight_spans_with_needles(text, &needles, base_style, highlight_style)
+}
+
+fn highlight_spans_with_needles(
+    text: &str,
+    needles: &[String],
+    base_style: Option<Style>,
+    highlight_style: Style,
+) -> Vec<Span<'static>> {
     if needles.is_empty() {
         return vec![base_style.map_or_else(
             || Span::raw(text.to_string()),
@@ -864,8 +881,8 @@ fn highlight_spans(
     let mut i = 0usize;
     while i < text.len() {
         let mut best: Option<(usize, usize)> = None;
-        for needle in &needles {
-            if let Some(rel) = hay[i..].find(needle) {
+        for needle in needles {
+            if let Some(rel) = hay[i..].find(needle.as_str()) {
                 let start = i + rel;
                 let end = start + needle.len();
                 best = match best {
@@ -1107,6 +1124,7 @@ impl SearchCockpitScreen {
 
     fn rebuild_result_rows(&mut self) {
         let shared_terms = Arc::new(self.highlight_terms.clone());
+        let shared_needles = Arc::new(build_highlight_needles(shared_terms.as_slice()));
         self.result_rows = self
             .results
             .iter()
@@ -1114,6 +1132,7 @@ impl SearchCockpitScreen {
             .map(|entry| SearchResultRow {
                 entry,
                 highlight_terms: Arc::clone(&shared_terms),
+                highlight_needles: Arc::clone(&shared_needles),
                 sort_direction: self.sort_direction,
             })
             .collect();
@@ -2589,6 +2608,7 @@ fn query_message_rows(
                     let body_md: String = row.get_named("body_md").unwrap_or_default();
                     // Keep row extraction lightweight: defer rich markdown rendering to detail view.
                     let subject_text = collapse_whitespace(&subject);
+                    let body_lines = markdown_to_searchable_lines(&body_md);
                     let body_text = markdown_to_searchable_plain(&body_md);
                     let subject_match_count = count_term_matches(&subject_text, highlight_terms);
                     let body_match_count = count_term_matches(&body_text, highlight_terms);
@@ -2597,7 +2617,11 @@ fn query_message_rows(
                     let mut preview = if highlight_terms.is_empty() {
                         truncate_str(&body_text, 120)
                     } else if body_match_count > 0 {
-                        extract_snippet(&body_text, highlight_terms, MAX_SNIPPET_CHARS)
+                        extract_context_snippet_from_lines(
+                            &body_lines,
+                            highlight_terms,
+                            MAX_SNIPPET_CHARS,
+                        )
                     } else if subject_match_count > 0 {
                         let subject_snippet =
                             extract_snippet(&subject_text, highlight_terms, MAX_SNIPPET_CHARS);
@@ -2608,10 +2632,20 @@ fn query_message_rows(
                     if preview.is_empty() {
                         preview = truncate_str(&subject_text, 120);
                     }
-                    let body_preview = if body_text.is_empty() {
+                    let body_preview_source = if body_lines.is_empty() {
+                        body_text
+                    } else {
+                        body_lines
+                            .iter()
+                            .take(6)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" ⟫ ")
+                    };
+                    let body_preview = if body_preview_source.is_empty() {
                         truncate_str(&subject_text, 320)
                     } else {
-                        truncate_str(&body_text, 320)
+                        truncate_str(&body_preview_source, 320)
                     };
 
                     Some(ResultEntry {
@@ -2742,24 +2776,86 @@ fn collapse_whitespace(s: &str) -> String {
     out
 }
 
-fn markdown_to_searchable_plain(markdown: &str) -> String {
+fn markdown_to_searchable_lines(markdown: &str) -> Vec<String> {
     if markdown.trim().is_empty() {
-        return String::new();
+        return Vec::new();
     }
-    let mut raw = String::new();
+    let mut lines = Vec::new();
     for line in markdown.lines() {
-        // Remove leading markdown decoration while preserving sentence content.
+        // Remove common markdown decoration while preserving semantic content.
         let stripped = line
             .trim_start_matches(['#', '>', '-', '*', '+', '|', '`'])
+            .trim()
+            .trim_matches('|')
             .trim();
-        if !stripped.is_empty() {
-            if !raw.is_empty() {
-                raw.push(' ');
-            }
-            raw.push_str(stripped);
+        if stripped.is_empty() {
+            continue;
+        }
+        // Ignore GFM table separator lines like |---|:---:|.
+        if stripped
+            .chars()
+            .all(|c| matches!(c, '-' | ':' | '|') || c.is_whitespace())
+        {
+            continue;
+        }
+        let collapsed = collapse_whitespace(stripped);
+        if !collapsed.is_empty() {
+            lines.push(collapsed);
         }
     }
-    collapse_whitespace(&raw)
+    lines
+}
+
+fn markdown_to_searchable_plain(markdown: &str) -> String {
+    let lines = markdown_to_searchable_lines(markdown);
+    collapse_whitespace(&lines.join(" "))
+}
+
+fn extract_context_snippet_from_lines(
+    lines: &[String],
+    terms: &[QueryTerm],
+    max_chars: usize,
+) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let needles = build_highlight_needles(terms);
+    let match_line_idx = if needles.is_empty() {
+        None
+    } else {
+        lines.iter().position(|line| {
+            let hay = line.to_ascii_lowercase();
+            needles.iter().any(|needle| hay.contains(needle))
+        })
+    };
+
+    let snippet = match_line_idx.map_or_else(
+        || {
+            lines
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ⟫ ")
+        },
+        |hit_idx| {
+            let start = hit_idx.saturating_sub(1);
+            let end = (hit_idx + 2).min(lines.len());
+            let segments = lines[start..end]
+                .iter()
+                .filter(|line| !line.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            if segments.is_empty() {
+                String::new()
+            } else {
+                segments.join(" ⟫ ")
+            }
+        },
+    );
+
+    truncate_str(snippet.trim(), max_chars)
 }
 
 fn count_term_matches(text: &str, terms: &[QueryTerm]) -> usize {
@@ -3735,15 +3831,40 @@ fn render_detail(
             format!("{} matches", entry.match_count)
         };
         lines.push(styled_field("Matches:    ", match_label));
-        let mut snippet_spans: Vec<Span<'static>> = Vec::new();
-        snippet_spans.push(Span::styled("Snippet:    ".to_string(), label_style));
-        snippet_spans.extend(highlight_spans(
-            &entry.context_snippet,
-            highlight_terms,
-            Some(value_style),
-            highlight_style,
-        ));
-        lines.push(Line::from_spans(snippet_spans));
+        let context_segments = entry
+            .context_snippet
+            .split(" ⟫ ")
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if context_segments.is_empty() {
+            let mut snippet_spans: Vec<Span<'static>> = Vec::new();
+            snippet_spans.push(Span::styled("Context:    ".to_string(), label_style));
+            snippet_spans.extend(highlight_spans(
+                &entry.context_snippet,
+                highlight_terms,
+                Some(value_style),
+                highlight_style,
+            ));
+            lines.push(Line::from_spans(snippet_spans));
+        } else {
+            for (idx, segment) in context_segments.iter().enumerate() {
+                let mut snippet_spans: Vec<Span<'static>> = Vec::new();
+                let label = if idx == 0 {
+                    "Context:    "
+                } else {
+                    "            "
+                };
+                snippet_spans.push(Span::styled(label.to_string(), label_style));
+                snippet_spans.extend(highlight_spans(
+                    segment,
+                    highlight_terms,
+                    Some(value_style),
+                    highlight_style,
+                ));
+                lines.push(Line::from_spans(snippet_spans));
+            }
+        }
     }
 
     // Explain section: reason codes and score factors (when populated).
@@ -5403,6 +5524,7 @@ mod tests {
         let row = SearchResultRow {
             entry,
             highlight_terms: Arc::new(Vec::new()),
+            highlight_needles: Arc::new(Vec::new()),
             sort_direction: SortDirection::NewestFirst,
         };
         let mut pool = ftui::GraphemePool::new();

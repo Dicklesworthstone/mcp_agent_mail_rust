@@ -5,7 +5,8 @@
 //! by pressing `.` (period).
 
 use ftui::layout::Rect;
-use ftui::{Cell, Event, Frame, KeyCode, KeyEventKind, PackedRgba};
+use ftui::text::display_width;
+use ftui::{Cell, Event, Frame, KeyCode, KeyEventKind};
 
 use crate::tui_screens::{DeepLinkTarget, MailScreenId};
 
@@ -202,16 +203,6 @@ pub struct ActionMenu<'a> {
     state: &'a ActionMenuState,
 }
 
-/// Colors for action menu rendering.
-const ACTION_MENU_BG: PackedRgba = PackedRgba::rgb(30, 30, 35);
-const ACTION_MENU_BORDER: PackedRgba = PackedRgba::rgb(80, 80, 100);
-const ACTION_MENU_SELECTED_BG: PackedRgba = PackedRgba::rgb(60, 80, 120);
-const ACTION_MENU_DESTRUCTIVE: PackedRgba = PackedRgba::rgb(255, 100, 100);
-const ACTION_MENU_DISABLED_FG: PackedRgba = PackedRgba::rgb(100, 100, 110);
-const ACTION_MENU_DISABLED_REASON: PackedRgba = PackedRgba::rgb(80, 80, 90);
-#[allow(dead_code)] // Reserved for future use when rendering keybinding hints
-const ACTION_MENU_KEYBINDING: PackedRgba = PackedRgba::rgb(150, 150, 180);
-
 impl<'a> ActionMenu<'a> {
     /// Create a new action menu widget.
     #[must_use]
@@ -225,6 +216,15 @@ impl<'a> ActionMenu<'a> {
         if self.state.is_empty() {
             return;
         }
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let action_menu_bg = tp.panel_bg;
+        let action_menu_border = tp.panel_border;
+        let row_highlight_bg = tp.selection_bg;
+        let row_focus_fg = tp.selection_fg;
+        let action_menu_destructive = tp.severity_critical;
+        let action_menu_disabled_fg = tp.text_disabled;
+        let action_menu_disabled_reason = tp.text_muted;
+        let action_menu_normal_fg = tp.text_primary;
 
         // Calculate menu dimensions
         let max_label_len = self
@@ -232,9 +232,13 @@ impl<'a> ActionMenu<'a> {
             .entries
             .iter()
             .map(|e| {
-                let mut w = e.label.len() + e.keybinding.as_ref().map_or(0, |k| k.len() + 3);
+                let mut w = display_width(&e.label)
+                    + e.keybinding.as_ref().map_or(0, |k| display_width(k) + 3);
                 if !e.enabled {
-                    w += e.disabled_reason.as_ref().map_or(0, |r| r.len() + 2);
+                    w += e
+                        .disabled_reason
+                        .as_ref()
+                        .map_or(0, |r| display_width(r) + 2);
                 }
                 w
             })
@@ -255,7 +259,7 @@ impl<'a> ActionMenu<'a> {
         for row in area.y..area.bottom() {
             for col in area.x..area.right() {
                 let mut cell = Cell::from_char(' ');
-                cell.bg = ACTION_MENU_BG;
+                cell.bg = action_menu_bg;
                 frame.buffer.set_fast(col, row, cell);
             }
         }
@@ -283,7 +287,7 @@ impl<'a> ActionMenu<'a> {
                 text.push(']');
             }
             // Append disabled reason as dimmed suffix.
-            let label_len = text.len();
+            let label_char_count = text.chars().count();
             if !entry.enabled {
                 if let Some(ref reason) = entry.disabled_reason {
                     text.push_str("  ");
@@ -300,34 +304,34 @@ impl<'a> ActionMenu<'a> {
                 let mut cell = Cell::from_char(ch);
                 if !entry.enabled {
                     // Disabled: dimmed text; reason part even dimmer.
-                    cell.fg = if j >= label_len {
-                        ACTION_MENU_DISABLED_REASON
+                    cell.fg = if j >= label_char_count {
+                        action_menu_disabled_reason
                     } else {
-                        ACTION_MENU_DISABLED_FG
+                        action_menu_disabled_fg
                     };
                 } else if entry.is_destructive {
-                    cell.fg = ACTION_MENU_DESTRUCTIVE;
+                    cell.fg = action_menu_destructive;
                 } else if is_selected {
-                    cell.fg = PackedRgba::rgb(255, 255, 255);
+                    cell.fg = row_focus_fg;
                 } else {
-                    cell.fg = PackedRgba::rgb(200, 200, 200);
+                    cell.fg = action_menu_normal_fg;
                 }
                 if is_selected {
-                    cell.bg = ACTION_MENU_SELECTED_BG;
+                    cell.bg = row_highlight_bg;
                 } else {
-                    cell.bg = ACTION_MENU_BG;
+                    cell.bg = action_menu_bg;
                 }
                 frame.buffer.set_fast(col, row, cell);
             }
 
             // Fill rest of line with background
-            let text_len = text.len() as u16;
+            let text_len = u16::try_from(display_width(&text)).unwrap_or(inner.width);
             for col in (inner.x + text_len)..inner.right() {
                 let mut cell = Cell::from_char(' ');
                 if is_selected {
-                    cell.bg = ACTION_MENU_SELECTED_BG;
+                    cell.bg = row_highlight_bg;
                 } else {
-                    cell.bg = ACTION_MENU_BG;
+                    cell.bg = action_menu_bg;
                 }
                 frame.buffer.set_fast(col, row, cell);
             }
@@ -336,8 +340,8 @@ impl<'a> ActionMenu<'a> {
         // Draw border - helper to create a border cell
         let border_cell = |ch: char| -> Cell {
             let mut cell = Cell::from_char(ch);
-            cell.fg = ACTION_MENU_BORDER;
-            cell.bg = ACTION_MENU_BG;
+            cell.fg = action_menu_border;
+            cell.bg = action_menu_bg;
             cell
         };
 
@@ -379,7 +383,10 @@ impl<'a> ActionMenu<'a> {
         for (i, ch) in title.chars().enumerate() {
             let col = title_x + i as u16;
             if col < area.right().saturating_sub(1) {
-                frame.buffer.set_fast(col, area.y, border_cell(ch));
+                let mut cell = Cell::from_char(ch);
+                cell.fg = tp.panel_title_fg;
+                cell.bg = action_menu_bg;
+                frame.buffer.set_fast(col, area.y, cell);
             }
         }
     }

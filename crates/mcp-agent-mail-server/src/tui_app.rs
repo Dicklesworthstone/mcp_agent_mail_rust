@@ -3898,6 +3898,10 @@ impl Model for MailAppModel {
             );
         }
 
+        // Final readability guard: normalize low-contrast cells so every
+        // visible glyph remains legible across all themes (especially light).
+        apply_frame_contrast_guard(frame, &tp);
+
         // Keep an exportable snapshot of the last fully rendered frame.
         self.last_export_snapshot
             .borrow_mut()
@@ -5490,6 +5494,104 @@ fn render_focus_hint(
     }
 }
 
+/// Minimum WCAG-like contrast ratio for readable TUI text.
+const MIN_TEXT_CONTRAST_RATIO: f64 = 3.0;
+
+/// Normalize low-contrast rendered cells to readable theme-safe foreground colors.
+fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiThemePalette) {
+    let height = frame.buffer.height();
+    let width = frame.buffer.width();
+
+    for y in 0..height {
+        for x in 0..width {
+            let Some(cell) = frame.buffer.get_mut(x, y) else {
+                continue;
+            };
+            if cell.is_continuation() {
+                continue;
+            }
+            let Some(ch) = cell.content.as_char() else {
+                continue;
+            };
+            if ch.is_whitespace() {
+                continue;
+            }
+
+            let bg = if cell.bg.a() == 0 {
+                tp.bg_deep
+            } else {
+                cell.bg
+            };
+            let fg = if cell.fg.a() == 0 {
+                tp.text_primary
+            } else {
+                cell.fg
+            };
+
+            if contrast_ratio(fg, bg) < MIN_TEXT_CONTRAST_RATIO {
+                cell.fg = best_readable_fg(bg, tp);
+            }
+        }
+    }
+}
+
+fn best_readable_fg(bg: PackedRgba, tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
+    let fallback = if perceived_luma(bg) >= 128 {
+        PackedRgba::rgb(0, 0, 0)
+    } else {
+        PackedRgba::rgb(255, 255, 255)
+    };
+    let candidates = [
+        tp.text_primary,
+        tp.text_secondary,
+        tp.selection_fg,
+        fallback,
+    ];
+
+    let mut best = candidates[0];
+    let mut best_ratio = contrast_ratio(best, bg);
+    for candidate in candidates.into_iter().skip(1) {
+        let ratio = contrast_ratio(candidate, bg);
+        if ratio > best_ratio {
+            best = candidate;
+            best_ratio = ratio;
+        }
+    }
+    best
+}
+
+fn perceived_luma(color: PackedRgba) -> u8 {
+    let y = 299_u32
+        .saturating_mul(u32::from(color.r()))
+        .saturating_add(587_u32.saturating_mul(u32::from(color.g())))
+        .saturating_add(114_u32.saturating_mul(u32::from(color.b())));
+    let luma = (y + 500) / 1000;
+    u8::try_from(luma).unwrap_or(u8::MAX)
+}
+
+fn srgb_channel_to_linear(c: u8) -> f64 {
+    let cs = f64::from(c) / 255.0;
+    if cs <= 0.04045 {
+        cs / 12.92
+    } else {
+        ((cs + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn rel_luminance(c: PackedRgba) -> f64 {
+    let r = srgb_channel_to_linear(c.r());
+    let g = srgb_channel_to_linear(c.g());
+    let b = srgb_channel_to_linear(c.b());
+    0.2126_f64.mul_add(r, 0.7152_f64.mul_add(g, 0.0722 * b))
+}
+
+fn contrast_ratio(fg: PackedRgba, bg: PackedRgba) -> f64 {
+    let l1 = rel_luminance(fg);
+    let l2 = rel_luminance(bg);
+    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 fn extract_tool_name(event: &MailEvent) -> Option<&str> {
     match event {
         MailEvent::ToolCallStart { tool_name, .. } | MailEvent::ToolCallEnd { tool_name, .. } => {
@@ -5692,6 +5794,45 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn contrast_guard_fixes_white_on_white_cells() {
+        let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(6, 2, &mut pool);
+
+        let mut unreadable = ftui::Cell::from_char('X');
+        unreadable.fg = PackedRgba::rgb(255, 255, 255);
+        unreadable.bg = PackedRgba::rgb(255, 255, 255);
+        frame.buffer.set(1, 0, unreadable);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        apply_frame_contrast_guard(&mut frame, &tp);
+
+        let fixed = frame.buffer.get(1, 0).expect("cell exists after guard");
+        assert!(
+            contrast_ratio(fixed.fg, fixed.bg) >= MIN_TEXT_CONTRAST_RATIO,
+            "contrast guard should enforce minimum readability"
+        );
+    }
+
+    #[test]
+    fn contrast_guard_ignores_whitespace_cells() {
+        let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(4, 2, &mut pool);
+
+        let mut space = ftui::Cell::from_char(' ');
+        space.fg = PackedRgba::rgb(255, 255, 255);
+        space.bg = PackedRgba::rgb(255, 255, 255);
+        frame.buffer.set(0, 0, space);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        apply_frame_contrast_guard(&mut frame, &tp);
+
+        let result = frame.buffer.get(0, 0).expect("space cell exists");
+        assert_eq!(result.fg, PackedRgba::rgb(255, 255, 255));
     }
 
     #[test]

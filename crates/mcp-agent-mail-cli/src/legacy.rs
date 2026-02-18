@@ -647,9 +647,21 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
             source_db.display()
         )));
     }
+    if !source_db.is_file() {
+        return Err(CliError::InvalidArgument(format!(
+            "source DB must be a file path: {}",
+            source_db.display()
+        )));
+    }
     if !source_storage.exists() {
         return Err(CliError::InvalidArgument(format!(
             "source storage root missing: {}",
+            source_storage.display()
+        )));
+    }
+    if !source_storage.is_dir() {
+        return Err(CliError::InvalidArgument(format!(
+            "source storage root must be a directory: {}",
             source_storage.display()
         )));
     }
@@ -703,6 +715,12 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         return Err(CliError::InvalidArgument(
             "copy mode requires target storage root different from source storage root".to_string(),
         ));
+    }
+    if mode == ImportMode::Copy && target_storage.exists() && !target_storage.is_dir() {
+        return Err(CliError::InvalidArgument(format!(
+            "copy mode requires target storage root to be a directory path: {}",
+            target_storage.display()
+        )));
     }
     if mode == ImportMode::Copy && paths_overlap(&source_storage, &target_storage) {
         return Err(CliError::InvalidArgument(
@@ -1095,11 +1113,13 @@ fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
         return None;
     }
     let map = read_env_file_map(&env_file);
-    let db = map.get("DATABASE_URL")?;
-    let storage = map.get("STORAGE_ROOT");
-    if db.contains("sqlite+aiosqlite:///")
-        || storage.is_some_and(|v| v.contains(".mcp_agent_mail_git_mailbox_repo"))
-    {
+    let legacy_db = map
+        .get("DATABASE_URL")
+        .is_some_and(|value| value.contains("sqlite+aiosqlite:///"));
+    let legacy_storage = map
+        .get("STORAGE_ROOT")
+        .is_some_and(|value| value.contains(".mcp_agent_mail_git_mailbox_repo"));
+    if legacy_db || legacy_storage {
         return Some(LegacyMarker {
             id: "legacy_env_defaults".to_string(),
             severity: MarkerSeverity::High,
@@ -1350,10 +1370,18 @@ fn read_env_file_map(path: &Path) -> BTreeMap<String, String> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let Some((k, v)) = trimmed.split_once('=') else {
+        let kv_line = trimmed
+            .strip_prefix("export")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        let Some((k, v)) = kv_line.split_once('=') else {
             continue;
         };
         let key = k.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
         let mut val = v.trim().to_string();
         if ((val.starts_with('"') && val.ends_with('"'))
             || (val.starts_with('\'') && val.ends_with('\'')))
@@ -1509,6 +1537,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
         let entry = entry?;
         let path = entry.path();
         let target = dst.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            if path.is_dir() {
+                return Err(CliError::InvalidArgument(format!(
+                    "symlinked directories are not supported during recursive copy: {}",
+                    path.display()
+                )));
+            }
+            if !path.is_file() {
+                return Err(CliError::InvalidArgument(format!(
+                    "broken symlink encountered during recursive copy: {}",
+                    path.display()
+                )));
+            }
+        }
         if path.is_dir() {
             copy_dir_recursive(&path, &target)?;
         } else if path.is_file() {
@@ -1582,6 +1625,41 @@ mod tests {
         assert_eq!(
             map.get("STORAGE_ROOT").unwrap(),
             "~/.mcp_agent_mail_git_mailbox_repo"
+        );
+    }
+
+    #[test]
+    fn read_env_file_map_parses_export_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = tmp.path().join(".env");
+        fs::write(
+            &env,
+            "export DATABASE_URL=sqlite+aiosqlite:///./storage.sqlite3\nexport STORAGE_ROOT=~/mailbox\n",
+        )
+        .unwrap();
+
+        let map = read_env_file_map(&env);
+        assert_eq!(
+            map.get("DATABASE_URL").unwrap(),
+            "sqlite+aiosqlite:///./storage.sqlite3"
+        );
+        assert_eq!(map.get("STORAGE_ROOT").unwrap(), "~/mailbox");
+    }
+
+    #[test]
+    fn read_env_file_map_parses_export_with_tabs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = tmp.path().join(".env");
+        fs::write(
+            &env,
+            "export\tDATABASE_URL=sqlite+aiosqlite:///./tabbed.sqlite3\n",
+        )
+        .unwrap();
+
+        let map = read_env_file_map(&env);
+        assert_eq!(
+            map.get("DATABASE_URL").unwrap(),
+            "sqlite+aiosqlite:///./tabbed.sqlite3"
         );
     }
 
@@ -1721,6 +1799,68 @@ mod tests {
     }
 
     #[test]
+    fn build_import_plan_rejects_source_db_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_db_dir = tmp.path().join("legacy.sqlite3");
+        let source_storage = tmp.path().join("legacy-storage");
+        fs::create_dir_all(&source_db_dir).unwrap();
+        fs::create_dir_all(&source_storage).unwrap();
+
+        let err = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(tmp.path().to_path_buf()),
+            db: Some(source_db_dir.clone()),
+            storage_root: Some(source_storage),
+            in_place: true,
+            copy: false,
+            target_db: None,
+            target_storage_root: None,
+            dry_run: true,
+            yes: true,
+        })
+        .unwrap_err();
+
+        match err {
+            CliError::InvalidArgument(msg) => {
+                assert!(msg.contains("source DB must be a file path"));
+                assert!(msg.contains(&source_db_dir.display().to_string()));
+            }
+            other => panic!("expected invalid argument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_import_plan_rejects_source_storage_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_db = tmp.path().join("legacy.sqlite3");
+        let source_storage_file = tmp.path().join("legacy-storage");
+        fs::write(&source_db, b"sqlite").unwrap();
+        fs::write(&source_storage_file, b"not-a-directory").unwrap();
+
+        let err = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(tmp.path().to_path_buf()),
+            db: Some(source_db),
+            storage_root: Some(source_storage_file.clone()),
+            in_place: true,
+            copy: false,
+            target_db: None,
+            target_storage_root: None,
+            dry_run: true,
+            yes: true,
+        })
+        .unwrap_err();
+
+        match err {
+            CliError::InvalidArgument(msg) => {
+                assert!(msg.contains("source storage root must be a directory"));
+                assert!(msg.contains(&source_storage_file.display().to_string()));
+            }
+            other => panic!("expected invalid argument, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_import_plan_copy_rejects_existing_target_db() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("legacy.sqlite3");
@@ -1748,6 +1888,39 @@ mod tests {
             CliError::InvalidArgument(msg) => {
                 assert!(msg.contains("target DB path that does not already exist"));
                 assert!(msg.contains(&target_db.display().to_string()));
+            }
+            other => panic!("expected invalid argument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_import_plan_copy_rejects_target_storage_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("legacy.sqlite3");
+        let storage = tmp.path().join("legacy-storage");
+        let target_storage_file = tmp.path().join("target-storage");
+        fs::write(&db, b"sqlite").unwrap();
+        fs::create_dir_all(&storage).unwrap();
+        fs::write(&target_storage_file, b"not-a-directory").unwrap();
+
+        let err = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(tmp.path().to_path_buf()),
+            db: Some(db),
+            storage_root: Some(storage),
+            in_place: false,
+            copy: true,
+            target_db: Some(tmp.path().join("target.sqlite3")),
+            target_storage_root: Some(target_storage_file.clone()),
+            dry_run: true,
+            yes: true,
+        })
+        .unwrap_err();
+
+        match err {
+            CliError::InvalidArgument(msg) => {
+                assert!(msg.contains("target storage root to be a directory path"));
+                assert!(msg.contains(&target_storage_file.display().to_string()));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
@@ -1799,6 +1972,23 @@ mod tests {
                 .markers
                 .iter()
                 .any(|marker| marker.id == "pyproject_package")
+        );
+    }
+
+    #[test]
+    fn build_detect_report_marks_legacy_storage_only_env_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".env"),
+            "STORAGE_ROOT=~/.mcp_agent_mail_git_mailbox_repo\n",
+        )
+        .unwrap();
+        let report = build_detect_report(tmp.path(), None, None).unwrap();
+        assert!(
+            report
+                .markers
+                .iter()
+                .any(|marker| marker.id == "legacy_env_defaults")
         );
     }
 
@@ -1974,5 +2164,47 @@ mod tests {
             .and_then(|r| r.get_named::<i64>("c").ok())
             .unwrap_or(0);
         assert_eq!(trigger_count, 0, "legacy FTS triggers should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_rejects_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let nested = src.join("nested");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("file.txt"), "payload").unwrap();
+        symlink(&nested, src.join("nested-link")).unwrap();
+
+        let err = copy_dir_recursive(&src, &dst).unwrap_err();
+        match err {
+            CliError::InvalidArgument(msg) => {
+                assert!(msg.contains("symlinked directories are not supported"));
+            }
+            other => panic!("expected invalid argument, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_rejects_broken_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        symlink("/does/not/exist", src.join("broken-link")).unwrap();
+
+        let err = copy_dir_recursive(&src, &dst).unwrap_err();
+        match err {
+            CliError::InvalidArgument(msg) => {
+                assert!(msg.contains("broken symlink encountered"));
+            }
+            other => panic!("expected invalid argument, got {other:?}"),
+        }
     }
 }

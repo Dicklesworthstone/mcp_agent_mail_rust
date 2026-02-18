@@ -41,7 +41,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::error::SearchResult;
-use crate::fastembed::{FastEmbedEmbedder, get_quality_embedder};
+#[cfg(feature = "quality-fastembed")]
+use crate::fastembed::get_quality_embedder;
 use crate::fs_bridge::{FsEmbedderStack, SyncEmbedderAdapter};
 use crate::metrics::TwoTierInitMetrics;
 use crate::model2vec::{Model2VecEmbedder, get_fast_embedder};
@@ -98,6 +99,71 @@ pub struct EmbedderInfo {
     pub dimension: usize,
 }
 
+#[cfg(feature = "quality-fastembed")]
+const QUALITY_INSTALL_HINT: &str = "pip install fastembed && python -c \"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')\"";
+#[cfg(not(feature = "quality-fastembed"))]
+const QUALITY_INSTALL_HINT: &str =
+    "quality tier disabled at compile time; build with feature \"quality-fastembed\"";
+
+#[cfg(feature = "quality-fastembed")]
+fn current_quality_embedder_info() -> Option<EmbedderInfo> {
+    get_quality_embedder().map(|e| EmbedderInfo {
+        id: e.id().to_string(),
+        dimension: e.dimension(),
+    })
+}
+
+#[cfg(not(feature = "quality-fastembed"))]
+fn current_quality_embedder_info() -> Option<EmbedderInfo> {
+    None
+}
+
+#[cfg(feature = "quality-fastembed")]
+fn quality_embedder_available() -> bool {
+    get_quality_embedder().is_some()
+}
+
+#[cfg(not(feature = "quality-fastembed"))]
+const fn quality_embedder_available() -> bool {
+    false
+}
+
+#[cfg(feature = "quality-fastembed")]
+fn embed_quality_query(query: &str) -> SearchResult<Vec<f32>> {
+    get_quality_embedder()
+        .ok_or_else(|| {
+            crate::error::SearchError::ModeUnavailable("quality embedder unavailable".into())
+        })?
+        .embed(query)
+}
+
+#[cfg(not(feature = "quality-fastembed"))]
+fn embed_quality_query(_query: &str) -> SearchResult<Vec<f32>> {
+    Err(crate::error::SearchError::ModeUnavailable(
+        "quality embedder unavailable".into(),
+    ))
+}
+
+#[cfg(feature = "quality-fastembed")]
+fn quality_embedder_dimension() -> usize {
+    get_quality_embedder().map_or(384, crate::fastembed::FastEmbedEmbedder::dimension)
+}
+
+#[cfg(not(feature = "quality-fastembed"))]
+const fn quality_embedder_dimension() -> usize {
+    384
+}
+
+#[cfg(feature = "quality-fastembed")]
+fn quality_embedder_id() -> &'static str {
+    get_quality_embedder().map_or("unavailable", |e| e.id())
+}
+
+#[cfg(not(feature = "quality-fastembed"))]
+const fn quality_embedder_id() -> &'static str {
+    "unavailable"
+}
+
 impl TwoTierContext {
     /// Initialize the context, detecting available embedders.
     fn init() -> Self {
@@ -113,10 +179,10 @@ impl TwoTierContext {
         let has_fast = fast_embedder.is_some();
 
         let quality_start = Instant::now();
-        let quality_embedder = get_quality_embedder();
+        let quality_info = current_quality_embedder_info();
         #[allow(clippy::cast_possible_truncation)]
         let quality_embedder_load_ms = quality_start.elapsed().as_millis() as u64;
-        let has_quality = quality_embedder.is_some();
+        let has_quality = quality_info.is_some();
 
         let availability = match (has_fast, has_quality) {
             (true, true) => TwoTierAvailability::Full,
@@ -126,11 +192,6 @@ impl TwoTierContext {
         };
 
         let fast_info = fast_embedder.map(|e| EmbedderInfo {
-            id: e.id().to_string(),
-            dimension: e.dimension(),
-        });
-
-        let quality_info = quality_embedder.map(|e| EmbedderInfo {
             id: e.id().to_string(),
             dimension: e.dimension(),
         });
@@ -177,7 +238,7 @@ impl TwoTierContext {
                     fast_model = ?fast_info.as_ref().map(|i| &i.id),
                     fast_embedder_load_ms,
                     quality_embedder_load_ms,
-                    install_hint = "pip install fastembed && python -c \"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')\"",
+                    install_hint = QUALITY_INSTALL_HINT,
                     "Two-tier search initialized in FAST-ONLY mode; install MiniLM-L6-v2 to enable quality refinement"
                 );
             }
@@ -271,8 +332,7 @@ impl TwoTierContext {
             return None;
         };
 
-        let quality: Option<Arc<dyn frankensearch::Embedder>> = if get_quality_embedder().is_some()
-        {
+        let quality: Option<Arc<dyn frankensearch::Embedder>> = if quality_embedder_available() {
             Some(Arc::new(SyncEmbedderAdapter::quality(Arc::new(
                 QualityEmbedderWrapper,
             ))))
@@ -293,8 +353,7 @@ impl TwoTierContext {
             None => return None,
         };
 
-        let quality_embedder: Option<Arc<dyn TwoTierEmbedder>> = if get_quality_embedder().is_some()
-        {
+        let quality_embedder: Option<Arc<dyn TwoTierEmbedder>> = if quality_embedder_available() {
             Some(Arc::new(QualityEmbedderWrapper))
         } else {
             None
@@ -327,11 +386,7 @@ impl TwoTierContext {
     ///
     /// Returns an error if the quality embedder is unavailable.
     pub fn embed_quality(&self, query: &str) -> SearchResult<Vec<f32>> {
-        get_quality_embedder()
-            .ok_or_else(|| {
-                crate::error::SearchError::ModeUnavailable("quality embedder unavailable".into())
-            })?
-            .embed(query)
+        embed_quality_query(query)
     }
 }
 
@@ -365,19 +420,15 @@ struct QualityEmbedderWrapper;
 
 impl TwoTierEmbedder for QualityEmbedderWrapper {
     fn embed(&self, text: &str) -> SearchResult<Vec<f32>> {
-        get_quality_embedder()
-            .ok_or_else(|| {
-                crate::error::SearchError::ModeUnavailable("quality embedder unavailable".into())
-            })?
-            .embed(text)
+        embed_quality_query(text)
     }
 
     fn dimension(&self) -> usize {
-        get_quality_embedder().map_or(384, FastEmbedEmbedder::dimension)
+        quality_embedder_dimension()
     }
 
     fn id(&self) -> &str {
-        get_quality_embedder().map_or("unavailable", |e| e.id())
+        quality_embedder_id()
     }
 }
 

@@ -54,6 +54,7 @@ const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
 const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
 const MESSAGE_DRAG_HOLD_DELAY: Duration = Duration::from_millis(200);
 const THREAD_SPLIT_WIDTH_THRESHOLD: u16 = 80;
+const THREAD_MAIN_PANE_GAP_THRESHOLD: u16 = 84;
 const THREAD_STACKED_MIN_HEIGHT: u16 = 14;
 const THREAD_STACKED_LIST_PERCENT: u16 = 42;
 const THREAD_COMPACT_HINT_MIN_HEIGHT: u16 = 7;
@@ -1356,7 +1357,7 @@ impl MailScreen for ThreadExplorerScreen {
 
         // Wide: split content (list left, detail right).
         if content_area.width >= THREAD_SPLIT_WIDTH_THRESHOLD {
-            let pane_gap = u16::from(content_area.width >= 96);
+            let pane_gap = u16::from(content_area.width >= THREAD_MAIN_PANE_GAP_THRESHOLD);
             let available_width = content_area.width.saturating_sub(pane_gap);
             let list_width = available_width * 40 / 100;
             let detail_width = available_width.saturating_sub(list_width);
@@ -1977,11 +1978,21 @@ fn render_thread_list(
     // Clear interior cells each frame to avoid stale glyphs from previous layouts.
     clear_rect(frame, inner, tp.panel_bg);
 
-    let visible_height = inner.height as usize;
+    let content_inner = if inner.width > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        )
+    } else {
+        inner
+    };
+    let visible_height = content_inner.height as usize;
 
     if threads.is_empty() {
         let p = Paragraph::new("  No threads found.");
-        p.render(inner, frame);
+        p.render(content_inner, frame);
         return;
     }
 
@@ -1991,7 +2002,7 @@ fn render_thread_list(
     let (start, end) = viewport_range(total, visible_height, cursor_clamped);
     let viewport = &threads[start..end];
 
-    let inner_w = inner.width as usize;
+    let inner_w = content_inner.width as usize;
     let show_subject = visible_height > viewport.len() * 2 || viewport.len() <= 5;
     let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len() * 2);
     for (view_idx, thread) in viewport.iter().enumerate() {
@@ -2023,24 +2034,6 @@ fn render_thread_list(
             Style::default()
         };
 
-        // Unread badge
-        let unread_span = if thread.unread_count > 0 {
-            Span::styled(
-                format!(" {}", thread.unread_count),
-                crate::tui_theme::text_accent(&tp),
-            )
-        } else {
-            Span::raw("")
-        };
-        let moving_span = if keyboard_marked_source {
-            Span::styled(
-                " [MOVING]",
-                Style::default().fg(tp.selection_indicator).bold(),
-            )
-        } else {
-            Span::raw("")
-        };
-
         // Compact timestamp (HH:MM from ISO string)
         let time_short = if thread.last_timestamp_iso.len() >= 16 {
             &thread.last_timestamp_iso[11..16]
@@ -2048,24 +2041,30 @@ fn render_thread_list(
             &thread.last_timestamp_iso
         };
 
-        // Project tag (shortened)
-        let proj_span = if thread.project_slug.is_empty() {
-            Span::raw("")
+        let project_text = if thread.project_slug.is_empty() {
+            String::new()
         } else {
-            Span::styled(
-                format!("[{}] ", truncate_str(&thread.project_slug, 12)),
-                crate::tui_theme::text_meta(&tp),
-            )
+            format!("[{}] ", truncate_display_width(&thread.project_slug, 12))
+        };
+        let unread_text = if thread.unread_count > 0 {
+            format!(" {}", thread.unread_count)
+        } else {
+            String::new()
+        };
+        let moving_text = if keyboard_marked_source {
+            " [MOVING]".to_string()
+        } else {
+            String::new()
         };
 
         // Lens-specific metadata
-        let meta = match view_lens {
+        let mut meta_text = match view_lens {
             ViewLens::Activity => format!(
                 "{}m  {}a  {:.1}/hr",
                 thread.message_count, thread.participant_count, thread.velocity_msg_per_hr,
             ),
             ViewLens::Participants => {
-                truncate_str(&thread.participant_names, inner_w.saturating_sub(30))
+                truncate_display_width(&thread.participant_names, inner_w.saturating_sub(30))
             }
             ViewLens::Escalation => {
                 let flag = if thread.has_escalation { "ESC" } else { "---" };
@@ -2073,11 +2072,31 @@ fn render_thread_list(
             }
         };
 
-        // Build spans for the primary line
-        let prefix_len = 1 + 1 + 5 + 1; // marker + esc + time + space
-        let meta_len = meta.len() + 2; // " meta"
-        let id_space = inner_w.saturating_sub(prefix_len + meta_len);
-        let thread_id_display = truncate_str(&thread.thread_id, id_space);
+        // Ensure row content never exceeds the panel width (prevents wrap artifacts that look
+        // like random border glyphs cutting through text).
+        let marker_w = ftui::text::display_width(marker);
+        let esc_w = ftui::text::display_width(esc_badge);
+        let time_w = ftui::text::display_width(time_short);
+        let project_w = ftui::text::display_width(&project_text);
+        let unread_w = ftui::text::display_width(&unread_text);
+        let moving_w = ftui::text::display_width(&moving_text);
+        let min_id_w = if inner_w >= 36 {
+            12
+        } else if inner_w >= 24 {
+            8
+        } else {
+            4.min(inner_w)
+        };
+        let fixed_w = marker_w + esc_w + time_w + 1 + project_w + 1 + unread_w + moving_w;
+        let max_meta_w = inner_w.saturating_sub(fixed_w.saturating_add(min_id_w));
+        if max_meta_w == 0 {
+            meta_text.clear();
+        } else if ftui::text::display_width(&meta_text) > max_meta_w {
+            meta_text = truncate_display_width(&meta_text, max_meta_w);
+        }
+        let meta_w = ftui::text::display_width(&meta_text);
+        let id_space = inner_w.saturating_sub(fixed_w + meta_w);
+        let thread_id_display = truncate_display_width(&thread.thread_id, id_space);
 
         let cursor_style = if is_selected {
             Style::default()
@@ -2088,20 +2107,42 @@ fn render_thread_list(
             Style::default()
         };
 
-        let mut primary = Line::from_spans([
+        let mut primary_spans: Vec<Span<'static>> = vec![
             Span::raw(marker),
             Span::styled(esc_badge, esc_style),
-            Span::styled(time_short, crate::tui_theme::text_meta(&tp)),
-            Span::raw(" "),
-            proj_span,
-            Span::styled(
-                format!("{thread_id_display:<id_space$}"),
-                Style::default().fg(tp.text_primary),
-            ),
-            Span::styled(format!(" {meta}"), crate::tui_theme::text_meta(&tp)),
-            unread_span,
-            moving_span,
-        ]);
+            Span::styled(time_short.to_string(), crate::tui_theme::text_meta(&tp)),
+            Span::raw(" ".to_string()),
+        ];
+        if !project_text.is_empty() {
+            primary_spans.push(Span::styled(
+                project_text.clone(),
+                crate::tui_theme::text_meta(&tp),
+            ));
+        }
+        primary_spans.push(Span::styled(
+            thread_id_display,
+            Style::default().fg(tp.text_primary),
+        ));
+        if !meta_text.is_empty() || !unread_text.is_empty() || !moving_text.is_empty() {
+            primary_spans.push(Span::raw(" ".to_string()));
+        }
+        if !meta_text.is_empty() {
+            primary_spans.push(Span::styled(meta_text, crate::tui_theme::text_meta(&tp)));
+        }
+        if !unread_text.is_empty() {
+            primary_spans.push(Span::styled(
+                unread_text,
+                crate::tui_theme::text_accent(&tp),
+            ));
+        }
+        if !moving_text.is_empty() {
+            primary_spans.push(Span::styled(
+                moving_text,
+                Style::default().fg(tp.selection_indicator).bold(),
+            ));
+        }
+
+        let mut primary = Line::from_spans(primary_spans);
         if is_selected {
             primary.apply_base_style(cursor_style);
         } else if hovered_here && valid_drop_zone {
@@ -2120,24 +2161,28 @@ fn render_thread_list(
 
         // Second line: last subject (if there's room)
         if show_subject {
-            let indent = "    ";
-            let subj_space = inner_w.saturating_sub(indent.len());
+            let indent = "  ";
+            let subj_space = inner_w.saturating_sub(ftui::text::display_width(indent));
             let subj_line = if thread.last_sender.is_empty() {
                 Line::from_spans([
-                    Span::raw(indent),
+                    Span::raw(indent.to_string()),
                     Span::styled(
-                        truncate_str(&thread.last_subject, subj_space),
+                        truncate_display_width(&thread.last_subject, subj_space),
                         crate::tui_theme::text_hint(&tp),
                     ),
                 ])
             } else {
-                let sender_prefix = format!("{}: ", thread.last_sender);
-                let remaining = subj_space.saturating_sub(sender_prefix.len());
+                let sender_prefix = truncate_display_width(
+                    &format!("{}: ", thread.last_sender),
+                    subj_space.min(24),
+                );
+                let remaining =
+                    subj_space.saturating_sub(ftui::text::display_width(sender_prefix.as_str()));
                 Line::from_spans([
-                    Span::raw(indent),
+                    Span::raw(indent.to_string()),
                     Span::styled(sender_prefix, Style::default().fg(tp.text_secondary)),
                     Span::styled(
-                        truncate_str(&thread.last_subject, remaining),
+                        truncate_display_width(&thread.last_subject, remaining),
                         crate::tui_theme::text_hint(&tp),
                     ),
                 ])
@@ -2161,7 +2206,7 @@ fn render_thread_list(
 
     let text = Text::from_lines(text_lines);
     let p = Paragraph::new(text);
-    p.render(inner, frame);
+    p.render(content_inner, frame);
 }
 
 /// Render the thread detail/conversation panel.
@@ -2783,6 +2828,35 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         result.push_str("...");
         result
     }
+}
+
+/// Truncate a string to a target display width, adding an ellipsis on overflow.
+fn truncate_display_width(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if ftui::text::display_width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut out = String::new();
+    let mut used = 0usize;
+    let budget = max_width - 1;
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let ch_s = ch.encode_utf8(&mut buf);
+        let ch_w = ftui::text::display_width(ch_s);
+        if used.saturating_add(ch_w) > budget {
+            break;
+        }
+        out.push(ch);
+        used = used.saturating_add(ch_w);
+    }
+    out.push('…');
+    out
 }
 
 /// Fit a block title to a panel width, preserving rounded-border margins.

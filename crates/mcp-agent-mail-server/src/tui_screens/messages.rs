@@ -2683,6 +2683,7 @@ fn looks_like_json(body: &str) -> bool {
 /// tokens to distinguish object keys from string values: a `String` token
 /// immediately followed (ignoring whitespace) by a `Punctuation` token whose
 /// text is `:` is classified as a key.
+#[allow(dead_code)] // kept for tests and fallback experiments; main path uses markdown rendering.
 fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Text {
     let tokenizer = JsonTokenizer;
     let key_style = crate::tui_theme::style_json_key(tp);
@@ -3047,9 +3048,7 @@ fn render_detail_panel(
         combined_lines.push(Line::raw(line));
     }
 
-    let body_text = if looks_like_json(&msg.body_md) {
-        colorize_json_body(&msg.body_md, &tp)
-    } else {
+    let body_text = {
         let width = content_inner.width;
         let mut cached = cache.borrow_mut();
 
@@ -3074,8 +3073,13 @@ fn render_detail_panel(
             body_md
         });
 
+        let markdown_body = if looks_like_json(&body_str) {
+            format!("```json\n{}\n```", body_str.trim_end())
+        } else {
+            body_str
+        };
         let md_theme = crate::tui_theme::markdown_theme();
-        crate::tui_markdown::render_body(&body_str, &md_theme)
+        crate::tui_markdown::render_body(&markdown_body, &md_theme)
     };
 
     for line in body_text.lines() {

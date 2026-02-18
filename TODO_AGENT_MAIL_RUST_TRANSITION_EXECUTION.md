@@ -187,7 +187,14 @@ Scope: implement all requested deliverables from `AGENT_MAIL_RUST_VERSION_REPO_T
 - [x] Fix `am upgrade` non-interactive behavior to require `--yes`.
 - [x] Add copy-mode overlap guard for source/target storage roots.
 - [x] Add copy-mode guard rejecting pre-existing target DB paths.
+- [x] Fix `am upgrade` to actually execute setup refresh after successful import.
 - [x] Harden overlap normalization for paths containing `..` segments.
+- [x] Fix `.env` parsing to handle `export KEY=VALUE` lines for legacy path auto-detection.
+- [x] Expand `.env` parsing to handle `export<TAB>KEY=VALUE` format.
+- [x] Fix env-marker detection so legacy `STORAGE_ROOT` alone still counts as a legacy signal.
+- [x] Add preflight validation for source DB file type and source storage directory type.
+- [x] Add preflight validation rejecting copy-mode target storage paths that are existing files.
+- [x] Harden recursive storage copy against symlink-directory recursion and broken symlink ambiguity.
 - [x] Add/extend regression tests covering all above edge cases.
 - [x] Re-run `cargo fmt --check`.
 - [x] Re-run focused legacy test suite.

@@ -82,7 +82,7 @@ impl FastEmbedEmbedder {
             return Err(SearchError::InvalidQuery("empty text".to_string()));
         }
 
-        let model = self
+        let mut model = self
             .model
             .lock()
             .map_err(|_| SearchError::Internal("fastembed lock poisoned".to_string()))?;

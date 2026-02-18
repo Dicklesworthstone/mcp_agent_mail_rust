@@ -110,7 +110,7 @@ half = "2"
 wide = "0.7"
 safetensors = "0.5"
 tokenizers = "0.22"
-fastembed = "4"
+fastembed = "5.9.0"
 rayon = "1.10"
 dirs = "5"
 smallvec = { version = "1", features = ["serde"] }

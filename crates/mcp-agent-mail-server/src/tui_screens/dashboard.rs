@@ -70,7 +70,7 @@ const fn anomaly_rail_height(tc: TerminalClass, anomaly_count: usize) -> u16 {
     match tc {
         TerminalClass::Tiny => 0,
         TerminalClass::Compact => 2, // show 1 card, condensed
-        TerminalClass::UltraWide => 4,
+        TerminalClass::UltraWide => 5,
         _ => 3,
     }
 }
@@ -99,17 +99,17 @@ const RECENT_MESSAGE_PREVIEW_STALE_MICROS: i64 = 10 * 60 * 1_000_000;
 const RESERVATION_SOON_THRESHOLD_MICROS: i64 = 5 * 60 * 1_000_000;
 const AGENT_ACTIVE_THRESHOLD_MICROS: i64 = 60 * 1_000_000;
 const AGENT_IDLE_THRESHOLD_MICROS: i64 = 5 * 60 * 1_000_000;
-const TOP_MATCH_SAMPLE_CAP: usize = 4;
+const TOP_MATCH_SAMPLE_CAP: usize = 6;
 const ULTRAWIDE_INSIGHT_MIN_WIDTH: u16 = 98;
 const ULTRAWIDE_INSIGHT_MIN_HEIGHT: u16 = 12;
-const ULTRAWIDE_BOTTOM_MIN_WIDTH: u16 = 112;
-const ULTRAWIDE_BOTTOM_MIN_HEIGHT: u16 = 7;
-const SUPERGRID_INSIGHT_MIN_WIDTH: u16 = 146;
-const SUPERGRID_INSIGHT_MIN_HEIGHT: u16 = 16;
-const SUPERGRID_BOTTOM_MIN_WIDTH: u16 = 140;
-const SUPERGRID_BOTTOM_MIN_HEIGHT: u16 = 8;
-const MEGAGRID_BOTTOM_MIN_WIDTH: u16 = 170;
-const MEGAGRID_BOTTOM_MIN_HEIGHT: u16 = 12;
+const ULTRAWIDE_BOTTOM_MIN_WIDTH: u16 = 96;
+const ULTRAWIDE_BOTTOM_MIN_HEIGHT: u16 = 6;
+const SUPERGRID_INSIGHT_MIN_WIDTH: u16 = 120;
+const SUPERGRID_INSIGHT_MIN_HEIGHT: u16 = 14;
+const SUPERGRID_BOTTOM_MIN_WIDTH: u16 = 124;
+const SUPERGRID_BOTTOM_MIN_HEIGHT: u16 = 7;
+const MEGAGRID_BOTTOM_MIN_WIDTH: u16 = 152;
+const MEGAGRID_BOTTOM_MIN_HEIGHT: u16 = 10;
 
 /// Anomaly thresholds.
 const ACK_PENDING_WARN: u64 = 3;
@@ -5270,7 +5270,7 @@ mod tests {
         assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 2);
         assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 3);
         assert_eq!(anomaly_rail_height(TerminalClass::Wide, 2), 3);
-        assert_eq!(anomaly_rail_height(TerminalClass::UltraWide, 2), 4);
+        assert_eq!(anomaly_rail_height(TerminalClass::UltraWide, 2), 5);
 
         assert_eq!(footer_bar_height(TerminalClass::Tiny), 0);
         assert_eq!(footer_bar_height(TerminalClass::Compact), 0);

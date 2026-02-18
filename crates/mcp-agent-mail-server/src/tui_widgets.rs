@@ -858,6 +858,7 @@ impl Widget for Leaderboard<'_> {
 
         let no_styling =
             frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
+        let tp = crate::tui_theme::TuiThemePalette::current();
 
         let mut lines: Vec<Line> = Vec::with_capacity(max_entries);
 
@@ -870,10 +871,7 @@ impl Widget for Leaderboard<'_> {
                 RankChange::Up(n) => (format!("\u{25B2}{n}"), self.color_up),
                 RankChange::Down(n) => (format!("\u{25BC}{n}"), self.color_down),
                 RankChange::New => ("NEW".to_string(), self.color_new),
-                RankChange::Steady => (
-                    "\u{2500}\u{2500}".to_string(),
-                    PackedRgba::rgb(100, 100, 100),
-                ),
+                RankChange::Steady => ("\u{2500}\u{2500}".to_string(), tp.text_muted),
             };
 
             // Value formatting.
@@ -885,7 +883,7 @@ impl Widget for Leaderboard<'_> {
             let rank_color = if rank == 1 && !no_styling {
                 self.color_top
             } else {
-                PackedRgba::rgb(200, 200, 200)
+                tp.text_secondary
             };
 
             let mut spans = vec![
@@ -900,16 +898,13 @@ impl Widget for Leaderboard<'_> {
                     },
                 ),
                 Span::raw(" "),
-                Span::styled(
-                    entry.name.to_string(),
-                    Style::new().fg(PackedRgba::rgb(240, 240, 240)),
-                ),
+                Span::styled(entry.name.to_string(), Style::new().fg(tp.text_primary)),
             ];
 
             if let Some(secondary) = entry.secondary {
                 spans.push(Span::styled(
                     format!(" ({secondary})"),
-                    Style::new().fg(PackedRgba::rgb(120, 120, 120)),
+                    Style::new().fg(tp.text_muted),
                 ));
             }
 
@@ -920,10 +915,7 @@ impl Widget for Leaderboard<'_> {
             if padding > 0 {
                 spans.push(Span::raw(" ".repeat(padding)));
             }
-            spans.push(Span::styled(
-                value_str,
-                Style::new().fg(PackedRgba::rgb(200, 200, 200)),
-            ));
+            spans.push(Span::styled(value_str, Style::new().fg(tp.text_secondary)));
 
             lines.push(Line::from_spans(spans));
         }
@@ -3422,6 +3414,7 @@ impl ThreadTreeItem {
 
     #[must_use]
     pub fn render_line(&self, is_selected: bool, is_expanded: bool) -> Line {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let selection_prefix = if is_selected { "> " } else { "  " };
         let mut spans: Vec<Span<'static>> = vec![Span::raw(selection_prefix.to_string())];
 
@@ -3434,25 +3427,25 @@ impl ThreadTreeItem {
         };
         spans.push(Span::styled(
             format!("{glyph} "),
-            Style::new().fg(PackedRgba::rgb(170, 170, 180)),
+            Style::new().fg(tp.text_muted),
         ));
 
         let sender_style = if self.is_unread {
-            Style::new().fg(PackedRgba::rgb(235, 235, 245)).bold()
+            Style::new().fg(tp.text_primary).bold()
         } else {
-            Style::new().fg(PackedRgba::rgb(210, 210, 220))
+            Style::new().fg(tp.text_secondary)
         };
         spans.push(Span::styled(self.sender.clone(), sender_style));
         spans.push(Span::raw(": ".to_string()));
         spans.push(Span::raw(self.subject_snippet.clone()));
         spans.push(Span::styled(
             format!(" [{}]", self.relative_time),
-            Style::new().fg(PackedRgba::rgb(140, 140, 150)).dim(),
+            Style::new().fg(tp.text_muted).dim(),
         ));
         if self.is_ack_required {
             spans.push(Span::styled(
                 " [ACK]".to_string(),
-                Style::new().fg(PackedRgba::rgb(255, 185, 100)).bold(),
+                Style::new().fg(tp.severity_warn).bold(),
             ));
         }
         Line::from_spans(spans)
@@ -3617,10 +3610,11 @@ impl Widget for MessageCard<'_> {
         }
 
         // Determine border color based on selection and importance.
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let border_color = if self.selected {
-            PackedRgba::rgb(100, 160, 255) // soft blue for focus
+            tp.panel_border_focused
         } else {
-            PackedRgba::rgb(60, 60, 70) // dim border
+            tp.panel_border_dim
         };
 
         // Create block with rounded corners.
@@ -3651,6 +3645,7 @@ impl Widget for MessageCard<'_> {
 impl MessageCard<'_> {
     /// Render collapsed state: sender line + preview snippet.
     fn render_collapsed(&self, inner: Rect, frame: &mut Frame) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let mut y = inner.y;
 
         // Line 1: [Initial] Sender · timestamp · importance badge
@@ -3664,29 +3659,20 @@ impl MessageCard<'_> {
                 Span::styled(
                     format!("[{initial}]"),
                     Style::new()
-                        .fg(PackedRgba::rgb(255, 255, 255))
+                        .fg(contrast_text(sender_color))
                         .bg(sender_color),
                 ),
                 Span::raw(" "),
                 // Sender name (bold via brighter color).
-                Span::styled(
-                    self.sender.to_string(),
-                    Style::new().fg(PackedRgba::rgb(240, 240, 240)),
-                ),
-                Span::styled(" · ", Style::new().fg(PackedRgba::rgb(100, 100, 100))),
+                Span::styled(self.sender.to_string(), Style::new().fg(tp.text_primary)),
+                Span::styled(" · ", Style::new().fg(tp.text_muted)),
                 // Timestamp (dim).
-                Span::styled(
-                    self.timestamp.to_string(),
-                    Style::new().fg(PackedRgba::rgb(140, 140, 140)),
-                ),
+                Span::styled(self.timestamp.to_string(), Style::new().fg(tp.text_muted)),
             ];
 
             // Importance badge (if high/urgent).
             if let Some(badge) = self.importance.badge_label() {
-                spans.push(Span::styled(
-                    " · ",
-                    Style::new().fg(PackedRgba::rgb(100, 100, 100)),
-                ));
+                spans.push(Span::styled(" · ", Style::new().fg(tp.text_muted)));
                 spans.push(Span::styled(
                     badge.to_string(),
                     Style::new().fg(self.importance.badge_color()),
@@ -3726,7 +3712,7 @@ impl MessageCard<'_> {
             let max_display = (inner.width as usize).saturating_sub(1);
             let display: String = preview.chars().take(max_display).collect();
 
-            let line = Line::styled(display, Style::new().fg(PackedRgba::rgb(160, 160, 160)));
+            let line = Line::styled(display, Style::new().fg(tp.text_secondary));
             Paragraph::new(line).render(
                 Rect {
                     x: inner.x,
@@ -3742,6 +3728,7 @@ impl MessageCard<'_> {
     /// Render expanded state: full header + separator + body + footer.
     #[allow(clippy::too_many_lines)]
     fn render_expanded(&self, inner: Rect, frame: &mut Frame) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let mut y = inner.y;
 
         // Header line: [Initial] Sender · timestamp · importance badge · #message_id
@@ -3753,26 +3740,17 @@ impl MessageCard<'_> {
                 Span::styled(
                     format!("[{initial}]"),
                     Style::new()
-                        .fg(PackedRgba::rgb(255, 255, 255))
+                        .fg(contrast_text(sender_color))
                         .bg(sender_color),
                 ),
                 Span::raw(" "),
-                Span::styled(
-                    self.sender.to_string(),
-                    Style::new().fg(PackedRgba::rgb(240, 240, 240)),
-                ),
-                Span::styled(" · ", Style::new().fg(PackedRgba::rgb(100, 100, 100))),
-                Span::styled(
-                    self.timestamp.to_string(),
-                    Style::new().fg(PackedRgba::rgb(140, 140, 140)),
-                ),
+                Span::styled(self.sender.to_string(), Style::new().fg(tp.text_primary)),
+                Span::styled(" · ", Style::new().fg(tp.text_muted)),
+                Span::styled(self.timestamp.to_string(), Style::new().fg(tp.text_muted)),
             ];
 
             if let Some(badge) = self.importance.badge_label() {
-                spans.push(Span::styled(
-                    " · ",
-                    Style::new().fg(PackedRgba::rgb(100, 100, 100)),
-                ));
+                spans.push(Span::styled(" · ", Style::new().fg(tp.text_muted)));
                 spans.push(Span::styled(
                     badge.to_string(),
                     Style::new().fg(self.importance.badge_color()),
@@ -3780,13 +3758,10 @@ impl MessageCard<'_> {
             }
 
             if let Some(id) = self.message_id {
-                spans.push(Span::styled(
-                    " · ",
-                    Style::new().fg(PackedRgba::rgb(100, 100, 100)),
-                ));
+                spans.push(Span::styled(" · ", Style::new().fg(tp.text_muted)));
                 spans.push(Span::styled(
                     format!("#{id}"),
-                    Style::new().fg(PackedRgba::rgb(100, 100, 100)),
+                    Style::new().fg(tp.text_muted),
                 ));
             }
 
@@ -3810,7 +3785,7 @@ impl MessageCard<'_> {
         // Separator line: thin horizontal rule.
         {
             let rule: String = "─".repeat(inner.width as usize);
-            let line = Line::styled(rule, Style::new().fg(PackedRgba::rgb(60, 60, 70)));
+            let line = Line::styled(rule, Style::new().fg(tp.panel_border_dim));
             Paragraph::new(line).render(
                 Rect {
                     x: inner.x,
@@ -3836,8 +3811,7 @@ impl MessageCard<'_> {
             .saturating_sub(footer_height);
 
         if body_height > 0 {
-            // Render body as simple wrapped text.
-            // TODO: Use MarkdownRenderer when available (ftui_extras::markdown).
+            // Render full message body through the shared markdown pipeline.
             let body_area = Rect {
                 x: inner.x,
                 y,
@@ -3845,15 +3819,25 @@ impl MessageCard<'_> {
                 height: body_height,
             };
 
-            // Word-wrap the body manually for now.
-            let wrapped = wrap_text(self.body, inner.width as usize);
-            let lines: Vec<Line> = wrapped
+            let md_theme = crate::tui_theme::markdown_theme();
+            let rendered_md = crate::tui_markdown::render_body(self.body, &md_theme);
+            let mut lines: Vec<Line> = rendered_md
+                .lines()
                 .iter()
                 .take(body_height as usize)
-                .map(|s| Line::styled(s.clone(), Style::new().fg(PackedRgba::rgb(220, 220, 220))))
+                .cloned()
                 .collect();
+            if lines.is_empty() {
+                lines = wrap_text(self.body, inner.width as usize)
+                    .into_iter()
+                    .take(body_height as usize)
+                    .map(|s| Line::styled(s, Style::new().fg(tp.text_primary)))
+                    .collect();
+            }
 
-            Paragraph::new(Text::from_lines(lines)).render(body_area, frame);
+            Paragraph::new(Text::from_lines(lines))
+                .wrap(ftui::text::WrapMode::Word)
+                .render(body_area, frame);
             y += body_height;
         }
 
@@ -3864,7 +3848,7 @@ impl MessageCard<'_> {
         // Footer separator.
         {
             let rule: String = "─".repeat(inner.width as usize);
-            let line = Line::styled(rule, Style::new().fg(PackedRgba::rgb(60, 60, 70)));
+            let line = Line::styled(rule, Style::new().fg(tp.panel_border_dim));
             Paragraph::new(line).render(
                 Rect {
                     x: inner.x,
@@ -3884,15 +3868,9 @@ impl MessageCard<'_> {
         // Footer hints.
         {
             let hints = Line::from_spans([
-                Span::styled(
-                    "[View Full]",
-                    Style::new().fg(PackedRgba::rgb(100, 140, 180)),
-                ),
+                Span::styled("[View Full]", Style::new().fg(tp.status_accent)),
                 Span::raw("  "),
-                Span::styled(
-                    "[Jump to Sender]",
-                    Style::new().fg(PackedRgba::rgb(100, 140, 180)),
-                ),
+                Span::styled("[Jump to Sender]", Style::new().fg(tp.status_accent)),
             ]);
             Paragraph::new(hints).render(
                 Rect {
@@ -4713,14 +4691,15 @@ impl Widget for EvidenceLedgerWidget<'_> {
         }
 
         if self.entries.is_empty() {
-            let msg = Paragraph::new("No evidence entries")
-                .style(Style::new().fg(PackedRgba::rgb(120, 120, 120)));
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let msg = Paragraph::new("No evidence entries").style(Style::new().fg(tp.text_muted));
             msg.render(inner, frame);
             return;
         }
 
         let no_styling =
             frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
+        let tp = crate::tui_theme::TuiThemePalette::current();
 
         let max = if self.max_visible > 0 {
             self.max_visible.min(inner.height as usize)
@@ -4729,7 +4708,7 @@ impl Widget for EvidenceLedgerWidget<'_> {
         };
 
         // Header line
-        let header_style = Style::new().fg(PackedRgba::rgb(140, 140, 140));
+        let header_style = Style::new().fg(tp.text_muted);
         let header = Line::from_spans(vec![
             Span::styled("Seq", header_style),
             Span::raw("  "),
@@ -4784,13 +4763,13 @@ impl Widget for EvidenceLedgerWidget<'_> {
             };
 
             lines.push(Line::from_spans(vec![
-                Span::styled(seq_str, Style::new().fg(PackedRgba::rgb(180, 180, 180))),
+                Span::styled(seq_str, Style::new().fg(tp.text_secondary)),
                 Span::raw("  "),
-                Span::styled(dp, Style::new().fg(PackedRgba::rgb(100, 180, 220))),
+                Span::styled(dp, Style::new().fg(tp.status_accent)),
                 Span::raw("  "),
-                Span::styled(act, Style::new().fg(PackedRgba::rgb(220, 220, 220))),
+                Span::styled(act, Style::new().fg(tp.text_primary)),
                 Span::raw("  "),
-                Span::styled(conf_str, Style::new().fg(PackedRgba::rgb(180, 180, 100))),
+                Span::styled(conf_str, Style::new().fg(tp.severity_warn)),
                 Span::raw("  "),
                 Span::styled(
                     status_char.to_string(),

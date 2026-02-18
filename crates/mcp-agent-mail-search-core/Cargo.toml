@@ -42,17 +42,19 @@ dirs = { workspace = true, optional = true }
 [features]
 # Enable Tantivy-based lexical search engine
 tantivy-engine = ["dep:tantivy"]
+# Enable legacy FastEmbed quality tier (optional, may pull ONNX Runtime).
+quality-fastembed = ["dep:fastembed"]
 # Enable vector/semantic search engine with two-tier support
 semantic = [
     "dep:frankensearch",
     "dep:frankensearch-core",
     "dep:frankensearch-embed",
     "dep:frankensearch-fusion",
+    "quality-fastembed",
     "dep:half",
     "dep:wide",
     "dep:safetensors",
     "dep:tokenizers",
-    "dep:fastembed",
     "dep:rayon",
     "dep:dirs",
 ]

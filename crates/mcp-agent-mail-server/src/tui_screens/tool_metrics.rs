@@ -516,7 +516,7 @@ impl ToolMetricsScreen {
                 .entry(metric.name.clone())
                 .or_insert_with(|| ToolStats::new(metric.name.clone()));
 
-            if tool_stats.calls > metric.calls && metric.calls > 0 {
+            if tool_stats.calls > metric.calls {
                 continue;
             }
 
