@@ -20,6 +20,7 @@ use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListStat
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
@@ -47,7 +48,7 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 const MAX_RESULTS: usize = 200;
 
 /// Debounce delay in ticks for search-as-you-type.
-const DEBOUNCE_TICKS: u8 = 2;
+const DEBOUNCE_TICKS: u8 = 1;
 const SEARCH_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
 const SEARCH_STACKED_WIDTH_THRESHOLD: u16 = 60;
 const SEARCH_STACKED_MIN_HEIGHT: u16 = 12;
@@ -625,7 +626,7 @@ impl RenderItem for SearchResultRow {
             .map(|s| ftui::text::display_width(s.as_str()))
             .sum::<usize>();
         let remaining = w.saturating_sub(prefix_len);
-        let title = truncate_str(&self.entry.title, remaining);
+        let title = truncate_display_width(&self.entry.title, remaining);
 
         // Title with optional highlighting
         let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
@@ -653,7 +654,7 @@ impl RenderItem for SearchResultRow {
         if show_context_line {
             let context_prefix = "  ↳ ";
             let snippet_width = w.saturating_sub(ftui::text::display_width(context_prefix));
-            let snippet = truncate_str(snippet_source, snippet_width);
+            let snippet = truncate_display_width(snippet_source, snippet_width);
             let mut context_spans = vec![Span::styled(context_prefix, meta_style)];
             context_spans.extend(highlight_spans_with_needles(
                 &snippet,
@@ -1026,6 +1027,8 @@ pub struct SearchCockpitScreen {
     guidance: Option<ZeroResultGuidance>,
     /// Derived degraded-mode diagnostics for the most recent message query.
     last_diagnostics: Option<SearchDegradedDiagnostics>,
+    /// Most recent search execution time in milliseconds.
+    last_search_ms: Option<u32>,
     debounce_remaining: u8,
     search_dirty: bool,
 
@@ -1095,6 +1098,7 @@ impl SearchCockpitScreen {
             query_assistance: None,
             guidance: None,
             last_diagnostics: None,
+            last_search_ms: None,
             debounce_remaining: 0,
             search_dirty: true,
             saved_recipes: Vec::new(),
@@ -1241,6 +1245,7 @@ impl SearchCockpitScreen {
 
     /// Execute the search using sync DB connection.
     fn execute_search(&mut self, state: &TuiSharedState) {
+        let started = Instant::now();
         let raw = self.query_input.value().trim().to_string();
         self.last_query.clone_from(&raw);
         self.last_diagnostics = None;
@@ -1256,6 +1261,7 @@ impl SearchCockpitScreen {
             self.cursor = 0;
             self.detail_scroll = 0;
             self.search_dirty = false;
+            self.last_search_ms = None;
             return;
         }
 
@@ -1316,6 +1322,8 @@ impl SearchCockpitScreen {
         self.detail_scroll = 0;
         self.rebuild_result_rows();
         self.search_dirty = false;
+        let elapsed_ms = started.elapsed().as_millis();
+        self.last_search_ms = Some(u32::try_from(elapsed_ms).unwrap_or(u32::MAX));
         self.record_history();
     }
 
@@ -2756,6 +2764,33 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn truncate_display_width(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if ftui::text::display_width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    let budget = max_width - 1;
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let ch_s = ch.encode_utf8(&mut buf);
+        let ch_w = ftui::text::display_width(ch_s);
+        if used.saturating_add(ch_w) > budget {
+            break;
+        }
+        out.push(ch);
+        used = used.saturating_add(ch_w);
+    }
+    out.push('…');
+    out
+}
+
 fn collapse_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_space = true; // trim leading whitespace
@@ -3070,14 +3105,19 @@ fn render_query_bar(
         } else {
             "ready".to_string()
         };
+        let latency_label = screen
+            .last_search_ms
+            .map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"));
         let chips = format!(
-            "{}  state:{}  scope:{}  type:{}  sort:{}  terms:{}",
+            "{}  state:{}  scope:{}  type:{}  sort:{}  terms:{}  sql:{}  latency:{}",
             meter,
             state_label,
             screen.scope_mode.label(),
             screen.doc_kind_filter.label(),
             screen.sort_direction.label(),
-            screen.highlight_terms.len()
+            screen.highlight_terms.len(),
+            screen.total_sql_rows,
+            latency_label,
         );
         let chips_area = Rect::new(content_inner.x, content_inner.y + 2, content_inner.width, 1);
         Paragraph::new(truncate_str(&chips, content_inner.width as usize))

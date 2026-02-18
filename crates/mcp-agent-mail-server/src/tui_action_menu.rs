@@ -295,10 +295,16 @@ impl<'a> ActionMenu<'a> {
                 }
             }
 
-            // Render each character
+            // Render each character, advancing by display width for Unicode safety.
+            let mut col = inner.x;
             for (j, ch) in text.chars().enumerate() {
-                let col = inner.x + j as u16;
                 if col >= inner.right() {
+                    break;
+                }
+                let mut utf8 = [0_u8; 4];
+                let ch_str = ch.encode_utf8(&mut utf8);
+                let advance = u16::try_from(display_width(ch_str)).unwrap_or(1).max(1);
+                if col.saturating_add(advance) > inner.right() {
                     break;
                 }
                 let mut cell = Cell::from_char(ch);
@@ -322,11 +328,24 @@ impl<'a> ActionMenu<'a> {
                     cell.bg = action_menu_bg;
                 }
                 frame.buffer.set_fast(col, row, cell);
+                // Keep trailing cells of wide glyphs styled consistently.
+                for fill_col in col.saturating_add(1)..col.saturating_add(advance) {
+                    if fill_col >= inner.right() {
+                        break;
+                    }
+                    let mut filler = Cell::from_char(' ');
+                    if is_selected {
+                        filler.bg = row_highlight_bg;
+                    } else {
+                        filler.bg = action_menu_bg;
+                    }
+                    frame.buffer.set_fast(fill_col, row, filler);
+                }
+                col = col.saturating_add(advance);
             }
 
             // Fill rest of line with background
-            let text_len = u16::try_from(display_width(&text)).unwrap_or(inner.width);
-            for col in (inner.x + text_len)..inner.right() {
+            for col in col..inner.right() {
                 let mut cell = Cell::from_char(' ');
                 if is_selected {
                     cell.bg = row_highlight_bg;

@@ -2204,6 +2204,46 @@ fn render_thread_list(
         }
     }
 
+    let remaining_rows = visible_height.saturating_sub(text_lines.len());
+    if remaining_rows >= 2 {
+        text_lines.push(Line::raw(String::new()));
+        let total_unread: usize = threads.iter().map(|t| t.unread_count).sum();
+        let avg_velocity = if threads.is_empty() {
+            0.0
+        } else {
+            let denom = f64::from(u32::try_from(threads.len()).unwrap_or(u32::MAX));
+            threads.iter().map(|t| t.velocity_msg_per_hr).sum::<f64>() / denom
+        };
+        let summary = format!(
+            "selected:{}  unread:{}  escalations:{}  avg:{avg_velocity:.1}/hr",
+            truncate_display_width(&threads[cursor_clamped].thread_id, 20),
+            total_unread,
+            escalated,
+        );
+        text_lines.push(Line::from_spans([
+            Span::styled("  ", Style::default()),
+            Span::styled(summary, crate::tui_theme::text_meta(&tp)),
+        ]));
+    }
+    if remaining_rows >= 3 {
+        let selected = &threads[cursor_clamped];
+        let participant_line = if selected.participant_names.is_empty() {
+            "participants: (none)".to_string()
+        } else {
+            format!(
+                "participants: {}",
+                truncate_display_width(
+                    &selected.participant_names,
+                    inner_w.saturating_sub(16).max(12)
+                )
+            )
+        };
+        text_lines.push(Line::from_spans([
+            Span::styled("  ", Style::default()),
+            Span::styled(participant_line, crate::tui_theme::text_hint(&tp)),
+        ]));
+    }
+
     let text = Text::from_lines(text_lines);
     let p = Paragraph::new(text);
     p.render(content_inner, frame);
@@ -2865,7 +2905,7 @@ fn fit_panel_title(title: &str, panel_width: u16) -> String {
     if max_len == 0 {
         String::new()
     } else {
-        truncate_str(title, max_len)
+        truncate_display_width(title, max_len)
     }
 }
 

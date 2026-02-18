@@ -407,6 +407,29 @@ const fn severity_badge(severity: AnomalySeverity) -> &'static str {
     }
 }
 
+fn perceived_luma(color: PackedRgba) -> u8 {
+    let y = 299_u32
+        .saturating_mul(u32::from(color.r()))
+        .saturating_add(587_u32.saturating_mul(u32::from(color.g())))
+        .saturating_add(114_u32.saturating_mul(u32::from(color.b())));
+    let luma = (y + 500) / 1000;
+    u8::try_from(luma).unwrap_or(u8::MAX)
+}
+
+fn analytics_table_backgrounds(
+    tp: &crate::tui_theme::TuiThemePalette,
+) -> (PackedRgba, PackedRgba, PackedRgba, PackedRgba) {
+    let table_base_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.58);
+    let stripe_seed = crate::tui_theme::lerp_color(tp.table_row_alt_bg, tp.bg_surface, 0.5);
+    let is_light_surface = perceived_luma(table_base_bg) >= 140;
+    let header_mix = if is_light_surface { 0.22 } else { 0.16 };
+    let odd_mix = if is_light_surface { 0.14 } else { 0.09 };
+    let even_row_bg = table_base_bg;
+    let odd_row_bg = crate::tui_theme::lerp_color(table_base_bg, stripe_seed, odd_mix);
+    let header_bg = crate::tui_theme::lerp_color(table_base_bg, stripe_seed, header_mix);
+    (table_base_bg, header_bg, even_row_bg, odd_row_bg)
+}
+
 fn confidence_bar_colored(confidence: f64, severity: AnomalySeverity) -> ftui::text::Line {
     use ftui::text::{Line, Span};
 
@@ -862,10 +885,7 @@ fn render_card_list(
     focus: AnalyticsFocus,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let table_base_bg = crate::tui_theme::lerp_color(tp.bg_deep, tp.bg_surface, 0.7);
-    let header_bg = crate::tui_theme::lerp_color(table_base_bg, tp.bg_overlay, 0.08);
-    let even_row_bg = crate::tui_theme::lerp_color(table_base_bg, tp.bg_overlay, 0.04);
-    let odd_row_bg = crate::tui_theme::lerp_color(table_base_bg, tp.bg_overlay, 0.1);
+    let (table_base_bg, header_bg, even_row_bg, odd_row_bg) = analytics_table_backgrounds(&tp);
     let compact_columns = area.width < 62;
     let narrow_columns = area.width < 84;
     let header = if compact_columns {
@@ -884,10 +904,15 @@ fn render_card_list(
             let conf_text = format!("{:3.0}%", card.confidence * 100.0);
             let border_char = "\u{2590}"; // ▐ colored left border
             let row_bg = if i % 2 == 0 { even_row_bg } else { odd_row_bg };
+            let row_tinted_bg =
+                crate::tui_theme::lerp_color(row_bg, severity_color(card.severity), 0.07);
             let style = if i == selected {
-                severity_style(card.severity).bg(tp.selection_bg)
+                Style::default()
+                    .fg(tp.selection_fg)
+                    .bg(tp.selection_bg)
+                    .bold()
             } else {
-                severity_style(card.severity).bg(row_bg)
+                Style::default().fg(tp.text_primary).bg(row_tinted_bg)
             };
             if compact_columns {
                 Row::new(vec![
@@ -966,9 +991,9 @@ fn render_card_list(
             .title(title.as_str())
             .border_type(BorderType::Rounded)
             .border_style(if focus == AnalyticsFocus::List {
-                Style::default().fg(tp.selection_fg)
+                Style::default().fg(tp.panel_border_focused)
             } else {
-                Style::default().fg(tp.panel_border)
+                Style::default().fg(tp.panel_border_dim)
             }),
     )
     .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
@@ -1007,15 +1032,24 @@ fn render_card_detail(
 
     // Headline
     lines.push(Line::from_spans(vec![
-        Span::styled("Headline: ", Style::default().bold()),
-        Span::raw(&card.headline),
+        Span::styled("Headline: ", crate::tui_theme::text_section(&tp)),
+        Span::styled(
+            card.headline.clone(),
+            crate::tui_theme::text_primary(&tp).bold(),
+        ),
     ]));
     lines.push(Line::raw(""));
 
     // Rationale
-    lines.push(Line::styled("Rationale:", Style::default().bold()));
+    lines.push(Line::styled(
+        "Rationale:",
+        crate::tui_theme::text_section(&tp),
+    ));
     for line in card.rationale.lines() {
-        lines.push(Line::raw(format!("  {line}")));
+        lines.push(Line::styled(
+            format!("  {line}"),
+            crate::tui_theme::text_primary(&tp),
+        ));
     }
     lines.push(Line::raw(""));
 
@@ -1035,7 +1069,10 @@ fn render_card_detail(
             crate::tui_theme::text_success(&tp).bold(),
         ));
         for (i, step) in card.next_steps.iter().enumerate() {
-            lines.push(Line::raw(format!("  {}. {step}", i + 1)));
+            lines.push(Line::styled(
+                format!("  {}. {step}", i + 1),
+                crate::tui_theme::text_primary(&tp),
+            ));
         }
         lines.push(Line::raw(""));
     }
@@ -1067,12 +1104,15 @@ fn render_card_detail(
             crate::tui_theme::text_section(&tp),
         ));
         for trend in &card.supporting_trends {
-            lines.push(Line::raw(format!(
-                "  {} {} ({:+.1}%)",
-                trend.metric,
-                trend.direction,
-                trend.delta_ratio * 100.0,
-            )));
+            lines.push(Line::styled(
+                format!(
+                    "  {} {} ({:+.1}%)",
+                    trend.metric,
+                    trend.direction,
+                    trend.delta_ratio * 100.0,
+                ),
+                crate::tui_theme::text_primary(&tp),
+            ));
         }
         lines.push(Line::raw(""));
     }
@@ -1086,10 +1126,13 @@ fn render_card_detail(
             crate::tui_theme::text_section(&tp),
         ));
         for corr in &card.supporting_correlations {
-            lines.push(Line::raw(format!(
-                "  {} \u{2194} {} ({})",
-                corr.metric_a, corr.metric_b, corr.explanation,
-            )));
+            lines.push(Line::styled(
+                format!(
+                    "  {} \u{2194} {} ({})",
+                    corr.metric_a, corr.metric_b, corr.explanation,
+                ),
+                crate::tui_theme::text_primary(&tp),
+            ));
         }
     }
 
@@ -1099,9 +1142,9 @@ fn render_card_detail(
             .title(" Card Detail ")
             .border_type(BorderType::Rounded)
             .border_style(if focus == AnalyticsFocus::Detail {
-                Style::default().fg(tp.selection_fg)
+                Style::default().fg(tp.panel_border_focused)
             } else {
-                Style::default().fg(tp.panel_border)
+                Style::default().fg(tp.panel_border_dim)
             }),
     );
     para.render(area, frame);
@@ -1801,13 +1844,48 @@ impl MailScreen for AnalyticsScreen {
                         true,
                         self.focus,
                     );
-                    render_card_detail(
-                        frame,
-                        detail_area,
-                        selected_card,
-                        self.detail_scroll,
-                        self.focus,
-                    );
+                    if detail_area.height >= 18 && detail_area.width >= 52 {
+                        let detail_main_h = detail_area
+                            .height
+                            .saturating_mul(62)
+                            .saturating_div(100)
+                            .clamp(10, detail_area.height.saturating_sub(7));
+                        let detail_main = Rect::new(
+                            detail_area.x,
+                            detail_area.y,
+                            detail_area.width,
+                            detail_main_h,
+                        );
+                        let detail_viz = Rect::new(
+                            detail_area.x,
+                            detail_area.y.saturating_add(detail_main_h),
+                            detail_area.width,
+                            detail_area.height.saturating_sub(detail_main_h),
+                        );
+                        render_card_detail(
+                            frame,
+                            detail_main,
+                            selected_card,
+                            self.detail_scroll,
+                            self.focus,
+                        );
+                        render_runtime_viz_fallback(
+                            frame,
+                            detail_viz,
+                            state,
+                            self.focus,
+                            self.severity_filter,
+                            self.sort_mode,
+                        );
+                    } else {
+                        render_card_detail(
+                            frame,
+                            detail_area,
+                            selected_card,
+                            self.detail_scroll,
+                            self.focus,
+                        );
+                    }
                     if status_h > 0 {
                         render_status_strip(
                             frame,
