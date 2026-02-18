@@ -43,12 +43,101 @@ use mcp_agent_mail_search_core::{
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
+use mcp_agent_mail_search_core::cache::{
+    CacheConfig, InvalidationTrigger, QueryCache, QueryCacheKey, WarmResource,
+    WarmWorker, WarmWorkerConfig,
+};
+use mcp_agent_mail_search_core::SearchMode;
 #[cfg(feature = "hybrid")]
 use std::collections::BTreeMap;
 #[cfg(feature = "hybrid")]
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "hybrid")]
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, RwLock};
+
+// ────────────────────────────────────────────────────────────────────
+// Global search cache singleton
+// ────────────────────────────────────────────────────────────────────
+
+/// Global query cache for search results (initialized on first use).
+static SEARCH_CACHE: OnceLock<Arc<QueryCache<ScopedSearchResponse>>> = OnceLock::new();
+
+/// Global warm worker for tracking search resource readiness.
+static WARM_WORKER: OnceLock<Arc<WarmWorker>> = OnceLock::new();
+
+/// Get or initialize the global search cache.
+fn global_search_cache() -> &'static Arc<QueryCache<ScopedSearchResponse>> {
+    SEARCH_CACHE.get_or_init(|| Arc::new(QueryCache::new(CacheConfig::from_env())))
+}
+
+/// Get or initialize the global warm worker.
+fn global_warm_worker() -> &'static Arc<WarmWorker> {
+    WARM_WORKER.get_or_init(|| Arc::new(WarmWorker::new(WarmWorkerConfig::default())))
+}
+
+/// Invalidate the global search cache (call when index is updated).
+///
+/// This bumps the cache epoch so all stale entries are rejected on next access.
+pub fn invalidate_search_cache(trigger: InvalidationTrigger) {
+    if let Some(cache) = SEARCH_CACHE.get() {
+        let entries_before = cache.metrics().current_entries;
+        cache.invalidate_all();
+        let new_epoch = cache.current_epoch();
+        tracing::debug!(
+            target: "search.cache",
+            trigger = ?trigger,
+            entries_invalidated = entries_before,
+            new_epoch,
+            "search cache invalidated"
+        );
+    }
+}
+
+/// Get search cache metrics snapshot (for diagnostics).
+#[must_use]
+pub fn search_cache_metrics() -> mcp_agent_mail_search_core::cache::CacheMetrics {
+    SEARCH_CACHE
+        .get()
+        .map(|c| c.metrics())
+        .unwrap_or_default()
+}
+
+/// Get warm worker status snapshot (for diagnostics).
+#[must_use]
+pub fn warm_worker_status() -> Vec<mcp_agent_mail_search_core::cache::WarmStatus> {
+    WARM_WORKER
+        .get()
+        .map(|w| w.all_status())
+        .unwrap_or_default()
+}
+
+/// Record warmup completion for a search resource.
+pub fn record_warmup(resource: WarmResource, duration: std::time::Duration) {
+    global_warm_worker().complete_warmup(resource, duration);
+}
+
+/// Record warmup failure for a search resource.
+pub fn record_warmup_failure(resource: WarmResource, error: &str) {
+    global_warm_worker().fail_warmup(resource, error);
+}
+
+/// Record warmup start for a search resource.
+pub fn record_warmup_start(resource: WarmResource) {
+    global_warm_worker().start_warmup(resource);
+}
+
+/// Map a [`SearchEngine`] config variant to the cache-key [`SearchMode`].
+#[allow(deprecated)]
+const fn engine_to_search_mode(engine: SearchEngine) -> SearchMode {
+    match engine {
+        SearchEngine::Legacy | SearchEngine::Shadow | SearchEngine::Lexical => SearchMode::Lexical,
+        SearchEngine::Semantic => SearchMode::Semantic,
+        SearchEngine::Hybrid => SearchMode::Hybrid,
+        SearchEngine::Auto => SearchMode::Auto,
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Search service options
 // ────────────────────────────────────────────────────────────────────
@@ -790,13 +879,17 @@ const fn convert_planner_doc_kind(kind: DocKind) -> SearchDocKind {
 /// Should be called once at startup when hybrid search is enabled.
 #[cfg(feature = "hybrid")]
 pub fn init_semantic_bridge(config: VectorIndexConfig) -> Result<(), String> {
+    record_warmup_start(WarmResource::SemanticEmbedder);
+    let warmup_timer = std::time::Instant::now();
     let bridge = SemanticBridge::new(config);
     if SEMANTIC_BRIDGE.set(Some(Arc::new(bridge))).is_err() {
+        record_warmup_failure(WarmResource::SemanticEmbedder, "already initialized");
         return Err(
             "semantic bridge is already initialized; restart process to apply a new config"
                 .to_string(),
         );
     }
+    record_warmup(WarmResource::SemanticEmbedder, warmup_timer.elapsed());
     Ok(())
 }
 
@@ -1284,6 +1377,9 @@ impl TwoTierBridge {
         }
         drop(index);
 
+        // Invalidate search cache since index content changed
+        invalidate_search_cache(InvalidationTrigger::IndexUpdate);
+
         Ok(())
     }
 
@@ -1369,7 +1465,13 @@ where
 
 #[cfg(feature = "hybrid")]
 fn get_or_init_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
-    get_or_init_two_tier_bridge_with(&TWO_TIER_BRIDGE, || Some(Arc::new(TwoTierBridge::new())))
+    get_or_init_two_tier_bridge_with(&TWO_TIER_BRIDGE, || {
+        record_warmup_start(WarmResource::VectorIndex);
+        let warmup_timer = std::time::Instant::now();
+        let bridge = Arc::new(TwoTierBridge::new());
+        record_warmup(WarmResource::VectorIndex, warmup_timer.elapsed());
+        Some(bridge)
+    })
 }
 
 /// Try executing semantic candidate retrieval using two-tier system.
@@ -2424,6 +2526,53 @@ pub async fn execute_search(
     options: &SearchOptions,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
+
+    // ── Cache lookup ──────────────────────────────────────────────────
+    let cache = global_search_cache();
+    let cache_key = {
+        let filter = query.to_search_filter();
+        let engine_mode = options
+            .search_engine
+            .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+        let mode = engine_to_search_mode(engine_mode);
+        // Cursor-based pagination: hash cursor string into offset for cache key
+        // differentiation. Different cursors = different result pages.
+        let offset_proxy = query
+            .cursor
+            .as_ref()
+            .map_or(0_usize, |c| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                c.hash(&mut h);
+                // Truncation is intentional: this is a hash-based discriminator,
+                // not a precise offset. Losing high bits on 32-bit is fine.
+                #[allow(clippy::cast_possible_truncation)]
+                { h.finish() as usize }
+            });
+        QueryCacheKey::new(
+            &query.text,
+            mode,
+            &filter,
+            cache.current_epoch(),
+            offset_proxy,
+            query.effective_limit(),
+        )
+    };
+
+    if let Some(cached) = cache.get(&cache_key) {
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if options.track_telemetry {
+            record_query("search_service_cache_hit", latency_us);
+        }
+        tracing::debug!(
+            target: "search.cache",
+            latency_us,
+            query = %query.text,
+            "search cache hit"
+        );
+        return Outcome::Ok(cached);
+    }
+
     let engine = options
         .search_engine
         .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
@@ -2443,13 +2592,17 @@ pub async fn execute_search(
             }
             // Record V3 metrics
             global_metrics().search.record_v3_query(latency_us, false);
-            return finish_scoped_response(
+            let resp = finish_scoped_response(
                 raw_results,
                 query,
                 options,
                 assistance.clone(),
                 explain,
             );
+            if let Outcome::Ok(ref val) = resp {
+                cache.put(cache_key, val.clone());
+            }
+            return resp;
         }
         maybe_record_v3_fallback(engine, query);
         // Bridge not initialized → fall through to FTS5.
@@ -2549,13 +2702,17 @@ pub async fn execute_search(
                 record_query("search_service_hybrid_candidates", latency_us);
             }
             global_metrics().search.record_v3_query(latency_us, false);
-            return finish_scoped_response(
+            let resp = finish_scoped_response(
                 raw_results,
                 query,
                 options,
                 assistance.clone(),
                 explain,
             );
+            if let Outcome::Ok(ref val) = resp {
+                cache.put(cache_key, val.clone());
+            }
+            return resp;
         }
         maybe_record_v3_fallback(engine, query);
         // No lexical bridge available yet → fall through to legacy FTS.
@@ -2584,7 +2741,7 @@ pub async fn execute_search(
             None
         };
         let guidance = generate_zero_result_guidance(query, 0, assistance.as_ref());
-        return Outcome::Ok(ScopedSearchResponse {
+        let response = ScopedSearchResponse {
             results: Vec::new(),
             next_cursor: None,
             explain,
@@ -2592,7 +2749,9 @@ pub async fn execute_search(
             sql_row_count: 0,
             assistance,
             guidance,
-        });
+        };
+        cache.put(cache_key, response.clone());
+        return Outcome::Ok(response);
     }
 
     // Step 2: Acquire connection
@@ -2682,7 +2841,7 @@ pub async fn execute_search(
 
     let guidance = generate_zero_result_guidance(query, scoped_results.len(), assistance.as_ref());
 
-    Outcome::Ok(ScopedSearchResponse {
+    let response = ScopedSearchResponse {
         results: scoped_results,
         next_cursor,
         explain,
@@ -2690,7 +2849,9 @@ pub async fn execute_search(
         sql_row_count,
         assistance,
         guidance,
-    })
+    };
+    cache.put(cache_key, response.clone());
+    Outcome::Ok(response)
 }
 
 /// Apply scope enforcement and build a `ScopedSearchResponse` from raw results.

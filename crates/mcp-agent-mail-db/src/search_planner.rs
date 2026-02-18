@@ -351,6 +351,43 @@ impl SearchQuery {
     pub fn effective_limit(&self) -> usize {
         self.limit.unwrap_or(50).clamp(1, 1000)
     }
+
+    /// Convert query facets to a [`SearchFilter`] for cache key construction.
+    #[must_use]
+    pub fn to_search_filter(&self) -> mcp_agent_mail_search_core::SearchFilter {
+        use mcp_agent_mail_search_core::{DateRange, ImportanceFilter, SearchFilter};
+
+        let importance = if self.importance.is_empty() {
+            None
+        } else {
+            // Map the first importance level to the filter enum.
+            // Multiple levels are rare; first element is the dominant filter.
+            Some(match self.importance[0] {
+                Importance::Low => ImportanceFilter::Low,
+                Importance::Normal => ImportanceFilter::Normal,
+                Importance::High => ImportanceFilter::High,
+                Importance::Urgent => ImportanceFilter::Urgent,
+            })
+        };
+
+        let date_range = if self.time_range.is_empty() {
+            None
+        } else {
+            Some(DateRange {
+                start: self.time_range.min_ts,
+                end: self.time_range.max_ts,
+            })
+        };
+
+        SearchFilter {
+            sender: self.agent_name.clone(),
+            project_id: self.project_id,
+            date_range,
+            importance,
+            thread_id: self.thread_id.clone(),
+            doc_kind: None, // doc_kind is part of the query text normalization, not filter
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────

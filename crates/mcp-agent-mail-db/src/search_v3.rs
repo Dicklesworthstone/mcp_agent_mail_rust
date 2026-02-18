@@ -285,8 +285,20 @@ static BRIDGE: OnceLock<Option<Arc<TantivyBridge>>> = OnceLock::new();
 /// Should be called once at startup when `SearchEngine::Tantivy` or `Shadow`
 /// is configured. Returns `Ok(())` on success.
 pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
-    let bridge = TantivyBridge::open(index_dir)?;
+    use crate::search_service::{record_warmup, record_warmup_failure, record_warmup_start};
+    use mcp_agent_mail_search_core::cache::WarmResource;
+
+    record_warmup_start(WarmResource::LexicalIndex);
+    let warmup_timer = std::time::Instant::now();
+    let bridge = match TantivyBridge::open(index_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            record_warmup_failure(WarmResource::LexicalIndex, &e);
+            return Err(e);
+        }
+    };
     let _ = BRIDGE.set(Some(Arc::new(bridge)));
+    record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
     Ok(())
 }
 
