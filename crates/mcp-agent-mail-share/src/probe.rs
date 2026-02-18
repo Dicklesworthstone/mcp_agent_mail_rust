@@ -1021,4 +1021,79 @@ mod tests {
         assert!(result.passed);
         assert_eq!(result.http_status, Some(200));
     }
+
+    // ── br-3h13.17.5: read_chunked_body tests (RubyPrairie) ────────────
+
+    #[test]
+    fn chunked_body_single_chunk() {
+        // "5\r\nhello\r\n0\r\n\r\n"
+        let data = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn chunked_body_multiple_chunks() {
+        let data = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
+        assert_eq!(body, b"hello world");
+    }
+
+    #[test]
+    fn chunked_body_empty() {
+        // Zero-length chunk terminates immediately
+        let data = b"0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn chunked_body_hex_uppercase() {
+        // Chunk size in uppercase hex: A = 10 bytes
+        let data = b"A\r\n0123456789\r\n0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
+        assert_eq!(body, b"0123456789");
+    }
+
+    #[test]
+    fn chunked_body_hex_lowercase() {
+        // Chunk size in lowercase hex: a = 10 bytes
+        let data = b"a\r\n0123456789\r\n0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
+        assert_eq!(body, b"0123456789");
+    }
+
+    #[test]
+    fn chunked_body_with_extension() {
+        // Chunk extension: "5;ext=val\r\nhello\r\n0\r\n\r\n"
+        let data = b"5;ext=val\r\nhello\r\n0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn chunked_body_invalid_hex_returns_error() {
+        let data = b"XZ\r\nbad\r\n0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let result = read_chunked_body(&mut std::io::BufReader::new(&mut cursor));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn chunked_body_binary_data() {
+        // Chunk with non-UTF8 binary bytes
+        let chunk_data: Vec<u8> = (0..16).collect();
+        let mut data = b"10\r\n".to_vec(); // 0x10 = 16 bytes
+        data.extend_from_slice(&chunk_data);
+        data.extend_from_slice(b"\r\n0\r\n\r\n");
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
+        assert_eq!(body, chunk_data);
+    }
 }

@@ -2159,4 +2159,174 @@ mod tests {
         });
         assert!(outcome.is_err(), "corrupted migrations table should error");
     }
+
+    // ── br-3h13.17.3: SQL schema extraction tests (JadeCave) ──────────
+
+    #[test]
+    fn extract_ident_create_table() {
+        let result = extract_ident_after_keyword(
+            "CREATE TABLE IF NOT EXISTS foo (id INT)",
+            "create table if not exists ",
+        );
+        assert_eq!(result, Some("foo".to_string()));
+    }
+
+    #[test]
+    fn extract_ident_create_index() {
+        let result = extract_ident_after_keyword(
+            "CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages (ts)",
+            "create index if not exists ",
+        );
+        assert_eq!(result, Some("idx_messages_ts".to_string()));
+    }
+
+    #[test]
+    fn extract_ident_create_trigger() {
+        let result = extract_ident_after_keyword(
+            "CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN ... END",
+            "create trigger if not exists ",
+        );
+        assert_eq!(result, Some("messages_ai".to_string()));
+    }
+
+    #[test]
+    fn extract_ident_create_virtual_table() {
+        let result = extract_ident_after_keyword(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(subject, body_md)",
+            "create virtual table if not exists ",
+        );
+        assert_eq!(result, Some("fts_messages".to_string()));
+    }
+
+    #[test]
+    fn extract_ident_keyword_not_found() {
+        let result = extract_ident_after_keyword(
+            "SELECT * FROM foo",
+            "create table if not exists ",
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn extract_ident_empty_sql() {
+        assert_eq!(extract_ident_after_keyword("", "create table "), None);
+    }
+
+    #[test]
+    fn extract_ident_keyword_at_end() {
+        // Keyword found but nothing after it
+        let result = extract_ident_after_keyword(
+            "CREATE TABLE IF NOT EXISTS ",
+            "create table if not exists ",
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn extract_ident_case_insensitive() {
+        let result = extract_ident_after_keyword(
+            "create table if not exists MyTable (id INT)",
+            "create table if not exists ",
+        );
+        assert_eq!(result, Some("MyTable".to_string()));
+    }
+
+    #[test]
+    fn extract_ident_multiple_spaces() {
+        let result = extract_ident_after_keyword(
+            "CREATE TABLE IF NOT EXISTS    spaced_table  (id INT)",
+            "create table if not exists ",
+        );
+        assert_eq!(result, Some("spaced_table".to_string()));
+    }
+
+    #[test]
+    fn extract_ident_underscore_name() {
+        let result = extract_ident_after_keyword(
+            "CREATE TABLE IF NOT EXISTS _private_table (id INT)",
+            "create table if not exists ",
+        );
+        assert_eq!(result, Some("_private_table".to_string()));
+    }
+
+    #[test]
+    fn extract_trigger_statements_single() {
+        let sql = "CREATE TRIGGER IF NOT EXISTS trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;";
+        let stmts = extract_trigger_statements(sql);
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].contains("trg_ai"));
+    }
+
+    #[test]
+    fn extract_trigger_statements_multiple() {
+        let sql = "\
+            CREATE TRIGGER IF NOT EXISTS trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;\n\
+            CREATE TRIGGER IF NOT EXISTS trg_ad AFTER DELETE ON t BEGIN SELECT 2; END;";
+        let stmts = extract_trigger_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("trg_ai"));
+        assert!(stmts[1].contains("trg_ad"));
+    }
+
+    #[test]
+    fn extract_trigger_statements_empty() {
+        assert!(extract_trigger_statements("").is_empty());
+    }
+
+    #[test]
+    fn extract_trigger_statements_no_triggers() {
+        let sql = "CREATE TABLE foo (id INT); CREATE INDEX idx ON foo (id);";
+        assert!(extract_trigger_statements(sql).is_empty());
+    }
+
+    #[test]
+    fn extract_trigger_statements_mixed_with_non_trigger() {
+        let sql = "\
+            CREATE TABLE foo (id INT);\n\
+            CREATE TRIGGER IF NOT EXISTS trg_ai AFTER INSERT ON foo BEGIN INSERT INTO bar VALUES (NEW.id); END;\n\
+            CREATE INDEX idx ON foo (id);";
+        let stmts = extract_trigger_statements(sql);
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].starts_with("CREATE TRIGGER"));
+    }
+
+    #[test]
+    fn derive_migration_id_table() {
+        let result = derive_migration_id_and_description(
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)"
+        );
+        assert_eq!(
+            result,
+            Some(("v1_create_table_messages".to_string(), "create table messages".to_string()))
+        );
+    }
+
+    #[test]
+    fn derive_migration_id_index() {
+        let result = derive_migration_id_and_description(
+            "CREATE INDEX IF NOT EXISTS idx_ts ON messages (ts)"
+        );
+        assert_eq!(
+            result,
+            Some(("v1_create_index_idx_ts".to_string(), "create index idx_ts".to_string()))
+        );
+    }
+
+    #[test]
+    fn derive_migration_id_unknown_returns_none() {
+        assert_eq!(derive_migration_id_and_description("SELECT 1"), None);
+        assert_eq!(derive_migration_id_and_description(""), None);
+    }
+
+    // ── br-3h13.17.3 addendum: additional edge case (RubyPrairie) ──────
+
+    #[test]
+    fn extract_ident_stops_at_parenthesis() {
+        // No space between identifier and parenthesis
+        let sql = "CREATE TABLE IF NOT EXISTS tbl(id INT)";
+        assert_eq!(
+            extract_ident_after_keyword(sql, "create table if not exists "),
+            Some("tbl".into())
+        );
+    }
 }
