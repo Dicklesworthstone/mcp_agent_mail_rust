@@ -122,6 +122,52 @@ Initial budgets (conservative; tighten after the first baseline run on CI-like h
 | medium | 5,000 | < 15ms | < 25ms |
 | large | 15,000 | < 50ms | < 80ms |
 
+## Search V3 Tantivy Lexical Budgets (br-2tnl.7.5)
+
+Deterministic harness implemented in `crates/mcp-agent-mail-db/benches/search_v3_bench.rs`.
+Seeds Tantivy indexes with synthetic documents and measures `TantivyBridge::search()` p50/p95/p99
+for a fixed query (`needle`, `limit=20`).
+
+Artifacts are written under:
+- `tests/artifacts/bench/search_v3/<run_id>/summary.json`
+
+Also includes:
+- Index build throughput (docs/sec) at each corpus size
+- Incremental add throughput (batch 1/10/100)
+- Disk overhead per document (bytes)
+
+To enforce budgets (CI/robot mode):
+
+```bash
+MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1 \
+  cargo bench -p mcp-agent-mail-db --bench search_v3_bench
+```
+
+Baseline (2026-02-18):
+
+| Scenario | Messages | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 | Budget p99 | Notes |
+|----------|----------|-------------|-------------|-------------|------------|------------|-------|
+| small | 1,000 | ~382µs | ~531µs | ~706µs | < 1.5ms | < 3ms | 6x under budget |
+| medium | 5,000 | ~622µs | ~800µs | ~1.1ms | < 5ms | < 10ms | Tantivy sub-ms even at 5K |
+| large | 15,000 | ~679µs | ~805µs | ~1.0ms | < 15ms | < 25ms | 18x under budget; Tantivy barely scales with corpus |
+
+Index build throughput (baseline): 7.5K docs/sec (1K), 36K docs/sec (5K), 90K docs/sec (15K).
+Disk overhead: ~89-107 bytes/doc (amortized).
+
+### Criterion Bench Groups
+
+| Group | Bench IDs | Notes |
+|-------|-----------|-------|
+| `tantivy_lexical_search` | `small/1000`, `medium/5000`, `large/15000` | Core latency at scale |
+| `tantivy_query_selectivity` | `high_selectivity`, `medium_selectivity`, `low_selectivity`, `phrase_query` | Query diversity on 5K corpus |
+| `tantivy_index_build` | `docs/1000`, `docs/5000`, `docs/15000` | Construction throughput |
+| `tantivy_incremental_add` | `batch/1`, `batch/10`, `batch/100` | Incremental update on 5K corpus |
+
+### Two-Tier Semantic Budgets
+
+Covered by `crates/mcp-agent-mail-search-core/benches/two_tier_bench.rs` (requires `semantic` feature).
+Micro-benchmarks for dot product, normalization, score blending, and index-level search at 100/1K/10K.
+
 ## Share/Export Pipeline Budgets
 
 Baseline numbers are taken from the bench harness artifacts emitted by:
