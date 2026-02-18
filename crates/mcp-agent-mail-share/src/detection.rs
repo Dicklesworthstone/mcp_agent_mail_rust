@@ -44,15 +44,16 @@ pub fn detect_environment(bundle_path: Option<&Path>, cwd: &Path) -> DetectedEnv
     detect_filesystem_signals(cwd, &mut env);
 
     // Check for existing bundle
-    if let Some(path) = bundle_path {
-        if path.is_dir() && path.join("manifest.json").exists() {
-            env.existing_bundle = Some(path.to_path_buf());
-            env.signals.push(DetectedSignal {
-                source: "filesystem".to_string(),
-                detail: format!("Bundle found at {}", path.display()),
-                confidence: DetectionConfidence::High,
-            });
-        }
+    if let Some(path) = bundle_path
+        && path.is_dir()
+        && path.join("manifest.json").exists()
+    {
+        env.existing_bundle = Some(path.to_path_buf());
+        env.signals.push(DetectedSignal {
+            source: "filesystem".to_string(),
+            detail: format!("Bundle found at {}", path.display()),
+            confidence: DetectionConfidence::High,
+        });
     }
 
     // Determine recommended provider based on signals
@@ -75,42 +76,42 @@ pub fn detect_github_pages(cwd: &Path) -> Vec<DetectedSignal> {
     let mut signals = Vec::new();
 
     // Check git remote
-    if let Some(url) = git_remote_url(cwd) {
-        if url.contains("github.com") || url.contains("github:") {
-            signals.push(DetectedSignal {
-                source: "git_remote".to_string(),
-                detail: format!("Git remote points to GitHub: {url}"),
-                confidence: DetectionConfidence::High,
-            });
-        }
+    if let Some(url) = git_remote_url(cwd)
+        && (url.contains("github.com") || url.contains("github:"))
+    {
+        signals.push(DetectedSignal {
+            source: "git_remote".to_string(),
+            detail: format!("Git remote points to GitHub: {url}"),
+            confidence: DetectionConfidence::High,
+        });
     }
 
     // Check for GitHub Actions workflows
-    if let Some(workflows_dir) = find_ancestor_path(cwd, ".github/workflows") {
-        if workflows_dir.is_dir() {
-            let mut has_pages_workflow = false;
-            if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_lowercase();
-                    if (name.ends_with(".yml") || name.ends_with(".yaml"))
-                        && (name.contains("pages") || name.contains("deploy"))
-                    {
-                        has_pages_workflow = true;
-                        signals.push(DetectedSignal {
-                            source: "config_file".to_string(),
-                            detail: format!("GitHub Actions workflow found: {name}"),
-                            confidence: DetectionConfidence::High,
-                        });
-                    }
+    if let Some(workflows_dir) = find_ancestor_path(cwd, ".github/workflows")
+        && workflows_dir.is_dir()
+    {
+        let mut has_pages_workflow = false;
+        if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if (name.ends_with(".yml") || name.ends_with(".yaml"))
+                    && (name.contains("pages") || name.contains("deploy"))
+                {
+                    has_pages_workflow = true;
+                    signals.push(DetectedSignal {
+                        source: "config_file".to_string(),
+                        detail: format!("GitHub Actions workflow found: {name}"),
+                        confidence: DetectionConfidence::High,
+                    });
                 }
             }
-            if !has_pages_workflow {
-                signals.push(DetectedSignal {
-                    source: "config_file".to_string(),
-                    detail: ".github/workflows/ directory exists".to_string(),
-                    confidence: DetectionConfidence::Medium,
-                });
-            }
+        }
+        if !has_pages_workflow {
+            signals.push(DetectedSignal {
+                source: "config_file".to_string(),
+                detail: ".github/workflows/ directory exists".to_string(),
+                confidence: DetectionConfidence::Medium,
+            });
         }
     }
 
@@ -242,21 +243,20 @@ pub fn detect_s3(cwd: &Path) -> Vec<DetectedSignal> {
 
     // Check for S3-related scripts
     let scripts_dir = cwd.join("scripts");
-    if scripts_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_lowercase();
-                if name.contains("s3") || name.contains("aws") || name.contains("deploy") {
-                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                        if content.contains("s3 ") || content.contains("aws s3") {
-                            signals.push(DetectedSignal {
-                                source: "config_file".to_string(),
-                                detail: format!("S3/AWS deploy script: {name}"),
-                                confidence: DetectionConfidence::Medium,
-                            });
-                        }
-                    }
-                }
+    if scripts_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&scripts_dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if (name.contains("s3") || name.contains("aws") || name.contains("deploy"))
+                && let Ok(content) = std::fs::read_to_string(entry.path())
+                && (content.contains("s3 ") || content.contains("aws s3"))
+            {
+                signals.push(DetectedSignal {
+                    source: "config_file".to_string(),
+                    detail: format!("S3/AWS deploy script: {name}"),
+                    confidence: DetectionConfidence::Medium,
+                });
             }
         }
     }
@@ -435,10 +435,10 @@ fn determine_recommended_provider(env: &DetectedEnvironment) -> Option<HostingPr
     }
 
     // Default to GitHub Pages if git remote is GitHub
-    if let Some(ref url) = env.git_remote_url {
-        if url.contains("github") {
-            return Some(HostingProvider::GithubPages);
-        }
+    if let Some(ref url) = env.git_remote_url
+        && url.contains("github")
+    {
+        return Some(HostingProvider::GithubPages);
     }
 
     // No clear recommendation
@@ -722,6 +722,181 @@ mod tests {
                 .iter()
                 .any(|s| s.detail.contains("GitHub Actions workflow found")),
             "expected github workflow signal in detection output"
+        );
+    }
+
+    // ── Individual detection functions ───────────────────────────────
+
+    #[test]
+    fn detect_github_pages_empty_dir_no_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let signals = detect_github_pages(dir.path());
+        // No git, no workflows, no env → may be empty
+        // (GITHUB_REPOSITORY env var could leak from CI, so just check structure)
+        for s in &signals {
+            assert!(!s.source.is_empty());
+            assert!(!s.detail.is_empty());
+        }
+    }
+
+    #[test]
+    fn detect_github_pages_with_docs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        let signals = detect_github_pages(dir.path());
+        assert!(signals.iter().any(|s| s.detail.contains("docs/")));
+    }
+
+    #[test]
+    fn detect_github_pages_workflow_dir_without_pages_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("ci.yml"), "name: CI\njobs: {}").unwrap();
+        let signals = detect_github_pages(dir.path());
+        // .github/workflows/ exists but no pages-related workflow
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.detail.contains(".github/workflows/ directory exists"))
+        );
+    }
+
+    #[test]
+    fn detect_cloudflare_pages_with_wrangler() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("wrangler.toml"), "").unwrap();
+        let signals = detect_cloudflare_pages(dir.path());
+        assert!(signals.iter().any(|s| s.detail.contains("wrangler.toml")));
+    }
+
+    #[test]
+    fn detect_cloudflare_pages_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let signals = detect_cloudflare_pages(dir.path());
+        // Without CF env vars, should be empty or only env-based
+        for s in &signals {
+            assert!(!s.detail.is_empty());
+        }
+    }
+
+    #[test]
+    fn detect_netlify_with_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("netlify.toml"), "[build]").unwrap();
+        let signals = detect_netlify(dir.path());
+        assert!(signals.iter().any(|s| s.detail.contains("netlify.toml")));
+    }
+
+    #[test]
+    fn detect_netlify_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let signals = detect_netlify(dir.path());
+        for s in &signals {
+            assert!(!s.detail.is_empty());
+        }
+    }
+
+    #[test]
+    fn detect_s3_with_deploy_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        std::fs::write(scripts.join("deploy-s3.sh"), "aws s3 sync . s3://bucket").unwrap();
+        let signals = detect_s3(dir.path());
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.detail.contains("S3/AWS deploy script"))
+        );
+    }
+
+    #[test]
+    fn detect_s3_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let signals = detect_s3(dir.path());
+        for s in &signals {
+            assert!(!s.detail.is_empty());
+        }
+    }
+
+    #[test]
+    fn extract_github_repo_empty_string() {
+        assert_eq!(extract_github_repo(""), None);
+    }
+
+    #[test]
+    fn extract_github_repo_nested_path() {
+        assert_eq!(
+            extract_github_repo("https://github.com/org/repo/tree/main"),
+            Some("org/repo/tree/main".to_string())
+        );
+    }
+
+    #[test]
+    fn obscure_id_exact_boundary() {
+        // 9 chars → shows first 4
+        assert_eq!(obscure_id("123456789"), "1234***");
+    }
+
+    #[test]
+    fn detect_environment_signals_sorted_by_confidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = detect_environment(None, dir.path());
+        // Verify signals are sorted: High first, then Medium, then Low
+        let mut prev_order = 0u8;
+        for signal in &env.signals {
+            let order = confidence_order(signal.confidence);
+            assert!(
+                order >= prev_order,
+                "signals should be sorted by confidence (high to low)"
+            );
+            prev_order = order;
+        }
+    }
+
+    #[test]
+    fn determine_provider_github_env_takes_priority_over_git_remote() {
+        let env = DetectedEnvironment {
+            github_env: true,
+            git_remote_url: Some("https://github.com/owner/repo".to_string()),
+            ..Default::default()
+        };
+        // github_env flag should be checked before git remote fallback
+        assert_eq!(
+            determine_recommended_provider(&env),
+            Some(HostingProvider::GithubPages)
+        );
+    }
+
+    #[test]
+    fn determine_provider_cloudflare_beats_github() {
+        let env = DetectedEnvironment {
+            cloudflare_env: true,
+            github_env: true,
+            ..Default::default()
+        };
+        // Cloudflare has higher priority than GitHub
+        assert_eq!(
+            determine_recommended_provider(&env),
+            Some(HostingProvider::CloudflarePages)
+        );
+    }
+
+    #[test]
+    fn determine_provider_s3_with_script_signal() {
+        let env = DetectedEnvironment {
+            aws_env: true,
+            signals: vec![DetectedSignal {
+                source: "config_file".to_string(),
+                detail: "S3/AWS deploy script: deploy-s3.sh".to_string(),
+                confidence: DetectionConfidence::Medium,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            determine_recommended_provider(&env),
+            Some(HostingProvider::S3)
         );
     }
 }
