@@ -13,6 +13,7 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{
     Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, PackedRgba, Style,
 };
+use ftui_extras::charts::Sparkline;
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
@@ -2426,7 +2427,7 @@ impl MailScreen for SearchCockpitScreen {
                 &self.highlight_terms,
                 self.last_diagnostics.as_ref(),
                 rendered_body_override.as_deref(),
-                !matches!(self.focus, Focus::QueryBar),
+                matches!(self.focus, Focus::ResultList),
             );
         }
 
@@ -3597,6 +3598,49 @@ fn render_results(
         return;
     }
 
+    let mut list_area = inner;
+    if inner.height >= 5 {
+        let summary_area = Rect::new(inner.x, inner.y, inner.width, 1);
+        let radar_area = Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1);
+        list_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(2),
+            inner.width,
+            inner.height.saturating_sub(2),
+        );
+
+        let active = cursor.min(rows.len().saturating_sub(1));
+        let active_matches = rows[active].entry.match_count;
+        let total_matches: usize = rows.iter().map(|row| row.entry.match_count).sum();
+        let summary = format!(
+            "active:{}  row_matches:{}  total_matches:{}  visible_rows:{}",
+            active + 1,
+            active_matches,
+            total_matches,
+            list_area.height,
+        );
+        Paragraph::new(truncate_str(&summary, summary_area.width as usize))
+            .style(crate::tui_theme::text_hint(&tp))
+            .render(summary_area, frame);
+
+        let density = rows
+            .iter()
+            .take(80)
+            .map(|row| {
+                if row.entry.match_count == 0 {
+                    0.25
+                } else {
+                    f64::from(u32::try_from(row.entry.match_count).unwrap_or(u32::MAX))
+                }
+            })
+            .collect::<Vec<_>>();
+        if !density.is_empty() && radar_area.width > 0 && radar_area.height > 0 {
+            Sparkline::new(&density)
+                .style(Style::default().fg(tp.status_accent))
+                .render(radar_area, frame);
+        }
+    }
+
     // Render using VirtualizedList for efficient scrolling
     let list = VirtualizedList::new(rows)
         .style(Style::default())
@@ -3608,7 +3652,7 @@ fn render_results(
         )
         .show_scrollbar(true);
 
-    list.render(inner, frame, list_state);
+    list.render(list_area, frame, list_state);
 }
 
 #[allow(clippy::cast_possible_truncation)]

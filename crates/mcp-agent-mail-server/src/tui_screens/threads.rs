@@ -1991,7 +1991,7 @@ fn render_thread_list(
     let visible_height = content_inner.height as usize;
 
     if threads.is_empty() {
-        let p = Paragraph::new("  No threads found.");
+        let p = Paragraph::new(" No threads found.").style(crate::tui_theme::text_hint(&tp));
         p.render(content_inner, frame);
         return;
     }
@@ -2245,7 +2245,7 @@ fn render_thread_list(
     }
 
     let text = Text::from_lines(text_lines);
-    let p = Paragraph::new(text);
+    let p = Paragraph::new(text).wrap(ftui::text::WrapMode::None);
     p.render(content_inner, frame);
 }
 
@@ -2277,7 +2277,7 @@ fn render_thread_detail(
             let focus_tag = if focused { "" } else { " (inactive)" };
             format!(
                 "Thread: {} ({} msgs){focus_tag}",
-                truncate_str(&t.thread_id, 30),
+                truncate_display_width(&t.thread_id, 30),
                 t.message_count,
             )
         },
@@ -2303,7 +2303,7 @@ fn render_thread_detail(
             Some(_) => "  No messages in this thread.",
             None => "Select a thread to view conversation.",
         };
-        let p = Paragraph::new(text);
+        let p = Paragraph::new(text).style(crate::tui_theme::text_hint(&tp));
         p.render(inner, frame);
         return;
     }
@@ -2312,7 +2312,9 @@ fn render_thread_detail(
     let mut tree_rows = Vec::new();
     flatten_thread_tree_rows(&tree_items, collapsed_tree_ids, &mut tree_rows);
     if tree_rows.is_empty() {
-        Paragraph::new("  No hierarchy available.").render(inner, frame);
+        Paragraph::new("  No hierarchy available.")
+            .style(crate::tui_theme::text_hint(&tp))
+            .render(inner, frame);
         return;
     }
 
@@ -2337,7 +2339,7 @@ fn render_thread_detail(
         header_lines.push(Line::from_spans([
             Span::styled("Thread: ", crate::tui_theme::text_meta(&tp)),
             Span::styled(
-                truncate_str(&t.thread_id, inner.width.saturating_sub(34) as usize),
+                truncate_display_width(&t.thread_id, inner.width.saturating_sub(34) as usize),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::styled(
@@ -2365,7 +2367,7 @@ fn render_thread_detail(
             header_lines.push(Line::from_spans([
                 Span::styled("Agents: ", crate::tui_theme::text_meta(&tp)),
                 Span::styled(
-                    truncate_str(&t.participant_names, inner.width.saturating_sub(8) as usize),
+                    truncate_display_width(&t.participant_names, inner.width.saturating_sub(8) as usize),
                     Style::default().fg(tp.text_secondary),
                 ),
             ]));
@@ -2407,7 +2409,10 @@ fn render_thread_detail(
         inner.width,
         inner.height.saturating_sub(header_height),
     );
-    Paragraph::new(Text::from_lines(header_lines)).render(header_area, frame);
+    Paragraph::new(Text::from_lines(header_lines))
+        .style(crate::tui_theme::text_primary(&tp))
+        .wrap(ftui::text::WrapMode::None)
+        .render(header_area, frame);
     if body_area.width < 10 || body_area.height == 0 {
         return;
     }
@@ -2493,7 +2498,7 @@ fn render_thread_detail(
                 .saturating_sub(marker_len)
                 .saturating_sub(ftui::text::display_width(indent.as_str()))
                 .saturating_sub(1);
-            let label = truncate_str(&row.label, available);
+            let label = truncate_display_width(&row.label, available);
             let mut line = Line::from_spans([
                 Span::styled(marker.to_string(), crate::tui_theme::text_meta(&tp)),
                 Span::styled(indent, crate::tui_theme::text_meta(&tp)),
@@ -2511,7 +2516,9 @@ fn render_thread_detail(
             }
             lines.push(line);
         }
-        Paragraph::new(Text::from_lines(lines)).render(tree_inner, frame);
+        Paragraph::new(Text::from_lines(lines))
+            .wrap(ftui::text::WrapMode::None)
+            .render(tree_inner, frame);
     }
 
     let preview_title_raw = if focused && !tree_focus {
@@ -2576,7 +2583,7 @@ fn render_thread_detail(
     if !selected_message.to_agents.is_empty() {
         preview_header_spans.push(Span::raw(format!(
             " -> {}",
-            truncate_str(
+            truncate_display_width(
                 &selected_message.to_agents,
                 preview_content.width.saturating_sub(24) as usize
             )
@@ -2598,7 +2605,7 @@ fn render_thread_detail(
         preview_lines.push(Line::from_spans([
             Span::styled("Subject: ", crate::tui_theme::text_meta(&tp)),
             Span::styled(
-                truncate_str(
+                truncate_display_width(
                     &selected_message.subject,
                     preview_content.width.saturating_sub(9) as usize,
                 ),
@@ -2626,6 +2633,7 @@ fn render_thread_detail(
 
     let scroll_rows = u16::try_from(scroll).unwrap_or(u16::MAX);
     Paragraph::new(Text::from_lines(preview_lines))
+        .style(crate::tui_theme::text_primary(&tp))
         .wrap(ftui::text::WrapMode::Word)
         .scroll((scroll_rows, 0))
         .render(preview_content, frame);
@@ -2796,7 +2804,7 @@ fn build_thread_tree_item_node(
     let mut node = crate::tui_widgets::ThreadTreeItem::new(
         message.id,
         message.from_agent.clone(),
-        truncate_str(&message.subject, 60),
+        truncate_display_width(&message.subject, 60),
         iso_compact_time(&message.timestamp_iso).to_string(),
         message.is_unread,
         message.ack_required,
