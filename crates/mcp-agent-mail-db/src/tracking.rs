@@ -640,8 +640,7 @@ fn extract_table(sql: &str) -> Option<String> {
             let raw = m.as_str();
             // Take last segment after schema dots, then strip quote chars
             let last_segment = SCHEMA_DOT.split(raw).last().unwrap_or(raw);
-            let table =
-                last_segment.trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']');
+            let table = last_segment.trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']');
             if table.is_empty() {
                 return None;
             }
@@ -1124,6 +1123,71 @@ mod tests {
         assert!(dict.get("slow_queries").is_some());
         // Must not have extra keys.
         assert_eq!(dict.as_object().unwrap().len(), 5);
+    }
+
+    // ── query_timer / elapsed_us / global_tracker / record_query ───────
+
+    #[test]
+    fn query_timer_returns_instant_before_now() {
+        let t = query_timer();
+        // A small sleep to ensure elapsed > 0
+        std::thread::sleep(std::time::Duration::from_micros(100));
+        let us = elapsed_us(t);
+        assert!(us > 0, "elapsed_us should be > 0 after sleep");
+    }
+
+    #[test]
+    fn elapsed_us_is_monotonic() {
+        let t = query_timer();
+        let us1 = elapsed_us(t);
+        let us2 = elapsed_us(t);
+        assert!(us2 >= us1, "elapsed_us should be monotonically non-decreasing");
+    }
+
+    #[test]
+    fn global_tracker_is_accessible_and_consistent() {
+        let gt = global_tracker();
+        // Should not panic and should return a valid reference
+        let _enabled = gt.is_enabled();
+        // Calling it twice should return the same pointer
+        let gt2 = global_tracker();
+        assert!(std::ptr::eq(gt, gt2), "global_tracker should return the same static reference");
+    }
+
+    #[test]
+    fn record_query_routes_to_global_when_no_active() {
+        // Enable the global tracker, record a query, check it was counted
+        let gt = global_tracker();
+        let was_enabled = gt.is_enabled();
+        gt.enable(None);
+        let before = gt.snapshot().total;
+
+        record_query("SELECT * FROM messages WHERE id = 1", 100);
+
+        let after = gt.snapshot().total;
+        assert!(
+            after > before,
+            "record_query should increment global tracker total: before={before}, after={after}"
+        );
+
+        // Restore previous state
+        if !was_enabled {
+            gt.disable();
+        }
+    }
+
+    #[test]
+    fn record_query_routes_to_active_tracker_when_set() {
+        let local = Arc::new(QueryTracker::new());
+        local.enable(None);
+        let _guard = set_active_tracker(local.clone());
+
+        record_query("INSERT INTO agents (name) VALUES ('test')", 500);
+
+        assert_eq!(
+            local.snapshot().total, 1,
+            "record_query should route to active tracker"
+        );
     }
 
     // ── Fixture-driven table extraction tests ──────────────────────────

@@ -1042,6 +1042,46 @@ mod tests {
         assert!(table_names.contains(&"messages".to_string()));
     }
 
+    // ── DbPoolConfig coverage ─────────────────────────────────────────
+
+    #[test]
+    fn from_env_defaults_use_auto_pool_size() {
+        // When no DATABASE_POOL_SIZE env is set, from_env should use auto_pool_size
+        let config = DbPoolConfig::from_env();
+        let (auto_min, auto_max) = auto_pool_size();
+        assert_eq!(config.min_connections, auto_min);
+        assert_eq!(config.max_connections, auto_max);
+        assert_eq!(config.max_lifetime_ms, DEFAULT_POOL_RECYCLE_MS);
+        assert!(config.run_migrations);
+    }
+
+    #[test]
+    fn sqlite_path_memory_returns_memory_string() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.sqlite_path().unwrap(), ":memory:");
+    }
+
+    #[test]
+    fn sqlite_path_file_returns_path() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///./storage.sqlite3".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.sqlite_path().unwrap(), "./storage.sqlite3");
+    }
+
+    #[test]
+    fn sqlite_path_invalid_url_returns_error() {
+        let config = DbPoolConfig {
+            database_url: "postgres://localhost/db".to_string(),
+            ..Default::default()
+        };
+        assert!(config.sqlite_path().is_err());
+    }
+
     /// Verify pool defaults are sized for 1000+ concurrent agent workloads.
     ///
     /// The defaults were upgraded from the legacy Python values (3+4=7) to

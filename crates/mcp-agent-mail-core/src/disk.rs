@@ -429,6 +429,67 @@ mod tests {
         assert!(sample.errors.is_empty());
     }
 
+    // ── DiskPressure enum coverage ──────────────────────────────────────
+
+    #[test]
+    fn disk_pressure_as_u64_roundtrip() {
+        for &(variant, expected) in &[
+            (DiskPressure::Ok, 0u64),
+            (DiskPressure::Warning, 1),
+            (DiskPressure::Critical, 2),
+            (DiskPressure::Fatal, 3),
+        ] {
+            assert_eq!(variant.as_u64(), expected);
+            assert_eq!(DiskPressure::from_u64(expected), variant);
+        }
+    }
+
+    #[test]
+    fn disk_pressure_from_u64_unknown_maps_to_ok() {
+        // Any value outside 1..=3 maps to Ok (the catch-all)
+        assert_eq!(DiskPressure::from_u64(4), DiskPressure::Ok);
+        assert_eq!(DiskPressure::from_u64(255), DiskPressure::Ok);
+        assert_eq!(DiskPressure::from_u64(u64::MAX), DiskPressure::Ok);
+    }
+
+    #[test]
+    fn disk_pressure_label_covers_all_variants() {
+        assert_eq!(DiskPressure::Ok.label(), "ok");
+        assert_eq!(DiskPressure::Warning.label(), "warning");
+        assert_eq!(DiskPressure::Critical.label(), "critical");
+        assert_eq!(DiskPressure::Fatal.label(), "fatal");
+    }
+
+    #[test]
+    fn disk_free_bytes_succeeds_on_existing_dir() {
+        let dir = tempdir().unwrap();
+        let bytes = disk_free_bytes(dir.path());
+        assert!(bytes.is_ok(), "disk_free_bytes should succeed for existing dir");
+        assert!(bytes.unwrap() > 0, "available space should be > 0");
+    }
+
+    #[test]
+    fn disk_free_bytes_fails_on_nonexistent_path() {
+        let result = disk_free_bytes(Path::new("/nonexistent_path_that_does_not_exist_12345"));
+        assert!(result.is_err(), "disk_free_bytes should fail for nonexistent path");
+    }
+
+    #[test]
+    fn classify_pressure_all_zeros_is_ok() {
+        // When all thresholds are 0, everything is Ok
+        assert_eq!(classify_pressure(0, 0, 0, 0), DiskPressure::Ok);
+        assert_eq!(classify_pressure(1_000_000, 0, 0, 0), DiskPressure::Ok);
+    }
+
+    #[test]
+    fn classify_pressure_saturating_mul_no_panic() {
+        // Huge MB values should not overflow due to saturating_mul
+        assert_eq!(
+            classify_pressure(0, u64::MAX, u64::MAX, u64::MAX),
+            DiskPressure::Fatal
+        );
+    }
+
     #[test]
     fn sample_and_record_updates_disk_metrics() {
         let tmp = tempdir().expect("tempdir should be created");
