@@ -1532,4 +1532,114 @@ mod tests {
             "10K atomic loads should be <50ms; took {elapsed:?}"
         );
     }
+
+    // ── Inbox Stats Cache ───────────────────────────────────────────
+
+    fn make_inbox_stats(agent_id: i64, total: i64, unread: i64) -> InboxStatsRow {
+        InboxStatsRow {
+            agent_id,
+            total_count: total,
+            unread_count: unread,
+            ack_pending_count: 0,
+            last_message_ts: Some(1_000_000),
+        }
+    }
+
+    #[test]
+    fn inbox_stats_put_and_get() {
+        let cache = ReadCache::new_for_testing();
+        let stats = make_inbox_stats(42, 10, 3);
+        cache.put_inbox_stats(&stats);
+        let got = cache.get_inbox_stats(42);
+        assert!(got.is_some());
+        let got = got.unwrap();
+        assert_eq!(got.agent_id, 42);
+        assert_eq!(got.total_count, 10);
+        assert_eq!(got.unread_count, 3);
+    }
+
+    #[test]
+    fn inbox_stats_miss_returns_none() {
+        let cache = ReadCache::new_for_testing();
+        assert!(cache.get_inbox_stats(999).is_none());
+    }
+
+    #[test]
+    fn inbox_stats_invalidate_removes_entry() {
+        let cache = ReadCache::new_for_testing();
+        let stats = make_inbox_stats(42, 10, 3);
+        cache.put_inbox_stats(&stats);
+        assert!(cache.get_inbox_stats(42).is_some());
+        cache.invalidate_inbox_stats(42);
+        assert!(cache.get_inbox_stats(42).is_none());
+    }
+
+    #[test]
+    fn inbox_stats_scoped_isolation() {
+        let cache = ReadCache::new_for_testing();
+        let stats_a = make_inbox_stats(42, 10, 3);
+        let mut stats_b = make_inbox_stats(42, 20, 5);
+        stats_b.agent_id = 42; // same agent_id, different scope
+        cache.put_inbox_stats_scoped("scope-a", &stats_a);
+        cache.put_inbox_stats_scoped("scope-b", &stats_b);
+
+        let got_a = cache.get_inbox_stats_scoped("scope-a", 42);
+        let got_b = cache.get_inbox_stats_scoped("scope-b", 42);
+        assert!(got_a.is_some());
+        assert!(got_b.is_some());
+        assert_eq!(got_a.unwrap().total_count, 10);
+        assert_eq!(got_b.unwrap().total_count, 20);
+    }
+
+    #[test]
+    fn inbox_stats_scoped_invalidate_only_affects_scope() {
+        let cache = ReadCache::new_for_testing();
+        let stats = make_inbox_stats(42, 10, 3);
+        cache.put_inbox_stats_scoped("scope-a", &stats);
+        cache.put_inbox_stats_scoped("scope-b", &stats);
+
+        cache.invalidate_inbox_stats_scoped("scope-a", 42);
+        assert!(cache.get_inbox_stats_scoped("scope-a", 42).is_none());
+        assert!(cache.get_inbox_stats_scoped("scope-b", 42).is_some());
+    }
+
+    #[test]
+    fn inbox_stats_default_scope_matches_empty_string() {
+        let cache = ReadCache::new_for_testing();
+        let stats = make_inbox_stats(42, 10, 3);
+        // put via default (empty scope)
+        cache.put_inbox_stats(&stats);
+        // get via explicit empty scope should match
+        let got = cache.get_inbox_stats_scoped("", 42);
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().total_count, 10);
+    }
+
+    #[test]
+    fn inbox_stats_overwrite_updates_value() {
+        let cache = ReadCache::new_for_testing();
+        let stats1 = make_inbox_stats(42, 10, 3);
+        cache.put_inbox_stats(&stats1);
+
+        let stats2 = make_inbox_stats(42, 20, 7);
+        cache.put_inbox_stats(&stats2);
+
+        let got = cache.get_inbox_stats(42).unwrap();
+        assert_eq!(got.total_count, 20);
+        assert_eq!(got.unread_count, 7);
+    }
+
+    #[test]
+    fn inbox_stats_different_agents_independent() {
+        let cache = ReadCache::new_for_testing();
+        cache.put_inbox_stats(&make_inbox_stats(1, 10, 3));
+        cache.put_inbox_stats(&make_inbox_stats(2, 20, 5));
+
+        assert_eq!(cache.get_inbox_stats(1).unwrap().total_count, 10);
+        assert_eq!(cache.get_inbox_stats(2).unwrap().total_count, 20);
+
+        cache.invalidate_inbox_stats(1);
+        assert!(cache.get_inbox_stats(1).is_none());
+        assert!(cache.get_inbox_stats(2).is_some());
+    }
 }
