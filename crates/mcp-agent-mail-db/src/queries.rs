@@ -7206,6 +7206,225 @@ mod tests {
         });
     }
 
+    // ─── rebuild_indexes removal regression tests (br-3h13.16.5) ────────────
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn write_ops_succeed_without_reindex_even_with_data_issues() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("no_reindex_regression.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("pragmas");
+        init_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("base schema");
+
+        // Insert a project and agent for project=1
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj1', '/tmp/proj1', 0)",
+            )
+            .expect("insert proj1");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents (project_id, name, program, model, task_description, \
+                 inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 'RedFox', 'cc', 'opus', '', 0, 0, 'auto', 'auto')",
+            )
+            .expect("insert agent");
+
+        // Simulate data issue: drop the NOCASE unique index, then insert
+        // case-duplicate agents in project=2 (a different project).
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj2', '/tmp/proj2', 0)",
+            )
+            .expect("insert proj2");
+        init_conn
+            .execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+            .ok();
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents (project_id, name, program, model, task_description, \
+                 inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (2, 'BlueLake', 'cc', 'opus', '', 0, 0, 'auto', 'auto')",
+            )
+            .expect("insert BlueLake proj2");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents (project_id, name, program, model, task_description, \
+                 inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (2, 'bluelake', 'cc', 'opus', '', 0, 0, 'auto', 'auto')",
+            )
+            .expect("insert bluelake (case dup) proj2");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            // ensure_project for a NEW project should work despite proj2 data issues
+            let proj3 = ensure_project(&cx, &pool, "/tmp/proj3")
+                .await
+                .into_result()
+                .expect("ensure_project should succeed without REINDEX");
+            assert!(proj3.id.is_some());
+
+            // register_agent on proj1 should work
+            let agent = register_agent(
+                &cx,
+                &pool,
+                1,
+                "RedFox",
+                "claude-code",
+                "opus-4.6",
+                Some("regression test"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register_agent should succeed without REINDEX");
+            assert_eq!(agent.name, "RedFox");
+
+            // create_agent on proj3 should work
+            let proj3_id = proj3.id.unwrap();
+            let new_agent = create_agent(
+                &cx,
+                &pool,
+                proj3_id,
+                "GoldHawk",
+                "codex",
+                "gpt-5.2",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("create_agent should succeed without REINDEX");
+            assert_eq!(new_agent.name, "GoldHawk");
+
+            // Verify all data is queryable via indexes
+            let fetched = get_agent(&cx, &pool, 1, "RedFox")
+                .await
+                .into_result()
+                .expect("index lookup should work without REINDEX");
+            assert_eq!(fetched.program, "claude-code");
+        });
+    }
+
+    #[test]
+    fn commit_tx_and_contact_policy_ops_work_without_reindex() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("no_reindex_ops.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("pragmas");
+        init_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            // Setup: create project + agent
+            let project = ensure_project(&cx, &pool, "/tmp/commit-ops-test")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.unwrap();
+
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "SwiftPeak",
+                "cc",
+                "opus",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.unwrap();
+
+            // Test set_agent_contact_policy
+            let updated = set_agent_contact_policy(&cx, &pool, agent_id, "open")
+                .await
+                .into_result()
+                .expect("set_agent_contact_policy should succeed without REINDEX");
+            assert_eq!(updated.contact_policy, "open");
+
+            // Test set_agent_contact_policy_by_name
+            let updated2 =
+                set_agent_contact_policy_by_name(&cx, &pool, project_id, "SwiftPeak", "closed")
+                    .await
+                    .into_result()
+                    .expect("set_agent_contact_policy_by_name should succeed without REINDEX");
+            assert_eq!(updated2.contact_policy, "closed");
+
+            // Test flush_deferred_touches (even when cache is empty, should not error)
+            flush_deferred_touches(&cx, &pool)
+                .await
+                .into_result()
+                .expect("flush_deferred_touches should succeed without REINDEX");
+
+            // Seed the touch cache and verify flush works
+            crate::cache::read_cache().enqueue_touch(agent_id, now_micros());
+            flush_deferred_touches(&cx, &pool)
+                .await
+                .into_result()
+                .expect("flush_deferred_touches with pending touch should succeed");
+
+            // Verify the agent's last_active_ts was updated
+            let refetched = get_agent(&cx, &pool, project_id, "SwiftPeak")
+                .await
+                .into_result()
+                .expect("refetch agent");
+            assert!(
+                refetched.last_active_ts > 0,
+                "last_active_ts should be updated after touch flush"
+            );
+        });
+    }
+
     // ─── Property tests ───────────────────────────────────────────────────────
 
     mod proptest_queries {
