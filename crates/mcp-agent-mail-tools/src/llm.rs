@@ -1459,7 +1459,7 @@ mod tests {
         let messages: Vec<_> = (0..MAX_MESSAGES_FOR_LLM + 5)
             .map(|i| {
                 (
-                    i as i64,
+                    i64::try_from(i).unwrap(),
                     "Agent".to_string(),
                     "Subj".to_string(),
                     "body".to_string(),
@@ -1471,7 +1471,7 @@ mod tests {
         let last_included = MAX_MESSAGES_FOR_LLM - 1;
         assert!(prompt.contains(&format!("Message {last_included}")));
         // Should NOT contain the first excluded message
-        assert!(!prompt.contains(&format!("Message {}", MAX_MESSAGES_FOR_LLM)));
+        assert!(!prompt.contains(&format!("Message {MAX_MESSAGES_FOR_LLM}")));
     }
 
     // -- multi_thread_user_prompt edge cases --
@@ -1495,7 +1495,7 @@ mod tests {
         // Should include up to MAX_KEY_POINTS_PER_THREAD
         let last_included = MAX_KEY_POINTS_PER_THREAD - 1;
         assert!(prompt.contains(&format!("point-{last_included}")));
-        assert!(!prompt.contains(&format!("point-{}", MAX_KEY_POINTS_PER_THREAD)));
+        assert!(!prompt.contains(&format!("point-{MAX_KEY_POINTS_PER_THREAD}")));
     }
 
     #[test]
@@ -1508,6 +1508,6 @@ mod tests {
         let prompt = multi_thread_user_prompt(&threads);
         let last_included = MAX_ACTIONS_PER_THREAD - 1;
         assert!(prompt.contains(&format!("action-{last_included}")));
-        assert!(!prompt.contains(&format!("action-{}", MAX_ACTIONS_PER_THREAD)));
+        assert!(!prompt.contains(&format!("action-{MAX_ACTIONS_PER_THREAD}")));
     }
 }
