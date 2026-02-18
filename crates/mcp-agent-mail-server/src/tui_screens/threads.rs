@@ -57,9 +57,12 @@ const THREAD_SPLIT_WIDTH_THRESHOLD: u16 = 80;
 const THREAD_MAIN_PANE_GAP_THRESHOLD: u16 = 84;
 const THREAD_STACKED_MIN_HEIGHT: u16 = 14;
 const THREAD_STACKED_LIST_PERCENT: u16 = 42;
+const THREAD_STACKED_SPLITTER_HEIGHT: u16 = 1;
 const THREAD_COMPACT_HINT_MIN_HEIGHT: u16 = 7;
 const THREAD_DETAIL_PANE_GAP_THRESHOLD: u16 = 72;
 const THREAD_DETAIL_MIN_PREVIEW_WIDTH: u16 = 16;
+const THREAD_DETAIL_MIN_BODY_HEIGHT: u16 = 6;
+const THREAD_COLLAPSED_PREVIEW_LINES: usize = 3;
 
 /// Color palette for deterministic per-agent coloring in thread cards.
 fn agent_color_palette() -> [PackedRgba; 8] {
@@ -124,6 +127,66 @@ fn clear_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
                 *cell = ftui::Cell::from_char(' ');
                 cell.bg = bg;
             }
+        }
+    }
+}
+
+fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, active: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let splitter_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.62);
+    clear_rect(frame, area, splitter_bg);
+
+    let rail_color = if active {
+        crate::tui_theme::lerp_color(tp.panel_border_focused, tp.selection_indicator, 0.32)
+    } else {
+        tp.panel_border_dim
+    };
+    let knob_color = if active {
+        tp.selection_indicator
+    } else {
+        tp.text_muted
+    };
+
+    if vertical {
+        let x = area.x.saturating_add(area.width / 2);
+        let grip_len = area.height.min(5).max(1);
+        let start_y = area
+            .y
+            .saturating_add(area.height.saturating_sub(grip_len) / 2);
+        for y in start_y..start_y.saturating_add(grip_len) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char('•');
+                cell.fg = rail_color;
+                cell.bg = splitter_bg;
+            }
+        }
+        let knob_y = start_y.saturating_add(grip_len / 2);
+        if let Some(cell) = frame.buffer.get_mut(x, knob_y) {
+            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
+            cell.fg = knob_color;
+            cell.bg = splitter_bg;
+        }
+    } else {
+        let y = area.y.saturating_add(area.height / 2);
+        let grip_len = area.width.min(5).max(1);
+        let start_x = area
+            .x
+            .saturating_add(area.width.saturating_sub(grip_len) / 2);
+        for x in start_x..start_x.saturating_add(grip_len) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char('•');
+                cell.fg = rail_color;
+                cell.bg = splitter_bg;
+            }
+        }
+        let knob_x = start_x.saturating_add(grip_len / 2);
+        if let Some(cell) = frame.buffer.get_mut(knob_x, y) {
+            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
+            cell.fg = knob_color;
+            cell.bg = splitter_bg;
         }
     }
 }
@@ -1377,16 +1440,16 @@ impl MailScreen for ThreadExplorerScreen {
                 content_area.height,
             );
             if pane_gap > 0 {
-                clear_rect(
-                    frame,
-                    Rect::new(
-                        content_area.x.saturating_add(list_width),
-                        content_area.y,
-                        pane_gap,
-                        content_area.height,
-                    ),
-                    tp.bg_deep,
+                let splitter_area = Rect::new(
+                    content_area.x.saturating_add(list_width),
+                    content_area.y,
+                    pane_gap,
+                    content_area.height,
                 );
+                clear_rect(frame, splitter_area, tp.bg_deep);
+                if !self.threads.is_empty() {
+                    render_splitter_handle(frame, splitter_area, true, true);
+                }
             }
             self.last_list_area.set(list_area);
             self.last_detail_area.set(detail_area);
@@ -1431,6 +1494,12 @@ impl MailScreen for ThreadExplorerScreen {
             // Narrow but tall: stacked fallback preserves both list and detail.
             let min_list_h: u16 = 4;
             let min_detail_h: u16 = 6;
+            let stack_gap = u16::from(
+                content_area.height
+                    >= min_list_h
+                        .saturating_add(min_detail_h)
+                        .saturating_add(THREAD_STACKED_SPLITTER_HEIGHT),
+            );
             let raw_list_h = content_area
                 .height
                 .saturating_mul(THREAD_STACKED_LIST_PERCENT)
@@ -1439,18 +1508,35 @@ impl MailScreen for ThreadExplorerScreen {
                 min_list_h,
                 content_area
                     .height
-                    .saturating_sub(min_detail_h)
+                    .saturating_sub(min_detail_h.saturating_add(stack_gap))
                     .max(min_list_h),
             );
-            let detail_h = content_area.height.saturating_sub(list_h);
+            let detail_h = content_area
+                .height
+                .saturating_sub(list_h.saturating_add(stack_gap));
 
             let list_area = Rect::new(content_area.x, content_area.y, content_area.width, list_h);
             let detail_area = Rect::new(
                 content_area.x,
-                content_area.y + list_h,
+                content_area
+                    .y
+                    .saturating_add(list_h)
+                    .saturating_add(stack_gap),
                 content_area.width,
                 detail_h,
             );
+            if stack_gap > 0 {
+                let splitter_area = Rect::new(
+                    content_area.x,
+                    content_area.y.saturating_add(list_h),
+                    content_area.width,
+                    stack_gap,
+                );
+                clear_rect(frame, splitter_area, tp.bg_deep);
+                if !self.threads.is_empty() {
+                    render_splitter_handle(frame, splitter_area, false, true);
+                }
+            }
             self.last_list_area.set(list_area);
             self.last_detail_area.set(detail_area);
 
@@ -1885,7 +1971,7 @@ fn render_filter_bar(
     } else {
         // Active state
         let cursor = if editing { "_" } else { "" };
-        let value = truncate_str(
+        let value = truncate_display_width(
             &format!("{text}{cursor}"),
             area.width.saturating_sub(10) as usize,
         );
@@ -1916,7 +2002,7 @@ fn render_compact_focus_hint(
         }
     };
 
-    Paragraph::new(truncate_str(hint, area.width as usize))
+    Paragraph::new(truncate_display_width(hint, area.width as usize))
         .style(crate::tui_theme::text_hint(&tp))
         .render(area, frame);
 }
@@ -1978,7 +2064,14 @@ fn render_thread_list(
     // Clear interior cells each frame to avoid stale glyphs from previous layouts.
     clear_rect(frame, inner, tp.panel_bg);
 
-    let content_inner = if inner.width > 2 {
+    let content_inner = if inner.width > 2 && inner.height > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y.saturating_add(1),
+            inner.width.saturating_sub(2),
+            inner.height.saturating_sub(1),
+        )
+    } else if inner.width > 2 {
         Rect::new(
             inner.x.saturating_add(1),
             inner.y,
@@ -2214,11 +2307,14 @@ fn render_thread_list(
             let denom = f64::from(u32::try_from(threads.len()).unwrap_or(u32::MAX));
             threads.iter().map(|t| t.velocity_msg_per_hr).sum::<f64>() / denom
         };
-        let summary = format!(
-            "selected:{}  unread:{}  escalations:{}  avg:{avg_velocity:.1}/hr",
-            truncate_display_width(&threads[cursor_clamped].thread_id, 20),
-            total_unread,
-            escalated,
+        let summary = truncate_display_width(
+            &format!(
+                "selected:{}  unread:{}  escalations:{}  avg:{avg_velocity:.1}/hr",
+                truncate_display_width(&threads[cursor_clamped].thread_id, 20),
+                total_unread,
+                escalated,
+            ),
+            inner_w.saturating_sub(2),
         );
         text_lines.push(Line::from_spans([
             Span::styled("  ", Style::default()),
@@ -2238,6 +2334,7 @@ fn render_thread_list(
                 )
             )
         };
+        let participant_line = truncate_display_width(&participant_line, inner_w.saturating_sub(2));
         text_lines.push(Line::from_spans([
             Span::styled("  ", Style::default()),
             Span::styled(participant_line, crate::tui_theme::text_hint(&tp)),
@@ -2297,6 +2394,27 @@ fn render_thread_detail(
     }
     // Clear interior cells each frame to avoid stale tree/border glyph artifacts.
     clear_rect(frame, inner, tp.panel_bg);
+    let content_inner = if inner.width > 2 && inner.height > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y.saturating_add(1),
+            inner.width.saturating_sub(2),
+            inner.height.saturating_sub(1),
+        )
+    } else if inner.width > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        )
+    } else {
+        inner
+    };
+    if content_inner.height == 0 || content_inner.width == 0 {
+        return;
+    }
+    clear_rect(frame, content_inner, tp.panel_bg);
 
     if messages.is_empty() {
         let text = match thread {
@@ -2304,7 +2422,7 @@ fn render_thread_detail(
             None => "Select a thread to view conversation.",
         };
         let p = Paragraph::new(text).style(crate::tui_theme::text_hint(&tp));
-        p.render(inner, frame);
+        p.render(content_inner, frame);
         return;
     }
 
@@ -2314,7 +2432,7 @@ fn render_thread_detail(
     if tree_rows.is_empty() {
         Paragraph::new("  No hierarchy available.")
             .style(crate::tui_theme::text_hint(&tp))
-            .render(inner, frame);
+            .render(content_inner, frame);
         return;
     }
 
@@ -2339,7 +2457,10 @@ fn render_thread_detail(
         header_lines.push(Line::from_spans([
             Span::styled("Thread: ", crate::tui_theme::text_meta(&tp)),
             Span::styled(
-                truncate_display_width(&t.thread_id, inner.width.saturating_sub(34) as usize),
+                truncate_display_width(
+                    &t.thread_id,
+                    content_inner.width.saturating_sub(34) as usize,
+                ),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::styled(
@@ -2369,7 +2490,7 @@ fn render_thread_detail(
                 Span::styled(
                     truncate_display_width(
                         &t.participant_names,
-                        inner.width.saturating_sub(8) as usize,
+                        content_inner.width.saturating_sub(8) as usize,
                     ),
                     Style::default().fg(tp.text_secondary),
                 ),
@@ -2404,18 +2525,71 @@ fn render_thread_detail(
         ]));
     }
 
-    let header_height = header_lines.len().min(inner.height as usize).min(5) as u16;
-    let header_area = Rect::new(inner.x, inner.y, inner.width, header_height);
-    let body_area = Rect::new(
-        inner.x,
-        inner.y + header_height,
-        inner.width,
-        inner.height.saturating_sub(header_height),
+    let wrap_width = usize::from(content_inner.width.max(1));
+    let header_rows_needed = header_lines
+        .iter()
+        .map(|line| {
+            let plain = line.to_plain_text();
+            let width = ftui::text::display_width(plain.as_str()).max(1);
+            width.div_ceil(wrap_width).max(1)
+        })
+        .sum::<usize>()
+        .max(1);
+    let max_header_height = content_inner
+        .height
+        .saturating_sub(THREAD_DETAIL_MIN_BODY_HEIGHT)
+        .max(1);
+    let header_height = u16::try_from(header_rows_needed)
+        .unwrap_or(u16::MAX)
+        .min(max_header_height)
+        .min(content_inner.height);
+    let header_gap = u16::from(
+        content_inner.height > header_height.saturating_add(THREAD_DETAIL_MIN_BODY_HEIGHT),
     );
-    Paragraph::new(Text::from_lines(header_lines))
-        .style(crate::tui_theme::text_primary(&tp))
-        .wrap(ftui::text::WrapMode::None)
-        .render(header_area, frame);
+    let header_area = Rect::new(
+        content_inner.x,
+        content_inner.y,
+        content_inner.width,
+        header_height,
+    );
+    let body_area = Rect::new(
+        content_inner.x,
+        content_inner
+            .y
+            .saturating_add(header_height)
+            .saturating_add(header_gap),
+        content_inner.width,
+        content_inner
+            .height
+            .saturating_sub(header_height)
+            .saturating_sub(header_gap),
+    );
+    if header_area.height > 0 {
+        Paragraph::new(Text::from_lines(header_lines))
+            .style(crate::tui_theme::text_primary(&tp))
+            .wrap(ftui::text::WrapMode::Word)
+            .render(header_area, frame);
+    }
+    if header_gap > 0 {
+        let separator = Rect::new(
+            content_inner.x,
+            content_inner.y.saturating_add(header_height),
+            content_inner.width,
+            header_gap,
+        );
+        clear_rect(frame, separator, tp.panel_bg);
+        let center_x = separator.x.saturating_add(separator.width / 2);
+        let center_y = separator.y.saturating_add(separator.height / 2);
+        if let Some(cell) = frame.buffer.get_mut(center_x, center_y) {
+            *cell = ftui::Cell::from_char('•');
+            cell.fg = if focused {
+                tp.panel_border_focused
+            } else {
+                tp.panel_border_dim
+            };
+            cell.bg = tp.panel_bg;
+        }
+    }
     if body_area.width < 10 || body_area.height == 0 {
         return;
     }
@@ -2441,16 +2615,14 @@ fn render_thread_detail(
         body_area.height,
     );
     if pane_gap > 0 {
-        clear_rect(
-            frame,
-            Rect::new(
-                body_area.x.saturating_add(tree_width),
-                body_area.y,
-                pane_gap,
-                body_area.height,
-            ),
-            tp.panel_bg,
+        let splitter_area = Rect::new(
+            body_area.x.saturating_add(tree_width),
+            body_area.y,
+            pane_gap,
+            body_area.height,
         );
+        clear_rect(frame, splitter_area, tp.panel_bg);
+        render_splitter_handle(frame, splitter_area, true, focused);
     }
 
     let tree_title_raw = if focused && tree_focus {
@@ -2625,13 +2797,22 @@ fn render_thread_detail(
         }
     } else {
         let rendered = crate::tui_markdown::render_body(&selected_message.body_md, &md_theme);
-        let first = rendered
+        let lines = rendered
             .lines()
             .iter()
-            .find(|line| !line.to_plain_text().trim().is_empty())
+            .filter(|line| !line.to_plain_text().trim().is_empty())
             .cloned()
-            .unwrap_or_else(|| Line::raw("(empty)"));
-        preview_lines.push(first);
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            preview_lines.push(Line::raw("(empty)"));
+        } else {
+            for line in lines.iter().take(THREAD_COLLAPSED_PREVIEW_LINES) {
+                preview_lines.push(line.clone());
+            }
+            if lines.len() > THREAD_COLLAPSED_PREVIEW_LINES {
+                preview_lines.push(Line::styled("…", crate::tui_theme::text_hint(&tp)));
+            }
+        }
     }
 
     let scroll_rows = u16::try_from(scroll).unwrap_or(u16::MAX);
@@ -2869,6 +3050,7 @@ fn flatten_thread_tree_rows_at_depth(
 }
 
 /// Truncate a string to at most `max_len` characters, adding "..." if truncated.
+#[cfg(test)]
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
         s.to_string()

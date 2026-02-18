@@ -86,13 +86,13 @@ impl DocumentSource for FaultySource {
 
     fn fetch_all_batched(&self, batch_size: usize, offset: usize) -> SearchResult<Vec<Document>> {
         let call_num = self.batch_calls.fetch_add(1, Ordering::Relaxed);
-        if let Some(limit) = self.fail_after_batches {
-            if call_num >= limit {
-                return Err(SearchError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "simulated batch read failure",
-                )));
-            }
+        if let Some(limit) = self.fail_after_batches
+            && call_num >= limit
+        {
+            return Err(SearchError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated batch read failure",
+            )));
         }
         Ok(self
             .docs
@@ -195,13 +195,13 @@ impl IndexLifecycle for FaultyLifecycle {
         }
 
         let call_num = self.incremental_calls.fetch_add(1, Ordering::Relaxed);
-        if let Some(limit) = self.incremental_fail_after {
-            if call_num >= limit {
-                return Err(SearchError::Io(std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    "simulated OOM during incremental update",
-                )));
-            }
+        if let Some(limit) = self.incremental_fail_after
+            && call_num >= limit
+        {
+            return Err(SearchError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "simulated OOM during incremental update",
+            )));
         }
 
         let count = changes.len();

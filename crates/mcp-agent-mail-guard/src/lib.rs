@@ -80,17 +80,17 @@ pub struct GuardCheckResult {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("HOME") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    if let Some(p) = std::env::var_os("HOME")
+        && !p.is_empty()
+    {
+        return Some(PathBuf::from(p));
     }
 
     // Windows fallbacks (best-effort; tests run on Linux, but keep portable).
-    if let Some(p) = std::env::var_os("USERPROFILE") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    if let Some(p) = std::env::var_os("USERPROFILE")
+        && !p.is_empty()
+    {
+        return Some(PathBuf::from(p));
     }
 
     let drive = std::env::var_os("HOMEDRIVE");
@@ -105,10 +105,10 @@ fn expand_user(path: &str) -> PathBuf {
     if path == "~" {
         return home_dir().unwrap_or_else(|| PathBuf::from("~"));
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(path)
 }

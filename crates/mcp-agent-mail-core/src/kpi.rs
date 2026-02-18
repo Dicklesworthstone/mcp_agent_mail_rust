@@ -234,7 +234,7 @@ impl SampleRing {
     }
 
     /// Number of samples currently stored.
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.buf.len()
     }
 }
@@ -1984,7 +1984,7 @@ mod tests {
     #[test]
     fn contention_delta_computation() {
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_secs(60);
+        let t1 = t0 + Duration::from_mins(1);
         let old = Sample {
             taken_at: t0,
             metrics: make_snapshot(0, 0, 0, 0, 3, 10),

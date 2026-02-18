@@ -525,7 +525,7 @@ mod tests {
     fn batch_size_one_triggers_immediately() {
         let updater = IncrementalUpdater::with_config(UpdaterConfig {
             batch_size: 1,
-            flush_interval: Duration::from_secs(3600), // long so interval never fires
+            flush_interval: Duration::from_hours(1), // long so interval never fires
             ..UpdaterConfig::default()
         });
 

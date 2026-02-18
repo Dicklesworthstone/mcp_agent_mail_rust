@@ -38,8 +38,8 @@ use crate::models::{AgentRow, InboxStatsRow, ProjectRow};
 use crate::s3fifo::S3FifoCache;
 use mcp_agent_mail_core::{InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
 
-const PROJECT_TTL: Duration = Duration::from_secs(300); // 5 min
-const AGENT_TTL: Duration = Duration::from_secs(300); // 5 min
+const PROJECT_TTL: Duration = Duration::from_mins(5);
+const AGENT_TTL: Duration = Duration::from_mins(5);
 const INBOX_STATS_TTL: Duration = Duration::from_secs(30); // 30 sec (shorter: counters change often)
 const MAX_ENTRIES_PER_CATEGORY: usize = 16_384;
 /// Minimum interval between deferred touch flushes.
@@ -428,12 +428,12 @@ impl ReadCache {
     pub fn invalidate_agent(&self, project_id: i64, name: &str) {
         let key = (project_id, InternedStr::new(name));
         let mut cache = self.agents_by_key.write();
-        if let Some(agent) = cache.remove(&key) {
-            if let Some(id) = agent.value.id {
-                drop(cache); // release key map lock first
-                let mut id_cache = self.agents_by_id.write();
-                id_cache.remove(&id);
-            }
+        if let Some(agent) = cache.remove(&key)
+            && let Some(id) = agent.value.id
+        {
+            drop(cache); // release key map lock first
+            let mut id_cache = self.agents_by_id.write();
+            id_cache.remove(&id);
         }
     }
 
@@ -842,7 +842,7 @@ mod tests {
             access_count: ADAPTIVE_TTL_THRESHOLD,
         };
 
-        let base = Duration::from_secs(60);
+        let base = Duration::from_mins(1);
         assert_eq!(entry_cold.effective_ttl(base), base);
         assert_eq!(entry_hot.effective_ttl(base), base * 2);
 

@@ -332,17 +332,15 @@ impl DbPool {
                 let cx2 = cx2.clone();
                 async move {
                     // Ensure parent directory exists for file-backed DBs.
-                    if sqlite_path != ":memory:" {
-                        if let Some(parent) = Path::new(&sqlite_path).parent() {
-                            if !parent.as_os_str().is_empty() {
-                                if let Err(e) = std::fs::create_dir_all(parent) {
-                                    return Outcome::Err(SqlError::Custom(format!(
-                                        "failed to create db dir {}: {e}",
-                                        parent.display()
-                                    )));
-                                }
-                            }
-                        }
+                    if sqlite_path != ":memory:"
+                        && let Some(parent) = Path::new(&sqlite_path).parent()
+                        && !parent.as_os_str().is_empty()
+                        && let Err(e) = std::fs::create_dir_all(parent)
+                    {
+                        return Outcome::Err(SqlError::Custom(format!(
+                            "failed to create db dir {}: {e}",
+                            parent.display()
+                        )));
                     }
 
                     // For file-backed DBs, run DB-wide init (journal mode, migrations) with

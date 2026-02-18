@@ -927,7 +927,18 @@ fn write_receipt(
 ) -> CliResult<()> {
     let dir = target_storage_root.join("legacy_import_receipts");
     fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("legacy_import_{timestamp}.json"));
+    let mut path = dir.join(format!("legacy_import_{timestamp}.json"));
+    if path.exists() {
+        let mut suffix = 1_u32;
+        loop {
+            let candidate = dir.join(format!("legacy_import_{timestamp}_{suffix}.json"));
+            if !candidate.exists() {
+                path = candidate;
+                break;
+            }
+            suffix += 1;
+        }
+    }
     let content = serde_json::to_string_pretty(receipt)
         .map_err(|e| CliError::Other(format!("failed to serialize receipt: {e}")))?;
     fs::write(path, format!("{content}\n"))?;
@@ -2007,6 +2018,31 @@ mod tests {
         assert_eq!(parsed.receipt_version, 1);
         assert_eq!(parsed.mode, ImportMode::InPlace);
         assert_eq!(parsed.source_db, "/tmp/storage.sqlite3");
+    }
+
+    #[test]
+    fn write_receipt_avoids_timestamp_collision_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = sample_receipt("2026-02-17T00:00:00Z", "/tmp/first.sqlite3");
+        let second = sample_receipt("2026-02-17T00:00:01Z", "/tmp/second.sqlite3");
+        write_receipt(tmp.path(), &first, "20260217T000000Z").unwrap();
+        write_receipt(tmp.path(), &second, "20260217T000000Z").unwrap();
+
+        let receipts_dir = tmp.path().join("legacy_import_receipts");
+        let path_primary = receipts_dir.join("legacy_import_20260217T000000Z.json");
+        let path_collision = receipts_dir.join("legacy_import_20260217T000000Z_1.json");
+        assert!(path_primary.exists(), "primary receipt path should exist");
+        assert!(
+            path_collision.exists(),
+            "collision receipt path should exist"
+        );
+
+        let parsed_primary: LegacyImportReceipt =
+            serde_json::from_str(&fs::read_to_string(path_primary).unwrap()).unwrap();
+        let parsed_collision: LegacyImportReceipt =
+            serde_json::from_str(&fs::read_to_string(path_collision).unwrap()).unwrap();
+        assert_eq!(parsed_primary.target_db, "/tmp/first.sqlite3");
+        assert_eq!(parsed_collision.target_db, "/tmp/second.sqlite3");
     }
 
     #[test]

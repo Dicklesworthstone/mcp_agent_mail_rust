@@ -153,7 +153,14 @@ pub struct AnalyticsScreen {
 impl AnalyticsScreen {
     #[must_use]
     pub fn new() -> Self {
-        let feed = quick_insight_feed();
+        let mut feed = quick_insight_feed();
+        if feed.cards.is_empty() {
+            feed = InsightFeed {
+                cards: vec![build_bootstrap_card()],
+                alerts_processed: 0,
+                cards_produced: 1,
+            };
+        }
         Self {
             feed,
             selected: 0,
@@ -203,15 +210,7 @@ impl AnalyticsScreen {
         }
     }
 
-    fn active_card_indices(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = self
-            .feed
-            .cards
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, card)| self.severity_filter.includes(card.severity).then_some(idx))
-            .collect();
-
+    fn sort_card_indices(&self, indices: &mut [usize]) {
         match self.sort_mode {
             AnalyticsSortMode::Priority => {}
             AnalyticsSortMode::Severity => {
@@ -238,6 +237,23 @@ impl AnalyticsScreen {
                         .then_with(|| left.cmp(right))
                 });
             }
+        }
+    }
+
+    fn active_card_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
+            .feed
+            .cards
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, card)| self.severity_filter.includes(card.severity).then_some(idx))
+            .collect();
+
+        self.sort_card_indices(&mut indices);
+        if indices.is_empty() && !self.feed.cards.is_empty() {
+            indices = (0..self.feed.cards.len()).collect();
+            self.sort_card_indices(&mut indices);
+            indices.truncate(1);
         }
 
         indices
@@ -407,6 +423,79 @@ const fn severity_badge(severity: AnomalySeverity) -> &'static str {
     }
 }
 
+fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
+    if area.is_empty() {
+        return;
+    }
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.bg = bg;
+            }
+        }
+    }
+}
+
+fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, active: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let splitter_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.62);
+    fill_rect(frame, area, splitter_bg);
+    let rail = if active {
+        crate::tui_theme::lerp_color(tp.panel_border_focused, tp.selection_indicator, 0.32)
+    } else {
+        tp.panel_border_dim
+    };
+    let knob = if active {
+        tp.selection_indicator
+    } else {
+        tp.text_muted
+    };
+
+    if vertical {
+        let x = area.x.saturating_add(area.width / 2);
+        let grip_len = area.height.min(5).max(1);
+        let start_y = area
+            .y
+            .saturating_add(area.height.saturating_sub(grip_len) / 2);
+        for y in start_y..start_y.saturating_add(grip_len) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char('•');
+                cell.fg = rail;
+                cell.bg = splitter_bg;
+            }
+        }
+        let y = start_y.saturating_add(grip_len / 2);
+        if let Some(cell) = frame.buffer.get_mut(x, y) {
+            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
+            cell.fg = knob;
+            cell.bg = splitter_bg;
+        }
+    } else {
+        let y = area.y.saturating_add(area.height / 2);
+        let grip_len = area.width.min(5).max(1);
+        let start_x = area
+            .x
+            .saturating_add(area.width.saturating_sub(grip_len) / 2);
+        for x in start_x..start_x.saturating_add(grip_len) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char('•');
+                cell.fg = rail;
+                cell.bg = splitter_bg;
+            }
+        }
+        let x = start_x.saturating_add(grip_len / 2);
+        if let Some(cell) = frame.buffer.get_mut(x, y) {
+            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
+            cell.fg = knob;
+            cell.bg = splitter_bg;
+        }
+    }
+}
+
 fn perceived_luma(color: PackedRgba) -> u8 {
     let y = 299_u32
         .saturating_mul(u32::from(color.r()))
@@ -419,14 +508,15 @@ fn perceived_luma(color: PackedRgba) -> u8 {
 fn analytics_table_backgrounds(
     tp: &crate::tui_theme::TuiThemePalette,
 ) -> (PackedRgba, PackedRgba, PackedRgba, PackedRgba) {
+    // Keep striping neutral and low-contrast in light mode.
     let table_base_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.58);
-    let stripe_seed = crate::tui_theme::lerp_color(tp.table_row_alt_bg, tp.bg_surface, 0.5);
+    let neutral_seed = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.78);
     let is_light_surface = perceived_luma(table_base_bg) >= 140;
-    let header_mix = if is_light_surface { 0.22 } else { 0.16 };
-    let odd_mix = if is_light_surface { 0.14 } else { 0.09 };
+    let header_mix = if is_light_surface { 0.06 } else { 0.12 };
+    let odd_mix = if is_light_surface { 0.03 } else { 0.07 };
     let even_row_bg = table_base_bg;
-    let odd_row_bg = crate::tui_theme::lerp_color(table_base_bg, stripe_seed, odd_mix);
-    let header_bg = crate::tui_theme::lerp_color(table_base_bg, stripe_seed, header_mix);
+    let odd_row_bg = crate::tui_theme::lerp_color(table_base_bg, neutral_seed, odd_mix);
+    let header_bg = crate::tui_theme::lerp_color(table_base_bg, neutral_seed, header_mix);
     (table_base_bg, header_bg, even_row_bg, odd_row_bg)
 }
 
@@ -904,15 +994,13 @@ fn render_card_list(
             let conf_text = format!("{:3.0}%", card.confidence * 100.0);
             let border_char = "\u{2590}"; // ▐ colored left border
             let row_bg = if i % 2 == 0 { even_row_bg } else { odd_row_bg };
-            let row_tinted_bg =
-                crate::tui_theme::lerp_color(row_bg, severity_color(card.severity), 0.07);
             let style = if i == selected {
                 Style::default()
                     .fg(tp.selection_fg)
                     .bg(tp.selection_bg)
                     .bold()
             } else {
-                Style::default().fg(tp.text_primary).bg(row_tinted_bg)
+                Style::default().fg(tp.text_primary).bg(row_bg)
             };
             if compact_columns {
                 Row::new(vec![
@@ -1136,18 +1224,46 @@ fn render_card_detail(
         }
     }
 
-    let text = Text::from_lines(lines);
-    let para = Paragraph::new(text).scroll((scroll, 0)).block(
-        Block::new()
-            .title(" Card Detail ")
-            .border_type(BorderType::Rounded)
-            .border_style(if focus == AnalyticsFocus::Detail {
-                Style::default().fg(tp.panel_border_focused)
-            } else {
-                Style::default().fg(tp.panel_border_dim)
-            }),
-    );
-    para.render(area, frame);
+    let block = Block::new()
+        .title(" Card Detail ")
+        .border_type(BorderType::Rounded)
+        .border_style(if focus == AnalyticsFocus::Detail {
+            Style::default().fg(tp.panel_border_focused)
+        } else {
+            Style::default().fg(tp.panel_border_dim)
+        });
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.is_empty() {
+        return;
+    }
+    let content = if inner.width > 2 && inner.height > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y.saturating_add(1),
+            inner.width.saturating_sub(2),
+            inner.height.saturating_sub(1),
+        )
+    } else if inner.width > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        )
+    } else {
+        inner
+    };
+    if content.is_empty() {
+        return;
+    }
+    Paragraph::new("")
+        .style(Style::default().bg(tp.panel_bg))
+        .render(content, frame);
+    Paragraph::new(Text::from_lines(lines))
+        .style(crate::tui_theme::text_primary(&tp).bg(tp.panel_bg))
+        .scroll((scroll, 0))
+        .render(content, frame);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1812,7 +1928,7 @@ impl MailScreen for AnalyticsScreen {
         let wide_split = content.width >= ANALYTICS_WIDE_SPLIT_MIN_WIDTH
             && content.height >= ANALYTICS_WIDE_SPLIT_MIN_HEIGHT;
         if wide_split {
-            let gap = u16::from(content.width >= 140);
+            let gap = u16::from(content.width >= 96);
             let mut list_w = content
                 .width
                 .saturating_mul(ANALYTICS_WIDE_LIST_RATIO_PERCENT)
@@ -1832,6 +1948,15 @@ impl MailScreen for AnalyticsScreen {
                         detail_w,
                         content.height,
                     );
+                    if gap > 0 {
+                        let splitter_area = Rect::new(
+                            content.x.saturating_add(list_w),
+                            content.y,
+                            gap,
+                            content.height,
+                        );
+                        render_splitter_handle(frame, splitter_area, true, true);
+                    }
                     render_card_list(
                         frame,
                         list_area,
@@ -1845,22 +1970,44 @@ impl MailScreen for AnalyticsScreen {
                         self.focus,
                     );
                     if detail_area.height >= 18 && detail_area.width >= 52 {
+                        let detail_gap = u16::from(detail_area.height >= 24);
                         let detail_main_h = detail_area
                             .height
                             .saturating_mul(62)
                             .saturating_div(100)
-                            .clamp(10, detail_area.height.saturating_sub(7));
+                            .clamp(
+                                10,
+                                detail_area
+                                    .height
+                                    .saturating_sub(7)
+                                    .saturating_sub(detail_gap),
+                            );
                         let detail_main = Rect::new(
                             detail_area.x,
                             detail_area.y,
                             detail_area.width,
                             detail_main_h,
                         );
+                        if detail_gap > 0 {
+                            let splitter_area = Rect::new(
+                                detail_area.x,
+                                detail_area.y.saturating_add(detail_main_h),
+                                detail_area.width,
+                                detail_gap,
+                            );
+                            render_splitter_handle(frame, splitter_area, false, true);
+                        }
                         let detail_viz = Rect::new(
                             detail_area.x,
-                            detail_area.y.saturating_add(detail_main_h),
+                            detail_area
+                                .y
+                                .saturating_add(detail_main_h)
+                                .saturating_add(detail_gap),
                             detail_area.width,
-                            detail_area.height.saturating_sub(detail_main_h),
+                            detail_area
+                                .height
+                                .saturating_sub(detail_main_h)
+                                .saturating_sub(detail_gap),
                         );
                         render_card_detail(
                             frame,
@@ -1908,20 +2055,39 @@ impl MailScreen for AnalyticsScreen {
                 >= ANALYTICS_STACKED_LIST_MIN_HEIGHT
                     .saturating_add(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT);
         if stacked_detail {
+            let stack_gap = u16::from(
+                content.height
+                    >= ANALYTICS_STACKED_LIST_MIN_HEIGHT
+                        .saturating_add(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT)
+                        .saturating_add(1),
+            );
             let mut list_h = content.height.saturating_mul(38) / 100;
             list_h = list_h.max(ANALYTICS_STACKED_LIST_MIN_HEIGHT);
             let max_list_h = content
                 .height
-                .saturating_sub(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT);
+                .saturating_sub(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT)
+                .saturating_sub(stack_gap);
             list_h = list_h.min(max_list_h);
 
             let list_area = Rect::new(content.x, content.y, content.width, list_h);
             let detail_area = Rect::new(
                 content.x,
-                content.y.saturating_add(list_h),
+                content.y.saturating_add(list_h).saturating_add(stack_gap),
                 content.width,
-                content.height.saturating_sub(list_h),
+                content
+                    .height
+                    .saturating_sub(list_h)
+                    .saturating_sub(stack_gap),
             );
+            if stack_gap > 0 {
+                let splitter_area = Rect::new(
+                    content.x,
+                    content.y.saturating_add(list_h),
+                    content.width,
+                    stack_gap,
+                );
+                render_splitter_handle(frame, splitter_area, false, true);
+            }
             render_card_list(
                 frame,
                 list_area,
@@ -2319,6 +2485,26 @@ mod tests {
                 .selected_card()
                 .is_some_and(|card| card.severity == AnomalySeverity::Critical)
         );
+    }
+
+    #[test]
+    fn severity_filter_falls_back_to_top_card_when_filtered_empty() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![
+                sample_card("medium", AnomalySeverity::Medium, 0.7),
+                sample_card("low", AnomalySeverity::Low, 0.9),
+            ],
+            alerts_processed: 2,
+            cards_produced: 2,
+        };
+        screen.severity_filter = AnalyticsSeverityFilter::CriticalOnly;
+        screen.sort_mode = AnalyticsSortMode::Confidence;
+        screen.clamp_selected_to_active_cards();
+
+        let active = screen.active_cards();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "low");
     }
 
     #[test]

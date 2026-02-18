@@ -79,10 +79,10 @@ impl Model2VecEmbedder {
         // Fall back to agent-mail-specific paths
         let candidates = Self::agent_mail_model_paths(model_name);
         for candidate in &candidates {
-            if candidate.exists() {
-                if let Ok(embedder) = Self::load_from_dir(candidate, model_name) {
-                    return Ok(embedder);
-                }
+            if candidate.exists()
+                && let Ok(embedder) = Self::load_from_dir(candidate, model_name)
+            {
+                return Ok(embedder);
             }
         }
 

@@ -62,11 +62,11 @@ pub fn generate_snippet(text: &str, query_terms: &[String]) -> Option<String> {
 
     for term in query_terms {
         let lower_term = term.to_lowercase();
-        if let Some(pos) = lower_text.find(&lower_term) {
-            if best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX) {
-                best_pos = Some(pos);
-                best_term = term;
-            }
+        if let Some(pos) = lower_text.find(&lower_term)
+            && (best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX))
+        {
+            best_pos = Some(pos);
+            best_term = term;
         }
     }
 

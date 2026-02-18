@@ -116,17 +116,17 @@ pub fn compile_filters(filter: &SearchFilter, handles: &FieldHandles) -> Compile
     }
 
     // Importance filter
-    if let Some(importance) = filter.importance {
-        if let Some(clause) = importance_filter(handles.importance, importance) {
-            clauses.push(clause);
-        }
+    if let Some(importance) = filter.importance
+        && let Some(clause) = importance_filter(handles.importance, importance)
+    {
+        clauses.push(clause);
     }
 
     // Date range filter
-    if let Some(ref date_range) = filter.date_range {
-        if let Some(clause) = date_range_filter(handles.created_ts, date_range) {
-            clauses.push(clause);
-        }
+    if let Some(ref date_range) = filter.date_range
+        && let Some(clause) = date_range_filter(handles.created_ts, date_range)
+    {
+        clauses.push(clause);
     }
 
     CompiledFilters { clauses }

@@ -16836,6 +16836,528 @@ mod tests {
     fn truncate_str_empty() {
         assert_eq!(truncate_str("", 5), "");
     }
+
+    // =========================================================================
+    // resolve_project_async tests — Doom Loop Fix (br-3h13.16.2)
+    // =========================================================================
+
+    /// Helper: create a DbPool backed by a file-based SQLite DB with full
+    /// migrations applied. Returns `(pool, tempdir)` — keep `_dir` alive.
+    fn make_test_pool() -> (mcp_agent_mail_db::DbPool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let db_path = dir.path().join("resolve_project_test.db");
+
+        // Initialize the DB with base schema via SqliteConnection.
+        let init_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open sqlite connection");
+        init_conn
+            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        init_conn
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..mcp_agent_mail_db::DbPoolConfig::default()
+        };
+        let pool = mcp_agent_mail_db::create_pool(&cfg).expect("create pool");
+        (pool, dir)
+    }
+
+    fn block_on_async<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce(asupersync::Cx) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let cx = asupersync::Cx::for_testing();
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(f(cx))
+    }
+
+    // T16.2.1: slug lookup succeeds
+    #[test]
+    fn resolve_project_async_returns_project_by_slug() {
+        let (pool, _dir) = make_test_pool();
+
+        block_on_async(|cx| async move {
+            // Create a project first via ensure_project.
+            let human_key = "/tmp/resolve-slug-test";
+            let created = mcp_agent_mail_db::queries::ensure_project(&cx, &pool, human_key)
+                .await
+                .into_result()
+                .expect("ensure project");
+
+            // Resolve by slug — should find it immediately.
+            let resolved = resolve_project_async(&cx, &pool, &created.slug)
+                .await
+                .expect("resolve by slug");
+            assert_eq!(resolved.slug, created.slug);
+            assert_eq!(resolved.human_key, human_key);
+            assert_eq!(resolved.id, created.id);
+        });
+    }
+
+    // T16.2.2: slug NotFound falls through to human_key
+    #[test]
+    fn resolve_project_async_falls_through_to_human_key() {
+        let (pool, _dir) = make_test_pool();
+
+        block_on_async(|cx| async move {
+            // Create a project.
+            let human_key = "/home/user/my-project";
+            let created = mcp_agent_mail_db::queries::ensure_project(&cx, &pool, human_key)
+                .await
+                .into_result()
+                .expect("ensure project");
+
+            // Resolve by human_key (not by slug) — slug lookup will NotFound,
+            // falls through to human_key lookup.
+            let resolved = resolve_project_async(&cx, &pool, human_key)
+                .await
+                .expect("resolve by human_key");
+            assert_eq!(resolved.human_key, human_key);
+            assert_eq!(resolved.slug, created.slug);
+            assert_eq!(resolved.id, created.id);
+        });
+    }
+
+    // T16.2.3: real DB errors surface immediately
+    #[test]
+    fn resolve_project_async_surfaces_db_errors() {
+        // Create a pool pointing to a corrupt/broken database.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("broken.db");
+
+        // Write junk to the DB file to make it corrupt.
+        std::fs::write(&db_path, b"this is not a valid sqlite database")
+            .expect("write junk DB file");
+
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..mcp_agent_mail_db::DbPoolConfig::default()
+        };
+
+        // Pool creation may succeed (lazy connections) — the error surfaces on use.
+        match mcp_agent_mail_db::create_pool(&cfg) {
+            Ok(pool) => {
+                let result = block_on_async(|cx| async move {
+                    resolve_project_async(&cx, &pool, "anything").await
+                });
+                assert!(
+                    result.is_err(),
+                    "resolve_project_async should return error for corrupt DB"
+                );
+                let err_msg = format!("{}", result.unwrap_err());
+                // The error should surface as a database error, NOT as
+                // "ensure_project failed" (the old misleading path).
+                assert!(
+                    err_msg.contains("database error") || err_msg.contains("not a database")
+                        || err_msg.contains("corrupt") || err_msg.contains("malformed")
+                        || err_msg.contains("project not found"),
+                    "error should indicate DB issue, got: {err_msg}"
+                );
+            }
+            Err(e) => {
+                // Pool failed to create — that's also acceptable for a corrupt DB.
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("database") || err_msg.contains("sqlite")
+                        || err_msg.contains("not a database"),
+                    "pool creation error should mention database, got: {err_msg}"
+                );
+            }
+        }
+    }
+
+    // T16.2.4: auto-creates project for absolute paths
+    #[test]
+    fn resolve_project_async_auto_creates_for_absolute_paths() {
+        let (pool, _dir) = make_test_pool();
+
+        block_on_async(|cx| async move {
+            // Resolve an absolute path that doesn't exist yet — should auto-create.
+            let abs_path = "/tmp/new-project-autocreate";
+            let resolved = resolve_project_async(&cx, &pool, abs_path)
+                .await
+                .expect("resolve absolute path should auto-create");
+            assert_eq!(resolved.human_key, abs_path);
+
+            // Verify the project was actually created in the DB.
+            let by_slug =
+                mcp_agent_mail_db::queries::get_project_by_slug(&cx, &pool, &resolved.slug)
+                    .await
+                    .into_result()
+                    .expect("lookup newly created project by slug");
+            assert_eq!(by_slug.human_key, abs_path);
+            assert_eq!(by_slug.id, resolved.id);
+        });
+    }
+
+    // T16.2.4 (negative): relative path that doesn't match returns error
+    #[test]
+    fn resolve_project_async_rejects_unknown_relative_path() {
+        let (pool, _dir) = make_test_pool();
+
+        let result = block_on_async(|cx| async move {
+            resolve_project_async(&cx, &pool, "nonexistent-project").await
+        });
+        assert!(
+            result.is_err(),
+            "unknown relative path should return error"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("project not found"),
+            "error should say 'project not found', got: {err_msg}"
+        );
+    }
+
+    // ── Doctor check probe tests (br-3h13.16.3) ────────────────────────────
+
+    #[test]
+    fn doctor_check_healthy_db_reports_db_file_sanity_and_pool_init_ok() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        // Fully migrate and seed with a project + agent
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let conn = open_db_sync_with_database_url(&db_url).expect("open");
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('test-proj', '/tmp/test-proj', 0)",
+            &[],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 'RedFox', 'test', 'test', 0, 0)",
+            &[],
+        )
+        .expect("insert agent");
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "doctor check failed: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("should be valid JSON");
+
+        assert_eq!(parsed["healthy"], true, "healthy should be true");
+
+        let checks = parsed["checks"].as_array().expect("checks array");
+
+        // db_file_sanity should be present and OK
+        let sanity = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("db_file_sanity"))
+            .expect("db_file_sanity check should be present");
+        assert_eq!(
+            sanity["status"].as_str().unwrap(),
+            "ok",
+            "db_file_sanity should pass on healthy DB"
+        );
+        assert!(
+            sanity["detail"]
+                .as_str()
+                .unwrap()
+                .contains("quick_check OK"),
+            "detail should mention quick_check OK"
+        );
+
+        // pool_init should be present and OK
+        let pool_check = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("pool_init"))
+            .expect("pool_init check should be present");
+        assert_eq!(
+            pool_check["status"].as_str().unwrap(),
+            "ok",
+            "pool_init should pass on healthy DB"
+        );
+    }
+
+    #[test]
+    fn doctor_check_zero_byte_db_reports_db_file_sanity_fail() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("empty.sqlite3");
+
+        // Create a zero-byte file and make it read-only so that Check 1
+        // (open_db_sync_with_database_url) cannot silently "repair" it by
+        // writing the schema — otherwise the file grows before Check 1b reads
+        // the metadata and the 0-byte branch is never taken.
+        std::fs::write(&db_path, b"").expect("create empty file");
+        {
+            let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(true);
+            std::fs::set_permissions(&db_path, perms).expect("set read-only");
+        }
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
+        let output = capture.drain_to_string();
+
+        // Doctor check itself should succeed (it reports status, doesn't fail)
+        assert!(result.is_ok(), "doctor check should not error: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("should be valid JSON");
+
+        // healthy should be false because db_file_sanity fails
+        assert_eq!(parsed["healthy"], false, "healthy should be false");
+
+        let checks = parsed["checks"].as_array().expect("checks array");
+
+        // db_file_sanity should be present and FAIL
+        let sanity = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("db_file_sanity"))
+            .expect("db_file_sanity check should be present");
+        assert_eq!(
+            sanity["status"].as_str().unwrap(),
+            "fail",
+            "db_file_sanity should fail on 0-byte DB"
+        );
+        let detail = sanity["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("0 bytes") || detail.contains("empty") || detail.contains("corrupt"),
+            "detail should mention empty/corrupt/0 bytes, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn doctor_check_corrupt_db_reports_pool_init_fail() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt.sqlite3");
+
+        // Write garbage bytes to create a corrupt DB file (non-zero but invalid)
+        std::fs::write(&db_path, b"THIS IS NOT A SQLITE FILE AT ALL - GARBAGE DATA HERE!")
+            .expect("write corrupt file");
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
+        let output = capture.drain_to_string();
+
+        // Doctor check itself should succeed (it reports status, doesn't panic)
+        assert!(result.is_ok(), "doctor check should not error: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("should be valid JSON");
+
+        // healthy should be false
+        assert_eq!(parsed["healthy"], false, "healthy should be false");
+
+        let checks = parsed["checks"].as_array().expect("checks array");
+
+        // pool_init should be present and FAIL (can't run migrations on corrupt DB)
+        let pool_check = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("pool_init"))
+            .expect("pool_init check should be present");
+        assert_eq!(
+            pool_check["status"].as_str().unwrap(),
+            "fail",
+            "pool_init should fail on corrupt DB"
+        );
+    }
+
+    // ── Doctor repair .bak sibling tests (br-3h13.16.4) ────────────────────
+
+    #[test]
+    fn doctor_repair_creates_valid_bak_sibling_file() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repair_test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        // Create and populate DB
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let conn = open_db_sync_with_database_url(&db_url).expect("open");
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('p1', '/tmp/p1', 0)",
+            &[],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 'RedFox', 'cc', 'opus', 0, 0)",
+            &[],
+        )
+        .expect("insert agent");
+        drop(conn);
+
+        // Run doctor repair (not dry_run)
+        let _capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result =
+            handle_doctor_repair_with(&db_url, &backup_dir, None, false, false);
+        assert!(result.is_ok(), "repair failed: {result:?}");
+
+        // Verify .bak sibling exists
+        let bak_path = format!("{}.bak", db_path.display());
+        let bak = std::path::Path::new(&bak_path);
+        assert!(bak.exists(), ".bak sibling should exist at {bak_path}");
+        assert!(bak.metadata().unwrap().len() > 0, ".bak should be non-empty");
+
+        // Verify .bak is a valid SQLite DB with same data
+        let bak_conn =
+            mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&bak_path)
+                .expect("open .bak");
+        let rows = bak_conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+            .expect("query projects in .bak");
+        let count: i64 = rows.first().unwrap().get_named("cnt").unwrap();
+        assert_eq!(count, 1, ".bak should contain 1 project");
+
+        let agent_rows = bak_conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM agents", &[])
+            .expect("query agents in .bak");
+        let agent_count: i64 = agent_rows.first().unwrap().get_named("cnt").unwrap();
+        assert_eq!(agent_count, 1, ".bak should contain 1 agent");
+
+        // Verify original DB still exists and is healthy
+        assert!(db_path.exists(), "original DB should still exist");
+        let orig_conn = open_db_sync_with_database_url(&db_url).expect("reopen original");
+        let orig_rows = orig_conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+            .expect("query original");
+        let orig_count: i64 = orig_rows.first().unwrap().get_named("cnt").unwrap();
+        assert_eq!(orig_count, 1, "original should still have 1 project");
+
+        // Verify timestamped backup in backups/ dir also exists
+        assert!(backup_dir.exists(), "backups dir should exist");
+        let entries: Vec<_> = std::fs::read_dir(&backup_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "backups dir should contain timestamped backup"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_bak_found_by_pool_backup_candidates() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pool_test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        // Create DB and run repair to produce .bak
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let conn = open_db_sync_with_database_url(&db_url).expect("open");
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('p2', '/tmp/p2', 0)",
+            &[],
+        )
+        .expect("insert project");
+        drop(conn);
+
+        let _capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with(&db_url, &backup_dir, None, false, false)
+            .expect("repair");
+
+        // Verify the .bak is a valid DB that passes quick_check
+        let bak_path = format!("{}.bak", db_path.display());
+        let bak_conn =
+            mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&bak_path)
+                .expect("open .bak");
+        let qc_rows = bak_conn
+            .query_sync("PRAGMA quick_check", &[])
+            .expect("quick_check");
+        let qc_result: String = qc_rows
+            .first()
+            .unwrap()
+            .get_named("quick_check")
+            .unwrap();
+        assert_eq!(qc_result, "ok", ".bak should pass quick_check");
+
+        // The .bak file uses the naming convention expected by
+        // pool's sqlite_backup_candidates: "{primary_path}.bak"
+        let expected_name = format!("{}.bak", db_path.file_name().unwrap().to_str().unwrap());
+        let bak_file = std::path::Path::new(&bak_path);
+        assert_eq!(
+            bak_file.file_name().unwrap().to_str().unwrap(),
+            expected_name,
+            ".bak should match naming convention for pool auto-recovery"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_gracefully_handles_bak_creation_failure() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("readonly_test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        // Use a separate writable backup dir (so timestamped backup succeeds)
+        let backup_dir = dir.path().join("backups");
+
+        // Create DB
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        // Pre-create a .bak path as a directory — fs::copy to a directory fails
+        let bak_path = format!("{}.bak", db_path.display());
+        std::fs::create_dir_all(&bak_path).expect("create .bak as directory");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result =
+            handle_doctor_repair_with(&db_url, &backup_dir, None, false, false);
+        let output = capture.drain_to_string();
+
+        // Repair should still complete (non-fatal .bak failure)
+        assert!(
+            result.is_ok(),
+            "repair should succeed despite .bak failure: {result:?}"
+        );
+
+        // Warning about .bak failure should appear in output
+        assert!(
+            output.contains("Warning") && output.contains("could not create sibling backup"),
+            "should warn about .bak failure, got: {output}"
+        );
+
+        // Timestamped backup in backups/ should still exist
+        assert!(backup_dir.exists(), "backups dir should still be created");
+        let entries: Vec<_> = std::fs::read_dir(&backup_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "timestamped backup should exist despite .bak failure"
+        );
+
+        // Original DB should be undamaged
+        let conn = open_db_sync_with_database_url(&db_url).expect("reopen original");
+        let rows = conn
+            .query_sync("PRAGMA quick_check", &[])
+            .expect("quick_check");
+        let qc: String = rows.first().unwrap().get_named("quick_check").unwrap();
+        assert_eq!(qc, "ok", "original DB should still be healthy");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19060,10 +19582,24 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
 fn handle_doctor_repair(
     project: Option<String>,
     dry_run: bool,
-    _yes: bool,
+    yes: bool,
     backup_dir: Option<PathBuf>,
 ) -> CliResult<()> {
-    let conn = open_db_sync()?;
+    let config = Config::from_env();
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let database_url = &cfg.database_url;
+    let bak_dir = backup_dir.unwrap_or_else(|| config.storage_root.join("backups"));
+    handle_doctor_repair_with(database_url, &bak_dir, project, dry_run, yes)
+}
+
+fn handle_doctor_repair_with(
+    database_url: &str,
+    backup_dir: &Path,
+    project: Option<String>,
+    dry_run: bool,
+    _yes: bool,
+) -> CliResult<()> {
+    let conn = open_db_sync_with_database_url(database_url)?;
 
     ftui_runtime::ftui_println!("Running database repair...");
 
@@ -19091,15 +19627,16 @@ fn handle_doctor_repair(
 
     // 2. Optional backup before repair
     if !dry_run {
-        let config = Config::from_env();
-        let bak_dir = backup_dir.unwrap_or_else(|| config.storage_root.join("backups"));
-        std::fs::create_dir_all(&bak_dir)?;
+        std::fs::create_dir_all(backup_dir)?;
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let bak_name = format!("pre_repair_{timestamp}.sqlite3");
-        let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: database_url.to_string(),
+            ..Default::default()
+        };
         let db_path = cfg.sqlite_path().unwrap_or_default();
         if std::path::Path::new(&db_path).exists() {
-            let bak_path = bak_dir.join(&bak_name);
+            let bak_path = backup_dir.join(&bak_name);
             std::fs::copy(&db_path, &bak_path)?;
             ftui_runtime::ftui_println!("  Backup: {}", bak_path.display());
 

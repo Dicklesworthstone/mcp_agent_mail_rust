@@ -49,14 +49,20 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 const MAX_RESULTS: usize = 200;
 
 /// Debounce delay in ticks for search-as-you-type.
-const DEBOUNCE_TICKS: u8 = 1;
+const DEBOUNCE_TICKS: u8 = 3;
 const SEARCH_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
 const SEARCH_STACKED_WIDTH_THRESHOLD: u16 = 60;
 const SEARCH_STACKED_MIN_HEIGHT: u16 = 12;
 const SEARCH_STACKED_DOCK_RATIO: f32 = 0.38;
+const SEARCH_FACET_GAP_THRESHOLD: u16 = 72;
+const SEARCH_SPLIT_GAP_THRESHOLD: u16 = 78;
 
 /// Max chars for the message snippet shown in the detail pane.
 const MAX_SNIPPET_CHARS: usize = 180;
+/// Max markdown body lines to inspect when building searchable previews.
+const SEARCHABLE_BODY_MAX_LINES: usize = 96;
+/// Max markdown body bytes to inspect when building searchable previews.
+const SEARCHABLE_BODY_MAX_CHARS: usize = 12_000;
 
 /// Hard cap on highlight terms to keep rendering predictable.
 const MAX_HIGHLIGHT_TERMS: usize = 8;
@@ -84,6 +90,65 @@ fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
                 *cell = ftui::Cell::from_char(' ');
                 cell.bg = bg;
             }
+        }
+    }
+}
+
+fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, active: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let splitter_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.62);
+    fill_rect(frame, area, splitter_bg);
+    let rail_color = if active {
+        crate::tui_theme::lerp_color(tp.panel_border_focused, tp.selection_indicator, 0.32)
+    } else {
+        tp.panel_border_dim
+    };
+    let knob_color = if active {
+        tp.selection_indicator
+    } else {
+        tp.text_muted
+    };
+
+    if vertical {
+        let x = area.x.saturating_add(area.width / 2);
+        let grip_len = area.height.min(5).max(1);
+        let start_y = area
+            .y
+            .saturating_add(area.height.saturating_sub(grip_len) / 2);
+        for y in start_y..start_y.saturating_add(grip_len) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char('•');
+                cell.fg = rail_color;
+                cell.bg = splitter_bg;
+            }
+        }
+        let knob_y = start_y.saturating_add(grip_len / 2);
+        if let Some(cell) = frame.buffer.get_mut(x, knob_y) {
+            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
+            cell.fg = knob_color;
+            cell.bg = splitter_bg;
+        }
+    } else {
+        let y = area.y.saturating_add(area.height / 2);
+        let grip_len = area.width.min(5).max(1);
+        let start_x = area
+            .x
+            .saturating_add(area.width.saturating_sub(grip_len) / 2);
+        for x in start_x..start_x.saturating_add(grip_len) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char('•');
+                cell.fg = rail_color;
+                cell.bg = splitter_bg;
+            }
+        }
+        let knob_x = start_x.saturating_add(grip_len / 2);
+        if let Some(cell) = frame.buffer.get_mut(knob_x, y) {
+            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
+            cell.fg = knob_color;
+            cell.bg = splitter_bg;
         }
     }
 }
@@ -653,17 +718,47 @@ impl RenderItem for SearchResultRow {
             && self.entry.doc_kind == DocKind::Message
             && !snippet_source.is_empty();
         if show_context_line {
-            let context_prefix = "  ↳ ";
-            let snippet_width = w.saturating_sub(ftui::text::display_width(context_prefix));
-            let snippet = truncate_display_width(snippet_source, snippet_width);
-            let mut context_spans = vec![Span::styled(context_prefix, meta_style)];
-            context_spans.extend(highlight_spans_with_needles(
-                &snippet,
-                &self.highlight_needles,
-                Some(crate::tui_theme::text_hint(&tp)),
-                highlight_style,
-            ));
-            lines.push(Line::from_spans(context_spans));
+            let context_segments = snippet_source
+                .split(" ⟫ ")
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>();
+            let max_context_lines = usize::from(area.height.saturating_sub(1)).clamp(1, 2);
+            if context_segments.is_empty() {
+                let context_prefix = "  ↳ ";
+                let snippet_width = w.saturating_sub(ftui::text::display_width(context_prefix));
+                let snippet = truncate_display_width(snippet_source, snippet_width);
+                let mut context_spans = vec![Span::styled(context_prefix, meta_style)];
+                context_spans.extend(highlight_spans_with_needles(
+                    &snippet,
+                    &self.highlight_needles,
+                    Some(crate::tui_theme::text_hint(&tp)),
+                    highlight_style,
+                ));
+                lines.push(Line::from_spans(context_spans));
+            } else {
+                for (idx, segment) in context_segments.iter().take(max_context_lines).enumerate() {
+                    let context_prefix = if idx == 0 { "  ↳ " } else { "    " };
+                    let snippet_width = w.saturating_sub(ftui::text::display_width(context_prefix));
+                    let snippet = truncate_display_width(segment, snippet_width);
+                    let mut context_spans = vec![Span::styled(context_prefix, meta_style)];
+                    context_spans.extend(highlight_spans_with_needles(
+                        &snippet,
+                        &self.highlight_needles,
+                        Some(crate::tui_theme::text_hint(&tp)),
+                        highlight_style,
+                    ));
+                    lines.push(Line::from_spans(context_spans));
+                }
+                if context_segments.len() > max_context_lines
+                    && lines.len() < usize::from(area.height)
+                {
+                    lines.push(Line::from_spans([Span::styled(
+                        "    …",
+                        crate::tui_theme::text_hint(&tp),
+                    )]));
+                }
+            }
         }
 
         let mut para =
@@ -680,7 +775,11 @@ impl RenderItem for SearchResultRow {
         if self.entry.doc_kind == DocKind::Message
             && (!self.entry.context_snippet.is_empty() || !self.entry.body_preview.is_empty())
         {
-            2
+            if self.entry.context_snippet.contains(" ⟫ ") {
+                3
+            } else {
+                2
+            }
         } else {
             1
         }
@@ -1065,7 +1164,7 @@ pub struct SearchCockpitScreen {
     /// Small animation phase for header/status flourish.
     ui_phase: u8,
     /// Cached markdown render for selected message bodies, keyed by message id.
-    rendered_markdown_cache: RefCell<HashMap<i64, Arc<Text>>>,
+    rendered_markdown_cache: RefCell<HashMap<(i64, &'static str), Arc<Text>>>,
 }
 
 impl SearchCockpitScreen {
@@ -1154,14 +1253,18 @@ impl SearchCockpitScreen {
             .full_body
             .as_deref()
             .filter(|raw| !raw.trim().is_empty())?;
-        if let Some(existing) = self.rendered_markdown_cache.borrow().get(&entry.id) {
+        let theme_key = crate::tui_theme::current_theme_env_value();
+        let cache_key = (entry.id, theme_key);
+        if let Some(existing) = self.rendered_markdown_cache.borrow().get(&cache_key) {
             return Some(Arc::clone(existing));
         }
         let theme = crate::tui_theme::markdown_theme();
         let rendered = Arc::new(tui_markdown::render_body(body, &theme));
-        self.rendered_markdown_cache
-            .borrow_mut()
-            .insert(entry.id, Arc::clone(&rendered));
+        let mut cache = self.rendered_markdown_cache.borrow_mut();
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        cache.insert(cache_key, Arc::clone(&rendered));
         Some(rendered)
     }
 
@@ -2331,11 +2434,13 @@ impl MailScreen for SearchCockpitScreen {
             computed_facet_w.min(max_facet_w).min(body_area.width)
         };
         let facet_w = if facet_w_raw < 12 { 0 } else { facet_w_raw };
+        let facet_gap = u16::from(facet_w > 0 && body_area.width >= SEARCH_FACET_GAP_THRESHOLD);
+        let consumed_w = facet_w.saturating_add(facet_gap).min(body_area.width);
         let facet_area = Rect::new(body_area.x, body_area.y, facet_w, body_area.height);
         let split_area = Rect::new(
-            body_area.x + facet_w,
+            body_area.x.saturating_add(consumed_w),
             body_area.y,
-            body_area.width.saturating_sub(facet_w),
+            body_area.width.saturating_sub(consumed_w),
             body_area.height,
         );
 
@@ -2383,26 +2488,105 @@ impl MailScreen for SearchCockpitScreen {
                 self,
                 matches!(self.focus, Focus::FacetRail),
             );
+            if facet_gap > 0 {
+                render_splitter_handle(
+                    frame,
+                    Rect::new(
+                        body_area.x.saturating_add(facet_w),
+                        body_area.y,
+                        facet_gap,
+                        body_area.height,
+                    ),
+                    true,
+                    matches!(self.focus, Focus::FacetRail),
+                );
+            }
         }
 
         self.last_split_area.set(split_area);
         let split = dock.split(split_area);
+        let mut primary_area = split.primary;
+        let mut detail_area = split.dock;
+        if let Some(mut dock_area) = detail_area {
+            let split_extent = if dock.position.is_horizontal() {
+                split_area.height
+            } else {
+                split_area.width
+            };
+            let split_gap = u16::from(split_extent >= SEARCH_SPLIT_GAP_THRESHOLD);
+            if split_gap > 0 {
+                let splitter_area = match dock.position {
+                    DockPosition::Right => {
+                        dock_area.x = dock_area.x.saturating_add(split_gap);
+                        dock_area.width = dock_area.width.saturating_sub(split_gap);
+                        Rect::new(
+                            split.primary.x.saturating_add(split.primary.width),
+                            split_area.y,
+                            split_gap,
+                            split_area.height,
+                        )
+                    }
+                    DockPosition::Left => {
+                        primary_area.x = primary_area.x.saturating_add(split_gap);
+                        primary_area.width = primary_area.width.saturating_sub(split_gap);
+                        Rect::new(
+                            dock_area.x.saturating_add(dock_area.width),
+                            split_area.y,
+                            split_gap,
+                            split_area.height,
+                        )
+                    }
+                    DockPosition::Bottom => {
+                        dock_area.y = dock_area.y.saturating_add(split_gap);
+                        dock_area.height = dock_area.height.saturating_sub(split_gap);
+                        Rect::new(
+                            split_area.x,
+                            split.primary.y.saturating_add(split.primary.height),
+                            split_area.width,
+                            split_gap,
+                        )
+                    }
+                    DockPosition::Top => {
+                        primary_area.y = primary_area.y.saturating_add(split_gap);
+                        primary_area.height = primary_area.height.saturating_sub(split_gap);
+                        Rect::new(
+                            split_area.x,
+                            dock_area.y.saturating_add(dock_area.height),
+                            split_area.width,
+                            split_gap,
+                        )
+                    }
+                };
+                render_splitter_handle(
+                    frame,
+                    splitter_area,
+                    !dock.position.is_horizontal(),
+                    self.dock_drag == DockDragState::Dragging,
+                );
+            }
+            detail_area = if dock_area.width > 0 && dock_area.height > 0 {
+                Some(dock_area)
+            } else {
+                None
+            };
+        }
+
         let results_area =
-            if facet_area.width == 0 && split.primary.width >= 24 && split.primary.height >= 3 {
-                let hint_area = Rect::new(split.primary.x, split.primary.y, split.primary.width, 1);
+            if facet_area.width == 0 && primary_area.width >= 24 && primary_area.height >= 3 {
+                let hint_area = Rect::new(primary_area.x, primary_area.y, primary_area.width, 1);
                 render_collapsed_facet_hint(frame, hint_area, self);
                 Rect::new(
-                    split.primary.x,
-                    split.primary.y + 1,
-                    split.primary.width,
-                    split.primary.height.saturating_sub(1),
+                    primary_area.x,
+                    primary_area.y.saturating_add(1),
+                    primary_area.width,
+                    primary_area.height.saturating_sub(1),
                 )
             } else {
-                split.primary
+                primary_area
             };
         self.last_results_area.set(results_area);
         self.last_detail_area
-            .set(split.dock.unwrap_or(Rect::new(0, 0, 0, 0)));
+            .set(detail_area.unwrap_or(Rect::new(0, 0, 0, 0)));
 
         self.sync_list_state();
         render_results(
@@ -2416,7 +2600,7 @@ impl MailScreen for SearchCockpitScreen {
             matches!(self.focus, Focus::ResultList),
             self.guidance.as_ref(),
         );
-        if let Some(detail_area) = split.dock {
+        if let Some(detail_area) = detail_area {
             let rendered_body_override = self
                 .results
                 .get(self.cursor)
@@ -2649,7 +2833,7 @@ fn query_message_rows(
                         body_lines
                             .iter()
                             .take(6)
-                            .cloned()
+                            .map(|line| line.text.clone())
                             .collect::<Vec<_>>()
                             .join(" ⟫ ")
                     };
@@ -2814,14 +2998,31 @@ fn collapse_whitespace(s: &str) -> String {
     out
 }
 
-fn markdown_to_searchable_lines(markdown: &str) -> Vec<String> {
+#[derive(Debug, Clone)]
+struct SearchableLine {
+    line_no: usize,
+    text: String,
+}
+
+fn markdown_to_searchable_lines(markdown: &str) -> Vec<SearchableLine> {
     if markdown.trim().is_empty() {
         return Vec::new();
     }
     let mut lines = Vec::new();
-    for line in markdown.lines() {
+    let mut scanned_chars = 0usize;
+    for (line_idx, line) in markdown.lines().enumerate() {
+        if lines.len() >= SEARCHABLE_BODY_MAX_LINES || scanned_chars >= SEARCHABLE_BODY_MAX_CHARS {
+            break;
+        }
+        scanned_chars = scanned_chars.saturating_add(line.len().saturating_add(1));
+        let bounded_line = if line.len() > SEARCHABLE_BODY_MAX_CHARS {
+            let stop = clamp_to_char_boundary(line, SEARCHABLE_BODY_MAX_CHARS);
+            &line[..stop]
+        } else {
+            line
+        };
         // Remove common markdown decoration while preserving semantic content.
-        let stripped = line
+        let stripped = bounded_line
             .trim_start_matches(['#', '>', '-', '*', '+', '|', '`'])
             .trim()
             .trim_matches('|')
@@ -2838,7 +3039,10 @@ fn markdown_to_searchable_lines(markdown: &str) -> Vec<String> {
         }
         let collapsed = collapse_whitespace(stripped);
         if !collapsed.is_empty() {
-            lines.push(collapsed);
+            lines.push(SearchableLine {
+                line_no: line_idx.saturating_add(1),
+                text: collapsed,
+            });
         }
     }
     lines
@@ -2846,11 +3050,17 @@ fn markdown_to_searchable_lines(markdown: &str) -> Vec<String> {
 
 fn markdown_to_searchable_plain(markdown: &str) -> String {
     let lines = markdown_to_searchable_lines(markdown);
-    collapse_whitespace(&lines.join(" "))
+    collapse_whitespace(
+        &lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 fn extract_context_snippet_from_lines(
-    lines: &[String],
+    lines: &[SearchableLine],
     terms: &[QueryTerm],
     max_chars: usize,
 ) -> String {
@@ -2863,7 +3073,7 @@ fn extract_context_snippet_from_lines(
         None
     } else {
         lines.iter().position(|line| {
-            let hay = line.to_ascii_lowercase();
+            let hay = line.text.to_ascii_lowercase();
             needles.iter().any(|needle| hay.contains(needle))
         })
     };
@@ -2873,7 +3083,7 @@ fn extract_context_snippet_from_lines(
             lines
                 .iter()
                 .take(2)
-                .cloned()
+                .map(|line| format!("L{}: {}", line.line_no, line.text))
                 .collect::<Vec<_>>()
                 .join(" ⟫ ")
         },
@@ -2882,13 +3092,20 @@ fn extract_context_snippet_from_lines(
             let end = (hit_idx + 2).min(lines.len());
             let segments = lines[start..end]
                 .iter()
-                .filter(|line| !line.is_empty())
-                .cloned()
+                .filter(|line| !line.text.is_empty())
+                .map(|line| format!("L{}: {}", line.line_no, line.text))
                 .collect::<Vec<_>>();
             if segments.is_empty() {
                 String::new()
             } else {
-                segments.join(" ⟫ ")
+                let mut joined = segments.join(" ⟫ ");
+                if start > 0 {
+                    joined = format!("… {joined}");
+                }
+                if end < lines.len() {
+                    joined.push_str(" ⟫ …");
+                }
+                joined
             }
         },
     );
@@ -3088,7 +3305,7 @@ fn render_query_bar(
         );
 
         let hint_area = Rect::new(content_inner.x, content_inner.y + 1, content_inner.width, 1);
-        Paragraph::new(truncate_str(&hint, w))
+        Paragraph::new(truncate_display_width(&hint, w))
             .style(style)
             .render(hint_area, frame);
     }
@@ -3123,7 +3340,7 @@ fn render_query_bar(
             latency_label,
         );
         let chips_area = Rect::new(content_inner.x, content_inner.y + 2, content_inner.width, 1);
-        Paragraph::new(truncate_str(&chips, content_inner.width as usize))
+        Paragraph::new(truncate_display_width(&chips, content_inner.width as usize))
             .style(Style::default().fg(RESULT_CURSOR_FG()))
             .render(chips_area, frame);
     }
@@ -3131,9 +3348,12 @@ fn render_query_bar(
     if content_inner.height >= 4 && (has_active_query || in_query) {
         let telemetry_area =
             Rect::new(content_inner.x, content_inner.y + 3, content_inner.width, 1);
-        Paragraph::new(truncate_str(telemetry, content_inner.width as usize))
-            .style(Style::default().fg(FACET_ACTIVE_FG()))
-            .render(telemetry_area, frame);
+        Paragraph::new(truncate_display_width(
+            telemetry,
+            content_inner.width as usize,
+        ))
+        .style(Style::default().fg(FACET_ACTIVE_FG()))
+        .render(telemetry_area, frame);
     }
 }
 
@@ -3149,7 +3369,7 @@ fn render_collapsed_facet_hint(frame: &mut Frame<'_>, area: Rect, screen: &Searc
         screen.sort_direction.label(),
         screen.search_mode.label(),
     );
-    Paragraph::new(truncate_str(&hint, area.width as usize))
+    Paragraph::new(truncate_display_width(&hint, area.width as usize))
         .style(crate::tui_theme::text_hint(&tp))
         .render(area, frame);
 }
@@ -3181,6 +3401,7 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
     let Some(popup_area) = query_help_popup_rect(area, query_area) else {
         return;
     };
+    let tp = crate::tui_theme::TuiThemePalette::current();
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3192,6 +3413,7 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    fill_rect(frame, inner, tp.panel_bg);
 
     let text = "AND/OR: error AND deploy\n\
 Quotes: \"build failed\"\n\
@@ -3280,7 +3502,7 @@ fn render_facet_rail(
 
         // Label row
         let label_text = format!("{marker} {label}");
-        let label_line = truncate_str(&label_text, w);
+        let label_line = truncate_display_width(&label_text, w);
         let label_area = Rect::new(inner.x, y, inner.width, 1);
         Paragraph::new(label_line)
             .style(label_style)
@@ -3290,7 +3512,7 @@ fn render_facet_rail(
         let value_y = y + 1;
         if value_y < inner.y + inner.height {
             let val_text = format!("  [{value}]");
-            let val_line = truncate_str(&val_text, w);
+            let val_line = truncate_display_width(&val_text, w);
             let val_area = Rect::new(inner.x, value_y, inner.width, 1);
             let val_style = if is_active {
                 Style::default().fg(RESULT_CURSOR_FG()).bg(tp.bg_overlay)
@@ -3307,7 +3529,10 @@ fn render_facet_rail(
     if let Some(ref tid) = screen.thread_filter {
         let y = inner.y + 16;
         if y + 1 < inner.y + inner.height {
-            let thread_text = format!("  Thread: {}", truncate_str(tid, w.saturating_sub(10)));
+            let thread_text = format!(
+                "  Thread: {}",
+                truncate_display_width(tid, w.saturating_sub(10))
+            );
             let thread_area = Rect::new(inner.x, y, inner.width, 1);
             Paragraph::new(thread_text)
                 .style(Style::default().fg(FACET_ACTIVE_FG()))
@@ -3328,7 +3553,7 @@ fn render_facet_rail(
             "f:facets  L:query lab  mouse:click/wheel"
         };
         let hint_area = Rect::new(inner.x, help_y, inner.width, 1);
-        Paragraph::new(truncate_str(hint, w))
+        Paragraph::new(truncate_display_width(hint, w))
             .style(Style::default().fg(FACET_LABEL_FG()))
             .render(hint_area, frame);
     }
@@ -3360,6 +3585,7 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
     if lab_inner.height == 0 || lab_inner.width == 0 {
         return;
     }
+    fill_rect(frame, lab_inner, tp.panel_bg);
 
     let mut rows: Vec<String> = Vec::new();
     let q = screen.query_input.value().trim();
@@ -3419,7 +3645,7 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
         } else {
             Style::default().fg(FACET_LABEL_FG())
         };
-        Paragraph::new(truncate_str(&row, lab_inner.width as usize))
+        Paragraph::new(truncate_display_width(&row, lab_inner.width as usize))
             .style(style)
             .render(line_area, frame);
     }
@@ -3804,10 +4030,28 @@ fn render_detail(
         (inner, None)
     };
 
+    let hint_area = if content_inner.width > 2 && content_inner.height > 2 {
+        Rect::new(
+            content_inner.x.saturating_add(1),
+            content_inner.y.saturating_add(1),
+            content_inner.width.saturating_sub(2),
+            content_inner.height.saturating_sub(1),
+        )
+    } else if content_inner.width > 2 {
+        Rect::new(
+            content_inner.x.saturating_add(1),
+            content_inner.y,
+            content_inner.width.saturating_sub(2),
+            content_inner.height,
+        )
+    } else {
+        content_inner
+    };
+
     let Some(entry) = entry else {
         Paragraph::new("Select a result to view details.")
             .style(crate::tui_theme::text_hint(&tp))
-            .render(content_inner, frame);
+            .render(hint_area, frame);
         return;
     };
 
@@ -3816,9 +4060,9 @@ fn render_detail(
     let content_h = content_inner.height.saturating_sub(action_bar_h);
     let mut content_area = Rect::new(
         content_inner.x,
-        content_inner.y,
+        content_inner.y.saturating_add(u16::from(content_h > 1)),
         content_inner.width,
-        content_h,
+        content_h.saturating_sub(u16::from(content_h > 1)),
     );
     if content_area.width > 2 {
         content_area = Rect::new(
@@ -5151,6 +5395,45 @@ mod tests {
         assert!(snippet.contains("needle"));
         assert!(snippet.starts_with('\u{2026}'));
         assert!(snippet.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn extract_context_snippet_includes_line_numbers_and_hit_context() {
+        let lines = vec![
+            SearchableLine {
+                line_no: 3,
+                text: "alpha context".to_string(),
+            },
+            SearchableLine {
+                line_no: 4,
+                text: "target needle match".to_string(),
+            },
+            SearchableLine {
+                line_no: 5,
+                text: "omega context".to_string(),
+            },
+        ];
+        let terms = vec![QueryTerm {
+            text: "needle".to_string(),
+            kind: QueryTermKind::Word,
+            negated: false,
+        }];
+
+        let snippet = extract_context_snippet_from_lines(&lines, &terms, 200);
+        assert!(snippet.contains("L4:"));
+        assert!(snippet.contains("needle"));
+        assert!(snippet.contains(" ⟫ "));
+    }
+
+    #[test]
+    fn markdown_to_searchable_lines_respects_scan_caps() {
+        let mut markdown = String::new();
+        for idx in 0..200 {
+            markdown.push_str(&format!("line {idx}\n"));
+        }
+        let lines = markdown_to_searchable_lines(&markdown);
+        assert!(lines.len() <= SEARCHABLE_BODY_MAX_LINES);
+        assert!(lines.first().is_some_and(|line| line.line_no > 0));
     }
 
     #[test]

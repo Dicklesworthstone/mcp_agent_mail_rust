@@ -446,14 +446,13 @@ impl TwoTierIndex {
     pub fn migrate_zero_quality_to_no_quality(&mut self) -> usize {
         let mut count = 0;
         for idx in 0..self.metadata.doc_count {
-            if self.has_quality_flags.get(idx).copied().unwrap_or(false) {
-                if let Some(emb) = self.quality_embedding(idx) {
-                    if is_zero_vector_f16(emb) {
-                        self.has_quality_flags[idx] = false;
-                        self.quality_doc_count = self.quality_doc_count.saturating_sub(1);
-                        count += 1;
-                    }
-                }
+            if self.has_quality_flags.get(idx).copied().unwrap_or(false)
+                && let Some(emb) = self.quality_embedding(idx)
+                && is_zero_vector_f16(emb)
+            {
+                self.has_quality_flags[idx] = false;
+                self.quality_doc_count = self.quality_doc_count.saturating_sub(1);
+                count += 1;
             }
         }
         if count > 0 {

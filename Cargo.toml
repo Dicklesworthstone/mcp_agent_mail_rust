@@ -19,7 +19,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.95"
 repository = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust"
 authors = ["Jeff Emanuel"]
 
@@ -75,8 +75,8 @@ include_dir = "0.7.4"
 minijinja = "2.15.1"
 ammonia = "4.1.2"
 regex = "1"
-similar = "2.5.0"
-git2 = "0.19"
+similar = "2"
+git2 = "0.20"
 glob = "0.3.3"
 globset = "0.4"
 tracing = "0.1"
@@ -88,7 +88,7 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["std"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 proptest = "1"
@@ -107,12 +107,12 @@ frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
-wide = "0.7"
-safetensors = "0.5"
+wide = "1"
+safetensors = "0.7"
 tokenizers = "0.22"
 fastembed = "5.9.0"
-rayon = "1.10"
-dirs = "5"
+rayon = "1"
+dirs = "6"
 smallvec = { version = "1", features = ["serde"] }
 atty = "0.2"
 

@@ -406,11 +406,11 @@ impl<T: Clone> QueryCache<T> {
         entries.retain(|_, entry| !entry.is_expired(self.config.ttl));
         let removed = before - entries.len();
 
-        if removed > 0 {
-            if let Ok(mut metrics) = self.metrics.write() {
-                metrics.evictions_ttl += removed as u64;
-                metrics.current_entries = entries.len();
-            }
+        if removed > 0
+            && let Ok(mut metrics) = self.metrics.write()
+        {
+            metrics.evictions_ttl += removed as u64;
+            metrics.current_entries = entries.len();
         }
     }
 }
@@ -547,22 +547,22 @@ impl WarmWorker {
     /// Record warmup completion.
     #[allow(clippy::cast_possible_truncation)] // Duration in ms won't exceed u64
     pub fn complete_warmup(&self, resource: WarmResource, duration: Duration) {
-        if let Ok(mut status) = self.status.write() {
-            if let Some(ws) = status.get_mut(&resource) {
-                ws.state = WarmState::Warm;
-                ws.warm_duration_ms = Some(duration.as_millis() as u64);
-                ws.error = None;
-            }
+        if let Ok(mut status) = self.status.write()
+            && let Some(ws) = status.get_mut(&resource)
+        {
+            ws.state = WarmState::Warm;
+            ws.warm_duration_ms = Some(duration.as_millis() as u64);
+            ws.error = None;
         }
     }
 
     /// Record warmup failure.
     pub fn fail_warmup(&self, resource: WarmResource, error: &str) {
-        if let Ok(mut status) = self.status.write() {
-            if let Some(ws) = status.get_mut(&resource) {
-                ws.state = WarmState::Failed;
-                ws.error = Some(error.to_string());
-            }
+        if let Ok(mut status) = self.status.write()
+            && let Some(ws) = status.get_mut(&resource)
+        {
+            ws.state = WarmState::Failed;
+            ws.error = Some(error.to_string());
         }
     }
 
@@ -751,7 +751,7 @@ mod tests {
     fn test_cache_lru_eviction() {
         let config = CacheConfig {
             max_entries: 2,
-            ttl: Duration::from_secs(300),
+            ttl: Duration::from_mins(5),
             enabled: true,
         };
         let cache: QueryCache<i64> = QueryCache::new(config);
@@ -852,7 +852,7 @@ mod tests {
     fn test_disabled_cache_get_always_returns_none() {
         let config = CacheConfig {
             max_entries: 100,
-            ttl: Duration::from_secs(300),
+            ttl: Duration::from_mins(5),
             enabled: false,
         };
         let cache: QueryCache<i64> = QueryCache::new(config);
@@ -868,7 +868,7 @@ mod tests {
     fn test_disabled_cache_put_is_noop() {
         let config = CacheConfig {
             max_entries: 100,
-            ttl: Duration::from_secs(300),
+            ttl: Duration::from_mins(5),
             enabled: false,
         };
         let cache: QueryCache<i64> = QueryCache::new(config);
@@ -888,7 +888,7 @@ mod tests {
     fn test_cache_entry_is_expired() {
         let entry = CacheEntry::new(42_i64);
         // Just created → not expired with 300s TTL
-        assert!(!entry.is_expired(Duration::from_secs(300)));
+        assert!(!entry.is_expired(Duration::from_mins(5)));
         // Expired with 0 TTL
         assert!(entry.is_expired(Duration::ZERO));
     }
@@ -970,7 +970,7 @@ mod tests {
     fn test_prune_expired_with_zero_ttl_clears_all() {
         let config = CacheConfig {
             max_entries: 100,
-            ttl: Duration::from_secs(300),
+            ttl: Duration::from_mins(5),
             enabled: true,
         };
         let cache: QueryCache<i64> = QueryCache::new(config);
@@ -1414,14 +1414,14 @@ mod tests {
     fn warm_worker_config_accessor() {
         let config = WarmWorkerConfig {
             warmup_on_startup: false,
-            warmup_timeout: Duration::from_secs(60),
+            warmup_timeout: Duration::from_mins(1),
             retry_on_failure: false,
             max_retries: 0,
         };
         let worker = WarmWorker::new(config);
         let got = worker.config();
         assert!(!got.warmup_on_startup);
-        assert_eq!(got.warmup_timeout, Duration::from_secs(60));
+        assert_eq!(got.warmup_timeout, Duration::from_mins(1));
     }
 
     // ── Constants ───────────────────────────────────────────────────

@@ -3524,32 +3524,32 @@ pub async fn release_reservations(
         Value::BigInt(agent_id),
     ];
 
-    if let Some(ids) = reservation_ids {
-        if !ids.is_empty() {
-            sql.push_str(" AND id IN (");
-            for (i, id) in ids.iter().enumerate() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-                params.push(Value::BigInt(*id));
+    if let Some(ids) = reservation_ids
+        && !ids.is_empty()
+    {
+        sql.push_str(" AND id IN (");
+        for (i, id) in ids.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
             }
-            sql.push(')');
+            sql.push('?');
+            params.push(Value::BigInt(*id));
         }
+        sql.push(')');
     }
 
-    if let Some(pats) = paths {
-        if !pats.is_empty() {
-            sql.push_str(" AND (");
-            for (i, pat) in pats.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" OR ");
-                }
-                sql.push_str("path_pattern = ?");
-                params.push(Value::Text((*pat).to_string()));
+    if let Some(pats) = paths
+        && !pats.is_empty()
+    {
+        sql.push_str(" AND (");
+        for (i, pat) in pats.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
             }
-            sql.push(')');
+            sql.push_str("path_pattern = ?");
+            params.push(Value::Text((*pat).to_string()));
         }
+        sql.push(')');
     }
 
     let out = map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await);
@@ -3603,32 +3603,32 @@ pub async fn renew_reservations(
     );
     let mut params: Vec<Value> = vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
 
-    if let Some(ids) = reservation_ids {
-        if !ids.is_empty() {
-            sql.push_str(" AND id IN (");
-            for (i, id) in ids.iter().enumerate() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-                params.push(Value::BigInt(*id));
+    if let Some(ids) = reservation_ids
+        && !ids.is_empty()
+    {
+        sql.push_str(" AND id IN (");
+        for (i, id) in ids.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
             }
-            sql.push(')');
+            sql.push('?');
+            params.push(Value::BigInt(*id));
         }
+        sql.push(')');
     }
 
-    if let Some(pats) = paths {
-        if !pats.is_empty() {
-            sql.push_str(" AND (");
-            for (i, pat) in pats.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" OR ");
-                }
-                sql.push_str("path_pattern = ?");
-                params.push(Value::Text((*pat).to_string()));
+    if let Some(pats) = paths
+        && !pats.is_empty()
+    {
+        sql.push_str(" AND (");
+        for (i, pat) in pats.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
             }
-            sql.push(')');
+            sql.push_str("path_pattern = ?");
+            params.push(Value::Text((*pat).to_string()));
         }
+        sql.push(')');
     }
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);

@@ -271,15 +271,15 @@ pub fn generate_token() -> String {
 /// explicit flag > `HTTP_BEARER_TOKEN` env var > .env file > generate new.
 #[must_use]
 pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> String {
-    if let Some(t) = explicit {
-        if !t.is_empty() {
-            return t.to_string();
-        }
+    if let Some(t) = explicit
+        && !t.is_empty()
+    {
+        return t.to_string();
     }
-    if let Ok(t) = std::env::var("HTTP_BEARER_TOKEN") {
-        if !t.is_empty() {
-            return t;
-        }
+    if let Ok(t) = std::env::var("HTTP_BEARER_TOKEN")
+        && !t.is_empty()
+    {
+        return t;
     }
     if let Some(t) = read_env_file_token(env_file) {
         return t;
@@ -999,15 +999,15 @@ fn check_config_file(path: &Path, expected_url: &str) -> (bool, bool) {
 
     // Search for "mcp-agent-mail" at any nesting level in known keys
     for key in &["mcpServers", "mcp", "servers"] {
-        if let Some(servers) = doc.get(key).and_then(|v| v.as_object()) {
-            if let Some(entry) = servers.get("mcp-agent-mail") {
-                let url_match = entry
-                    .get("url")
-                    .or_else(|| entry.get("httpUrl"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|u| u == expected_url);
-                return (true, url_match);
-            }
+        if let Some(servers) = doc.get(key).and_then(|v| v.as_object())
+            && let Some(entry) = servers.get("mcp-agent-mail")
+        {
+            let url_match = entry
+                .get("url")
+                .or_else(|| entry.get("httpUrl"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|u| u == expected_url);
+            return (true, url_match);
         }
     }
 

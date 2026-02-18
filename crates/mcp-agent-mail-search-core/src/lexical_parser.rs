@@ -333,7 +333,7 @@ impl SanitizedQuery {
 
     /// Returns the sanitized query string, or `None` if empty
     #[must_use]
-    pub fn as_str(&self) -> Option<&str> {
+    pub const fn as_str(&self) -> Option<&str> {
         match self {
             Self::Empty => None,
             Self::Valid(s) => Some(s.as_str()),

@@ -1862,3 +1862,367 @@ fn frankenconnection_many_tables_corruption_threshold() {
         }
     }
 }
+
+// ===========================================================================
+// v10a/v10b migration tests — Doom Loop Fix Test Coverage (br-3h13.16.1)
+// ===========================================================================
+
+/// Helper: create a pre-v10 agents table (case-sensitive UNIQUE constraint)
+/// and a projects table, then insert agents manually. Returns an open
+/// `SqliteConnection` ready for `migrate_to_latest`.
+fn setup_pre_v10_db_with_agents(
+    agents: &[(i64, &str, i64)], // (project_id, name, explicit_id)
+) -> (SqliteConnection, tempfile::TempDir) {
+    let (conn, dir) = open_temp_db();
+
+    conn.execute_raw(schema::PRAGMA_SETTINGS_SQL)
+        .expect("apply PRAGMAs");
+
+    // Create pre-v10 schema: projects + agents with case-sensitive UNIQUE.
+    conn.execute_sync(
+        "CREATE TABLE IF NOT EXISTS projects (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            slug TEXT NOT NULL UNIQUE,\
+            human_key TEXT NOT NULL,\
+            created_at INTEGER NOT NULL\
+        )",
+        &[],
+    )
+    .expect("create projects");
+
+    conn.execute_sync(
+        "CREATE TABLE IF NOT EXISTS agents (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            project_id INTEGER NOT NULL REFERENCES projects(id),\
+            name TEXT NOT NULL,\
+            program TEXT NOT NULL,\
+            model TEXT NOT NULL,\
+            task_description TEXT NOT NULL DEFAULT '',\
+            inception_ts INTEGER NOT NULL,\
+            last_active_ts INTEGER NOT NULL,\
+            attachments_policy TEXT NOT NULL DEFAULT 'auto',\
+            contact_policy TEXT NOT NULL DEFAULT 'auto',\
+            UNIQUE(project_id, name)\
+        )",
+        &[],
+    )
+    .expect("create agents");
+
+    // Create index matching pre-v10 schema.
+    conn.execute_sync(
+        "CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name)",
+        &[],
+    )
+    .expect("create index");
+
+    // Insert projects that are referenced by agents.
+    let mut project_ids: Vec<i64> = agents.iter().map(|(pid, _, _)| *pid).collect();
+    project_ids.sort_unstable();
+    project_ids.dedup();
+    for pid in &project_ids {
+        conn.execute_sync(
+            "INSERT OR IGNORE INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(*pid),
+                Value::Text(format!("proj-{pid}")),
+                Value::Text(format!("/proj/{pid}")),
+                Value::BigInt(1_000_000),
+            ],
+        )
+        .expect("insert project");
+    }
+
+    // Insert agents with explicit IDs to control ordering.
+    for (project_id, name, agent_id) in agents {
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(*agent_id),
+                Value::BigInt(*project_id),
+                Value::Text(name.to_string()),
+                Value::Text("test-program".into()),
+                Value::Text("test-model".into()),
+                Value::BigInt(*agent_id * 1_000_000),
+                Value::BigInt(*agent_id * 1_000_000),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("insert agent '{name}' (id={agent_id}): {e}"));
+    }
+
+    (conn, dir)
+}
+
+// ---------------------------------------------------------------------------
+// T16.1.1: Test v10a dedup fires on case-duplicate agents and keeps oldest
+// (br-3h13.16.1.1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v10a_dedup_case_duplicate_agents_keeps_oldest() {
+    // Setup: Two agents with same project_id but different-case names.
+    // id=10 "SilverFox" (oldest), id=20 "silverfox" (newer), id=30 "SILVERFOX" (newest).
+    let (conn, _dir) = setup_pre_v10_db_with_agents(&[
+        (1, "SilverFox", 10),
+        (1, "silverfox", 20),
+        (1, "SILVERFOX", 30),
+    ]);
+
+    // Run all migrations (v10a will dedup).
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    // Only 1 agent should remain for project_id=1.
+    let rows = conn
+        .query_sync(
+            "SELECT id, name FROM agents WHERE project_id = 1 ORDER BY id",
+            &[],
+        )
+        .expect("query agents after dedup");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly 1 agent after v10a dedup, got {}",
+        rows.len()
+    );
+
+    // The KEPT agent must be the one with the lowest id (oldest = id 10).
+    let kept_id: i64 = rows[0].get_named("id").expect("get id");
+    let kept_name: String = rows[0].get_named("name").expect("get name");
+    assert_eq!(kept_id, 10, "should keep oldest agent (id=10)");
+    assert_eq!(
+        kept_name, "SilverFox",
+        "should keep the name of the oldest agent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T16.1.2: Test v10a migration is safe on empty agents table
+// (br-3h13.16.1.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v10a_safe_on_empty_agents_table() {
+    // Setup: No agents at all.
+    let (conn, _dir) = setup_pre_v10_db_with_agents(&[]);
+
+    // Run all migrations — should succeed without error.
+    let applied = block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+    assert!(
+        applied
+            .iter()
+            .any(|id| id == "v10a_dedup_agents_case_insensitive"),
+        "v10a migration should have been applied"
+    );
+
+    // Agents table still exists and is empty.
+    let rows = conn
+        .query_sync("SELECT COUNT(*) as cnt FROM agents", &[])
+        .expect("count agents");
+    let count: i64 = rows[0].get_named("cnt").unwrap_or(-1);
+    assert_eq!(
+        count, 0,
+        "agents table should be empty after v10a on empty table"
+    );
+
+    // Idempotency: running again also succeeds.
+    let applied2 = block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+    assert!(applied2.is_empty(), "re-running migrations should be no-op");
+}
+
+// ---------------------------------------------------------------------------
+// T16.1.3: Test v10a preserves non-duplicate agents unchanged
+// (br-3h13.16.1.3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v10a_preserves_non_duplicate_agents() {
+    // Setup: 3 agents with unique names (no case collisions).
+    let (conn, _dir) =
+        setup_pre_v10_db_with_agents(&[(1, "Alice", 1), (1, "Bob", 2), (2, "Charlie", 3)]);
+
+    // Run all migrations.
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    // All 3 agents should still exist with unchanged data.
+    let rows = conn
+        .query_sync(
+            "SELECT id, name, project_id, program, model FROM agents ORDER BY id",
+            &[],
+        )
+        .expect("query all agents");
+
+    assert_eq!(rows.len(), 3, "all 3 non-duplicate agents should survive");
+
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| r.get_named::<String>("name").unwrap_or_default())
+        .collect();
+    assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
+
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get_named::<i64>("id").unwrap_or(0))
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3], "agent IDs should be unchanged");
+
+    // Verify agent data (program, model) is also unchanged.
+    for row in &rows {
+        let program: String = row.get_named("program").unwrap_or_default();
+        let model: String = row.get_named("model").unwrap_or_default();
+        assert_eq!(program, "test-program", "program should be unchanged");
+        assert_eq!(model, "test-model", "model should be unchanged");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T16.1.4: Test v10a cross-project isolation (same name, different projects kept)
+// (br-3h13.16.1.4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v10a_cross_project_isolation_same_name_different_projects() {
+    // Setup: Same name (different case) but in DIFFERENT projects.
+    // These should NOT be deduped because GROUP BY includes project_id.
+    let (conn, _dir) = setup_pre_v10_db_with_agents(&[(1, "Alice", 1), (2, "alice", 2)]);
+
+    // Run all migrations.
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    // Both agents should still exist (2 rows total).
+    let rows = conn
+        .query_sync("SELECT id, name, project_id FROM agents ORDER BY id", &[])
+        .expect("query agents");
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "cross-project agents with same name should both survive dedup"
+    );
+
+    let agent1_id: i64 = rows[0].get_named("id").unwrap_or(0);
+    let agent1_proj: i64 = rows[0].get_named("project_id").unwrap_or(0);
+    let agent2_id: i64 = rows[1].get_named("id").unwrap_or(0);
+    let agent2_proj: i64 = rows[1].get_named("project_id").unwrap_or(0);
+
+    assert_eq!(agent1_id, 1, "agent in project 1 should have id=1");
+    assert_eq!(agent1_proj, 1, "first agent should be in project 1");
+    assert_eq!(agent2_id, 2, "agent in project 2 should have id=2");
+    assert_eq!(agent2_proj, 2, "second agent should be in project 2");
+}
+
+// ---------------------------------------------------------------------------
+// T16.1.5: Test v10b index creation and uniqueness enforcement
+// (br-3h13.16.1.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v10b_index_creation_and_uniqueness_enforcement() {
+    // Setup: Clean agents (no duplicates) so v10a is a no-op and v10b creates the index.
+    let (conn, _dir) = setup_pre_v10_db_with_agents(&[
+        (1, "Alice", 1),
+        (1, "Bob", 2),
+        (2, "Alice", 3), // Same name but different project — allowed.
+    ]);
+
+    // Run all migrations (v10a dedup + v10b index creation).
+    let applied = block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    assert!(
+        applied
+            .iter()
+            .any(|id| id == "v10b_idx_agents_project_name_nocase"),
+        "v10b migration should have been applied"
+    );
+
+    // Verify index exists via PRAGMA index_list.
+    let rows = conn
+        .query_sync("PRAGMA index_list(agents)", &[])
+        .expect("query index_list");
+
+    let index_names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get_named::<String>("name").ok())
+        .collect();
+    assert!(
+        index_names.contains(&"idx_agents_project_name_nocase".to_string()),
+        "idx_agents_project_name_nocase should exist in {index_names:?}"
+    );
+
+    // Verify the index is UNIQUE (origin = 'u' in PRAGMA index_list).
+    let unique_flag: Option<i64> = rows
+        .iter()
+        .find(|r| {
+            r.get_named::<String>("name").unwrap_or_default() == "idx_agents_project_name_nocase"
+        })
+        .and_then(|r| r.get_named::<i64>("unique").ok());
+    assert_eq!(
+        unique_flag,
+        Some(1),
+        "idx_agents_project_name_nocase should be UNIQUE"
+    );
+
+    // Verify uniqueness enforcement: inserting a case-duplicate should FAIL.
+    let result = conn.execute_sync(
+        "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+        &[
+            Value::BigInt(1),
+            Value::Text("alice".into()), // "Alice" already exists in project 1
+            Value::Text("test".into()),
+            Value::Text("model".into()),
+            Value::BigInt(99_000_000),
+            Value::BigInt(99_000_000),
+        ],
+    );
+    assert!(
+        result.is_err(),
+        "inserting case-duplicate 'alice' when 'Alice' exists in same project should fail with UNIQUE constraint"
+    );
+
+    // Verify cross-project insertion still works: "bob" in project 2 should succeed.
+    let result = conn.execute_sync(
+        "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+        &[
+            Value::BigInt(2),
+            Value::Text("bob".into()), // "Bob" only exists in project 1, not project 2
+            Value::Text("test".into()),
+            Value::Text("model".into()),
+            Value::BigInt(100_000_000),
+            Value::BigInt(100_000_000),
+        ],
+    );
+    assert!(
+        result.is_ok(),
+        "inserting 'bob' in project 2 (only exists in project 1) should succeed"
+    );
+
+    // Verify final state: 4 agents total (3 original + 1 new cross-project).
+    let rows = conn
+        .query_sync("SELECT COUNT(*) as cnt FROM agents", &[])
+        .expect("count agents");
+    let count: i64 = rows[0].get_named("cnt").unwrap_or(0);
+    assert_eq!(
+        count, 4,
+        "should have 4 agents total after cross-project insert"
+    );
+}

@@ -260,12 +260,12 @@ pub fn compute_project_slug(human_key: &str) -> String {
 
     match mode {
         ProjectIdentityMode::GitRemote => {
-            if let Some(url) = remote_url {
-                if let Some(normalized) = normalize_remote_first_two(&url) {
-                    let base = normalized.rsplit('/').next().unwrap_or("repo").to_string();
-                    let canonical = normalized;
-                    return format!("{base}-{}", short_sha1(&canonical, 10));
-                }
+            if let Some(url) = remote_url
+                && let Some(normalized) = normalize_remote_first_two(&url)
+            {
+                let base = normalized.rsplit('/').next().unwrap_or("repo").to_string();
+                let canonical = normalized;
+                return format!("{base}-{}", short_sha1(&canonical, 10));
             }
             slugify(human_key)
         }
@@ -429,66 +429,63 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
     let marker_committed = repo_root_path
         .as_ref()
         .map(|root| root.join(".agent-mail-project-id"));
-    if let Some(marker) = marker_committed.as_ref() {
-        if let Ok(text) = std::fs::read_to_string(marker) {
-            let trimmed = text.trim().to_string();
-            if !trimmed.is_empty() {
-                project_uid = Some(trimmed);
-            }
+    if let Some(marker) = marker_committed.as_ref()
+        && let Ok(text) = std::fs::read_to_string(marker)
+    {
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() {
+            project_uid = Some(trimmed);
         }
     }
 
-    if project_uid.is_none() {
-        if let Some(info) = discovery.as_ref() {
-            if let Some(uid) = info.project_uid.as_ref() {
-                if !uid.trim().is_empty() {
-                    project_uid = Some(uid.trim().to_string());
-                }
-            }
-        }
+    if project_uid.is_none()
+        && let Some(info) = discovery.as_ref()
+        && let Some(uid) = info.project_uid.as_ref()
+        && !uid.trim().is_empty()
+    {
+        project_uid = Some(uid.trim().to_string());
     }
 
     let marker_private = git_common_dir
         .as_ref()
         .map(|g| PathBuf::from(g).join("agent-mail").join("project-id"));
-    if project_uid.is_none() {
-        if let Some(marker) = marker_private.as_ref() {
-            if let Ok(text) = std::fs::read_to_string(marker) {
-                let trimmed = text.trim().to_string();
-                if !trimmed.is_empty() {
-                    project_uid = Some(trimmed);
-                }
-            }
+    if project_uid.is_none()
+        && let Some(marker) = marker_private.as_ref()
+        && let Ok(text) = std::fs::read_to_string(marker)
+    {
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() {
+            project_uid = Some(trimmed);
         }
     }
 
-    if project_uid.is_none() {
-        if let Some(remote) = normalized_remote.as_ref() {
-            let fingerprint = format!("{remote}@{default_branch}");
-            project_uid = Some(short_sha1(&fingerprint, 20));
-        }
+    if project_uid.is_none()
+        && let Some(remote) = normalized_remote.as_ref()
+    {
+        let fingerprint = format!("{remote}@{default_branch}");
+        project_uid = Some(short_sha1(&fingerprint, 20));
     }
 
-    if project_uid.is_none() {
-        if let Some(common) = git_common_dir.as_ref() {
-            project_uid = Some(short_sha1(common, 20));
-        }
+    if project_uid.is_none()
+        && let Some(common) = git_common_dir.as_ref()
+    {
+        project_uid = Some(short_sha1(common, 20));
     }
 
     if project_uid.is_none() {
         project_uid = Some(short_sha1(&target_str, 20));
     }
 
-    if let (true, Some(marker)) = (config.worktrees_enabled, marker_private.as_ref()) {
-        if !marker.exists() {
-            if let Some(parent) = marker.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(
-                marker,
-                format!("{}\n", project_uid.as_deref().unwrap_or("")),
-            );
+    if let (true, Some(marker)) = (config.worktrees_enabled, marker_private.as_ref())
+        && !marker.exists()
+    {
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
+        let _ = std::fs::write(
+            marker,
+            format!("{}\n", project_uid.as_deref().unwrap_or("")),
+        );
     }
 
     let slug_value = compute_project_slug(&target_str);

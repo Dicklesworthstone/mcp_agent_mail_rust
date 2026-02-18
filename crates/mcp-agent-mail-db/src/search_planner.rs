@@ -758,16 +758,15 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     if let ScopePolicy::ProjectSet {
         ref allowed_project_ids,
     } = query.scope
+        && !allowed_project_ids.is_empty()
     {
-        if !allowed_project_ids.is_empty() {
-            let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
-            where_clauses.push(format!("m.project_id IN ({})", placeholders.join(", ")));
-            for &pid in allowed_project_ids {
-                params.push(PlanParam::Int(pid));
-            }
-            facets_applied.push("scope_project_set".to_string());
-            scope_enforced = true;
+        let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
+        where_clauses.push(format!("m.project_id IN ({})", placeholders.join(", ")));
+        for &pid in allowed_project_ids {
+            params.push(PlanParam::Int(pid));
         }
+        facets_applied.push("scope_project_set".to_string());
+        scope_enforced = true;
     }
 
     // ── Facet filters ──────────────────────────────────────────────
@@ -833,16 +832,16 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     }
 
     // ── Cursor-based pagination ────────────────────────────────────
-    if let Some(ref cursor_str) = query.cursor {
-        if let Some(cursor) = SearchCursor::decode(cursor_str) {
-            // For relevance ranking: score ASC, id ASC
-            // Cursor means: continue after (score, id)
-            where_clauses.push("(score > ? OR (score = ? AND m.id > ?))".to_string());
-            params.push(PlanParam::Float(cursor.score));
-            params.push(PlanParam::Float(cursor.score));
-            params.push(PlanParam::Int(cursor.id));
-            facets_applied.push("cursor".to_string());
-        }
+    if let Some(ref cursor_str) = query.cursor
+        && let Some(cursor) = SearchCursor::decode(cursor_str)
+    {
+        // For relevance ranking: score ASC, id ASC
+        // Cursor means: continue after (score, id)
+        where_clauses.push("(score > ? OR (score = ? AND m.id > ?))".to_string());
+        params.push(PlanParam::Float(cursor.score));
+        params.push(PlanParam::Float(cursor.score));
+        params.push(PlanParam::Int(cursor.id));
+        facets_applied.push("cursor".to_string());
     }
 
     // ── Assemble SQL ───────────────────────────────────────────────
@@ -918,16 +917,15 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     if let ScopePolicy::ProjectSet {
         ref allowed_project_ids,
     } = query.scope
+        && !allowed_project_ids.is_empty()
     {
-        if !allowed_project_ids.is_empty() {
-            let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
-            where_clauses.push(format!("a.project_id IN ({})", placeholders.join(", ")));
-            for &pid in allowed_project_ids {
-                params.push(PlanParam::Int(pid));
-            }
-            facets_applied.push("scope_project_set".to_string());
-            scope_enforced = true;
+        let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
+        where_clauses.push(format!("a.project_id IN ({})", placeholders.join(", ")));
+        for &pid in allowed_project_ids {
+            params.push(PlanParam::Int(pid));
         }
+        facets_applied.push("scope_project_set".to_string());
+        scope_enforced = true;
     }
 
     let where_str = if where_clauses.is_empty() {
@@ -995,16 +993,15 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     if let ScopePolicy::ProjectSet {
         ref allowed_project_ids,
     } = query.scope
+        && !allowed_project_ids.is_empty()
     {
-        if !allowed_project_ids.is_empty() {
-            let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
-            where_clauses.push(format!("p.id IN ({})", placeholders.join(", ")));
-            for &pid in allowed_project_ids {
-                params.push(PlanParam::Int(pid));
-            }
-            facets_applied.push("scope_project_set".to_string());
-            scope_enforced = true;
+        let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
+        where_clauses.push(format!("p.id IN ({})", placeholders.join(", ")));
+        for &pid in allowed_project_ids {
+            params.push(PlanParam::Int(pid));
         }
+        facets_applied.push("scope_project_set".to_string());
+        scope_enforced = true;
     }
 
     let where_str = if where_clauses.is_empty() {
@@ -1028,7 +1025,7 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
 }
 
 /// Check if the query has any message-specific facet filters.
-fn has_any_message_facet(query: &SearchQuery) -> bool {
+const fn has_any_message_facet(query: &SearchQuery) -> bool {
     !query.importance.is_empty()
         || query.direction.is_some()
         || query.agent_name.is_some()

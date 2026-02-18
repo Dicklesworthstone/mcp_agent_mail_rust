@@ -253,18 +253,18 @@ pub fn parse_toon_stats(stderr: &str) -> Option<ToonStats> {
 
     for line in stderr.lines() {
         // Token estimates line
-        if line.contains("Token estimates:") {
-            if let Some(stats) = parse_token_line(line) {
-                json_tokens = Some(stats.0);
-                toon_tokens = Some(stats.1);
-            }
+        if line.contains("Token estimates:")
+            && let Some(stats) = parse_token_line(line)
+        {
+            json_tokens = Some(stats.0);
+            toon_tokens = Some(stats.1);
         }
         // Saved line
-        if line.starts_with("Saved") {
-            if let Some((tokens, pct)) = parse_saved_line(line) {
-                saved_tokens = Some(tokens);
-                saved_percent = Some(pct);
-            }
+        if line.starts_with("Saved")
+            && let Some((tokens, pct)) = parse_saved_line(line)
+        {
+            saved_tokens = Some(tokens);
+            saved_percent = Some(pct);
         }
     }
 

@@ -217,31 +217,31 @@ impl VectorFilter {
     #[must_use]
     pub fn matches(&self, meta: &VectorMetadata) -> bool {
         // Project filter
-        if let Some(pid) = self.project_id {
-            if meta.project_id != Some(pid) {
-                return false;
-            }
+        if let Some(pid) = self.project_id
+            && meta.project_id != Some(pid)
+        {
+            return false;
         }
 
         // Document kind filter
-        if let Some(ref kinds) = self.doc_kinds {
-            if !kinds.contains(&meta.doc_kind) {
-                return false;
-            }
+        if let Some(ref kinds) = self.doc_kinds
+            && !kinds.contains(&meta.doc_kind)
+        {
+            return false;
         }
 
         // Model filter
-        if let Some(ref mid) = self.model_id {
-            if meta.model_id != *mid {
-                return false;
-            }
+        if let Some(ref mid) = self.model_id
+            && meta.model_id != *mid
+        {
+            return false;
         }
 
         // Exclusion filter
-        if let Some(ref excluded) = self.exclude_doc_ids {
-            if excluded.contains(&meta.doc_id) {
-                return false;
-            }
+        if let Some(ref excluded) = self.exclude_doc_ids
+            && excluded.contains(&meta.doc_id)
+        {
+            return false;
         }
 
         true
@@ -470,13 +470,13 @@ impl VectorIndex {
 
     /// Number of vectors in the index.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Check if the index is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 

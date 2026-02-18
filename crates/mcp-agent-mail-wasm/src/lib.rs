@@ -209,7 +209,7 @@ impl SyncState {
     }
 
     fn decode_snapshot_cells(raw: &[u8], expected_len: usize) -> Vec<u32> {
-        let mut decoded = if raw.len() % 4 == 0 && !raw.is_empty() {
+        let mut decoded = if raw.len().is_multiple_of(4) && !raw.is_empty() {
             raw.chunks_exact(4)
                 .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect::<Vec<_>>()

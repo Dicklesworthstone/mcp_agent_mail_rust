@@ -3380,12 +3380,15 @@ impl Model for MailAppModel {
                             self.open_compose();
                             return Cmd::none();
                         }
-                        // Ctrl+T: cycle theme globally.
+                        // Ctrl+T / Shift+T: cycle theme globally.
                         let is_ctrl_t = (key.modifiers.contains(Modifiers::CTRL)
                             && matches!(key.code, KeyCode::Char('t' | 'T')))
                             // Some terminals emit ASCII control code 0x14 for Ctrl+T.
                             || matches!(key.code, KeyCode::Char('\u{14}'));
-                        if is_ctrl_t {
+                        let is_shift_t = !text_mode
+                            && key.modifiers.contains(Modifiers::SHIFT)
+                            && matches!(key.code, KeyCode::Char('T'));
+                        if is_ctrl_t || is_shift_t {
                             let name = self.cycle_theme();
                             self.notifications.notify(
                                 Toast::new(format!("Theme: {name}"))
@@ -4134,7 +4137,7 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
 
     out.push(
         ActionItem::new(palette_action_ids::THEME_CYCLE, "Cycle Theme")
-            .with_description("Switch to the next color theme (Ctrl+T)")
+            .with_description("Switch to the next color theme (Ctrl+T / Shift+T)")
             .with_tags(&["theme", "colors", "appearance"])
             .with_category("Appearance"),
     );
@@ -5496,6 +5499,8 @@ fn render_focus_hint(
 
 /// Minimum contrast ratio for readable TUI text.
 const MIN_TEXT_CONTRAST_RATIO: f64 = 4.5;
+/// Higher floor for bright surfaces to avoid white-on-white regressions.
+const MIN_TEXT_CONTRAST_RATIO_LIGHT_SURFACE: f64 = 5.6;
 
 /// Normalize low-contrast rendered cells to readable theme-safe foreground colors.
 fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiThemePalette) {
@@ -5504,41 +5509,94 @@ fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiTheme
 
     for y in 0..height {
         for x in 0..width {
-            let Some(cell) = frame.buffer.get_mut(x, y) else {
+            let Some(snapshot) = frame.buffer.get(x, y) else {
                 continue;
             };
-            if cell.is_continuation() {
-                continue;
-            }
-            if cell.content.as_char().is_some_and(char::is_whitespace) {
-                continue;
-            }
+            let is_continuation = snapshot.is_continuation();
+            let is_whitespace = snapshot.content.as_char().is_some_and(char::is_whitespace);
 
-            let fg = if cell.fg.a() == 0 {
+            let fg = if snapshot.fg.a() == 0 {
                 tp.text_primary
             } else {
-                cell.fg
+                snapshot.fg
             };
-            let bg_candidates = if cell.bg.a() == 0 {
-                [tp.panel_bg, tp.bg_surface, tp.bg_deep]
+            let effective_bg = if snapshot.bg.a() == 0 {
+                infer_effective_background(frame, x, y, tp)
             } else {
-                [cell.bg, cell.bg, cell.bg]
+                snapshot.bg
             };
-
-            let mut worst_bg = bg_candidates[0];
-            let mut worst_ratio = contrast_ratio(fg, worst_bg);
-            for candidate in bg_candidates.into_iter().skip(1) {
-                let ratio = contrast_ratio(fg, candidate);
-                if ratio < worst_ratio {
-                    worst_ratio = ratio;
-                    worst_bg = candidate;
+            if snapshot.bg.a() == 0 {
+                if let Some(cell) = frame.buffer.get_mut(x, y) {
+                    cell.bg = effective_bg;
                 }
             }
+            if is_continuation || is_whitespace {
+                continue;
+            }
+            let min_ratio = minimum_text_contrast_for_bg(effective_bg);
 
-            if worst_ratio < MIN_TEXT_CONTRAST_RATIO {
-                cell.fg = best_readable_fg(worst_bg, tp);
+            if contrast_ratio(fg, effective_bg) < min_ratio {
+                let replacement = best_readable_fg(effective_bg, tp);
+                if let Some(cell) = frame.buffer.get_mut(x, y) {
+                    cell.fg = replacement;
+                }
             }
         }
+    }
+}
+
+fn infer_effective_background(
+    frame: &Frame,
+    x: u16,
+    y: u16,
+    tp: &crate::tui_theme::TuiThemePalette,
+) -> PackedRgba {
+    // Prefer nearby painted backgrounds over global fallbacks for transparent cells.
+    const OFFSETS: &[(i16, i16)] = &[
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (1, -1),
+        (-1, 1),
+        (1, 1),
+    ];
+    for radius in 1_i32..=3 {
+        for &(dx, dy) in OFFSETS {
+            let neighbor = (
+                i32::from(x) + i32::from(dx) * radius,
+                i32::from(y) + i32::from(dy) * radius,
+            );
+            if neighbor.0 < 0 || neighbor.1 < 0 {
+                continue;
+            }
+            let Ok(nx) = u16::try_from(neighbor.0) else {
+                continue;
+            };
+            let Ok(ny) = u16::try_from(neighbor.1) else {
+                continue;
+            };
+            let Some(neighbor) = frame.buffer.get(nx, ny) else {
+                continue;
+            };
+            if neighbor.bg.a() != 0 {
+                return neighbor.bg;
+            }
+        }
+    }
+    if tp.bg_surface.a() != 0 {
+        tp.bg_surface
+    } else {
+        tp.panel_bg
+    }
+}
+
+fn minimum_text_contrast_for_bg(bg: PackedRgba) -> f64 {
+    if perceived_luma(bg) >= 150 {
+        MIN_TEXT_CONTRAST_RATIO_LIGHT_SURFACE
+    } else {
+        MIN_TEXT_CONTRAST_RATIO
     }
 }
 
@@ -5870,6 +5928,28 @@ mod tests {
 
         let result = frame.buffer.get(0, 0).expect("space cell exists");
         assert_eq!(result.fg, PackedRgba::rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn contrast_guard_sets_background_for_transparent_whitespace_cells() {
+        let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(4, 2, &mut pool);
+
+        let mut space = ftui::Cell::from_char(' ');
+        space.fg = PackedRgba::rgb(255, 255, 255);
+        space.bg = PackedRgba::rgba(0, 0, 0, 0);
+        frame.buffer.set(0, 0, space);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        apply_frame_contrast_guard(&mut frame, &tp);
+
+        let result = frame.buffer.get(0, 0).expect("space cell exists");
+        assert_ne!(
+            result.bg.a(),
+            0,
+            "transparent whitespace background should be materialized"
+        );
     }
 
     #[test]
@@ -8408,6 +8488,18 @@ mod tests {
         let before = crate::tui_theme::current_theme_id();
         let ctrl_t = Event::Key(KeyEvent::new(KeyCode::Char('t')).with_modifiers(Modifiers::CTRL));
         let cmd = model.update(MailMsg::Terminal(ctrl_t));
+        assert!(matches!(cmd, Cmd::None));
+        let after = crate::tui_theme::current_theme_id();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn shift_t_cycles_theme_when_not_in_text_mode() {
+        let mut model = test_model();
+        let before = crate::tui_theme::current_theme_id();
+        let shift_t =
+            Event::Key(KeyEvent::new(KeyCode::Char('T')).with_modifiers(Modifiers::SHIFT));
+        let cmd = model.update(MailMsg::Terminal(shift_t));
         assert!(matches!(cmd, Cmd::None));
         let after = crate::tui_theme::current_theme_id();
         assert_ne!(before, after);

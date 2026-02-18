@@ -207,10 +207,10 @@ impl EvidenceLedger {
     ///
     /// Parent directories are created automatically.
     pub fn with_file(path: &Path, max_entries: usize) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
@@ -250,12 +250,12 @@ impl EvidenceLedger {
         };
 
         // Write to JSONL if configured
-        if let Ok(mut guard) = self.writer.lock() {
-            if let Some(ref mut w) = *guard {
-                let _ = serde_json::to_writer(&mut *w, &entry);
-                let _ = w.write_all(b"\n");
-                let _ = w.flush();
-            }
+        if let Ok(mut guard) = self.writer.lock()
+            && let Some(ref mut w) = *guard
+        {
+            let _ = serde_json::to_writer(&mut *w, &entry);
+            let _ = w.write_all(b"\n");
+            let _ = w.flush();
         }
 
         // Push to ring buffer
@@ -286,18 +286,18 @@ impl EvidenceLedger {
         }
 
         // Also write an outcome line to JSONL
-        if let Ok(mut guard) = self.writer.lock() {
-            if let Some(ref mut w) = *guard {
-                let line = serde_json::json!({
-                    "type": "outcome",
-                    "seq": seq,
-                    "actual": actual_str,
-                    "correct": correct,
-                });
-                let _ = serde_json::to_writer(&mut *w, &line);
-                let _ = w.write_all(b"\n");
-                let _ = w.flush();
-            }
+        if let Ok(mut guard) = self.writer.lock()
+            && let Some(ref mut w) = *guard
+        {
+            let line = serde_json::json!({
+                "type": "outcome",
+                "seq": seq,
+                "actual": actual_str,
+                "correct": correct,
+            });
+            let _ = serde_json::to_writer(&mut *w, &line);
+            let _ = w.write_all(b"\n");
+            let _ = w.flush();
         }
     }
 

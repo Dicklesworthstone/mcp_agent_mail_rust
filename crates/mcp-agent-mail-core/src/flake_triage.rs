@@ -671,7 +671,7 @@ impl Default for MultiSeedConfig {
                 "mcp-agent-mail-server".to_string(),
                 "mcp-agent-mail-db".to_string(),
             ],
-            timeout: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_mins(1),
         }
     }
 }
@@ -1392,7 +1392,7 @@ mod tests {
         let config = MultiSeedConfig::default();
         assert_eq!(config.num_seeds, DEFAULT_FLAKE_SEEDS.len());
         assert_eq!(config.packages.len(), 3);
-        assert_eq!(config.timeout, std::time::Duration::from_secs(60));
+        assert_eq!(config.timeout, std::time::Duration::from_mins(1));
     }
 
     #[test]

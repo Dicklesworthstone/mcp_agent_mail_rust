@@ -224,15 +224,15 @@ fn has_duplicate_source_ranks(candidates: &[PreparedCandidate]) -> bool {
     let mut semantic_ranks = HashSet::new();
 
     for candidate in candidates {
-        if let Some(rank) = candidate.lexical_rank {
-            if !lexical_ranks.insert(rank) {
-                return true;
-            }
+        if let Some(rank) = candidate.lexical_rank
+            && !lexical_ranks.insert(rank)
+        {
+            return true;
         }
-        if let Some(rank) = candidate.semantic_rank {
-            if !semantic_ranks.insert(rank) {
-                return true;
-            }
+        if let Some(rank) = candidate.semantic_rank
+            && !semantic_ranks.insert(rank)
+        {
+            return true;
         }
     }
 

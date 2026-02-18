@@ -166,7 +166,7 @@ impl ConformalPredictor {
         });
         let median_val = *median;
 
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             // Even number of elements: median is avg of sorted[mid-1] and sorted[mid].
             // select_nth_unstable puts element at mid_idx in place, and everything
             // smaller to the left. The max of the left partition is sorted[mid-1].

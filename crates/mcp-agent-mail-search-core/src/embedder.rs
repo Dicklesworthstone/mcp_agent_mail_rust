@@ -417,20 +417,19 @@ impl ModelRegistry {
             ModelTier::Hash => unreachable!(),
         };
 
-        if let Some(preferred_id) = preferred {
-            if let Some(embedder) = self.embedders.get(preferred_id) {
-                if embedder.is_ready() {
-                    return Ok(embedder.clone());
-                }
-            }
+        if let Some(preferred_id) = preferred
+            && let Some(embedder) = self.embedders.get(preferred_id)
+            && embedder.is_ready()
+        {
+            return Ok(embedder.clone());
         }
 
         // Find first available at requested tier
         for (id, info) in &self.models {
-            if info.tier == tier && info.available {
-                if let Some(embedder) = self.embedders.get(id) {
-                    return Ok(embedder.clone());
-                }
+            if info.tier == tier && info.available
+                && let Some(embedder) = self.embedders.get(id)
+            {
+                return Ok(embedder.clone());
             }
         }
 

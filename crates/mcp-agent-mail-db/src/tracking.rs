@@ -634,18 +634,18 @@ fn extract_table(sql: &str) -> Option<String> {
         LazyLock::new(|| Regex::new(r#"[`"\[\]]*\.[`"\[\]]*"#).unwrap());
 
     for pattern in TABLE_PATTERNS.iter() {
-        if let Some(captures) = pattern.captures(sql) {
-            if let Some(m) = captures.get(1) {
-                let raw = m.as_str();
-                // Take last segment after schema dots, then strip quote chars
-                let last_segment = SCHEMA_DOT.split(raw).last().unwrap_or(raw);
-                let table =
-                    last_segment.trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']');
-                if table.is_empty() {
-                    return None;
-                }
-                return Some(table.to_string());
+        if let Some(captures) = pattern.captures(sql)
+            && let Some(m) = captures.get(1)
+        {
+            let raw = m.as_str();
+            // Take last segment after schema dots, then strip quote chars
+            let last_segment = SCHEMA_DOT.split(raw).last().unwrap_or(raw);
+            let table =
+                last_segment.trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']');
+            if table.is_empty() {
+                return None;
             }
+            return Some(table.to_string());
         }
     }
     None

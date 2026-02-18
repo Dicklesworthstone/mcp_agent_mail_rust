@@ -1376,10 +1376,10 @@ impl Config {
             config.console_ui_height_percent,
         )
         .clamp(10, 80);
-        if let Some(v) = console_value("CONSOLE_UI_ANCHOR") {
-            if let Some(anchor) = ConsoleUiAnchor::parse(&v) {
-                config.console_ui_anchor = anchor;
-            }
+        if let Some(v) = console_value("CONSOLE_UI_ANCHOR")
+            && let Some(anchor) = ConsoleUiAnchor::parse(&v)
+        {
+            config.console_ui_anchor = anchor;
         }
         config.console_ui_auto_size =
             console_bool("CONSOLE_UI_AUTO_SIZE", config.console_ui_auto_size);
@@ -1393,20 +1393,20 @@ impl Config {
             config.console_inline_auto_max_rows,
         )
         .max(config.console_inline_auto_min_rows);
-        if let Some(v) = console_value("CONSOLE_SPLIT_MODE") {
-            if let Some(mode) = ConsoleSplitMode::parse(&v) {
-                config.console_split_mode = mode;
-            }
+        if let Some(v) = console_value("CONSOLE_SPLIT_MODE")
+            && let Some(mode) = ConsoleSplitMode::parse(&v)
+        {
+            config.console_split_mode = mode;
         }
         config.console_split_ratio_percent = console_u16(
             "CONSOLE_SPLIT_RATIO_PERCENT",
             config.console_split_ratio_percent,
         )
         .clamp(10, 80);
-        if let Some(v) = console_value("CONSOLE_THEME") {
-            if let Some(theme) = ConsoleThemeId::parse(&v) {
-                config.console_theme = theme;
-            }
+        if let Some(v) = console_value("CONSOLE_THEME")
+            && let Some(theme) = ConsoleThemeId::parse(&v)
+        {
+            config.console_theme = theme;
         }
 
         config.tui_enabled = env_bool("TUI_ENABLED", config.tui_enabled);
@@ -1953,10 +1953,10 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
     let mut out = out_lines.join("\n");
     out.push('\n');
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     fs::write(path, out)
 }

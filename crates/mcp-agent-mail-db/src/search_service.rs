@@ -2519,17 +2519,17 @@ pub async fn execute_search(
                         > = details.into_iter().map(|d| (d.id, d)).collect();
 
                         for r in &mut raw_results {
-                            if r.title.is_empty() {
-                                if let Some(d) = details_map.get(&r.id) {
-                                    r.title = d.subject.clone();
-                                    r.body = d.body_md.clone();
-                                    r.importance = Some(d.importance.clone());
-                                    r.ack_required = Some(d.ack_required != 0);
-                                    r.created_ts = Some(d.created_ts);
-                                    r.thread_id = d.thread_id.clone();
-                                    r.from_agent = Some(d.from.clone());
-                                    r.project_id = Some(d.project_id);
-                                }
+                            if r.title.is_empty()
+                                && let Some(d) = details_map.get(&r.id)
+                            {
+                                r.title = d.subject.clone();
+                                r.body = d.body_md.clone();
+                                r.importance = Some(d.importance.clone());
+                                r.ack_required = Some(d.ack_required != 0);
+                                r.created_ts = Some(d.created_ts);
+                                r.thread_id = d.thread_id.clone();
+                                r.from_agent = Some(d.from.clone());
+                                r.project_id = Some(d.project_id);
                             }
                         }
                     }
