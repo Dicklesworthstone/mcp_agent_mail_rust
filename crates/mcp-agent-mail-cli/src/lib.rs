@@ -2925,19 +2925,19 @@ fn handle_list_projects_with_database_url(
             "created_at": mcp_agent_mail_db::timestamps::micros_to_iso(created_at),
         });
 
-        if include_agents {
-            if let Some(agent_list) = agents_by_project.get(&id) {
-                let agents_json: Vec<serde_json::Value> = agent_list
-                    .iter()
-                    .map(|(name, program, model)| {
-                        serde_json::json!({ "name": name, "program": program, "model": model })
-                    })
-                    .collect();
-                entry
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("agents".to_string(), serde_json::json!(agents_json));
-            }
+        if include_agents
+            && let Some(agent_list) = agents_by_project.get(&id)
+        {
+            let agents_json: Vec<serde_json::Value> = agent_list
+                .iter()
+                .map(|(name, program, model)| {
+                    serde_json::json!({ "name": name, "program": program, "model": model })
+                })
+                .collect();
+            entry
+                .as_object_mut()
+                .unwrap()
+                .insert("agents".to_string(), serde_json::json!(agents_json));
         }
         output_data.push(entry);
     }
@@ -2957,12 +2957,12 @@ fn handle_list_projects_with_database_url(
             for row in &projects {
                 let id: i64 = row.get_named("id").unwrap_or(0);
                 let slug: String = row.get_named("slug").unwrap_or_default();
-                if let Some(agent_list) = agents_by_project.get(&id) {
-                    if !agent_list.is_empty() {
-                        output::section(&format!("Agents for {slug}:"));
-                        for (name, program, model) in agent_list {
-                            ftui_runtime::ftui_println!("  {name} ({program}/{model})");
-                        }
+                if let Some(agent_list) = agents_by_project.get(&id)
+                    && !agent_list.is_empty()
+                {
+                    output::section(&format!("Agents for {slug}:"));
+                    for (name, program, model) in agent_list {
+                        ftui_runtime::ftui_println!("  {name} ({program}/{model})");
                     }
                 }
             }
@@ -3117,10 +3117,10 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 None => {
                     let mut platforms = Vec::new();
                     for slug in &detected_slugs {
-                        if let Some(p) = setup::AgentPlatform::from_slug(slug) {
-                            if !platforms.contains(&p) {
-                                platforms.push(p);
-                            }
+                        if let Some(p) = setup::AgentPlatform::from_slug(slug)
+                            && !platforms.contains(&p)
+                        {
+                            platforms.push(p);
                         }
                     }
                     platforms
@@ -3150,10 +3150,10 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             };
 
             // Save token to .env (unless dry-run)
-            if !dry_run {
-                if let Err(e) = setup::save_token_to_env_file(&env_file, &resolved_token) {
-                    output::warn(&format!("Could not save token to .env: {e}"));
-                }
+            if !dry_run
+                && let Err(e) = setup::save_token_to_env_file(&env_file, &resolved_token)
+            {
+                output::warn(&format!("Could not save token to .env: {e}"));
             }
 
             let results = setup::run_setup(&params);
@@ -3761,10 +3761,10 @@ fn handle_golden_verify(
                 if let Some(note) = &row.note {
                     ftui_runtime::ftui_println!("    note: {note}");
                 }
-                if let Some(diff) = &row.diff {
-                    if !diff.is_empty() {
-                        ftui_runtime::ftui_println!("    diff:\n{diff}");
-                    }
+                if let Some(diff) = &row.diff
+                    && !diff.is_empty()
+                {
+                    ftui_runtime::ftui_println!("    diff:\n{diff}");
                 }
             }
         }
@@ -7148,40 +7148,40 @@ fn handle_doctor_check_with(
     }
 
     // Check 5: Project-specific checks
-    if let Some(ref slug) = project {
-        if let Ok(conn) = open_db_sync_with_database_url(database_url) {
-            let rows = conn
+    if let Some(ref slug) = project
+        && let Ok(conn) = open_db_sync_with_database_url(database_url)
+    {
+        let rows = conn
+            .query_sync(
+                "SELECT id, slug FROM projects WHERE slug = ?",
+                &[sqlmodel_core::Value::Text(slug.clone())],
+            )
+            .unwrap_or_default();
+        let project_exists = !rows.is_empty();
+        checks.push(serde_json::json!({
+            "check": "project_exists",
+            "status": if project_exists { "ok" } else { "fail" },
+            "detail": format!("project '{slug}'"),
+        }));
+
+        if project_exists {
+            let agent_rows = conn
                 .query_sync(
-                    "SELECT id, slug FROM projects WHERE slug = ?",
+                    "SELECT COUNT(*) AS cnt FROM agents a \
+                     JOIN projects p ON p.id = a.project_id \
+                     WHERE p.slug = ?",
                     &[sqlmodel_core::Value::Text(slug.clone())],
                 )
                 .unwrap_or_default();
-            let project_exists = !rows.is_empty();
+            let agent_count: i64 = agent_rows
+                .first()
+                .and_then(|r| r.get_named("cnt").ok())
+                .unwrap_or(0);
             checks.push(serde_json::json!({
-                "check": "project_exists",
-                "status": if project_exists { "ok" } else { "fail" },
-                "detail": format!("project '{slug}'"),
+                "check": "agents_registered",
+                "status": "ok",
+                "detail": format!("{agent_count} agent(s)"),
             }));
-
-            if project_exists {
-                let agent_rows = conn
-                    .query_sync(
-                        "SELECT COUNT(*) AS cnt FROM agents a \
-                         JOIN projects p ON p.id = a.project_id \
-                         WHERE p.slug = ?",
-                        &[sqlmodel_core::Value::Text(slug.clone())],
-                    )
-                    .unwrap_or_default();
-                let agent_count: i64 = agent_rows
-                    .first()
-                    .and_then(|r| r.get_named("cnt").ok())
-                    .unwrap_or(0);
-                checks.push(serde_json::json!({
-                    "check": "agents_registered",
-                    "status": "ok",
-                    "detail": format!("{agent_count} agent(s)"),
-                }));
-            }
         }
     }
 
@@ -8723,6 +8723,34 @@ mod tests {
     fn stdio_capture_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Extract the first top-level JSON object `{...}` from a string that may
+    /// contain non-JSON text (e.g. from concurrent test output).
+    fn extract_json_block(s: &str) -> Option<&str> {
+        let start = s.find('{')?;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        for (i, ch) in s[start..].char_indices() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' if in_string => escape = true,
+                '"' => in_string = !in_string,
+                '{' if !in_string => depth += 1,
+                '}' if !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[start..start + i + 1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     #[test]
@@ -10332,6 +10360,9 @@ mod tests {
 
     #[test]
     fn native_wizard_non_interactive_requires_provider() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Test that non-interactive mode fails without provider
         let args = ShareWizardArgs {
             bundle: Some(PathBuf::from("/tmp/nonexistent")),
@@ -10391,8 +10422,11 @@ mod tests {
         );
 
         let output = capture.drain_to_string();
-        let parsed: serde_json::Value = serde_json::from_str(output.trim())
-            .unwrap_or_else(|_| panic!("failed to parse wizard JSON failure output: {output}"));
+        // Extract JSON block — concurrent tests may inject non-JSON lines
+        let json_str = extract_json_block(&output)
+            .unwrap_or_else(|| panic!("no JSON object found in wizard output: {output}"));
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .unwrap_or_else(|_| panic!("failed to parse wizard JSON failure output: {json_str}"));
         assert_eq!(parsed["success"], serde_json::Value::Bool(false));
         assert_eq!(parsed["error_code"], "MISSING_REQUIRED_OPTION");
     }
@@ -10429,9 +10463,11 @@ mod tests {
         let _ = run_native_wizard(args);
 
         let output = capture.drain_to_string();
-        // JSON output should be parseable
-        let parsed: serde_json::Value = serde_json::from_str(output.trim())
-            .unwrap_or_else(|_| panic!("Failed to parse JSON output: {output}"));
+        // Extract JSON block — concurrent tests may inject non-JSON lines
+        let json_str = extract_json_block(&output)
+            .unwrap_or_else(|| panic!("no JSON object found in wizard output: {output}"));
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .unwrap_or_else(|_| panic!("Failed to parse JSON output: {json_str}"));
 
         // Verify essential fields are present
         assert!(parsed.get("success").is_some(), "missing 'success' field");
@@ -10486,6 +10522,9 @@ mod tests {
 
     #[test]
     fn native_wizard_validates_bundle_path() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let args = ShareWizardArgs {
             bundle: Some(PathBuf::from("/nonexistent/bundle/path")),
             provider: Some("custom".to_string()),
@@ -14167,7 +14206,7 @@ mod tests {
 
     #[test]
     fn integration_migrate_and_list_projects_json() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -14190,7 +14229,7 @@ mod tests {
 
     #[test]
     fn integration_doctor_check_on_fresh_db() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -14212,7 +14251,7 @@ mod tests {
 
     #[test]
     fn integration_doctor_check_reports_installed_agents_probe() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -14236,7 +14275,7 @@ mod tests {
 
     #[test]
     fn integration_doctor_check_reports_beads_issue_awareness_probe() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -14457,7 +14496,7 @@ mod tests {
 
     #[test]
     fn handle_beads_status_on_fresh_db() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
@@ -14480,7 +14519,7 @@ mod tests {
 
     #[test]
     fn handle_beads_ready_on_fresh_db_shows_empty() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
@@ -14500,7 +14539,7 @@ mod tests {
 
     #[test]
     fn integration_doctor_backups_empty_dir() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
@@ -14516,7 +14555,7 @@ mod tests {
 
     #[test]
     fn integration_config_show_port_returns_ok() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let capture = ftui_runtime::StdioCapture::install().unwrap();
         let result = handle_config(ConfigCommand::ShowPort);
         let output = capture.drain_to_string();
@@ -14530,7 +14569,7 @@ mod tests {
 
     #[test]
     fn integration_config_set_port_to_file() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let env_file = dir.path().join(".env");
         let result = handle_config(ConfigCommand::SetPort {
@@ -14697,7 +14736,7 @@ mod tests {
 
     #[test]
     fn integration_acks_pending_shows_unacked_messages() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14722,7 +14761,7 @@ mod tests {
 
     #[test]
     fn integration_acks_pending_empty_when_no_acks() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14747,7 +14786,7 @@ mod tests {
 
     #[test]
     fn integration_acks_overdue_finds_old_messages() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14774,7 +14813,7 @@ mod tests {
 
     #[test]
     fn integration_list_acks_shows_ack_required_messages() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14791,7 +14830,7 @@ mod tests {
 
     #[test]
     fn integration_list_acks_empty_for_nonexistent_agent() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14808,7 +14847,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_list_shows_active() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14832,7 +14871,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_active_shows_active() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14858,7 +14897,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_empty_project() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14882,7 +14921,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_reserve_creates_entries() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14922,7 +14961,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_reserve_detects_conflicts() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14951,7 +14990,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_renew_extends_ttl() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14993,7 +15032,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_release_sets_released_ts() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15028,7 +15067,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_conflicts_detects_overlap() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15051,7 +15090,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_conflicts_no_overlap() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15074,7 +15113,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_reserve_invalid_project() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15096,7 +15135,7 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_reserve_invalid_agent() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15118,7 +15157,7 @@ mod tests {
 
     #[test]
     fn integration_acks_remind_finds_stale() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15240,7 +15279,7 @@ mod tests {
 
     #[test]
     fn integration_mail_status_shows_counts() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let project_path = "/tmp/mail-status-test-proj";
@@ -15268,7 +15307,7 @@ mod tests {
 
     #[test]
     fn integration_mail_status_empty_project() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         // Seed with one project path, then query with a different one
@@ -15296,7 +15335,7 @@ mod tests {
 
     #[test]
     fn integration_projects_mark_identity_writes_marker_file() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let result = handle_project_mark_identity(dir.path(), false);
         assert!(result.is_ok(), "mark-identity failed: {result:?}");
@@ -15312,7 +15351,7 @@ mod tests {
 
     #[test]
     fn integration_projects_discovery_init_writes_yaml() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let result = handle_project_discovery_init(dir.path(), Some("prod-alpha".to_string()));
         assert!(result.is_ok(), "discovery-init failed: {result:?}");
@@ -15448,7 +15487,7 @@ mod tests {
 
     #[test]
     fn integration_projects_adopt_apply_rekeys_and_moves_archive() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
@@ -16443,7 +16482,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_request_creates_link() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16480,7 +16519,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_respond_approve() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16531,7 +16570,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_respond_reject() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16581,7 +16620,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_list_json() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16624,7 +16663,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_list_empty() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16649,7 +16688,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_policy_set() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16683,7 +16722,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_policy_invalid() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16701,7 +16740,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_request_invalid_project() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16721,7 +16760,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_request_invalid_agent() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16741,7 +16780,7 @@ mod tests {
 
     #[test]
     fn integration_contacts_request_upsert() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -17028,9 +17067,28 @@ mod tests {
 
     // ── Doctor check probe tests (br-3h13.16.3) ────────────────────────────
 
+    /// Run doctor check and capture JSON output, retrying once if capture is empty.
+    fn run_doctor_check_json(db_url: &str, storage: &Path) -> serde_json::Value {
+        for attempt in 0..2 {
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            let result = handle_doctor_check_with(db_url, storage, None, false, None, true);
+            let output = capture.drain_to_string();
+            assert!(result.is_ok(), "doctor check should not error: {result:?}");
+            if let Some(json_str) = extract_json_block(&output) {
+                return serde_json::from_str(json_str)
+                    .unwrap_or_else(|e| panic!("invalid JSON: {e}\n{json_str}"));
+            }
+            if attempt == 0 {
+                // StdioCapture can miss output from async runtime work; retry
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        panic!("doctor check produced no JSON output after 2 attempts");
+    }
+
     #[test]
     fn doctor_check_healthy_db_reports_db_file_sanity_and_pool_init_ok() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("healthy.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -17051,13 +17109,7 @@ mod tests {
         .expect("insert agent");
         drop(conn);
 
-        let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
-        let output = capture.drain_to_string();
-
-        assert!(result.is_ok(), "doctor check failed: {result:?}");
-        let parsed: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("should be valid JSON");
+        let parsed = run_doctor_check_json(&db_url, dir.path());
 
         assert_eq!(parsed["healthy"], true, "healthy should be true");
 
@@ -17095,7 +17147,7 @@ mod tests {
 
     #[test]
     fn doctor_check_zero_byte_db_reports_db_file_sanity_fail() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("empty.sqlite3");
 
@@ -17113,14 +17165,7 @@ mod tests {
 
         let db_url = format!("sqlite:///{}", db_path.display());
 
-        let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
-        let output = capture.drain_to_string();
-
-        // Doctor check itself should succeed (it reports status, doesn't fail)
-        assert!(result.is_ok(), "doctor check should not error: {result:?}");
-        let parsed: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("should be valid JSON");
+        let parsed = run_doctor_check_json(&db_url, dir.path());
 
         // healthy should be false because db_file_sanity fails
         assert_eq!(parsed["healthy"], false, "healthy should be false");
@@ -17146,7 +17191,7 @@ mod tests {
 
     #[test]
     fn doctor_check_corrupt_db_reports_pool_init_fail() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("corrupt.sqlite3");
 
@@ -17156,14 +17201,7 @@ mod tests {
 
         let db_url = format!("sqlite:///{}", db_path.display());
 
-        let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
-        let output = capture.drain_to_string();
-
-        // Doctor check itself should succeed (it reports status, doesn't panic)
-        assert!(result.is_ok(), "doctor check should not error: {result:?}");
-        let parsed: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("should be valid JSON");
+        let parsed = run_doctor_check_json(&db_url, dir.path());
 
         // healthy should be false
         assert_eq!(parsed["healthy"], false, "healthy should be false");
@@ -17186,7 +17224,7 @@ mod tests {
 
     #[test]
     fn doctor_repair_creates_valid_bak_sibling_file() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("repair_test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -17259,7 +17297,7 @@ mod tests {
 
     #[test]
     fn doctor_repair_bak_found_by_pool_backup_candidates() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pool_test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -17307,7 +17345,7 @@ mod tests {
 
     #[test]
     fn doctor_repair_gracefully_handles_bak_creation_failure() {
-        let _guard = stdio_capture_lock().lock().unwrap();
+        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("readonly_test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -17712,19 +17750,9 @@ fn handle_am_run_with(
                 false
             };
 
-            if !server_released {
-                if let Some(path) = lease_path_opt.as_ref() {
-                    let now = Utc::now().to_rfc3339();
-                    if let Some(mut lease) = read_lease(path) {
-                        lease.released_ts = Some(now.clone());
-                        lease.expires_ts = now.clone();
-                        let _ = write_lease(path, &lease);
-                        released_locally = true;
-                    }
-                }
-            }
-        } else {
-            if let Some(path) = lease_path_opt.as_ref() {
+            if !server_released
+                && let Some(path) = lease_path_opt.as_ref()
+            {
                 let now = Utc::now().to_rfc3339();
                 if let Some(mut lease) = read_lease(path) {
                     lease.released_ts = Some(now.clone());
@@ -17732,6 +17760,14 @@ fn handle_am_run_with(
                     let _ = write_lease(path, &lease);
                     released_locally = true;
                 }
+            }
+        } else if let Some(path) = lease_path_opt.as_ref() {
+            let now = Utc::now().to_rfc3339();
+            if let Some(mut lease) = read_lease(path) {
+                lease.released_ts = Some(now.clone());
+                lease.expires_ts = now.clone();
+                let _ = write_lease(path, &lease);
+                released_locally = true;
             }
         }
 
@@ -17852,10 +17888,10 @@ fn read_active_leases(
             Some(l) => l,
             None => continue,
         };
-        if let Some(exp) = parse_rfc3339(&lease.expires_ts) {
-            if exp <= now {
-                continue;
-            }
+        if let Some(exp) = parse_rfc3339(&lease.expires_ts)
+            && exp <= now
+        {
+            continue;
         }
         if lease.exclusive && !shared && !(lease.agent == agent && lease.branch == branch) {
             out.push(lease);
@@ -18727,29 +18763,29 @@ fn detect_git_head(repo_path: &Path) -> Option<String> {
     if let Some(ref_name) = head_contents.strip_prefix("ref:") {
         let ref_name = ref_name.trim();
         let ref_path = git_dir.join(ref_name);
-        if ref_path.exists() {
-            if let Ok(value) = std::fs::read_to_string(ref_path) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+        if ref_path.exists()
+            && let Ok(value) = std::fs::read_to_string(ref_path)
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
             }
         }
 
         let packed_refs = git_dir.join("packed-refs");
-        if packed_refs.exists() {
-            if let Ok(text) = std::fs::read_to_string(packed_refs) {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    let Some((commit, reference)) = line.split_once(' ') else {
-                        continue;
-                    };
-                    if reference.trim() == ref_name {
-                        return Some(commit.trim().to_string());
-                    }
+        if packed_refs.exists()
+            && let Ok(text) = std::fs::read_to_string(packed_refs)
+        {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((commit, reference)) = line.split_once(' ') else {
+                    continue;
+                };
+                if reference.trim() == ref_name {
+                    return Some(commit.trim().to_string());
                 }
             }
         }
@@ -18913,10 +18949,10 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<(
         let path = entry.path();
         if path.is_dir() {
             collect_files(base, &path, out)?;
-        } else if path.is_file() {
-            if let Ok(rel) = path.strip_prefix(base) {
-                out.push(rel.to_path_buf());
-            }
+        } else if path.is_file()
+            && let Ok(rel) = path.strip_prefix(base)
+        {
+            out.push(rel.to_path_buf());
         }
     }
     Ok(())
@@ -19190,21 +19226,21 @@ fn archive_restore_state(
         .and_then(|v| v.get("source_path"))
         .and_then(|v| v.as_str());
 
-    if let Some(path) = archive_db_path {
-        if path != database_path.display().to_string() {
-            ftui_runtime::ftui_eprintln!(
-                "Archive was created from database {path}, current config is {}. Continuing...",
-                database_path.display()
-            );
-        }
+    if let Some(path) = archive_db_path
+        && path != database_path.display().to_string()
+    {
+        ftui_runtime::ftui_eprintln!(
+            "Archive was created from database {path}, current config is {}. Continuing...",
+            database_path.display()
+        );
     }
-    if let Some(path) = archive_storage_path {
-        if path != storage_root.display().to_string() {
-            ftui_runtime::ftui_eprintln!(
-                "Archive used storage root {path}, current config is {}. Continuing...",
-                storage_root.display()
-            );
-        }
+    if let Some(path) = archive_storage_path
+        && path != storage_root.display().to_string()
+    {
+        ftui_runtime::ftui_eprintln!(
+            "Archive used storage root {path}, current config is {}. Continuing...",
+            storage_root.display()
+        );
     }
 
     // Planned operations (and safety backups)
@@ -19279,11 +19315,11 @@ fn archive_restore_state(
     let prefix_string = format!("{ARCHIVE_STORAGE_DIRNAME}/");
     let mut has_storage = false;
     for i in 0..archive.len() {
-        if let Ok(file) = archive.by_index(i) {
-            if file.name().starts_with(&prefix_string) {
-                has_storage = true;
-                break;
-            }
+        if let Ok(file) = archive.by_index(i)
+            && file.name().starts_with(&prefix_string)
+        {
+            has_storage = true;
+            break;
         }
     }
     if !has_storage {
@@ -19314,10 +19350,10 @@ fn archive_restore_state(
     }
 
     // Restore snapshot.
-    if let Some(parent) = database_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = database_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     {
         let mut snapshot_file = archive
@@ -19328,10 +19364,10 @@ fn archive_restore_state(
     }
 
     // Restore storage repo entries.
-    if let Some(parent) = storage_root.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = storage_root.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     std::fs::create_dir_all(&storage_root)?;
 
@@ -19740,16 +19776,16 @@ fn handle_doctor_backups_with_storage_root(
     let mut backups: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
     for entry in std::fs::read_dir(&backup_dir)?.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("sqlite3") {
-            if let Ok(meta) = path.metadata() {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                backups.push((name, meta.len(), modified));
-            }
+        if path.extension().and_then(|s| s.to_str()) == Some("sqlite3")
+            && let Ok(meta) = path.metadata()
+        {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            backups.push((name, meta.len(), modified));
         }
     }
     backups.sort_by_key(|x| std::cmp::Reverse(x.2));
@@ -19973,14 +20009,14 @@ fn normalize_agent_mail_url(raw: &str) -> String {
         format!("http://{base}")
     };
 
-    if let Some((scheme, rest)) = with_scheme.split_once("://") {
-        if rest.contains('/') {
-            let mut full = format!("{scheme}://{rest}");
-            if !full.ends_with('/') {
-                full.push('/');
-            }
-            return full;
+    if let Some((scheme, rest)) = with_scheme.split_once("://")
+        && rest.contains('/')
+    {
+        let mut full = format!("{scheme}://{rest}");
+        if !full.ends_with('/') {
+            full.push('/');
         }
+        return full;
     }
     format!("{with_scheme}/api/")
 }
@@ -20477,10 +20513,9 @@ fn coerce_tool_result_json(result: serde_json::Value) -> Option<serde_json::Valu
                     .and_then(|a| a.first())
                     .and_then(|v| v.get("text"))
                     .and_then(|v| v.as_str())
+                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text)
                 {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
-                        return Some(parsed);
-                    }
+                    return Some(parsed);
                 }
             }
             Some(serde_json::Value::Object(map))
@@ -20531,10 +20566,10 @@ async fn get_project_record(
     let raw = identifier.trim();
     let mut canonical = raw.to_string();
     let path = Path::new(raw);
-    if path.is_absolute() {
-        if let Ok(resolved) = path.canonicalize() {
-            canonical = resolved.display().to_string();
-        }
+    if path.is_absolute()
+        && let Ok(resolved) = path.canonicalize()
+    {
+        canonical = resolved.display().to_string();
     }
     let slug = mcp_agent_mail_core::compute_project_slug(&canonical);
 
@@ -21348,55 +21383,55 @@ async fn handle_products_with(
             let title = format!("Thread summary: {thread_id}");
             print_table(Some(&title), &["Key", "Value"], kv_rows);
 
-            if let Some(points) = summary.get("key_points").and_then(|v| v.as_array()) {
-                if !points.is_empty() {
-                    let rows = points
-                        .iter()
-                        .map(|p| vec![p.as_str().unwrap_or("").to_string()])
-                        .collect::<Vec<_>>();
-                    ftui_runtime::ftui_println!();
-                    print_table(Some("Key Points"), &["point"], rows);
-                }
+            if let Some(points) = summary.get("key_points").and_then(|v| v.as_array())
+                && !points.is_empty()
+            {
+                let rows = points
+                    .iter()
+                    .map(|p| vec![p.as_str().unwrap_or("").to_string()])
+                    .collect::<Vec<_>>();
+                ftui_runtime::ftui_println!();
+                print_table(Some("Key Points"), &["point"], rows);
             }
-            if let Some(items) = summary.get("action_items").and_then(|v| v.as_array()) {
-                if !items.is_empty() {
-                    let rows = items
-                        .iter()
-                        .map(|p| vec![p.as_str().unwrap_or("").to_string()])
-                        .collect::<Vec<_>>();
-                    ftui_runtime::ftui_println!();
-                    print_table(Some("Action Items"), &["item"], rows);
-                }
+            if let Some(items) = summary.get("action_items").and_then(|v| v.as_array())
+                && !items.is_empty()
+            {
+                let rows = items
+                    .iter()
+                    .map(|p| vec![p.as_str().unwrap_or("").to_string()])
+                    .collect::<Vec<_>>();
+                ftui_runtime::ftui_println!();
+                print_table(Some("Action Items"), &["item"], rows);
             }
-            if let Some(examples) = payload.get("examples").and_then(|v| v.as_array()) {
-                if !examples.is_empty() {
-                    let rows = examples
-                        .iter()
-                        .map(|e| {
-                            vec![
-                                e.get("id").cloned().unwrap_or_default().to_string(),
-                                e.get("subject")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                e.get("from")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                e.get("created_ts")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    ftui_runtime::ftui_println!();
-                    print_table(
-                        Some("Examples"),
-                        &["id", "subject", "from", "created_ts"],
-                        rows,
-                    );
-                }
+            if let Some(examples) = payload.get("examples").and_then(|v| v.as_array())
+                && !examples.is_empty()
+            {
+                let rows = examples
+                    .iter()
+                    .map(|e| {
+                        vec![
+                            e.get("id").cloned().unwrap_or_default().to_string(),
+                            e.get("subject")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            e.get("from")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            e.get("created_ts")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                ftui_runtime::ftui_println!();
+                print_table(
+                    Some("Examples"),
+                    &["id", "subject", "from", "created_ts"],
+                    rows,
+                );
             }
             Ok(())
         }
@@ -21942,31 +21977,29 @@ fn run_share_preview_with_control(
         while !stop_requested && !deployment_requested && !server.join.is_finished() {
             if poll(std::time::Duration::from_millis(200))
                 .map_err(|e| CliError::Other(format!("hotkey poll error: {e}")))?
-            {
-                if let Event::Key(key) =
+                && let Event::Key(key) =
                     read().map_err(|e| CliError::Other(format!("hotkey read error: {e}")))?
+            {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
                 {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
-                    {
-                        stop_requested = true;
-                        continue;
-                    }
+                    stop_requested = true;
+                    continue;
+                }
 
-                    match key.code {
-                        KeyCode::Char('r') | KeyCode::Char('R') => {
-                            let token = bump_preview_force_token();
-                            ftui_runtime::ftui_println!("Reload signal sent (token {token}).");
-                        }
-                        KeyCode::Char('d') | KeyCode::Char('D') => {
-                            deployment_requested = true;
-                            stop_requested = true;
-                        }
-                        KeyCode::Char('q') | KeyCode::Char('Q') => {
-                            stop_requested = true;
-                        }
-                        _ => {}
+                match key.code {
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        let token = bump_preview_force_token();
+                        ftui_runtime::ftui_println!("Reload signal sent (token {token}).");
                     }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        deployment_requested = true;
+                        stop_requested = true;
+                    }
+                    KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        stop_requested = true;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -22295,10 +22328,10 @@ fn handle_tooling_schemas(
         std::collections::BTreeMap::new();
 
     for &(tool_name, cluster) in cluster_map {
-        if let Some(ref filter) = filter_tool {
-            if tool_name != filter.as_str() {
-                continue;
-            }
+        if let Some(ref filter) = filter_tool
+            && tool_name != filter.as_str()
+        {
+            continue;
         }
         let meta = mcp_agent_mail_tools::tool_meta(tool_name);
         tools.insert(
