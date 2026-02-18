@@ -2406,9 +2406,7 @@ pub fn commit_lock_path(repo_root: &Path, rel_paths: &[&str]) -> PathBuf {
         }
     }
 
-    if same_project
-        && let Some(slug) = project_slug
-    {
+    if same_project && let Some(slug) = project_slug {
         return repo_root.join("projects").join(slug).join(".commit.lock");
     }
 
@@ -2569,9 +2567,7 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
     if let Some(age) = age
         && age > max_age_seconds
     {
-        tracing::info!(
-            "[git-lock] removing stale index.lock (age={age:.1}s > {max_age_seconds}s)"
-        );
+        tracing::info!("[git-lock] removing stale index.lock (age={age:.1}s > {max_age_seconds}s)");
         let _ = fs::remove_file(&lock_path);
         let _ = fs::remove_file(&owner_path);
         return true;
@@ -5287,15 +5283,13 @@ pub fn get_historical_inbox_snapshot(
                             _ => continue,
                         };
 
-                        let mut subject =
-                            subject_slug.replace(['-', '_'], " ").trim().to_string();
+                        let mut subject = subject_slug.replace(['-', '_'], " ").trim().to_string();
                         if subject.is_empty() {
                             subject = "Unknown".to_string();
                         }
 
                         if let Ok(blob) = repo.find_blob(item.id()) {
-                            let blob_content =
-                                String::from_utf8_lossy(blob.content()).to_string();
+                            let blob_content = String::from_utf8_lossy(blob.content()).to_string();
                             if let Some(rest) = blob_content.strip_prefix("---json\n")
                                 && let Some(end_idx) = rest.find("\n---\n")
                             {
@@ -5303,15 +5297,13 @@ pub fn get_historical_inbox_snapshot(
                                 if let Ok(meta) =
                                     serde_json::from_str::<serde_json::Value>(json_str)
                                 {
-                                    if let Some(from) = meta
-                                        .get("from")
-                                        .and_then(serde_json::Value::as_str)
+                                    if let Some(from) =
+                                        meta.get("from").and_then(serde_json::Value::as_str)
                                     {
                                         from_agent = from.to_string();
                                     }
-                                    if let Some(imp) = meta
-                                        .get("importance")
-                                        .and_then(serde_json::Value::as_str)
+                                    if let Some(imp) =
+                                        meta.get("importance").and_then(serde_json::Value::as_str)
                                     {
                                         importance = imp.to_string();
                                     }
@@ -5943,7 +5935,8 @@ fn append_trailers(message: &str) -> String {
 
     let mut trailers = Vec::new();
 
-    if message.starts_with("mail: ") && !has_agent
+    if message.starts_with("mail: ")
+        && !has_agent
         && let Some(rest) = message.strip_prefix("mail: ")
         && let Some(agent_part) = rest.split("->").next()
     {
@@ -5951,7 +5944,8 @@ fn append_trailers(message: &str) -> String {
         if !agent.is_empty() {
             trailers.push(format!("Agent: {agent}"));
         }
-    } else if message.starts_with("file_reservation: ") && !has_agent
+    } else if message.starts_with("file_reservation: ")
+        && !has_agent
         && let Some(rest) = message.strip_prefix("file_reservation: ")
         && let Some(agent_part) = rest.split_whitespace().next()
     {
@@ -10384,8 +10378,7 @@ mod tests {
     fn now_iso_returns_rfc3339_format() {
         let ts = now_iso();
         // Must be parseable back as RFC 3339
-        chrono::DateTime::parse_from_rfc3339(&ts)
-            .expect("now_iso() should return valid RFC 3339");
+        chrono::DateTime::parse_from_rfc3339(&ts).expect("now_iso() should return valid RFC 3339");
         // Should contain the year, 'T' separator, and timezone offset
         assert!(ts.len() >= 20, "timestamp too short: {ts}");
         assert!(ts.contains('T'), "missing T separator: {ts}");
@@ -10464,8 +10457,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("secret.txt"), "data").unwrap();
         // Attempt traversal
-        let result =
-            resolve_attachment_source_path(dir.path(), &config, "../outside/secret.txt");
+        let result = resolve_attachment_source_path(dir.path(), &config, "../outside/secret.txt");
         // This should either not find the file or reject the traversal
         assert!(result.is_err(), "path traversal should be rejected");
     }

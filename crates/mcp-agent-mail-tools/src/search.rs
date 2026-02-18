@@ -325,13 +325,12 @@ pub(crate) fn summarize_messages(
                 || is_ordered_prefix(stripped)
             {
                 let mut normalized = stripped.to_string();
-                if normalized.starts_with("- [ ]")
+                if (normalized.starts_with("- [ ]")
                     || normalized.starts_with("- [x]")
-                    || normalized.starts_with("- [X]")
+                    || normalized.starts_with("- [X]"))
+                    && let Some((_, rest)) = normalized.split_once(']')
                 {
-                    if let Some((_, rest)) = normalized.split_once(']') {
-                        normalized = rest.trim().to_string();
-                    }
+                    normalized = rest.trim().to_string();
                 }
                 let cleaned = normalized
                     .trim_start_matches(&['-', '+', '*', ' '][..])
@@ -581,19 +580,19 @@ pub(crate) fn parse_time_range_with_aliases(
         TimeBoundary::EndInclusive,
     )?;
 
-    if let (Some(start), Some(end)) = (min_ts, max_ts) {
-        if start > end {
-            return Err(legacy_tool_error(
-                "INVALID_ARGUMENT",
-                "Invalid date range: date_start must be less than or equal to date_end.",
-                true,
-                json!({
-                    "field": "date_range",
-                    "date_start_micros": start,
-                    "date_end_micros": end
-                }),
-            ));
-        }
+    if let (Some(start), Some(end)) = (min_ts, max_ts)
+        && start > end
+    {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid date range: date_start must be less than or equal to date_end.",
+            true,
+            json!({
+                "field": "date_range",
+                "date_start_micros": start,
+                "date_end_micros": end
+            }),
+        ));
     }
 
     Ok(mcp_agent_mail_db::search_planner::TimeRange { min_ts, max_ts })

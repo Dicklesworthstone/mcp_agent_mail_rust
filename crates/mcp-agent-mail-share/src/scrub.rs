@@ -271,11 +271,11 @@ pub fn scrub_snapshot(
                     let (sanitized, rep_count, keys_removed) =
                         scrub_structure(&Value::Array(attachments_data.clone()), 0);
                     attachment_replacements += rep_count;
-                    if let Value::Array(arr) = sanitized {
-                        if arr != attachments_data {
-                            attachments_data = arr;
-                            attachments_updated = true;
-                        }
+                    if let Value::Array(arr) = sanitized
+                        && arr != attachments_data
+                    {
+                        attachments_data = arr;
+                        attachments_updated = true;
                     }
                     if keys_removed > 0 {
                         attachments_updated = true;

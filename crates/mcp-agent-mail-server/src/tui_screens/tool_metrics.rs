@@ -563,14 +563,14 @@ impl ToolMetricsScreen {
         self.sorted_tools = tools.iter().map(|t| t.name.clone()).collect();
 
         // Clamp selection
-        if let Some(sel) = self.table_state.selected {
-            if sel >= self.sorted_tools.len() {
-                self.table_state.selected = if self.sorted_tools.is_empty() {
-                    None
-                } else {
-                    Some(self.sorted_tools.len() - 1)
-                };
-            }
+        if let Some(sel) = self.table_state.selected
+            && sel >= self.sorted_tools.len()
+        {
+            self.table_state.selected = if self.sorted_tools.is_empty() {
+                None
+            } else {
+                Some(self.sorted_tools.len() - 1)
+            };
         }
     }
 
@@ -779,7 +779,7 @@ impl ToolMetricsScreen {
                 } else if stats.err_pct() > 5.0 {
                     Style::default().fg(tp.severity_error).bg(row_bg)
                 } else {
-                    Style::default().bg(row_bg)
+                    Style::default().fg(tp.text_primary).bg(row_bg)
                 };
                 Some(
                     Row::new([
@@ -1119,74 +1119,74 @@ impl Default for ToolMetricsScreen {
 
 impl MailScreen for ToolMetricsScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-                    KeyCode::Char('G') | KeyCode::End => {
-                        if !self.sorted_tools.is_empty() {
-                            self.table_state.selected = Some(self.sorted_tools.len() - 1);
-                        }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+                KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+                KeyCode::Char('G') | KeyCode::End => {
+                    if !self.sorted_tools.is_empty() {
+                        self.table_state.selected = Some(self.sorted_tools.len() - 1);
                     }
-                    KeyCode::Char('g') | KeyCode::Home => {
-                        if !self.sorted_tools.is_empty() {
-                            self.table_state.selected = Some(0);
-                        }
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    if !self.sorted_tools.is_empty() {
+                        self.table_state.selected = Some(0);
                     }
-                    KeyCode::Char('s') => {
-                        self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
-                        self.rebuild_sorted();
-                    }
-                    KeyCode::Char('S') => {
-                        self.sort_asc = !self.sort_asc;
-                        self.rebuild_sorted();
-                    }
-                    KeyCode::Char('v') => {
-                        self.view_mode = match self.view_mode {
-                            ViewMode::Table => ViewMode::Dashboard,
-                            ViewMode::Dashboard => ViewMode::Table,
-                        };
-                    }
-                    KeyCode::Char('l') => {
+                }
+                KeyCode::Char('s') => {
+                    self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                    self.rebuild_sorted();
+                }
+                KeyCode::Char('S') => {
+                    self.sort_asc = !self.sort_asc;
+                    self.rebuild_sorted();
+                }
+                KeyCode::Char('v') => {
+                    self.view_mode = match self.view_mode {
+                        ViewMode::Table => ViewMode::Dashboard,
+                        ViewMode::Dashboard => ViewMode::Table,
+                    };
+                }
+                KeyCode::Char('l') => {
+                    self.disclosure_level = self.disclosure_level.next();
+                }
+                KeyCode::Char('L') => {
+                    self.disclosure_level = self.disclosure_level.prev();
+                }
+                KeyCode::Enter => {
+                    // Drill down: activate evidence panel or step deeper.
+                    if self.drilldown_active {
                         self.disclosure_level = self.disclosure_level.next();
-                    }
-                    KeyCode::Char('L') => {
-                        self.disclosure_level = self.disclosure_level.prev();
-                    }
-                    KeyCode::Enter => {
-                        // Drill down: activate evidence panel or step deeper.
-                        if self.drilldown_active {
-                            self.disclosure_level = self.disclosure_level.next();
-                        } else if !self.evidence_entries.is_empty() {
-                            self.drilldown_active = true;
-                            self.disclosure_level = DisclosureLevel::Detail;
-                        }
-                    }
-                    KeyCode::Escape => {
-                        // Step up one level or deactivate drill-down.
-                        if self.drilldown_active {
-                            if self.disclosure_level == DisclosureLevel::Badge {
-                                self.drilldown_active = false;
-                            } else {
-                                self.disclosure_level = self.disclosure_level.prev();
-                            }
-                        }
-                    }
-                    KeyCode::Char('1') => {
-                        self.disclosure_level = DisclosureLevel::Badge;
-                    }
-                    KeyCode::Char('2') => {
-                        self.disclosure_level = DisclosureLevel::Summary;
-                    }
-                    KeyCode::Char('3') => {
+                    } else if !self.evidence_entries.is_empty() {
+                        self.drilldown_active = true;
                         self.disclosure_level = DisclosureLevel::Detail;
                     }
-                    KeyCode::Char('4') => {
-                        self.disclosure_level = DisclosureLevel::DeepDive;
-                    }
-                    _ => {}
                 }
+                KeyCode::Escape => {
+                    // Step up one level or deactivate drill-down.
+                    if self.drilldown_active {
+                        if self.disclosure_level == DisclosureLevel::Badge {
+                            self.drilldown_active = false;
+                        } else {
+                            self.disclosure_level = self.disclosure_level.prev();
+                        }
+                    }
+                }
+                KeyCode::Char('1') => {
+                    self.disclosure_level = DisclosureLevel::Badge;
+                }
+                KeyCode::Char('2') => {
+                    self.disclosure_level = DisclosureLevel::Summary;
+                }
+                KeyCode::Char('3') => {
+                    self.disclosure_level = DisclosureLevel::Detail;
+                }
+                KeyCode::Char('4') => {
+                    self.disclosure_level = DisclosureLevel::DeepDive;
+                }
+                _ => {}
             }
         }
         Cmd::None
@@ -1201,10 +1201,10 @@ impl MailScreen for ToolMetricsScreen {
             self.last_persisted_hydrate_tick = tick_count;
         }
         self.ingest_events(state);
-        if self.tool_map.is_empty() || tick_count % 20 == 0 {
+        if self.tool_map.is_empty() || tick_count.is_multiple_of(20) {
             self.hydrate_from_runtime_snapshot();
         }
-        if tick_count % 10 == 0 {
+        if tick_count.is_multiple_of(10) {
             self.rebuild_sorted();
             self.snapshot_percentiles();
             self.snapshot_tick += 1;
@@ -1212,7 +1212,7 @@ impl MailScreen for ToolMetricsScreen {
             self.evidence_entries = evidence_ledger().recent(20);
         }
         // Checkpoint ranks every ~50 ticks for change tracking.
-        if tick_count % 50 == 0 {
+        if tick_count.is_multiple_of(50) {
             self.checkpoint_ranks();
         }
         self.refresh_latency_ribbon_animation();
@@ -1260,11 +1260,11 @@ impl MailScreen for ToolMetricsScreen {
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
-        if let DeepLinkTarget::ToolByName(name) = target {
-            if let Some(pos) = self.sorted_tools.iter().position(|t| t == name) {
-                self.table_state.selected = Some(pos);
-                return true;
-            }
+        if let DeepLinkTarget::ToolByName(name) = target
+            && let Some(pos) = self.sorted_tools.iter().position(|t| t == name)
+        {
+            self.table_state.selected = Some(pos);
+            return true;
         }
         false
     }

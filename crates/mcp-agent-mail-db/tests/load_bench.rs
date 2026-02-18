@@ -660,22 +660,20 @@ fn load_scenario_c_mixed_workload() {
                                     )
                                     .await
                                 }
-                            }) {
-                                if let Some(msg) = msgs.first() {
-                                    let mid = msg.message.id.unwrap();
-                                    let t0 = Instant::now();
-                                    match block_on(|cx| {
-                                        let pp = pool.clone();
-                                        async move {
-                                            queries::acknowledge_message(&cx, &pp, agent_id, mid)
-                                                .await
-                                        }
-                                    }) {
-                                        Outcome::Ok(_) => {
-                                            ack_lats.push(t0.elapsed().as_micros() as u64);
-                                        }
-                                        _ => errors += 1,
+                            }) && let Some(msg) = msgs.first()
+                            {
+                                let mid = msg.message.id.unwrap();
+                                let t0 = Instant::now();
+                                match block_on(|cx| {
+                                    let pp = pool.clone();
+                                    async move {
+                                        queries::acknowledge_message(&cx, &pp, agent_id, mid).await
                                     }
+                                }) {
+                                    Outcome::Ok(_) => {
+                                        ack_lats.push(t0.elapsed().as_micros() as u64);
+                                    }
+                                    _ => errors += 1,
                                 }
                             }
                         }

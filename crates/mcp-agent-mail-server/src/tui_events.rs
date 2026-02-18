@@ -1169,7 +1169,7 @@ impl EventRingBuffer {
 
         // Sample: keep 1 out of every N.
         let counter = self.sample_counter.fetch_add(1, Ordering::Relaxed);
-        counter % self.policy.sample_rate != 0
+        !counter.is_multiple_of(self.policy.sample_rate)
     }
 
     fn push_inner(inner: &mut EventRingBufferInner, mut event: MailEvent) -> u64 {
@@ -1622,7 +1622,7 @@ impl RenderItem for TimelineRow {
         let tp = crate::tui_theme::TuiThemePalette::current();
 
         let base_style = if selected {
-            Style::default().bg(tp.selection_bg)
+            Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
         } else {
             Style::default()
         };
@@ -1801,7 +1801,7 @@ impl RenderItem for MessageRow {
 
         let tp = crate::tui_theme::TuiThemePalette::current();
         let base_style = if selected {
-            Style::default().bg(tp.selection_bg)
+            Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
         } else {
             Style::default()
         };
@@ -1869,7 +1869,7 @@ impl RenderItem for SearchHitRow {
 
         let tp = crate::tui_theme::TuiThemePalette::current();
         let base_style = if selected {
-            Style::default().bg(tp.selection_bg)
+            Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
         } else {
             Style::default()
         };
@@ -1928,7 +1928,7 @@ impl RenderItem for ExplorerRow {
 
         let tp = crate::tui_theme::TuiThemePalette::current();
         let base_style = if selected {
-            Style::default().bg(tp.selection_bg)
+            Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
         } else {
             Style::default()
         };

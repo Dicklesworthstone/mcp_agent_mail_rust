@@ -251,7 +251,7 @@ impl RenderItem for CommitTimelineEntry {
                 meta_style,
             ),
             Span::styled(format!(" {:<10} ", self.type_label()), type_style),
-            Span::styled(self.detail_summary(), Style::default()),
+            Span::styled(self.detail_summary(), crate::tui_theme::text_primary(&tp)),
         ]);
 
         if selected {
@@ -1387,13 +1387,13 @@ impl MailScreen for TimelineScreen {
                             }
                         } else if self.view_mode == TimelineViewMode::Combined {
                             let idx = (c as u8 - b'0') as usize;
-                            if let Some(event) = self.selected_combined_event() {
-                                if let Some(target) = super::inspector::resolve_link(&event, idx) {
-                                    if self.dock != dock_before {
-                                        self.dock_changed();
-                                    }
-                                    return Cmd::Msg(MailScreenMsg::DeepLink(target));
+                            if let Some(event) = self.selected_combined_event()
+                                && let Some(target) = super::inspector::resolve_link(&event, idx)
+                            {
+                                if self.dock != dock_before {
+                                    self.dock_changed();
                                 }
+                                return Cmd::Msg(MailScreenMsg::DeepLink(target));
                             }
                         }
                     }
@@ -1941,7 +1941,7 @@ fn render_save_preset_dialog(
         .title("Save Timeline Preset")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border))
-        .style(Style::default().bg(tp.bg_overlay));
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay));
     let inner = block.inner(overlay);
     block.render(overlay, frame);
     if inner.height == 0 {
@@ -1985,7 +1985,7 @@ fn render_load_preset_dialog(frame: &mut Frame<'_>, area: Rect, names: &[String]
         .title("Load Timeline Preset")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border))
-        .style(Style::default().bg(tp.bg_overlay));
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay));
     let inner = block.inner(overlay);
     block.render(overlay, frame);
     if inner.height == 0 {
@@ -2092,14 +2092,14 @@ fn render_timeline(
 
     // Render VirtualizedList into inner area.
     let list = VirtualizedList::new(&filtered)
-        .style(Style::default())
+        .style(crate::tui_theme::text_primary(&tp))
         .highlight_style(
             Style::default()
                 .fg(tp.selection_fg)
                 .bg(tp.selection_bg)
                 .bold(),
         )
-        .show_scrollbar(true);
+        .show_scrollbar(filtered.len() > usize::from(inner_area.height));
     StatefulWidget::render(&list, inner_area, frame, list_state);
 }
 
@@ -2276,14 +2276,14 @@ fn render_virtualized_rows<T: RenderItem>(
     });
 
     let list = VirtualizedList::new(rows)
-        .style(Style::default())
+        .style(crate::tui_theme::text_primary(&tp))
         .highlight_style(
             Style::default()
                 .fg(tp.selection_fg)
                 .bg(tp.selection_bg)
                 .bold(),
         )
-        .show_scrollbar(true);
+        .show_scrollbar(rows.len() > usize::from(list_area.height));
     StatefulWidget::render(&list, list_area, frame, list_state);
 }
 

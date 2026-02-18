@@ -481,14 +481,13 @@ impl PresetManager {
         if let Ok(entries) = std::fs::read_dir(&storage_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "json") {
-                    if let Ok(data) = std::fs::read_to_string(&path) {
-                        if let Ok(preset) = DashboardPreset::from_json(&data) {
-                            // Don't overwrite built-ins with user files.
-                            if !presets.get(&preset.name).is_some_and(|p| p.builtin) {
-                                presets.insert(preset.name.clone(), preset);
-                            }
-                        }
+                if path.extension().is_some_and(|ext| ext == "json")
+                    && let Ok(data) = std::fs::read_to_string(&path)
+                    && let Ok(preset) = DashboardPreset::from_json(&data)
+                {
+                    // Don't overwrite built-ins with user files.
+                    if !presets.get(&preset.name).is_some_and(|p| p.builtin) {
+                        presets.insert(preset.name.clone(), preset);
                     }
                 }
             }

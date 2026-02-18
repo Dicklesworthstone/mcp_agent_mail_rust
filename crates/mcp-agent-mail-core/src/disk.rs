@@ -464,14 +464,20 @@ mod tests {
     fn disk_free_bytes_succeeds_on_existing_dir() {
         let dir = tempdir().unwrap();
         let bytes = disk_free_bytes(dir.path());
-        assert!(bytes.is_ok(), "disk_free_bytes should succeed for existing dir");
+        assert!(
+            bytes.is_ok(),
+            "disk_free_bytes should succeed for existing dir"
+        );
         assert!(bytes.unwrap() > 0, "available space should be > 0");
     }
 
     #[test]
     fn disk_free_bytes_fails_on_nonexistent_path() {
         let result = disk_free_bytes(Path::new("/nonexistent_path_that_does_not_exist_12345"));
-        assert!(result.is_err(), "disk_free_bytes should fail for nonexistent path");
+        assert!(
+            result.is_err(),
+            "disk_free_bytes should fail for nonexistent path"
+        );
     }
 
     #[test]

@@ -1028,12 +1028,12 @@ fn build_status(
     if urgent > 0 {
         actions.push("am robot inbox --urgent".to_string());
     }
-    if ack_overdue > 0 {
-        if let Some((_, ref name)) = agent {
-            actions.push(format!(
-                "am mail ack --project {project_slug} --agent {name}"
-            ));
-        }
+    if ack_overdue > 0
+        && let Some((_, ref name)) = agent
+    {
+        actions.push(format!(
+            "am mail ack --project {project_slug} --agent {name}"
+        ));
     }
     if let Some(top) = top_threads.first() {
         actions.push(format!("am robot thread {}", top.id));
@@ -1227,10 +1227,10 @@ fn build_inbox(
             "am mail ack --project {project_slug} --agent {agent_name} {id}"
         ));
     }
-    if let Some(entry) = entries.first() {
-        if !entry.thread.is_empty() {
-            actions.push(format!("am robot thread {}", entry.thread));
-        }
+    if let Some(entry) = entries.first()
+        && !entry.thread.is_empty()
+    {
+        actions.push(format!("am robot thread {}", entry.thread));
     }
 
     Ok(InboxResult {
@@ -1883,10 +1883,10 @@ fn build_reservations(
 
         all_active.push(entry.clone());
 
-        if let Some((my_id, _)) = &agent {
-            if agent_id_row == *my_id {
-                my_reservations.push(entry.clone());
-            }
+        if let Some((my_id, _)) = &agent
+            && agent_id_row == *my_id
+        {
+            my_reservations.push(entry.clone());
         }
 
         if expires_ts < expiring_threshold {
@@ -2082,16 +2082,16 @@ fn build_timeline(
                     source: agent.clone(),
                 });
             }
-            if let Some(rel_ts) = released_ts {
-                if rel_ts > since_us {
-                    events.push(TimelineEvent {
-                        seq: 0,
-                        timestamp: mcp_agent_mail_db::micros_to_iso(rel_ts),
-                        kind: "reservation".to_string(),
-                        summary: format!("{agent} released {path}"),
-                        source: agent.clone(),
-                    });
-                }
+            if let Some(rel_ts) = released_ts
+                && rel_ts > since_us
+            {
+                events.push(TimelineEvent {
+                    seq: 0,
+                    timestamp: mcp_agent_mail_db::micros_to_iso(rel_ts),
+                    kind: "reservation".to_string(),
+                    summary: format!("{agent} released {path}"),
+                    source: agent.clone(),
+                });
             }
         }
     }
@@ -3023,14 +3023,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         None,
                     );
                 }
-                if let Some(lat) = &e.latency {
-                    if lat.avg_ms > 2000.0 {
-                        env = env.with_alert(
-                            "warn",
-                            format!("{} avg latency {:.0}ms (>2s)", e.name, lat.avg_ms),
-                            None,
-                        );
-                    }
+                if let Some(lat) = &e.latency
+                    && lat.avg_ms > 2000.0
+                {
+                    env = env.with_alert(
+                        "warn",
+                        format!("{} avg latency {:.0}ms (>2s)", e.name, lat.avg_ms),
+                        None,
+                    );
                 }
             }
             if error_rate > 5.0 {
@@ -3185,10 +3185,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             if !db_ok {
                 env = env.with_alert("error", "Database connectivity probe failed", None);
             }
-            if !circuits_ok {
-                if let Some(rec) = &db_health.recommendation {
-                    env = env.with_alert("error", rec, None);
-                }
+            if !circuits_ok && let Some(rec) = &db_health.recommendation {
+                env = env.with_alert("error", rec, None);
             }
             if !integrity_ok {
                 env = env.with_alert(

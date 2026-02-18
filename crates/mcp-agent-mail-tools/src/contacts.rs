@@ -175,8 +175,9 @@ fn parse_contact_target(
     if let Some(tp) = to_project {
         return (tp, to_agent.to_string());
     }
-    if to_agent.starts_with("project:") && to_agent.contains('#') {
-        if let Some((slug, agent)) = to_agent.split_once(':').and_then(|(_, rest)| {
+    if to_agent.starts_with("project:")
+        && to_agent.contains('#')
+        && let Some((slug, agent)) = to_agent.split_once(':').and_then(|(_, rest)| {
             let (slug, agent) = rest.split_once('#')?;
             let agent = agent.trim();
             if slug.is_empty() || agent.is_empty() {
@@ -184,9 +185,9 @@ fn parse_contact_target(
             } else {
                 Some((slug.to_string(), agent.to_string()))
             }
-        }) {
-            return (slug, agent);
-        }
+        })
+    {
+        return (slug, agent);
     }
     (default_project.to_string(), to_agent.to_string())
 }
@@ -452,15 +453,15 @@ pub async fn list_contacts(
     b_agent_ids.dedup();
 
     let mut agent_names: HashMap<i64, String> = HashMap::with_capacity(b_agent_ids.len());
-    if !b_agent_ids.is_empty() {
-        if let Ok(rows) = db_outcome_to_mcp_result(
+    if !b_agent_ids.is_empty()
+        && let Ok(rows) = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::get_agents_by_ids(ctx.cx(), &pool, &b_agent_ids).await,
-        ) {
-            for row in rows {
-                // Safe unwrap: row.id is primary key, guaranteed to be Some(id)
-                if let Some(id) = row.id {
-                    agent_names.insert(id, row.name);
-                }
+        )
+    {
+        for row in rows {
+            // Safe unwrap: row.id is primary key, guaranteed to be Some(id)
+            if let Some(id) = row.id {
+                agent_names.insert(id, row.name);
             }
         }
     }

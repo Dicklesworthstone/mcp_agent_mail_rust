@@ -726,15 +726,15 @@ pub async fn macro_contact_handshake(
     );
 
     // Log registration params
-    if let Some(reg) = register_if_missing {
-        if reg {
-            tracing::debug!(
-                "Auto-register: program={:?}, model={:?}, task={:?}",
-                program,
-                model,
-                task_description
-            );
-        }
+    if let Some(reg) = register_if_missing
+        && reg
+    {
+        tracing::debug!(
+            "Auto-register: program={:?}, model={:?}, task={:?}",
+            program,
+            model,
+            task_description
+        );
     }
     if let Some(tid) = thread_id_for_log {
         tracing::debug!("Welcome message thread: {}", tid);

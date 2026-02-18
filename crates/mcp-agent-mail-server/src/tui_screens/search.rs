@@ -49,20 +49,25 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 const MAX_RESULTS: usize = 200;
 
 /// Debounce delay in ticks for search-as-you-type.
-const DEBOUNCE_TICKS: u8 = 3;
+const DEBOUNCE_TICKS: u8 = 1;
 const SEARCH_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
 const SEARCH_STACKED_WIDTH_THRESHOLD: u16 = 60;
 const SEARCH_STACKED_MIN_HEIGHT: u16 = 12;
 const SEARCH_STACKED_DOCK_RATIO: f32 = 0.38;
-const SEARCH_FACET_GAP_THRESHOLD: u16 = 72;
-const SEARCH_SPLIT_GAP_THRESHOLD: u16 = 78;
+const SEARCH_FACET_GAP_THRESHOLD: u16 = 56;
+const SEARCH_SPLIT_GAP_THRESHOLD: u16 = 60;
 
 /// Max chars for the message snippet shown in the detail pane.
-const MAX_SNIPPET_CHARS: usize = 180;
+const MAX_SNIPPET_CHARS: usize = 320;
 /// Max markdown body lines to inspect when building searchable previews.
-const SEARCHABLE_BODY_MAX_LINES: usize = 96;
+const SEARCHABLE_BODY_MAX_LINES: usize = 72;
 /// Max markdown body bytes to inspect when building searchable previews.
-const SEARCHABLE_BODY_MAX_CHARS: usize = 12_000;
+const SEARCHABLE_BODY_MAX_CHARS: usize = 9_000;
+/// Lower caps used when no highlight terms are active (keeps search snappy).
+const SEARCHABLE_PREVIEW_MAX_LINES: usize = 24;
+const SEARCHABLE_PREVIEW_MAX_CHARS: usize = 2_800;
+const CONTEXT_NO_HIT_LINES: usize = 3;
+const CONTEXT_HIT_RADIUS_LINES: usize = 2;
 
 /// Hard cap on highlight terms to keep rendering predictable.
 const MAX_HIGHLIGHT_TERMS: usize = 8;
@@ -84,10 +89,12 @@ fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
     if area.is_empty() {
         return;
     }
+    let fg = crate::tui_theme::TuiThemePalette::current().text_primary;
     for y in area.y..area.y.saturating_add(area.height) {
         for x in area.x..area.x.saturating_add(area.width) {
             if let Some(cell) = frame.buffer.get_mut(x, y) {
                 *cell = ftui::Cell::from_char(' ');
+                cell.fg = fg;
                 cell.bg = bg;
             }
         }
@@ -99,56 +106,34 @@ fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, act
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let splitter_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.62);
-    fill_rect(frame, area, splitter_bg);
-    let rail_color = if active {
-        crate::tui_theme::lerp_color(tp.panel_border_focused, tp.selection_indicator, 0.32)
-    } else {
-        tp.panel_border_dim
-    };
-    let knob_color = if active {
-        tp.selection_indicator
-    } else {
-        tp.text_muted
-    };
 
-    if vertical {
-        let x = area.x.saturating_add(area.width / 2);
-        let grip_len = area.height.min(5).max(1);
-        let start_y = area
-            .y
-            .saturating_add(area.height.saturating_sub(grip_len) / 2);
-        for y in start_y..start_y.saturating_add(grip_len) {
+    // Repaint the whole splitter gap first so prior layout artifacts never
+    // remain visible as stray borders across list/detail content.
+    let separator_color = crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border_dim, 0.58);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
             if let Some(cell) = frame.buffer.get_mut(x, y) {
-                *cell = ftui::Cell::from_char('•');
-                cell.fg = rail_color;
-                cell.bg = splitter_bg;
+                *cell = ftui::Cell::from_char(' ');
+                cell.fg = separator_color;
+                cell.bg = tp.panel_bg;
             }
         }
-        let knob_y = start_y.saturating_add(grip_len / 2);
-        if let Some(cell) = frame.buffer.get_mut(x, knob_y) {
-            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
-            cell.fg = knob_color;
-            cell.bg = splitter_bg;
-        }
-    } else {
-        let y = area.y.saturating_add(area.height / 2);
-        let grip_len = area.width.min(5).max(1);
-        let start_x = area
-            .x
-            .saturating_add(area.width.saturating_sub(grip_len) / 2);
-        for x in start_x..start_x.saturating_add(grip_len) {
-            if let Some(cell) = frame.buffer.get_mut(x, y) {
-                *cell = ftui::Cell::from_char('•');
-                cell.fg = rail_color;
-                cell.bg = splitter_bg;
-            }
-        }
-        let knob_x = start_x.saturating_add(grip_len / 2);
-        if let Some(cell) = frame.buffer.get_mut(knob_x, y) {
-            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
-            cell.fg = knob_color;
-            cell.bg = splitter_bg;
+    }
+    if active && ((vertical && area.height >= 5) || (!vertical && area.width >= 5)) {
+        let x = if vertical {
+            area.x.saturating_add(area.width / 2)
+        } else {
+            area.x.saturating_add(area.width.saturating_sub(1) / 2)
+        };
+        let y = if vertical {
+            area.y.saturating_add(area.height.saturating_sub(1) / 2)
+        } else {
+            area.y.saturating_add(area.height / 2)
+        };
+        if let Some(cell) = frame.buffer.get_mut(x, y) {
+            *cell = ftui::Cell::from_char('·');
+            cell.fg = tp.selection_indicator;
+            cell.bg = tp.panel_bg;
         }
     }
 }
@@ -508,6 +493,8 @@ struct SearchDegradedDiagnostics {
     remediation_hint: Option<String>,
 }
 
+type DetailCacheKey = (i64, &'static str, &'static str);
+
 fn explain_facet_value<'a>(
     explain: &'a mcp_agent_mail_db::search_planner::QueryExplain,
     key: &str,
@@ -697,7 +684,8 @@ impl RenderItem for SearchResultRow {
         // Title with optional highlighting
         let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
 
-        if self.highlight_terms.is_empty() {
+        let highlight_enabled = selected && !self.highlight_needles.is_empty();
+        if !highlight_enabled {
             spans.push(Span::styled(title, primary_style));
         } else {
             spans.extend(highlight_spans_with_needles(
@@ -718,41 +706,55 @@ impl RenderItem for SearchResultRow {
             && self.entry.doc_kind == DocKind::Message
             && !snippet_source.is_empty();
         if show_context_line {
-            let context_segments = snippet_source
+            let max_context_lines = usize::from(area.height.saturating_sub(1)).clamp(1, 3);
+            let mut context_segments = snippet_source
                 .split(" ⟫ ")
                 .map(str::trim)
                 .filter(|segment| !segment.is_empty())
-                .collect::<Vec<_>>();
-            let max_context_lines = usize::from(area.height.saturating_sub(1)).clamp(1, 2);
-            if context_segments.is_empty() {
+                .peekable();
+            let highlight_context = highlight_enabled;
+            if context_segments.peek().is_none() {
                 let context_prefix = "  ↳ ";
                 let snippet_width = w.saturating_sub(ftui::text::display_width(context_prefix));
                 let snippet = truncate_display_width(snippet_source, snippet_width);
-                let mut context_spans = vec![Span::styled(context_prefix, meta_style)];
-                context_spans.extend(highlight_spans_with_needles(
-                    &snippet,
-                    &self.highlight_needles,
-                    Some(crate::tui_theme::text_hint(&tp)),
-                    highlight_style,
-                ));
-                lines.push(Line::from_spans(context_spans));
-            } else {
-                for (idx, segment) in context_segments.iter().take(max_context_lines).enumerate() {
-                    let context_prefix = if idx == 0 { "  ↳ " } else { "    " };
-                    let snippet_width = w.saturating_sub(ftui::text::display_width(context_prefix));
-                    let snippet = truncate_display_width(segment, snippet_width);
-                    let mut context_spans = vec![Span::styled(context_prefix, meta_style)];
+                let mut context_spans = Vec::with_capacity(2);
+                context_spans.push(Span::styled(context_prefix, meta_style));
+                if highlight_context {
                     context_spans.extend(highlight_spans_with_needles(
                         &snippet,
                         &self.highlight_needles,
                         Some(crate::tui_theme::text_hint(&tp)),
                         highlight_style,
                     ));
-                    lines.push(Line::from_spans(context_spans));
+                } else {
+                    context_spans.push(Span::styled(snippet, crate::tui_theme::text_hint(&tp)));
                 }
-                if context_segments.len() > max_context_lines
-                    && lines.len() < usize::from(area.height)
-                {
+                lines.push(Line::from_spans(context_spans));
+            } else {
+                let mut rendered = 0usize;
+                while rendered < max_context_lines {
+                    let Some(segment) = context_segments.next() else {
+                        break;
+                    };
+                    let context_prefix = if rendered == 0 { "  ↳ " } else { "    " };
+                    let snippet_width = w.saturating_sub(ftui::text::display_width(context_prefix));
+                    let snippet = truncate_display_width(segment, snippet_width);
+                    let mut context_spans = Vec::with_capacity(2);
+                    context_spans.push(Span::styled(context_prefix, meta_style));
+                    if highlight_context {
+                        context_spans.extend(highlight_spans_with_needles(
+                            &snippet,
+                            &self.highlight_needles,
+                            Some(crate::tui_theme::text_hint(&tp)),
+                            highlight_style,
+                        ));
+                    } else {
+                        context_spans.push(Span::styled(snippet, crate::tui_theme::text_hint(&tp)));
+                    }
+                    lines.push(Line::from_spans(context_spans));
+                    rendered += 1;
+                }
+                if context_segments.next().is_some() && lines.len() < usize::from(area.height) {
                     lines.push(Line::from_spans([Span::styled(
                         "    …",
                         crate::tui_theme::text_hint(&tp),
@@ -775,11 +777,7 @@ impl RenderItem for SearchResultRow {
         if self.entry.doc_kind == DocKind::Message
             && (!self.entry.context_snippet.is_empty() || !self.entry.body_preview.is_empty())
         {
-            if self.entry.context_snippet.contains(" ⟫ ") {
-                3
-            } else {
-                2
-            }
+            3
         } else {
             1
         }
@@ -925,11 +923,11 @@ fn extract_snippet(text: &str, terms: &[QueryTerm], max_chars: usize) -> String 
                 continue;
             }
             let needle = term.text.to_ascii_lowercase();
-            if let Some(pos) = hay.find(&needle) {
-                if best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX) {
-                    best_pos = Some(pos);
-                    best_len = needle.len();
-                }
+            if let Some(pos) = hay.find(&needle)
+                && (best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX))
+            {
+                best_pos = Some(pos);
+                best_len = needle.len();
             }
         }
     }
@@ -1165,6 +1163,8 @@ pub struct SearchCockpitScreen {
     ui_phase: u8,
     /// Cached markdown render for selected message bodies, keyed by message id.
     rendered_markdown_cache: RefCell<HashMap<(i64, &'static str), Arc<Text>>>,
+    /// Cached detail panel text for selected entries, keyed by (id, kind, theme).
+    rendered_detail_cache: RefCell<HashMap<DetailCacheKey, Arc<Text>>>,
 }
 
 impl SearchCockpitScreen {
@@ -1219,6 +1219,7 @@ impl SearchCockpitScreen {
             last_split_area: Cell::new(Rect::new(0, 0, 0, 0)),
             ui_phase: 0,
             rendered_markdown_cache: RefCell::new(HashMap::new()),
+            rendered_detail_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1266,6 +1267,32 @@ impl SearchCockpitScreen {
         }
         cache.insert(cache_key, Arc::clone(&rendered));
         Some(rendered)
+    }
+
+    /// Return cached detail text for an entry, generating lazily.
+    fn cached_rendered_detail(&self, entry: &ResultEntry) -> Arc<Text> {
+        let theme_key = crate::tui_theme::current_theme_env_value();
+        let cache_key = (entry.id, entry.doc_kind.as_str(), theme_key);
+        if let Some(existing) = self.rendered_detail_cache.borrow().get(&cache_key) {
+            return Arc::clone(existing);
+        }
+
+        let rendered_body = self.cached_rendered_markdown(entry);
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let rendered = Arc::new(compose_detail_text(
+            entry,
+            &self.highlight_terms,
+            self.last_diagnostics.as_ref(),
+            rendered_body.as_deref(),
+            &tp,
+        ));
+
+        let mut cache = self.rendered_detail_cache.borrow_mut();
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        cache.insert(cache_key, Arc::clone(&rendered));
+        rendered
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected search result.
@@ -1362,6 +1389,7 @@ impl SearchCockpitScreen {
             self.results.clear();
             self.result_rows.clear();
             self.rendered_markdown_cache.borrow_mut().clear();
+            self.rendered_detail_cache.borrow_mut().clear();
             self.total_sql_rows = 0;
             self.guidance = None;
             self.cursor = 0;
@@ -1411,6 +1439,7 @@ impl SearchCockpitScreen {
 
         self.db_conn = Some(conn);
         self.rendered_markdown_cache.borrow_mut().clear();
+        self.rendered_detail_cache.borrow_mut().clear();
 
         // Generate zero-result guidance from TUI facet state
         self.guidance = if self.results.is_empty() && !raw.is_empty() {
@@ -1726,7 +1755,7 @@ impl SearchCockpitScreen {
         }
     }
 
-    fn detail_visible(&self) -> bool {
+    const fn detail_visible(&self) -> bool {
         let area = self.last_detail_area.get();
         area.width > 0 && area.height > 0
     }
@@ -1743,9 +1772,13 @@ impl SearchCockpitScreen {
         } else {
             usize::from(area.height.saturating_sub(3))
         };
-        let width = if area.width == 0 { 80 } else { area.width };
-        let rendered_override = self.cached_rendered_markdown(entry);
-        let total = estimate_search_detail_lines(entry, width, rendered_override.as_deref());
+        let width = if area.width == 0 {
+            80
+        } else {
+            area.width.saturating_sub(2).max(1)
+        };
+        let detail_text = self.cached_rendered_detail(entry);
+        let total = estimate_wrapped_text_lines(detail_text.as_ref(), usize::from(width));
         total.saturating_sub(visible)
     }
 
@@ -1817,18 +1850,18 @@ impl SearchCockpitScreen {
             thread_filter: self.thread_filter.clone(),
             ..Default::default()
         };
-        if let Some(ref conn) = self.db_conn {
-            if let Ok(id) = insert_recipe(conn, &recipe) {
-                let mut saved = recipe;
-                saved.id = Some(id);
-                self.saved_recipes.insert(0, saved);
-                // Evict oldest non-pinned recipes when over the cap.
-                while self.saved_recipes.len() > MAX_RECIPES {
-                    if let Some(pos) = self.saved_recipes.iter().rposition(|r| !r.pinned) {
-                        self.saved_recipes.remove(pos);
-                    } else {
-                        break; // all remaining are pinned
-                    }
+        if let Some(ref conn) = self.db_conn
+            && let Ok(id) = insert_recipe(conn, &recipe)
+        {
+            let mut saved = recipe;
+            saved.id = Some(id);
+            self.saved_recipes.insert(0, saved);
+            // Evict oldest non-pinned recipes when over the cap.
+            while self.saved_recipes.len() > MAX_RECIPES {
+                if let Some(pos) = self.saved_recipes.iter().rposition(|r| !r.pinned) {
+                    self.saved_recipes.remove(pos);
+                } else {
+                    break; // all remaining are pinned
                 }
             }
         }
@@ -2332,30 +2365,30 @@ impl MailScreen for SearchCockpitScreen {
                         self.debounce_remaining = 0;
                     }
                     KeyCode::Char('o') => {
-                        if let Some(entry) = self.results.get(self.cursor) {
-                            if let Some(ref tid) = entry.thread_id {
-                                return Cmd::msg(MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::ThreadById(tid.clone()),
-                                ));
-                            }
+                        if let Some(entry) = self.results.get(self.cursor)
+                            && let Some(ref tid) = entry.thread_id
+                        {
+                            return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(
+                                tid.clone(),
+                            )));
                         }
                     }
                     KeyCode::Char('a') => {
-                        if let Some(entry) = self.results.get(self.cursor) {
-                            if let Some(ref agent) = entry.from_agent {
-                                return Cmd::msg(MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::AgentByName(agent.clone()),
-                                ));
-                            }
+                        if let Some(entry) = self.results.get(self.cursor)
+                            && let Some(ref agent) = entry.from_agent
+                        {
+                            return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::AgentByName(
+                                agent.clone(),
+                            )));
                         }
                     }
                     KeyCode::Char('T') => {
-                        if let Some(entry) = self.results.get(self.cursor) {
-                            if let Some(ts) = entry.created_ts {
-                                return Cmd::msg(MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::TimelineAtTime(ts),
-                                ));
-                            }
+                        if let Some(entry) = self.results.get(self.cursor)
+                            && let Some(ts) = entry.created_ts
+                        {
+                            return Cmd::msg(MailScreenMsg::DeepLink(
+                                DeepLinkTarget::TimelineAtTime(ts),
+                            ));
                         }
                     }
                     KeyCode::Char('L') => {
@@ -2395,6 +2428,7 @@ impl MailScreen for SearchCockpitScreen {
         if area.height < 4 || area.width < 30 {
             let tp = crate::tui_theme::TuiThemePalette::current();
             Block::default()
+                .borders(Borders::ALL)
                 .title("Search")
                 .border_type(BorderType::Rounded)
                 .border_style(crate::tui_theme::text_meta(&tp))
@@ -2498,7 +2532,7 @@ impl MailScreen for SearchCockpitScreen {
                         body_area.height,
                     ),
                     true,
-                    matches!(self.focus, Focus::FacetRail),
+                    false,
                 );
             }
         }
@@ -2601,18 +2635,20 @@ impl MailScreen for SearchCockpitScreen {
             self.guidance.as_ref(),
         );
         if let Some(detail_area) = detail_area {
-            let rendered_body_override = self
-                .results
-                .get(self.cursor)
-                .and_then(|entry| self.cached_rendered_markdown(entry));
+            let selected_entry = self.results.get(self.cursor);
+            let rendered_body_override =
+                selected_entry.and_then(|entry| self.cached_rendered_markdown(entry));
+            let rendered_detail_override =
+                selected_entry.map(|entry| self.cached_rendered_detail(entry));
             render_detail(
                 frame,
                 detail_area,
-                self.results.get(self.cursor),
+                selected_entry,
                 self.detail_scroll,
                 &self.highlight_terms,
                 self.last_diagnostics.as_ref(),
                 rendered_body_override.as_deref(),
+                rendered_detail_override.as_deref(),
                 matches!(self.focus, Focus::ResultList),
             );
         }
@@ -2803,14 +2839,40 @@ fn query_message_rows(
                     let body_md: String = row.get_named("body_md").unwrap_or_default();
                     // Keep row extraction lightweight: defer rich markdown rendering to detail view.
                     let subject_text = collapse_whitespace(&subject);
-                    let body_lines = markdown_to_searchable_lines(&body_md);
-                    let body_text = markdown_to_searchable_plain(&body_md);
-                    let subject_match_count = count_term_matches(&subject_text, highlight_terms);
-                    let body_match_count = count_term_matches(&body_text, highlight_terms);
+                    let has_highlight_terms = highlight_terms
+                        .iter()
+                        .any(|term| !term.negated && term.text.len() >= 2);
+                    let (line_cap, char_cap) = if has_highlight_terms {
+                        (SEARCHABLE_BODY_MAX_LINES, SEARCHABLE_BODY_MAX_CHARS)
+                    } else {
+                        (SEARCHABLE_PREVIEW_MAX_LINES, SEARCHABLE_PREVIEW_MAX_CHARS)
+                    };
+                    let body_lines =
+                        markdown_to_searchable_lines_with_caps(&body_md, line_cap, char_cap);
+                    let subject_match_count = if has_highlight_terms {
+                        count_term_matches(&subject_text, highlight_terms)
+                    } else {
+                        0
+                    };
+                    let body_match_count = if has_highlight_terms {
+                        count_term_matches_in_lines(&body_lines, highlight_terms)
+                    } else {
+                        0
+                    };
                     let match_count = subject_match_count.saturating_add(body_match_count);
+                    let body_preview_source = if body_lines.is_empty() {
+                        String::new()
+                    } else {
+                        body_lines
+                            .iter()
+                            .take(8)
+                            .map(|line| line.text.clone())
+                            .collect::<Vec<_>>()
+                            .join(" ⟫ ")
+                    };
 
-                    let mut preview = if highlight_terms.is_empty() {
-                        truncate_str(&body_text, 120)
+                    let mut preview = if !has_highlight_terms {
+                        truncate_str(&body_preview_source, 120)
                     } else if body_match_count > 0 {
                         extract_context_snippet_from_lines(
                             &body_lines,
@@ -2822,21 +2884,11 @@ fn query_message_rows(
                             extract_snippet(&subject_text, highlight_terms, MAX_SNIPPET_CHARS);
                         format!("subject: {subject_snippet}")
                     } else {
-                        extract_snippet(&body_text, highlight_terms, MAX_SNIPPET_CHARS)
+                        extract_snippet(&body_preview_source, highlight_terms, MAX_SNIPPET_CHARS)
                     };
                     if preview.is_empty() {
                         preview = truncate_str(&subject_text, 120);
                     }
-                    let body_preview_source = if body_lines.is_empty() {
-                        body_text
-                    } else {
-                        body_lines
-                            .iter()
-                            .take(6)
-                            .map(|line| line.text.clone())
-                            .collect::<Vec<_>>()
-                            .join(" ⟫ ")
-                    };
                     let body_preview = if body_preview_source.is_empty() {
                         truncate_str(&subject_text, 320)
                     } else {
@@ -2975,6 +3027,13 @@ fn truncate_display_width(s: &str, max_width: usize) -> String {
         used = used.saturating_add(ch_w);
     }
     out.push('…');
+    while ftui::text::display_width(out.as_str()) > max_width {
+        let _ = out.pop();
+        if out.pop().is_none() {
+            return "…".to_string();
+        }
+        out.push('…');
+    }
     out
 }
 
@@ -3005,18 +3064,30 @@ struct SearchableLine {
 }
 
 fn markdown_to_searchable_lines(markdown: &str) -> Vec<SearchableLine> {
+    markdown_to_searchable_lines_with_caps(
+        markdown,
+        SEARCHABLE_BODY_MAX_LINES,
+        SEARCHABLE_BODY_MAX_CHARS,
+    )
+}
+
+fn markdown_to_searchable_lines_with_caps(
+    markdown: &str,
+    max_lines: usize,
+    max_chars: usize,
+) -> Vec<SearchableLine> {
     if markdown.trim().is_empty() {
         return Vec::new();
     }
     let mut lines = Vec::new();
     let mut scanned_chars = 0usize;
     for (line_idx, line) in markdown.lines().enumerate() {
-        if lines.len() >= SEARCHABLE_BODY_MAX_LINES || scanned_chars >= SEARCHABLE_BODY_MAX_CHARS {
+        if lines.len() >= max_lines || scanned_chars >= max_chars {
             break;
         }
         scanned_chars = scanned_chars.saturating_add(line.len().saturating_add(1));
-        let bounded_line = if line.len() > SEARCHABLE_BODY_MAX_CHARS {
-            let stop = clamp_to_char_boundary(line, SEARCHABLE_BODY_MAX_CHARS);
+        let bounded_line = if line.len() > max_chars {
+            let stop = clamp_to_char_boundary(line, max_chars);
             &line[..stop]
         } else {
             line
@@ -3048,15 +3119,11 @@ fn markdown_to_searchable_lines(markdown: &str) -> Vec<SearchableLine> {
     lines
 }
 
-fn markdown_to_searchable_plain(markdown: &str) -> String {
-    let lines = markdown_to_searchable_lines(markdown);
-    collapse_whitespace(
-        &lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+fn count_term_matches_in_lines(lines: &[SearchableLine], terms: &[QueryTerm]) -> usize {
+    lines
+        .iter()
+        .map(|line| count_term_matches(&line.text, terms))
+        .sum()
 }
 
 fn extract_context_snippet_from_lines(
@@ -3072,24 +3139,34 @@ fn extract_context_snippet_from_lines(
     let match_line_idx = if needles.is_empty() {
         None
     } else {
-        lines.iter().position(|line| {
+        let mut best_idx: Option<usize> = None;
+        let mut best_score = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
             let hay = line.text.to_ascii_lowercase();
-            needles.iter().any(|needle| hay.contains(needle))
-        })
+            let score = needles
+                .iter()
+                .map(|needle| hay.matches(needle).count())
+                .sum::<usize>();
+            if score > best_score || (score > 0 && score == best_score) {
+                best_score = score;
+                best_idx = Some(idx);
+            }
+        }
+        best_idx
     };
 
     let snippet = match_line_idx.map_or_else(
         || {
             lines
                 .iter()
-                .take(2)
+                .take(CONTEXT_NO_HIT_LINES)
                 .map(|line| format!("L{}: {}", line.line_no, line.text))
                 .collect::<Vec<_>>()
                 .join(" ⟫ ")
         },
         |hit_idx| {
-            let start = hit_idx.saturating_sub(1);
-            let end = (hit_idx + 2).min(lines.len());
+            let start = hit_idx.saturating_sub(CONTEXT_HIT_RADIUS_LINES);
+            let end = (hit_idx + CONTEXT_HIT_RADIUS_LINES + 1).min(lines.len());
             let segments = lines[start..end]
                 .iter()
                 .filter(|line| !line.text.is_empty())
@@ -3225,6 +3302,7 @@ fn render_query_bar(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -3234,6 +3312,7 @@ fn render_query_bar(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    fill_rect(frame, inner, tp.panel_bg);
     let content_inner = if inner.width > 2 {
         Rect::new(
             inner.x.saturating_add(1),
@@ -3436,6 +3515,7 @@ fn render_facet_rail(
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
+        .borders(Borders::ALL)
         .title("Facets")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -3577,6 +3657,7 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
+        .borders(Borders::ALL)
         .title("Query Lab")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border_dim));
@@ -3721,8 +3802,10 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
     };
 
     // Ensure we don't overrun tiny viewports.
-    prefix = truncate_str(&prefix, cfg.width);
-    let remaining = cfg.width.saturating_sub(prefix.len());
+    prefix = truncate_display_width(&prefix, cfg.width);
+    let remaining = cfg
+        .width
+        .saturating_sub(ftui::text::display_width(prefix.as_str()));
 
     let sep_len = RESULTS_SNIPPET_SEP.len();
     let mut include_snippet = !entry.body_preview.is_empty();
@@ -3744,10 +3827,14 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
         (remaining, 0)
     };
 
-    let title = truncate_str(&entry.title, title_w);
-    // Use extract_snippet to center the preview around the first match
+    let title = truncate_display_width(&entry.title, title_w);
+    let snippet_source = if entry.context_snippet.is_empty() {
+        entry.body_preview.as_str()
+    } else {
+        entry.context_snippet.as_str()
+    };
     let snippet = if include_snippet {
-        extract_snippet(&entry.body_preview, cfg.highlight_terms, snippet_w)
+        truncate_display_width(snippet_source, snippet_w)
     } else {
         String::new()
     };
@@ -3779,7 +3866,7 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
 }
 
 /// Render search results using `VirtualizedList` for O(1) scroll performance.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_results(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3806,6 +3893,7 @@ fn render_results(
     };
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -3816,27 +3904,122 @@ fn render_results(
         return;
     }
     fill_rect(frame, inner, tp.panel_bg);
+    let content = if inner.width > 2 {
+        Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        )
+    } else {
+        inner
+    };
+    if content.height == 0 || content.width == 0 {
+        return;
+    }
 
     if rows.is_empty() {
         if let Some(guide) = guidance {
-            render_guidance(frame, inner, guide, &tp);
+            render_guidance(frame, content, guide, &tp);
         } else {
             Paragraph::new("  No results found.")
                 .style(crate::tui_theme::text_hint(&tp))
-                .render(inner, frame);
+                .render(content, frame);
         }
         return;
     }
 
-    let mut list_area = inner;
-    if inner.height >= 5 {
-        let summary_area = Rect::new(inner.x, inner.y, inner.width, 1);
-        let radar_area = Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1);
+    let mut list_area = content;
+    if content.height >= 6 {
+        let summary_area = Rect::new(content.x, content.y, content.width, 1);
+        let radar_area = Rect::new(content.x, content.y.saturating_add(1), content.width, 1);
+        let context_area = Rect::new(content.x, content.y.saturating_add(2), content.width, 1);
         list_area = Rect::new(
-            inner.x,
-            inner.y.saturating_add(2),
-            inner.width,
-            inner.height.saturating_sub(2),
+            content.x,
+            content.y.saturating_add(3),
+            content.width,
+            content.height.saturating_sub(3),
+        );
+
+        let active = cursor.min(rows.len().saturating_sub(1));
+        let active_matches = rows[active].entry.match_count;
+        let total_matches: usize = rows.iter().map(|row| row.entry.match_count).sum();
+        let summary = format!(
+            "active:{}  row_matches:{}  total_matches:{}  visible_rows:{}",
+            active + 1,
+            active_matches,
+            total_matches,
+            list_area.height,
+        );
+        Paragraph::new(truncate_display_width(
+            &summary,
+            summary_area.width as usize,
+        ))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(summary_area, frame);
+
+        let density = rows
+            .iter()
+            .take(80)
+            .map(|row| {
+                if row.entry.match_count == 0 {
+                    0.25
+                } else {
+                    f64::from(u32::try_from(row.entry.match_count).unwrap_or(u32::MAX))
+                }
+            })
+            .collect::<Vec<_>>();
+        if !density.is_empty() && radar_area.width > 0 && radar_area.height > 0 {
+            Sparkline::new(&density)
+                .style(Style::default().fg(tp.status_accent))
+                .render(radar_area, frame);
+        }
+
+        let entry = &rows[active].entry;
+        let snippet_source = if entry.context_snippet.is_empty() {
+            entry.body_preview.as_str()
+        } else {
+            entry.context_snippet.as_str()
+        };
+        let snippet = if snippet_source.is_empty() {
+            "(no contextual snippet)".to_string()
+        } else if snippet_source.contains(" ⟫ ") {
+            snippet_source
+                .split(" ⟫ ")
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .take(2)
+                .map(|segment| {
+                    truncate_display_width(segment, context_area.width.saturating_sub(10) as usize)
+                })
+                .collect::<Vec<_>>()
+                .join("  |  ")
+        } else {
+            truncate_display_width(
+                snippet_source,
+                context_area.width.saturating_sub(10) as usize,
+            )
+        };
+        let mut context_spans = vec![Span::styled(
+            "context: ".to_string(),
+            crate::tui_theme::text_meta(&tp),
+        )];
+        context_spans.extend(highlight_spans(
+            &snippet,
+            highlight_terms,
+            Some(crate::tui_theme::text_hint(&tp)),
+            Style::default().fg(tp.selection_indicator).bold(),
+        ));
+        Paragraph::new(Text::from_line(Line::from_spans(context_spans)))
+            .render(context_area, frame);
+    } else if content.height >= 5 {
+        let summary_area = Rect::new(content.x, content.y, content.width, 1);
+        let radar_area = Rect::new(content.x, content.y.saturating_add(1), content.width, 1);
+        list_area = Rect::new(
+            content.x,
+            content.y.saturating_add(2),
+            content.width,
+            content.height.saturating_sub(2),
         );
 
         let active = cursor.min(rows.len().saturating_sub(1));
@@ -3883,77 +4066,9 @@ fn render_results(
                 .bg(tp.selection_bg)
                 .bold(),
         )
-        .show_scrollbar(true);
+        .show_scrollbar(rows.len() > usize::from(list_area.height));
 
     list.render(list_area, frame, list_state);
-}
-
-#[allow(clippy::cast_possible_truncation)]
-/// Estimate the number of lines in the search detail panel for a result entry.
-fn estimate_search_detail_lines(
-    entry: &ResultEntry,
-    width: u16,
-    rendered_body_override: Option<&Text>,
-) -> usize {
-    // Type, Title = 2
-    let mut count: usize = 2;
-    if entry.from_agent.is_some() {
-        count += 1; // From
-    }
-    if entry.thread_id.is_some() {
-        count += 1; // Thread
-    }
-    if entry.importance.is_some() {
-        count += 1; // Importance
-    }
-    if entry.ack_required.is_some() {
-        count += 1; // Ack
-    }
-    if entry.created_ts.is_some() {
-        count += 1; // Time
-    }
-    count += 1; // ID line
-    if entry.score.is_some() {
-        count += 1; // Score
-    }
-    count += 2; // Separator + body header
-    // Body lines
-    let avail_width = usize::from(width.saturating_sub(2)).max(1);
-    let body_lines = rendered_body_override
-        .or(entry.rendered_body.as_ref())
-        .map_or_else(
-            || {
-                let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
-                body.lines()
-                    .map(|line| {
-                        let len = ftui::text::display_width(line);
-                        if len == 0 {
-                            1
-                        } else {
-                            len.div_ceil(avail_width)
-                        }
-                    })
-                    .sum::<usize>()
-                    .max(1)
-            },
-            |rendered| {
-                rendered
-                    .lines()
-                    .iter()
-                    .map(|line| {
-                        let len = ftui::text::display_width(line.to_plain_text().as_str());
-                        if len == 0 {
-                            1
-                        } else {
-                            len.div_ceil(avail_width)
-                        }
-                    })
-                    .sum::<usize>()
-                    .max(1)
-            },
-        );
-    count += body_lines;
-    count
 }
 
 /// Render zero-result recovery guidance inside the results pane.
@@ -3987,6 +4102,219 @@ fn render_guidance(
         .render(area, frame);
 }
 
+#[allow(clippy::too_many_lines)]
+fn compose_detail_text(
+    entry: &ResultEntry,
+    highlight_terms: &[QueryTerm],
+    diagnostics: Option<&SearchDegradedDiagnostics>,
+    rendered_body_override: Option<&Text>,
+    tp: &crate::tui_theme::TuiThemePalette,
+) -> Text {
+    let label_style = Style::default().fg(FACET_LABEL_FG());
+    let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
+    let value_style = crate::tui_theme::text_primary(tp);
+    let accent_style = crate::tui_theme::text_accent(tp);
+
+    // Helper: build a label+value line with consistent styling.
+    let styled_field = |label: &str, value: String| -> Line {
+        Line::from_spans([
+            Span::styled(label.to_string(), label_style),
+            Span::styled(value, value_style),
+        ])
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let type_label = match entry.doc_kind {
+        DocKind::Message => "Message",
+        DocKind::Agent => "Agent",
+        DocKind::Project => "Project",
+        DocKind::Thread => "Thread",
+    };
+    lines.push(styled_field("Type:       ", type_label.to_string()));
+
+    let mut title_spans: Vec<Span<'static>> = Vec::new();
+    title_spans.push(Span::styled("Title:      ".to_string(), label_style));
+    title_spans.extend(highlight_spans(
+        &entry.title,
+        highlight_terms,
+        Some(value_style),
+        highlight_style,
+    ));
+    lines.push(Line::from_spans(title_spans));
+    lines.push(styled_field("ID:         ", format!("#{}", entry.id)));
+
+    if let Some(ref agent) = entry.from_agent {
+        lines.push(Line::from_spans([
+            Span::styled("From:       ".to_string(), label_style),
+            Span::styled(agent.clone(), accent_style),
+        ]));
+    }
+    if let Some(ref tid) = entry.thread_id {
+        lines.push(styled_field("Thread:     ", tid.clone()));
+    }
+    if let Some(ref imp) = entry.importance {
+        let imp_style = match imp.as_str() {
+            "urgent" => crate::tui_theme::text_critical(tp),
+            "high" => crate::tui_theme::text_warning(tp),
+            _ => value_style,
+        };
+        lines.push(Line::from_spans([
+            Span::styled("Importance: ".to_string(), label_style),
+            Span::styled(imp.clone(), imp_style),
+        ]));
+    }
+    if let Some(ack) = entry.ack_required {
+        let (ack_text, ack_style) = if ack {
+            ("required", accent_style)
+        } else {
+            ("no", value_style)
+        };
+        lines.push(Line::from_spans([
+            Span::styled("Ack:        ".to_string(), label_style),
+            Span::styled(ack_text.to_string(), ack_style),
+        ]));
+    }
+    if let Some(ts) = entry.created_ts {
+        lines.push(styled_field("Time:       ", micros_to_iso(ts)));
+    }
+    if let Some(pid) = entry.project_id {
+        lines.push(styled_field("Project:    ", format!("#{pid}")));
+    }
+    if let Some(score) = entry.score {
+        lines.push(styled_field("Score:      ", format!("{score:.3}")));
+    }
+
+    if !entry.context_snippet.is_empty() {
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::styled("Context".to_string(), label_style.bold()));
+        let match_label = if entry.match_count == 0 {
+            "no matched terms".to_string()
+        } else if entry.match_count == 1 {
+            "1 match".to_string()
+        } else {
+            format!("{} matches", entry.match_count)
+        };
+        lines.push(styled_field("Matches:    ", match_label));
+        let context_segments = entry
+            .context_snippet
+            .split(" ⟫ ")
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if context_segments.is_empty() {
+            let mut snippet_spans: Vec<Span<'static>> = Vec::new();
+            snippet_spans.push(Span::styled("Context:    ".to_string(), label_style));
+            snippet_spans.extend(highlight_spans(
+                &entry.context_snippet,
+                highlight_terms,
+                Some(value_style),
+                highlight_style,
+            ));
+            lines.push(Line::from_spans(snippet_spans));
+        } else {
+            for (idx, segment) in context_segments.iter().enumerate() {
+                let mut snippet_spans: Vec<Span<'static>> = Vec::new();
+                let label = if idx == 0 {
+                    "Context:    "
+                } else {
+                    "            "
+                };
+                snippet_spans.push(Span::styled(label.to_string(), label_style));
+                snippet_spans.extend(highlight_spans(
+                    segment,
+                    highlight_terms,
+                    Some(value_style),
+                    highlight_style,
+                ));
+                lines.push(Line::from_spans(snippet_spans));
+            }
+        }
+    }
+
+    if !entry.reason_codes.is_empty() {
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::styled("Explain".to_string(), label_style.bold()));
+        lines.push(styled_field("Reasons:    ", entry.reason_codes.join(", ")));
+        for sf in &entry.score_factors {
+            let sign = if sf.contribution >= 0.0 { "+" } else { "" };
+            lines.push(Line::from_spans([
+                Span::styled("  ".to_string(), label_style),
+                Span::styled(
+                    format!("{}{:.3}", sign, sf.contribution),
+                    if sf.contribution >= 0.0 {
+                        accent_style
+                    } else {
+                        value_style
+                    },
+                ),
+                Span::styled(format!(" {} ", sf.key), label_style),
+                Span::styled(sf.summary.clone(), value_style),
+            ]));
+        }
+    }
+
+    if let Some(diag) = diagnostics.filter(|diag| diag.degraded) {
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::styled(
+            "Degraded Mode".to_string(),
+            label_style.bold(),
+        ));
+        if let Some(mode) = &diag.fallback_mode {
+            lines.push(styled_field("Fallback:   ", mode.clone()));
+        }
+        if let Some(stage) = &diag.timeout_stage {
+            lines.push(styled_field("Timeout:    ", stage.clone()));
+        }
+        if let Some(tier) = &diag.budget_tier {
+            lines.push(styled_field("Budget:     ", format!("tier={tier}")));
+        }
+        if let Some(exhausted) = diag.budget_exhausted {
+            lines.push(styled_field(
+                "BudgetExh:  ",
+                if exhausted { "true" } else { "false" }.to_string(),
+            ));
+        }
+        if let Some(hint) = &diag.remediation_hint {
+            lines.push(styled_field("Hint:       ", hint.clone()));
+        }
+    }
+
+    lines.push(Line::raw(String::new()));
+    if let Some(rendered) = rendered_body_override.or(entry.rendered_body.as_ref()) {
+        lines.push(Line::styled("Body".to_string(), label_style.bold()));
+        lines.extend(rendered.lines().iter().cloned());
+    } else if let Some(ref body) = entry.full_body {
+        lines.push(Line::styled("Body".to_string(), label_style.bold()));
+        let theme = crate::tui_theme::markdown_theme();
+        let rendered = tui_markdown::render_body(body, &theme);
+        lines.extend(rendered.lines().iter().cloned());
+    } else {
+        lines.push(Line::styled("Preview".to_string(), label_style.bold()));
+        let theme = crate::tui_theme::markdown_theme();
+        let rendered = tui_markdown::render_body(&entry.body_preview, &theme);
+        lines.extend(rendered.lines().iter().cloned());
+    }
+
+    Text::from_lines(lines)
+}
+
+fn estimate_wrapped_text_lines(text: &Text, width: usize) -> usize {
+    let wrap_width = width.max(1);
+    text.lines()
+        .iter()
+        .map(|line| {
+            let len = line.width();
+            if len == 0 {
+                1
+            } else {
+                len.div_ceil(wrap_width)
+            }
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_detail(
     frame: &mut Frame<'_>,
@@ -3996,10 +4324,12 @@ fn render_detail(
     highlight_terms: &[QueryTerm],
     diagnostics: Option<&SearchDegradedDiagnostics>,
     rendered_body_override: Option<&Text>,
+    rendered_detail_override: Option<&Text>,
     focused: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
+        .borders(Borders::ALL)
         .title("Detail")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -4060,9 +4390,9 @@ fn render_detail(
     let content_h = content_inner.height.saturating_sub(action_bar_h);
     let mut content_area = Rect::new(
         content_inner.x,
-        content_inner.y.saturating_add(u16::from(content_h > 1)),
+        content_inner.y,
         content_inner.width,
-        content_h.saturating_sub(u16::from(content_h > 1)),
+        content_h,
     );
     if content_area.width > 2 {
         content_area = Rect::new(
@@ -4072,238 +4402,47 @@ fn render_detail(
             content_area.height,
         );
     }
+    if content_area.height > 1 {
+        content_area = Rect::new(
+            content_area.x,
+            content_area.y.saturating_add(1),
+            content_area.width,
+            content_area.height.saturating_sub(1),
+        );
+    }
     let action_area = Rect::new(
         content_inner.x,
         content_inner.y + content_h,
         content_inner.width,
         action_bar_h,
     );
-
-    let label_style = Style::default().fg(FACET_LABEL_FG());
-    let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
-    let value_style = crate::tui_theme::text_primary(&tp);
-    let accent_style = crate::tui_theme::text_accent(&tp);
-
-    // Helper: build a label+value line with consistent styling.
-    let styled_field = |label: &str, value: String| -> Line {
-        Line::from_spans([
-            Span::styled(label.to_string(), label_style),
-            Span::styled(value, value_style),
-        ])
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Type with human-readable label
-    let type_label = match entry.doc_kind {
-        DocKind::Message => "Message",
-        DocKind::Agent => "Agent",
-        DocKind::Project => "Project",
-        DocKind::Thread => "Thread",
-    };
-    lines.push(styled_field("Type:       ", type_label.to_string()));
-
-    let mut title_spans: Vec<Span<'static>> = Vec::new();
-    title_spans.push(Span::styled("Title:      ".to_string(), label_style));
-    title_spans.extend(highlight_spans(
-        &entry.title,
-        highlight_terms,
-        Some(value_style),
-        highlight_style,
-    ));
-    lines.push(Line::from_spans(title_spans));
-
-    lines.push(styled_field("ID:         ", format!("#{}", entry.id)));
-
-    if let Some(ref agent) = entry.from_agent {
-        lines.push(Line::from_spans([
-            Span::styled("From:       ".to_string(), label_style),
-            Span::styled(agent.clone(), accent_style),
-        ]));
-    }
-    if let Some(ref tid) = entry.thread_id {
-        lines.push(styled_field("Thread:     ", tid.clone()));
-    }
-    if let Some(ref imp) = entry.importance {
-        let imp_style = match imp.as_str() {
-            "urgent" => crate::tui_theme::text_critical(&tp),
-            "high" => crate::tui_theme::text_warning(&tp),
-            _ => value_style,
-        };
-        lines.push(Line::from_spans([
-            Span::styled("Importance: ".to_string(), label_style),
-            Span::styled(imp.clone(), imp_style),
-        ]));
-    }
-    if let Some(ack) = entry.ack_required {
-        let (ack_text, ack_style) = if ack {
-            ("required", accent_style)
-        } else {
-            ("no", value_style)
-        };
-        lines.push(Line::from_spans([
-            Span::styled("Ack:        ".to_string(), label_style),
-            Span::styled(ack_text.to_string(), ack_style),
-        ]));
-    }
-    if let Some(ts) = entry.created_ts {
-        lines.push(styled_field("Time:       ", micros_to_iso(ts)));
-    }
-    if let Some(pid) = entry.project_id {
-        lines.push(styled_field("Project:    ", format!("#{pid}")));
-    }
-    if let Some(score) = entry.score {
-        lines.push(styled_field("Score:      ", format!("{score:.3}")));
-    }
-
-    if !entry.context_snippet.is_empty() {
-        lines.push(Line::raw(String::new()));
-        lines.push(Line::styled(
-            "\u{2500}\u{2500}\u{2500} Active Hit Context \u{2500}\u{2500}\u{2500}".to_string(),
-            label_style,
-        ));
-        let match_label = if entry.match_count == 0 {
-            "no matched terms".to_string()
-        } else if entry.match_count == 1 {
-            "1 match".to_string()
-        } else {
-            format!("{} matches", entry.match_count)
-        };
-        lines.push(styled_field("Matches:    ", match_label));
-        let context_segments = entry
-            .context_snippet
-            .split(" ⟫ ")
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        if context_segments.is_empty() {
-            let mut snippet_spans: Vec<Span<'static>> = Vec::new();
-            snippet_spans.push(Span::styled("Context:    ".to_string(), label_style));
-            snippet_spans.extend(highlight_spans(
-                &entry.context_snippet,
-                highlight_terms,
-                Some(value_style),
-                highlight_style,
-            ));
-            lines.push(Line::from_spans(snippet_spans));
-        } else {
-            for (idx, segment) in context_segments.iter().enumerate() {
-                let mut snippet_spans: Vec<Span<'static>> = Vec::new();
-                let label = if idx == 0 {
-                    "Context:    "
-                } else {
-                    "            "
-                };
-                snippet_spans.push(Span::styled(label.to_string(), label_style));
-                snippet_spans.extend(highlight_spans(
-                    segment,
-                    highlight_terms,
-                    Some(value_style),
-                    highlight_style,
-                ));
-                lines.push(Line::from_spans(snippet_spans));
-            }
-        }
-    }
-
-    // Explain section: reason codes and score factors (when populated).
-    if !entry.reason_codes.is_empty() {
-        lines.push(Line::raw(String::new()));
-        lines.push(Line::styled(
-            "\u{2500}\u{2500}\u{2500} Explain \u{2500}\u{2500}\u{2500}".to_string(),
-            label_style,
-        ));
-        lines.push(styled_field("Reasons:    ", entry.reason_codes.join(", ")));
-        for sf in &entry.score_factors {
-            let sign = if sf.contribution >= 0.0 { "+" } else { "" };
-            lines.push(Line::from_spans([
-                Span::styled("  ".to_string(), label_style),
-                Span::styled(
-                    format!("{}{:.3}", sign, sf.contribution),
-                    if sf.contribution >= 0.0 {
-                        accent_style
-                    } else {
-                        value_style
-                    },
-                ),
-                Span::styled(format!(" {} ", sf.key), label_style),
-                Span::styled(sf.summary.clone(), value_style),
-            ]));
-        }
-    }
-
-    if let Some(diag) = diagnostics.filter(|diag| diag.degraded) {
-        lines.push(Line::raw(String::new()));
-        lines.push(Line::styled(
-            "\u{2500}\u{2500}\u{2500} Degraded Mode \u{2500}\u{2500}\u{2500}".to_string(),
-            label_style,
-        ));
-        if let Some(mode) = &diag.fallback_mode {
-            lines.push(styled_field("Fallback:   ", mode.clone()));
-        }
-        if let Some(stage) = &diag.timeout_stage {
-            lines.push(styled_field("Timeout:    ", stage.clone()));
-        }
-        if let Some(tier) = &diag.budget_tier {
-            lines.push(styled_field("Budget:     ", format!("tier={tier}")));
-        }
-        if let Some(exhausted) = diag.budget_exhausted {
-            lines.push(styled_field(
-                "BudgetExh:  ",
-                if exhausted { "true" } else { "false" }.to_string(),
-            ));
-        }
-        if let Some(hint) = &diag.remediation_hint {
-            lines.push(styled_field("Hint:       ", hint.clone()));
-        }
-    }
-
-    // Markdown preview section (messages with full body) or plain preview fallback.
-    lines.push(Line::raw(String::new()));
-    if let Some(rendered) = rendered_body_override.or(entry.rendered_body.as_ref()) {
-        lines.push(Line::styled(
-            "\u{2500}\u{2500}\u{2500} Body \u{2500}\u{2500}\u{2500}".to_string(),
-            label_style,
-        ));
-        for line in rendered.lines() {
-            lines.push(line.clone());
-        }
-    } else if let Some(ref body) = entry.full_body {
-        lines.push(Line::styled(
-            "\u{2500}\u{2500}\u{2500} Body \u{2500}\u{2500}\u{2500}".to_string(),
-            label_style,
-        ));
-        let theme = crate::tui_theme::markdown_theme();
-        let rendered = tui_markdown::render_body(body, &theme);
-        for line in rendered.lines() {
-            lines.push(line.clone());
-        }
-    } else {
-        lines.push(Line::styled(
-            "\u{2500}\u{2500}\u{2500} Preview \u{2500}\u{2500}\u{2500}".to_string(),
-            label_style,
-        ));
-        let theme = crate::tui_theme::markdown_theme();
-        let rendered = tui_markdown::render_body(&entry.body_preview, &theme);
-        for line in rendered.lines() {
-            lines.push(line.clone());
-        }
-    }
+    let detail_text = rendered_detail_override.cloned().unwrap_or_else(|| {
+        compose_detail_text(
+            entry,
+            highlight_terms,
+            diagnostics,
+            rendered_body_override,
+            &tp,
+        )
+    });
 
     if content_h == 0 {
         render_action_bar(frame, action_area, entry);
         return;
     }
 
-    // Apply scroll using Paragraph's internal wrapping support.
-    let total_estimated =
-        estimate_search_detail_lines(entry, content_area.width, rendered_body_override);
     let visible = usize::from(content_h);
+    let line_count = detail_text.lines().len().max(1);
+    let total_estimated = if line_count <= visible {
+        line_count
+    } else {
+        estimate_wrapped_text_lines(&detail_text, usize::from(content_area.width.max(1)))
+    };
     let max_scroll = total_estimated.saturating_sub(visible);
     let clamped_scroll = scroll.min(max_scroll);
     let scroll_rows = u16::try_from(clamped_scroll).unwrap_or(u16::MAX);
 
-    Paragraph::new(Text::from_lines(lines))
+    Paragraph::new(detail_text)
         .style(crate::tui_theme::text_primary(&tp))
         .wrap(ftui::text::WrapMode::Word)
         .scroll((scroll_rows, 0))
@@ -4378,6 +4517,8 @@ fn render_action_bar(frame: &mut Frame<'_>, area: Rect, entry: &ResultEntry) {
     if area.width < 10 || area.height == 0 {
         return;
     }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    fill_rect(frame, area, tp.panel_bg);
     let key_style = Style::default().fg(ACTION_KEY_FG()).bold();
     let label_style = Style::default().fg(FACET_LABEL_FG());
 
@@ -5426,10 +5567,52 @@ mod tests {
     }
 
     #[test]
+    fn extract_context_snippet_prefers_strongest_hit_line() {
+        let lines = vec![
+            SearchableLine {
+                line_no: 10,
+                text: "alpha appears once".to_string(),
+            },
+            SearchableLine {
+                line_no: 11,
+                text: "noise section".to_string(),
+            },
+            SearchableLine {
+                line_no: 12,
+                text: "alpha and beta both appear here".to_string(),
+            },
+        ];
+        let terms = vec![
+            QueryTerm {
+                text: "alpha".to_string(),
+                kind: QueryTermKind::Word,
+                negated: false,
+            },
+            QueryTerm {
+                text: "beta".to_string(),
+                kind: QueryTermKind::Word,
+                negated: false,
+            },
+        ];
+
+        let snippet = extract_context_snippet_from_lines(&lines, &terms, 200);
+        assert!(
+            snippet.contains("L12:"),
+            "snippet should center strongest hit: {snippet}"
+        );
+        assert!(
+            snippet.contains("beta"),
+            "snippet should include strongest-hit terms: {snippet}"
+        );
+    }
+
+    #[test]
     fn markdown_to_searchable_lines_respects_scan_caps() {
+        use std::fmt::Write as _;
+
         let mut markdown = String::new();
         for idx in 0..200 {
-            markdown.push_str(&format!("line {idx}\n"));
+            let _ = writeln!(markdown, "line {idx}");
         }
         let lines = markdown_to_searchable_lines(&markdown);
         assert!(lines.len() <= SEARCHABLE_BODY_MAX_LINES);
@@ -5538,6 +5721,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -5570,6 +5754,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -5589,6 +5774,7 @@ mod tests {
             None,
             0,
             &[],
+            None,
             None,
             None,
             true,
@@ -5928,6 +6114,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             true,
         );
         let text = buffer_to_text(&frame.buffer);
@@ -5953,6 +6140,7 @@ mod tests {
             Some(&entry),
             0,
             &terms,
+            None,
             None,
             None,
             true,

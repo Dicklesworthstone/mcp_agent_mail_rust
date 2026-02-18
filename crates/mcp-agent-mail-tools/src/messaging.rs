@@ -220,13 +220,13 @@ fn recipient_not_found_error(
         "unknown_local": missing_sorted,
         "hint": hint,
     });
-    if !suggested_tool_calls.is_empty() {
-        if let Some(obj) = data.as_object_mut() {
-            obj.insert(
-                "suggested_tool_calls".to_string(),
-                Value::Array(suggested_tool_calls),
-            );
-        }
+    if !suggested_tool_calls.is_empty()
+        && let Some(obj) = data.as_object_mut()
+    {
+        obj.insert(
+            "suggested_tool_calls".to_string(),
+            Value::Array(suggested_tool_calls),
+        );
     }
 
     legacy_tool_error("RECIPIENT_NOT_FOUND", message, true, data)
@@ -700,31 +700,29 @@ async fn push_recipient(
             Ok(a) => a,
             Err(e) => {
                 // Re-wrap NOT_FOUND as RECIPIENT_NOT_FOUND with Python-parity message.
-                if let Some(data) = &e.data {
-                    if let Some(err_type) = data
+                if let Some(data) = &e.data
+                    && let Some(err_type) = data
                         .as_object()
                         .and_then(|o| o.get("error"))
                         .and_then(|e| e.get("type"))
                         .and_then(|t| t.as_str())
-                    {
-                        if err_type == "NOT_FOUND" {
-                            let hint = format!(
-                                "Use resource://agents/{project_slug} to list registered agents or register new identities."
-                            );
-                            let message = format!(
-                                "Unable to send message — local recipients {name} are not registered in project '{project_human_key}'; {hint}"
-                            );
-                            return Err(legacy_tool_error(
-                                "RECIPIENT_NOT_FOUND",
-                                message,
-                                true,
-                                json!({
-                                    "unknown_local": [name],
-                                    "hint": hint,
-                                }),
-                            ));
-                        }
-                    }
+                    && err_type == "NOT_FOUND"
+                {
+                    let hint = format!(
+                        "Use resource://agents/{project_slug} to list registered agents or register new identities."
+                    );
+                    let message = format!(
+                        "Unable to send message — local recipients {name} are not registered in project '{project_human_key}'; {hint}"
+                    );
+                    return Err(legacy_tool_error(
+                        "RECIPIENT_NOT_FOUND",
+                        message,
+                        true,
+                        json!({
+                            "unknown_local": [name],
+                            "hint": hint,
+                        }),
+                    ));
                 }
                 return Err(e);
             }
@@ -923,22 +921,22 @@ pub async fn send_message(
     }
 
     // Validate thread_id format if provided
-    if let Some(ref tid) = thread_id {
-        if !is_valid_thread_id(tid) {
-            return Err(legacy_tool_error(
-                "INVALID_THREAD_ID",
-                format!(
-                    "Invalid thread_id: '{tid}'. Thread IDs must start with an alphanumeric character and \
+    if let Some(ref tid) = thread_id
+        && !is_valid_thread_id(tid)
+    {
+        return Err(legacy_tool_error(
+            "INVALID_THREAD_ID",
+            format!(
+                "Invalid thread_id: '{tid}'. Thread IDs must start with an alphanumeric character and \
                      contain only letters, numbers, '.', '_', or '-' (max 128). \
                      Examples: 'TKT-123', 'bd-42', 'feature-xyz'."
-                ),
-                true,
-                json!({
-                    "provided": tid,
-                    "examples": ["TKT-123", "bd-42", "feature-xyz"],
-                }),
-            ));
-        }
+            ),
+            true,
+            json!({
+                "provided": tid,
+                "examples": ["TKT-123", "bd-42", "feature-xyz"],
+            }),
+        ));
     }
 
     let config = &Config::get();
@@ -1221,31 +1219,31 @@ effective_free_bytes={free}"
                 }
 
                 // Process explicit attachment_paths
-                if let Some(ref paths) = attachment_paths {
-                    if !paths.is_empty() {
-                        let (att_meta, rel_paths) = mcp_agent_mail_storage::process_attachments(
-                            &archive,
-                            config,
-                            base_dir,
-                            paths,
-                            embed_policy,
+                if let Some(ref paths) = attachment_paths
+                    && !paths.is_empty()
+                {
+                    let (att_meta, rel_paths) = mcp_agent_mail_storage::process_attachments(
+                        &archive,
+                        config,
+                        base_dir,
+                        paths,
+                        embed_policy,
+                    )
+                    .map_err(|e| {
+                        legacy_tool_error(
+                            "INVALID_ARGUMENT",
+                            format!("Invalid attachment_paths: {e}"),
+                            true,
+                            json!({
+                                "field": "attachment_paths",
+                                "provided": paths,
+                            }),
                         )
-                        .map_err(|e| {
-                            legacy_tool_error(
-                                "INVALID_ARGUMENT",
-                                format!("Invalid attachment_paths: {e}"),
-                                true,
-                                json!({
-                                    "field": "attachment_paths",
-                                    "provided": paths,
-                                }),
-                            )
-                        })?;
-                        all_attachment_rel_paths.extend(rel_paths);
-                        for m in &att_meta {
-                            if let Ok(v) = serde_json::to_value(m) {
-                                all_attachment_meta.push(v);
-                            }
+                    })?;
+                    all_attachment_rel_paths.extend(rel_paths);
+                    for m in &att_meta {
+                        if let Ok(v) = serde_json::to_value(m) {
+                            all_attachment_meta.push(v);
                         }
                     }
                 }
@@ -1347,15 +1345,15 @@ effective_free_bytes={free}"
         if config.max_total_message_bytes > 0 {
             let mut total_size = subject.len().saturating_add(final_body.len());
             for meta in &all_attachment_meta {
-                if meta.get("type").and_then(serde_json::Value::as_str) == Some("file") {
-                    if let Some(bytes) = meta.get("bytes").and_then(serde_json::Value::as_u64) {
-                        if let Ok(bytes_usize) = usize::try_from(bytes) {
-                            total_size = total_size.saturating_add(bytes_usize);
-                        } else {
-                            // On 32-bit platforms, treat oversized metadata as exceeding limits.
-                            total_size = usize::MAX;
-                            break;
-                        }
+                if meta.get("type").and_then(serde_json::Value::as_str) == Some("file")
+                    && let Some(bytes) = meta.get("bytes").and_then(serde_json::Value::as_u64)
+                {
+                    if let Ok(bytes_usize) = usize::try_from(bytes) {
+                        total_size = total_size.saturating_add(bytes_usize);
+                    } else {
+                        // On 32-bit platforms, treat oversized metadata as exceeding limits.
+                        total_size = usize::MAX;
+                        break;
                     }
                 }
             }
@@ -1462,14 +1460,14 @@ effective_free_bytes={free}"
         }
         if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
             for agent in recipient_map.values() {
-                if let Some(rec_id) = agent.id {
-                    if let Some(rec_patterns) = patterns_by_agent.get(&rec_id) {
-                        let overlaps = sender_patterns
-                            .iter()
-                            .any(|a| rec_patterns.iter().any(|b| a.overlaps(b)));
-                        if overlaps {
-                            auto_ok_names.insert(agent.name.clone());
-                        }
+                if let Some(rec_id) = agent.id
+                    && let Some(rec_patterns) = patterns_by_agent.get(&rec_id)
+                {
+                    let overlaps = sender_patterns
+                        .iter()
+                        .any(|a| rec_patterns.iter().any(|b| a.overlaps(b)));
+                    if overlaps {
+                        auto_ok_names.insert(agent.name.clone());
                     }
                 }
             }
@@ -2097,14 +2095,14 @@ effective_free_bytes={free}"
         }
         if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
             for agent in recipient_map.values() {
-                if let Some(rec_id) = agent.id {
-                    if let Some(rec_patterns) = patterns_by_agent.get(&rec_id) {
-                        let overlaps = sender_patterns
-                            .iter()
-                            .any(|a| rec_patterns.iter().any(|b| a.overlaps(b)));
-                        if overlaps {
-                            auto_ok_names.insert(agent.name.clone());
-                        }
+                if let Some(rec_id) = agent.id
+                    && let Some(rec_patterns) = patterns_by_agent.get(&rec_id)
+                {
+                    let overlaps = sender_patterns
+                        .iter()
+                        .any(|a| rec_patterns.iter().any(|b| a.overlaps(b)));
+                    if overlaps {
+                        auto_ok_names.insert(agent.name.clone());
                     }
                 }
             }

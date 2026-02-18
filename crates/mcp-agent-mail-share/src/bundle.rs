@@ -931,12 +931,12 @@ pub fn compute_viewer_sri(output_dir: &Path) -> HashMap<String, String> {
 
     for relative_path in &entries {
         let full_path = vendor_dir.join(relative_path);
-        if full_path.is_file() {
-            if let Ok(data) = std::fs::read(&full_path) {
-                let hash = Sha256::digest(&data);
-                let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
-                sri_map.insert(format!("vendor/{relative_path}"), format!("sha256-{b64}"));
-            }
+        if full_path.is_file()
+            && let Ok(data) = std::fs::read(&full_path)
+        {
+            let hash = Sha256::digest(&data);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+            sri_map.insert(format!("vendor/{relative_path}"), format!("sha256-{b64}"));
         }
     }
 

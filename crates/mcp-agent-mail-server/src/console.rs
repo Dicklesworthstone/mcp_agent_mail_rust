@@ -2217,12 +2217,12 @@ impl TimelinePane {
                         lines.push(format!("{k}: {v}"));
                     }
                 }
-                if let Some(ref json) = ev.json {
-                    if let Ok(pretty) = serde_json::to_string_pretty(json) {
-                        lines.push(String::new());
-                        for line in pretty.lines().take(12) {
-                            lines.push(compact_path(line, 120));
-                        }
+                if let Some(ref json) = ev.json
+                    && let Ok(pretty) = serde_json::to_string_pretty(json)
+                {
+                    lines.push(String::new());
+                    for line in pretty.lines().take(12) {
+                        lines.push(compact_path(line, 120));
                     }
                 }
                 Paragraph::new(lines.join("\n"))

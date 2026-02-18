@@ -272,14 +272,14 @@ impl ArchiveBrowserScreen {
         self.entries = entries;
 
         // Clamp selection
-        if let Some(sel) = self.tree_state.selected {
-            if sel >= self.entries.len() {
-                self.tree_state.selected = if self.entries.is_empty() {
-                    None
-                } else {
-                    Some(self.entries.len() - 1)
-                };
-            }
+        if let Some(sel) = self.tree_state.selected
+            && sel >= self.entries.len()
+        {
+            self.tree_state.selected = if self.entries.is_empty() {
+                None
+            } else {
+                Some(self.entries.len() - 1)
+            };
         }
     }
 
@@ -443,39 +443,40 @@ impl ArchiveBrowserScreen {
         let Some(sel) = self.tree_state.selected else {
             return;
         };
-        if let Some(entry) = self.entries.get_mut(sel) {
-            if entry.is_dir {
-                entry.expanded = !entry.expanded;
-                // Re-scan to rebuild visible entries with expansion state
-                if let Some(root) = &self.archive_root {
-                    let root = root.clone();
-                    let filter = self.filter.clone();
-                    // Preserve expansion states
-                    let expanded_paths: Vec<(PathBuf, bool)> = self
-                        .entries
-                        .iter()
-                        .filter(|e| e.is_dir)
-                        .map(|e| (e.rel_path.clone(), e.expanded))
-                        .collect();
+        if let Some(entry) = self.entries.get_mut(sel)
+            && entry.is_dir
+        {
+            entry.expanded = !entry.expanded;
+            // Re-scan to rebuild visible entries with expansion state
+            if let Some(root) = &self.archive_root {
+                let root = root.clone();
+                let filter = self.filter.clone();
+                // Preserve expansion states
+                let expanded_paths: Vec<(PathBuf, bool)> = self
+                    .entries
+                    .iter()
+                    .filter(|e| e.is_dir)
+                    .map(|e| (e.rel_path.clone(), e.expanded))
+                    .collect();
 
-                    // Re-scan with correct expansion
-                    let mut final_entries = Vec::new();
-                    Self::scan_directory_with_state(
-                        &root,
-                        &root,
-                        0,
-                        &filter,
-                        &expanded_paths,
-                        &mut final_entries,
-                    );
-                    self.entries = final_entries;
+                // Re-scan with correct expansion
+                let mut final_entries = Vec::new();
+                Self::scan_directory_with_state(
+                    &root,
+                    &root,
+                    0,
+                    &filter,
+                    &expanded_paths,
+                    &mut final_entries,
+                );
+                self.entries = final_entries;
 
-                    // Clamp selection
-                    if let Some(s) = self.tree_state.selected {
-                        if s >= self.entries.len() && !self.entries.is_empty() {
-                            self.tree_state.selected = Some(self.entries.len() - 1);
-                        }
-                    }
+                // Clamp selection
+                if let Some(s) = self.tree_state.selected
+                    && s >= self.entries.len()
+                    && !self.entries.is_empty()
+                {
+                    self.tree_state.selected = Some(self.entries.len() - 1);
                 }
             }
         }
@@ -698,14 +699,16 @@ impl ArchiveBrowserScreen {
         if self.preview_type == ContentType::Markdown && self.preview_content.is_some() {
             let md_theme = crate::tui_theme::markdown_theme();
             let text = crate::tui_markdown::render_body(content, &md_theme);
+            let tp = crate::tui_theme::TuiThemePalette::current();
             Paragraph::new(text)
                 .scroll((self.preview_scroll, 0))
-                .style(Style::default())
+                .style(crate::tui_theme::text_primary(&tp))
                 .render(content_inner, frame);
         } else {
+            let tp = crate::tui_theme::TuiThemePalette::current();
             Paragraph::new(display_text)
                 .scroll((self.preview_scroll, 0))
-                .style(Style::default())
+                .style(crate::tui_theme::text_primary(&tp))
                 .render(content_inner, frame);
         }
     }
@@ -801,29 +804,29 @@ impl ArchiveBrowserScreen {
                 }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(sel) = self.tree_state.selected {
-                    if let Some(entry) = self.entries.get(sel) {
-                        if entry.is_dir {
-                            self.toggle_expand();
-                        } else {
-                            self.load_preview();
-                            self.preview_focused = true;
-                        }
+                if let Some(sel) = self.tree_state.selected
+                    && let Some(entry) = self.entries.get(sel)
+                {
+                    if entry.is_dir {
+                        self.toggle_expand();
+                    } else {
+                        self.load_preview();
+                        self.preview_focused = true;
                     }
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if let Some(sel) = self.tree_state.selected {
-                    if let Some(entry) = self.entries.get(sel) {
-                        if entry.is_dir && entry.expanded {
-                            self.toggle_expand();
-                        } else if entry.depth > 0 {
-                            for i in (0..sel).rev() {
-                                if self.entries[i].is_dir && self.entries[i].depth < entry.depth {
-                                    self.tree_state.selected = Some(i);
-                                    self.load_preview();
-                                    break;
-                                }
+                if let Some(sel) = self.tree_state.selected
+                    && let Some(entry) = self.entries.get(sel)
+                {
+                    if entry.is_dir && entry.expanded {
+                        self.toggle_expand();
+                    } else if entry.depth > 0 {
+                        for i in (0..sel).rev() {
+                            if self.entries[i].is_dir && self.entries[i].depth < entry.depth {
+                                self.tree_state.selected = Some(i);
+                                self.load_preview();
+                                break;
                             }
                         }
                     }
@@ -891,16 +894,16 @@ impl Default for ArchiveBrowserScreen {
 
 impl MailScreen for ArchiveBrowserScreen {
     fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                if self.filter_active {
-                    return self.handle_filter_key(key.code, state);
-                }
-                if self.preview_focused {
-                    return self.handle_preview_key(key);
-                }
-                return self.handle_tree_key(key.code, state);
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            if self.filter_active {
+                return self.handle_filter_key(key.code, state);
             }
+            if self.preview_focused {
+                return self.handle_preview_key(key);
+            }
+            return self.handle_tree_key(key.code, state);
         }
         Cmd::None
     }
@@ -1002,12 +1005,11 @@ impl MailScreen for ArchiveBrowserScreen {
 
             // Restore expansion state
             for entry in &mut self.entries {
-                if entry.is_dir {
-                    if let Some((_, exp)) =
+                if entry.is_dir
+                    && let Some((_, exp)) =
                         expanded_state.iter().find(|(p, _)| *p == entry.rel_path)
-                    {
-                        entry.expanded = *exp;
-                    }
+                {
+                    entry.expanded = *exp;
                 }
             }
         }

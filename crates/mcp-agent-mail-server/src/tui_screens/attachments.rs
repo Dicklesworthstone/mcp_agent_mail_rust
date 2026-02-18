@@ -374,14 +374,14 @@ impl AttachmentExplorerScreen {
         });
 
         // Clamp selection
-        if let Some(sel) = self.table_state.selected {
-            if sel >= self.display_indices.len() {
-                self.table_state.selected = if self.display_indices.is_empty() {
-                    None
-                } else {
-                    Some(self.display_indices.len() - 1)
-                };
-            }
+        if let Some(sel) = self.table_state.selected
+            && sel >= self.display_indices.len()
+        {
+            self.table_state.selected = if self.display_indices.is_empty() {
+                None
+            } else {
+                Some(self.display_indices.len() - 1)
+            };
         }
     }
 
@@ -769,12 +769,12 @@ impl MailScreen for AttachmentExplorerScreen {
                 }
                 KeyCode::Char('t') => {
                     // Deep-link to source thread
-                    if let Some(entry) = self.selected_entry() {
-                        if let Some(tid) = &entry.thread_id {
-                            return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(
-                                tid.clone(),
-                            )));
-                        }
+                    if let Some(entry) = self.selected_entry()
+                        && let Some(tid) = &entry.thread_id
+                    {
+                        return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(
+                            tid.clone(),
+                        )));
                     }
                 }
                 KeyCode::Escape => {

@@ -151,18 +151,18 @@ impl ActionMenuState {
 
     /// Number of entries.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Check if empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Move selection up (wraps from first to last).
-    pub fn move_up(&mut self) {
+    pub const fn move_up(&mut self) {
         if self.entries.is_empty() {
             return;
         }
@@ -174,7 +174,7 @@ impl ActionMenuState {
     }
 
     /// Move selection down (wraps from last to first).
-    pub fn move_down(&mut self) {
+    pub const fn move_down(&mut self) {
         if self.entries.is_empty() {
             return;
         }
@@ -288,11 +288,11 @@ impl<'a> ActionMenu<'a> {
             }
             // Append disabled reason as dimmed suffix.
             let label_char_count = text.chars().count();
-            if !entry.enabled {
-                if let Some(ref reason) = entry.disabled_reason {
-                    text.push_str("  ");
-                    text.push_str(reason);
-                }
+            if !entry.enabled
+                && let Some(ref reason) = entry.disabled_reason
+            {
+                text.push_str("  ");
+                text.push_str(reason);
             }
 
             // Render each character, advancing by display width for Unicode safety.

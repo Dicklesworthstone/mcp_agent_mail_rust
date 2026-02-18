@@ -3141,18 +3141,33 @@ mod tests {
 
     #[test]
     fn search_shadow_mode_parse_all_aliases() {
-        assert_eq!(SearchShadowMode::parse("log_only"), SearchShadowMode::LogOnly);
-        assert_eq!(SearchShadowMode::parse("log-only"), SearchShadowMode::LogOnly);
-        assert_eq!(SearchShadowMode::parse("logonly"), SearchShadowMode::LogOnly);
+        assert_eq!(
+            SearchShadowMode::parse("log_only"),
+            SearchShadowMode::LogOnly
+        );
+        assert_eq!(
+            SearchShadowMode::parse("log-only"),
+            SearchShadowMode::LogOnly
+        );
+        assert_eq!(
+            SearchShadowMode::parse("logonly"),
+            SearchShadowMode::LogOnly
+        );
         assert_eq!(SearchShadowMode::parse("log"), SearchShadowMode::LogOnly);
-        assert_eq!(SearchShadowMode::parse("compare"), SearchShadowMode::Compare);
+        assert_eq!(
+            SearchShadowMode::parse("compare"),
+            SearchShadowMode::Compare
+        );
         assert_eq!(SearchShadowMode::parse("v3"), SearchShadowMode::Compare);
         assert_eq!(SearchShadowMode::parse("new"), SearchShadowMode::Compare);
         // Unknown falls back to Off
         assert_eq!(SearchShadowMode::parse("unknown"), SearchShadowMode::Off);
         assert_eq!(SearchShadowMode::parse(""), SearchShadowMode::Off);
         // Case insensitive
-        assert_eq!(SearchShadowMode::parse("LOG_ONLY"), SearchShadowMode::LogOnly);
+        assert_eq!(
+            SearchShadowMode::parse("LOG_ONLY"),
+            SearchShadowMode::LogOnly
+        );
     }
 
     #[test]
@@ -3185,7 +3200,10 @@ mod tests {
             semantic_enabled: true,
             ..SearchRolloutConfig::default()
         };
-        assert_eq!(cfg.effective_engine("search_messages"), SearchEngine::Lexical);
+        assert_eq!(
+            cfg.effective_engine("search_messages"),
+            SearchEngine::Lexical
+        );
     }
 
     #[test]
@@ -3195,8 +3213,12 @@ mod tests {
             semantic_enabled: true,
             ..SearchRolloutConfig::default()
         };
-        cfg.surface_overrides.insert("search_messages".to_string(), SearchEngine::Hybrid);
-        assert_eq!(cfg.effective_engine("search_messages"), SearchEngine::Hybrid);
+        cfg.surface_overrides
+            .insert("search_messages".to_string(), SearchEngine::Hybrid);
+        assert_eq!(
+            cfg.effective_engine("search_messages"),
+            SearchEngine::Hybrid
+        );
         assert_eq!(cfg.effective_engine("other_tool"), SearchEngine::Legacy);
     }
 
@@ -3246,7 +3268,10 @@ mod tests {
 
     #[test]
     fn console_ui_anchor_parse() {
-        assert_eq!(ConsoleUiAnchor::parse("bottom"), Some(ConsoleUiAnchor::Bottom));
+        assert_eq!(
+            ConsoleUiAnchor::parse("bottom"),
+            Some(ConsoleUiAnchor::Bottom)
+        );
         assert_eq!(ConsoleUiAnchor::parse("b"), Some(ConsoleUiAnchor::Bottom));
         assert_eq!(ConsoleUiAnchor::parse("top"), Some(ConsoleUiAnchor::Top));
         assert_eq!(ConsoleUiAnchor::parse("t"), Some(ConsoleUiAnchor::Top));
@@ -3256,25 +3281,61 @@ mod tests {
 
     #[test]
     fn console_split_mode_parse() {
-        assert_eq!(ConsoleSplitMode::parse("inline"), Some(ConsoleSplitMode::Inline));
+        assert_eq!(
+            ConsoleSplitMode::parse("inline"),
+            Some(ConsoleSplitMode::Inline)
+        );
         assert_eq!(ConsoleSplitMode::parse("i"), Some(ConsoleSplitMode::Inline));
-        assert_eq!(ConsoleSplitMode::parse("left"), Some(ConsoleSplitMode::Left));
+        assert_eq!(
+            ConsoleSplitMode::parse("left"),
+            Some(ConsoleSplitMode::Left)
+        );
         assert_eq!(ConsoleSplitMode::parse("l"), Some(ConsoleSplitMode::Left));
         assert_eq!(ConsoleSplitMode::parse("unknown"), None);
     }
 
     #[test]
     fn console_theme_id_parse() {
-        assert_eq!(ConsoleThemeId::parse("cyberpunk"), Some(ConsoleThemeId::CyberpunkAurora));
-        assert_eq!(ConsoleThemeId::parse("cyberpunk_aurora"), Some(ConsoleThemeId::CyberpunkAurora));
-        assert_eq!(ConsoleThemeId::parse("cyberpunk-aurora"), Some(ConsoleThemeId::CyberpunkAurora));
-        assert_eq!(ConsoleThemeId::parse("aurora"), Some(ConsoleThemeId::CyberpunkAurora));
-        assert_eq!(ConsoleThemeId::parse("darcula"), Some(ConsoleThemeId::Darcula));
-        assert_eq!(ConsoleThemeId::parse("lumen"), Some(ConsoleThemeId::LumenLight));
-        assert_eq!(ConsoleThemeId::parse("light"), Some(ConsoleThemeId::LumenLight));
-        assert_eq!(ConsoleThemeId::parse("nordic"), Some(ConsoleThemeId::NordicFrost));
-        assert_eq!(ConsoleThemeId::parse("hc"), Some(ConsoleThemeId::HighContrast));
-        assert_eq!(ConsoleThemeId::parse("high_contrast"), Some(ConsoleThemeId::HighContrast));
+        assert_eq!(
+            ConsoleThemeId::parse("cyberpunk"),
+            Some(ConsoleThemeId::CyberpunkAurora)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("cyberpunk_aurora"),
+            Some(ConsoleThemeId::CyberpunkAurora)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("cyberpunk-aurora"),
+            Some(ConsoleThemeId::CyberpunkAurora)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("aurora"),
+            Some(ConsoleThemeId::CyberpunkAurora)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("darcula"),
+            Some(ConsoleThemeId::Darcula)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("lumen"),
+            Some(ConsoleThemeId::LumenLight)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("light"),
+            Some(ConsoleThemeId::LumenLight)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("nordic"),
+            Some(ConsoleThemeId::NordicFrost)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("hc"),
+            Some(ConsoleThemeId::HighContrast)
+        );
+        assert_eq!(
+            ConsoleThemeId::parse("high_contrast"),
+            Some(ConsoleThemeId::HighContrast)
+        );
         assert_eq!(ConsoleThemeId::parse("unknown"), None);
     }
 

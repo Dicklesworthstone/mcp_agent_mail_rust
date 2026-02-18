@@ -32,16 +32,45 @@ pub const OVERSEER_AGENT_NAME: &str = "HumanOverseer";
 
 // ── Palette ─────────────────────────────────────────────────────────
 
-const COMPOSE_BG: PackedRgba = PackedRgba::rgb(25, 25, 32);
-const COMPOSE_BORDER: PackedRgba = PackedRgba::rgb(80, 120, 180);
-const COMPOSE_TITLE_FG: PackedRgba = PackedRgba::rgb(200, 220, 255);
-const COMPOSE_LABEL_FG: PackedRgba = PackedRgba::rgb(160, 160, 180);
-const COMPOSE_VALUE_FG: PackedRgba = PackedRgba::rgb(220, 220, 230);
-const COMPOSE_ACTIVE_BORDER: PackedRgba = PackedRgba::rgb(100, 180, 255);
-const COMPOSE_PLACEHOLDER_FG: PackedRgba = PackedRgba::rgb(90, 90, 110);
-const COMPOSE_ERROR_FG: PackedRgba = PackedRgba::rgb(255, 100, 100);
-const COMPOSE_HINT_FG: PackedRgba = PackedRgba::rgb(120, 120, 140);
-const COMPOSE_SELECTED_RECIPIENT_BG: PackedRgba = PackedRgba::rgb(50, 70, 100);
+#[derive(Debug, Clone, Copy)]
+struct ComposePalette {
+    bg: PackedRgba,
+    border: PackedRgba,
+    title_fg: PackedRgba,
+    label_fg: PackedRgba,
+    value_fg: PackedRgba,
+    active_border: PackedRgba,
+    placeholder_fg: PackedRgba,
+    error_fg: PackedRgba,
+    hint_fg: PackedRgba,
+    selected_recipient_bg: PackedRgba,
+    cursor_fg: PackedRgba,
+}
+
+fn compose_palette() -> ComposePalette {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let active_luma = 299_u32
+        .saturating_mul(u32::from(tp.panel_border_focused.r()))
+        .saturating_add(587_u32.saturating_mul(u32::from(tp.panel_border_focused.g())))
+        .saturating_add(114_u32.saturating_mul(u32::from(tp.panel_border_focused.b())));
+    ComposePalette {
+        bg: tp.bg_overlay,
+        border: tp.panel_border,
+        title_fg: tp.panel_title_fg,
+        label_fg: tp.text_muted,
+        value_fg: tp.text_primary,
+        active_border: tp.panel_border_focused,
+        placeholder_fg: tp.text_disabled,
+        error_fg: tp.severity_error,
+        hint_fg: tp.text_secondary,
+        selected_recipient_bg: tp.list_hover_bg,
+        cursor_fg: if active_luma >= 150_000 {
+            tp.bg_deep
+        } else {
+            tp.text_primary
+        },
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // ComposeField — which field is active
@@ -143,12 +172,12 @@ impl Importance {
 
     /// Color for rendering.
     #[must_use]
-    pub const fn color(self) -> PackedRgba {
+    pub const fn color(self, tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
         match self {
-            Self::Low => PackedRgba::rgb(120, 140, 160),
-            Self::Normal => PackedRgba::rgb(180, 200, 220),
-            Self::High => PackedRgba::rgb(255, 200, 80),
-            Self::Urgent => PackedRgba::rgb(255, 100, 100),
+            Self::Low => tp.text_secondary,
+            Self::Normal => tp.text_primary,
+            Self::High => tp.severity_warn,
+            Self::Urgent => tp.severity_error,
         }
     }
 }
@@ -332,11 +361,11 @@ impl ComposeState {
     /// Cycle the recipient kind (To/Cc/Bcc) at the current cursor position.
     pub fn cycle_recipient_kind(&mut self) {
         let filtered = self.filtered_recipients();
-        if let Some(&idx) = filtered.get(self.recipient_cursor) {
-            if self.recipients[idx].selected {
-                self.recipients[idx].kind = self.recipients[idx].kind.cycle();
-                self.dirty = true;
-            }
+        if let Some(&idx) = filtered.get(self.recipient_cursor)
+            && self.recipients[idx].selected
+        {
+            self.recipients[idx].kind = self.recipients[idx].kind.cycle();
+            self.dirty = true;
         }
     }
 
@@ -830,18 +859,20 @@ impl<'a> ComposePanel<'a> {
     #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub fn render(&self, terminal_area: Rect, frame: &mut Frame<'_>, _state: &TuiSharedState) {
         let area = Self::overlay_area(terminal_area);
+        let cp = compose_palette();
+        let tp = crate::tui_theme::TuiThemePalette::current();
 
         // Fill background
         for row in area.y..area.bottom() {
             for col in area.x..area.right() {
                 let mut cell = Cell::from_char(' ');
-                cell.bg = COMPOSE_BG;
+                cell.bg = cp.bg;
                 frame.buffer.set_fast(col, row, cell);
             }
         }
 
         // Draw border
-        self.draw_border(area, frame);
+        self.draw_border(area, &cp, frame);
 
         // Title bar
         let title = " Compose Message (Ctrl+Enter: Send | Esc: Cancel) ";
@@ -849,8 +880,8 @@ impl<'a> ComposePanel<'a> {
             area.x + 2,
             area.y,
             title,
-            COMPOSE_TITLE_FG,
-            COMPOSE_BG,
+            cp.title_fg,
+            cp.bg,
             area.right(),
             frame,
         );
@@ -871,23 +902,15 @@ impl<'a> ComposePanel<'a> {
         if y < max_y {
             let is_active = self.state.active_field == ComposeField::Recipients;
             let label_color = if is_active {
-                COMPOSE_ACTIVE_BORDER
+                cp.active_border
             } else {
-                COMPOSE_LABEL_FG
+                cp.label_fg
             };
 
             // Label + selected count
             let selected_count = self.state.recipients.iter().filter(|r| r.selected).count();
             let label = format!("To ({selected_count} selected):");
-            self.draw_text(
-                inner.x,
-                y,
-                &label,
-                label_color,
-                COMPOSE_BG,
-                inner.right(),
-                frame,
-            );
+            self.draw_text(inner.x, y, &label, label_color, cp.bg, inner.right(), frame);
             y += 1;
 
             // Filter bar (when active)
@@ -898,16 +921,16 @@ impl<'a> ComposePanel<'a> {
                     &self.state.recipient_filter
                 };
                 let filter_color = if self.state.recipient_filter.is_empty() {
-                    COMPOSE_PLACEHOLDER_FG
+                    cp.placeholder_fg
                 } else {
-                    COMPOSE_VALUE_FG
+                    cp.value_fg
                 };
                 self.draw_text(
                     inner.x,
                     y,
                     filter_display,
                     filter_color,
-                    COMPOSE_BG,
+                    cp.bg,
                     inner.right(),
                     frame,
                 );
@@ -931,11 +954,11 @@ impl<'a> ComposePanel<'a> {
                 let line = format!(" {checkbox} {}{kind_label}", r.name);
 
                 let (fg, bg) = if is_active && vi == self.state.recipient_cursor {
-                    (COMPOSE_VALUE_FG, COMPOSE_SELECTED_RECIPIENT_BG)
+                    (cp.value_fg, cp.selected_recipient_bg)
                 } else if r.selected {
-                    (COMPOSE_VALUE_FG, COMPOSE_BG)
+                    (cp.value_fg, cp.bg)
                 } else {
-                    (COMPOSE_PLACEHOLDER_FG, COMPOSE_BG)
+                    (cp.placeholder_fg, cp.bg)
                 };
 
                 self.draw_text(inner.x, y, &line, fg, bg, inner.right(), frame);
@@ -944,15 +967,7 @@ impl<'a> ComposePanel<'a> {
 
             if filtered.len() > max_rows && y < max_y {
                 let more = format!("  ... +{} more", filtered.len() - max_rows);
-                self.draw_text(
-                    inner.x,
-                    y,
-                    &more,
-                    COMPOSE_HINT_FG,
-                    COMPOSE_BG,
-                    inner.right(),
-                    frame,
-                );
+                self.draw_text(inner.x, y, &more, cp.hint_fg, cp.bg, inner.right(), frame);
                 y += 1;
             }
 
@@ -963,9 +978,9 @@ impl<'a> ComposePanel<'a> {
         if y < max_y {
             let is_active = self.state.active_field == ComposeField::Subject;
             let label_color = if is_active {
-                COMPOSE_ACTIVE_BORDER
+                cp.active_border
             } else {
-                COMPOSE_LABEL_FG
+                cp.label_fg
             };
             let counter = format!(
                 "Subject ({}/{}):",
@@ -977,7 +992,7 @@ impl<'a> ComposePanel<'a> {
                 y,
                 &counter,
                 label_color,
-                COMPOSE_BG,
+                cp.bg,
                 inner.right(),
                 frame,
             );
@@ -992,24 +1007,24 @@ impl<'a> ComposePanel<'a> {
                     &self.state.subject
                 };
                 let fg = if self.state.subject.is_empty() && !is_active {
-                    COMPOSE_PLACEHOLDER_FG
+                    cp.placeholder_fg
                 } else {
-                    COMPOSE_VALUE_FG
+                    cp.value_fg
                 };
                 let border_fg = if is_active {
-                    COMPOSE_ACTIVE_BORDER
+                    cp.active_border
                 } else {
-                    COMPOSE_BORDER
+                    cp.border
                 };
 
                 // Draw bordered input
-                self.draw_bordered_line(inner.x, y, inner_w, display, fg, border_fg, frame);
+                self.draw_bordered_line(inner.x, y, inner_w, display, fg, border_fg, cp.bg, frame);
 
                 // Draw cursor
                 if is_active {
                     let cursor_x = inner.x + 1 + self.state.subject_cursor as u16;
                     if cursor_x < inner.right() - 1 {
-                        self.set_cursor_cell(cursor_x, y, frame);
+                        self.set_cursor_cell(cursor_x, y, &cp, frame);
                     }
                 }
                 y += 1;
@@ -1021,9 +1036,9 @@ impl<'a> ComposePanel<'a> {
         if y < max_y {
             let is_active = self.state.active_field == ComposeField::Body;
             let label_color = if is_active {
-                COMPOSE_ACTIVE_BORDER
+                cp.active_border
             } else {
-                COMPOSE_LABEL_FG
+                cp.label_fg
             };
             let body_label = format!("Body ({} chars):", self.state.body.len());
             self.draw_text(
@@ -1031,7 +1046,7 @@ impl<'a> ComposePanel<'a> {
                 y,
                 &body_label,
                 label_color,
-                COMPOSE_BG,
+                cp.bg,
                 inner.right(),
                 frame,
             );
@@ -1043,14 +1058,14 @@ impl<'a> ComposePanel<'a> {
             let lines = self.state.body_lines();
 
             let border_fg = if is_active {
-                COMPOSE_ACTIVE_BORDER
+                cp.active_border
             } else {
-                COMPOSE_BORDER
+                cp.border
             };
 
             // Draw body border
             if y < max_y {
-                self.draw_horizontal_border(inner.x, y, inner_w, border_fg, frame);
+                self.draw_horizontal_border(inner.x, y, inner_w, border_fg, cp.bg, frame);
                 y += 1;
             }
 
@@ -1065,8 +1080,8 @@ impl<'a> ComposePanel<'a> {
                     inner.x + 1,
                     y,
                     &truncated,
-                    COMPOSE_VALUE_FG,
-                    COMPOSE_BG,
+                    cp.value_fg,
+                    cp.bg,
                     inner.right() - 1,
                     frame,
                 );
@@ -1075,7 +1090,7 @@ impl<'a> ComposePanel<'a> {
                 if is_active && line_idx == self.state.body_cursor_line {
                     let cursor_x = inner.x + 1 + self.state.body_cursor_col as u16;
                     if cursor_x < inner.right() - 1 {
-                        self.set_cursor_cell(cursor_x, y, frame);
+                        self.set_cursor_cell(cursor_x, y, &cp, frame);
                     }
                 }
 
@@ -1083,7 +1098,7 @@ impl<'a> ComposePanel<'a> {
             }
 
             if y < max_y {
-                self.draw_horizontal_border(inner.x, y, inner_w, border_fg, frame);
+                self.draw_horizontal_border(inner.x, y, inner_w, border_fg, cp.bg, frame);
                 y += 1;
             }
 
@@ -1094,8 +1109,8 @@ impl<'a> ComposePanel<'a> {
                     inner.x + 1,
                     placeholder_y,
                     "Enter message body...",
-                    COMPOSE_PLACEHOLDER_FG,
-                    COMPOSE_BG,
+                    cp.placeholder_fg,
+                    cp.bg,
                     inner.right() - 1,
                     frame,
                 );
@@ -1106,43 +1121,35 @@ impl<'a> ComposePanel<'a> {
         if y < max_y {
             let is_active = self.state.active_field == ComposeField::Importance;
             let label_color = if is_active {
-                COMPOSE_ACTIVE_BORDER
+                cp.active_border
             } else {
-                COMPOSE_LABEL_FG
+                cp.label_fg
             };
             self.draw_text(
                 inner.x,
                 y,
                 "Importance: ",
                 label_color,
-                COMPOSE_BG,
+                cp.bg,
                 inner.right(),
                 frame,
             );
             let imp_x = inner.x + 12;
             let imp_display = self.state.importance.display();
-            let imp_color = self.state.importance.color();
+            let imp_color = self.state.importance.color(&tp);
             self.draw_text(
                 imp_x,
                 y,
                 imp_display,
                 imp_color,
-                COMPOSE_BG,
+                cp.bg,
                 inner.right(),
                 frame,
             );
             if is_active {
                 let hint = "  (Space/Enter to cycle)";
                 let hint_x = imp_x + imp_display.len() as u16;
-                self.draw_text(
-                    hint_x,
-                    y,
-                    hint,
-                    COMPOSE_HINT_FG,
-                    COMPOSE_BG,
-                    inner.right(),
-                    frame,
-                );
+                self.draw_text(hint_x, y, hint, cp.hint_fg, cp.bg, inner.right(), frame);
             }
             y += 1;
         }
@@ -1151,16 +1158,16 @@ impl<'a> ComposePanel<'a> {
         if y < max_y {
             let is_active = self.state.active_field == ComposeField::ThreadId;
             let label_color = if is_active {
-                COMPOSE_ACTIVE_BORDER
+                cp.active_border
             } else {
-                COMPOSE_LABEL_FG
+                cp.label_fg
             };
             self.draw_text(
                 inner.x,
                 y,
                 "Thread ID (optional): ",
                 label_color,
-                COMPOSE_BG,
+                cp.bg,
                 inner.right(),
                 frame,
             );
@@ -1175,22 +1182,22 @@ impl<'a> ComposePanel<'a> {
                     &self.state.thread_id
                 };
                 let fg = if self.state.thread_id.is_empty() && !is_active {
-                    COMPOSE_PLACEHOLDER_FG
+                    cp.placeholder_fg
                 } else {
-                    COMPOSE_VALUE_FG
+                    cp.value_fg
                 };
                 let border_fg = if is_active {
-                    COMPOSE_ACTIVE_BORDER
+                    cp.active_border
                 } else {
-                    COMPOSE_BORDER
+                    cp.border
                 };
 
-                self.draw_bordered_line(inner.x, y, inner_w, display, fg, border_fg, frame);
+                self.draw_bordered_line(inner.x, y, inner_w, display, fg, border_fg, cp.bg, frame);
 
                 if is_active {
                     let cursor_x = inner.x + 1 + self.state.thread_id_cursor as u16;
                     if cursor_x < inner.right() - 1 {
-                        self.set_cursor_cell(cursor_x, y, frame);
+                        self.set_cursor_cell(cursor_x, y, &cp, frame);
                     }
                 }
                 y += 1;
@@ -1200,73 +1207,57 @@ impl<'a> ComposePanel<'a> {
         // ── Error / hints ──────────────────────────────────────
         if y < max_y {
             if let Some(err) = &self.state.error {
-                self.draw_text(
-                    inner.x,
-                    y,
-                    err,
-                    COMPOSE_ERROR_FG,
-                    COMPOSE_BG,
-                    inner.right(),
-                    frame,
-                );
+                self.draw_text(inner.x, y, err, cp.error_fg, cp.bg, inner.right(), frame);
             } else if self.state.sending {
                 self.draw_text(
                     inner.x,
                     y,
                     "Sending...",
-                    COMPOSE_HINT_FG,
-                    COMPOSE_BG,
+                    cp.hint_fg,
+                    cp.bg,
                     inner.right(),
                     frame,
                 );
             } else {
                 let hint = "Tab: next field | Ctrl+Enter: send | Esc: cancel";
-                self.draw_text(
-                    inner.x,
-                    y,
-                    hint,
-                    COMPOSE_HINT_FG,
-                    COMPOSE_BG,
-                    inner.right(),
-                    frame,
-                );
+                self.draw_text(inner.x, y, hint, cp.hint_fg, cp.bg, inner.right(), frame);
             }
         }
     }
 
     // ── Drawing helpers ────────────────────────────────────────
 
-    fn draw_border(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn draw_border(&self, area: Rect, cp: &ComposePalette, frame: &mut Frame<'_>) {
         let right = area.right().saturating_sub(1);
         let bottom = area.bottom().saturating_sub(1);
 
         for col in area.x..=right {
-            self.set_border_cell(col, area.y, frame);
-            self.set_border_cell(col, bottom, frame);
+            self.set_border_cell(col, area.y, cp, frame);
+            self.set_border_cell(col, bottom, cp, frame);
         }
         for row in area.y..=bottom {
-            self.set_border_cell(area.x, row, frame);
-            self.set_border_cell(right, row, frame);
+            self.set_border_cell(area.x, row, cp, frame);
+            self.set_border_cell(right, row, cp, frame);
         }
     }
 
     #[allow(clippy::unused_self)]
-    fn set_border_cell(&self, x: u16, y: u16, frame: &mut Frame<'_>) {
+    fn set_border_cell(&self, x: u16, y: u16, cp: &ComposePalette, frame: &mut Frame<'_>) {
         let mut cell = Cell::from_char(' ');
-        cell.fg = COMPOSE_BORDER;
-        cell.bg = COMPOSE_BORDER;
+        cell.fg = cp.border;
+        cell.bg = cp.border;
         frame.buffer.set_fast(x, y, cell);
     }
 
     #[allow(clippy::unused_self)]
-    fn set_cursor_cell(&self, x: u16, y: u16, frame: &mut Frame<'_>) {
+    fn set_cursor_cell(&self, x: u16, y: u16, cp: &ComposePalette, frame: &mut Frame<'_>) {
         let mut cell = frame
             .buffer
             .get(x, y)
             .copied()
             .unwrap_or_else(|| Cell::from_char(' '));
-        cell.bg = COMPOSE_ACTIVE_BORDER;
-        cell.fg = PackedRgba::rgb(0, 0, 0);
+        cell.bg = cp.active_border;
+        cell.fg = cp.cursor_fg;
         frame.buffer.set_fast(x, y, cell);
     }
 
@@ -1307,6 +1298,7 @@ impl<'a> ComposePanel<'a> {
         text: &str,
         fg: PackedRgba,
         border_fg: PackedRgba,
+        bg: PackedRgba,
         frame: &mut Frame<'_>,
     ) {
         let right = x + width as u16;
@@ -1314,7 +1306,7 @@ impl<'a> ComposePanel<'a> {
         // Left border
         let mut cell = Cell::from_char('[');
         cell.fg = border_fg;
-        cell.bg = COMPOSE_BG;
+        cell.bg = bg;
         frame.buffer.set_fast(x, y, cell);
 
         // Content
@@ -1323,14 +1315,14 @@ impl<'a> ComposePanel<'a> {
         for ch in text.chars().take(content_width) {
             let mut c = Cell::from_char(ch);
             c.fg = fg;
-            c.bg = COMPOSE_BG;
+            c.bg = bg;
             frame.buffer.set_fast(col, y, c);
             col += 1;
         }
         // Pad remaining
         while col < right.saturating_sub(1) {
             let mut c = Cell::from_char(' ');
-            c.bg = COMPOSE_BG;
+            c.bg = bg;
             frame.buffer.set_fast(col, y, c);
             col += 1;
         }
@@ -1338,7 +1330,7 @@ impl<'a> ComposePanel<'a> {
         // Right border
         let mut cell = Cell::from_char(']');
         cell.fg = border_fg;
-        cell.bg = COMPOSE_BG;
+        cell.bg = bg;
         frame.buffer.set_fast(right.saturating_sub(1), y, cell);
     }
 
@@ -1349,12 +1341,13 @@ impl<'a> ComposePanel<'a> {
         y: u16,
         width: usize,
         fg: PackedRgba,
+        bg: PackedRgba,
         frame: &mut Frame<'_>,
     ) {
         for col in x..x + width as u16 {
             let mut cell = Cell::from_char('-');
             cell.fg = fg;
-            cell.bg = COMPOSE_BG;
+            cell.bg = bg;
             frame.buffer.set_fast(col, y, cell);
         }
     }

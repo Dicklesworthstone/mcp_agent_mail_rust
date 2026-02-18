@@ -93,10 +93,11 @@ fn render(name: &str, ctx: impl Serialize) -> Result<Option<String>, (u16, Strin
 
 fn extract_query_str(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key && !v.is_empty() {
-                return Some(percent_decode_component(v));
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+            && !v.is_empty()
+        {
+            return Some(percent_decode_component(v));
         }
     }
     None
@@ -165,12 +166,12 @@ fn percent_decode_component(input: &str) -> String {
                 let hi = bytes[i + 1];
                 let lo = bytes[i + 2];
                 let hex = [hi, lo];
-                if let Ok(hex_str) = std::str::from_utf8(&hex) {
-                    if let Ok(value) = u8::from_str_radix(hex_str, 16) {
-                        out.push(value);
-                        i += 3;
-                        continue;
-                    }
+                if let Ok(hex_str) = std::str::from_utf8(&hex)
+                    && let Ok(value) = u8::from_str_radix(hex_str, 16)
+                {
+                    out.push(value);
+                    i += 3;
+                    continue;
                 }
                 out.push(bytes[i]);
                 i += 1;
@@ -975,10 +976,11 @@ struct RecipeView {
 fn extract_query_str_all(query: &str, key: &str) -> Vec<String> {
     let mut out = Vec::new();
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key && !v.is_empty() {
-                out.push(percent_decode_component(v));
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+            && !v.is_empty()
+        {
+            out.push(percent_decode_component(v));
         }
     }
     out

@@ -7307,14 +7307,7 @@ mod tests {
             // create_agent on proj3 should work
             let proj3_id = proj3.id.unwrap();
             let new_agent = create_agent(
-                &cx,
-                &pool,
-                proj3_id,
-                "GoldHawk",
-                "codex",
-                "gpt-5.2",
-                None,
-                None,
+                &cx, &pool, proj3_id, "GoldHawk", "codex", "gpt-5.2", None, None,
             )
             .await
             .into_result()

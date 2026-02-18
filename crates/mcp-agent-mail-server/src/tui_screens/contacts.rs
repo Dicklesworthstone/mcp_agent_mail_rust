@@ -208,14 +208,14 @@ impl ContactsScreen {
         self.layout_graph(&recent_events);
 
         // Clamp selection
-        if let Some(sel) = self.table_state.selected {
-            if sel >= self.contacts.len() {
-                self.table_state.selected = if self.contacts.is_empty() {
-                    None
-                } else {
-                    Some(self.contacts.len() - 1)
-                };
-            }
+        if let Some(sel) = self.table_state.selected
+            && sel >= self.contacts.len()
+        {
+            self.table_state.selected = if self.contacts.is_empty() {
+                None
+            } else {
+                Some(self.contacts.len() - 1)
+            };
         }
     }
 
@@ -425,7 +425,7 @@ impl MailScreen for ContactsScreen {
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         // Rebuild every 5 seconds (contacts change infrequently)
-        if tick_count % 50 == 0 {
+        if tick_count.is_multiple_of(50) {
             // Save previous counts for trend computation before rebuild
             self.prev_contact_counts = self.contact_counts();
             self.rebuild_from_state(state);
@@ -567,15 +567,14 @@ impl MailScreen for ContactsScreen {
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
-        if let DeepLinkTarget::ContactByPair(from, to) = target {
-            if let Some(pos) = self
+        if let DeepLinkTarget::ContactByPair(from, to) = target
+            && let Some(pos) = self
                 .contacts
                 .iter()
                 .position(|c| c.from_agent == *from && c.to_agent == *to)
-            {
-                self.table_state.selected = Some(pos);
-                return true;
-            }
+        {
+            self.table_state.selected = Some(pos);
+            return true;
         }
         false
     }

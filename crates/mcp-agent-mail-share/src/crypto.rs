@@ -113,30 +113,17 @@ pub fn verify_bundle(
 
     // Check SRI hashes
     let mut sri_checked = false;
-    if let Some(viewer) = manifest.get("viewer") {
-        if let Some(sri_map) = viewer.get("sri").and_then(|v| v.as_object()) {
-            sri_checked = true;
-            for (relative_path, expected_sri) in sri_map {
-                if let Some(expected) = expected_sri.as_str() {
-                    let file_path = resolve_sri_file_path(bundle_root, relative_path);
-                    if file_path.exists() {
-                        let content = std::fs::read(&file_path)?;
-                        let actual_hash =
-                            format!("sha256-{}", base64_encode(&sha256_bytes(&content)));
-                        if actual_hash != expected {
-                            return Ok(VerifyResult {
-                                bundle: bundle_root.display().to_string(),
-                                sri_checked: true,
-                                sri_valid: false,
-                                signature_checked: false,
-                                signature_verified: false,
-                                key_source: None,
-                                error: Some(format!(
-                                    "SRI mismatch for {relative_path}: expected {expected}, got {actual_hash}"
-                                )),
-                            });
-                        }
-                    } else {
+    if let Some(viewer) = manifest.get("viewer")
+        && let Some(sri_map) = viewer.get("sri").and_then(|v| v.as_object())
+    {
+        sri_checked = true;
+        for (relative_path, expected_sri) in sri_map {
+            if let Some(expected) = expected_sri.as_str() {
+                let file_path = resolve_sri_file_path(bundle_root, relative_path);
+                if file_path.exists() {
+                    let content = std::fs::read(&file_path)?;
+                    let actual_hash = format!("sha256-{}", base64_encode(&sha256_bytes(&content)));
+                    if actual_hash != expected {
                         return Ok(VerifyResult {
                             bundle: bundle_root.display().to_string(),
                             sri_checked: true,
@@ -144,9 +131,21 @@ pub fn verify_bundle(
                             signature_checked: false,
                             signature_verified: false,
                             key_source: None,
-                            error: Some(format!("SRI-referenced file missing: {relative_path}")),
+                            error: Some(format!(
+                                "SRI mismatch for {relative_path}: expected {expected}, got {actual_hash}"
+                            )),
                         });
                     }
+                } else {
+                    return Ok(VerifyResult {
+                        bundle: bundle_root.display().to_string(),
+                        sri_checked: true,
+                        sri_valid: false,
+                        signature_checked: false,
+                        signature_verified: false,
+                        key_source: None,
+                        error: Some(format!("SRI-referenced file missing: {relative_path}")),
+                    });
                 }
             }
         }
@@ -187,18 +186,16 @@ pub fn verify_bundle(
 
         let sig_str = sig_json.get("signature").and_then(|v| v.as_str());
 
-        if let (Some(pk_b64), Some(sig_b64)) = (pub_key_str, sig_str) {
-            if let (Ok(pk_bytes), Ok(sig_bytes)) = (base64_decode(&pk_b64), base64_decode(sig_b64))
-            {
-                if pk_bytes.len() == 32 && sig_bytes.len() == 64 {
-                    let pk: [u8; 32] = pk_bytes.try_into().unwrap();
-                    let sig: [u8; 64] = sig_bytes.try_into().unwrap();
-                    if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk) {
-                        let signature = Signature::from_bytes(&sig);
-                        signature_verified =
-                            verifying_key.verify(&manifest_bytes, &signature).is_ok();
-                    }
-                }
+        if let (Some(pk_b64), Some(sig_b64)) = (pub_key_str, sig_str)
+            && let (Ok(pk_bytes), Ok(sig_bytes)) = (base64_decode(&pk_b64), base64_decode(sig_b64))
+            && pk_bytes.len() == 32
+            && sig_bytes.len() == 64
+        {
+            let pk: [u8; 32] = pk_bytes.try_into().unwrap();
+            let sig: [u8; 64] = sig_bytes.try_into().unwrap();
+            if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk) {
+                let signature = Signature::from_bytes(&sig);
+                signature_verified = verifying_key.verify(&manifest_bytes, &signature).is_ok();
             }
         }
     }

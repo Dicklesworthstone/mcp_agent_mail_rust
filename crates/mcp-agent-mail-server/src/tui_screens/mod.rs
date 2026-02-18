@@ -427,6 +427,8 @@ pub enum DeepLinkTarget {
     MessageById(i64),
     /// Open compose form in Messages screen with pre-filled recipient.
     ComposeToAgent(String),
+    /// Open quick-reply form in Messages screen for a message id.
+    ReplyToMessage(i64),
     /// Jump to a specific thread in the Thread Explorer.
     ThreadById(String),
     /// Jump to an agent in the Agent Roster screen.
@@ -451,7 +453,9 @@ impl DeepLinkTarget {
     pub const fn target_screen(&self) -> MailScreenId {
         match self {
             Self::TimelineAtTime(_) => MailScreenId::Timeline,
-            Self::MessageById(_) | Self::ComposeToAgent(_) => MailScreenId::Messages,
+            Self::MessageById(_) | Self::ComposeToAgent(_) | Self::ReplyToMessage(_) => {
+                MailScreenId::Messages
+            }
             Self::ThreadById(_) => MailScreenId::Threads,
             Self::AgentByName(_) => MailScreenId::Agents,
             Self::ToolByName(_) => MailScreenId::ToolMetrics,

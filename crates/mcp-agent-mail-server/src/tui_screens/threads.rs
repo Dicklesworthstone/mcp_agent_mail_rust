@@ -5,6 +5,7 @@
 //! and a conversation detail panel on the right showing chronological messages
 //! within the selected thread.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -14,7 +15,7 @@ use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
-use ftui::widgets::borders::BorderType;
+use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{
     Buffer, Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind,
@@ -54,15 +55,51 @@ const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
 const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
 const MESSAGE_DRAG_HOLD_DELAY: Duration = Duration::from_millis(200);
 const THREAD_SPLIT_WIDTH_THRESHOLD: u16 = 80;
-const THREAD_MAIN_PANE_GAP_THRESHOLD: u16 = 84;
+// Keep a dedicated blank separator whenever split mode is active so adjacent
+// rounded panel borders never visually merge into a heavy "random" line.
+const THREAD_MAIN_PANE_GAP_THRESHOLD: u16 = THREAD_SPLIT_WIDTH_THRESHOLD;
+const THREAD_WIDE_LIST_PERCENT: u16 = 34;
 const THREAD_STACKED_MIN_HEIGHT: u16 = 14;
 const THREAD_STACKED_LIST_PERCENT: u16 = 42;
 const THREAD_STACKED_SPLITTER_HEIGHT: u16 = 1;
 const THREAD_COMPACT_HINT_MIN_HEIGHT: u16 = 7;
-const THREAD_DETAIL_PANE_GAP_THRESHOLD: u16 = 72;
-const THREAD_DETAIL_MIN_PREVIEW_WIDTH: u16 = 16;
+const THREAD_DETAIL_PANE_GAP_THRESHOLD: u16 = 64;
+const THREAD_DETAIL_COMPACT_WIDTH_THRESHOLD: u16 = 74;
+const THREAD_DETAIL_COMPACT_HEIGHT_THRESHOLD: u16 = 12;
+const THREAD_DETAIL_MIN_PREVIEW_WIDTH: u16 = 20;
+const THREAD_DETAIL_MIN_PANE_RENDER_WIDTH: u16 = 18;
 const THREAD_DETAIL_MIN_BODY_HEIGHT: u16 = 6;
 const THREAD_COLLAPSED_PREVIEW_LINES: usize = 3;
+const THREAD_LIST_COMPACT_MIN_WIDTH: usize = 34;
+const THREAD_SUBJECT_LINE_MIN_WIDTH: usize = 40;
+const THREAD_LIST_SIDE_PADDING_MIN_WIDTH: u16 = 42;
+const THREAD_DETAIL_SIDE_PADDING_MIN_WIDTH: u16 = 52;
+
+const fn thread_list_width_percent(total_width: u16) -> u16 {
+    if total_width >= 280 {
+        22
+    } else if total_width >= 220 {
+        24
+    } else if total_width >= 170 {
+        27
+    } else if total_width >= 130 {
+        30
+    } else {
+        THREAD_WIDE_LIST_PERCENT
+    }
+}
+
+const fn thread_tree_width_percent(detail_width: u16) -> u16 {
+    if detail_width >= 220 {
+        42
+    } else if detail_width >= 170 {
+        46
+    } else if detail_width >= 130 {
+        52
+    } else {
+        60
+    }
+}
 
 /// Color palette for deterministic per-agent coloring in thread cards.
 fn agent_color_palette() -> [PackedRgba; 8] {
@@ -110,10 +147,12 @@ fn thread_tree_guides() -> TreeGuides {
 
 const fn tree_indent_token(guides: TreeGuides) -> &'static str {
     match guides {
-        TreeGuides::Ascii => "| ",
-        TreeGuides::Unicode | TreeGuides::Rounded => "│ ",
-        TreeGuides::Bold => "┃ ",
-        TreeGuides::Double => "║ ",
+        // Keep hierarchy cues intentionally non-border-like so indent guides
+        // never read as stray panel borders across wrapped text.
+        // Rounded is the default in this screen; keep it non-border-like.
+        TreeGuides::Ascii | TreeGuides::Unicode | TreeGuides::Rounded => "· ",
+        TreeGuides::Bold => "▪ ",
+        TreeGuides::Double => "• ",
     }
 }
 
@@ -121,10 +160,12 @@ fn clear_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
     if area.is_empty() {
         return;
     }
+    let fg = crate::tui_theme::TuiThemePalette::current().text_primary;
     for y in area.y..area.y.saturating_add(area.height) {
         for x in area.x..area.x.saturating_add(area.width) {
             if let Some(cell) = frame.buffer.get_mut(x, y) {
                 *cell = ftui::Cell::from_char(' ');
+                cell.fg = fg;
                 cell.bg = bg;
             }
         }
@@ -136,57 +177,36 @@ fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, act
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let splitter_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.62);
-    clear_rect(frame, area, splitter_bg);
 
-    let rail_color = if active {
-        crate::tui_theme::lerp_color(tp.panel_border_focused, tp.selection_indicator, 0.32)
-    } else {
-        tp.panel_border_dim
-    };
-    let knob_color = if active {
-        tp.selection_indicator
-    } else {
-        tp.text_muted
-    };
-
-    if vertical {
-        let x = area.x.saturating_add(area.width / 2);
-        let grip_len = area.height.min(5).max(1);
-        let start_y = area
-            .y
-            .saturating_add(area.height.saturating_sub(grip_len) / 2);
-        for y in start_y..start_y.saturating_add(grip_len) {
+    // Always repaint the splitter gap so stale border glyphs never leak into
+    // content when layouts toggle between stacked/wide modes.
+    let separator_color = crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border_dim, 0.58);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
             if let Some(cell) = frame.buffer.get_mut(x, y) {
-                *cell = ftui::Cell::from_char('•');
-                cell.fg = rail_color;
-                cell.bg = splitter_bg;
+                *cell = ftui::Cell::from_char(' ');
+                cell.fg = separator_color;
+                cell.bg = tp.panel_bg;
             }
         }
-        let knob_y = start_y.saturating_add(grip_len / 2);
-        if let Some(cell) = frame.buffer.get_mut(x, knob_y) {
-            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
+    }
+
+    if active && ((vertical && area.height >= 5) || (!vertical && area.width >= 5)) {
+        let knob_color = tp.selection_indicator;
+        let x = if vertical {
+            area.x.saturating_add(area.width / 2)
+        } else {
+            area.x.saturating_add(area.width.saturating_sub(1) / 2)
+        };
+        let y = if vertical {
+            area.y.saturating_add(area.height.saturating_sub(1) / 2)
+        } else {
+            area.y.saturating_add(area.height / 2)
+        };
+        if let Some(cell) = frame.buffer.get_mut(x, y) {
+            *cell = ftui::Cell::from_char('·');
             cell.fg = knob_color;
-            cell.bg = splitter_bg;
-        }
-    } else {
-        let y = area.y.saturating_add(area.height / 2);
-        let grip_len = area.width.min(5).max(1);
-        let start_x = area
-            .x
-            .saturating_add(area.width.saturating_sub(grip_len) / 2);
-        for x in start_x..start_x.saturating_add(grip_len) {
-            if let Some(cell) = frame.buffer.get_mut(x, y) {
-                *cell = ftui::Cell::from_char('•');
-                cell.fg = rail_color;
-                cell.bg = splitter_bg;
-            }
-        }
-        let knob_x = start_x.saturating_add(grip_len / 2);
-        if let Some(cell) = frame.buffer.get_mut(knob_x, y) {
-            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
-            cell.fg = knob_color;
-            cell.bg = splitter_bg;
+            cell.bg = tp.panel_bg;
         }
     }
 }
@@ -913,19 +933,19 @@ impl ThreadExplorerScreen {
     }
 
     fn collapse_selected_branch(&mut self) {
-        if let Some(row) = self.selected_tree_row() {
-            if row.has_children {
-                self.collapsed_tree_ids.insert(row.message_id);
-                self.clamp_detail_cursor_to_tree_rows();
-            }
+        if let Some(row) = self.selected_tree_row()
+            && row.has_children
+        {
+            self.collapsed_tree_ids.insert(row.message_id);
+            self.clamp_detail_cursor_to_tree_rows();
         }
     }
 
     fn expand_selected_branch(&mut self) {
-        if let Some(row) = self.selected_tree_row() {
-            if row.has_children {
-                self.collapsed_tree_ids.remove(&row.message_id);
-            }
+        if let Some(row) = self.selected_tree_row()
+            && row.has_children
+        {
+            self.collapsed_tree_ids.remove(&row.message_id);
         }
     }
 
@@ -990,6 +1010,7 @@ impl ThreadExplorerScreen {
         };
         let title = fit_panel_title(raw_title, area.width);
         let block = Block::default()
+            .borders(Borders::ALL)
             .title(title.as_str())
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -1084,92 +1105,206 @@ impl MailScreen for ThreadExplorerScreen {
             self.clear_message_drag_state(state);
         }
 
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                if key.code == KeyCode::Escape && state.keyboard_move_snapshot().is_some() {
-                    state.clear_keyboard_move_snapshot();
-                    return Cmd::None;
-                }
-                if key.code == KeyCode::Char('m') && key.modifiers.contains(Modifiers::CTRL) {
-                    self.mark_selected_message_for_keyboard_move(state);
-                    return Cmd::None;
-                }
-                if key.code == KeyCode::Char('v') && key.modifiers.contains(Modifiers::CTRL) {
-                    return self.execute_keyboard_move_to_selected_thread(state);
-                }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            if key.code == KeyCode::Escape && state.keyboard_move_snapshot().is_some() {
+                state.clear_keyboard_move_snapshot();
+                return Cmd::None;
+            }
+            if key.code == KeyCode::Char('m') && key.modifiers.contains(Modifiers::CTRL) {
+                self.mark_selected_message_for_keyboard_move(state);
+                return Cmd::None;
+            }
+            if key.code == KeyCode::Char('v') && key.modifiers.contains(Modifiers::CTRL) {
+                return self.execute_keyboard_move_to_selected_thread(state);
+            }
 
-                // Filter editing mode
-                if self.filter_editing {
+            // Filter editing mode
+            if self.filter_editing {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Escape => {
+                        self.filter_editing = false;
+                        if key.code == KeyCode::Enter {
+                            self.list_dirty = true;
+                        }
+                        return Cmd::None;
+                    }
+                    KeyCode::Backspace => {
+                        self.filter_text.pop();
+                        self.list_dirty = true;
+                        return Cmd::None;
+                    }
+                    KeyCode::Char(c) => {
+                        self.filter_text.push(c);
+                        self.list_dirty = true;
+                        return Cmd::None;
+                    }
+                    _ => return Cmd::None,
+                }
+            }
+
+            match self.focus {
+                Focus::ThreadList => {
                     match key.code {
-                        KeyCode::Enter | KeyCode::Escape => {
-                            self.filter_editing = false;
-                            if key.code == KeyCode::Enter {
-                                self.list_dirty = true;
+                        // Cursor navigation
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !self.threads.is_empty() {
+                                self.cursor = (self.cursor + 1).min(self.threads.len() - 1);
+                                self.detail_scroll = 0;
+                                self.refresh_detail_if_needed();
                             }
-                            return Cmd::None;
                         }
-                        KeyCode::Backspace => {
-                            self.filter_text.pop();
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            self.cursor = self.cursor.saturating_sub(1);
+                            self.detail_scroll = 0;
+                            self.refresh_detail_if_needed();
+                        }
+                        KeyCode::Char('G') | KeyCode::End => {
+                            if !self.threads.is_empty() {
+                                self.cursor = self.threads.len() - 1;
+                                self.detail_scroll = 0;
+                                self.refresh_detail_if_needed();
+                            }
+                        }
+                        KeyCode::Home => {
+                            self.cursor = 0;
+                            self.detail_scroll = 0;
+                            self.refresh_detail_if_needed();
+                        }
+                        KeyCode::Char('g') => {
+                            self.show_mermaid_panel = !self.show_mermaid_panel;
+                        }
+                        // Page navigation
+                        KeyCode::Char('d') | KeyCode::PageDown => {
+                            if !self.threads.is_empty() {
+                                self.cursor = (self.cursor + 20).min(self.threads.len() - 1);
+                                self.detail_scroll = 0;
+                                self.refresh_detail_if_needed();
+                            }
+                        }
+                        KeyCode::Char('u') | KeyCode::PageUp => {
+                            self.cursor = self.cursor.saturating_sub(20);
+                            self.detail_scroll = 0;
+                            self.refresh_detail_if_needed();
+                        }
+                        // Enter detail pane (or deep-link to messages)
+                        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                            self.focus = Focus::DetailPanel;
+                        }
+                        // Deep-link: jump to timeline at thread last activity.
+                        KeyCode::Char('t') => {
+                            if let Some(thread) = self.threads.get(self.cursor) {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::TimelineAtTime(thread.last_timestamp_micros),
+                                ));
+                            }
+                        }
+                        // Search/filter
+                        KeyCode::Char('/') => {
+                            self.filter_editing = true;
+                        }
+                        // Cycle sort mode
+                        KeyCode::Char('s') => {
+                            self.sort_mode = self.sort_mode.next();
+                            self.apply_sort();
+                        }
+                        // Cycle view lens
+                        KeyCode::Char('v') => {
+                            self.view_lens = self.view_lens.next();
+                        }
+                        // Clear filter
+                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                            self.filter_text.clear();
                             self.list_dirty = true;
-                            return Cmd::None;
                         }
-                        KeyCode::Char(c) => {
-                            self.filter_text.push(c);
-                            self.list_dirty = true;
-                            return Cmd::None;
+                        KeyCode::Escape => {
+                            if self.show_mermaid_panel {
+                                self.show_mermaid_panel = false;
+                            }
                         }
-                        _ => return Cmd::None,
+                        _ => {}
                     }
                 }
-
-                match self.focus {
-                    Focus::ThreadList => {
-                        match key.code {
-                            // Cursor navigation
+                Focus::DetailPanel => {
+                    self.clamp_detail_cursor_to_tree_rows();
+                    let tree_rows = self.detail_tree_rows();
+                    match key.code {
+                        // Back to thread list
+                        KeyCode::Escape => {
+                            if self.show_mermaid_panel {
+                                self.show_mermaid_panel = false;
+                            } else {
+                                self.focus = Focus::ThreadList;
+                                self.load_older_selected = false;
+                            }
+                        }
+                        KeyCode::Char('g') => {
+                            self.show_mermaid_panel = !self.show_mermaid_panel;
+                        }
+                        // Toggle focus between hierarchy tree and preview pane.
+                        KeyCode::Tab => {
+                            self.detail_tree_focus = !self.detail_tree_focus;
+                        }
+                        // Search/filter
+                        KeyCode::Char('/') => {
+                            self.focus = Focus::ThreadList;
+                            self.filter_editing = true;
+                        }
+                        _ if self.detail_tree_focus => match key.code {
+                            // Tree navigation
                             KeyCode::Char('j') | KeyCode::Down => {
-                                if !self.threads.is_empty() {
-                                    self.cursor = (self.cursor + 1).min(self.threads.len() - 1);
-                                    self.detail_scroll = 0;
-                                    self.refresh_detail_if_needed();
+                                if self.detail_cursor + 1 < tree_rows.len() {
+                                    self.detail_cursor += 1;
                                 }
                             }
                             KeyCode::Char('k') | KeyCode::Up => {
-                                self.cursor = self.cursor.saturating_sub(1);
-                                self.detail_scroll = 0;
-                                self.refresh_detail_if_needed();
+                                self.detail_cursor = self.detail_cursor.saturating_sub(1);
                             }
-                            KeyCode::Char('G') | KeyCode::End => {
-                                if !self.threads.is_empty() {
-                                    self.cursor = self.threads.len() - 1;
-                                    self.detail_scroll = 0;
-                                    self.refresh_detail_if_needed();
-                                }
-                            }
-                            KeyCode::Home => {
-                                self.cursor = 0;
-                                self.detail_scroll = 0;
-                                self.refresh_detail_if_needed();
-                            }
-                            KeyCode::Char('g') => {
-                                self.show_mermaid_panel = !self.show_mermaid_panel;
-                            }
-                            // Page navigation
                             KeyCode::Char('d') | KeyCode::PageDown => {
-                                if !self.threads.is_empty() {
-                                    self.cursor = (self.cursor + 20).min(self.threads.len() - 1);
-                                    self.detail_scroll = 0;
-                                    self.refresh_detail_if_needed();
-                                }
+                                let step = 10usize;
+                                self.detail_cursor = (self.detail_cursor + step)
+                                    .min(tree_rows.len().saturating_sub(1));
                             }
                             KeyCode::Char('u') | KeyCode::PageUp => {
-                                self.cursor = self.cursor.saturating_sub(20);
-                                self.detail_scroll = 0;
-                                self.refresh_detail_if_needed();
+                                self.detail_cursor = self.detail_cursor.saturating_sub(10);
                             }
-                            // Enter detail pane (or deep-link to messages)
-                            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                                self.focus = Focus::DetailPanel;
+                            KeyCode::Char('G') | KeyCode::End => {
+                                self.detail_cursor = tree_rows.len().saturating_sub(1);
                             }
+                            KeyCode::Home => {
+                                self.detail_cursor = 0;
+                            }
+                            // Tree expansion controls (fall back to ThreadList if nothing to collapse)
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                let before = self.collapsed_tree_ids.len();
+                                self.collapse_selected_branch();
+                                if self.collapsed_tree_ids.len() == before {
+                                    self.focus = Focus::ThreadList;
+                                    self.load_older_selected = false;
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Char('l') => {
+                                self.expand_selected_branch();
+                            }
+                            KeyCode::Char(' ') => {
+                                self.toggle_selected_branch();
+                            }
+                            // Open selected message in preview mode.
+                            KeyCode::Enter => {
+                                self.toggle_selected_expansion();
+                                self.detail_tree_focus = false;
+                            }
+                            // Load more history
+                            KeyCode::Char('o') => {
+                                if self.has_older_messages() {
+                                    self.load_older_messages();
+                                    self.clamp_detail_cursor_to_tree_rows();
+                                }
+                            }
+                            // Expand/collapse all selected-message previews.
+                            KeyCode::Char('e') => self.expand_all(),
+                            KeyCode::Char('c') => self.collapse_all(),
                             // Deep-link: jump to timeline at thread last activity.
                             KeyCode::Char('t') => {
                                 if let Some(thread) = self.threads.get(self.cursor) {
@@ -1180,157 +1315,41 @@ impl MailScreen for ThreadExplorerScreen {
                                     ));
                                 }
                             }
-                            // Search/filter
-                            KeyCode::Char('/') => {
-                                self.filter_editing = true;
+                            _ => {}
+                        },
+                        _ => match key.code {
+                            // Preview scrolling/actions while preview has focus.
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                self.detail_scroll = self.detail_scroll.saturating_add(1);
                             }
-                            // Cycle sort mode
-                            KeyCode::Char('s') => {
-                                self.sort_mode = self.sort_mode.next();
-                                self.apply_sort();
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                self.detail_scroll = self.detail_scroll.saturating_sub(1);
                             }
-                            // Cycle view lens
-                            KeyCode::Char('v') => {
-                                self.view_lens = self.view_lens.next();
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                self.detail_tree_focus = true;
                             }
-                            // Clear filter
-                            KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
-                                self.filter_text.clear();
-                                self.list_dirty = true;
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                self.toggle_selected_expansion();
                             }
-                            KeyCode::Escape => {
-                                if self.show_mermaid_panel {
-                                    self.show_mermaid_panel = false;
+                            KeyCode::Char('o') => {
+                                if self.has_older_messages() {
+                                    self.load_older_messages();
+                                    self.clamp_detail_cursor_to_tree_rows();
+                                }
+                            }
+                            KeyCode::Char('e') => self.expand_all(),
+                            KeyCode::Char('c') => self.collapse_all(),
+                            KeyCode::Char('t') => {
+                                if let Some(thread) = self.threads.get(self.cursor) {
+                                    return Cmd::msg(MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::TimelineAtTime(
+                                            thread.last_timestamp_micros,
+                                        ),
+                                    ));
                                 }
                             }
                             _ => {}
-                        }
-                    }
-                    Focus::DetailPanel => {
-                        self.clamp_detail_cursor_to_tree_rows();
-                        let tree_rows = self.detail_tree_rows();
-                        match key.code {
-                            // Back to thread list
-                            KeyCode::Escape => {
-                                if self.show_mermaid_panel {
-                                    self.show_mermaid_panel = false;
-                                } else {
-                                    self.focus = Focus::ThreadList;
-                                    self.load_older_selected = false;
-                                }
-                            }
-                            KeyCode::Char('g') => {
-                                self.show_mermaid_panel = !self.show_mermaid_panel;
-                            }
-                            // Toggle focus between hierarchy tree and preview pane.
-                            KeyCode::Tab => {
-                                self.detail_tree_focus = !self.detail_tree_focus;
-                            }
-                            // Search/filter
-                            KeyCode::Char('/') => {
-                                self.focus = Focus::ThreadList;
-                                self.filter_editing = true;
-                            }
-                            _ if self.detail_tree_focus => match key.code {
-                                // Tree navigation
-                                KeyCode::Char('j') | KeyCode::Down => {
-                                    if self.detail_cursor + 1 < tree_rows.len() {
-                                        self.detail_cursor += 1;
-                                    }
-                                }
-                                KeyCode::Char('k') | KeyCode::Up => {
-                                    self.detail_cursor = self.detail_cursor.saturating_sub(1);
-                                }
-                                KeyCode::Char('d') | KeyCode::PageDown => {
-                                    let step = 10usize;
-                                    self.detail_cursor = (self.detail_cursor + step)
-                                        .min(tree_rows.len().saturating_sub(1));
-                                }
-                                KeyCode::Char('u') | KeyCode::PageUp => {
-                                    self.detail_cursor = self.detail_cursor.saturating_sub(10);
-                                }
-                                KeyCode::Char('G') | KeyCode::End => {
-                                    self.detail_cursor = tree_rows.len().saturating_sub(1);
-                                }
-                                KeyCode::Home => {
-                                    self.detail_cursor = 0;
-                                }
-                                // Tree expansion controls (fall back to ThreadList if nothing to collapse)
-                                KeyCode::Left | KeyCode::Char('h') => {
-                                    let before = self.collapsed_tree_ids.len();
-                                    self.collapse_selected_branch();
-                                    if self.collapsed_tree_ids.len() == before {
-                                        self.focus = Focus::ThreadList;
-                                        self.load_older_selected = false;
-                                    }
-                                }
-                                KeyCode::Right | KeyCode::Char('l') => {
-                                    self.expand_selected_branch();
-                                }
-                                KeyCode::Char(' ') => {
-                                    self.toggle_selected_branch();
-                                }
-                                // Open selected message in preview mode.
-                                KeyCode::Enter => {
-                                    self.toggle_selected_expansion();
-                                    self.detail_tree_focus = false;
-                                }
-                                // Load more history
-                                KeyCode::Char('o') => {
-                                    if self.has_older_messages() {
-                                        self.load_older_messages();
-                                        self.clamp_detail_cursor_to_tree_rows();
-                                    }
-                                }
-                                // Expand/collapse all selected-message previews.
-                                KeyCode::Char('e') => self.expand_all(),
-                                KeyCode::Char('c') => self.collapse_all(),
-                                // Deep-link: jump to timeline at thread last activity.
-                                KeyCode::Char('t') => {
-                                    if let Some(thread) = self.threads.get(self.cursor) {
-                                        return Cmd::msg(MailScreenMsg::DeepLink(
-                                            DeepLinkTarget::TimelineAtTime(
-                                                thread.last_timestamp_micros,
-                                            ),
-                                        ));
-                                    }
-                                }
-                                _ => {}
-                            },
-                            _ => match key.code {
-                                // Preview scrolling/actions while preview has focus.
-                                KeyCode::Char('j') | KeyCode::Down => {
-                                    self.detail_scroll = self.detail_scroll.saturating_add(1);
-                                }
-                                KeyCode::Char('k') | KeyCode::Up => {
-                                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                                }
-                                KeyCode::Left | KeyCode::Char('h') => {
-                                    self.detail_tree_focus = true;
-                                }
-                                KeyCode::Enter | KeyCode::Char(' ') => {
-                                    self.toggle_selected_expansion();
-                                }
-                                KeyCode::Char('o') => {
-                                    if self.has_older_messages() {
-                                        self.load_older_messages();
-                                        self.clamp_detail_cursor_to_tree_rows();
-                                    }
-                                }
-                                KeyCode::Char('e') => self.expand_all(),
-                                KeyCode::Char('c') => self.collapse_all(),
-                                KeyCode::Char('t') => {
-                                    if let Some(thread) = self.threads.get(self.cursor) {
-                                        return Cmd::msg(MailScreenMsg::DeepLink(
-                                            DeepLinkTarget::TimelineAtTime(
-                                                thread.last_timestamp_micros,
-                                            ),
-                                        ));
-                                    }
-                                }
-                                _ => {}
-                            },
-                        }
+                        },
                     }
                 }
             }
@@ -1340,7 +1359,7 @@ impl MailScreen for ThreadExplorerScreen {
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         self.urgent_pulse_on =
-            self.reduced_motion || ((tick_count / URGENT_PULSE_HALF_PERIOD_TICKS) % 2) == 0;
+            self.reduced_motion || (tick_count / URGENT_PULSE_HALF_PERIOD_TICKS).is_multiple_of(2);
         self.promote_pending_message_drag_if_due(state);
         // Initial load or dirty flag
         if self.list_dirty {
@@ -1389,6 +1408,10 @@ impl MailScreen for ThreadExplorerScreen {
         if area.height < 4 || area.width < 20 {
             return;
         }
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        // Hard-clear the full screen area before drawing filter/list/detail panes.
+        // This prevents stale border glyphs from previous layouts leaking through.
+        clear_rect(frame, area, tp.bg_deep);
 
         // Filter bar (always visible: hint when collapsed, input when active)
         let has_filter = !self.filter_text.is_empty();
@@ -1405,7 +1428,6 @@ impl MailScreen for ThreadExplorerScreen {
         );
 
         let content_area = Rect::new(area.x, area.y + filter_height, area.width, content_height);
-        let tp = crate::tui_theme::TuiThemePalette::current();
         // Always repaint content background so mode switches never leave stray borders.
         clear_rect(frame, content_area, tp.bg_deep);
         let drop_visual = match &self.message_drag {
@@ -1422,7 +1444,7 @@ impl MailScreen for ThreadExplorerScreen {
         if content_area.width >= THREAD_SPLIT_WIDTH_THRESHOLD {
             let pane_gap = u16::from(content_area.width >= THREAD_MAIN_PANE_GAP_THRESHOLD);
             let available_width = content_area.width.saturating_sub(pane_gap);
-            let list_width = available_width * 40 / 100;
+            let list_width = available_width * thread_list_width_percent(content_area.width) / 100;
             let detail_width = available_width.saturating_sub(list_width);
             let list_area = Rect::new(
                 content_area.x,
@@ -1446,10 +1468,7 @@ impl MailScreen for ThreadExplorerScreen {
                     pane_gap,
                     content_area.height,
                 );
-                clear_rect(frame, splitter_area, tp.bg_deep);
-                if !self.threads.is_empty() {
-                    render_splitter_handle(frame, splitter_area, true, true);
-                }
+                render_splitter_handle(frame, splitter_area, true, false);
             }
             self.last_list_area.set(list_area);
             self.last_detail_area.set(detail_area);
@@ -1532,10 +1551,7 @@ impl MailScreen for ThreadExplorerScreen {
                     content_area.width,
                     stack_gap,
                 );
-                clear_rect(frame, splitter_area, tp.bg_deep);
-                if !self.threads.is_empty() {
-                    render_splitter_handle(frame, splitter_area, false, true);
-                }
+                render_splitter_handle(frame, splitter_area, false, false);
             }
             self.last_list_area.set(list_area);
             self.last_detail_area.set(detail_area);
@@ -2052,6 +2068,7 @@ fn render_thread_list(
         crate::tui_theme::focus_border_color(&tp, focused)
     };
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
@@ -2064,14 +2081,8 @@ fn render_thread_list(
     // Clear interior cells each frame to avoid stale glyphs from previous layouts.
     clear_rect(frame, inner, tp.panel_bg);
 
-    let content_inner = if inner.width > 2 && inner.height > 2 {
-        Rect::new(
-            inner.x.saturating_add(1),
-            inner.y.saturating_add(1),
-            inner.width.saturating_sub(2),
-            inner.height.saturating_sub(1),
-        )
-    } else if inner.width > 2 {
+    // Use full inner area to maximize density and reduce wasted space.
+    let content_inner = if inner.width >= THREAD_LIST_SIDE_PADDING_MIN_WIDTH {
         Rect::new(
             inner.x.saturating_add(1),
             inner.y,
@@ -2081,6 +2092,9 @@ fn render_thread_list(
     } else {
         inner
     };
+    if content_inner.height == 0 || content_inner.width == 0 {
+        return;
+    }
     let visible_height = content_inner.height as usize;
 
     if threads.is_empty() {
@@ -2096,7 +2110,8 @@ fn render_thread_list(
     let viewport = &threads[start..end];
 
     let inner_w = content_inner.width as usize;
-    let show_subject = visible_height > viewport.len() * 2 || viewport.len() <= 5;
+    let show_subject = (visible_height > viewport.len() * 2 || viewport.len() <= 5)
+        && inner_w >= THREAD_SUBJECT_LINE_MIN_WIDTH;
     let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len() * 2);
     for (view_idx, thread) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
@@ -2126,6 +2141,31 @@ fn render_thread_list(
         } else {
             Style::default()
         };
+
+        if inner_w < THREAD_LIST_COMPACT_MIN_WIDTH {
+            let compact_id = truncate_display_width(&thread.thread_id, inner_w.saturating_sub(6));
+            let mut compact_line = Line::from_spans([
+                Span::raw(marker),
+                Span::styled(esc_badge, esc_style),
+                Span::raw(" ".to_string()),
+                Span::styled(compact_id, Style::default().fg(tp.text_primary)),
+            ]);
+            if is_selected || (hovered_here && valid_drop_zone) {
+                compact_line.apply_base_style(
+                    Style::default()
+                        .fg(tp.selection_fg)
+                        .bg(tp.selection_bg)
+                        .bold(),
+                );
+            } else if hovered_here {
+                compact_line.apply_base_style(Style::default().fg(tp.severity_warn).bold());
+            } else if valid_drop_zone {
+                compact_line
+                    .apply_base_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
+            }
+            text_lines.push(clip_line_to_display_width(compact_line, inner_w));
+            continue;
+        }
 
         // Compact timestamp (HH:MM from ISO string)
         let time_short = if thread.last_timestamp_iso.len() >= 16 {
@@ -2248,8 +2288,9 @@ fn render_thread_list(
         } else if hovered_here {
             primary.apply_base_style(Style::default().fg(tp.severity_warn).bold());
         } else if valid_drop_zone {
-            primary.apply_base_style(Style::default().bg(tp.selection_bg));
+            primary.apply_base_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
         }
+        primary = clip_line_to_display_width(primary, inner_w);
         text_lines.push(primary);
 
         // Second line: last subject (if there's room)
@@ -2291,8 +2332,10 @@ fn render_thread_list(
             } else if !is_selected && hovered_here {
                 subj_line.apply_base_style(Style::default().fg(tp.severity_warn).bold());
             } else if !is_selected && valid_drop_zone {
-                subj_line.apply_base_style(Style::default().bg(tp.selection_bg));
+                subj_line
+                    .apply_base_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
             }
+            subj_line = clip_line_to_display_width(subj_line, inner_w);
             text_lines.push(subj_line);
         }
     }
@@ -2316,10 +2359,13 @@ fn render_thread_list(
             ),
             inner_w.saturating_sub(2),
         );
-        text_lines.push(Line::from_spans([
-            Span::styled("  ", Style::default()),
-            Span::styled(summary, crate::tui_theme::text_meta(&tp)),
-        ]));
+        text_lines.push(clip_line_to_display_width(
+            Line::from_spans([
+                Span::styled("  ", crate::tui_theme::text_meta(&tp)),
+                Span::styled(summary, crate::tui_theme::text_meta(&tp)),
+            ]),
+            inner_w,
+        ));
     }
     if remaining_rows >= 3 {
         let selected = &threads[cursor_clamped];
@@ -2335,10 +2381,13 @@ fn render_thread_list(
             )
         };
         let participant_line = truncate_display_width(&participant_line, inner_w.saturating_sub(2));
-        text_lines.push(Line::from_spans([
-            Span::styled("  ", Style::default()),
-            Span::styled(participant_line, crate::tui_theme::text_hint(&tp)),
-        ]));
+        text_lines.push(clip_line_to_display_width(
+            Line::from_spans([
+                Span::styled("  ", crate::tui_theme::text_hint(&tp)),
+                Span::styled(participant_line, crate::tui_theme::text_hint(&tp)),
+            ]),
+            inner_w,
+        ));
     }
 
     let text = Text::from_lines(text_lines);
@@ -2383,6 +2432,7 @@ fn render_thread_detail(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -2394,14 +2444,8 @@ fn render_thread_detail(
     }
     // Clear interior cells each frame to avoid stale tree/border glyph artifacts.
     clear_rect(frame, inner, tp.panel_bg);
-    let content_inner = if inner.width > 2 && inner.height > 2 {
-        Rect::new(
-            inner.x.saturating_add(1),
-            inner.y.saturating_add(1),
-            inner.width.saturating_sub(2),
-            inner.height.saturating_sub(1),
-        )
-    } else if inner.width > 2 {
+    // Use full inner area to maximize density and reduce wasted space.
+    let content_inner = if inner.width >= THREAD_DETAIL_SIDE_PADDING_MIN_WIDTH {
         Rect::new(
             inner.x.saturating_add(1),
             inner.y,
@@ -2502,7 +2546,7 @@ fn render_thread_detail(
         Line::from_spans([
             Span::styled("Mode: ", crate::tui_theme::text_meta(&tp)),
             Span::styled("Tree", Style::default().fg(tp.text_primary).bold()),
-            Span::styled("  ", Style::default()),
+            Span::styled("  ", crate::tui_theme::text_meta(&tp)),
             Span::styled("Tab", crate::tui_theme::text_action_key(&tp)),
             Span::styled(" Preview", crate::tui_theme::text_hint(&tp)),
         ])
@@ -2510,7 +2554,7 @@ fn render_thread_detail(
         Line::from_spans([
             Span::styled("Mode: ", crate::tui_theme::text_meta(&tp)),
             Span::styled("Preview", Style::default().fg(tp.text_primary).bold()),
-            Span::styled("  ", Style::default()),
+            Span::styled("  ", crate::tui_theme::text_meta(&tp)),
             Span::styled("Tab", crate::tui_theme::text_action_key(&tp)),
             Span::styled(" Tree", crate::tui_theme::text_hint(&tp)),
         ])
@@ -2564,6 +2608,7 @@ fn render_thread_detail(
             .saturating_sub(header_height)
             .saturating_sub(header_gap),
     );
+    clear_rect(frame, body_area, tp.panel_bg);
     if header_area.height > 0 {
         Paragraph::new(Text::from_lines(header_lines))
             .style(crate::tui_theme::text_primary(&tp))
@@ -2578,125 +2623,168 @@ fn render_thread_detail(
             header_gap,
         );
         clear_rect(frame, separator, tp.panel_bg);
-        let center_x = separator.x.saturating_add(separator.width / 2);
-        let center_y = separator.y.saturating_add(separator.height / 2);
-        if let Some(cell) = frame.buffer.get_mut(center_x, center_y) {
-            *cell = ftui::Cell::from_char('•');
-            cell.fg = if focused {
-                tp.panel_border_focused
-            } else {
-                tp.panel_border_dim
-            };
-            cell.bg = tp.panel_bg;
-        }
     }
     if body_area.width < 10 || body_area.height == 0 {
         return;
     }
 
-    let pane_gap = u16::from(body_area.width >= THREAD_DETAIL_PANE_GAP_THRESHOLD);
+    let compact_detail_mode = body_area.width < THREAD_DETAIL_COMPACT_WIDTH_THRESHOLD
+        || body_area.height < THREAD_DETAIL_COMPACT_HEIGHT_THRESHOLD;
+    let min_split_width = THREAD_DETAIL_MIN_PREVIEW_WIDTH
+        .saturating_add(12)
+        .saturating_add(1);
+    let pane_gap = u16::from(
+        !compact_detail_mode
+            && body_area.width >= THREAD_DETAIL_PANE_GAP_THRESHOLD.max(min_split_width),
+    );
     let available_width = body_area.width.saturating_sub(pane_gap);
     let min_preview_width =
         THREAD_DETAIL_MIN_PREVIEW_WIDTH.min(available_width.saturating_sub(1).max(1));
     let max_tree_width = available_width.saturating_sub(min_preview_width);
     let min_tree_width = 12_u16.min(max_tree_width.max(1));
-    let preferred_tree_width = ((u32::from(body_area.width) * 60) / 100) as u16;
+    let preferred_tree_width = ((u32::from(body_area.width)
+        * u32::from(thread_tree_width_percent(body_area.width)))
+        / 100) as u16;
     let tree_width = preferred_tree_width.max(min_tree_width).min(max_tree_width);
     let preview_width = available_width.saturating_sub(tree_width);
 
-    let tree_area = Rect::new(body_area.x, body_area.y, tree_width, body_area.height);
-    let preview_area = Rect::new(
-        body_area
-            .x
-            .saturating_add(tree_width)
-            .saturating_add(pane_gap),
-        body_area.y,
-        preview_width,
-        body_area.height,
-    );
-    if pane_gap > 0 {
+    let (mut tree_area, mut preview_area) = if compact_detail_mode {
+        (Rect::new(0, 0, 0, 0), body_area)
+    } else {
+        (
+            Rect::new(body_area.x, body_area.y, tree_width, body_area.height),
+            Rect::new(
+                body_area
+                    .x
+                    .saturating_add(tree_width)
+                    .saturating_add(pane_gap),
+                body_area.y,
+                preview_width,
+                body_area.height,
+            ),
+        )
+    };
+    let render_tree_pane = !compact_detail_mode
+        && tree_area.width >= THREAD_DETAIL_MIN_PANE_RENDER_WIDTH
+        && tree_area.height >= 3;
+    let preview_min_width = if compact_detail_mode {
+        8
+    } else {
+        THREAD_DETAIL_MIN_PANE_RENDER_WIDTH
+    };
+    let render_preview_pane = preview_area.width >= preview_min_width && preview_area.height >= 3;
+    if render_preview_pane && !render_tree_pane {
+        preview_area = body_area;
+    }
+    if render_tree_pane && !render_preview_pane {
+        tree_area = body_area;
+    }
+    if pane_gap > 0 && render_tree_pane && render_preview_pane {
         let splitter_area = Rect::new(
             body_area.x.saturating_add(tree_width),
             body_area.y,
             pane_gap,
             body_area.height,
         );
-        clear_rect(frame, splitter_area, tp.panel_bg);
-        render_splitter_handle(frame, splitter_area, true, focused);
+        render_splitter_handle(frame, splitter_area, true, false);
     }
 
-    let tree_title_raw = if focused && tree_focus {
-        if tree_area.width < 18 {
-            "Tree *"
-        } else {
-            "Hierarchy *"
-        }
-    } else if tree_area.width < 18 {
-        "Tree"
-    } else {
-        "Hierarchy"
-    };
-    let tree_title = fit_panel_title(tree_title_raw, tree_area.width);
-    let tree_block = Block::default()
-        .title(tree_title.as_str())
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(
-            &tp,
-            focused && tree_focus,
-        )));
-    let tree_inner = tree_block.inner(tree_area);
-    tree_block.render(tree_area, frame);
-    if tree_inner.width > 0 && tree_inner.height > 0 {
-        clear_rect(frame, tree_inner, tp.panel_bg);
-        let guides = thread_tree_guides();
-        let indent_token = tree_indent_token(guides);
-        let marker_len = crate::tui_theme::SELECTION_PREFIX.chars().count();
-        let max_depth = usize::from(tree_inner.width / 3).saturating_sub(1).max(1);
-        let selected_style = Style::default()
-            .fg(tp.selection_fg)
-            .bg(tp.selection_bg)
-            .bold();
-        let (start, end) =
-            viewport_range(tree_rows.len(), tree_inner.height as usize, selected_idx);
-        let rows = &tree_rows[start..end];
-        let mut lines = Vec::with_capacity(rows.len());
-        for row in rows {
-            let is_selected = row.message_id == selected_row.message_id;
-            let marker = if is_selected {
-                crate::tui_theme::SELECTION_PREFIX
+    if render_tree_pane {
+        clear_rect(frame, tree_area, tp.panel_bg);
+        let tree_title_raw = if focused && tree_focus {
+            if tree_area.width < 18 {
+                "Tree *"
             } else {
-                crate::tui_theme::SELECTION_PREFIX_EMPTY
-            };
-            let depth = row.depth.min(max_depth);
-            let indent = indent_token.repeat(depth);
-            let available = usize::from(tree_inner.width)
-                .saturating_sub(marker_len)
-                .saturating_sub(ftui::text::display_width(indent.as_str()))
-                .saturating_sub(1);
-            let label = truncate_display_width(&row.label, available);
-            let mut line = Line::from_spans([
-                Span::styled(marker.to_string(), crate::tui_theme::text_meta(&tp)),
-                Span::styled(indent, crate::tui_theme::text_meta(&tp)),
+                "Hierarchy *"
+            }
+        } else if tree_area.width < 18 {
+            "Tree"
+        } else {
+            "Hierarchy"
+        };
+        let tree_title = fit_panel_title(tree_title_raw, tree_area.width);
+        let tree_header_h = u16::from(tree_area.height >= 2);
+        if tree_header_h > 0 {
+            let header_line = Line::from_spans([
+                Span::styled(" ".to_string(), crate::tui_theme::text_meta(&tp)),
                 Span::styled(
-                    label,
-                    if row.has_children {
-                        crate::tui_theme::text_primary(&tp)
+                    tree_title,
+                    if focused && tree_focus {
+                        crate::tui_theme::text_primary(&tp).bold()
                     } else {
-                        crate::tui_theme::text_hint(&tp)
+                        crate::tui_theme::text_meta(&tp)
                     },
                 ),
             ]);
-            if is_selected {
-                line.apply_base_style(selected_style);
-            }
-            lines.push(line);
+            Paragraph::new(Text::from_line(header_line)).render(
+                Rect::new(tree_area.x, tree_area.y, tree_area.width, tree_header_h),
+                frame,
+            );
         }
-        Paragraph::new(Text::from_lines(lines))
-            .wrap(ftui::text::WrapMode::None)
-            .render(tree_inner, frame);
+        let tree_inner = Rect::new(
+            tree_area.x,
+            tree_area.y.saturating_add(tree_header_h),
+            tree_area.width,
+            tree_area.height.saturating_sub(tree_header_h),
+        );
+        if tree_inner.width > 0 && tree_inner.height > 0 {
+            let guides = thread_tree_guides();
+            let indent_token = tree_indent_token(guides);
+            let marker_len = crate::tui_theme::SELECTION_PREFIX.chars().count();
+            let max_depth = usize::from(tree_inner.width / 3).saturating_sub(1).max(1);
+            let selected_style = Style::default()
+                .fg(tp.selection_fg)
+                .bg(tp.selection_bg)
+                .bold();
+            let (start, end) =
+                viewport_range(tree_rows.len(), tree_inner.height as usize, selected_idx);
+            let rows = &tree_rows[start..end];
+            let mut lines = Vec::with_capacity(rows.len());
+            for row in rows {
+                let is_selected = row.message_id == selected_row.message_id;
+                let marker = if is_selected {
+                    crate::tui_theme::SELECTION_PREFIX
+                } else {
+                    crate::tui_theme::SELECTION_PREFIX_EMPTY
+                };
+                let depth = row.depth.min(max_depth);
+                let indent = indent_token.repeat(depth);
+                let available = usize::from(tree_inner.width)
+                    .saturating_sub(marker_len)
+                    .saturating_sub(ftui::text::display_width(indent.as_str()))
+                    .saturating_sub(1);
+                let label = truncate_display_width(&row.label, available);
+                let mut line = Line::from_spans([
+                    Span::styled(marker.to_string(), crate::tui_theme::text_meta(&tp)),
+                    Span::styled(indent, crate::tui_theme::text_meta(&tp)),
+                    Span::styled(
+                        label,
+                        if row.has_children {
+                            crate::tui_theme::text_primary(&tp)
+                        } else {
+                            crate::tui_theme::text_hint(&tp)
+                        },
+                    ),
+                ]);
+                if is_selected {
+                    line.apply_base_style(selected_style);
+                }
+                lines.push(line);
+            }
+            Paragraph::new(Text::from_lines(lines))
+                .wrap(ftui::text::WrapMode::None)
+                .render(tree_inner, frame);
+        }
+    } else if !render_preview_pane {
+        return;
     }
 
-    let preview_title_raw = if focused && !tree_focus {
+    if !render_preview_pane {
+        return;
+    }
+    let preview_title_raw = if compact_detail_mode {
+        if focused { "Message *" } else { "Message" }
+    } else if focused && !tree_focus {
         if preview_area.width < 18 {
             "Msg *"
         } else {
@@ -2707,37 +2795,49 @@ fn render_thread_detail(
     } else {
         "Preview"
     };
+    clear_rect(frame, preview_area, tp.panel_bg);
     let preview_title = fit_panel_title(preview_title_raw, preview_area.width);
-    let preview_block = Block::default()
-        .title(preview_title.as_str())
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(
-            &tp,
-            focused && !tree_focus,
-        )));
-    let preview_inner = preview_block.inner(preview_area);
-    preview_block.render(preview_area, frame);
+    let preview_header_h = u16::from(preview_area.height >= 2);
+    if preview_header_h > 0 {
+        let header_line = Line::from_spans([
+            Span::styled(" ".to_string(), crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                preview_title,
+                if focused && !tree_focus {
+                    crate::tui_theme::text_primary(&tp).bold()
+                } else {
+                    crate::tui_theme::text_meta(&tp)
+                },
+            ),
+        ]);
+        Paragraph::new(Text::from_line(header_line)).render(
+            Rect::new(
+                preview_area.x,
+                preview_area.y,
+                preview_area.width,
+                preview_header_h,
+            ),
+            frame,
+        );
+    }
+    let preview_inner = Rect::new(
+        preview_area.x,
+        preview_area.y.saturating_add(preview_header_h),
+        preview_area.width,
+        preview_area.height.saturating_sub(preview_header_h),
+    );
     if preview_inner.width == 0 || preview_inner.height == 0 {
         return;
     }
-    clear_rect(frame, preview_inner, tp.panel_bg);
-    let preview_content = if preview_inner.width > 2 && preview_inner.height > 1 {
-        Rect::new(
-            preview_inner.x.saturating_add(1),
-            preview_inner.y.saturating_add(1),
-            preview_inner.width.saturating_sub(2),
-            preview_inner.height.saturating_sub(1),
-        )
-    } else if preview_inner.width > 2 {
-        Rect::new(
-            preview_inner.x.saturating_add(1),
-            preview_inner.y,
-            preview_inner.width.saturating_sub(2),
-            preview_inner.height,
-        )
-    } else {
+    let preview_pad_x = u16::from(preview_inner.width >= 28);
+    let preview_content = Rect::new(
+        preview_inner.x.saturating_add(preview_pad_x),
+        preview_inner.y,
         preview_inner
-    };
+            .width
+            .saturating_sub(preview_pad_x.saturating_mul(2)),
+        preview_inner.height,
+    );
     if preview_content.width == 0 || preview_content.height == 0 {
         return;
     }
@@ -3089,7 +3189,49 @@ fn truncate_display_width(s: &str, max_width: usize) -> String {
         used = used.saturating_add(ch_w);
     }
     out.push('…');
+    while ftui::text::display_width(out.as_str()) > max_width {
+        let _ = out.pop();
+        if out.pop().is_none() {
+            return "…".to_string();
+        }
+        out.push('…');
+    }
     out
+}
+
+/// Clip a styled line to `max_width` display cells while preserving style/link metadata.
+fn clip_line_to_display_width(line: Line, max_width: usize) -> Line {
+    if max_width == 0 {
+        return Line::raw(String::new());
+    }
+    if line.width() <= max_width {
+        return line;
+    }
+
+    let mut remaining = max_width;
+    let mut clipped: Vec<Span<'static>> = Vec::new();
+    for span in line.spans() {
+        if remaining == 0 {
+            break;
+        }
+        let span_width = span.width();
+        if span_width <= remaining {
+            clipped.push(span.clone());
+            remaining = remaining.saturating_sub(span_width);
+            continue;
+        }
+        let truncated = truncate_display_width(span.as_str(), remaining);
+        if !truncated.is_empty() {
+            clipped.push(Span {
+                content: Cow::Owned(truncated),
+                style: span.style,
+                link: span.link.clone(),
+            });
+        }
+        break;
+    }
+
+    Line::from_spans(clipped)
 }
 
 /// Fit a block title to a panel width, preserving rounded-border margins.
@@ -3711,6 +3853,73 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(120, 30, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+    }
+
+    #[test]
+    fn thread_list_content_does_not_emit_box_drawing_glyphs() {
+        let threads = vec![
+            make_thread(
+                "thread-very-long-identifier-aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                7,
+                3,
+            ),
+            make_thread(
+                "thread-very-long-identifier-bbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                5,
+                2,
+            ),
+            make_thread(
+                "thread-very-long-identifier-cccccccccccccccccccccccccccc",
+                4,
+                1,
+            ),
+        ];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(72, 16, &mut pool);
+        let area = Rect::new(0, 0, 72, 16);
+        render_thread_list(
+            &mut frame,
+            area,
+            &threads,
+            0,
+            true,
+            ViewLens::Activity,
+            SortMode::Newest,
+            false,
+            None,
+            None,
+        );
+
+        let inner = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        let content = if inner.width >= THREAD_LIST_SIDE_PADDING_MIN_WIDTH {
+            Rect::new(
+                inner.x.saturating_add(1),
+                inner.y,
+                inner.width.saturating_sub(2),
+                inner.height,
+            )
+        } else {
+            inner
+        };
+
+        for y in content.y..content.y.saturating_add(content.height) {
+            for x in content.x..content.x.saturating_add(content.width) {
+                let ch = frame
+                    .buffer
+                    .get(x, y)
+                    .and_then(|cell| cell.content.as_char())
+                    .unwrap_or(' ');
+                assert!(
+                    !matches!(ch as u32, 0x2500..=0x257F),
+                    "unexpected box-drawing glyph {ch:?} in content at ({x},{y})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -304,11 +304,11 @@ struct PressureBoard {
 }
 
 impl PressureBoard {
-    fn total_cards(&self) -> usize {
+    const fn total_cards(&self) -> usize {
         self.overdue_acks.len() + self.unread_hotspots.len() + self.reservation_pressure.len()
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.total_cards() == 0
     }
 }
@@ -801,144 +801,144 @@ impl MailScreen for MailExplorerScreen {
             }
             return Cmd::None;
         }
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                match self.focus {
-                    Focus::SearchBar => match key.code {
-                        KeyCode::Enter => {
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            match self.focus {
+                Focus::SearchBar => match key.code {
+                    KeyCode::Enter => {
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                        self.focus = Focus::ResultList;
+                        self.search_input.set_focused(false);
+                    }
+                    KeyCode::Escape => {
+                        self.focus = Focus::ResultList;
+                        self.search_input.set_focused(false);
+                    }
+                    KeyCode::Tab => {
+                        self.focus = Focus::FilterRail;
+                        self.search_input.set_focused(false);
+                    }
+                    _ => {
+                        let before = self.search_input.value().to_string();
+                        self.search_input.handle_event(event);
+                        if self.search_input.value() != before {
                             self.search_dirty = true;
-                            self.debounce_remaining = 0;
-                            self.focus = Focus::ResultList;
-                            self.search_input.set_focused(false);
+                            self.debounce_remaining = DEBOUNCE_TICKS;
                         }
-                        KeyCode::Escape => {
-                            self.focus = Focus::ResultList;
-                            self.search_input.set_focused(false);
-                        }
-                        KeyCode::Tab => {
-                            self.focus = Focus::FilterRail;
-                            self.search_input.set_focused(false);
-                        }
-                        _ => {
-                            let before = self.search_input.value().to_string();
-                            self.search_input.handle_event(event);
-                            if self.search_input.value() != before {
-                                self.search_dirty = true;
-                                self.debounce_remaining = DEBOUNCE_TICKS;
-                            }
-                        }
-                    },
+                    }
+                },
 
-                    Focus::FilterRail => match key.code {
-                        KeyCode::Escape | KeyCode::Char('q') | KeyCode::Tab => {
-                            self.focus = Focus::ResultList;
-                        }
-                        KeyCode::Char('/') => {
-                            self.focus = Focus::SearchBar;
-                            self.search_input.set_focused(true);
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            self.active_filter = self.active_filter.next();
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            self.active_filter = self.active_filter.prev();
-                        }
-                        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
-                            self.toggle_active_filter();
-                        }
-                        KeyCode::Left => {
-                            // Same as toggle for simplicity
-                            self.toggle_active_filter();
-                        }
-                        KeyCode::Char('r') => {
-                            self.reset_filters();
-                        }
-                        _ => {}
-                    },
+                Focus::FilterRail => match key.code {
+                    KeyCode::Escape | KeyCode::Char('q') | KeyCode::Tab => {
+                        self.focus = Focus::ResultList;
+                    }
+                    KeyCode::Char('/') => {
+                        self.focus = Focus::SearchBar;
+                        self.search_input.set_focused(true);
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.active_filter = self.active_filter.next();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.active_filter = self.active_filter.prev();
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                        self.toggle_active_filter();
+                    }
+                    KeyCode::Left => {
+                        // Same as toggle for simplicity
+                        self.toggle_active_filter();
+                    }
+                    KeyCode::Char('r') => {
+                        self.reset_filters();
+                    }
+                    _ => {}
+                },
 
-                    Focus::ResultList => match key.code {
-                        KeyCode::Char('/') => {
-                            self.focus = Focus::SearchBar;
-                            self.search_input.set_focused(true);
-                        }
-                        KeyCode::Tab | KeyCode::Char('f') => {
-                            self.focus = Focus::FilterRail;
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !self.entries.is_empty() {
-                                self.cursor = (self.cursor + 1).min(self.entries.len() - 1);
-                                self.detail_scroll = 0;
-                            }
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            self.cursor = self.cursor.saturating_sub(1);
+                Focus::ResultList => match key.code {
+                    KeyCode::Char('/') => {
+                        self.focus = Focus::SearchBar;
+                        self.search_input.set_focused(true);
+                    }
+                    KeyCode::Tab | KeyCode::Char('f') => {
+                        self.focus = Focus::FilterRail;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if !self.entries.is_empty() {
+                            self.cursor = (self.cursor + 1).min(self.entries.len() - 1);
                             self.detail_scroll = 0;
                         }
-                        KeyCode::Char('G') | KeyCode::End => {
-                            if !self.entries.is_empty() {
-                                self.cursor = self.entries.len() - 1;
-                                self.detail_scroll = 0;
-                            }
-                        }
-                        KeyCode::Char('g') | KeyCode::Home => {
-                            self.cursor = 0;
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.cursor = self.cursor.saturating_sub(1);
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Char('G') | KeyCode::End => {
+                        if !self.entries.is_empty() {
+                            self.cursor = self.entries.len() - 1;
                             self.detail_scroll = 0;
                         }
-                        KeyCode::Char('d') | KeyCode::PageDown => {
-                            if !self.entries.is_empty() {
-                                self.cursor = (self.cursor + 20).min(self.entries.len() - 1);
-                                self.detail_scroll = 0;
-                            }
-                        }
-                        KeyCode::Char('u') | KeyCode::PageUp => {
-                            self.cursor = self.cursor.saturating_sub(20);
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => {
+                        self.cursor = 0;
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Char('d') | KeyCode::PageDown => {
+                        if !self.entries.is_empty() {
+                            self.cursor = (self.cursor + 20).min(self.entries.len() - 1);
                             self.detail_scroll = 0;
                         }
-                        KeyCode::Char('J') => {
-                            self.detail_scroll += 1;
+                    }
+                    KeyCode::Char('u') | KeyCode::PageUp => {
+                        self.cursor = self.cursor.saturating_sub(20);
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Char('J') => {
+                        self.detail_scroll += 1;
+                    }
+                    KeyCode::Char('K') => {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                    }
+                    // Deep-link: Enter on result
+                    KeyCode::Enter => {
+                        if let Some(entry) = self.entries.get(self.cursor) {
+                            return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::MessageById(
+                                entry.message_id,
+                            )));
                         }
-                        KeyCode::Char('K') => {
-                            self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                    }
+                    // Quick filter toggles
+                    KeyCode::Char('D') => {
+                        self.direction = next_direction(self.direction);
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                    }
+                    KeyCode::Char('s') => {
+                        self.sort_mode = next_sort(self.sort_mode);
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                    }
+                    KeyCode::Char('a') => {
+                        self.ack_filter = next_ack(self.ack_filter);
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                    }
+                    // Toggle pressure board
+                    KeyCode::Char('P') => {
+                        self.pressure_mode = !self.pressure_mode;
+                        if self.pressure_mode {
+                            self.pressure_dirty = true;
                         }
-                        // Deep-link: Enter on result
-                        KeyCode::Enter => {
-                            if let Some(entry) = self.entries.get(self.cursor) {
-                                return Cmd::msg(MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::MessageById(entry.message_id),
-                                ));
-                            }
-                        }
-                        // Quick filter toggles
-                        KeyCode::Char('D') => {
-                            self.direction = next_direction(self.direction);
-                            self.search_dirty = true;
-                            self.debounce_remaining = 0;
-                        }
-                        KeyCode::Char('s') => {
-                            self.sort_mode = next_sort(self.sort_mode);
-                            self.search_dirty = true;
-                            self.debounce_remaining = 0;
-                        }
-                        KeyCode::Char('a') => {
-                            self.ack_filter = next_ack(self.ack_filter);
-                            self.search_dirty = true;
-                            self.debounce_remaining = 0;
-                        }
-                        // Toggle pressure board
-                        KeyCode::Char('P') => {
-                            self.pressure_mode = !self.pressure_mode;
-                            if self.pressure_mode {
-                                self.pressure_dirty = true;
-                            }
-                        }
-                        // Clear all
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
-                            self.search_input.clear();
-                            self.reset_filters();
-                        }
-                        _ => {}
-                    },
-                }
+                    }
+                    // Clear all
+                    KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        self.search_input.clear();
+                        self.reset_filters();
+                    }
+                    _ => {}
+                },
             }
         }
         Cmd::None

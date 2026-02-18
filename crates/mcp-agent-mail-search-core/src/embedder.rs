@@ -426,7 +426,8 @@ impl ModelRegistry {
 
         // Find first available at requested tier
         for (id, info) in &self.models {
-            if info.tier == tier && info.available
+            if info.tier == tier
+                && info.available
                 && let Some(embedder) = self.embedders.get(id)
             {
                 return Ok(embedder.clone());

@@ -948,21 +948,21 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
 
     // ── Cross-origin headers check ──────────────────────────────────
     let headers_path = bundle_dir.join("_headers");
-    if headers_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&headers_path) {
-            let has_coop = content.contains("Cross-Origin-Opener-Policy");
-            let has_coep = content.contains("Cross-Origin-Embedder-Policy");
-            checks.push(DeployCheck {
-                name: "coop_coep_headers".to_string(),
-                passed: has_coop && has_coep,
-                message: if has_coop && has_coep {
-                    "COOP/COEP headers configured for cross-origin isolation".to_string()
-                } else {
-                    "Missing COOP or COEP headers — SQLite OPFS may not work".to_string()
-                },
-                severity: CheckSeverity::Warning,
-            });
-        }
+    if headers_path.is_file()
+        && let Ok(content) = std::fs::read_to_string(&headers_path)
+    {
+        let has_coop = content.contains("Cross-Origin-Opener-Policy");
+        let has_coep = content.contains("Cross-Origin-Embedder-Policy");
+        checks.push(DeployCheck {
+            name: "coop_coep_headers".to_string(),
+            passed: has_coop && has_coep,
+            message: if has_coop && has_coep {
+                "COOP/COEP headers configured for cross-origin isolation".to_string()
+            } else {
+                "Missing COOP or COEP headers — SQLite OPFS may not work".to_string()
+            },
+            severity: CheckSeverity::Warning,
+        });
     }
 
     // ── Platform detection ──────────────────────────────────────────
@@ -1458,10 +1458,10 @@ fn compute_integrity(bundle_dir: &Path) -> BTreeMap<String, String> {
 
     for rel in &key_files {
         let path = bundle_dir.join(rel);
-        if path.is_file() {
-            if let Ok(hash) = sha256_file_streaming(&path) {
-                checksums.insert((*rel).to_string(), hash);
-            }
+        if path.is_file()
+            && let Ok(hash) = sha256_file_streaming(&path)
+        {
+            checksums.insert((*rel).to_string(), hash);
         }
     }
 

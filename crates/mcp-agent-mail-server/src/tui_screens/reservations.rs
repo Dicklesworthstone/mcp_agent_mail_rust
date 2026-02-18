@@ -227,50 +227,48 @@ impl ReservationsScreen {
             return changed;
         }
 
-        if let Some(id_str) = token.strip_prefix("id:") {
-            if let Ok(target_id) = id_str.parse::<i64>() {
-                let mut changed = false;
-                for res in self.reservations.values_mut() {
-                    if res.project == project
-                        && res.agent == agent
-                        && res.reservation_id == Some(target_id)
-                        && !res.released
-                    {
-                        res.released = true;
-                        changed = true;
-                    }
-                }
-                if changed {
-                    return true;
-                }
-
-                // The event stream does not always carry reservation IDs on
-                // grant events. If there is exactly one active candidate for
-                // this agent/project, reconcile release eagerly instead of
-                // waiting for the next DB snapshot to map `id:*`.
-                let mut candidates: Vec<_> = self
-                    .reservations
-                    .iter_mut()
-                    .filter(|(_, res)| {
-                        res.project == project && res.agent == agent && !res.released
-                    })
-                    .collect();
-                if candidates.len() == 1 {
-                    let (_, res) = candidates.remove(0);
+        if let Some(id_str) = token.strip_prefix("id:")
+            && let Ok(target_id) = id_str.parse::<i64>()
+        {
+            let mut changed = false;
+            for res in self.reservations.values_mut() {
+                if res.project == project
+                    && res.agent == agent
+                    && res.reservation_id == Some(target_id)
+                    && !res.released
+                {
                     res.released = true;
-                    res.reservation_id = Some(target_id);
-                    return true;
+                    changed = true;
                 }
-                return changed;
             }
+            if changed {
+                return true;
+            }
+
+            // The event stream does not always carry reservation IDs on
+            // grant events. If there is exactly one active candidate for
+            // this agent/project, reconcile release eagerly instead of
+            // waiting for the next DB snapshot to map `id:*`.
+            let mut candidates: Vec<_> = self
+                .reservations
+                .iter_mut()
+                .filter(|(_, res)| res.project == project && res.agent == agent && !res.released)
+                .collect();
+            if candidates.len() == 1 {
+                let (_, res) = candidates.remove(0);
+                res.released = true;
+                res.reservation_id = Some(target_id);
+                return true;
+            }
+            return changed;
         }
 
         let key = reservation_key(project, agent, token);
-        if let Some(res) = self.reservations.get_mut(&key) {
-            if !res.released {
-                res.released = true;
-                return true;
-            }
+        if let Some(res) = self.reservations.get_mut(&key)
+            && !res.released
+        {
+            res.released = true;
+            return true;
         }
         false
     }
@@ -433,14 +431,14 @@ impl ReservationsScreen {
         self.sorted_keys = entries.iter().map(|(k, _)| (*k).clone()).collect();
 
         // Clamp selection
-        if let Some(sel) = self.table_state.selected {
-            if sel >= self.sorted_keys.len() {
-                self.table_state.selected = if self.sorted_keys.is_empty() {
-                    None
-                } else {
-                    Some(self.sorted_keys.len() - 1)
-                };
-            }
+        if let Some(sel) = self.table_state.selected
+            && sel >= self.sorted_keys.len()
+        {
+            self.table_state.selected = if self.sorted_keys.is_empty() {
+                None
+            } else {
+                Some(self.sorted_keys.len() - 1)
+            };
         }
         self.prune_selection_to_visible();
     }
@@ -646,52 +644,52 @@ impl Default for ReservationsScreen {
 
 impl MailScreen for ReservationsScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        self.move_selection(1);
-                        self.extend_visual_selection_to_cursor();
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.move_selection(-1);
-                        self.extend_visual_selection_to_cursor();
-                    }
-                    KeyCode::Char('G') | KeyCode::End => {
-                        if !self.sorted_keys.is_empty() {
-                            self.table_state.selected = Some(self.sorted_keys.len() - 1);
-                            self.extend_visual_selection_to_cursor();
-                        }
-                    }
-                    KeyCode::Char('g') | KeyCode::Home => {
-                        if !self.sorted_keys.is_empty() {
-                            self.table_state.selected = Some(0);
-                            self.extend_visual_selection_to_cursor();
-                        }
-                    }
-                    KeyCode::Char(' ') => self.toggle_selection_for_cursor(),
-                    KeyCode::Char('v') => {
-                        let enabled = self.selected_reservation_keys.toggle_visual_mode();
-                        if enabled {
-                            self.extend_visual_selection_to_cursor();
-                        }
-                    }
-                    KeyCode::Char('A') => self.select_all_visible_reservations(),
-                    KeyCode::Char('C') => self.clear_reservation_selection(),
-                    KeyCode::Char('s') => {
-                        self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
-                        self.rebuild_sorted();
-                    }
-                    KeyCode::Char('S') => {
-                        self.sort_asc = !self.sort_asc;
-                        self.rebuild_sorted();
-                    }
-                    KeyCode::Char('x') => {
-                        self.show_released = !self.show_released;
-                        self.rebuild_sorted();
-                    }
-                    _ => {}
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.move_selection(1);
+                    self.extend_visual_selection_to_cursor();
                 }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.move_selection(-1);
+                    self.extend_visual_selection_to_cursor();
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    if !self.sorted_keys.is_empty() {
+                        self.table_state.selected = Some(self.sorted_keys.len() - 1);
+                        self.extend_visual_selection_to_cursor();
+                    }
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    if !self.sorted_keys.is_empty() {
+                        self.table_state.selected = Some(0);
+                        self.extend_visual_selection_to_cursor();
+                    }
+                }
+                KeyCode::Char(' ') => self.toggle_selection_for_cursor(),
+                KeyCode::Char('v') => {
+                    let enabled = self.selected_reservation_keys.toggle_visual_mode();
+                    if enabled {
+                        self.extend_visual_selection_to_cursor();
+                    }
+                }
+                KeyCode::Char('A') => self.select_all_visible_reservations(),
+                KeyCode::Char('C') => self.clear_reservation_selection(),
+                KeyCode::Char('s') => {
+                    self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                    self.rebuild_sorted();
+                }
+                KeyCode::Char('S') => {
+                    self.sort_asc = !self.sort_asc;
+                    self.rebuild_sorted();
+                }
+                KeyCode::Char('x') => {
+                    self.show_released = !self.show_released;
+                    self.rebuild_sorted();
+                }
+                _ => {}
             }
         }
         if let Event::Mouse(mouse) = event {
@@ -735,7 +733,7 @@ impl MailScreen for ReservationsScreen {
             self.last_fallback_probe_tick = tick_count;
             changed |= self.refresh_from_db_fallback(state);
         }
-        if changed || tick_count % 10 == 0 {
+        if changed || tick_count.is_multiple_of(10) {
             // Save previous counts for trend computation before rebuild
             let (a, e, s, x) = self.summary_counts();
             self.prev_counts = (a as u64, e as u64, s as u64, x as u64);
@@ -1221,7 +1219,7 @@ fn render_ttl_overlays(
         let mut gauge = ProgressBar::new()
             .ratio(row.ratio)
             .style(base_style)
-            .gauge_style(Style::default().bg(gauge_bg));
+            .gauge_style(Style::default().fg(tp.text_primary).bg(gauge_bg));
         if ttl_width >= 12 {
             gauge = gauge.label(&row.label);
         }

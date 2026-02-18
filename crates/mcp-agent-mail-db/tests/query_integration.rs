@@ -1299,13 +1299,13 @@ fn v3_scope_redaction_on_deny_excludes_from_results() {
                 "cross-project denied doc should not appear in results at all"
             );
             // Verify audit tracks the denial
-            if let Some(audit) = &resp.audit_summary {
-                if audit.total_before > 0 {
-                    assert!(
-                        audit.denied_count > 0,
-                        "should have at least one denied result in audit"
-                    );
-                }
+            if let Some(audit) = &resp.audit_summary
+                && audit.total_before > 0
+            {
+                assert!(
+                    audit.denied_count > 0,
+                    "should have at least one denied result in audit"
+                );
             }
         }
         other => panic!("v3 scope deny search failed: {other:?}"),

@@ -103,13 +103,13 @@ impl MacroDef {
 
     /// Number of steps.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.steps.len()
     }
 
     /// Whether the macro has no steps.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.steps.is_empty()
     }
 }
@@ -638,12 +638,11 @@ impl MacroEngine {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                if let Ok(data) = std::fs::read_to_string(&path) {
-                    if let Ok(def) = serde_json::from_str::<MacroDef>(&data) {
-                        self.macros.insert(def.name.clone(), def);
-                    }
-                }
+            if path.extension().is_some_and(|e| e == "json")
+                && let Ok(data) = std::fs::read_to_string(&path)
+                && let Ok(def) = serde_json::from_str::<MacroDef>(&data)
+            {
+                self.macros.insert(def.name.clone(), def);
             }
         }
     }

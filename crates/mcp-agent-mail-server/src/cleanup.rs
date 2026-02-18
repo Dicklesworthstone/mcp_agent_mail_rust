@@ -268,14 +268,14 @@ fn check_filesystem_activity(
     }
 
     for path in &matches {
-        if let Ok(metadata) = path.metadata() {
-            if let Ok(modified) = metadata.modified() {
-                let mtime_us = modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-                if (now_us - mtime_us) <= grace_us {
-                    return true;
-                }
+        if let Ok(metadata) = path.metadata()
+            && let Ok(modified) = metadata.modified()
+        {
+            let mtime_us = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
+            if (now_us - mtime_us) <= grace_us {
+                return true;
             }
         }
     }

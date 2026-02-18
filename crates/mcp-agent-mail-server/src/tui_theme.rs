@@ -882,7 +882,7 @@ impl TuiThemePalette {
     /// Unknown values fall back to the default theme.
     #[must_use]
     pub fn from_config_name(name: &str) -> Self {
-        match name {
+        let palette = match name {
             "default" | "cyberpunk_aurora" | "cyberpunk" | "aurora" => {
                 Self::for_theme(ThemeId::CyberpunkAurora)
             }
@@ -894,7 +894,8 @@ impl TuiThemePalette {
             }
             "frankenstein" => Self::frankenstein(),
             _ => Self::for_theme(ThemeId::CyberpunkAurora),
-        }
+        };
+        palette.normalized_for_contrast()
     }
 
     /// Resolve a palette by its zero-based index in the named theme registry.
@@ -1044,6 +1045,459 @@ impl TuiThemePalette {
             json_literal: p.syntax_type,
             json_punctuation: p.fg_muted,
         }
+        .normalized_for_contrast()
+    }
+
+    /// Normalize key foreground/background pairings to avoid unreadable
+    /// edge cases (especially on light themes and custom palettes).
+    #[allow(clippy::too_many_lines)]
+    fn normalized_for_contrast(mut self) -> Self {
+        const MIN_TEXT_RATIO: f64 = 4.5;
+        const MIN_ACCENT_RATIO: f64 = 3.2;
+        const MIN_MUTED_RATIO: f64 = 2.6;
+        const MIN_BORDER_RATIO: f64 = 1.24;
+        const MAX_BORDER_RATIO: f64 = 2.35;
+        const MIN_BORDER_DIM_RATIO: f64 = 1.10;
+        const MAX_BORDER_DIM_RATIO: f64 = 1.70;
+        const MAX_BORDER_FOCUSED_RATIO: f64 = 3.00;
+        const MIN_HOVER_RATIO: f64 = 1.06;
+        const MAX_HOVER_RATIO: f64 = 1.34;
+        const MIN_OVERLAY_RATIO: f64 = 1.03;
+        const MAX_OVERLAY_RATIO: f64 = 1.55;
+        let dark_fallback = PackedRgba::rgb(12, 12, 12);
+        let light_fallback = PackedRgba::rgb(245, 245, 245);
+
+        self.tab_active_fg = ensure_min_contrast(
+            self.tab_active_fg,
+            self.tab_active_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.tab_inactive_fg = ensure_min_contrast(
+            self.tab_inactive_fg,
+            self.tab_inactive_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        self.tab_key_fg = ensure_min_contrast(
+            self.tab_key_fg,
+            self.tab_inactive_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.text_primary = ensure_min_contrast(
+            self.text_primary,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.text_secondary = ensure_min_contrast(
+            self.text_secondary,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.text_muted = ensure_min_contrast(
+            self.text_muted,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.panel_title_fg = ensure_min_contrast(
+            self.panel_title_fg,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.text_disabled = ensure_min_contrast(
+            self.text_disabled,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        if contrast_ratio(self.selection_bg, self.panel_bg) < 1.22 {
+            let dark_tint = lerp_color(self.panel_bg, dark_fallback, 0.18);
+            let light_tint = lerp_color(self.panel_bg, light_fallback, 0.18);
+            self.selection_bg = if contrast_ratio(dark_tint, self.panel_bg)
+                >= contrast_ratio(light_tint, self.panel_bg)
+            {
+                dark_tint
+            } else {
+                light_tint
+            };
+        }
+        self.selection_fg = ensure_min_contrast(
+            self.selection_fg,
+            self.selection_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.selection_indicator = ensure_min_contrast(
+            self.selection_indicator,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.status_fg = ensure_min_contrast(
+            self.status_fg,
+            self.status_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.status_accent = ensure_min_contrast(
+            self.status_accent,
+            self.status_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.status_good = ensure_min_contrast(
+            self.status_good,
+            self.status_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.status_warn = ensure_min_contrast(
+            self.status_warn,
+            self.status_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.help_fg = ensure_min_contrast(
+            self.help_fg,
+            self.help_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.help_key_fg = ensure_min_contrast(
+            self.help_key_fg,
+            self.help_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.help_category_fg = ensure_min_contrast(
+            self.help_category_fg,
+            self.help_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.help_border_fg = ensure_min_contrast(
+            self.help_border_fg,
+            self.help_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        self.table_header_fg = ensure_min_contrast(
+            self.table_header_fg,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        let stripe_ratio = contrast_ratio(self.table_row_alt_bg, self.panel_bg);
+        if !(1.04..=1.25).contains(&stripe_ratio) {
+            let neutral_target = if relative_luminance(self.panel_bg) >= 0.45 {
+                dark_fallback
+            } else {
+                light_fallback
+            };
+            self.table_row_alt_bg = lerp_color(self.panel_bg, neutral_target, 0.08);
+        }
+        if relative_luminance(self.panel_bg) >= 0.45
+            && relative_luminance(self.table_row_alt_bg) < 0.30
+        {
+            // Guard against accidentally dark stripe rows in light mode.
+            self.table_row_alt_bg = lerp_color(self.panel_bg, dark_fallback, 0.06);
+        }
+        self.table_header_fg = ensure_min_contrast(
+            self.table_header_fg,
+            self.table_row_alt_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        let hover_ratio = contrast_ratio(self.list_hover_bg, self.panel_bg);
+        if !(MIN_HOVER_RATIO..=MAX_HOVER_RATIO).contains(&hover_ratio) {
+            let neutral_target = if relative_luminance(self.panel_bg) >= 0.45 {
+                dark_fallback
+            } else {
+                light_fallback
+            };
+            self.list_hover_bg = lerp_color(self.panel_bg, neutral_target, 0.10);
+        }
+        let overlay_ratio = contrast_ratio(self.bg_overlay, self.panel_bg);
+        if !(MIN_OVERLAY_RATIO..=MAX_OVERLAY_RATIO).contains(&overlay_ratio) {
+            let neutral_target = if relative_luminance(self.panel_bg) >= 0.45 {
+                dark_fallback
+            } else {
+                light_fallback
+            };
+            self.bg_overlay = lerp_color(self.panel_bg, neutral_target, 0.14);
+        }
+        self.chart_axis = ensure_min_contrast(
+            self.chart_axis,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        self.chart_grid = ensure_min_contrast(
+            self.chart_grid,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_BORDER_DIM_RATIO,
+        );
+        for series in &mut self.chart_series {
+            *series = ensure_min_contrast(
+                *series,
+                self.panel_bg,
+                dark_fallback,
+                light_fallback,
+                MIN_ACCENT_RATIO,
+            );
+        }
+        self.metric_uptime = ensure_min_contrast(
+            self.metric_uptime,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.metric_requests = ensure_min_contrast(
+            self.metric_requests,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.metric_latency = ensure_min_contrast(
+            self.metric_latency,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.metric_messages = ensure_min_contrast(
+            self.metric_messages,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.metric_agents = ensure_min_contrast(
+            self.metric_agents,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.metric_ack_ok = ensure_min_contrast(
+            self.metric_ack_ok,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.metric_ack_bad = ensure_min_contrast(
+            self.metric_ack_bad,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.metric_reservations = ensure_min_contrast(
+            self.metric_reservations,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.metric_projects = ensure_min_contrast(
+            self.metric_projects,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.contact_approved = ensure_min_contrast(
+            self.contact_approved,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.contact_pending = ensure_min_contrast(
+            self.contact_pending,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.contact_blocked = ensure_min_contrast(
+            self.contact_blocked,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.activity_active = ensure_min_contrast(
+            self.activity_active,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.activity_idle = ensure_min_contrast(
+            self.activity_idle,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.activity_stale = ensure_min_contrast(
+            self.activity_stale,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.toast_error = ensure_min_contrast(
+            self.toast_error,
+            self.bg_deep,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.toast_warning = ensure_min_contrast(
+            self.toast_warning,
+            self.bg_deep,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.toast_info = ensure_min_contrast(
+            self.toast_info,
+            self.bg_deep,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        self.toast_success = ensure_min_contrast(
+            self.toast_success,
+            self.bg_deep,
+            dark_fallback,
+            light_fallback,
+            MIN_ACCENT_RATIO,
+        );
+        if contrast_ratio(self.badge_urgent_bg, self.panel_bg) < 1.18 {
+            self.badge_urgent_bg = lerp_color(self.panel_bg, self.severity_warn, 0.32);
+        }
+        if contrast_ratio(self.badge_info_bg, self.panel_bg) < 1.14 {
+            self.badge_info_bg = lerp_color(self.panel_bg, self.status_accent, 0.28);
+        }
+        self.badge_urgent_fg = ensure_min_contrast(
+            self.badge_urgent_fg,
+            self.badge_urgent_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.badge_info_fg = ensure_min_contrast(
+            self.badge_info_fg,
+            self.badge_info_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_TEXT_RATIO,
+        );
+        self.json_key = ensure_min_contrast(
+            self.json_key,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        self.json_string = ensure_min_contrast(
+            self.json_string,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        self.json_number = ensure_min_contrast(
+            self.json_number,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        self.json_literal = ensure_min_contrast(
+            self.json_literal,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        self.json_punctuation = ensure_min_contrast(
+            self.json_punctuation,
+            self.panel_bg,
+            dark_fallback,
+            light_fallback,
+            MIN_MUTED_RATIO,
+        );
+        // Keep panel borders subtle/neutral so they delineate sections without
+        // reading as heavy random lines in dense views (especially light mode).
+        let neutral_seed = if relative_luminance(self.panel_bg) >= 0.45 {
+            dark_fallback
+        } else {
+            light_fallback
+        };
+        let border_ratio = contrast_ratio(self.panel_border, self.panel_bg);
+        if border_ratio > MAX_BORDER_RATIO {
+            self.panel_border = lerp_color(self.panel_bg, neutral_seed, 0.14);
+        } else if border_ratio < MIN_BORDER_RATIO {
+            self.panel_border = ensure_min_contrast(
+                self.panel_border,
+                self.panel_bg,
+                dark_fallback,
+                light_fallback,
+                MIN_BORDER_RATIO,
+            );
+        }
+        let border_dim_ratio = contrast_ratio(self.panel_border_dim, self.panel_bg);
+        if border_dim_ratio > MAX_BORDER_DIM_RATIO {
+            self.panel_border_dim = lerp_color(self.panel_bg, neutral_seed, 0.09);
+        } else if border_dim_ratio < MIN_BORDER_DIM_RATIO {
+            self.panel_border_dim = ensure_min_contrast(
+                self.panel_border_dim,
+                self.panel_bg,
+                dark_fallback,
+                light_fallback,
+                MIN_BORDER_DIM_RATIO,
+            );
+        }
+        if contrast_ratio(self.panel_border_focused, self.panel_bg) > MAX_BORDER_FOCUSED_RATIO {
+            self.panel_border_focused =
+                lerp_color(self.panel_border_focused, self.panel_border, 0.34);
+        }
+        self
     }
 
     /// Resolve the palette for the currently active named theme.
@@ -1063,17 +1517,17 @@ impl TuiThemePalette {
 /// Style for a `MailEventKind` badge / icon.
 #[must_use]
 pub fn style_for_event_kind(kind: MailEventKind) -> Style {
-    let p = theme::current_palette();
+    let tp = effective_palette();
     let fg = match kind {
-        MailEventKind::ToolCallStart | MailEventKind::ToolCallEnd => p.accent_primary,
-        MailEventKind::MessageSent | MailEventKind::MessageReceived => p.accent_info,
+        MailEventKind::ToolCallStart | MailEventKind::ToolCallEnd => tp.status_accent,
+        MailEventKind::MessageSent | MailEventKind::MessageReceived => tp.metric_messages,
         MailEventKind::ReservationGranted | MailEventKind::ReservationReleased => {
-            p.accent_secondary
+            tp.metric_reservations
         }
-        MailEventKind::AgentRegistered | MailEventKind::ServerStarted => p.accent_success,
-        MailEventKind::HttpRequest => p.fg_secondary,
-        MailEventKind::HealthPulse => p.fg_muted,
-        MailEventKind::ServerShutdown => p.accent_error,
+        MailEventKind::AgentRegistered | MailEventKind::ServerStarted => tp.severity_ok,
+        MailEventKind::HttpRequest => tp.text_secondary,
+        MailEventKind::HealthPulse => tp.text_muted,
+        MailEventKind::ServerShutdown => tp.severity_error,
     };
     Style::default().fg(fg)
 }
@@ -1088,12 +1542,12 @@ pub fn style_for_severity(severity: EventSeverity) -> Style {
 /// Style for an HTTP status code.
 #[must_use]
 pub fn style_for_status(status: u16) -> Style {
-    let p = theme::current_palette();
+    let tp = effective_palette();
     let fg = match status {
-        200..=299 => p.accent_success,
-        300..=399 => p.accent_info,
-        400..=499 => p.accent_warning,
-        _ => p.accent_error,
+        200..=299 => tp.severity_ok,
+        300..=399 => tp.status_accent,
+        400..=499 => tp.severity_warn,
+        _ => tp.severity_error,
     };
     Style::default().fg(fg)
 }
@@ -1101,13 +1555,13 @@ pub fn style_for_status(status: u16) -> Style {
 /// Style for a latency value in milliseconds (green → yellow → red).
 #[must_use]
 pub fn style_for_latency(ms: u64) -> Style {
-    let p = theme::current_palette();
+    let tp = effective_palette();
     let fg = if ms < 50 {
-        p.accent_success
+        tp.severity_ok
     } else if ms < 200 {
-        p.accent_warning
+        tp.severity_warn
     } else {
-        p.accent_error
+        tp.severity_error
     };
     Style::default().fg(fg)
 }
@@ -1115,13 +1569,13 @@ pub fn style_for_latency(ms: u64) -> Style {
 /// Style for an agent based on time since last activity.
 #[must_use]
 pub fn style_for_agent_recency(last_active_secs_ago: u64) -> Style {
-    let p = theme::current_palette();
+    let tp = effective_palette();
     let fg = if last_active_secs_ago < 60 {
-        p.accent_success // active within last minute
+        tp.activity_active // active within last minute
     } else if last_active_secs_ago < 600 {
-        p.accent_warning // active within last 10 min
+        tp.activity_idle // active within last 10 min
     } else {
-        p.accent_error // stale
+        tp.activity_stale // stale
     };
     Style::default().fg(fg)
 }
@@ -1129,13 +1583,13 @@ pub fn style_for_agent_recency(last_active_secs_ago: u64) -> Style {
 /// Style for a TTL countdown (green → yellow → red → flash).
 #[must_use]
 pub fn style_for_ttl(remaining_secs: u64) -> Style {
-    let p = theme::current_palette();
+    let tp = effective_palette();
     let fg = if remaining_secs > 600 {
-        p.accent_success
+        tp.ttl_healthy
     } else if remaining_secs > 60 {
-        p.accent_warning
+        tp.ttl_warning
     } else {
-        p.accent_error
+        tp.ttl_danger
     };
     if remaining_secs <= 30 {
         Style::default().fg(fg).bold()
@@ -1191,6 +1645,20 @@ pub fn set_theme_and_get_name(id: ThemeId) -> &'static str {
     theme::current_theme_name()
 }
 
+/// Effective palette for rendering.
+///
+/// For standard named themes, this tracks the active base `ThemeId` so scoped
+/// test/theme overrides remain accurate. For the custom `frankenstein` variant,
+/// return its explicit palette because it is not represented by `ThemeId`.
+#[must_use]
+fn effective_palette() -> TuiThemePalette {
+    if active_named_theme_config_name() == "frankenstein" {
+        TuiThemePalette::frankenstein().normalized_for_contrast()
+    } else {
+        TuiThemePalette::for_theme(current_theme_id())
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Markdown Theme Integration
 // ──────────────────────────────────────────────────────────────────────
@@ -1201,24 +1669,75 @@ pub fn set_theme_and_get_name(id: ThemeId) -> &'static str {
 /// with the rest of the TUI, including headings, code blocks, links,
 /// task lists, and admonitions.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn markdown_theme() -> MarkdownTheme {
-    let p = theme::current_palette();
+    let tp = effective_palette();
+    let light_theme = current_theme_id() == ThemeId::LumenLight
+        || matches!(
+            active_named_theme_config_name(),
+            "solarized" | "lumen_light" | "lumen" | "light"
+        );
 
     // Build a table theme matching the current palette
-    let table_base_bg = lerp_color(p.bg_base, p.bg_surface, 0.12);
-    let border = Style::default().fg(p.fg_muted).bg(table_base_bg);
+    let table_base_bg = if light_theme {
+        lerp_color(tp.bg_deep, tp.bg_surface, 0.26)
+    } else {
+        lerp_color(tp.bg_deep, tp.bg_surface, 0.12)
+    };
+    let neutral_seed = if light_theme {
+        // Keep light-theme striping neutral and subtle; avoid dark/black-looking rows.
+        lerp_color(table_base_bg, tp.panel_border, 0.16)
+    } else {
+        tp.bg_overlay
+    };
+    let border_color = if light_theme {
+        // Light mode needs more border separation so table structure stays visible.
+        lerp_color(table_base_bg, tp.panel_border, 0.64)
+    } else {
+        lerp_color(tp.panel_border_dim, tp.panel_border, 0.34)
+    };
+    let border = Style::default().fg(border_color).bg(table_base_bg);
     let header = Style::default()
-        .fg(p.fg_primary)
-        .bg(lerp_color(table_base_bg, p.bg_overlay, 0.18))
+        .fg(tp.text_primary)
+        .bg(lerp_color(
+            table_base_bg,
+            neutral_seed,
+            if light_theme { 0.10 } else { 0.18 },
+        ))
         .bold();
     // Keep zebra striping neutral and low-contrast across light/dark themes.
-    // Important for Lumen Light where transparent rows can appear black.
+    // For Lumen Light, avoid bg_overlay in striping because it can read as
+    // dark/black bands against otherwise light surfaces.
     let row_bg = table_base_bg;
-    let row_alt_bg = lerp_color(table_base_bg, p.bg_overlay, 0.12);
-    let row = Style::default().fg(p.fg_secondary).bg(row_bg);
-    let row_alt = Style::default().fg(p.fg_secondary).bg(row_alt_bg);
+    let row_alt_bg = lerp_color(
+        table_base_bg,
+        neutral_seed,
+        if light_theme { 0.05 } else { 0.12 },
+    );
+    let row_text_color = if light_theme {
+        tp.text_primary
+    } else {
+        tp.text_secondary
+    };
+    let row = Style::default().fg(row_text_color).bg(row_bg);
+    let row_alt = Style::default().fg(row_text_color).bg(row_alt_bg);
+    let row_hover_bg = if light_theme {
+        lerp_color(row_alt_bg, tp.panel_border, 0.08)
+    } else {
+        tp.list_hover_bg
+    };
+    let selected_row_bg = if light_theme {
+        lerp_color(row_alt_bg, tp.panel_border, 0.18)
+    } else {
+        tp.selection_bg
+    };
+    let selected_row_text_color = if light_theme {
+        tp.text_primary
+    } else {
+        tp.selection_fg
+    };
     let divider = Style::default()
-        .fg(lerp_color(p.fg_muted, p.fg_disabled, 0.32))
+        .fg(lerp_color(border_color, tp.text_muted, 0.30))
         .bg(table_base_bg);
 
     let table_theme = TableTheme {
@@ -1226,8 +1745,11 @@ pub fn markdown_theme() -> MarkdownTheme {
         header,
         row,
         row_alt,
-        row_selected: Style::default().fg(p.fg_primary).bg(p.bg_highlight).bold(),
-        row_hover: Style::default().fg(p.fg_primary).bg(p.bg_overlay),
+        row_selected: Style::default()
+            .fg(selected_row_text_color)
+            .bg(selected_row_bg)
+            .bold(),
+        row_hover: Style::default().fg(tp.text_primary).bg(row_hover_bg),
         divider,
         padding: 1,
         column_gap: 1,
@@ -1238,49 +1760,49 @@ pub fn markdown_theme() -> MarkdownTheme {
 
     MarkdownTheme {
         // Headings: bright to muted gradient using palette colors
-        h1: Style::default().fg(p.fg_primary).bold(),
-        h2: Style::default().fg(p.accent_primary).bold(),
-        h3: Style::default().fg(p.accent_info).bold(),
-        h4: Style::default().fg(p.fg_secondary).bold(),
-        h5: Style::default().fg(p.fg_muted).bold(),
-        h6: Style::default().fg(p.fg_muted),
+        h1: Style::default().fg(tp.text_primary).bold(),
+        h2: Style::default().fg(tp.status_accent).bold(),
+        h3: Style::default().fg(tp.metric_agents).bold(),
+        h4: Style::default().fg(tp.text_secondary).bold(),
+        h5: Style::default().fg(tp.text_muted).bold(),
+        h6: Style::default().fg(tp.text_muted),
 
         // Code: use syntax highlighting colors
-        code_inline: Style::default().fg(p.syntax_string),
-        code_block: Style::default().fg(p.fg_secondary),
+        code_inline: Style::default().fg(tp.json_string),
+        code_block: Style::default().fg(tp.text_secondary),
 
         // Text formatting
-        blockquote: Style::default().fg(p.fg_muted).italic(),
-        link: Style::default().fg(p.accent_link).underline(),
+        blockquote: Style::default().fg(tp.text_muted).italic(),
+        link: Style::default().fg(tp.status_accent).underline(),
         emphasis: Style::default().italic(),
         strong: Style::default().bold(),
         strikethrough: Style::default().strikethrough(),
 
         // Lists
-        list_bullet: Style::default().fg(p.accent_secondary),
-        horizontal_rule: Style::default().fg(p.fg_muted).dim(),
+        list_bullet: Style::default().fg(tp.metric_messages),
+        horizontal_rule: Style::default().fg(tp.text_muted).dim(),
 
         // Tables
         table_theme,
 
         // Task lists
-        task_done: Style::default().fg(p.accent_success),
-        task_todo: Style::default().fg(p.accent_info),
+        task_done: Style::default().fg(tp.severity_ok),
+        task_todo: Style::default().fg(tp.metric_agents),
 
         // Math
-        math_inline: Style::default().fg(p.syntax_number).italic(),
-        math_block: Style::default().fg(p.syntax_number).bold(),
+        math_inline: Style::default().fg(tp.json_number).italic(),
+        math_block: Style::default().fg(tp.json_number).bold(),
 
         // Footnotes
-        footnote_ref: Style::default().fg(p.fg_muted).dim(),
-        footnote_def: Style::default().fg(p.fg_muted),
+        footnote_ref: Style::default().fg(tp.text_muted).dim(),
+        footnote_def: Style::default().fg(tp.text_muted),
 
         // Admonitions (GitHub alerts) - semantic colors
-        admonition_note: Style::default().fg(p.accent_info).bold(),
-        admonition_tip: Style::default().fg(p.accent_success).bold(),
-        admonition_important: Style::default().fg(p.accent_primary).bold(),
-        admonition_warning: Style::default().fg(p.accent_warning).bold(),
-        admonition_caution: Style::default().fg(p.accent_error).bold(),
+        admonition_note: Style::default().fg(tp.metric_agents).bold(),
+        admonition_tip: Style::default().fg(tp.severity_ok).bold(),
+        admonition_important: Style::default().fg(tp.status_accent).bold(),
+        admonition_warning: Style::default().fg(tp.severity_warn).bold(),
+        admonition_caution: Style::default().fg(tp.severity_error).bold(),
     }
 }
 
@@ -1306,18 +1828,61 @@ pub fn lerp_color(a: PackedRgba, b: PackedRgba, t: f32) -> PackedRgba {
     PackedRgba::rgb(r, g, bl)
 }
 
+#[allow(clippy::suboptimal_flops)]
+fn relative_luminance(color: PackedRgba) -> f64 {
+    fn to_linear(component: u8) -> f64 {
+        let v = f64::from(component) / 255.0;
+        if v <= 0.039_28 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * to_linear(color.r()) + 0.7152 * to_linear(color.g()) + 0.0722 * to_linear(color.b())
+}
+
+fn contrast_ratio(fg: PackedRgba, bg: PackedRgba) -> f64 {
+    let l1 = relative_luminance(fg);
+    let l2 = relative_luminance(bg);
+    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+fn ensure_min_contrast(
+    fg: PackedRgba,
+    bg: PackedRgba,
+    dark_fallback: PackedRgba,
+    light_fallback: PackedRgba,
+    min_ratio: f64,
+) -> PackedRgba {
+    if contrast_ratio(fg, bg) >= min_ratio {
+        return fg;
+    }
+    let dark_ratio = contrast_ratio(dark_fallback, bg);
+    let light_ratio = contrast_ratio(light_fallback, bg);
+    if dark_ratio >= light_ratio {
+        dark_fallback
+    } else {
+        light_fallback
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Focus-aware panel helpers
 // ──────────────────────────────────────────────────────────────────────
 
 /// Return the border color for a panel based on focus state.
 #[must_use]
-pub const fn focus_border_color(tp: &TuiThemePalette, focused: bool) -> PackedRgba {
-    if focused {
+pub fn focus_border_color(tp: &TuiThemePalette, focused: bool) -> PackedRgba {
+    let target = if focused {
         tp.panel_border_focused
     } else {
         tp.panel_border_dim
-    }
+    };
+    // Keep borders visually present but low-noise to avoid "random border" glare,
+    // especially on light themes and high-density monitors.
+    let mix = if focused { 0.42 } else { 0.24 };
+    lerp_color(tp.panel_bg, target, mix)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1846,6 +2411,43 @@ mod tests {
         assert!(
             ratio <= 1.20,
             "striping should stay low-contrast/neutral, got contrast {ratio:.2}"
+        );
+        let row_luma = (299_u32
+            .saturating_mul(u32::from(row_bg.r()))
+            .saturating_add(587_u32.saturating_mul(u32::from(row_bg.g())))
+            .saturating_add(114_u32.saturating_mul(u32::from(row_bg.b()))))
+            / 1000;
+        let alt_luma = (299_u32
+            .saturating_mul(u32::from(row_alt_bg.r()))
+            .saturating_add(587_u32.saturating_mul(u32::from(row_alt_bg.g())))
+            .saturating_add(114_u32.saturating_mul(u32::from(row_alt_bg.b()))))
+            / 1000;
+        assert!(
+            row_luma >= 140 && alt_luma >= 130,
+            "lumen striping should remain light/neutral (row={row_luma}, alt={alt_luma})"
+        );
+    }
+
+    #[test]
+    fn lumen_light_surface_pairs_stay_neutral_and_legible() {
+        let p = TuiThemePalette::for_theme(ThemeId::LumenLight);
+        let hover_ratio = contrast_ratio(p.list_hover_bg, p.panel_bg);
+        let overlay_ratio = contrast_ratio(p.bg_overlay, p.panel_bg);
+        assert!(
+            (1.06..=1.34).contains(&hover_ratio),
+            "hover surface should stay subtle/neutral (ratio={hover_ratio:.2})"
+        );
+        assert!(
+            (1.03..=1.55).contains(&overlay_ratio),
+            "overlay surface should stay readable without harsh contrast (ratio={overlay_ratio:.2})"
+        );
+        assert!(
+            rel_luminance(p.list_hover_bg) >= 0.30,
+            "hover background should not collapse to near-black in light theme"
+        );
+        assert!(
+            rel_luminance(p.bg_overlay) >= 0.26,
+            "overlay background should remain legible in light theme"
         );
     }
 

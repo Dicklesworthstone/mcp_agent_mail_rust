@@ -72,12 +72,12 @@ fn percent_decode_component(input: &str) -> String {
                 let hi = bytes[i + 1];
                 let lo = bytes[i + 2];
                 let hex = [hi, lo];
-                if let Ok(hex_str) = std::str::from_utf8(&hex) {
-                    if let Ok(value) = u8::from_str_radix(hex_str, 16) {
-                        out.push(value);
-                        i += 3;
-                        continue;
-                    }
+                if let Ok(hex_str) = std::str::from_utf8(&hex)
+                    && let Ok(value) = u8::from_str_radix(hex_str, 16)
+                {
+                    out.push(value);
+                    i += 3;
+                    continue;
                 }
                 out.push(bytes[i]);
                 i += 1;
@@ -97,10 +97,10 @@ fn workspace_root_from(start: &Path) -> Option<PathBuf> {
         if !cargo_toml.exists() {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
-            if content.contains("[workspace]") {
-                return Some(dir.to_path_buf());
-            }
+        if let Ok(content) = std::fs::read_to_string(&cargo_toml)
+            && content.contains("[workspace]")
+        {
+            return Some(dir.to_path_buf());
         }
     }
     None
@@ -151,10 +151,10 @@ pub struct HttpSnapshot {
 }
 
 fn redact_database_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://") {
-        if let Some((_creds, host)) = rest.rsplit_once('@') {
-            return format!("{scheme}://****@{host}");
-        }
+    if let Some((scheme, rest)) = url.split_once("://")
+        && let Some((_creds, host)) = rest.rsplit_once('@')
+    {
+        return format!("{scheme}://****@{host}");
     }
     url.to_string()
 }
@@ -3403,10 +3403,10 @@ fn reservation_compute_pattern_activity(
         if candidate.exists() {
             matches = true;
 
-            if let Ok(meta) = std::fs::metadata(&candidate) {
-                if let Ok(modified) = meta.modified() {
-                    fs_latest = reservation_system_time_to_micros(modified);
-                }
+            if let Ok(meta) = std::fs::metadata(&candidate)
+                && let Ok(modified) = meta.modified()
+            {
+                fs_latest = reservation_system_time_to_micros(modified);
             }
         }
     }

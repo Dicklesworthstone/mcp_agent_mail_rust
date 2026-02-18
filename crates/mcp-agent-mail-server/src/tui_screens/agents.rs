@@ -267,14 +267,14 @@ impl AgentsScreen {
         self.agents = rows;
 
         // Clamp selection
-        if let Some(sel) = self.table_state.selected {
-            if sel >= self.agents.len() {
-                self.table_state.selected = if self.agents.is_empty() {
-                    None
-                } else {
-                    Some(self.agents.len() - 1)
-                };
-            }
+        if let Some(sel) = self.table_state.selected
+            && sel >= self.agents.len()
+        {
+            self.table_state.selected = if self.agents.is_empty() {
+                None
+            } else {
+                Some(self.agents.len() - 1)
+            };
         }
     }
 
@@ -474,60 +474,60 @@ impl Default for AgentsScreen {
 
 impl MailScreen for AgentsScreen {
     fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                // Filter mode: capture text input
-                if self.filter_active {
-                    match key.code {
-                        KeyCode::Escape | KeyCode::Enter => {
-                            self.filter_active = false;
-                        }
-                        KeyCode::Backspace => {
-                            self.filter.pop();
-                            self.rebuild_from_state(state);
-                        }
-                        KeyCode::Char(c) => {
-                            self.filter.push(c);
-                            self.rebuild_from_state(state);
-                        }
-                        _ => {}
-                    }
-                    return Cmd::None;
-                }
-
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            // Filter mode: capture text input
+            if self.filter_active {
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-                    KeyCode::Char('G') | KeyCode::End => {
-                        if !self.agents.is_empty() {
-                            self.table_state.selected = Some(self.agents.len() - 1);
-                        }
+                    KeyCode::Escape | KeyCode::Enter => {
+                        self.filter_active = false;
                     }
-                    KeyCode::Char('g') | KeyCode::Home => {
-                        if !self.agents.is_empty() {
-                            self.table_state.selected = Some(0);
-                        }
-                    }
-                    KeyCode::Char('/') => {
-                        self.filter_active = true;
-                        self.filter.clear();
-                    }
-                    KeyCode::Char('s') => {
-                        self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                    KeyCode::Backspace => {
+                        self.filter.pop();
                         self.rebuild_from_state(state);
                     }
-                    KeyCode::Char('S') => {
-                        self.sort_asc = !self.sort_asc;
+                    KeyCode::Char(c) => {
+                        self.filter.push(c);
                         self.rebuild_from_state(state);
-                    }
-                    KeyCode::Escape => {
-                        if !self.filter.is_empty() {
-                            self.filter.clear();
-                            self.rebuild_from_state(state);
-                        }
                     }
                     _ => {}
                 }
+                return Cmd::None;
+            }
+
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+                KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+                KeyCode::Char('G') | KeyCode::End => {
+                    if !self.agents.is_empty() {
+                        self.table_state.selected = Some(self.agents.len() - 1);
+                    }
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    if !self.agents.is_empty() {
+                        self.table_state.selected = Some(0);
+                    }
+                }
+                KeyCode::Char('/') => {
+                    self.filter_active = true;
+                    self.filter.clear();
+                }
+                KeyCode::Char('s') => {
+                    self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                    self.rebuild_from_state(state);
+                }
+                KeyCode::Char('S') => {
+                    self.sort_asc = !self.sort_asc;
+                    self.rebuild_from_state(state);
+                }
+                KeyCode::Escape => {
+                    if !self.filter.is_empty() {
+                        self.filter.clear();
+                        self.rebuild_from_state(state);
+                    }
+                }
+                _ => {}
             }
         }
         Cmd::None
@@ -541,7 +541,7 @@ impl MailScreen for AgentsScreen {
             self.advance_stagger_reveals();
         }
         // Rebuild every second (10 ticks)
-        if tick_count % 10 == 0 {
+        if tick_count.is_multiple_of(10) {
             let total: u64 = self.msg_counts.values().sum();
             self.prev_total_msgs = total;
             self.record_sparkline_sample();
@@ -588,7 +588,7 @@ impl MailScreen for AgentsScreen {
 
         // Clear stale glyphs before writing header/status text.
         Paragraph::new("")
-            .style(Style::default().bg(tp.panel_bg))
+            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
             .render(header_area, frame);
 
         // Render header info line
@@ -620,7 +620,7 @@ impl MailScreen for AgentsScreen {
 
         // Clear table region each frame to prevent ghost separators from prior layouts.
         Paragraph::new("")
-            .style(Style::default().bg(tp.panel_bg))
+            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
             .render(table_area, frame);
 
         self.render_table(frame, table_area, wide, narrow);
@@ -662,11 +662,11 @@ impl MailScreen for AgentsScreen {
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
-        if let DeepLinkTarget::AgentByName(name) = target {
-            if let Some(pos) = self.agents.iter().position(|a| a.name == *name) {
-                self.table_state.selected = Some(pos);
-                return true;
-            }
+        if let DeepLinkTarget::AgentByName(name) = target
+            && let Some(pos) = self.agents.iter().position(|a| a.name == *name)
+        {
+            self.table_state.selected = Some(pos);
+            return true;
         }
         false
     }

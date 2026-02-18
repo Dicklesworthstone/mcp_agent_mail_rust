@@ -337,10 +337,7 @@ mod tests {
             "wrangler.toml should trigger cloudflare_pages hint"
         );
         let cf = cf.unwrap();
-        assert!(cf
-            .signals
-            .iter()
-            .any(|s| s.contains("wrangler.toml")));
+        assert!(cf.signals.iter().any(|s| s.contains("wrangler.toml")));
     }
 
     #[test]
@@ -349,15 +346,9 @@ mod tests {
         std::fs::write(dir.path().join("netlify.toml"), "[build]").unwrap();
         let hints = detect_hosting_hints(dir.path());
         let nl = hints.iter().find(|h| h.id == "netlify");
-        assert!(
-            nl.is_some(),
-            "netlify.toml should trigger netlify hint"
-        );
+        assert!(nl.is_some(), "netlify.toml should trigger netlify hint");
         let nl = nl.unwrap();
-        assert!(nl
-            .signals
-            .iter()
-            .any(|s| s.contains("netlify.toml")));
+        assert!(nl.signals.iter().any(|s| s.contains("netlify.toml")));
     }
 
     #[test]

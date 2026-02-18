@@ -179,12 +179,14 @@ impl ScreenTransition {
         }
     }
 
+    #[cfg(test)]
     fn progress(self) -> f32 {
         let done = SCREEN_TRANSITION_TICKS.saturating_sub(self.ticks_remaining);
         f32::from(done) / f32::from(SCREEN_TRANSITION_TICKS.max(1))
     }
 
     /// Ease-out cubic curve for more natural deceleration.
+    #[cfg(test)]
     fn eased_progress(self) -> f32 {
         let t = self.progress().clamp(0.0, 1.0);
         1.0 - (1.0 - t).powi(3)
@@ -832,10 +834,10 @@ impl CoachHintManager {
         if !self.dirty {
             return;
         }
-        if let Some(ref path) = self.persist_path {
-            if crate::tui_persist::save_dismissed_hints(path, &self.dismissed).is_ok() {
-                self.dirty = false;
-            }
+        if let Some(ref path) = self.persist_path
+            && crate::tui_persist::save_dismissed_hints(path, &self.dismissed).is_ok()
+        {
+            self.dirty = false;
         }
     }
 }
@@ -1151,9 +1153,11 @@ impl MailAppModel {
             MailScreenId::Timeline,
             Box::new(TimelineScreen::with_config(config)),
         );
-        // Initialize the named palette theme from config (T14.2).
+        // Initialize named palette and synchronize the base ftui theme.
         crate::tui_theme::init_named_theme(&config.tui_theme);
-        let initial_theme = crate::tui_theme::current_theme_id();
+        let configured_theme = Self::theme_id_for_named_config(&config.tui_theme);
+        let _ = crate::tui_theme::set_theme_and_get_name(configured_theme);
+        let initial_theme = configured_theme;
         model.last_non_hc_theme = if initial_theme == ThemeId::HighContrast {
             ThemeId::CyberpunkAurora
         } else {
@@ -1233,14 +1237,6 @@ impl MailAppModel {
             self.focus_memory.insert(active_screen, next_node.target);
         }
         true
-    }
-
-    fn focused_panel_rect(&self, content_area: Rect) -> Option<Rect> {
-        let active_screen = self.screen_manager.active_screen();
-        let graph = focus_graph_for_screen(active_screen, content_area);
-        graph
-            .node(self.focus_manager.current())
-            .map(|node| node.rect)
     }
 
     fn terminal_area_from_last_content(&self) -> Rect {
@@ -1938,10 +1934,12 @@ impl MailAppModel {
 
     fn theme_id_for_named_config(cfg: &str) -> ThemeId {
         match cfg {
-            "solarized" => ThemeId::LumenLight,
-            "dracula" => ThemeId::Darcula,
-            "nord" => ThemeId::NordicFrost,
-            "gruvbox" => ThemeId::HighContrast,
+            "solarized" | "lumen_light" | "lumen" | "light" => ThemeId::LumenLight,
+            "dracula" | "darcula" => ThemeId::Darcula,
+            "nord" | "nordic_frost" | "nordic" => ThemeId::NordicFrost,
+            "gruvbox" | "high_contrast" | "high-contrast" | "contrast" | "hc" => {
+                ThemeId::HighContrast
+            }
             _ => ThemeId::CyberpunkAurora,
         }
     }
@@ -2314,18 +2312,18 @@ impl MailAppModel {
         let mut actions = build_palette_actions(&self.state);
 
         // Inject context-aware quick actions from the focused entity.
-        if let Some(screen) = self.screen_manager.active_screen_ref() {
-            if let Some(event) = screen.focused_event() {
-                let quick = crate::tui_screens::inspector::build_quick_actions(event);
-                for qa in quick.into_iter().rev() {
-                    actions.insert(
-                        0,
-                        ActionItem::new(qa.id, qa.label)
-                            .with_description(&qa.description)
-                            .with_tags(&["quick", "context"])
-                            .with_category("Quick Actions"),
-                    );
-                }
+        if let Some(screen) = self.screen_manager.active_screen_ref()
+            && let Some(event) = screen.focused_event()
+        {
+            let quick = crate::tui_screens::inspector::build_quick_actions(event);
+            for qa in quick.into_iter().rev() {
+                actions.insert(
+                    0,
+                    ActionItem::new(qa.id, qa.label)
+                        .with_description(&qa.description)
+                        .with_tags(&["quick", "context"])
+                        .with_category("Quick Actions"),
+                );
             }
         }
 
@@ -3053,10 +3051,10 @@ impl Model for MailAppModel {
                         _ => {}
                     }
 
-                    if !self.toast_muted {
-                        if let Some(toast) = safe_toast_for_event(event, self.toast_severity) {
-                            self.notifications.notify(self.apply_toast_policy(toast));
-                        }
+                    if !self.toast_muted
+                        && let Some(toast) = safe_toast_for_event(event, self.toast_severity)
+                    {
+                        self.notifications.notify(self.apply_toast_policy(toast));
                     }
                 }
 
@@ -3118,13 +3116,14 @@ impl Model for MailAppModel {
                     self.resize_detected.set(true);
                 }
 
-                if let Event::Key(key) = event {
-                    if key.kind == KeyEventKind::Press && Self::is_inspector_toggle_key(key) {
-                        if self.inspector_enabled() {
-                            self.toggle_inspector();
-                        }
-                        return Cmd::none();
+                if let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                    && Self::is_inspector_toggle_key(key)
+                {
+                    if self.inspector_enabled() {
+                        self.toggle_inspector();
                     }
+                    return Cmd::none();
                 }
 
                 if self.handle_inspector_event(event) {
@@ -3155,32 +3154,32 @@ impl Model for MailAppModel {
 
                 // Compose overlay (z=6, traps all)
                 if let Some(ref mut compose) = self.compose_state {
-                    if let Event::Key(key) = event {
-                        if key.kind == KeyEventKind::Press {
-                            match compose.handle_key(key) {
-                                ComposeAction::Consumed | ComposeAction::Ignored => {}
-                                ComposeAction::Close => {
-                                    self.compose_state = None;
-                                }
-                                ComposeAction::ConfirmClose => {
-                                    // TODO: show modal confirmation for unsaved changes
-                                    self.compose_state = None;
-                                }
-                                ComposeAction::Send => {
-                                    if let Some(mut cs) = self.compose_state.take() {
-                                        match cs.build_envelope() {
-                                            Ok(envelope) => {
-                                                return self.dispatch_compose_send(envelope);
-                                            }
-                                            Err(err) => {
-                                                // Put state back so user can fix.
-                                                self.compose_state = Some(cs);
-                                                self.notifications.notify(
-                                                    Toast::new(format!("Compose error: {err}"))
-                                                        .icon(ToastIcon::Error)
-                                                        .duration(Duration::from_secs(5)),
-                                                );
-                                            }
+                    if let Event::Key(key) = event
+                        && key.kind == KeyEventKind::Press
+                    {
+                        match compose.handle_key(key) {
+                            ComposeAction::Consumed | ComposeAction::Ignored => {}
+                            ComposeAction::Close => {
+                                self.compose_state = None;
+                            }
+                            ComposeAction::ConfirmClose => {
+                                // TODO: show modal confirmation for unsaved changes
+                                self.compose_state = None;
+                            }
+                            ComposeAction::Send => {
+                                if let Some(mut cs) = self.compose_state.take() {
+                                    match cs.build_envelope() {
+                                        Ok(envelope) => {
+                                            return self.dispatch_compose_send(envelope);
+                                        }
+                                        Err(err) => {
+                                            // Put state back so user can fix.
+                                            self.compose_state = Some(cs);
+                                            self.notifications.notify(
+                                                Toast::new(format!("Compose error: {err}"))
+                                                    .icon(ToastIcon::Error)
+                                                    .duration(Duration::from_secs(5)),
+                                            );
                                         }
                                     }
                                 }
@@ -3219,107 +3218,103 @@ impl Model for MailAppModel {
                 if matches!(
                     self.macro_engine.playback_state(),
                     PlaybackState::Paused { .. }
-                ) {
-                    if let Event::Key(key) = event {
-                        if key.kind == KeyEventKind::Press {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    if let Some(action_id) = self.macro_engine.confirm_step() {
-                                        let _ = self.dispatch_palette_action_from_macro(&action_id);
-                                        // Show progress toast.
-                                        if let Some(label) =
-                                            self.macro_engine.playback_state().status_label()
-                                        {
-                                            self.notifications.notify(
-                                                Toast::new(label)
-                                                    .icon(ToastIcon::Info)
-                                                    .duration(Duration::from_secs(3)),
-                                            );
-                                        }
-                                    }
-                                    return Cmd::none();
-                                }
-                                KeyCode::Escape => {
-                                    self.macro_engine.stop_playback();
+                ) && let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                {
+                    match key.code {
+                        KeyCode::Enter => {
+                            if let Some(action_id) = self.macro_engine.confirm_step() {
+                                let _ = self.dispatch_palette_action_from_macro(&action_id);
+                                // Show progress toast.
+                                if let Some(label) =
+                                    self.macro_engine.playback_state().status_label()
+                                {
                                     self.notifications.notify(
-                                        Toast::new("Playback cancelled")
-                                            .icon(ToastIcon::Warning)
-                                            .duration(Duration::from_secs(2)),
+                                        Toast::new(label)
+                                            .icon(ToastIcon::Info)
+                                            .duration(Duration::from_secs(3)),
                                     );
-                                    return Cmd::none();
                                 }
-                                _ => {} // Other keys pass through normally
                             }
+                            return Cmd::none();
                         }
+                        KeyCode::Escape => {
+                            self.macro_engine.stop_playback();
+                            self.notifications.notify(
+                                Toast::new("Playback cancelled")
+                                    .icon(ToastIcon::Warning)
+                                    .duration(Duration::from_secs(2)),
+                            );
+                            return Cmd::none();
+                        }
+                        _ => {} // Other keys pass through normally
                     }
                 }
 
                 // Toast focus mode (z=4b, traps j/k/Enter/Esc)
-                if self.toast_focus_index.is_some() {
-                    if let Event::Key(key) = event {
-                        if key.kind == KeyEventKind::Press {
-                            match key.code {
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    if let Some(ref mut idx) = self.toast_focus_index {
-                                        let count = self.notifications.visible_count();
-                                        if count > 0 {
-                                            *idx = if *idx == 0 { count - 1 } else { *idx - 1 };
-                                        }
-                                    }
-                                    return Cmd::none();
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    if let Some(ref mut idx) = self.toast_focus_index {
-                                        let count = self.notifications.visible_count();
-                                        if count > 0 {
-                                            *idx = (*idx + 1) % count;
-                                        }
-                                    }
-                                    return Cmd::none();
-                                }
-                                KeyCode::Enter => {
-                                    // Dismiss the focused toast.
-                                    if let Some(idx) = self.toast_focus_index {
-                                        let vis = self.notifications.visible();
-                                        if let Some(toast) = vis.get(idx) {
-                                            let id = toast.id;
-                                            self.notifications.dismiss(id);
-                                        }
-                                        // Clamp index after dismissal.
-                                        let count = self.notifications.visible_count();
-                                        if count == 0 {
-                                            self.toast_focus_index = None;
-                                        } else {
-                                            self.toast_focus_index =
-                                                Some(idx.min(count.saturating_sub(1)));
-                                        }
-                                    }
-                                    return Cmd::none();
-                                }
-                                KeyCode::Escape => {
-                                    self.toast_focus_index = None;
-                                    return Cmd::none();
-                                }
-                                KeyCode::Char('m') => {
-                                    self.toast_muted = !self.toast_muted;
-                                    let msg = if self.toast_muted {
-                                        "Toasts muted"
-                                    } else {
-                                        "Toasts unmuted"
-                                    };
-                                    self.notifications.notify(
-                                        self.apply_toast_policy(
-                                            Toast::new(msg)
-                                                .icon(ToastIcon::Info)
-                                                .style(Style::default().fg(toast_color_info())),
-                                        ),
-                                    );
-                                    return Cmd::none();
-                                }
-                                _ => {
-                                    // Let other keys (like Ctrl+T) fall through.
+                if self.toast_focus_index.is_some()
+                    && let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(ref mut idx) = self.toast_focus_index {
+                                let count = self.notifications.visible_count();
+                                if count > 0 {
+                                    *idx = if *idx == 0 { count - 1 } else { *idx - 1 };
                                 }
                             }
+                            return Cmd::none();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(ref mut idx) = self.toast_focus_index {
+                                let count = self.notifications.visible_count();
+                                if count > 0 {
+                                    *idx = (*idx + 1) % count;
+                                }
+                            }
+                            return Cmd::none();
+                        }
+                        KeyCode::Enter => {
+                            // Dismiss the focused toast.
+                            if let Some(idx) = self.toast_focus_index {
+                                let vis = self.notifications.visible();
+                                if let Some(toast) = vis.get(idx) {
+                                    let id = toast.id;
+                                    self.notifications.dismiss(id);
+                                }
+                                // Clamp index after dismissal.
+                                let count = self.notifications.visible_count();
+                                if count == 0 {
+                                    self.toast_focus_index = None;
+                                } else {
+                                    self.toast_focus_index = Some(idx.min(count.saturating_sub(1)));
+                                }
+                            }
+                            return Cmd::none();
+                        }
+                        KeyCode::Escape => {
+                            self.toast_focus_index = None;
+                            return Cmd::none();
+                        }
+                        KeyCode::Char('m') => {
+                            self.toast_muted = !self.toast_muted;
+                            let msg = if self.toast_muted {
+                                "Toasts muted"
+                            } else {
+                                "Toasts unmuted"
+                            };
+                            self.notifications.notify(
+                                self.apply_toast_policy(
+                                    Toast::new(msg)
+                                        .icon(ToastIcon::Info)
+                                        .style(Style::default().fg(toast_color_info())),
+                                ),
+                            );
+                            return Cmd::none();
+                        }
+                        _ => {
+                            // Let other keys (like Ctrl+T) fall through.
                         }
                     }
                 }
@@ -3335,60 +3330,147 @@ impl Model for MailAppModel {
                 // (tab clicks, status line). Checked before global keybindings
                 // so that shell regions consume the event and prevent
                 // accidental forwarding to screens.
-                if let Event::Mouse(ref mouse) = *event {
-                    if !text_mode {
-                        use crate::tui_hit_regions::MouseAction;
-                        match self.mouse_dispatcher.dispatch(mouse) {
-                            MouseAction::SwitchScreen(id) => {
-                                self.activate_screen(id);
-                                return Cmd::none();
-                            }
-                            MouseAction::ToggleHelp => {
-                                self.help_visible = !self.help_visible;
-                                self.help_scroll = 0;
-                                return Cmd::none();
-                            }
-                            MouseAction::OpenPalette => {
-                                self.open_palette();
-                                return Cmd::none();
-                            }
-                            MouseAction::Forward => {}
+                if let Event::Mouse(ref mouse) = *event
+                    && !text_mode
+                {
+                    use crate::tui_hit_regions::MouseAction;
+                    match self.mouse_dispatcher.dispatch(mouse) {
+                        MouseAction::SwitchScreen(id) => {
+                            self.activate_screen(id);
+                            return Cmd::none();
                         }
+                        MouseAction::ToggleHelp => {
+                            self.help_visible = !self.help_visible;
+                            self.help_scroll = 0;
+                            return Cmd::none();
+                        }
+                        MouseAction::OpenPalette => {
+                            self.open_palette();
+                            return Cmd::none();
+                        }
+                        MouseAction::Forward => {}
                     }
                 }
 
                 // Global keybindings (checked before screen dispatch)
-                if let Event::Key(key) = event {
-                    if key.kind == KeyEventKind::Press {
-                        let is_ctrl_p = key.modifiers.contains(Modifiers::CTRL)
-                            && matches!(key.code, KeyCode::Char('p'));
-                        if (is_ctrl_p || matches!(key.code, KeyCode::Char(':'))) && !text_mode {
-                            self.open_palette();
-                            return Cmd::none();
-                        }
-                        // Ctrl+E: open export format menu.
-                        let is_ctrl_e = key.modifiers.contains(Modifiers::CTRL)
-                            && matches!(key.code, KeyCode::Char('e' | 'E'));
-                        if is_ctrl_e && !text_mode {
-                            self.open_export_menu();
-                            return Cmd::none();
-                        }
-                        // Ctrl+N: open compose overlay.
-                        let is_ctrl_n = key.modifiers.contains(Modifiers::CTRL)
-                            && matches!(key.code, KeyCode::Char('n'));
-                        if is_ctrl_n && !text_mode {
-                            self.open_compose();
-                            return Cmd::none();
-                        }
-                        // Ctrl+T / Shift+T: cycle theme globally.
-                        let is_ctrl_t = (key.modifiers.contains(Modifiers::CTRL)
+                if let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                {
+                    let is_ctrl_p = key.modifiers.contains(Modifiers::CTRL)
+                        && matches!(key.code, KeyCode::Char('p'));
+                    if (is_ctrl_p || matches!(key.code, KeyCode::Char(':'))) && !text_mode {
+                        self.open_palette();
+                        return Cmd::none();
+                    }
+                    // Ctrl+E: open export format menu.
+                    let is_ctrl_e = key.modifiers.contains(Modifiers::CTRL)
+                        && matches!(key.code, KeyCode::Char('e' | 'E'));
+                    if is_ctrl_e && !text_mode {
+                        self.open_export_menu();
+                        return Cmd::none();
+                    }
+                    // Ctrl+N: open compose overlay.
+                    let is_ctrl_n = key.modifiers.contains(Modifiers::CTRL)
+                        && matches!(key.code, KeyCode::Char('n'));
+                    if is_ctrl_n && !text_mode {
+                        self.open_compose();
+                        return Cmd::none();
+                    }
+                    // Ctrl+T / Shift+T: cycle theme globally.
+                    let is_ctrl_t = (key.modifiers.contains(Modifiers::CTRL)
                             && matches!(key.code, KeyCode::Char('t' | 'T')))
                             // Some terminals emit ASCII control code 0x14 for Ctrl+T.
                             || matches!(key.code, KeyCode::Char('\u{14}'));
-                        let is_shift_t = !text_mode
-                            && key.modifiers.contains(Modifiers::SHIFT)
-                            && matches!(key.code, KeyCode::Char('T'));
-                        if is_ctrl_t || is_shift_t {
+                    let is_shift_t = !text_mode
+                        && key.modifiers.contains(Modifiers::SHIFT)
+                        && matches!(key.code, KeyCode::Char('T'));
+                    if is_ctrl_t || is_shift_t {
+                        let name = self.cycle_theme();
+                        self.notifications.notify(
+                            Toast::new(format!("Theme: {name}"))
+                                .icon(ToastIcon::Info)
+                                .duration(Duration::from_secs(3)),
+                        );
+                        return Cmd::none();
+                    }
+                    // Ctrl+Y: toggle toast focus mode.
+                    let is_ctrl_y = key.modifiers.contains(Modifiers::CTRL)
+                        && matches!(key.code, KeyCode::Char('y' | 'Y'));
+                    if is_ctrl_y && !text_mode {
+                        if self.toast_focus_index.is_some() {
+                            self.toast_focus_index = None;
+                        } else if self.notifications.visible_count() > 0 {
+                            self.toast_focus_index = Some(0);
+                        }
+                        return Cmd::none();
+                    }
+                    let is_ctrl_arrow = key.modifiers.contains(Modifiers::CTRL)
+                        && matches!(
+                            key.code,
+                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                        );
+                    if is_ctrl_arrow
+                        && !text_mode
+                        && !self.focus_manager.is_trapped()
+                        && self.move_focus_spatial(key.code)
+                    {
+                        return Cmd::none();
+                    }
+                    if self.help_visible {
+                        match key.code {
+                            KeyCode::Escape | KeyCode::Char('?') => {
+                                self.help_visible = false;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                self.help_scroll = self.help_scroll.saturating_add(1);
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                self.help_scroll = self.help_scroll.saturating_sub(1);
+                            }
+                            _ => {}
+                        }
+                        return Cmd::none();
+                    }
+
+                    let is_escape = matches!(key.code, KeyCode::Escape);
+                    let is_ctrl_c = key.modifiers.contains(Modifiers::CTRL)
+                        && matches!(key.code, KeyCode::Char('c' | 'C'));
+                    let is_ctrl_d = key.modifiers.contains(Modifiers::CTRL)
+                        && matches!(key.code, KeyCode::Char('d' | 'D'));
+
+                    if !(is_escape || is_ctrl_c) {
+                        self.clear_quit_confirmation();
+                    }
+
+                    if is_ctrl_d {
+                        return self.detach_tui_headless();
+                    }
+                    if is_escape && !text_mode {
+                        return self.handle_quit_confirmation_input(QuitConfirmSource::Escape);
+                    }
+                    if is_ctrl_c {
+                        return self.handle_quit_confirmation_input(QuitConfirmSource::CtrlC);
+                    }
+
+                    match key.code {
+                        KeyCode::Char('q') if !text_mode => {
+                            self.clear_quit_confirmation();
+                            self.flush_before_shutdown();
+                            self.state.request_shutdown();
+                            return Cmd::quit();
+                        }
+                        KeyCode::Char('?') if !text_mode => {
+                            self.help_visible = !self.help_visible;
+                            self.help_scroll = 0;
+                            return Cmd::none();
+                        }
+                        KeyCode::Char('m') if !text_mode => {
+                            let _ = self
+                                .state
+                                .try_send_server_control(ServerControlMsg::ToggleTransportBase);
+                            return Cmd::none();
+                        }
+                        KeyCode::Char('T') if !text_mode => {
                             let name = self.cycle_theme();
                             self.notifications.notify(
                                 Toast::new(format!("Theme: {name}"))
@@ -3397,143 +3479,54 @@ impl Model for MailAppModel {
                             );
                             return Cmd::none();
                         }
-                        // Ctrl+Y: toggle toast focus mode.
-                        let is_ctrl_y = key.modifiers.contains(Modifiers::CTRL)
-                            && matches!(key.code, KeyCode::Char('y' | 'Y'));
-                        if is_ctrl_y && !text_mode {
-                            if self.toast_focus_index.is_some() {
-                                self.toast_focus_index = None;
-                            } else if self.notifications.visible_count() > 0 {
-                                self.toast_focus_index = Some(0);
+                        KeyCode::Tab => {
+                            let next = self.screen_manager.active_screen().next();
+                            self.activate_screen(next);
+                            return Cmd::none();
+                        }
+                        KeyCode::BackTab => {
+                            let prev = self.screen_manager.active_screen().prev();
+                            self.activate_screen(prev);
+                            return Cmd::none();
+                        }
+                        // Global search: / opens SearchCockpit with query bar focused
+                        KeyCode::Char('/') if !text_mode => {
+                            self.apply_deep_link_with_transition(&DeepLinkTarget::SearchFocused(
+                                String::new(),
+                            ));
+                            return Cmd::none();
+                        }
+                        // Action menu: . opens contextual actions for selected item
+                        KeyCode::Char('.') if !text_mode => {
+                            if let Some(screen) = self.screen_manager.active_screen_ref()
+                                && let Some((entries, anchor, ctx)) = screen.contextual_actions()
+                            {
+                                self.action_menu.open(entries, anchor, ctx);
                             }
                             return Cmd::none();
                         }
-                        let is_ctrl_arrow = key.modifiers.contains(Modifiers::CTRL)
-                            && matches!(
-                                key.code,
-                                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-                            );
-                        if is_ctrl_arrow
-                            && !text_mode
-                            && !self.focus_manager.is_trapped()
-                            && self.move_focus_spatial(key.code)
-                        {
-                            return Cmd::none();
-                        }
-                        if self.help_visible {
-                            match key.code {
-                                KeyCode::Escape | KeyCode::Char('?') => {
-                                    self.help_visible = false;
+                        // Clipboard yank: y copies focused content
+                        KeyCode::Char('y') if !text_mode => {
+                            if let Some(screen) = self.screen_manager.active_screen_ref() {
+                                if let Some(content) = screen.copyable_content() {
+                                    self.copy_to_clipboard(&content);
+                                } else {
+                                    self.notifications.notify(
+                                        Toast::new("Nothing to copy")
+                                            .icon(ToastIcon::Warning)
+                                            .duration(Duration::from_secs(2)),
+                                    );
                                 }
-                                KeyCode::Char('j') | KeyCode::Down => {
-                                    self.help_scroll = self.help_scroll.saturating_add(1);
-                                }
-                                KeyCode::Char('k') | KeyCode::Up => {
-                                    self.help_scroll = self.help_scroll.saturating_sub(1);
-                                }
-                                _ => {}
                             }
                             return Cmd::none();
                         }
-
-                        let is_escape = matches!(key.code, KeyCode::Escape);
-                        let is_ctrl_c = key.modifiers.contains(Modifiers::CTRL)
-                            && matches!(key.code, KeyCode::Char('c' | 'C'));
-                        let is_ctrl_d = key.modifiers.contains(Modifiers::CTRL)
-                            && matches!(key.code, KeyCode::Char('d' | 'D'));
-
-                        if !(is_escape || is_ctrl_c) {
-                            self.clear_quit_confirmation();
+                        KeyCode::Char(c) if !text_mode => {
+                            if let Some(id) = screen_from_jump_key(c) {
+                                self.activate_screen(id);
+                                return Cmd::none();
+                            }
                         }
-
-                        if is_ctrl_d {
-                            return self.detach_tui_headless();
-                        }
-                        if is_escape && !text_mode {
-                            return self.handle_quit_confirmation_input(QuitConfirmSource::Escape);
-                        }
-                        if is_ctrl_c {
-                            return self.handle_quit_confirmation_input(QuitConfirmSource::CtrlC);
-                        }
-
-                        match key.code {
-                            KeyCode::Char('q') if !text_mode => {
-                                self.clear_quit_confirmation();
-                                self.flush_before_shutdown();
-                                self.state.request_shutdown();
-                                return Cmd::quit();
-                            }
-                            KeyCode::Char('?') if !text_mode => {
-                                self.help_visible = !self.help_visible;
-                                self.help_scroll = 0;
-                                return Cmd::none();
-                            }
-                            KeyCode::Char('m') if !text_mode => {
-                                let _ = self
-                                    .state
-                                    .try_send_server_control(ServerControlMsg::ToggleTransportBase);
-                                return Cmd::none();
-                            }
-                            KeyCode::Char('T') if !text_mode => {
-                                let name = self.cycle_theme();
-                                self.notifications.notify(
-                                    Toast::new(format!("Theme: {name}"))
-                                        .icon(ToastIcon::Info)
-                                        .duration(Duration::from_secs(3)),
-                                );
-                                return Cmd::none();
-                            }
-                            KeyCode::Tab => {
-                                let next = self.screen_manager.active_screen().next();
-                                self.activate_screen(next);
-                                return Cmd::none();
-                            }
-                            KeyCode::BackTab => {
-                                let prev = self.screen_manager.active_screen().prev();
-                                self.activate_screen(prev);
-                                return Cmd::none();
-                            }
-                            // Global search: / opens SearchCockpit with query bar focused
-                            KeyCode::Char('/') if !text_mode => {
-                                self.apply_deep_link_with_transition(
-                                    &DeepLinkTarget::SearchFocused(String::new()),
-                                );
-                                return Cmd::none();
-                            }
-                            // Action menu: . opens contextual actions for selected item
-                            KeyCode::Char('.') if !text_mode => {
-                                if let Some(screen) = self.screen_manager.active_screen_ref() {
-                                    if let Some((entries, anchor, ctx)) =
-                                        screen.contextual_actions()
-                                    {
-                                        self.action_menu.open(entries, anchor, ctx);
-                                    }
-                                }
-                                return Cmd::none();
-                            }
-                            // Clipboard yank: y copies focused content
-                            KeyCode::Char('y') if !text_mode => {
-                                if let Some(screen) = self.screen_manager.active_screen_ref() {
-                                    if let Some(content) = screen.copyable_content() {
-                                        self.copy_to_clipboard(&content);
-                                    } else {
-                                        self.notifications.notify(
-                                            Toast::new("Nothing to copy")
-                                                .icon(ToastIcon::Warning)
-                                                .duration(Duration::from_secs(2)),
-                                        );
-                                    }
-                                }
-                                return Cmd::none();
-                            }
-                            KeyCode::Char(c) if !text_mode => {
-                                if let Some(id) = screen_from_jump_key(c) {
-                                    self.activate_screen(id);
-                                    return Cmd::none();
-                                }
-                            }
-                            _ => {}
-                        }
+                        _ => {}
                     }
                 }
 
@@ -3647,9 +3640,7 @@ impl Model for MailAppModel {
         let area = Rect::new(0, 0, frame.width(), frame.height());
         // Hard guarantee that each frame paints the full terminal surface.
         let tp = crate::tui_theme::TuiThemePalette::current();
-        Paragraph::new("")
-            .style(Style::default().bg(tp.bg_deep))
-            .render(area, frame);
+        clear_rect(frame, area, tp.bg_deep, tp.text_primary);
         let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();
         *self.last_content_area.borrow_mut() = chrome.content;
@@ -3710,11 +3701,9 @@ impl Model for MailAppModel {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
-        if active_screen != MailScreenId::Dashboard
-            && let Some(focused_rect) = self.focused_panel_rect(chrome.content)
-        {
-            render_panel_focus_outline(chrome.content, focused_rect, frame);
-        }
+        // Per-screen panels already render their own focus borders. A second
+        // global outline can drift from dynamic split geometry and look like
+        // stray "random borders" crossing content, so keep this disabled.
 
         // Register pane hit region for the active screen's content area.
         frame.register_hit_region(
@@ -4773,101 +4762,95 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
     let mut reservations_seen: HashSet<String> = HashSet::new();
 
     for ev in events.iter().rev() {
-        if threads_seen.len() < PALETTE_DYNAMIC_THREAD_CAP {
-            if let Some((thread_id, subject)) = extract_thread(ev) {
-                if threads_seen.insert(thread_id.to_string()) {
-                    let thread_desc = thread_stats.get(thread_id).map_or_else(
-                        || format!("Latest: {subject}"),
-                        |stats| {
-                            let participants = format_participant_list(&stats.participants, 3);
-                            format!(
-                                "{} msgs • {} • latest: {}",
-                                stats.message_count,
-                                participants,
-                                truncate_subject(&stats.latest_subject, 42)
-                            )
-                        },
-                    );
-                    out.push(
-                        ActionItem::new(
-                            format!("{}{}", palette_action_ids::THREAD_PREFIX, thread_id),
-                            format!("Thread: {thread_id}"),
-                        )
-                        .with_description(thread_desc)
-                        .with_tags(&["thread", "messages"])
-                        .with_category("Threads"),
-                    );
-                }
-            }
-        }
-
-        if messages_seen.len() < PALETTE_DYNAMIC_MESSAGE_CAP {
-            if let Some((message_id, from, subject, thread_id)) = extract_message(ev) {
-                if messages_seen.insert(message_id) {
-                    let mut action = ActionItem::new(
-                        format!("{}{}", palette_action_ids::MESSAGE_PREFIX, message_id),
-                        format!("Message: {}", truncate_subject(subject, 56)),
+        if threads_seen.len() < PALETTE_DYNAMIC_THREAD_CAP
+            && let Some((thread_id, subject)) = extract_thread(ev)
+            && threads_seen.insert(thread_id.to_string())
+        {
+            let thread_desc = thread_stats.get(thread_id).map_or_else(
+                || format!("Latest: {subject}"),
+                |stats| {
+                    let participants = format_participant_list(&stats.participants, 3);
+                    format!(
+                        "{} msgs • {} • latest: {}",
+                        stats.message_count,
+                        participants,
+                        truncate_subject(&stats.latest_subject, 42)
                     )
-                    .with_description(format!("{from} • thread {thread_id} • id {message_id}"))
-                    .with_category("Messages");
-                    action.tags.push("message".to_string());
-                    action.tags.push((*from).to_string());
-                    action.tags.push((*thread_id).to_string());
-                    out.push(action);
-                }
-            }
+                },
+            );
+            out.push(
+                ActionItem::new(
+                    format!("{}{}", palette_action_ids::THREAD_PREFIX, thread_id),
+                    format!("Thread: {thread_id}"),
+                )
+                .with_description(thread_desc)
+                .with_tags(&["thread", "messages"])
+                .with_category("Threads"),
+            );
         }
 
-        if tools_seen.len() < PALETTE_DYNAMIC_TOOL_CAP {
-            if let Some(tool_name) = extract_tool_name(ev) {
-                if tools_seen.insert(tool_name.to_string()) {
-                    out.push(
-                        ActionItem::new(
-                            format!("{}{}", palette_action_ids::TOOL_PREFIX, tool_name),
-                            format!("Tool: {tool_name}"),
-                        )
-                        .with_description("Jump to Tool Metrics screen")
-                        .with_tags(&["tool"])
-                        .with_category("Tools"),
-                    );
-                }
-            }
+        if messages_seen.len() < PALETTE_DYNAMIC_MESSAGE_CAP
+            && let Some((message_id, from, subject, thread_id)) = extract_message(ev)
+            && messages_seen.insert(message_id)
+        {
+            let mut action = ActionItem::new(
+                format!("{}{}", palette_action_ids::MESSAGE_PREFIX, message_id),
+                format!("Message: {}", truncate_subject(subject, 56)),
+            )
+            .with_description(format!("{from} • thread {thread_id} • id {message_id}"))
+            .with_category("Messages");
+            action.tags.push("message".to_string());
+            action.tags.push((*from).to_string());
+            action.tags.push((*thread_id).to_string());
+            out.push(action);
         }
 
-        if reservations_seen.len() < PALETTE_DYNAMIC_RESERVATION_CAP {
-            if let Some(agent) = extract_reservation_agent(ev) {
-                if reservations_seen.insert(agent.to_string()) {
-                    let desc = reservation_stats.get(agent).map_or_else(
-                        || "View file reservations for this agent".to_string(),
-                        |stats| {
-                            if stats.released {
-                                return "released • no active reservation".to_string();
-                            }
-                            let mode = if stats.exclusive {
-                                "exclusive"
-                            } else {
-                                "shared"
-                            };
-                            let ttl = stats.ttl_remaining_secs.map_or_else(
-                                || "ttl unknown".to_string(),
-                                |ttl_secs| {
-                                    format!("{} remaining", format_ttl_remaining_short(ttl_secs))
-                                },
-                            );
-                            format!("{mode} • {ttl}")
-                        },
+        if tools_seen.len() < PALETTE_DYNAMIC_TOOL_CAP
+            && let Some(tool_name) = extract_tool_name(ev)
+            && tools_seen.insert(tool_name.to_string())
+        {
+            out.push(
+                ActionItem::new(
+                    format!("{}{}", palette_action_ids::TOOL_PREFIX, tool_name),
+                    format!("Tool: {tool_name}"),
+                )
+                .with_description("Jump to Tool Metrics screen")
+                .with_tags(&["tool"])
+                .with_category("Tools"),
+            );
+        }
+
+        if reservations_seen.len() < PALETTE_DYNAMIC_RESERVATION_CAP
+            && let Some(agent) = extract_reservation_agent(ev)
+            && reservations_seen.insert(agent.to_string())
+        {
+            let desc = reservation_stats.get(agent).map_or_else(
+                || "View file reservations for this agent".to_string(),
+                |stats| {
+                    if stats.released {
+                        return "released • no active reservation".to_string();
+                    }
+                    let mode = if stats.exclusive {
+                        "exclusive"
+                    } else {
+                        "shared"
+                    };
+                    let ttl = stats.ttl_remaining_secs.map_or_else(
+                        || "ttl unknown".to_string(),
+                        |ttl_secs| format!("{} remaining", format_ttl_remaining_short(ttl_secs)),
                     );
-                    out.push(
-                        ActionItem::new(
-                            format!("{}{}", palette_action_ids::RESERVATION_PREFIX, agent),
-                            format!("Reservation: {agent}"),
-                        )
-                        .with_description(desc)
-                        .with_tags(&["reservation", "file", "lock"])
-                        .with_category("Reservations"),
-                    );
-                }
-            }
+                    format!("{mode} • {ttl}")
+                },
+            );
+            out.push(
+                ActionItem::new(
+                    format!("{}{}", palette_action_ids::RESERVATION_PREFIX, agent),
+                    format!("Reservation: {agent}"),
+                )
+                .with_description(desc)
+                .with_tags(&["reservation", "file", "lock"])
+                .with_category("Reservations"),
+            );
         }
 
         if threads_seen.len() >= PALETTE_DYNAMIC_THREAD_CAP
@@ -5058,79 +5041,35 @@ fn safe_toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> 
     safe_toast_from_builder(|| toast_for_event(event, severity))
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::missing_const_for_fn
+)]
 fn render_screen_transition_overlay(transition: ScreenTransition, area: Rect, frame: &mut Frame) {
-    if area.width < 4 || area.height == 0 {
-        return;
-    }
-
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let eased = transition.eased_progress();
-
-    match transition.kind {
-        TransitionKind::Lateral => {
-            // Subtle directional slide indicator: a thin accent line that sweeps
-            // across the top edge in the direction of navigation.
-            let full_w = area.width;
-            let indicator_w = (f32::from(full_w) * 0.3).round().max(2.0) as u16;
-            let travel = full_w.saturating_sub(indicator_w);
-            let offset = match transition.direction {
-                TransitionDirection::Forward => (f32::from(travel) * eased).round() as u16,
-                TransitionDirection::Backward => {
-                    travel.saturating_sub((f32::from(travel) * eased).round() as u16)
-                }
-            };
-            let x = area.x.saturating_add(offset).min(area.x + full_w - 1);
-            let w = indicator_w.min(area.x + full_w - x);
-            Paragraph::new("")
-                .style(Style::default().bg(tp.selection_indicator))
-                .render(Rect::new(x, area.y, w, 1), frame);
-        }
-        TransitionKind::CrossCategory => {
-            // Cross-category: fade-in destination label centered in a banner
-            // that shrinks vertically as the transition progresses.
-            let banner_h = if eased < 0.5 { 2u16 } else { 1 };
-            let banner_h = banner_h.min(area.height);
-
-            // Semi-transparent overlay (painted as solid bg that fades out).
-            let fade_alpha = 1.0 - eased;
-            if fade_alpha > 0.05 {
-                Paragraph::new("")
-                    .style(Style::default().bg(tp.bg_overlay))
-                    .render(Rect::new(area.x, area.y, area.width, banner_h), frame);
-            }
-
-            // Destination label with category arrow.
-            let to_meta = screen_meta(transition.to);
-            let arrow = match transition.direction {
-                TransitionDirection::Forward => "\u{2192}",  // →
-                TransitionDirection::Backward => "\u{2190}", // ←
-            };
-            let label = format!(
-                " {arrow} {} \u{2022} {} ",
-                to_meta.category.short_label(),
-                to_meta.title,
-            );
-            let label_w = display_width(&label) as u16;
-            let label_x = area.x + area.width.saturating_sub(label_w) / 2;
-            let label_area = Rect::new(label_x, area.y, label_w.min(area.width), 1);
-            if label_area.width > 0 {
-                Paragraph::new(label)
-                    .style(
-                        Style::default()
-                            .fg(tp.status_accent)
-                            .bg(tp.bg_overlay)
-                            .bold(),
-                    )
-                    .render(label_area, frame);
-            }
-        }
-    }
+    // Screen transitions are intentionally disabled for now. Even subtle
+    // overlays can read as stray borders/noise over dense content screens.
+    let _ = (transition, area, frame);
 }
 
 fn set_focus_cell(frame: &mut Frame, x: u16, y: u16, symbol: char, color: PackedRgba) {
     if let Some(cell) = frame.buffer.get_mut(x, y) {
         *cell = (*cell).with_char(symbol).with_fg(color);
+    }
+}
+
+fn clear_rect(frame: &mut Frame, area: Rect, bg: PackedRgba, fg: PackedRgba) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.bg = bg;
+                cell.fg = fg;
+            }
+        }
     }
 }
 
@@ -5175,7 +5114,7 @@ fn render_export_format_menu(area: Rect, frame: &mut Frame) {
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     Paragraph::new("")
-        .style(Style::default().bg(tp.bg_overlay))
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay))
         .render(area, frame);
 
     let menu_width = area.width.saturating_sub(4).min(52);
@@ -5189,7 +5128,7 @@ fn render_export_format_menu(area: Rect, frame: &mut Frame) {
     }
 
     Paragraph::new("")
-        .style(Style::default().bg(tp.panel_bg))
+        .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
         .render(menu, frame);
 
     render_panel_focus_outline(area, menu, frame);
@@ -5501,6 +5440,10 @@ fn render_focus_hint(
 const MIN_TEXT_CONTRAST_RATIO: f64 = 4.5;
 /// Higher floor for bright surfaces to avoid white-on-white regressions.
 const MIN_TEXT_CONTRAST_RATIO_LIGHT_SURFACE: f64 = 5.6;
+/// Decorative separators should stay subtle so they do not read as random bars.
+const MIN_DECORATIVE_CONTRAST_RATIO: f64 = 1.35;
+/// Slightly higher decorative floor on bright surfaces for visibility.
+const MIN_DECORATIVE_CONTRAST_RATIO_LIGHT_SURFACE: f64 = 1.55;
 
 /// Normalize low-contrast rendered cells to readable theme-safe foreground colors.
 fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiThemePalette) {
@@ -5512,32 +5455,60 @@ fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiTheme
             let Some(snapshot) = frame.buffer.get(x, y) else {
                 continue;
             };
-            let is_continuation = snapshot.is_continuation();
-            let is_whitespace = snapshot.content.as_char().is_some_and(char::is_whitespace);
-
-            let fg = if snapshot.fg.a() == 0 {
-                tp.text_primary
+            let fg_color = snapshot.fg;
+            let bg_color = snapshot.bg;
+            let symbol_opt = snapshot.content.as_char();
+            let is_grapheme = snapshot.content.is_grapheme();
+            let symbol = if is_grapheme {
+                // Grapheme-backed cells represent visible user text (emoji/ZWJ/etc.)
+                // and should use full text contrast, not whitespace exemptions.
+                'A'
             } else {
-                snapshot.fg
+                symbol_opt.unwrap_or(' ')
             };
-            let effective_bg = if snapshot.bg.a() == 0 {
+            let is_continuation = snapshot.is_continuation();
+            let needs_surface_materialization = bg_color.a() == 0;
+            let needs_text_materialization = fg_color.a() == 0;
+            let effective_bg = if needs_surface_materialization {
                 infer_effective_background(frame, x, y, tp)
             } else {
-                snapshot.bg
+                bg_color
             };
-            if snapshot.bg.a() == 0 {
-                if let Some(cell) = frame.buffer.get_mut(x, y) {
+            let materialized_fg = if needs_text_materialization {
+                best_readable_fg(effective_bg, tp)
+            } else {
+                fg_color
+            };
+            if (needs_surface_materialization || needs_text_materialization)
+                && let Some(cell) = frame.buffer.get_mut(x, y)
+            {
+                if needs_surface_materialization {
                     cell.bg = effective_bg;
                 }
+                if needs_text_materialization {
+                    cell.fg = materialized_fg;
+                }
             }
-            if is_continuation || is_whitespace {
+            if is_continuation {
                 continue;
             }
-            let min_ratio = minimum_text_contrast_for_bg(effective_bg);
+            if symbol_opt.is_none() && !is_grapheme {
+                continue;
+            }
+            let min_ratio = minimum_text_contrast_for_cell(symbol, effective_bg);
+            if min_ratio <= 0.0 {
+                continue;
+            }
 
-            if contrast_ratio(fg, effective_bg) < min_ratio {
-                let replacement = best_readable_fg(effective_bg, tp);
-                if let Some(cell) = frame.buffer.get_mut(x, y) {
+            if contrast_ratio(materialized_fg, effective_bg) < min_ratio {
+                let replacement = if !is_grapheme && is_decorative_glyph(symbol) {
+                    best_readable_decorative_fg(effective_bg, tp)
+                } else {
+                    best_readable_fg(effective_bg, tp)
+                };
+                if replacement != materialized_fg
+                    && let Some(cell) = frame.buffer.get_mut(x, y)
+                {
                     cell.fg = replacement;
                 }
             }
@@ -5600,21 +5571,105 @@ fn minimum_text_contrast_for_bg(bg: PackedRgba) -> f64 {
     }
 }
 
-fn best_readable_fg(bg: PackedRgba, tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
-    let fallback = if perceived_luma(bg) >= 128 {
-        PackedRgba::rgb(0, 0, 0)
+fn minimum_text_contrast_for_cell(symbol: char, bg: PackedRgba) -> f64 {
+    if symbol.is_whitespace() {
+        0.0
+    } else if is_decorative_glyph(symbol) {
+        if perceived_luma(bg) >= 150 {
+            MIN_DECORATIVE_CONTRAST_RATIO_LIGHT_SURFACE
+        } else {
+            MIN_DECORATIVE_CONTRAST_RATIO
+        }
     } else {
-        PackedRgba::rgb(255, 255, 255)
+        minimum_text_contrast_for_bg(bg)
+    }
+}
+
+const fn is_decorative_glyph(symbol: char) -> bool {
+    matches!(
+        symbol as u32,
+        0x2500..=0x257F | // box drawing
+        0x2580..=0x259F | // block elements
+        0x2800..=0x28FF // braille patterns (sparklines/mini charts)
+    ) || matches!(
+        symbol,
+        '·' | '•'
+            | '▪'
+            | '▸'
+            | '▹'
+            | '▶'
+            | '◀'
+            | '→'
+            | '←'
+            | '↔'
+            | '↳'
+            | '↦'
+            | '⋮'
+            | '⋯'
+    )
+}
+
+fn best_readable_decorative_fg(
+    bg: PackedRgba,
+    tp: &crate::tui_theme::TuiThemePalette,
+) -> PackedRgba {
+    let target = if perceived_luma(bg) >= 150 { 1.8 } else { 1.55 };
+    let fallback = if perceived_luma(bg) >= 128 {
+        PackedRgba::rgb(88, 88, 88)
+    } else {
+        PackedRgba::rgb(176, 176, 176)
     };
     let candidates = [
+        tp.panel_border_dim,
+        tp.panel_border,
+        tp.text_muted,
+        tp.text_secondary,
+        tp.status_accent,
+        fallback,
+    ];
+
+    let mut best_above: Option<(PackedRgba, f64)> = None;
+    let mut best_below: Option<(PackedRgba, f64)> = None;
+    for candidate in candidates {
+        let ratio = contrast_ratio(candidate, bg);
+        if ratio >= target {
+            let distance = ratio - target;
+            if best_above.is_none_or(|(_, best)| distance < best) {
+                best_above = Some((candidate, distance));
+            }
+        } else if best_below.is_none_or(|(_, best)| ratio > best) {
+            best_below = Some((candidate, ratio));
+        }
+    }
+
+    best_above
+        .map(|(color, _)| color)
+        .or_else(|| best_below.map(|(color, _)| color))
+        .unwrap_or(fallback)
+}
+
+fn best_readable_fg(bg: PackedRgba, tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
+    let fallback = if perceived_luma(bg) >= 128 {
+        tp.status_bg
+    } else {
+        tp.text_primary
+    };
+    let candidates = [
+        PackedRgba::rgb(10, 10, 10),
+        PackedRgba::rgb(245, 245, 245),
         tp.text_primary,
         tp.text_secondary,
         tp.text_muted,
         tp.status_fg,
         tp.selection_fg,
+        tp.panel_title_fg,
+        tp.help_fg,
         tp.status_accent,
-        PackedRgba::rgb(0, 0, 0),
-        PackedRgba::rgb(255, 255, 255),
+        tp.metric_requests,
+        tp.status_good,
+        tp.status_warn,
+        tp.severity_warn,
+        tp.severity_error,
         fallback,
     ];
 
@@ -5724,10 +5779,10 @@ fn extract_numeric_id(context: &str) -> Option<i64> {
         return Some(id);
     }
     // Try after `":"` (e.g. "message:123").
-    if let Some((_prefix, num_part)) = context.rsplit_once(':') {
-        if let Ok(id) = num_part.parse::<i64>() {
-            return Some(id);
-        }
+    if let Some((_prefix, num_part)) = context.rsplit_once(':')
+        && let Ok(id) = num_part.parse::<i64>()
+    {
+        return Some(id);
     }
     None
 }
@@ -5784,7 +5839,7 @@ fn render_screen_error_fallback(
 
     // Background
     Paragraph::new("")
-        .style(Style::default().bg(tp.bg_deep))
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_deep))
         .render(area, frame);
 
     // Error icon + title
@@ -5888,6 +5943,33 @@ mod tests {
     }
 
     #[test]
+    fn contrast_guard_keeps_decorative_rules_subtle() {
+        let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(6, 2, &mut pool);
+
+        let mut decorative = ftui::Cell::from_char('│');
+        decorative.fg = PackedRgba::rgb(255, 255, 255);
+        decorative.bg = PackedRgba::rgb(255, 255, 255);
+        frame.buffer.set(1, 0, decorative);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        apply_frame_contrast_guard(&mut frame, &tp);
+
+        let fixed = frame.buffer.get(1, 0).expect("decorative cell exists");
+        let ratio = contrast_ratio(fixed.fg, fixed.bg);
+        let min_ratio = minimum_text_contrast_for_cell('│', fixed.bg);
+        assert!(
+            ratio >= min_ratio,
+            "decorative contrast should meet subtle minimum (ratio={ratio:.2}, min={min_ratio:.2})"
+        );
+        assert!(
+            ratio < MIN_TEXT_CONTRAST_RATIO,
+            "decorative separators should not be boosted to full text contrast (ratio={ratio:.2})"
+        );
+    }
+
+    #[test]
     fn contrast_guard_handles_transparent_background_cells() {
         let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
         let mut pool = ftui::GraphemePool::new();
@@ -5909,6 +5991,32 @@ mod tests {
         assert!(
             worst_ratio >= MIN_TEXT_CONTRAST_RATIO,
             "contrast guard should enforce minimum readability across transparent backgrounds"
+        );
+    }
+
+    #[test]
+    fn contrast_guard_handles_grapheme_backed_cells() {
+        let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(6, 2, &mut pool);
+
+        let content = ftui::render::cell::CellContent::from_grapheme(
+            ftui::render::cell::GraphemeId::new(7, 2),
+        );
+        let mut unreadable = ftui::Cell::new(content);
+        unreadable.fg = PackedRgba::rgb(255, 255, 255);
+        unreadable.bg = PackedRgba::rgb(255, 255, 255);
+        frame.buffer.set(1, 0, unreadable);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        apply_frame_contrast_guard(&mut frame, &tp);
+
+        let fixed = frame.buffer.get(1, 0).expect("grapheme cell exists");
+        let min_ratio = minimum_text_contrast_for_bg(fixed.bg);
+        let ratio = contrast_ratio(fixed.fg, fixed.bg);
+        assert!(
+            ratio >= min_ratio,
+            "grapheme-backed text should be contrast-normalized (ratio={ratio:.2}, min={min_ratio:.2})"
         );
     }
 

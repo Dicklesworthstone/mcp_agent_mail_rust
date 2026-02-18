@@ -56,6 +56,7 @@ const SHIMMER_WINDOW_MICROS: i64 = 500_000;
 const SHIMMER_MAX_ROWS: usize = 5;
 const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
 const COMPOSE_BODY_MIN_ROWS: u16 = 10;
+const QUICK_REPLY_BODY_MIN_ROWS: u16 = 8;
 const COMPOSE_SENDER_NAME: &str = "HumanOverseer";
 const COMPOSE_IMPORTANCE_LEVELS: [&str; 3] = ["normal", "high", "urgent"];
 const MESSAGE_DRAG_HOLD_DELAY: Duration = Duration::from_millis(200);
@@ -63,6 +64,9 @@ const MESSAGE_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
 const MESSAGE_STACKED_WIDTH_THRESHOLD: u16 = 68;
 const MESSAGE_STACKED_MIN_HEIGHT: u16 = 12;
 const MESSAGE_STACKED_DOCK_RATIO: f32 = 0.38;
+const MESSAGE_DEFAULT_DOCK_RATIO: f32 = 0.40;
+const MESSAGE_WIDE_DOCK_MIN_WIDTH: u16 = 150;
+const MESSAGE_ULTRAWIDE_DOCK_MIN_WIDTH: u16 = 220;
 
 /// Max body preview length in the results list (used for future
 /// inline preview in narrow mode).
@@ -80,6 +84,18 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn reduced_motion_enabled() -> bool {
     env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
+}
+
+const fn responsive_message_dock_ratio(width: u16) -> f32 {
+    if width >= MESSAGE_ULTRAWIDE_DOCK_MIN_WIDTH {
+        0.58
+    } else if width >= 180 {
+        0.52
+    } else if width >= MESSAGE_WIDE_DOCK_MIN_WIDTH {
+        0.47
+    } else {
+        MESSAGE_DEFAULT_DOCK_RATIO
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -329,17 +345,17 @@ impl MessageEntry {
             .bold();
         let mut spans = vec![
             Span::styled(batch_marker, batch_marker_style),
-            Span::styled(" ", Style::default().bg(row_bg)),
-            Span::styled(marker, Style::default().bg(row_bg)),
+            Span::styled(" ", Style::default().fg(tp.text_primary).bg(row_bg)),
+            Span::styled(marker, Style::default().fg(tp.text_primary).bg(row_bg)),
             Span::styled(format!("{badge:>2}"), badge_style),
             Span::styled(ack_badge, ack_style),
-            Span::styled(" ", Style::default().bg(row_bg)),
+            Span::styled(" ", Style::default().fg(tp.text_primary).bg(row_bg)),
             Span::styled(format!("{id_str:>6}"), id_style),
-            Span::styled(" ", Style::default().bg(row_bg)),
+            Span::styled(" ", Style::default().fg(tp.text_primary).bg(row_bg)),
             Span::styled(time_short, time_style),
-            Span::styled(" ", Style::default().bg(row_bg)),
+            Span::styled(" ", Style::default().fg(tp.text_primary).bg(row_bg)),
             Span::styled(format!("{sender:<12}"), sender_style),
-            Span::styled(" ", Style::default().bg(row_bg)),
+            Span::styled(" ", Style::default().fg(tp.text_primary).bg(row_bg)),
             Span::styled(project_badge, project_style),
             Span::styled(
                 moving_badge,
@@ -388,7 +404,9 @@ impl MessageEntry {
             line.apply_base_style(row_default_style);
             let drop_style = match drop_zone {
                 MessageDropZoneState::None => None,
-                MessageDropZoneState::Valid => Some(Style::default().bg(tp.selection_bg)),
+                MessageDropZoneState::Valid => {
+                    Some(Style::default().fg(tp.selection_fg).bg(tp.selection_bg))
+                }
                 MessageDropZoneState::HoveredValid => Some(
                     Style::default()
                         .fg(tp.selection_fg)
@@ -565,6 +583,28 @@ impl ComposeField {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickReplyField {
+    Body,
+    AckRequired,
+}
+
+impl QuickReplyField {
+    const fn next(self) -> Self {
+        match self {
+            Self::Body => Self::AckRequired,
+            Self::AckRequired => Self::Body,
+        }
+    }
+
+    const fn prev(self) -> Self {
+        match self {
+            Self::Body => Self::AckRequired,
+            Self::AckRequired => Self::Body,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct ComposeValidationErrors {
     to: Option<String>,
@@ -583,6 +623,55 @@ impl ComposeValidationErrors {
             || self.thread_id.is_some()
             || self.body.is_some()
             || self.general.is_some()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct QuickReplyValidationErrors {
+    body: Option<String>,
+    general: Option<String>,
+}
+
+impl QuickReplyValidationErrors {
+    const fn has_any(&self) -> bool {
+        self.body.is_some() || self.general.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QuickReplyContext {
+    message_id: i64,
+    project_slug: String,
+    to_agent: String,
+    thread_id: Option<String>,
+    subject: String,
+    original_from_agent: String,
+    original_timestamp_iso: String,
+    original_body_md: String,
+}
+
+impl QuickReplyContext {
+    fn from_entry(entry: &MessageEntry) -> Option<Self> {
+        let project_slug = entry.project_slug.trim().to_string();
+        let to_agent = entry.from_agent.trim().to_string();
+        if project_slug.is_empty() || to_agent.is_empty() {
+            return None;
+        }
+        let thread_id = if entry.thread_id.trim().is_empty() {
+            None
+        } else {
+            Some(entry.thread_id.trim().to_string())
+        };
+        Some(Self {
+            message_id: entry.id,
+            project_slug,
+            to_agent,
+            thread_id,
+            subject: prefixed_reply_subject(&entry.subject),
+            original_from_agent: entry.from_agent.clone(),
+            original_timestamp_iso: entry.timestamp_iso.clone(),
+            original_body_md: entry.body_md.clone(),
+        })
     }
 }
 
@@ -725,7 +814,7 @@ impl ComposeFormState {
         }
     }
 
-    fn move_suggestion(&mut self, delta: isize) {
+    const fn move_suggestion(&mut self, delta: isize) {
         if self.suggestions.is_empty() {
             return;
         }
@@ -762,6 +851,51 @@ impl ComposeFormState {
         input.set_value(&next);
         self.refresh_suggestions();
         true
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QuickReplyFormState {
+    context: QuickReplyContext,
+    body_input: TextArea,
+    ack_required: bool,
+    focus: QuickReplyField,
+    errors: QuickReplyValidationErrors,
+}
+
+impl QuickReplyFormState {
+    fn from_entry(entry: &MessageEntry) -> Option<Self> {
+        let context = QuickReplyContext::from_entry(entry)?;
+        let mut form = Self {
+            context,
+            body_input: TextArea::new()
+                .with_placeholder("Reply body (Markdown)...")
+                .with_soft_wrap(true)
+                .with_focus(true),
+            ack_required: entry.ack_required,
+            focus: QuickReplyField::Body,
+            errors: QuickReplyValidationErrors::default(),
+        };
+        form.update_focus();
+        Some(form)
+    }
+
+    fn update_focus(&mut self) {
+        self.body_input
+            .set_focused(matches!(self.focus, QuickReplyField::Body));
+    }
+
+    fn set_focus(&mut self, focus: QuickReplyField) {
+        self.focus = focus;
+        self.update_focus();
+    }
+
+    fn cycle_focus_next(&mut self) {
+        self.set_focus(self.focus.next());
+    }
+
+    fn cycle_focus_prev(&mut self) {
+        self.set_focus(self.focus.prev());
     }
 }
 
@@ -823,6 +957,8 @@ pub struct MessageBrowserScreen {
     last_results_area: Cell<Rect>,
     /// Last rendered detail area.
     last_detail_area: Cell<Rect>,
+    /// Quick reply modal state (when active).
+    quick_reply_form: Option<QuickReplyFormState>,
     /// Message compose modal state (when active).
     compose_form: Option<ComposeFormState>,
     /// Cache for rendered message body with inline images:
@@ -864,6 +1000,7 @@ impl MessageBrowserScreen {
             last_search_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            quick_reply_form: None,
             compose_form: None,
             detail_cache: RefCell::new(None),
         }
@@ -874,7 +1011,7 @@ impl MessageBrowserScreen {
             MESSAGE_URGENT_PULSE_ON.store(true, Ordering::Relaxed);
             return;
         }
-        let pulse_on = ((tick_count / URGENT_PULSE_HALF_PERIOD_TICKS) % 2) == 0;
+        let pulse_on = (tick_count / URGENT_PULSE_HALF_PERIOD_TICKS).is_multiple_of(2);
         MESSAGE_URGENT_PULSE_ON.store(pulse_on, Ordering::Relaxed);
     }
 
@@ -886,10 +1023,10 @@ impl MessageBrowserScreen {
             _ => {}
         }
 
-        if let Some(entry) = self.results.get(self.cursor) {
-            if !entry.project_slug.is_empty() {
-                return Some(entry.project_slug.clone());
-            }
+        if let Some(entry) = self.results.get(self.cursor)
+            && !entry.project_slug.is_empty()
+        {
+            return Some(entry.project_slug.clone());
         }
 
         let conn = self.db_conn.as_ref()?;
@@ -951,6 +1088,80 @@ impl MessageBrowserScreen {
             );
         }
         self.compose_form = Some(form);
+    }
+
+    fn ensure_modal_db_conn(&mut self, state: Option<&TuiSharedState>) {
+        if self.db_conn.is_some() {
+            return;
+        }
+        if let Some(shared) = state {
+            self.ensure_db_conn(shared);
+            if self.db_conn.is_some() {
+                return;
+            }
+        }
+        let cfg = DbPoolConfig::from_env();
+        if let Ok(path) = cfg.sqlite_path() {
+            self.db_conn = DbConn::open_file(&path).ok();
+            self.db_conn_attempted = true;
+        }
+    }
+
+    fn fetch_message_entry_by_id(
+        &mut self,
+        message_id: i64,
+        state: Option<&TuiSharedState>,
+    ) -> Result<MessageEntry, String> {
+        self.ensure_modal_db_conn(state);
+        let Some(conn) = &self.db_conn else {
+            return Err("Database connection unavailable".to_string());
+        };
+        let show_project = self.inbox_mode.is_global();
+        let sql = format!(
+            "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
+             m.created_ts, \
+             a_sender.name AS sender_name, \
+             p.slug AS project_slug, \
+             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+             FROM messages m \
+             JOIN agents a_sender ON a_sender.id = m.sender_id \
+             JOIN projects p ON p.id = m.project_id \
+             LEFT JOIN message_recipients mr ON mr.message_id = m.id \
+             LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
+             WHERE m.id = {message_id} \
+             GROUP BY m.id \
+             LIMIT 1"
+        );
+        query_messages(conn, &sql, &[], show_project)
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Message #{message_id} not found"))
+    }
+
+    fn open_quick_reply_modal_for_entry(&mut self, entry: &MessageEntry) -> Result<(), String> {
+        let Some(form) = QuickReplyFormState::from_entry(entry) else {
+            return Err("Selected message is missing required reply context".to_string());
+        };
+        self.quick_reply_form = Some(form);
+        self.compose_form = None;
+        Ok(())
+    }
+
+    fn open_quick_reply_modal_by_message_id(
+        &mut self,
+        message_id: i64,
+        state: Option<&TuiSharedState>,
+    ) -> Result<(), String> {
+        if let Some(entry) = self
+            .results
+            .iter()
+            .find(|entry| entry.id == message_id)
+            .cloned()
+        {
+            return self.open_quick_reply_modal_for_entry(&entry);
+        }
+        let entry = self.fetch_message_entry_by_id(message_id, state)?;
+        self.open_quick_reply_modal_for_entry(&entry)
     }
 
     fn ensure_compose_sender(&self, project_slug: &str) -> Result<(), String> {
@@ -1083,6 +1294,150 @@ impl MessageBrowserScreen {
                 ))
             }
         }
+    }
+
+    fn submit_quick_reply_form(&mut self) -> Cmd<MailScreenMsg> {
+        let (body_md, errors) = match self.quick_reply_form.as_ref() {
+            Some(form) => match validate_quick_reply_form(form) {
+                Ok(body) => (Some(body), QuickReplyValidationErrors::default()),
+                Err(errors) => (None, *errors),
+            },
+            None => return Cmd::None,
+        };
+        if errors.has_any() {
+            if let Some(form) = self.quick_reply_form.as_mut() {
+                form.errors = errors;
+            }
+            return Cmd::None;
+        }
+        let Some(body_md) = body_md else {
+            return Cmd::None;
+        };
+        let Some(context) = self
+            .quick_reply_form
+            .as_ref()
+            .map(|form| form.context.clone())
+        else {
+            return Cmd::None;
+        };
+
+        self.ensure_modal_db_conn(None);
+        if let Err(err) = self.ensure_compose_sender(&context.project_slug) {
+            if let Some(form) = self.quick_reply_form.as_mut() {
+                form.errors.general = Some(err.clone());
+            }
+            return Cmd::msg(MailScreenMsg::ActionExecute(
+                "quick_reply_result:error".to_string(),
+                err,
+            ));
+        }
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = block_on(mcp_agent_mail_tools::messaging::reply_message(
+            &ctx,
+            context.project_slug.clone(),
+            context.message_id,
+            COMPOSE_SENDER_NAME.to_string(),
+            body_md,
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        match result {
+            Ok(_) => {
+                let thread = context.thread_id.as_deref().unwrap_or("derived");
+                let ack = if self
+                    .quick_reply_form
+                    .as_ref()
+                    .is_some_and(|form| form.ack_required)
+                {
+                    "required"
+                } else {
+                    "optional"
+                };
+                self.quick_reply_form = None;
+                self.search_dirty = true;
+                self.debounce_remaining = 0;
+                Cmd::msg(MailScreenMsg::ActionExecute(
+                    "quick_reply_result:ok".to_string(),
+                    format!("to {} · thread {thread} · ack {ack}", context.to_agent),
+                ))
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if let Some(form) = self.quick_reply_form.as_mut() {
+                    form.errors.general = Some(message.clone());
+                }
+                Cmd::msg(MailScreenMsg::ActionExecute(
+                    "quick_reply_result:error".to_string(),
+                    message,
+                ))
+            }
+        }
+    }
+
+    fn handle_quick_reply_event(&mut self, event: &Event) -> Cmd<MailScreenMsg> {
+        if self.quick_reply_form.is_none() {
+            return Cmd::None;
+        }
+        if let Event::Mouse(mouse) = event {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let modal_area = quick_reply_modal_rect(self.screen_area());
+                if !point_in_rect(modal_area, mouse.x, mouse.y) {
+                    self.quick_reply_form = None;
+                }
+            }
+            // Quick reply modal traps pointer input.
+            return Cmd::None;
+        }
+        let Event::Key(key) = event else {
+            return Cmd::None;
+        };
+        if key.kind != KeyEventKind::Press {
+            return Cmd::None;
+        }
+
+        let ctrl_enter =
+            key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Enter);
+        if matches!(key.code, KeyCode::Escape) {
+            self.quick_reply_form = None;
+            return Cmd::None;
+        }
+        if ctrl_enter || matches!(key.code, KeyCode::F(5)) {
+            return self.submit_quick_reply_form();
+        }
+
+        let Some(form) = self.quick_reply_form.as_mut() else {
+            return Cmd::None;
+        };
+        match key.code {
+            KeyCode::Tab => {
+                form.cycle_focus_next();
+                return Cmd::None;
+            }
+            KeyCode::BackTab => {
+                form.cycle_focus_prev();
+                return Cmd::None;
+            }
+            _ => {}
+        }
+        match form.focus {
+            QuickReplyField::Body => {
+                let _ = form.body_input.handle_event(event);
+                form.errors.body = None;
+                form.errors.general = None;
+            }
+            QuickReplyField::AckRequired => match key.code {
+                KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Left | KeyCode::Right => {
+                    form.ack_required = !form.ack_required;
+                }
+                _ => {}
+            },
+        }
+        Cmd::None
     }
 
     fn handle_compose_event(&mut self, event: &Event) -> Cmd<MailScreenMsg> {
@@ -1437,7 +1792,7 @@ impl MessageBrowserScreen {
         Cmd::msg(MailScreenMsg::ActionExecute(op, marker.source_thread_id))
     }
 
-    fn detail_visible(&self) -> bool {
+    const fn detail_visible(&self) -> bool {
         let area = self.last_detail_area.get();
         area.width > 0 && area.height > 0
     }
@@ -1546,10 +1901,10 @@ impl MessageBrowserScreen {
                     continue;
                 }
                 // Apply project filter for Local mode
-                if let Some(slug) = project_filter {
-                    if entry.project_slug != slug {
-                        continue;
-                    }
+                if let Some(slug) = project_filter
+                    && entry.project_slug != slug
+                {
+                    continue;
                 }
                 results.push(entry);
                 live_added = live_added.saturating_add(1);
@@ -1652,17 +2007,19 @@ impl Default for MessageBrowserScreen {
 impl MailScreen for MessageBrowserScreen {
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        if self.quick_reply_form.is_some() {
+            return self.handle_quick_reply_event(event);
+        }
         if self.compose_form.is_some() {
             return self.handle_compose_event(event);
         }
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press
-                && key.code == KeyCode::Escape
-                && state.keyboard_move_snapshot().is_some()
-            {
-                state.clear_keyboard_move_snapshot();
-                return Cmd::None;
-            }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Escape
+            && state.keyboard_move_snapshot().is_some()
+        {
+            state.clear_keyboard_move_snapshot();
+            return Cmd::None;
         }
         if !matches!(event, Event::Mouse(_)) && !matches!(self.message_drag, MessageDragState::Idle)
         {
@@ -1891,6 +2248,18 @@ impl MailScreen for MessageBrowserScreen {
                         self.open_compose_modal(Some(state), None);
                         return Cmd::None;
                     }
+                    // Quick reply modal
+                    KeyCode::Char('r') if !key.modifiers.contains(Modifiers::CTRL) => {
+                        if let Some(entry) = self.results.get(self.cursor).cloned()
+                            && let Err(err) = self.open_quick_reply_modal_for_entry(&entry)
+                        {
+                            return Cmd::msg(MailScreenMsg::ActionExecute(
+                                "quick_reply_result:error".to_string(),
+                                err,
+                            ));
+                        }
+                        return Cmd::None;
+                    }
                     // Mark selected message for keyboard move.
                     KeyCode::Char('m') if key.modifiers.contains(Modifiers::CTRL) => {
                         self.mark_selected_result_for_keyboard_move(state);
@@ -1964,6 +2333,10 @@ impl MailScreen for MessageBrowserScreen {
                 self.open_compose_modal(None, prefill);
                 true
             }
+            DeepLinkTarget::ReplyToMessage(message_id) => {
+                let _ = self.open_quick_reply_modal_by_message_id(*message_id, None);
+                true
+            }
             _ => false,
         }
     }
@@ -1983,7 +2356,7 @@ impl MailScreen for MessageBrowserScreen {
         // Always paint the full content area so no cells remain stale between resizes.
         let tp = crate::tui_theme::TuiThemePalette::current();
         Paragraph::new("")
-            .style(Style::default().bg(tp.bg_deep))
+            .style(Style::default().fg(tp.text_primary).bg(tp.bg_deep))
             .render(area, frame);
 
         // Layout: search bar + dock-split content area.
@@ -2017,6 +2390,12 @@ impl MailScreen for MessageBrowserScreen {
         let mode_label = self.inbox_mode.label();
         let mut dock = self.dock;
         let mut stacked_fallback = false;
+        if dock.visible
+            && matches!(dock.position, DockPosition::Left | DockPosition::Right)
+            && (dock.ratio - MESSAGE_DEFAULT_DOCK_RATIO).abs() <= 0.01
+        {
+            dock.set_ratio(responsive_message_dock_ratio(content_area.width));
+        }
         if content_area.height < MESSAGE_DOCK_HIDE_HEIGHT_THRESHOLD {
             dock.visible = false;
         } else if content_area.width < MESSAGE_STACKED_WIDTH_THRESHOLD {
@@ -2099,7 +2478,9 @@ impl MailScreen for MessageBrowserScreen {
             );
         }
 
-        if let Some(form) = &self.compose_form {
+        if let Some(form) = &self.quick_reply_form {
+            render_quick_reply_modal(frame, area, form);
+        } else if let Some(form) = &self.compose_form {
             render_compose_modal(frame, area, form);
         }
     }
@@ -2171,20 +2552,26 @@ impl MailScreen for MessageBrowserScreen {
                 action: "Compose message",
             },
             HelpEntry {
+                key: "r",
+                action: "Quick reply",
+            },
+            HelpEntry {
                 key: "F5/Ctrl+Enter",
-                action: "Submit compose form",
+                action: "Submit compose/reply form",
             },
         ]
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some(
-            "Browse and triage messages. Space/v/A/C manage multi-select; c composes; Enter jumps timeline.",
+            "Browse and triage messages. Space/v/A/C manage multi-select; c composes; r quick-replies; Enter jumps timeline.",
         )
     }
 
     fn consumes_text_input(&self) -> bool {
-        self.compose_form.is_some() || matches!(self.focus, Focus::SearchBar)
+        self.compose_form.is_some()
+            || self.quick_reply_form.is_some()
+            || matches!(self.focus, Focus::SearchBar)
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -2529,11 +2916,15 @@ fn render_search_bar(
             tp.status_accent,
             0.45,
         )))
-        .style(Style::default().bg(crate::tui_theme::lerp_color(
-            tp.panel_bg,
-            tp.status_accent,
-            0.08,
-        )));
+        .style(
+            Style::default()
+                .fg(tp.text_primary)
+                .bg(crate::tui_theme::lerp_color(
+                    tp.panel_bg,
+                    tp.status_accent,
+                    0.08,
+                )),
+        );
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -2610,11 +3001,15 @@ fn render_results_list(
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(crate::tui_theme::lerp_color(
-            tp.panel_bg,
-            tp.selection_indicator,
-            0.07,
-        )));
+        .style(
+            Style::default()
+                .fg(tp.text_primary)
+                .bg(crate::tui_theme::lerp_color(
+                    tp.panel_bg,
+                    tp.selection_indicator,
+                    0.07,
+                )),
+        );
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -2658,14 +3053,14 @@ fn render_results_list(
         .collect();
 
     let list = VirtualizedList::new(rows.as_slice())
-        .style(Style::default())
+        .style(crate::tui_theme::text_primary(&tp))
         .highlight_style(
             Style::default()
                 .fg(tp.selection_fg)
                 .bg(tp.selection_bg)
                 .bold(),
         )
-        .show_scrollbar(true);
+        .show_scrollbar(rows.len() > usize::from(inner.height));
 
     StatefulWidget::render(&list, inner, frame, list_state);
 }
@@ -2979,7 +3374,11 @@ fn render_detail_panel(
         .title(&detail_title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.08)));
+        .style(
+            Style::default()
+                .fg(tp.text_primary)
+                .bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.08)),
+        );
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -3189,13 +3588,13 @@ fn render_compose_error_line(
     error: Option<&str>,
     tp: &crate::tui_theme::TuiThemePalette,
 ) {
-    if let Some(err) = error {
-        if *cursor_y < bottom {
-            Paragraph::new(truncate_str(err, inner.width as usize))
-                .style(crate::tui_theme::text_warning(tp))
-                .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
-            *cursor_y = (*cursor_y).saturating_add(1);
-        }
+    if let Some(err) = error
+        && *cursor_y < bottom
+    {
+        Paragraph::new(truncate_str(err, inner.width as usize))
+            .style(crate::tui_theme::text_warning(tp))
+            .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
+        *cursor_y = (*cursor_y).saturating_add(1);
     }
 }
 
@@ -3221,7 +3620,7 @@ fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormSta
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     Paragraph::new("")
-        .style(Style::default().bg(tp.bg_overlay))
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay))
         .render(area, frame);
 
     let modal = compose_modal_rect(area);
@@ -3422,16 +3821,184 @@ fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormSta
         &tp,
     );
 
-    if let Some(error) = &form.errors.general {
-        if cursor_y < bottom {
-            Paragraph::new(truncate_str(error, inner.width as usize))
-                .style(crate::tui_theme::text_warning(&tp))
-                .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
-        }
+    if let Some(error) = &form.errors.general
+        && cursor_y < bottom
+    {
+        Paragraph::new(truncate_str(error, inner.width as usize))
+            .style(crate::tui_theme::text_warning(&tp))
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
     }
 
     let footer_y = bottom.saturating_sub(1);
     let footer = "Tab/Shift+Tab fields • ↑/↓ suggestions • F5 or Ctrl+Enter submit • Esc cancel";
+    Paragraph::new(truncate_str(footer, inner.width as usize))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
+}
+
+#[must_use]
+fn quick_reply_modal_rect(area: Rect) -> Rect {
+    if area.width < 40 || area.height < 14 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let modal_width = ((u32::from(area.width) * 84) / 100).clamp(58, 108) as u16;
+    let modal_height = ((u32::from(area.height) * 82) / 100).clamp(18, 34) as u16;
+    let width = modal_width.min(area.width.saturating_sub(2));
+    let height = modal_height.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReplyFormState) {
+    if area.width < 40 || area.height < 14 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    Paragraph::new("")
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay))
+        .render(area, frame);
+
+    let modal = quick_reply_modal_rect(area);
+    let modal_title = format!("Quick Reply · message #{}", form.context.message_id);
+    let block = Block::default()
+        .title(&modal_title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.selection_indicator));
+    let inner = block.inner(modal);
+    block.render(modal, frame);
+    if inner.height < 8 || inner.width < 16 {
+        return;
+    }
+
+    let mut cursor_y = inner.y;
+    let bottom = inner.y + inner.height;
+
+    let to_line = format!("To: {}", form.context.to_agent);
+    Paragraph::new(truncate_str(&to_line, inner.width as usize))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+    cursor_y = cursor_y.saturating_add(1);
+
+    let thread_label = form.context.thread_id.as_deref().unwrap_or("(derived)");
+    let thread_line = format!("Thread: {thread_label}");
+    Paragraph::new(truncate_str(&thread_line, inner.width as usize))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+    cursor_y = cursor_y.saturating_add(1);
+
+    let subject_line = format!("Subject: {}", form.context.subject);
+    Paragraph::new(truncate_str(&subject_line, inner.width as usize))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+    cursor_y = cursor_y.saturating_add(1);
+
+    let ack_line = if form.ack_required {
+        "Ack Required: [x] (informational for reply_message)"
+    } else {
+        "Ack Required: [ ] (informational for reply_message)"
+    };
+    let ack_style = if matches!(form.focus, QuickReplyField::AckRequired) {
+        Style::default().fg(tp.selection_indicator).bold()
+    } else {
+        Style::default().fg(tp.text_secondary)
+    };
+    Paragraph::new(truncate_str(ack_line, inner.width as usize))
+        .style(ack_style)
+        .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+    cursor_y = cursor_y.saturating_add(1);
+
+    let body_label =
+        format!("Reply Body* (Markdown, min {QUICK_REPLY_BODY_MIN_ROWS} rows on normal terminals)");
+    render_compose_label(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        &body_label,
+        matches!(form.focus, QuickReplyField::Body),
+        &tp,
+    );
+
+    let footer_rows: u16 = 2;
+    let context_rows: u16 = 6;
+    let body_rows = bottom
+        .saturating_sub(cursor_y)
+        .saturating_sub(footer_rows.saturating_add(context_rows))
+        .max(3);
+    if body_rows > 0 {
+        ftui_widgets::Widget::render(
+            &form.body_input,
+            Rect::new(inner.x, cursor_y, inner.width, body_rows),
+            frame,
+        );
+        cursor_y = cursor_y.saturating_add(body_rows);
+    }
+
+    render_compose_error_line(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.body.as_deref(),
+        &tp,
+    );
+
+    if cursor_y < bottom {
+        let from_line = format!(
+            "Original from {} at {}",
+            form.context.original_from_agent, form.context.original_timestamp_iso
+        );
+        Paragraph::new(truncate_str(&from_line, inner.width as usize))
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+
+    let preview_rows = bottom.saturating_sub(cursor_y).saturating_sub(1);
+    if preview_rows > 0 {
+        if form.context.original_body_md.trim().is_empty() {
+            Paragraph::new("(empty body)")
+                .style(crate::tui_theme::text_hint(&tp))
+                .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+            cursor_y = cursor_y.saturating_add(1);
+        } else {
+            let md_theme = crate::tui_theme::markdown_theme();
+            let rendered =
+                crate::tui_markdown::render_body(&form.context.original_body_md, &md_theme);
+            let preview_lines = rendered
+                .lines()
+                .iter()
+                .filter(|line| !line.to_plain_text().trim().is_empty())
+                .take(usize::from(preview_rows))
+                .cloned()
+                .collect::<Vec<_>>();
+            if preview_lines.is_empty() {
+                Paragraph::new("(empty body)")
+                    .style(crate::tui_theme::text_hint(&tp))
+                    .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+                cursor_y = cursor_y.saturating_add(1);
+            } else {
+                let height = u16::try_from(preview_lines.len()).unwrap_or(preview_rows);
+                Paragraph::new(Text::from_lines(preview_lines))
+                    .wrap(ftui::text::WrapMode::Word)
+                    .render(Rect::new(inner.x, cursor_y, inner.width, height), frame);
+                cursor_y = cursor_y.saturating_add(height);
+            }
+        }
+    }
+
+    if let Some(error) = &form.errors.general
+        && cursor_y < bottom.saturating_sub(1)
+    {
+        Paragraph::new(truncate_str(error, inner.width as usize))
+            .style(crate::tui_theme::text_warning(&tp))
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+    }
+
+    let footer_y = bottom.saturating_sub(1);
+    let footer = "Tab/Shift+Tab field • Space/Enter toggles Ack • Ctrl+Enter submits • Esc cancel";
     Paragraph::new(truncate_str(footer, inner.width as usize))
         .style(crate::tui_theme::text_hint(&tp))
         .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
@@ -3505,6 +4072,18 @@ fn parse_recipient_list(raw: &str) -> Vec<String> {
     out
 }
 
+fn prefixed_reply_subject(subject: &str) -> String {
+    let trimmed = subject.trim();
+    if trimmed.is_empty() {
+        return "Re:".to_string();
+    }
+    if trimmed.to_ascii_lowercase().starts_with("re:") {
+        trimmed.to_string()
+    } else {
+        format!("Re: {trimmed}")
+    }
+}
+
 fn is_valid_compose_thread_id(value: &str) -> bool {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > 128 {
@@ -3575,6 +4154,20 @@ fn validate_compose_form(
         importance: form.importance().to_string(),
         ack_required: form.ack_required,
     })
+}
+
+fn validate_quick_reply_form(
+    form: &QuickReplyFormState,
+) -> Result<String, Box<QuickReplyValidationErrors>> {
+    let mut errors = QuickReplyValidationErrors::default();
+    let body_md = form.body_input.text();
+    if body_md.trim().is_empty() {
+        errors.body = Some("Reply body is required.".to_string());
+    }
+    if errors.has_any() {
+        return Err(Box::new(errors));
+    }
+    Ok(body_md)
 }
 
 fn apply_compose_field_key(form: &mut ComposeFormState, event: &Event, code: KeyCode) {
@@ -4686,6 +5279,45 @@ mod tests {
         assert!(
             detail.y > content.y,
             "stacked fallback detail should appear below list content"
+        );
+    }
+
+    #[test]
+    fn wide_layout_expands_default_detail_ratio_for_dense_viewports() {
+        let screen = MessageBrowserScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(220, 28, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 220, 28), &state);
+
+        let detail = screen.last_detail_area.get();
+        let list = screen.last_results_area.get();
+        assert!(detail.width > 0 && list.width > 0);
+        assert!(
+            detail.width > list.width,
+            "default wide layout should allocate more room to detail on very wide screens: list={} detail={}",
+            list.width,
+            detail.width
+        );
+    }
+
+    #[test]
+    fn wide_layout_preserves_user_tuned_dock_ratio() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.dock.set_ratio(0.3);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(220, 28, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 220, 28), &state);
+
+        let detail = screen.last_detail_area.get();
+        let list = screen.last_results_area.get();
+        assert!(detail.width > 0 && list.width > 0);
+        assert!(
+            detail.width < list.width,
+            "manual dock ratio should remain authoritative: list={} detail={}",
+            list.width,
+            detail.width
         );
     }
 

@@ -34,7 +34,6 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{Cell, Frame, PackedRgba, Style};
 use ftui_extras::canvas::Mode;
 use ftui_extras::charts::heatmap_gradient;
-use ftui_extras::theme;
 use ftui_extras::visual_fx::effects::DoomFireFx;
 use ftui_extras::visual_fx::effects::metaballs::{MetaballsFx, MetaballsPalette, MetaballsParams};
 use ftui_extras::visual_fx::effects::plasma::{PlasmaFx, PlasmaPalette};
@@ -78,33 +77,16 @@ impl<W: Widget> Widget for WidgetState<'_, W> {
         if area.is_empty() {
             return;
         }
+        let tp = crate::tui_theme::TuiThemePalette::current();
         match self {
             Self::Loading { message } => {
-                render_state_placeholder(
-                    area,
-                    frame,
-                    "\u{23F3}",
-                    message,
-                    PackedRgba::rgb(120, 160, 220),
-                );
+                render_state_placeholder(area, frame, "\u{23F3}", message, tp.metric_requests);
             }
             Self::Empty { message } => {
-                render_state_placeholder(
-                    area,
-                    frame,
-                    "\u{2205}",
-                    message,
-                    PackedRgba::rgb(140, 140, 140),
-                );
+                render_state_placeholder(area, frame, "\u{2205}", message, tp.text_muted);
             }
             Self::Error { message } => {
-                render_state_placeholder(
-                    area,
-                    frame,
-                    "\u{26A0}",
-                    message,
-                    PackedRgba::rgb(255, 120, 80),
-                );
+                render_state_placeholder(area, frame, "\u{26A0}", message, tp.severity_error);
             }
             Self::Ready(widget) => widget.render(area, frame),
         }
@@ -142,7 +124,7 @@ fn render_state_placeholder(
     let block = Block::default()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(border))
-        .style(Style::new().bg(bg));
+        .style(Style::new().fg(tp.text_primary).bg(bg));
     let inner = block.inner(area);
     block.render(area, frame);
     if inner.width == 0 || inner.height == 0 {
@@ -158,12 +140,12 @@ fn render_state_placeholder(
     let truncated: String = message.chars().take(msg_max).collect();
     let line = Line::from_spans([
         icon_span,
-        Span::styled(" ", Style::new().bg(bg)),
+        Span::styled(" ", Style::new().fg(tp.text_primary).bg(bg)),
         Span::styled(truncated, Style::new().fg(tp.text_secondary).bg(bg)),
     ]);
     let y = inner.y + inner.height / 2;
     Paragraph::new(line)
-        .style(Style::new().bg(bg))
+        .style(Style::new().fg(tp.text_primary).bg(bg))
         .render(Rect::new(inner.x, y, inner.width, 1), frame);
 }
 
@@ -420,25 +402,23 @@ impl Widget for HeatmapGrid<'_> {
         }
 
         // Render column headers.
-        if has_col_header {
-            if let Some(col_labels) = self.col_labels {
-                let y = inner.y;
-                for (c, label) in col_labels.iter().enumerate() {
+        if has_col_header && let Some(col_labels) = self.col_labels {
+            let y = inner.y;
+            for (c, label) in col_labels.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let x = grid_left + (c as u16) * cell_w;
+                if x >= inner.right() {
+                    break;
+                }
+                let max_w = cell_w.min(inner.right().saturating_sub(x));
+                let truncated: String = label.chars().take(max_w as usize).collect();
+                for (i, ch) in truncated.chars().enumerate() {
                     #[allow(clippy::cast_possible_truncation)]
-                    let x = grid_left + (c as u16) * cell_w;
-                    if x >= inner.right() {
-                        break;
-                    }
-                    let max_w = cell_w.min(inner.right().saturating_sub(x));
-                    let truncated: String = label.chars().take(max_w as usize).collect();
-                    for (i, ch) in truncated.chars().enumerate() {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let cx = x + i as u16;
-                        if cx < inner.right() {
-                            let mut cell = Cell::from_char(ch);
-                            cell.fg = PackedRgba::rgb(180, 180, 180);
-                            frame.buffer.set_fast(cx, y, cell);
-                        }
+                    let cx = x + i as u16;
+                    if cx < inner.right() {
+                        let mut cell = Cell::from_char(ch);
+                        cell.fg = PackedRgba::rgb(180, 180, 180);
+                        frame.buffer.set_fast(cx, y, cell);
                     }
                 }
             }
@@ -455,22 +435,21 @@ impl Widget for HeatmapGrid<'_> {
             }
 
             // Row label.
-            if effective_label_width > 0 {
-                if let Some(labels) = self.row_labels {
-                    if let Some(label) = labels.get(r) {
-                        let lbl: String = label
-                            .chars()
-                            .take((effective_label_width.saturating_sub(1)) as usize)
-                            .collect();
-                        for (i, ch) in lbl.chars().enumerate() {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let cx = inner.x + i as u16;
-                            if cx < grid_left {
-                                let mut cell = Cell::from_char(ch);
-                                cell.fg = PackedRgba::rgb(180, 180, 180);
-                                frame.buffer.set_fast(cx, y, cell);
-                            }
-                        }
+            if effective_label_width > 0
+                && let Some(labels) = self.row_labels
+                && let Some(label) = labels.get(r)
+            {
+                let lbl: String = label
+                    .chars()
+                    .take((effective_label_width.saturating_sub(1)) as usize)
+                    .collect();
+                for (i, ch) in lbl.chars().enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let cx = inner.x + i as u16;
+                    if cx < grid_left {
+                        let mut cell = Cell::from_char(ch);
+                        cell.fg = PackedRgba::rgb(180, 180, 180);
+                        frame.buffer.set_fast(cx, y, cell);
                     }
                 }
             }
@@ -1091,7 +1070,7 @@ impl Widget for AnomalyCard<'_> {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let card_bg = crate::tui_theme::lerp_color(tp.panel_bg, self.severity.color(), 0.08);
         Paragraph::new("")
-            .style(Style::new().bg(card_bg))
+            .style(Style::new().fg(tp.text_primary).bg(card_bg))
             .render(inner, frame);
 
         let mut y = inner.y;
@@ -1405,7 +1384,7 @@ impl Widget for MetricTile<'_> {
         };
         let tile_bg = crate::tui_theme::lerp_color(tp.panel_bg, self.value_color, 0.09);
         Paragraph::new("")
-            .style(Style::new().bg(tile_bg))
+            .style(Style::new().fg(tp.text_primary).bg(tile_bg))
             .render(inner, frame);
 
         // Line 1: label.
@@ -1442,7 +1421,7 @@ impl Widget for MetricTile<'_> {
                 self.value.to_string(),
                 Style::new().fg(self.value_color).bg(tile_bg).bold(),
             ),
-            Span::styled(" ", Style::new().bg(tile_bg)),
+            Span::styled(" ", Style::new().fg(tp.text_primary).bg(tile_bg)),
             Span::styled(
                 trend_str.to_string(),
                 Style::new().fg(trend_color).bg(tile_bg).bold(),
@@ -1636,6 +1615,17 @@ impl Widget for ReservationGauge<'_> {
 
         // Line 2: ProgressBar-backed gauge bar.
         let ratio = self.ratio();
+        let bar_color = self.bar_color();
+        let bar_luma = (299_u32
+            .saturating_mul(u32::from(bar_color.r()))
+            .saturating_add(587_u32.saturating_mul(u32::from(bar_color.g())))
+            .saturating_add(114_u32.saturating_mul(u32::from(bar_color.b()))))
+            / 1000;
+        let gauge_fg = if bar_luma >= 140 {
+            PackedRgba::rgb(24, 24, 24)
+        } else {
+            PackedRgba::rgb(244, 244, 244)
+        };
         let pct_str = format!("{:.0}%", ratio * 100.0);
         ProgressBar::new()
             .ratio(ratio)
@@ -1644,7 +1634,7 @@ impl Widget for ReservationGauge<'_> {
                     .bg(PackedRgba::rgb(40, 40, 40))
                     .fg(PackedRgba::rgb(220, 220, 220)),
             )
-            .gauge_style(Style::new().bg(self.bar_color()))
+            .gauge_style(Style::new().fg(gauge_fg).bg(bar_color))
             .label(&pct_str)
             .render(
                 Rect {
@@ -2351,46 +2341,45 @@ impl Default for AmbientEffectRenderer {
 
 fn build_ambient_theme_inputs(state: AmbientHealthState) -> ThemeInputs {
     let tui = crate::tui_theme::TuiThemePalette::current();
-    let base = theme::current_palette();
 
     let (accent_primary, accent_secondary, accent_slots) = match state {
         AmbientHealthState::Healthy => (
             tui.severity_ok,
-            base.accent_secondary,
+            tui.metric_requests,
             [
                 tui.severity_ok,
-                base.accent_secondary,
+                tui.metric_requests,
                 tui.status_good,
                 tui.status_accent,
             ],
         ),
         AmbientHealthState::Warning => (
             tui.severity_warn,
-            blend_rgb(tui.severity_warn, base.accent_warning, 0.5),
+            blend_rgb(tui.severity_warn, tui.status_warn, 0.5),
             [
                 tui.severity_warn,
-                blend_rgb(tui.severity_warn, base.accent_warning, 0.5),
+                blend_rgb(tui.severity_warn, tui.status_warn, 0.5),
                 blend_rgb(tui.severity_warn, tui.severity_critical, 0.25),
-                base.accent_warning,
+                tui.status_warn,
             ],
         ),
         AmbientHealthState::Critical => (
             tui.severity_critical,
-            blend_rgb(tui.severity_critical, base.accent_warning, 0.5),
+            blend_rgb(tui.severity_critical, tui.status_warn, 0.5),
             [
                 tui.severity_critical,
-                blend_rgb(tui.severity_critical, base.accent_warning, 0.5),
-                base.accent_error,
-                base.accent_warning,
+                blend_rgb(tui.severity_critical, tui.status_warn, 0.5),
+                tui.severity_error,
+                tui.status_warn,
             ],
         ),
         AmbientHealthState::Idle => (
-            base.accent_primary,
-            base.accent_info,
+            tui.panel_border_focused,
+            tui.metric_requests,
             [
-                base.accent_primary,
-                base.accent_info,
-                base.accent_secondary,
+                tui.panel_border_focused,
+                tui.metric_requests,
+                tui.status_accent,
                 tui.status_accent,
             ],
         ),
@@ -2517,13 +2506,13 @@ impl DrillDownWidget for AgentHeatmap<'_> {
                 target: DrillDownTarget::Agent(sender.to_string()),
             });
         }
-        if let Some(&receiver) = self.agents.get(col) {
-            if row != col {
-                actions.push(DrillDownAction {
-                    label: format!("View receiver: {receiver}"),
-                    target: DrillDownTarget::Agent(receiver.to_string()),
-                });
-            }
+        if let Some(&receiver) = self.agents.get(col)
+            && row != col
+        {
+            actions.push(DrillDownAction {
+                label: format!("View receiver: {receiver}"),
+                target: DrillDownTarget::Agent(receiver.to_string()),
+            });
         }
         actions
     }
@@ -3341,11 +3330,11 @@ pub fn truncate_at_word_boundary(body: &str, max_chars: usize) -> String {
     let truncated: String = body.chars().take(max_chars).collect();
 
     // Find the last space within the truncated portion for word boundary.
-    if let Some(last_space) = truncated.rfind(' ') {
-        if last_space > max_chars / 2 {
-            // Only break at space if it's not too early in the string.
-            return format!("{}…", &truncated[..last_space]);
-        }
+    if let Some(last_space) = truncated.rfind(' ')
+        && last_space > max_chars / 2
+    {
+        // Only break at space if it's not too early in the string.
+        return format!("{}…", &truncated[..last_space]);
     }
 
     // No good word boundary found — hard truncate.
@@ -4204,11 +4193,11 @@ impl ChartDataProvider for ThroughputProvider {
             let ts = event.timestamp_micros();
             let bucket_start = (ts / bucket_w) * bucket_w;
 
-            if let Some(last) = self.series.buckets.last_mut() {
-                if last.0 == bucket_start {
-                    last.1[0] += 1.0;
-                    continue;
-                }
+            if let Some(last) = self.series.buckets.last_mut()
+                && last.0 == bucket_start
+            {
+                last.1[0] += 1.0;
+                continue;
             }
 
             // Fill gaps with zero buckets.
@@ -4330,11 +4319,11 @@ impl ChartDataProvider for LatencyProvider {
                 let bucket_start = (timestamp_micros / bucket_w) * bucket_w;
                 let dur = *duration_ms as f64;
 
-                if let Some(last) = self.raw_samples.last_mut() {
-                    if last.0 == bucket_start {
-                        last.1.push(dur);
-                        continue;
-                    }
+                if let Some(last) = self.raw_samples.last_mut()
+                    && last.0 == bucket_start
+                {
+                    last.1.push(dur);
+                    continue;
                 }
 
                 self.raw_samples.push((bucket_start, vec![dur]));
@@ -4449,11 +4438,11 @@ impl ChartDataProvider for ResourceProvider {
                 ];
 
                 // HealthPulse is a snapshot — replace the bucket value (last wins).
-                if let Some(last) = self.series.buckets.last_mut() {
-                    if last.0 == bucket_start {
-                        last.1 = vals;
-                        continue;
-                    }
+                if let Some(last) = self.series.buckets.last_mut()
+                    && last.0 == bucket_start
+                {
+                    last.1 = vals;
+                    continue;
                 }
                 self.series.buckets.push((bucket_start, vals));
             }
@@ -4586,11 +4575,11 @@ impl ChartDataProvider for EventHeatmapProvider {
             let bucket_start = (ts / bucket_w) * bucket_w;
             let kind_idx = Self::kind_index(event.kind());
 
-            if let Some(last) = self.series.buckets.last_mut() {
-                if last.0 == bucket_start {
-                    last.1[kind_idx] += 1.0;
-                    continue;
-                }
+            if let Some(last) = self.series.buckets.last_mut()
+                && last.0 == bucket_start
+            {
+                last.1[kind_idx] += 1.0;
+                continue;
             }
 
             // Fill gaps with zero buckets.

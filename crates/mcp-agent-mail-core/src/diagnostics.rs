@@ -814,7 +814,11 @@ mod tests {
         signals.pool_utilization_pct = 95;
         let recs = generate_recommendations(&snap, HealthLevel::Red, &signals, &[], 2);
         // Should have health (red), database (pool 95%), tools (slow + error rate)
-        assert!(recs.len() >= 3, "expected at least 3 recommendations, got {}", recs.len());
+        assert!(
+            recs.len() >= 3,
+            "expected at least 3 recommendations, got {}",
+            recs.len()
+        );
         assert!(recs.iter().any(|r| r.subsystem == "health"));
         assert!(recs.iter().any(|r| r.subsystem == "database"));
         assert!(recs.iter().any(|r| r.subsystem == "tools"));

@@ -388,14 +388,14 @@ fn probe_storage_root(config: &Config) -> ProbeResult {
     let root = &config.storage_root;
 
     // Try to create if it doesn't exist
-    if !root.exists() {
-        if let Err(e) = std::fs::create_dir_all(root) {
-            return ProbeResult::Fail(ProbeFailure {
-                name: "storage",
-                problem: format!("Cannot create storage directory {}: {e}", root.display()),
-                fix: format!("Create the directory manually: mkdir -p {}", root.display()),
-            });
-        }
+    if !root.exists()
+        && let Err(e) = std::fs::create_dir_all(root)
+    {
+        return ProbeResult::Fail(ProbeFailure {
+            name: "storage",
+            problem: format!("Cannot create storage directory {}: {e}", root.display()),
+            fix: format!("Create the directory manually: mkdir -p {}", root.display()),
+        });
     }
 
     // Check it is a directory
@@ -450,17 +450,18 @@ fn probe_database(config: &Config) -> ProbeResult {
                 fix: "Use a valid SQLite URL like 'sqlite:///./storage.sqlite3'".into(),
             });
         };
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                return ProbeResult::Fail(ProbeFailure {
-                    name: "database",
-                    problem: format!(
-                        "Database parent directory does not exist: {}",
-                        parent.display()
-                    ),
-                    fix: format!("Create it: mkdir -p {}", parent.display()),
-                });
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            return ProbeResult::Fail(ProbeFailure {
+                name: "database",
+                problem: format!(
+                    "Database parent directory does not exist: {}",
+                    parent.display()
+                ),
+                fix: format!("Create it: mkdir -p {}", parent.display()),
+            });
         }
     }
 
@@ -527,15 +528,15 @@ fn probe_integrity(config: &Config) -> ProbeResult {
 /// Check auth configuration consistency.
 fn probe_auth(config: &Config) -> ProbeResult {
     // Warn if bearer token is set but very short (likely a mistake)
-    if let Some(ref token) = config.http_bearer_token {
-        if token.len() < 8 {
-            return ProbeResult::Fail(ProbeFailure {
-                name: "auth",
-                problem: "HTTP_BEARER_TOKEN is set but very short (< 8 chars)".into(),
-                fix: "Use a longer token for security, or unset HTTP_BEARER_TOKEN to disable auth"
-                    .into(),
-            });
-        }
+    if let Some(ref token) = config.http_bearer_token
+        && token.len() < 8
+    {
+        return ProbeResult::Fail(ProbeFailure {
+            name: "auth",
+            problem: "HTTP_BEARER_TOKEN is set but very short (< 8 chars)".into(),
+            fix: "Use a longer token for security, or unset HTTP_BEARER_TOKEN to disable auth"
+                .into(),
+        });
     }
 
     if config.http_jwt_enabled {

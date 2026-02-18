@@ -95,14 +95,14 @@ impl ProjectsScreen {
         self.projects = rows;
 
         // Clamp selection
-        if let Some(sel) = self.table_state.selected {
-            if sel >= self.projects.len() {
-                self.table_state.selected = if self.projects.is_empty() {
-                    None
-                } else {
-                    Some(self.projects.len() - 1)
-                };
-            }
+        if let Some(sel) = self.table_state.selected
+            && sel >= self.projects.len()
+        {
+            self.table_state.selected = if self.projects.is_empty() {
+                None
+            } else {
+                Some(self.projects.len() - 1)
+            };
         }
     }
 
@@ -201,60 +201,60 @@ const fn trend_for(current: u64, previous: u64) -> MetricTrend {
 
 impl MailScreen for ProjectsScreen {
     fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                // Filter mode: capture text input
-                if self.filter_active {
-                    match key.code {
-                        KeyCode::Escape | KeyCode::Enter => {
-                            self.filter_active = false;
-                        }
-                        KeyCode::Backspace => {
-                            self.filter.pop();
-                            self.rebuild_from_state(state);
-                        }
-                        KeyCode::Char(c) => {
-                            self.filter.push(c);
-                            self.rebuild_from_state(state);
-                        }
-                        _ => {}
-                    }
-                    return Cmd::None;
-                }
-
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            // Filter mode: capture text input
+            if self.filter_active {
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-                    KeyCode::Char('G') | KeyCode::End => {
-                        if !self.projects.is_empty() {
-                            self.table_state.selected = Some(self.projects.len() - 1);
-                        }
+                    KeyCode::Escape | KeyCode::Enter => {
+                        self.filter_active = false;
                     }
-                    KeyCode::Char('g') | KeyCode::Home => {
-                        if !self.projects.is_empty() {
-                            self.table_state.selected = Some(0);
-                        }
-                    }
-                    KeyCode::Char('/') => {
-                        self.filter_active = true;
-                        self.filter.clear();
-                    }
-                    KeyCode::Char('s') => {
-                        self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                    KeyCode::Backspace => {
+                        self.filter.pop();
                         self.rebuild_from_state(state);
                     }
-                    KeyCode::Char('S') => {
-                        self.sort_asc = !self.sort_asc;
+                    KeyCode::Char(c) => {
+                        self.filter.push(c);
                         self.rebuild_from_state(state);
-                    }
-                    KeyCode::Escape => {
-                        if !self.filter.is_empty() {
-                            self.filter.clear();
-                            self.rebuild_from_state(state);
-                        }
                     }
                     _ => {}
                 }
+                return Cmd::None;
+            }
+
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+                KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+                KeyCode::Char('G') | KeyCode::End => {
+                    if !self.projects.is_empty() {
+                        self.table_state.selected = Some(self.projects.len() - 1);
+                    }
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    if !self.projects.is_empty() {
+                        self.table_state.selected = Some(0);
+                    }
+                }
+                KeyCode::Char('/') => {
+                    self.filter_active = true;
+                    self.filter.clear();
+                }
+                KeyCode::Char('s') => {
+                    self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                    self.rebuild_from_state(state);
+                }
+                KeyCode::Char('S') => {
+                    self.sort_asc = !self.sort_asc;
+                    self.rebuild_from_state(state);
+                }
+                KeyCode::Escape => {
+                    if !self.filter.is_empty() {
+                        self.filter.clear();
+                        self.rebuild_from_state(state);
+                    }
+                }
+                _ => {}
             }
         }
         Cmd::None
@@ -263,7 +263,7 @@ impl MailScreen for ProjectsScreen {
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         self.ingest_events(state);
         // Rebuild every second
-        if tick_count % 10 == 0 {
+        if tick_count.is_multiple_of(10) {
             // Save previous totals for trend computation
             self.prev_totals = self.compute_totals();
             self.rebuild_from_state(state);
@@ -305,7 +305,7 @@ impl MailScreen for ProjectsScreen {
 
         // Clear header area
         Paragraph::new("")
-            .style(Style::default().bg(tp.panel_bg))
+            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
             .render(header_area, frame);
 
         let sort_indicator = if self.sort_asc {
@@ -336,7 +336,7 @@ impl MailScreen for ProjectsScreen {
 
         // Clear table region
         Paragraph::new("")
-            .style(Style::default().bg(tp.panel_bg))
+            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
             .render(table_area, frame);
 
         self.render_table(frame, table_area, wide, narrow);
@@ -378,11 +378,11 @@ impl MailScreen for ProjectsScreen {
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
-        if let DeepLinkTarget::ProjectBySlug(slug) = target {
-            if let Some(pos) = self.projects.iter().position(|p| p.slug == *slug) {
-                self.table_state.selected = Some(pos);
-                return true;
-            }
+        if let DeepLinkTarget::ProjectBySlug(slug) = target
+            && let Some(pos) = self.projects.iter().position(|p| p.slug == *slug)
+        {
+            self.table_state.selected = Some(pos);
+            return true;
         }
         false
     }

@@ -344,52 +344,52 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
 
     for line in stderr.lines() {
         // Compiler errors
-        if let Some(ref re) = compiler_pattern {
-            if let Some(caps) = re.captures(line) {
-                compiler_errors += 1;
-                if first_compiler_msg.is_none() {
-                    first_compiler_msg = caps.get(1).map(|m| m.as_str().to_string());
-                }
+        if let Some(ref re) = compiler_pattern
+            && let Some(caps) = re.captures(line)
+        {
+            compiler_errors += 1;
+            if first_compiler_msg.is_none() {
+                first_compiler_msg = caps.get(1).map(|m| m.as_str().to_string());
             }
         }
 
         // Test panics
-        if let Some(ref re) = test_panic {
-            if let Some(caps) = re.captures(line) {
-                test_failures += 1;
-                if first_test_name.is_none() {
-                    first_test_name = caps.get(1).map(|m| m.as_str().to_string());
-                }
+        if let Some(ref re) = test_panic
+            && let Some(caps) = re.captures(line)
+        {
+            test_failures += 1;
+            if first_test_name.is_none() {
+                first_test_name = caps.get(1).map(|m| m.as_str().to_string());
             }
         }
 
         // Test failures (---- test_name ----)
-        if let Some(ref re) = test_failed {
-            if let Some(caps) = re.captures(line) {
-                test_failures += 1;
-                if first_test_name.is_none() {
-                    first_test_name = caps.get(1).map(|m| m.as_str().to_string());
-                }
+        if let Some(ref re) = test_failed
+            && let Some(caps) = re.captures(line)
+        {
+            test_failures += 1;
+            if first_test_name.is_none() {
+                first_test_name = caps.get(1).map(|m| m.as_str().to_string());
             }
         }
 
         // Clippy warnings
-        if let Some(ref re) = clippy_pattern {
-            if let Some(caps) = re.captures(line) {
-                clippy_warnings += 1;
-                if first_clippy_msg.is_none() {
-                    first_clippy_msg = caps.get(1).map(|m| m.as_str().to_string());
-                }
+        if let Some(ref re) = clippy_pattern
+            && let Some(caps) = re.captures(line)
+        {
+            clippy_warnings += 1;
+            if first_clippy_msg.is_none() {
+                first_clippy_msg = caps.get(1).map(|m| m.as_str().to_string());
             }
         }
 
         // Format diffs
-        if let Some(ref re) = format_pattern {
-            if let Some(caps) = re.captures(line) {
-                format_diffs += 1;
-                if first_format_file.is_none() {
-                    first_format_file = caps.get(1).map(|m| m.as_str().to_string());
-                }
+        if let Some(ref re) = format_pattern
+            && let Some(caps) = re.captures(line)
+        {
+            format_diffs += 1;
+            if first_format_file.is_none() {
+                first_format_file = caps.get(1).map(|m| m.as_str().to_string());
             }
         }
     }

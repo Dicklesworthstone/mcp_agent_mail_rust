@@ -121,12 +121,12 @@ impl ReservationIndex {
         conflicts: &mut Vec<&'a ReservationRef>,
     ) {
         // Check exact reservations: only same-prefix group, string equality.
-        if let Some(prefix) = req_prefix {
-            if let Some(entries) = self.exact_by_prefix.get(prefix) {
-                for (norm, rref) in entries {
-                    if norm == req_norm {
-                        conflicts.push(rref);
-                    }
+        if let Some(prefix) = req_prefix
+            && let Some(entries) = self.exact_by_prefix.get(prefix)
+        {
+            for (norm, rref) in entries {
+                if norm == req_norm {
+                    conflicts.push(rref);
                 }
             }
         }
@@ -140,12 +140,12 @@ impl ReservationIndex {
         }
 
         // Check glob reservations in the same prefix group.
-        if let Some(prefix) = req_prefix {
-            if let Some(entries) = self.globs_by_prefix.get(prefix) {
-                for (res_pat, rref) in entries {
-                    if res_pat.overlaps(request_pat) {
-                        conflicts.push(rref);
-                    }
+        if let Some(prefix) = req_prefix
+            && let Some(entries) = self.globs_by_prefix.get(prefix)
+        {
+            for (res_pat, rref) in entries {
+                if res_pat.overlaps(request_pat) {
+                    conflicts.push(rref);
                 }
             }
         }

@@ -327,10 +327,12 @@ impl MouseDispatcher {
         if point_in_rect(tab_area, mx, my) {
             for slot_cell in &self.tab_slots {
                 let slot = slot_cell.get();
-                if let Some(screen) = slot.screen {
-                    if my == slot.y && mx >= slot.x_start && mx < slot.x_end {
-                        return MouseAction::SwitchScreen(screen);
-                    }
+                if let Some(screen) = slot.screen
+                    && my == slot.y
+                    && mx >= slot.x_start
+                    && mx < slot.x_end
+                {
+                    return MouseAction::SwitchScreen(screen);
                 }
             }
         }

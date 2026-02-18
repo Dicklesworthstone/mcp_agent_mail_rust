@@ -483,23 +483,21 @@ pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportC
     );
 
     let chunk_config_path = bundle_dir.join("mailbox.sqlite3.config.json");
-    if chunk_config_path.exists() {
-        if let Ok(text) = std::fs::read_to_string(&chunk_config_path) {
-            if let Ok(config) = serde_json::from_str::<Value>(&text) {
-                if let Some(obj) = config.as_object() {
-                    chunk_size = coerce_int(obj.get("chunk_size"), chunk_size);
-                    let threshold = coerce_int(obj.get("threshold_bytes"), chunk_threshold);
-                    return Ok(StoredExportConfig {
-                        projects,
-                        inline_threshold,
-                        detach_threshold,
-                        chunk_threshold: threshold,
-                        chunk_size,
-                        scrub_preset,
-                    });
-                }
-            }
-        }
+    if chunk_config_path.exists()
+        && let Ok(text) = std::fs::read_to_string(&chunk_config_path)
+        && let Ok(config) = serde_json::from_str::<Value>(&text)
+        && let Some(obj) = config.as_object()
+    {
+        chunk_size = coerce_int(obj.get("chunk_size"), chunk_size);
+        let threshold = coerce_int(obj.get("threshold_bytes"), chunk_threshold);
+        return Ok(StoredExportConfig {
+            projects,
+            inline_threshold,
+            detach_threshold,
+            chunk_threshold: threshold,
+            chunk_size,
+            scrub_preset,
+        });
     }
 
     Ok(StoredExportConfig {

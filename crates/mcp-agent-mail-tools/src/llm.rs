@@ -1516,10 +1516,7 @@ mod tests {
     #[test]
     fn choose_best_model_passthrough_qualified_name() {
         // Names with / or : are provider-qualified and pass through
-        assert_eq!(
-            choose_best_available_model("openai/gpt-4"),
-            "openai/gpt-4"
-        );
+        assert_eq!(choose_best_available_model("openai/gpt-4"), "openai/gpt-4");
         assert_eq!(
             choose_best_available_model("anthropic:claude-3"),
             "anthropic:claude-3"

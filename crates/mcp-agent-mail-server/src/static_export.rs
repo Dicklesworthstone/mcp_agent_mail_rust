@@ -292,10 +292,10 @@ fn emit_project_routes(
             if mid > 0 {
                 seen_messages.insert(mid);
             }
-            if let Some(ref tid) = msg.thread_id {
-                if !tid.is_empty() {
-                    seen_threads.insert(tid.clone());
-                }
+            if let Some(ref tid) = msg.thread_id
+                && !tid.is_empty()
+            {
+                seen_threads.insert(tid.clone());
             }
         }
     }

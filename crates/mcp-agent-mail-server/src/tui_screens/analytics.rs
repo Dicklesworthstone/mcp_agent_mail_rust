@@ -41,6 +41,9 @@ const ANALYTICS_VIZ_BAND_MIN_HEIGHT: u16 = 18;
 const ANALYTICS_VIZ_BAND_MIN: u16 = 7;
 const ANALYTICS_VIZ_BAND_MAX: u16 = 16;
 const ANALYTICS_VIZ_BAND_HEIGHT_PERCENT: u16 = 34;
+const ANALYTICS_LIGHT_HEADER_MIX: f32 = 0.18;
+const ANALYTICS_LIGHT_ODD_ROW_MIX: f32 = 0.11;
+const ANALYTICS_VIZ_TILE_MIN_WIDTH: u16 = 16;
 
 #[derive(Debug, Clone, Default)]
 struct AnalyticsVizSnapshot {
@@ -175,14 +178,14 @@ impl AnalyticsScreen {
 
     fn refresh_feed(&mut self, state: Option<&TuiSharedState>) {
         self.feed = quick_insight_feed();
-        if self.feed.cards.is_empty() {
-            if let Some(state) = state {
-                let persisted = build_persisted_insight_feed(state);
-                if persisted.cards.is_empty() {
-                    self.feed = build_runtime_insight_feed(state);
-                } else {
-                    self.feed = persisted;
-                }
+        if self.feed.cards.is_empty()
+            && let Some(state) = state
+        {
+            let persisted = build_persisted_insight_feed(state);
+            if persisted.cards.is_empty() {
+                self.feed = build_runtime_insight_feed(state);
+            } else {
+                self.feed = persisted;
             }
         }
         if self.feed.cards.is_empty() {
@@ -423,75 +426,52 @@ const fn severity_badge(severity: AnomalySeverity) -> &'static str {
     }
 }
 
-fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
-    if area.is_empty() {
-        return;
-    }
-    for y in area.y..area.y.saturating_add(area.height) {
-        for x in area.x..area.x.saturating_add(area.width) {
-            if let Some(cell) = frame.buffer.get_mut(x, y) {
-                *cell = ftui::Cell::from_char(' ');
-                cell.bg = bg;
-            }
-        }
-    }
-}
-
 fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, active: bool) {
     if area.is_empty() {
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let splitter_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.62);
-    fill_rect(frame, area, splitter_bg);
-    let rail = if active {
-        crate::tui_theme::lerp_color(tp.panel_border_focused, tp.selection_indicator, 0.32)
-    } else {
-        tp.panel_border_dim
-    };
-    let knob = if active {
-        tp.selection_indicator
-    } else {
-        tp.text_muted
-    };
+    let separator_color = crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border_dim, 0.58);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.fg = separator_color;
+                cell.bg = tp.panel_bg;
+            }
+        }
+    }
+    if active && ((vertical && area.height >= 5) || (!vertical && area.width >= 5)) {
+        let x = if vertical {
+            area.x.saturating_add(area.width / 2)
+        } else {
+            area.x.saturating_add(area.width.saturating_sub(1) / 2)
+        };
+        let y = if vertical {
+            area.y.saturating_add(area.height.saturating_sub(1) / 2)
+        } else {
+            area.y.saturating_add(area.height / 2)
+        };
+        if let Some(cell) = frame.buffer.get_mut(x, y) {
+            *cell = ftui::Cell::from_char('·');
+            cell.fg = tp.selection_indicator;
+            cell.bg = tp.panel_bg;
+        }
+    }
+}
 
-    if vertical {
-        let x = area.x.saturating_add(area.width / 2);
-        let grip_len = area.height.min(5).max(1);
-        let start_y = area
-            .y
-            .saturating_add(area.height.saturating_sub(grip_len) / 2);
-        for y in start_y..start_y.saturating_add(grip_len) {
+fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
+    if area.is_empty() {
+        return;
+    }
+    let fg = crate::tui_theme::TuiThemePalette::current().text_primary;
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
             if let Some(cell) = frame.buffer.get_mut(x, y) {
-                *cell = ftui::Cell::from_char('•');
-                cell.fg = rail;
-                cell.bg = splitter_bg;
+                *cell = ftui::Cell::from_char(' ');
+                cell.fg = fg;
+                cell.bg = bg;
             }
-        }
-        let y = start_y.saturating_add(grip_len / 2);
-        if let Some(cell) = frame.buffer.get_mut(x, y) {
-            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
-            cell.fg = knob;
-            cell.bg = splitter_bg;
-        }
-    } else {
-        let y = area.y.saturating_add(area.height / 2);
-        let grip_len = area.width.min(5).max(1);
-        let start_x = area
-            .x
-            .saturating_add(area.width.saturating_sub(grip_len) / 2);
-        for x in start_x..start_x.saturating_add(grip_len) {
-            if let Some(cell) = frame.buffer.get_mut(x, y) {
-                *cell = ftui::Cell::from_char('•');
-                cell.fg = rail;
-                cell.bg = splitter_bg;
-            }
-        }
-        let x = start_x.saturating_add(grip_len / 2);
-        if let Some(cell) = frame.buffer.get_mut(x, y) {
-            *cell = ftui::Cell::from_char(if active { '◆' } else { '•' });
-            cell.fg = knob;
-            cell.bg = splitter_bg;
         }
     }
 }
@@ -505,6 +485,18 @@ fn perceived_luma(color: PackedRgba) -> u8 {
     u8::try_from(luma).unwrap_or(u8::MAX)
 }
 
+fn format_error_rate_percent(total_errors: u64, total_calls: u64) -> String {
+    if total_calls == 0 {
+        return "0.00".to_string();
+    }
+    let basis_points = total_errors
+        .saturating_mul(10_000)
+        .saturating_div(total_calls.max(1));
+    let whole = basis_points / 100;
+    let fractional = basis_points % 100;
+    format!("{whole}.{fractional:02}")
+}
+
 fn analytics_table_backgrounds(
     tp: &crate::tui_theme::TuiThemePalette,
 ) -> (PackedRgba, PackedRgba, PackedRgba, PackedRgba) {
@@ -512,8 +504,16 @@ fn analytics_table_backgrounds(
     let table_base_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.58);
     let neutral_seed = crate::tui_theme::lerp_color(tp.panel_bg, tp.bg_surface, 0.78);
     let is_light_surface = perceived_luma(table_base_bg) >= 140;
-    let header_mix = if is_light_surface { 0.06 } else { 0.12 };
-    let odd_mix = if is_light_surface { 0.03 } else { 0.07 };
+    let header_mix = if is_light_surface {
+        ANALYTICS_LIGHT_HEADER_MIX
+    } else {
+        0.12
+    };
+    let odd_mix = if is_light_surface {
+        ANALYTICS_LIGHT_ODD_ROW_MIX
+    } else {
+        0.07
+    };
     let even_row_bg = table_base_bg;
     let odd_row_bg = crate::tui_theme::lerp_color(table_base_bg, neutral_seed, odd_mix);
     let header_bg = crate::tui_theme::lerp_color(table_base_bg, neutral_seed, header_mix);
@@ -537,7 +537,10 @@ fn confidence_bar_colored(confidence: f64, severity: AnomalySeverity) -> ftui::t
         Span::raw("["),
         Span::styled("\u{2588}".repeat(filled), Style::default().fg(bar_color)),
         Span::styled("\u{2591}".repeat(empty), Style::default().fg(dim_color)),
-        Span::styled(format!("] {:3.0}%", confidence * 100.0), Style::default()),
+        Span::styled(
+            format!("] {:3.0}%", confidence * 100.0),
+            Style::default().fg(tp.text_primary),
+        ),
     ])
 }
 
@@ -976,13 +979,13 @@ fn render_card_list(
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let (table_base_bg, header_bg, even_row_bg, odd_row_bg) = analytics_table_backgrounds(&tp);
+    fill_rect(frame, area, table_base_bg);
     let compact_columns = area.width < 62;
     let narrow_columns = area.width < 84;
     let header = if compact_columns {
-        Row::new(vec![" ", "Sev", "Headline"])
-            .style(crate::tui_theme::text_title(&tp).bg(header_bg))
+        Row::new(vec!["Sev", "Headline"]).style(crate::tui_theme::text_title(&tp).bg(header_bg))
     } else {
-        Row::new(vec![" ", "Sev", "Conf", "Headline"])
+        Row::new(vec!["Sev", "Conf", "Headline"])
             .style(crate::tui_theme::text_title(&tp).bg(header_bg))
     };
 
@@ -992,7 +995,6 @@ fn render_card_list(
         .map(|(i, card)| {
             let sev_text = severity_badge(card.severity);
             let conf_text = format!("{:3.0}%", card.confidence * 100.0);
-            let border_char = "\u{2590}"; // ▐ colored left border
             let row_bg = if i % 2 == 0 { even_row_bg } else { odd_row_bg };
             let style = if i == selected {
                 Style::default()
@@ -1004,40 +1006,26 @@ fn render_card_list(
             };
             if compact_columns {
                 Row::new(vec![
-                    border_char.to_string(),
                     sev_text.to_string(),
                     format!("{} ({conf_text})", card.headline),
                 ])
                 .style(style)
             } else {
-                Row::new(vec![
-                    border_char.to_string(),
-                    sev_text.to_string(),
-                    conf_text,
-                    card.headline.clone(),
-                ])
-                .style(style)
+                Row::new(vec![sev_text.to_string(), conf_text, card.headline.clone()]).style(style)
             }
         })
         .collect();
 
-    let widths = if compact_columns {
-        [
-            Constraint::Fixed(1),
-            Constraint::Fixed(5),
-            Constraint::Percentage(100.0),
-            Constraint::Fixed(0),
-        ]
+    let widths: Vec<Constraint> = if compact_columns {
+        vec![Constraint::Fixed(5), Constraint::Percentage(100.0)]
     } else if narrow_columns {
-        [
-            Constraint::Fixed(1),
+        vec![
             Constraint::Fixed(5),
             Constraint::Fixed(6),
             Constraint::Percentage(100.0),
         ]
     } else {
-        [
-            Constraint::Fixed(1),
+        vec![
             Constraint::Fixed(5),
             Constraint::Fixed(12),
             Constraint::Percentage(100.0),
@@ -1064,27 +1052,20 @@ fn render_card_list(
         compact_suffix
     );
 
-    let table = Table::new(
-        rows,
-        if compact_columns {
-            vec![widths[0], widths[1], widths[2]]
-        } else {
-            vec![widths[0], widths[1], widths[2], widths[3]]
-        },
-    )
-    .header(header)
-    .style(Style::default().fg(tp.text_secondary).bg(table_base_bg))
-    .block(
-        Block::new()
-            .title(title.as_str())
-            .border_type(BorderType::Rounded)
-            .border_style(if focus == AnalyticsFocus::List {
-                Style::default().fg(tp.panel_border_focused)
-            } else {
-                Style::default().fg(tp.panel_border_dim)
-            }),
-    )
-    .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
+    let table = Table::new(rows, widths)
+        .header(header)
+        .style(Style::default().fg(tp.text_secondary).bg(table_base_bg))
+        .block(
+            Block::new()
+                .title(title.as_str())
+                .border_type(BorderType::Rounded)
+                .border_style(if focus == AnalyticsFocus::List {
+                    Style::default().fg(tp.panel_border_focused)
+                } else {
+                    Style::default().fg(tp.panel_border_dim)
+                }),
+        )
+        .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
     table_state.select(Some(selected));
     StatefulWidget::render(&table, area, frame, table_state);
@@ -1257,9 +1238,7 @@ fn render_card_detail(
     if content.is_empty() {
         return;
     }
-    Paragraph::new("")
-        .style(Style::default().bg(tp.panel_bg))
-        .render(content, frame);
+    fill_rect(frame, content, tp.panel_bg);
     Paragraph::new(Text::from_lines(lines))
         .style(crate::tui_theme::text_primary(&tp).bg(tp.panel_bg))
         .scroll((scroll, 0))
@@ -1337,6 +1316,7 @@ fn render_filtered_empty_state(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    fill_rect(frame, inner, tp.panel_bg);
 
     let lines = vec![
         Line::raw(""),
@@ -1359,7 +1339,12 @@ fn render_filtered_empty_state(
 }
 
 #[allow(dead_code)]
-fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
+fn render_empty_state(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &AnalyticsVizSnapshot,
+    telemetry_active: bool,
+) {
     use ftui::text::{Line, Span, Text};
 
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -1372,6 +1357,7 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    fill_rect(frame, inner, tp.panel_bg);
 
     // Centered icon and structured guidance
     let mut lines = Vec::new();
@@ -1392,29 +1378,49 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
     lines.push(Line::raw(""));
 
     // Headline
+    let headline = if telemetry_active {
+        "No anomalies detected"
+    } else {
+        "Waiting for telemetry"
+    };
     lines.push(Line::from_spans(vec![Span::styled(
-        "No anomalies detected",
+        headline,
         crate::tui_theme::text_primary(&tp).bold(),
     )]));
     lines.push(Line::raw(""));
 
     // Description
-    lines.push(Line::styled(
-        "The insight feed monitors real-time KPI metrics",
-        crate::tui_theme::text_meta(&tp),
-    ));
-    lines.push(Line::styled(
-        "and surfaces anomaly cards when deviations occur.",
-        crate::tui_theme::text_meta(&tp),
-    ));
+    if telemetry_active {
+        let error_rate = format_error_rate_percent(snapshot.total_errors, snapshot.total_calls);
+        lines.push(Line::styled(
+            "Realtime metrics are healthy; anomaly cards appear only on deviations.",
+            crate::tui_theme::text_meta(&tp),
+        ));
+        lines.push(Line::styled(
+            format!(
+                "calls={} err={}% p95={:.1}ms active={} slow={} persisted={}",
+                snapshot.total_calls,
+                error_rate,
+                snapshot.p95_latency_ms,
+                snapshot.active_tools,
+                snapshot.slow_tools,
+                snapshot.persisted_samples
+            ),
+            crate::tui_theme::text_hint(&tp),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "No runtime signal yet. Start tool traffic to populate insights.",
+            crate::tui_theme::text_meta(&tp),
+        ));
+        lines.push(Line::styled(
+            "When metrics flow, this panel will surface anomalies automatically.",
+            crate::tui_theme::text_hint(&tp),
+        ));
+    }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "Metrics are collected as tool calls flow through the server.",
-        crate::tui_theme::text_hint(&tp),
-    ));
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "Press 'r' to refresh once activity resumes.",
+        "Press 'r' to refresh and sync runtime metrics.",
         crate::tui_theme::text_hint(&tp),
     ));
 
@@ -1429,7 +1435,7 @@ fn render_viz_metric_tile(
     value: &str,
     color: PackedRgba,
 ) {
-    if area.is_empty() {
+    if area.is_empty() || area.width < 6 || area.height < 3 {
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -1442,6 +1448,7 @@ fn render_viz_metric_tile(
     if inner.is_empty() {
         return;
     }
+    fill_rect(frame, inner, tp.panel_bg);
     Paragraph::new(value)
         .style(crate::tui_theme::text_primary(&tp).bold())
         .render(inner, frame);
@@ -1478,6 +1485,7 @@ fn render_runtime_viz_fallback(
     if inner.width < 8 || inner.height < 3 {
         return;
     }
+    fill_rect(frame, inner, tp.panel_bg);
     if inner.height < 5 {
         Paragraph::new(format!(
             "calls:{}  err:{}  p95:{:.1}ms",
@@ -1500,9 +1508,25 @@ fn render_runtime_viz_fallback(
             snapshot.slow_tools,
             snapshot.persisted_samples
         );
+        let compact_area = Rect::new(inner.x, inner.y, inner.width, 1);
         Paragraph::new(compact)
             .style(crate::tui_theme::text_hint(&tp))
-            .render(inner, frame);
+            .render(compact_area, frame);
+        if inner.height >= 3 {
+            let spark_label_h = u16::from(inner.height >= 5);
+            if spark_label_h > 0 {
+                let label = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+                Paragraph::new("Latency trace")
+                    .style(crate::tui_theme::text_hint(&tp))
+                    .render(label, frame);
+            }
+            let spark_y = inner.y.saturating_add(1).saturating_add(spark_label_h);
+            let spark_h = inner.height.saturating_sub(1).saturating_sub(spark_label_h);
+            let spark_area = Rect::new(inner.x, spark_y, inner.width, spark_h.max(1));
+            Sparkline::new(&snapshot.sparkline)
+                .style(Style::default().fg(tp.chart_series[1]))
+                .render(spark_area, frame);
+        }
         return;
     }
 
@@ -1515,61 +1539,82 @@ fn render_runtime_viz_fallback(
     let mid = Rect::new(inner.x, inner.y + top_h, inner.width, mid_h);
     let bottom = Rect::new(inner.x, inner.y + top_h + mid_h, inner.width, bottom_h);
 
-    let tile_w = top.width / 4;
-    let tile1 = Rect::new(top.x, top.y, tile_w, top.height);
-    let tile2 = Rect::new(top.x + tile_w, top.y, tile_w, top.height);
-    let tile3 = Rect::new(top.x + tile_w * 2, top.y, tile_w, top.height);
-    let tile4 = Rect::new(
-        top.x + tile_w * 3,
-        top.y,
-        top.width.saturating_sub(tile_w * 3),
-        top.height,
-    );
-    render_viz_metric_tile(
-        frame,
-        tile1,
-        "Total Calls",
-        &format!("{}", snapshot.total_calls),
-        tp.metric_requests,
-    );
-    render_viz_metric_tile(
-        frame,
-        tile2,
-        "Error Rate",
-        &if snapshot.total_calls > 0 {
-            format!(
-                "{:.2}%",
-                (snapshot.total_errors as f64 / snapshot.total_calls as f64) * 100.0
-            )
+    if top.width >= ANALYTICS_VIZ_TILE_MIN_WIDTH.saturating_mul(4) {
+        let tile_w = top.width / 4;
+        let tile1 = Rect::new(top.x, top.y, tile_w, top.height);
+        let tile2 = Rect::new(top.x + tile_w, top.y, tile_w, top.height);
+        let tile3 = Rect::new(top.x + tile_w * 2, top.y, tile_w, top.height);
+        let tile4 = Rect::new(
+            top.x + tile_w * 3,
+            top.y,
+            top.width.saturating_sub(tile_w * 3),
+            top.height,
+        );
+        render_viz_metric_tile(
+            frame,
+            tile1,
+            "Total Calls",
+            &format!("{}", snapshot.total_calls),
+            tp.metric_requests,
+        );
+        render_viz_metric_tile(
+            frame,
+            tile2,
+            "Error Rate",
+            &if snapshot.total_calls > 0 {
+                format!(
+                    "{:.2}%",
+                    (snapshot.total_errors as f64 / snapshot.total_calls as f64) * 100.0
+                )
+            } else {
+                "0.00%".to_string()
+            },
+            if snapshot.total_errors > 0 {
+                tp.severity_error
+            } else {
+                tp.severity_ok
+            },
+        );
+        render_viz_metric_tile(
+            frame,
+            tile3,
+            "Latency",
+            &format!(
+                "avg {:.1}ms / p95 {:.1}ms",
+                snapshot.avg_latency_ms, snapshot.p95_latency_ms
+            ),
+            tp.metric_latency,
+        );
+        render_viz_metric_tile(
+            frame,
+            tile4,
+            "Coverage",
+            &format!(
+                "{} active · {} slow · {} persisted",
+                snapshot.active_tools, snapshot.slow_tools, snapshot.persisted_samples
+            ),
+            tp.metric_messages,
+        );
+    } else {
+        let error_rate = if snapshot.total_calls > 0 {
+            (snapshot.total_errors as f64 / snapshot.total_calls as f64) * 100.0
         } else {
-            "0.00%".to_string()
-        },
-        if snapshot.total_errors > 0 {
-            tp.severity_error
-        } else {
-            tp.severity_ok
-        },
-    );
-    render_viz_metric_tile(
-        frame,
-        tile3,
-        "Latency",
-        &format!(
-            "avg {:.1}ms / p95 {:.1}ms",
-            snapshot.avg_latency_ms, snapshot.p95_latency_ms
-        ),
-        tp.metric_latency,
-    );
-    render_viz_metric_tile(
-        frame,
-        tile4,
-        "Coverage",
-        &format!(
-            "{} active · {} slow · {} persisted",
-            snapshot.active_tools, snapshot.slow_tools, snapshot.persisted_samples
-        ),
-        tp.metric_messages,
-    );
+            0.0
+        };
+        let compact = format!(
+            "calls:{} err:{:.2}% avg:{:.1}ms p95:{:.1}ms active:{} slow:{} persisted:{}",
+            snapshot.total_calls,
+            error_rate,
+            snapshot.avg_latency_ms,
+            snapshot.p95_latency_ms,
+            snapshot.active_tools,
+            snapshot.slow_tools,
+            snapshot.persisted_samples
+        );
+        Paragraph::new(compact)
+            .style(crate::tui_theme::text_hint(&tp))
+            .render(top, frame);
+    }
 
     if mid.height >= 3 {
         let gap = u16::from(mid.width >= 120);
@@ -1803,9 +1848,15 @@ impl MailScreen for AnalyticsScreen {
             return;
         }
         let tp = crate::tui_theme::TuiThemePalette::current();
-        Paragraph::new("")
-            .style(Style::default().bg(tp.bg_deep))
-            .render(area, frame);
+        fill_rect(frame, area, tp.bg_deep);
+        let runtime_snapshot = build_runtime_viz_snapshot(state);
+        let runtime_has_signal = runtime_snapshot.total_calls > 0
+            || runtime_snapshot.total_errors > 0
+            || runtime_snapshot.persisted_samples > 0
+            || state
+                .sparkline_snapshot()
+                .iter()
+                .any(|sample| *sample > 0.0);
 
         let mut cards_area = area;
         let viz_band_h = if area.height >= ANALYTICS_VIZ_BAND_MIN_HEIGHT {
@@ -1847,7 +1898,7 @@ impl MailScreen for AnalyticsScreen {
                 );
             }
             if cards_area.height > 0 {
-                render_empty_state(frame, cards_area);
+                render_empty_state(frame, cards_area, &runtime_snapshot, runtime_has_signal);
             }
             return;
         }
@@ -1955,7 +2006,7 @@ impl MailScreen for AnalyticsScreen {
                             gap,
                             content.height,
                         );
-                        render_splitter_handle(frame, splitter_area, true, true);
+                        render_splitter_handle(frame, splitter_area, true, false);
                     }
                     render_card_list(
                         frame,
@@ -1995,7 +2046,7 @@ impl MailScreen for AnalyticsScreen {
                                 detail_area.width,
                                 detail_gap,
                             );
-                            render_splitter_handle(frame, splitter_area, false, true);
+                            render_splitter_handle(frame, splitter_area, false, false);
                         }
                         let detail_viz = Rect::new(
                             detail_area.x,
@@ -2086,7 +2137,7 @@ impl MailScreen for AnalyticsScreen {
                     content.width,
                     stack_gap,
                 );
-                render_splitter_handle(frame, splitter_area, false, true);
+                render_splitter_handle(frame, splitter_area, false, false);
             }
             render_card_list(
                 frame,
@@ -2561,5 +2612,14 @@ mod tests {
         let text = frame_text(&frame);
         assert!(text.contains("card headline"));
         assert!(text.contains("card rationale"));
+    }
+
+    #[test]
+    fn light_table_backgrounds_keep_header_and_rows_distinct() {
+        let palette =
+            crate::tui_theme::TuiThemePalette::for_theme(ftui_extras::theme::ThemeId::LumenLight);
+        let (_base, header, even, odd) = analytics_table_backgrounds(&palette);
+        assert_ne!(header, even);
+        assert_ne!(odd, even);
     }
 }

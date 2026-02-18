@@ -162,10 +162,10 @@ fn expand_tilde(input: &str) -> PathBuf {
         }
         return PathBuf::from(input);
     }
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(input)
 }
@@ -189,16 +189,17 @@ fn renewal_filter_matches(
     if row.agent_id != agent_id || row.released_ts.is_some() {
         return false;
     }
-    if let Some(ids) = reservation_ids {
-        if !ids.is_empty() && !row.id.is_some_and(|id| ids.contains(&id)) {
-            return false;
-        }
+    if let Some(ids) = reservation_ids
+        && !ids.is_empty()
+        && !row.id.is_some_and(|id| ids.contains(&id))
+    {
+        return false;
     }
-    if let Some(path_patterns) = paths {
-        if !path_patterns.is_empty() && !path_patterns.iter().any(|path| path == &row.path_pattern)
-        {
-            return false;
-        }
+    if let Some(path_patterns) = paths
+        && !path_patterns.is_empty()
+        && !path_patterns.iter().any(|path| path == &row.path_pattern)
+    {
+        return false;
     }
     true
 }
@@ -1123,10 +1124,10 @@ fn guard_is_installed(repo_path: &std::path::Path) -> bool {
 
     // Check for legacy single-file hook
     let hook = hooks_dir.join("pre-commit");
-    if let Ok(content) = std::fs::read_to_string(hook) {
-        if content.contains("mcp-agent-mail") {
-            return true;
-        }
+    if let Ok(content) = std::fs::read_to_string(hook)
+        && content.contains("mcp-agent-mail")
+    {
+        return true;
     }
 
     false

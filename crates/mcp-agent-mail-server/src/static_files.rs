@@ -68,10 +68,10 @@ pub fn resolve_web_root() -> Option<WebRoot> {
     let mut candidates = Vec::new();
 
     // Candidate 1: relative to executable (mirrors Python's `Path(__file__).parents[3] / "web"`).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.extend(executable_web_candidates(parent));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.extend(executable_web_candidates(parent));
     }
 
     // Candidate 2: relative to CWD.

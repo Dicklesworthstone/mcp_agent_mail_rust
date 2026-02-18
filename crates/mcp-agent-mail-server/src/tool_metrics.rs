@@ -121,7 +121,7 @@ fn metrics_loop(config: &Config) {
                 }
             }
 
-            if conn.is_none() && tick_index % 12 == 0 {
+            if conn.is_none() && tick_index.is_multiple_of(12) {
                 conn = open_metrics_connection(&config.database_url);
                 if let Some(db) = conn.as_ref() {
                     ensure_metrics_schema(db);
@@ -134,7 +134,7 @@ fn metrics_loop(config: &Config) {
                         error = %err,
                         "failed persisting tool metrics snapshot"
                     );
-                } else if tick_index % PRUNE_INTERVAL_TICKS == 0 {
+                } else if tick_index.is_multiple_of(PRUNE_INTERVAL_TICKS) {
                     prune_old_snapshot_rows(db, collected_ts);
                 }
             }

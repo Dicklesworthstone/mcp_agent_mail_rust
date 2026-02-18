@@ -12,7 +12,7 @@ use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
-use ftui::widgets::borders::BorderType;
+use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_extras::canvas::{Canvas, Mode, Painter};
@@ -57,7 +57,8 @@ const STAT_REFRESH_TICKS: u64 = 10;
 const fn summary_band_height(tc: TerminalClass) -> u16 {
     match tc {
         TerminalClass::Tiny => 1,
-        TerminalClass::UltraWide => 3,
+        TerminalClass::UltraWide => 4,
+        TerminalClass::Wide => 3,
         _ => 2,
     }
 }
@@ -104,12 +105,20 @@ const ULTRAWIDE_INSIGHT_MIN_WIDTH: u16 = 98;
 const ULTRAWIDE_INSIGHT_MIN_HEIGHT: u16 = 12;
 const ULTRAWIDE_BOTTOM_MIN_WIDTH: u16 = 96;
 const ULTRAWIDE_BOTTOM_MIN_HEIGHT: u16 = 6;
+const MEGAGRID_INSIGHT_MIN_WIDTH: u16 = 168;
+const MEGAGRID_INSIGHT_MIN_HEIGHT: u16 = 16;
 const SUPERGRID_INSIGHT_MIN_WIDTH: u16 = 120;
 const SUPERGRID_INSIGHT_MIN_HEIGHT: u16 = 14;
 const SUPERGRID_BOTTOM_MIN_WIDTH: u16 = 124;
 const SUPERGRID_BOTTOM_MIN_HEIGHT: u16 = 7;
 const MEGAGRID_BOTTOM_MIN_WIDTH: u16 = 152;
 const MEGAGRID_BOTTOM_MIN_HEIGHT: u16 = 10;
+const ULTRADENSE_BOTTOM_MIN_WIDTH: u16 = 190;
+const ULTRADENSE_BOTTOM_MIN_HEIGHT: u16 = 12;
+const DASHBOARD_6K_MIN_WIDTH: u16 = 220;
+const DASHBOARD_6K_MIN_HEIGHT: u16 = 28;
+const DASHBOARD_6K_TREND_HEIGHT_PERCENT: u16 = 16;
+const DASHBOARD_6K_FOUR_ROW_MIN_HEIGHT: u16 = 22;
 
 /// Anomaly thresholds.
 const ACK_PENDING_WARN: u64 = 3;
@@ -729,7 +738,7 @@ impl DashboardScreen {
     /// - Optional trend panel (right rail)
     /// - Optional bottom rail (preview/query/activity)
     /// - Optional console log panel (bottom sidebar)
-    #[allow(clippy::fn_params_excessive_bools)]
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_lines)]
     fn main_content_layout(
         show_trend_panel: bool,
         show_log_panel: bool,
@@ -737,6 +746,7 @@ impl DashboardScreen {
         rich_footer_content: bool,
         console_log_lines: usize,
         force_dense_surface: bool,
+        mega_dense_surface: bool,
     ) -> ReactiveLayout {
         let mut layout = ReactiveLayout::new()
             // Primary anchor for horizontal splitting (footer rail).
@@ -762,8 +772,14 @@ impl DashboardScreen {
                     SplitAxis::Vertical,
                     PanelConstraint::HIDDEN,
                 )
-                .at(TerminalClass::Wide, PanelConstraint::visible(0.32, 24))
-                .at(TerminalClass::UltraWide, PanelConstraint::visible(0.38, 32)),
+                .at(TerminalClass::Wide, PanelConstraint::visible(0.24, 20))
+                .at(
+                    TerminalClass::UltraWide,
+                    PanelConstraint::visible(
+                        if mega_dense_surface { 0.48 } else { 0.26 },
+                        if mega_dense_surface { 52 } else { 24 },
+                    ),
+                ),
             );
         }
 
@@ -785,29 +801,45 @@ impl DashboardScreen {
 
         if show_footer_panel {
             let normal_ratio = if force_dense_surface {
+                0.18
+            } else if rich_footer_content {
+                0.16
+            } else {
+                0.12
+            };
+            let wide_ratio = if force_dense_surface {
                 0.22
             } else if rich_footer_content {
                 0.18
             } else {
                 0.14
             };
-            let wide_ratio = if force_dense_surface {
-                0.28
-            } else if rich_footer_content {
-                0.22
-            } else {
-                0.16
-            };
             let ultra_ratio = if force_dense_surface {
-                0.36
+                0.24
             } else if rich_footer_content {
-                0.23
+                0.20
             } else {
-                0.18
+                0.15
             };
-            let normal_min = if force_dense_surface { 6 } else { 4 };
-            let wide_min = if force_dense_surface { 9 } else { 6 };
-            let ultra_min = if force_dense_surface { 12 } else { 7 };
+            let normal_min = if force_dense_surface { 5 } else { 4 };
+            let wide_min = if force_dense_surface { 7 } else { 5 };
+            let ultra_min = if force_dense_surface { 9 } else { 6 };
+            let ultra_ratio = if mega_dense_surface {
+                if force_dense_surface {
+                    0.40
+                } else if rich_footer_content {
+                    0.34
+                } else {
+                    0.30
+                }
+            } else {
+                ultra_ratio
+            };
+            let ultra_min = if mega_dense_surface {
+                if force_dense_surface { 18 } else { 14 }
+            } else {
+                ultra_min
+            };
             layout = layout.panel(
                 PanelPolicy::new(
                     PanelSlot::Footer,
@@ -869,7 +901,11 @@ impl DashboardScreen {
 }
 
 const fn should_force_dense_dashboard_surface(main_area: Rect) -> bool {
-    main_area.width >= 128 && main_area.height >= 20
+    main_area.width >= 112 && main_area.height >= 18
+}
+
+const fn should_enable_mega_dashboard_density(main_area: Rect) -> bool {
+    main_area.width >= DASHBOARD_6K_MIN_WIDTH && main_area.height >= DASHBOARD_6K_MIN_HEIGHT
 }
 
 impl Default for DashboardScreen {
@@ -1047,7 +1083,7 @@ impl MailScreen for DashboardScreen {
         self.sparkline_data = state.sparkline_snapshot();
 
         // Refresh stats and compute trends on stat interval
-        if tick_count % STAT_REFRESH_TICKS == 0 {
+        if tick_count.is_multiple_of(STAT_REFRESH_TICKS) {
             if let Some(stats) = state.db_stats_snapshot() {
                 if self.current_db_stats.timestamp_micros == 0 {
                     self.current_db_stats = stats.clone();
@@ -1093,14 +1129,42 @@ impl MailScreen for DashboardScreen {
 
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        // Hard clear every frame to prevent stale border/text artifacts when
+        // switching layouts, resizing, or toggling dense 6k panel compositions.
+        fill_rect(frame, area, tp.bg_deep);
         let tc = TerminalClass::from_rect(area);
         let density = DensityHint::from_terminal_class(tc);
         let effects_enabled = state.config_snapshot().tui_effects;
+        let visible_entries = self.visible_entries();
+        let quick_query = self.quick_query();
+        let preview = if self.quick_filter.includes_messages() {
+            self.recent_message_preview
+                .as_ref()
+                .filter(|preview| !preview.is_stale())
+        } else {
+            None
+        };
+        let console_log_lines = self.console_log.borrow().len();
+        let dense_activity = !quick_query.is_empty()
+            || preview.is_some()
+            || !self.anomalies.is_empty()
+            || console_log_lines >= 8
+            || visible_entries.len() > 24;
+        let mega_dense_surface = should_enable_mega_dashboard_density(area);
 
         // ── Panel budgets (explicit per terminal class) ──────────
         let title_h = title_band_height(tc);
-        let summary_h = summary_band_height(tc);
-        let anomaly_h = anomaly_rail_height(tc, self.anomalies.len());
+        let summary_h = if mega_dense_surface {
+            summary_band_height(tc).min(2)
+        } else {
+            summary_band_height(tc)
+        };
+        let anomaly_h = if mega_dense_surface && !self.anomalies.is_empty() {
+            anomaly_rail_height(tc, self.anomalies.len()).min(2)
+        } else {
+            anomaly_rail_height(tc, self.anomalies.len())
+        };
         let footer_h = footer_bar_height(tc);
         let chrome_h = title_h + summary_h + anomaly_h + footer_h;
         let main_h = area.height.saturating_sub(chrome_h).max(3);
@@ -1143,27 +1207,20 @@ impl MailScreen for DashboardScreen {
         } else {
             state.db_stats_snapshot().unwrap_or_default()
         };
-        let visible_entries = self.visible_entries();
-        let quick_query = self.quick_query();
-        let preview = if self.quick_filter.includes_messages() {
-            self.recent_message_preview
-                .as_ref()
-                .filter(|preview| !preview.is_stale())
-        } else {
-            None
-        };
-        let force_dense_surface = should_force_dense_dashboard_surface(main_area);
+        let force_dense_surface = mega_dense_surface
+            || (should_force_dense_dashboard_surface(main_area) && dense_activity);
         let show_trend_panel = self.should_render_trend_panel() || force_dense_surface;
         let show_footer_panel =
             Self::should_render_bottom_rail(quick_query, preview, force_dense_surface);
-        let console_log_lines = self.console_log.borrow().len();
+        let show_log_panel = self.show_log_panel || mega_dense_surface;
         let layout = Self::main_content_layout(
             show_trend_panel,
-            self.show_log_panel,
+            show_log_panel,
             show_footer_panel,
             preview.is_some() || force_dense_surface,
             console_log_lines,
             force_dense_surface,
+            mega_dense_surface,
         );
         let comp = layout.compute(main_area);
         // When the anomaly rail is hidden (Tiny), inject an inline annotation
@@ -1451,12 +1508,20 @@ const fn is_supergrid_insight_area(area: Rect) -> bool {
     area.width >= SUPERGRID_INSIGHT_MIN_WIDTH && area.height >= SUPERGRID_INSIGHT_MIN_HEIGHT
 }
 
+const fn is_megagrid_insight_area(area: Rect) -> bool {
+    area.width >= MEGAGRID_INSIGHT_MIN_WIDTH && area.height >= MEGAGRID_INSIGHT_MIN_HEIGHT
+}
+
 const fn is_supergrid_bottom_area(area: Rect) -> bool {
     area.width >= SUPERGRID_BOTTOM_MIN_WIDTH && area.height >= SUPERGRID_BOTTOM_MIN_HEIGHT
 }
 
 const fn is_megagrid_bottom_area(area: Rect) -> bool {
     area.width >= MEGAGRID_BOTTOM_MIN_WIDTH && area.height >= MEGAGRID_BOTTOM_MIN_HEIGHT
+}
+
+const fn is_ultradense_bottom_area(area: Rect) -> bool {
+    area.width >= ULTRADENSE_BOTTOM_MIN_WIDTH && area.height >= ULTRADENSE_BOTTOM_MIN_HEIGHT
 }
 
 fn split_top(area: Rect, top_h: u16) -> (Rect, Rect) {
@@ -1485,6 +1550,160 @@ fn split_width_ratio_with_gap(area: Rect, left_ratio: f32, gap: u16) -> (Rect, R
         area.height,
     );
     (left, right)
+}
+
+fn split_columns_with_gap(area: Rect, cols: usize, gap: u16) -> Vec<Rect> {
+    if cols == 0 || area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let max_cols = usize::from(area.width.max(1));
+    let cols = cols.min(max_cols).max(1);
+    let cols_u16 = u16::try_from(cols).unwrap_or(1);
+    let total_gap = gap.saturating_mul(cols_u16.saturating_sub(1));
+    let usable = area.width.saturating_sub(total_gap);
+    if usable == 0 {
+        return Vec::new();
+    }
+
+    let base_w = usable / cols_u16;
+    let remainder = usize::from(usable % cols_u16);
+    let mut x = area.x;
+    let mut out = Vec::with_capacity(cols);
+
+    for idx in 0..cols {
+        let extra_w = u16::from(idx < remainder);
+        let width = base_w.saturating_add(extra_w).max(1);
+        out.push(Rect::new(x, area.y, width, area.height));
+        x = x.saturating_add(width);
+        if idx + 1 < cols {
+            x = x.saturating_add(gap);
+        }
+    }
+
+    out
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InsightPanelSlot {
+    Agents,
+    Contacts,
+    Projects,
+    ProjectLoad,
+    ReservationWatch,
+    ReservationTtl,
+    Signals,
+    ToolLatency,
+    EventMix,
+    MessageFlow,
+    RecentActivity,
+    RuntimeDigest,
+}
+
+const INSIGHT_TOP_LAYOUT: [InsightPanelSlot; 7] = [
+    InsightPanelSlot::Agents,
+    InsightPanelSlot::Projects,
+    InsightPanelSlot::ReservationWatch,
+    InsightPanelSlot::Signals,
+    InsightPanelSlot::EventMix,
+    InsightPanelSlot::RecentActivity,
+    InsightPanelSlot::ToolLatency,
+];
+
+const INSIGHT_BOTTOM_LAYOUT: [InsightPanelSlot; 7] = [
+    InsightPanelSlot::Contacts,
+    InsightPanelSlot::ProjectLoad,
+    InsightPanelSlot::ReservationTtl,
+    InsightPanelSlot::ToolLatency,
+    InsightPanelSlot::MessageFlow,
+    InsightPanelSlot::RuntimeDigest,
+    InsightPanelSlot::MessageFlow,
+];
+
+const INSIGHT_MID_LAYOUT: [InsightPanelSlot; 7] = [
+    InsightPanelSlot::RecentActivity,
+    InsightPanelSlot::Contacts,
+    InsightPanelSlot::RuntimeDigest,
+    InsightPanelSlot::ToolLatency,
+    InsightPanelSlot::MessageFlow,
+    InsightPanelSlot::EventMix,
+    InsightPanelSlot::ReservationWatch,
+];
+
+const INSIGHT_LOWER_MID_LAYOUT: [InsightPanelSlot; 7] = [
+    InsightPanelSlot::Signals,
+    InsightPanelSlot::ReservationWatch,
+    InsightPanelSlot::ProjectLoad,
+    InsightPanelSlot::EventMix,
+    InsightPanelSlot::ToolLatency,
+    InsightPanelSlot::MessageFlow,
+    InsightPanelSlot::RuntimeDigest,
+];
+
+#[allow(clippy::too_many_arguments)]
+fn render_insight_panel_slot(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    slot: InsightPanelSlot,
+    db_snapshot: &DbStatSnapshot,
+    query_text: &str,
+    anomalies: &[DetectedAnomaly],
+    entries: &[&EventEntry],
+) {
+    match slot {
+        InsightPanelSlot::Agents => {
+            render_agents_snapshot_panel(frame, area, &db_snapshot.agents_list, query_text);
+        }
+        InsightPanelSlot::Contacts => {
+            render_contacts_snapshot_panel(frame, area, &db_snapshot.contacts_list, query_text);
+        }
+        InsightPanelSlot::Projects => {
+            render_projects_snapshot_panel(frame, area, &db_snapshot.projects_list, query_text);
+        }
+        InsightPanelSlot::ProjectLoad => {
+            render_project_load_panel(frame, area, &db_snapshot.projects_list, query_text);
+        }
+        InsightPanelSlot::ReservationWatch => {
+            render_reservation_watch_panel(
+                frame,
+                area,
+                &db_snapshot.reservation_snapshots,
+                query_text,
+            );
+        }
+        InsightPanelSlot::ReservationTtl => {
+            render_reservation_ttl_buckets_panel(
+                frame,
+                area,
+                &db_snapshot.reservation_snapshots,
+                query_text,
+            );
+        }
+        InsightPanelSlot::Signals => {
+            render_signal_panel(
+                frame,
+                area,
+                anomalies,
+                entries,
+                &db_snapshot.contacts_list,
+                query_text,
+            );
+        }
+        InsightPanelSlot::ToolLatency => {
+            render_tool_latency_panel(frame, area, entries, query_text);
+        }
+        InsightPanelSlot::EventMix => {
+            render_event_mix_panel(frame, area, entries, query_text);
+        }
+        InsightPanelSlot::MessageFlow => {
+            render_message_flow_panel(frame, area, entries, query_text);
+        }
+        InsightPanelSlot::RecentActivity => {
+            render_recent_activity_panel(frame, area, entries, query_text);
+        }
+        InsightPanelSlot::RuntimeDigest => {
+            render_runtime_digest_panel(frame, area, db_snapshot, entries, anomalies, query_text);
+        }
+    }
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1521,6 +1740,62 @@ fn dense_columns_for_width(width: u16, min_col_width: u16, max_cols: usize) -> u
         cols = next;
     }
     cols.max(1)
+}
+
+const fn dense_panel_column_cap(width: u16) -> usize {
+    if width >= DASHBOARD_6K_MIN_WIDTH {
+        22
+    } else if width >= MEGAGRID_BOTTOM_MIN_WIDTH {
+        12
+    } else if width >= ULTRAWIDE_BOTTOM_MIN_WIDTH {
+        8
+    } else {
+        2
+    }
+}
+
+const fn event_log_columns_for_width(width: u16) -> usize {
+    if width >= 980 {
+        12
+    } else if width >= 900 {
+        11
+    } else if width >= 820 {
+        10
+    } else if width >= 740 {
+        9
+    } else if width >= 660 {
+        8
+    } else if width >= 580 {
+        7
+    } else if width >= 500 {
+        6
+    } else if width >= 420 {
+        5
+    } else if width >= 340 {
+        4
+    } else if width >= 220 {
+        3
+    } else if width >= 150 {
+        2
+    } else {
+        1
+    }
+}
+
+fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
+    if area.is_empty() {
+        return;
+    }
+    let fg = crate::tui_theme::TuiThemePalette::current().text_primary;
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.fg = fg;
+                cell.bg = bg;
+            }
+        }
+    }
 }
 
 fn render_lines_with_columns(
@@ -1832,17 +2107,18 @@ fn render_summary_band(
                 };
                 tile = tile.block(
                     Block::default()
+                        .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(crate::tui_theme::lerp_color(
                             tp.panel_border,
                             border_hint,
                             0.55,
                         )))
-                        .style(Style::default().bg(crate::tui_theme::lerp_color(
-                            tp.panel_bg,
-                            border_hint,
-                            0.08,
-                        ))),
+                        .style(
+                            Style::default()
+                                .fg(tp.text_primary)
+                                .bg(crate::tui_theme::lerp_color(tp.panel_bg, border_hint, 0.08)),
+                        ),
                 );
             }
             tile.render(tile_area, frame);
@@ -1880,17 +2156,18 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
             .selected(i == 0)
             .block(
                 Block::default()
+                    .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(crate::tui_theme::lerp_color(
                         tp.panel_border,
                         accent,
                         0.62,
                     )))
-                    .style(Style::default().bg(crate::tui_theme::lerp_color(
-                        tp.panel_bg,
-                        accent,
-                        0.08,
-                    ))),
+                    .style(
+                        Style::default()
+                            .fg(tp.text_primary)
+                            .bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.08)),
+                    ),
             );
         card.render(card_area, frame);
     }
@@ -1899,6 +2176,7 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
 fn accent_panel_block(title: &str, accent: PackedRgba) -> Block<'_> {
     let tp = crate::tui_theme::TuiThemePalette::current();
     Block::default()
+        .borders(Borders::ALL)
         .title(title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::lerp_color(
@@ -1906,7 +2184,11 @@ fn accent_panel_block(title: &str, accent: PackedRgba) -> Block<'_> {
             accent,
             0.58,
         )))
-        .style(Style::default().bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.07)))
+        .style(
+            Style::default()
+                .fg(tp.text_primary)
+                .bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.07)),
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1930,7 +2212,8 @@ fn render_primary_cluster(
         return;
     }
 
-    let query_visible = query_active || !query_text.trim().is_empty();
+    let query_visible =
+        query_active || !query_text.trim().is_empty() || (area.width >= 120 && area.height >= 14);
     let mut query_h = if query_visible {
         if area.height >= 15 { 3 } else { 2 }
     } else {
@@ -2039,6 +2322,7 @@ fn render_dashboard_query_bar(
         Style::default().fg(tp.panel_border)
     };
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(title)
         .border_type(BorderType::Rounded)
         .border_style(border);
@@ -2108,8 +2392,16 @@ fn render_insight_rail(
     }
 
     let ultrawide = area.width >= ULTRAWIDE_INSIGHT_MIN_WIDTH && area.height >= 20;
+    let six_k_surface =
+        area.width >= DASHBOARD_6K_MIN_WIDTH && area.height >= DASHBOARD_6K_MIN_HEIGHT;
     let (trend_area, remaining) = if area.height >= 20 {
-        let trend_height = if ultrawide {
+        let trend_height = if six_k_surface {
+            (area
+                .height
+                .saturating_mul(DASHBOARD_6K_TREND_HEIGHT_PERCENT)
+                / 100)
+                .max(8)
+        } else if ultrawide {
             (area.height.saturating_mul(2) / 5).max(8)
         } else {
             (area.height / 3).max(7)
@@ -2130,6 +2422,116 @@ fn render_insight_rail(
     }
 
     if remaining.height < 4 {
+        return;
+    }
+
+    if is_megagrid_insight_area(remaining) {
+        // Dedicated 6k-density pass: expand from fixed 5 columns to adaptive
+        // 6/7/8 columns so large monitors surface substantially more context.
+        let cols = if remaining.width >= DASHBOARD_6K_MIN_WIDTH {
+            8
+        } else if remaining.width >= ULTRADENSE_BOTTOM_MIN_WIDTH {
+            7
+        } else {
+            6
+        };
+        let columns = split_columns_with_gap(remaining, cols, 1);
+        let four_rows = remaining.height >= DASHBOARD_6K_FOUR_ROW_MIN_HEIGHT;
+        let three_rows = !four_rows && remaining.height >= 24;
+        for (idx, col) in columns.iter().enumerate() {
+            let slot_idx = idx.min(INSIGHT_TOP_LAYOUT.len().saturating_sub(1));
+            if four_rows {
+                let (top, rest_rows) = split_height_ratio_with_gap(*col, 0.26, 1);
+                let (mid, rest_rows) = split_height_ratio_with_gap(rest_rows, 0.34, 1);
+                let (lower_mid, bottom) = split_height_ratio_with_gap(rest_rows, 0.5, 1);
+                render_insight_panel_slot(
+                    frame,
+                    top,
+                    INSIGHT_TOP_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+                render_insight_panel_slot(
+                    frame,
+                    mid,
+                    INSIGHT_MID_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+                render_insight_panel_slot(
+                    frame,
+                    lower_mid,
+                    INSIGHT_LOWER_MID_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+                render_insight_panel_slot(
+                    frame,
+                    bottom,
+                    INSIGHT_BOTTOM_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+            } else if three_rows {
+                let (top, rest_rows) = split_height_ratio_with_gap(*col, 0.34, 1);
+                let (mid, bottom) = split_height_ratio_with_gap(rest_rows, 0.5, 1);
+                render_insight_panel_slot(
+                    frame,
+                    top,
+                    INSIGHT_TOP_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+                render_insight_panel_slot(
+                    frame,
+                    mid,
+                    INSIGHT_MID_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+                render_insight_panel_slot(
+                    frame,
+                    bottom,
+                    INSIGHT_BOTTOM_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+            } else {
+                let (top, bottom) = split_height_ratio_with_gap(*col, 0.5, 1);
+                render_insight_panel_slot(
+                    frame,
+                    top,
+                    INSIGHT_TOP_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+                render_insight_panel_slot(
+                    frame,
+                    bottom,
+                    INSIGHT_BOTTOM_LAYOUT[slot_idx],
+                    db_snapshot,
+                    query_text,
+                    anomalies,
+                    entries,
+                );
+            }
+        }
         return;
     }
 
@@ -2249,6 +2651,53 @@ fn render_bottom_rail(
 
     if preview.is_none() {
         if query_text.is_empty() {
+            if is_ultradense_bottom_area(area) {
+                let (activity_col, rest) = split_width_ratio_with_gap(area, 0.30, 1);
+                let (mix_col, rest) = split_width_ratio_with_gap(rest, 0.25, 1);
+                let (flow_col, rest) = split_width_ratio_with_gap(rest, 0.33, 1);
+                let (ops_col, reservations_col) = split_width_ratio_with_gap(rest, 0.5, 1);
+
+                render_recent_activity_panel(frame, activity_col, entries, query_text);
+                render_event_mix_panel(frame, mix_col, entries, query_text);
+                render_message_flow_panel(frame, flow_col, entries, query_text);
+                if ops_col.height >= 10 {
+                    let (ops_top, ops_bottom) = split_height_ratio_with_gap(ops_col, 0.5, 1);
+                    render_tool_latency_panel(frame, ops_top, entries, query_text);
+                    render_project_load_panel(
+                        frame,
+                        ops_bottom,
+                        &db_snapshot.projects_list,
+                        query_text,
+                    );
+                } else {
+                    render_tool_latency_panel(frame, ops_col, entries, query_text);
+                }
+                if reservations_col.height >= 10 {
+                    let (res_top, res_bottom) =
+                        split_height_ratio_with_gap(reservations_col, 0.5, 1);
+                    render_reservation_ttl_buckets_panel(
+                        frame,
+                        res_top,
+                        &db_snapshot.reservation_snapshots,
+                        query_text,
+                    );
+                    render_reservation_watch_panel(
+                        frame,
+                        res_bottom,
+                        &db_snapshot.reservation_snapshots,
+                        query_text,
+                    );
+                } else {
+                    render_reservation_ttl_buckets_panel(
+                        frame,
+                        reservations_col,
+                        &db_snapshot.reservation_snapshots,
+                        query_text,
+                    );
+                }
+                return;
+            }
+
             if is_megagrid_bottom_area(area) {
                 let (activity_col, rest) = split_width_ratio_with_gap(area, 0.38, 1);
                 let (analytics_col, ops_col) = split_width_ratio_with_gap(rest, 0.5, 1);
@@ -2330,6 +2779,37 @@ fn render_bottom_rail(
             render_recent_activity_panel(frame, right, entries, query_text);
         } else {
             render_query_matches_panel(frame, area, query_text, db_snapshot, entries);
+        }
+        return;
+    }
+
+    if is_ultradense_bottom_area(area) {
+        let (preview_col, rest) = split_width_ratio_with_gap(area, 0.24, 1);
+        let (query_col, rest) = split_width_ratio_with_gap(rest, 0.24, 1);
+        let (activity_col, rest) = split_width_ratio_with_gap(rest, 0.34, 1);
+        let (metrics_col, support_col) = split_width_ratio_with_gap(rest, 0.5, 1);
+
+        render_recent_message_preview_panel(frame, preview_col, preview);
+        render_query_matches_panel(frame, query_col, query_text, db_snapshot, entries);
+        render_recent_activity_panel(frame, activity_col, entries, query_text);
+        if metrics_col.height >= 10 {
+            let (metrics_top, metrics_bottom) = split_height_ratio_with_gap(metrics_col, 0.5, 1);
+            render_event_mix_panel(frame, metrics_top, entries, query_text);
+            render_tool_latency_panel(frame, metrics_bottom, entries, query_text);
+        } else {
+            render_event_mix_panel(frame, metrics_col, entries, query_text);
+        }
+        if support_col.height >= 10 {
+            let (support_top, support_bottom) = split_height_ratio_with_gap(support_col, 0.5, 1);
+            render_message_flow_panel(frame, support_top, entries, query_text);
+            render_reservation_ttl_buckets_panel(
+                frame,
+                support_bottom,
+                &db_snapshot.reservation_snapshots,
+                query_text,
+            );
+        } else {
+            render_message_flow_panel(frame, support_col, entries, query_text);
         }
         return;
     }
@@ -2458,6 +2938,7 @@ fn render_agents_snapshot_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Agents · {}", rows.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -2495,7 +2976,11 @@ fn render_agents_snapshot_panel(
             Span::styled("●<60s ●<5m ○>=5m", crate::tui_theme::text_meta(&tp)),
         ]));
     }
-    let dense_cols = dense_columns_for_width(content_area.width, 44, 2);
+    let dense_cols = dense_columns_for_width(
+        content_area.width,
+        44,
+        dense_panel_column_cap(content_area.width),
+    );
     let list_budget = content_rows
         .saturating_mul(dense_cols)
         .saturating_sub(lines.len());
@@ -2518,7 +3003,7 @@ fn render_agents_snapshot_panel(
             Span::styled(age, crate::tui_theme::text_meta(&tp)),
         ]));
     }
-    render_lines_with_columns(frame, content_area, &lines, 44, 2);
+    render_lines_with_columns(frame, content_area, &lines, 44, dense_cols);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "sorted by most recently active");
     }
@@ -2566,6 +3051,7 @@ fn render_contacts_snapshot_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Contacts · {} (p:{pending})", rows.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -2608,7 +3094,11 @@ fn render_contacts_snapshot_panel(
         ]));
     }
 
-    let dense_cols = dense_columns_for_width(content_area.width, 40, 2);
+    let dense_cols = dense_columns_for_width(
+        content_area.width,
+        40,
+        dense_panel_column_cap(content_area.width),
+    );
     let list_budget = content_rows
         .saturating_mul(dense_cols)
         .saturating_sub(lines.len());
@@ -2641,7 +3131,7 @@ fn render_contacts_snapshot_panel(
         ]));
     }
 
-    render_lines_with_columns(frame, content_area, &lines, 40, 2);
+    render_lines_with_columns(frame, content_area, &lines, 40, dense_cols);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "pending links need respond_contact");
     }
@@ -2675,6 +3165,7 @@ fn render_projects_snapshot_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Projects · {}", rows.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -2725,7 +3216,11 @@ fn render_projects_snapshot_panel(
             ),
         ]));
     }
-    let dense_cols = dense_columns_for_width(content_area.width, 44, 2);
+    let dense_cols = dense_columns_for_width(
+        content_area.width,
+        44,
+        dense_panel_column_cap(content_area.width),
+    );
     let list_budget = content_rows
         .saturating_mul(dense_cols)
         .saturating_sub(lines.len());
@@ -2745,7 +3240,7 @@ fn render_projects_snapshot_panel(
             ),
         ]));
     }
-    render_lines_with_columns(frame, content_area, &lines, 44, 2);
+    render_lines_with_columns(frame, content_area, &lines, 44, dense_cols);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "sorted by message volume, then agents");
     }
@@ -2783,6 +3278,7 @@ fn render_project_load_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Project Load · {}", rows.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -2827,7 +3323,11 @@ fn render_project_load_panel(
         ]));
     }
 
-    let dense_cols = dense_columns_for_width(content_area.width, 44, 2);
+    let dense_cols = dense_columns_for_width(
+        content_area.width,
+        44,
+        dense_panel_column_cap(content_area.width),
+    );
     let list_budget = content_rows
         .saturating_mul(dense_cols)
         .saturating_sub(lines.len());
@@ -2851,7 +3351,7 @@ fn render_project_load_panel(
         ]));
     }
 
-    render_lines_with_columns(frame, content_area, &lines, 44, 2);
+    render_lines_with_columns(frame, content_area, &lines, 44, dense_cols);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "L=msg + (2*agents) + (3*reservations)");
     }
@@ -2894,6 +3394,7 @@ fn render_reservation_watch_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Reservations · {} (≤5m:{soon_count})", rows.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -2944,7 +3445,8 @@ fn render_reservation_watch_panel(
         return;
     }
     let path_budget = usize::from(inner.width.saturating_sub(34)).max(8);
-    let dense_cols = dense_columns_for_width(list_area.width, 34, 2);
+    let dense_cols =
+        dense_columns_for_width(list_area.width, 34, dense_panel_column_cap(list_area.width));
     let row_budget = usize::from(list_area.height).saturating_mul(dense_cols);
     let mut lines = Vec::new();
     for reservation in rows.iter().take(row_budget) {
@@ -2990,7 +3492,7 @@ fn render_reservation_watch_panel(
             ),
         ]));
     }
-    render_lines_with_columns(frame, list_area, &lines, 34, 2);
+    render_lines_with_columns(frame, list_area, &lines, 34, dense_cols);
     if hint_rows == 1 {
         render_panel_hint_line(
             frame,
@@ -3030,6 +3532,7 @@ fn render_reservation_ttl_buckets_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Reservation TTL · {}", filtered.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3115,30 +3618,30 @@ fn render_reservation_ttl_buckets_panel(
     let soonest = filtered
         .iter()
         .min_by_key(|reservation| reservation.expires_ts);
-    if lines.len() < content_rows {
-        if let Some(soonest) = soonest {
-            let ttl = reservation_remaining_seconds(soonest, now);
-            lines.push(Line::from_spans([
-                Span::styled("next ", crate::tui_theme::text_meta(&tp)),
-                Span::styled(
-                    format!("{ttl}s"),
-                    Style::default().fg(tp.metric_latency).bold(),
+    if lines.len() < content_rows
+        && let Some(soonest) = soonest
+    {
+        let ttl = reservation_remaining_seconds(soonest, now);
+        lines.push(Line::from_spans([
+            Span::styled("next ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                format!("{ttl}s"),
+                Style::default().fg(tp.metric_latency).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&soonest.agent_name, 12),
+                Style::default().fg(tp.text_primary),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(
+                    &soonest.path_pattern,
+                    usize::from(inner.width.saturating_sub(24)),
                 ),
-                Span::raw(" "),
-                Span::styled(
-                    truncate(&soonest.agent_name, 12),
-                    Style::default().fg(tp.text_primary),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    truncate(
-                        &soonest.path_pattern,
-                        usize::from(inner.width.saturating_sub(24)),
-                    ),
-                    crate::tui_theme::text_meta(&tp),
-                ),
-            ]));
-        }
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
     }
 
     let content_area = Rect::new(
@@ -3149,7 +3652,8 @@ fn render_reservation_ttl_buckets_panel(
             .height
             .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
     );
-    render_lines_with_columns(frame, content_area, &lines, 44, 2);
+    let column_cap = dense_panel_column_cap(content_area.width);
+    render_lines_with_columns(frame, content_area, &lines, 44, column_cap);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "exclusive reservations should be short-lived");
     }
@@ -3292,7 +3796,8 @@ fn render_signal_panel(
             .height
             .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
     );
-    render_lines_with_columns(frame, content_area, &lines, 40, 2);
+    let column_cap = dense_panel_column_cap(content_area.width);
+    render_lines_with_columns(frame, content_area, &lines, 40, column_cap);
     if hint_rows == 1 {
         render_panel_hint_line(
             frame,
@@ -3428,7 +3933,11 @@ fn render_tool_latency_panel(
         )]));
     }
 
-    let dense_cols = dense_columns_for_width(content_area.width, 48, 2);
+    let dense_cols = dense_columns_for_width(
+        content_area.width,
+        48,
+        dense_panel_column_cap(content_area.width),
+    );
     let list_budget = content_rows
         .saturating_mul(dense_cols)
         .saturating_sub(lines.len());
@@ -3469,7 +3978,7 @@ fn render_tool_latency_panel(
         ]));
     }
 
-    render_lines_with_columns(frame, content_area, &lines, 48, 2);
+    render_lines_with_columns(frame, content_area, &lines, 48, dense_cols);
     if hint_rows == 1 {
         render_panel_hint_line(
             frame,
@@ -3505,6 +4014,7 @@ fn render_event_mix_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Event Mix · {}", filtered.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3675,6 +4185,7 @@ fn render_recent_activity_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Recent Activity · {}", filtered.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3718,7 +4229,11 @@ fn render_recent_activity_panel(
             Style::default().fg(tp.text_primary).bold(),
         )]));
     }
-    let dense_cols = dense_columns_for_width(content_area.width, 40, 2);
+    let dense_cols = dense_columns_for_width(
+        content_area.width,
+        40,
+        dense_panel_column_cap(content_area.width),
+    );
     let cols_u16 = u16::try_from(dense_cols).unwrap_or(1).max(1);
     let total_gap = cols_u16.saturating_sub(1);
     let column_width = content_area
@@ -3761,7 +4276,7 @@ fn render_recent_activity_panel(
         )]));
     }
 
-    render_lines_with_columns(frame, content_area, &lines, 40, 2);
+    render_lines_with_columns(frame, content_area, &lines, 40, dense_cols);
     if hint_rows == 1 {
         render_panel_hint_line(frame, inner, "icon color reflects event severity");
     }
@@ -3793,6 +4308,7 @@ fn render_message_flow_panel(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Message Flow · {}", filtered.len());
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3892,6 +4408,174 @@ fn render_message_flow_panel(
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+fn render_runtime_digest_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    db_snapshot: &DbStatSnapshot,
+    entries: &[&EventEntry],
+    anomalies: &[DetectedAnomaly],
+    query_text: &str,
+) {
+    if area.width < 22 || area.height < 3 {
+        return;
+    }
+
+    let query_terms = parse_query_terms(query_text);
+    let filtered = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            text_matches_query_terms(
+                &format!("{} {}", entry.kind.compact_label(), entry.summary),
+                &query_terms,
+            )
+        })
+        .collect::<Vec<_>>();
+    let total = u64::try_from(filtered.len()).unwrap_or(0).max(1);
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Runtime Digest · {}", filtered.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(&title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut msg_sent = 0u64;
+    let mut msg_recv = 0u64;
+    let mut tool_start = 0u64;
+    let mut tool_end = 0u64;
+    let mut reservation_ops = 0u64;
+    let mut http_calls = 0u64;
+    let mut agent_regs = 0u64;
+    let mut warn_count = 0u64;
+    let mut err_count = 0u64;
+    for entry in &filtered {
+        match entry.kind {
+            MailEventKind::MessageSent => msg_sent += 1,
+            MailEventKind::MessageReceived => msg_recv += 1,
+            MailEventKind::ToolCallStart => tool_start += 1,
+            MailEventKind::ToolCallEnd => tool_end += 1,
+            MailEventKind::ReservationGranted | MailEventKind::ReservationReleased => {
+                reservation_ops += 1;
+            }
+            MailEventKind::HttpRequest => http_calls += 1,
+            MailEventKind::AgentRegistered => agent_regs += 1,
+            _ => {}
+        }
+        match entry.severity {
+            EventSeverity::Warn => warn_count += 1,
+            EventSeverity::Error => err_count += 1,
+            _ => {}
+        }
+    }
+
+    let hint_rows = usize::from(inner.height >= 5);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(u16::try_from(hint_rows).unwrap_or(0)),
+    );
+    if content_area.width == 0 || content_area.height == 0 {
+        return;
+    }
+    let content_rows = usize::from(content_area.height);
+    let mut lines = Vec::new();
+    if content_rows >= 1 {
+        lines.push(Line::from_spans([
+            Span::styled(
+                format!(
+                    "ev:{} warn:{} err:{} anom:{}",
+                    filtered.len(),
+                    warn_count,
+                    err_count,
+                    anomalies.len()
+                ),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(
+                    "ag:{} pr:{} lock:{}",
+                    db_snapshot.agents, db_snapshot.projects, db_snapshot.file_reservations
+                ),
+                crate::tui_theme::text_meta(&tp),
+            ),
+        ]));
+    }
+    if content_rows >= 2 {
+        let msg_total = msg_sent.saturating_add(msg_recv).max(1);
+        lines.push(Line::from_spans([
+            Span::styled("msg ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                ratio_bar(msg_total, total, 6),
+                Style::default().fg(tp.metric_messages),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("↑{msg_sent} ↓{msg_recv}"),
+                Style::default().fg(tp.metric_messages),
+            ),
+        ]));
+    }
+    if content_rows >= 3 {
+        lines.push(Line::from_spans([
+            Span::styled("tool ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                ratio_bar(tool_end, total, 6),
+                Style::default().fg(tp.metric_latency),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("done:{tool_end} start:{tool_start}"),
+                Style::default().fg(tp.metric_latency),
+            ),
+        ]));
+    }
+    if content_rows >= 4 {
+        lines.push(Line::from_spans([
+            Span::styled("ops ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                ratio_bar(reservation_ops, total, 6),
+                Style::default().fg(tp.metric_reservations),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("resv:{reservation_ops} http:{http_calls} reg:{agent_regs}"),
+                Style::default().fg(tp.text_primary),
+            ),
+        ]));
+    }
+    if filtered.is_empty() && lines.is_empty() {
+        lines.push(Line::from_spans([Span::styled(
+            "No matching runtime events",
+            crate::tui_theme::text_meta(&tp),
+        )]));
+    }
+
+    let dense_cols = dense_columns_for_width(
+        content_area.width,
+        44,
+        dense_panel_column_cap(content_area.width),
+    );
+    render_lines_with_columns(frame, content_area, &lines, 44, dense_cols);
+    if hint_rows == 1 {
+        render_panel_hint_line(frame, inner, "digest blends live event flow + DB counters");
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_query_matches_panel(
     frame: &mut Frame<'_>,
@@ -3905,6 +4589,7 @@ fn render_query_matches_panel(
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
+        .borders(Borders::ALL)
         .title("Live Search")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -4247,6 +4932,28 @@ const fn heatmap_kind_index(kind: MailEventKind) -> usize {
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn heatmap_intensity_color(intensity: f64, tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
+    let t = intensity.clamp(0.0, 1.0) as f32;
+    let ramp = tp.chart_series;
+    let segment_count = ramp.len().saturating_sub(1);
+    if segment_count == 0 {
+        return tp.metric_messages;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let scaled = t * segment_count as f32;
+    let idx = (scaled.floor() as usize).min(segment_count);
+    let next = idx
+        .min(segment_count.saturating_sub(1))
+        .saturating_add(1)
+        .min(segment_count);
+    #[allow(clippy::cast_precision_loss)]
+    let local_t = scaled - idx as f32;
+    let vivid = crate::tui_theme::lerp_color(ramp[idx], ramp[next], local_t);
+    let neutral_base = crate::tui_theme::lerp_color(tp.bg_surface, tp.bg_overlay, 0.38);
+    crate::tui_theme::lerp_color(neutral_base, vivid, 0.88)
+}
+
 /// Render a Braille-mode Canvas heatmap of event activity density.
 ///
 /// X = time (bucketed into columns), Y = event kind, intensity = event count.
@@ -4332,10 +5039,7 @@ fn render_activity_heatmap(frame: &mut Frame<'_>, area: Rect, event_log: &VecDeq
                 continue;
             }
             let intensity = (f64::from(count) / f64::from(max_count)).sqrt();
-            let r = (50.0 + intensity * 205.0) as u8;
-            let g = (180.0 * (1.0 - intensity * 0.7)) as u8;
-            let b = (50.0 + intensity * 50.0) as u8;
-            let color = PackedRgba::rgb(r, g, b);
+            let color = heatmap_intensity_color(intensity, &tp);
 
             // Fill sub-pixel rows for this kind at this time column.
             for dy in 0..row_height.min(3) {
@@ -4474,6 +5178,7 @@ fn render_event_log(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
+        .borders(Borders::ALL)
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -4560,25 +5265,61 @@ fn render_event_log(
         return;
     }
 
-    let line_width_budget = usize::from(viewer_area.width);
+    let event_cols = event_log_columns_for_width(viewer_area.width);
+    let cols_u16 = u16::try_from(event_cols).unwrap_or(1).max(1);
+    let estimated_col_width = if event_cols > 1 {
+        let total_gap = cols_u16.saturating_sub(1);
+        viewer_area
+            .width
+            .saturating_sub(total_gap)
+            .checked_div(cols_u16)
+            .unwrap_or(viewer_area.width)
+    } else {
+        viewer_area.width
+    };
+    let line_width_budget = usize::from(estimated_col_width.max(1));
+    let rendered_lines: Vec<String> = window_entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let raw_line = format!(
+                "{:>6} {} {:<3} {} {:<10} {}",
+                entry.seq,
+                entry.timestamp,
+                entry.severity.badge(),
+                entry.icon,
+                entry.kind.compact_label(),
+                entry.summary
+            );
+            let line = truncate(&raw_line, line_width_budget).to_string();
+            shimmer_progresses.get(idx).and_then(|p| *p).map_or_else(
+                || line.clone(),
+                |progress| shimmerize_plain_text(&line, progress, SHIMMER_HIGHLIGHT_WIDTH),
+            )
+        })
+        .collect();
+
+    if event_cols > 1 {
+        let lines = rendered_lines
+            .iter()
+            .map(|line| Line::styled(line.clone(), Style::default().fg(tp.text_primary)))
+            .collect::<Vec<_>>();
+        render_lines_with_columns(frame, viewer_area, &lines, 48, event_cols);
+        return;
+    }
+
     let mut pane = viewer.borrow_mut();
     pane.clear();
-    pane.push_many(window_entries.iter().enumerate().map(|(idx, entry)| {
-        let raw_line = format!(
-            "{:>6} {} {:<3} {} {:<10} {}",
-            entry.seq,
-            entry.timestamp,
-            entry.severity.badge(),
-            entry.icon,
-            entry.kind.compact_label(),
-            entry.summary
-        );
-        let line = truncate(&raw_line, line_width_budget).to_string();
-        shimmer_progresses.get(idx).and_then(|p| *p).map_or_else(
-            || line.clone(),
-            |progress| shimmerize_plain_text(&line, progress, SHIMMER_HIGHLIGHT_WIDTH),
-        )
-    }));
+    let styled_lines = rendered_lines
+        .iter()
+        .map(|line| {
+            Text::from_line(Line::styled(
+                line.clone(),
+                Style::default().fg(tp.text_primary),
+            ))
+        })
+        .collect::<Vec<_>>();
+    pane.push_many(styled_lines);
     pane.scroll_to_bottom();
     pane.render(viewer_area, frame);
 }
@@ -5120,22 +5861,106 @@ mod tests {
             MEGAGRID_BOTTOM_MIN_WIDTH,
             MEGAGRID_BOTTOM_MIN_HEIGHT
         )));
+
+        assert!(!is_megagrid_insight_area(Rect::new(
+            0,
+            0,
+            MEGAGRID_INSIGHT_MIN_WIDTH - 1,
+            MEGAGRID_INSIGHT_MIN_HEIGHT
+        )));
+        assert!(!is_megagrid_insight_area(Rect::new(
+            0,
+            0,
+            MEGAGRID_INSIGHT_MIN_WIDTH,
+            MEGAGRID_INSIGHT_MIN_HEIGHT - 1
+        )));
+        assert!(is_megagrid_insight_area(Rect::new(
+            0,
+            0,
+            MEGAGRID_INSIGHT_MIN_WIDTH,
+            MEGAGRID_INSIGHT_MIN_HEIGHT
+        )));
+
+        assert!(!is_ultradense_bottom_area(Rect::new(
+            0,
+            0,
+            ULTRADENSE_BOTTOM_MIN_WIDTH - 1,
+            ULTRADENSE_BOTTOM_MIN_HEIGHT
+        )));
+        assert!(!is_ultradense_bottom_area(Rect::new(
+            0,
+            0,
+            ULTRADENSE_BOTTOM_MIN_WIDTH,
+            ULTRADENSE_BOTTOM_MIN_HEIGHT - 1
+        )));
+        assert!(is_ultradense_bottom_area(Rect::new(
+            0,
+            0,
+            ULTRADENSE_BOTTOM_MIN_WIDTH,
+            ULTRADENSE_BOTTOM_MIN_HEIGHT
+        )));
     }
 
     #[test]
     fn dense_surface_breakpoint_detects_large_main_canvas() {
         assert!(!should_force_dense_dashboard_surface(Rect::new(
-            0, 0, 127, 20
+            0, 0, 111, 18
         )));
         assert!(!should_force_dense_dashboard_surface(Rect::new(
-            0, 0, 128, 19
+            0, 0, 112, 17
         )));
         assert!(should_force_dense_dashboard_surface(Rect::new(
-            0, 0, 128, 20
+            0, 0, 112, 18
         )));
         assert!(should_force_dense_dashboard_surface(Rect::new(
             0, 0, 220, 40
         )));
+    }
+
+    #[test]
+    fn mega_density_breakpoint_detects_6k_surfaces() {
+        assert!(!should_enable_mega_dashboard_density(Rect::new(
+            0,
+            0,
+            DASHBOARD_6K_MIN_WIDTH - 1,
+            DASHBOARD_6K_MIN_HEIGHT
+        )));
+        assert!(!should_enable_mega_dashboard_density(Rect::new(
+            0,
+            0,
+            DASHBOARD_6K_MIN_WIDTH,
+            DASHBOARD_6K_MIN_HEIGHT - 1
+        )));
+        assert!(should_enable_mega_dashboard_density(Rect::new(
+            0,
+            0,
+            DASHBOARD_6K_MIN_WIDTH,
+            DASHBOARD_6K_MIN_HEIGHT
+        )));
+    }
+
+    #[test]
+    fn dense_panel_column_cap_scales_with_width() {
+        assert_eq!(dense_panel_column_cap(80), 2);
+        assert_eq!(dense_panel_column_cap(ULTRAWIDE_BOTTOM_MIN_WIDTH), 8);
+        assert_eq!(dense_panel_column_cap(MEGAGRID_BOTTOM_MIN_WIDTH), 12);
+        assert_eq!(dense_panel_column_cap(DASHBOARD_6K_MIN_WIDTH), 22);
+    }
+
+    #[test]
+    fn event_log_columns_scale_on_ultrawide_widths() {
+        assert_eq!(event_log_columns_for_width(120), 1);
+        assert_eq!(event_log_columns_for_width(160), 2);
+        assert_eq!(event_log_columns_for_width(220), 3);
+        assert_eq!(event_log_columns_for_width(340), 4);
+        assert_eq!(event_log_columns_for_width(420), 5);
+        assert_eq!(event_log_columns_for_width(500), 6);
+        assert_eq!(event_log_columns_for_width(580), 7);
+        assert_eq!(event_log_columns_for_width(660), 8);
+        assert_eq!(event_log_columns_for_width(740), 9);
+        assert_eq!(event_log_columns_for_width(820), 10);
+        assert_eq!(event_log_columns_for_width(900), 11);
+        assert_eq!(event_log_columns_for_width(980), 12);
     }
 
     #[test]
@@ -5263,8 +6088,8 @@ mod tests {
         assert_eq!(summary_band_height(TerminalClass::Tiny), 1);
         assert_eq!(summary_band_height(TerminalClass::Compact), 2);
         assert_eq!(summary_band_height(TerminalClass::Normal), 2);
-        assert_eq!(summary_band_height(TerminalClass::Wide), 2);
-        assert_eq!(summary_band_height(TerminalClass::UltraWide), 3);
+        assert_eq!(summary_band_height(TerminalClass::Wide), 3);
+        assert_eq!(summary_band_height(TerminalClass::UltraWide), 4);
 
         assert_eq!(anomaly_rail_height(TerminalClass::Tiny, 2), 0);
         assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 2);
@@ -5295,9 +6120,10 @@ mod tests {
 
     #[test]
     fn main_layout_ultrawide_exposes_double_surface_vs_standard() {
-        let standard = DashboardScreen::main_content_layout(true, false, true, true, 0, false)
-            .compute(Rect::new(0, 0, 100, 30));
-        let ultra = DashboardScreen::main_content_layout(true, false, true, true, 0, false)
+        let standard =
+            DashboardScreen::main_content_layout(true, false, true, true, 0, false, false)
+                .compute(Rect::new(0, 0, 100, 30));
+        let ultra = DashboardScreen::main_content_layout(true, false, true, true, 0, false, false)
             .compute(Rect::new(0, 0, 200, 50));
 
         let standard_visible = standard
@@ -5325,7 +6151,8 @@ mod tests {
     fn main_layout_ultrawide_panels_fit_bounds_without_overlap() {
         let area = Rect::new(0, 0, 200, 50);
         let composition =
-            DashboardScreen::main_content_layout(true, false, true, true, 0, false).compute(area);
+            DashboardScreen::main_content_layout(true, false, true, true, 0, false, false)
+                .compute(area);
         let visible_rects: Vec<Rect> = [
             composition.rect(PanelSlot::Primary),
             composition.rect(PanelSlot::Inspector),
@@ -5363,9 +6190,10 @@ mod tests {
     fn main_layout_dense_surface_allocates_taller_footer() {
         let area = Rect::new(0, 0, 220, 50);
         let standard =
-            DashboardScreen::main_content_layout(true, false, true, false, 0, false).compute(area);
-        let dense =
-            DashboardScreen::main_content_layout(true, false, true, false, 0, true).compute(area);
+            DashboardScreen::main_content_layout(true, false, true, false, 0, false, false)
+                .compute(area);
+        let dense = DashboardScreen::main_content_layout(true, false, true, false, 0, true, false)
+            .compute(area);
         let standard_footer = standard
             .rect(PanelSlot::Footer)
             .expect("standard footer should exist");
@@ -5376,17 +6204,42 @@ mod tests {
     }
 
     #[test]
+    fn main_layout_mega_density_expands_inspector_and_footer() {
+        let area = Rect::new(0, 0, 280, 70);
+        let ultra = DashboardScreen::main_content_layout(true, false, true, true, 0, false, false)
+            .compute(area);
+        let mega = DashboardScreen::main_content_layout(true, false, true, true, 0, false, true)
+            .compute(area);
+        let ultra_inspector = ultra
+            .rect(PanelSlot::Inspector)
+            .expect("ultra inspector should exist");
+        let mega_inspector = mega
+            .rect(PanelSlot::Inspector)
+            .expect("mega inspector should exist");
+        let ultra_footer = ultra
+            .rect(PanelSlot::Footer)
+            .expect("ultra footer should exist");
+        let mega_footer = mega
+            .rect(PanelSlot::Footer)
+            .expect("mega footer should exist");
+        assert!(mega_inspector.width > ultra_inspector.width);
+        assert!(mega_footer.height > ultra_footer.height);
+    }
+
+    #[test]
     fn main_layout_hides_trend_panel_when_disabled() {
-        let composition = DashboardScreen::main_content_layout(false, false, true, true, 0, false)
-            .compute(Rect::new(0, 0, 200, 50));
+        let composition =
+            DashboardScreen::main_content_layout(false, false, true, true, 0, false, false)
+                .compute(Rect::new(0, 0, 200, 50));
         assert!(composition.rect(PanelSlot::Inspector).is_none());
         assert!(composition.rect(PanelSlot::Footer).is_some());
     }
 
     #[test]
     fn main_layout_hides_footer_when_disabled() {
-        let composition = DashboardScreen::main_content_layout(true, false, false, false, 0, false)
-            .compute(Rect::new(0, 0, 200, 50));
+        let composition =
+            DashboardScreen::main_content_layout(true, false, false, false, 0, false, false)
+                .compute(Rect::new(0, 0, 200, 50));
         assert!(composition.rect(PanelSlot::Footer).is_none());
     }
 

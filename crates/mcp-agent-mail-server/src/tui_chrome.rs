@@ -16,32 +16,6 @@ use crate::tui_persist::AccessibilitySettings;
 use crate::tui_screens::{HelpEntry, MAIL_SCREEN_REGISTRY, MailScreenId, screen_meta};
 
 // ──────────────────────────────────────────────────────────────────────
-// Color palette
-// ──────────────────────────────────────────────────────────────────────
-
-// Legacy hardcoded colors (Cyberpunk Aurora defaults). Kept for
-// `ChromePalette::standard()` backward-compat; live rendering now
-// resolves from `TuiThemePalette::current()`.
-const TAB_ACTIVE_BG: PackedRgba = PackedRgba::rgb(50, 70, 110);
-const TAB_ACTIVE_FG: PackedRgba = PackedRgba::rgb(255, 255, 255);
-const TAB_INACTIVE_FG: PackedRgba = PackedRgba::rgb(140, 150, 170);
-const TAB_KEY_FG: PackedRgba = PackedRgba::rgb(100, 180, 255);
-
-const STATUS_FG: PackedRgba = PackedRgba::rgb(160, 170, 190);
-const STATUS_ACCENT: PackedRgba = PackedRgba::rgb(144, 205, 255);
-const STATUS_GOOD: PackedRgba = PackedRgba::rgb(120, 220, 150);
-const STATUS_WARN: PackedRgba = PackedRgba::rgb(255, 184, 108);
-
-const HELP_FG: PackedRgba = PackedRgba::rgb(200, 210, 230);
-const HELP_KEY_FG: PackedRgba = PackedRgba::rgb(100, 180, 255);
-const HELP_BORDER_FG: PackedRgba = PackedRgba::rgb(80, 100, 140);
-const HELP_CATEGORY_FG: PackedRgba = PackedRgba::rgb(180, 140, 255);
-
-// High-contrast palette is now handled at the theme level
-// (`ThemeId::HighContrast` in `TuiThemePalette`). Legacy HC_*
-// constants removed.
-
-// ──────────────────────────────────────────────────────────────────────
 // Chrome layout
 // ──────────────────────────────────────────────────────────────────────
 
@@ -275,7 +249,9 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
     let tp = crate::tui_theme::TuiThemePalette::current();
 
     // Fill background
-    let bg_style = Style::default().bg(tp.tab_inactive_bg);
+    let bg_style = Style::default()
+        .fg(tp.tab_inactive_fg)
+        .bg(tp.tab_inactive_bg);
     Paragraph::new("").style(bg_style).render(area, frame);
 
     let available = area.width;
@@ -368,12 +344,12 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
         // Clear each tab slot before drawing text so separators from prior
         // frames cannot bleed through shorter/shifted labels.
         Paragraph::new("")
-            .style(Style::default().bg(bg))
+            .style(Style::default().fg(fg).bg(bg))
             .render(tab_area, frame);
 
         let label_span = if use_gradient && has_label {
             // Reserve label width in the base tab row; overlay gradient text below.
-            Span::styled(" ".repeat(label.len()), Style::default().bg(bg))
+            Span::styled(" ".repeat(label.len()), Style::default().fg(fg).bg(bg))
         } else if has_label {
             Span::styled(label, label_style)
         } else {
@@ -397,7 +373,7 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
         };
 
         let mut spans = vec![
-            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(" ", Style::default().fg(fg).bg(bg)),
             Span::styled(key_str.as_str(), key_style),
         ];
         if has_label {
@@ -412,10 +388,10 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
                     Style::default().fg(tp.tab_inactive_fg).bg(bg),
                 ));
             }
-            spans.push(Span::styled(" ", Style::default().bg(bg)));
+            spans.push(Span::styled(" ", Style::default().fg(fg).bg(bg)));
             spans.push(label_span);
         }
-        spans.push(Span::styled(" ", Style::default().bg(bg)));
+        spans.push(Span::styled(" ", Style::default().fg(fg).bg(bg)));
 
         Paragraph::new(Text::from_lines([Line::from_spans(spans)])).render(tab_area, frame);
 
@@ -888,7 +864,7 @@ pub fn render_status_line(
     let tp = crate::tui_theme::TuiThemePalette::current();
 
     // Fill background
-    let bg_style = Style::default().bg(tp.status_bg);
+    let bg_style = Style::default().fg(tp.status_fg).bg(tp.status_bg);
     Paragraph::new("").style(bg_style).render(area, frame);
 
     let (left, center, right) = plan_status_segments(
@@ -1241,7 +1217,7 @@ pub fn render_inspector_overlay(
         }
     }
     Paragraph::new(Text::from_lines(tree_render_lines))
-        .style(Style::default().bg(tp.help_bg))
+        .style(Style::default().fg(tp.help_fg).bg(tp.help_bg))
         .render(tree_inner, frame);
 
     if panes.len() > 1 {
@@ -1307,13 +1283,13 @@ fn render_keybinding_line_themed(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let row_bg = if row_idx % 2 == 0 {
+    let row_bg = if row_idx.is_multiple_of(2) {
         crate::tui_theme::lerp_color(tp.help_bg, tp.bg_surface, 0.18)
     } else {
         crate::tui_theme::lerp_color(tp.help_bg, tp.bg_surface, 0.10)
     };
     Paragraph::new("")
-        .style(Style::default().bg(row_bg))
+        .style(Style::default().fg(tp.help_fg).bg(row_bg))
         .render(area, frame);
 
     let keycap = format!(" {key} ");
@@ -1334,9 +1310,9 @@ fn render_keybinding_line_themed(
     let action_style = Style::default().fg(tp.help_fg).bg(row_bg);
 
     let spans = vec![
-        Span::styled("  ", Style::default().bg(row_bg)),
+        Span::styled("  ", Style::default().fg(tp.help_fg).bg(row_bg)),
         Span::styled(keycap, keycap_style),
-        Span::styled(padding, Style::default().bg(row_bg)),
+        Span::styled(padding, Style::default().fg(tp.help_fg).bg(row_bg)),
         Span::styled(action, action_style),
     ];
 
@@ -1395,25 +1371,10 @@ impl ChromePalette {
         }
     }
 
-    /// Standard (non-high-contrast) palette with hardcoded Cyberpunk Aurora colors.
-    ///
-    /// Kept for backward compatibility with tests.
+    /// Standard palette from the currently active theme.
     #[must_use]
-    pub const fn standard() -> Self {
-        Self {
-            tab_active_bg: TAB_ACTIVE_BG,
-            tab_active_fg: TAB_ACTIVE_FG,
-            tab_inactive_fg: TAB_INACTIVE_FG,
-            tab_key_fg: TAB_KEY_FG,
-            status_fg: STATUS_FG,
-            status_accent: STATUS_ACCENT,
-            status_good: STATUS_GOOD,
-            status_warn: STATUS_WARN,
-            help_fg: HELP_FG,
-            help_key_fg: HELP_KEY_FG,
-            help_border_fg: HELP_BORDER_FG,
-            help_category_fg: HELP_CATEGORY_FG,
-        }
+    pub fn standard() -> Self {
+        Self::from_theme()
     }
 }
 
@@ -1543,7 +1504,10 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
     }
 
     let mut spans = Vec::new();
-    spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
+    spans.push(Span::styled(
+        " ",
+        Style::default().fg(tp.status_fg).bg(tp.status_bg),
+    ));
     push_keycap_chip_spans(&mut spans, &hints, &tp, tp.status_bg);
 
     let line = Line::from_spans(spans);
@@ -1682,8 +1646,9 @@ mod tests {
     #[test]
     fn palette_standard_uses_normal_colors() {
         let p = ChromePalette::standard();
-        assert_eq!(p.tab_active_bg, TAB_ACTIVE_BG);
-        assert_eq!(p.help_fg, HELP_FG);
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        assert_eq!(p.tab_active_bg, tp.tab_active_bg);
+        assert_eq!(p.help_fg, tp.help_fg);
     }
 
     #[test]
@@ -1731,7 +1696,7 @@ mod tests {
     #[test]
     fn standard_palette_has_non_zero_colors() {
         let p = ChromePalette::standard();
-        // Verify the standard palette constants are non-trivial
+        // Verify the standard palette fields are non-trivial
         let fg_sum = u32::from(p.tab_inactive_fg.r())
             + u32::from(p.tab_inactive_fg.g())
             + u32::from(p.tab_inactive_fg.b());
@@ -1900,16 +1865,17 @@ mod tests {
     }
 
     #[test]
-    fn color_constants_are_valid() {
+    fn chrome_palette_colors_are_valid() {
+        let p = ChromePalette::standard();
         let colors = [
-            TAB_ACTIVE_BG,
-            TAB_ACTIVE_FG,
-            TAB_INACTIVE_FG,
-            TAB_KEY_FG,
-            STATUS_FG,
-            STATUS_ACCENT,
-            STATUS_GOOD,
-            STATUS_WARN,
+            p.tab_active_bg,
+            p.tab_active_fg,
+            p.tab_inactive_fg,
+            p.tab_key_fg,
+            p.status_fg,
+            p.status_accent,
+            p.status_good,
+            p.status_warn,
         ];
         for color in colors {
             assert_ne!(color, PackedRgba::rgba(0, 0, 0, 0));

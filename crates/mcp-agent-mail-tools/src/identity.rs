@@ -21,10 +21,10 @@ use crate::tool_util::{
 };
 
 fn redact_database_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://") {
-        if let Some((_creds, host)) = rest.rsplit_once('@') {
-            return format!("{scheme}://****@{host}");
-        }
+    if let Some((scheme, rest)) = url.split_once("://")
+        && let Some((_creds, host)) = rest.rsplit_once('@')
+    {
+        return format!("{scheme}://****@{host}");
     }
     url.to_string()
 }

@@ -1370,7 +1370,9 @@ fn run_tui_main_thread(
 
     let model = tui_app::MailAppModel::with_config(Arc::clone(tui_state), config);
 
-    let tui_config = ftui_runtime::program::ProgramConfig::fullscreen().with_mouse();
+    let tui_config = ftui_runtime::program::ProgramConfig::fullscreen()
+        .with_mouse()
+        .with_diff_config(stable_tui_diff_config());
 
     let mut program = Program::with_native_backend(model, tui_config)?;
     program.run()
@@ -1439,7 +1441,7 @@ fn runtime_output_mode(config: &mcp_agent_mail_core::Config) -> RuntimeOutputMod
     }
 }
 
-const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
+const JWKS_CACHE_TTL: Duration = Duration::from_mins(1);
 const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
@@ -1704,6 +1706,23 @@ fn should_force_mux_left_split(
         && layout.split_mode == ConsoleSplitMode::Inline
 }
 
+fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
+    // Bias toward full redraw on any dirty frame to eliminate stale-glyph
+    // artifacts from aggressive diff minimization on complex multi-pane UIs.
+    let redraw_biased = ftui_runtime::DiffStrategyConfig {
+        c_emit: 0.0,
+        hysteresis_ratio: 0.0,
+        uncertainty_guard_variance: 0.0,
+        ..Default::default()
+    };
+    ftui_runtime::terminal_writer::RuntimeDiffConfig::default()
+        .with_bayesian_enabled(true)
+        .with_dirty_rows_enabled(true)
+        .with_dirty_spans_enabled(false)
+        .with_tile_skip_enabled(false)
+        .with_strategy_config(redraw_biased)
+}
+
 struct StartupDashboard {
     writer: Mutex<ftui::TerminalWriter<std::io::Stdout>>,
     stop: AtomicBool,
@@ -1770,8 +1789,13 @@ impl StartupDashboard {
             }
         }
 
-        let mut writer =
-            ftui::TerminalWriter::new(std::io::stdout(), screen_mode, ui_anchor, term_caps);
+        let mut writer = ftui::TerminalWriter::with_diff_config(
+            std::io::stdout(),
+            screen_mode,
+            ui_anchor,
+            term_caps,
+            stable_tui_diff_config(),
+        );
         writer.set_size(term_width, term_height);
 
         let endpoint = format!(
@@ -2317,11 +2341,12 @@ impl StartupDashboard {
     fn apply_console_layout(&self, term_width: u16, term_height: u16) {
         let (screen_mode, ui_anchor) =
             lock_mutex(&self.console_layout).compute_writer_settings(term_height);
-        let mut writer = ftui::TerminalWriter::new(
+        let mut writer = ftui::TerminalWriter::with_diff_config(
             std::io::stdout(),
             screen_mode,
             ui_anchor,
             ftui::TerminalCapabilities::detect(),
+            stable_tui_diff_config(),
         );
         writer.set_size(term_width.max(2), term_height.max(2));
         *lock_mutex(&self.writer) = writer;
@@ -2876,7 +2901,7 @@ fn pretty_num(value: u64) -> String {
     let s = value.to_string();
     let mut out = String::with_capacity(s.len() + (s.len() / 3));
     for (idx, ch) in s.chars().enumerate() {
-        if idx > 0 && (s.len() - idx) % 3 == 0 {
+        if idx > 0 && (s.len() - idx).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -3255,36 +3280,32 @@ impl HttpState {
 
         let dur_ms =
             u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
-        if let Some(dashboard) = dashboard.as_ref() {
-            if let (Some(method), Some(path), Some(client_ip)) =
+        if let Some(dashboard) = dashboard.as_ref()
+            && let (Some(method), Some(path), Some(client_ip)) =
                 (method.as_ref(), path.as_ref(), client_ip.as_ref())
-            {
-                dashboard.record_request(method.as_str(), path, resp.status, dur_ms, client_ip);
-            }
+        {
+            dashboard.record_request(method.as_str(), path, resp.status, dur_ms, client_ip);
         }
         // Emit TUI HttpRequest event (skip healthz / high-frequency polling)
-        if let Some(tui) = tui.as_ref() {
-            if let (Some(method), Some(path), Some(client_ip)) =
+        if let Some(tui) = tui.as_ref()
+            && let (Some(method), Some(path), Some(client_ip)) =
                 (method.as_ref(), path.as_ref(), client_ip.as_ref())
-            {
-                if !should_suppress_tui_http_event(path) {
-                    let _ = tui.push_event(tui_events::MailEvent::http_request(
-                        method.as_str(),
-                        path.as_str(),
-                        resp.status,
-                        dur_ms,
-                        client_ip.as_str(),
-                    ));
-                    tui.record_request(resp.status, dur_ms);
-                }
-            }
+            && !should_suppress_tui_http_event(path)
+        {
+            let _ = tui.push_event(tui_events::MailEvent::http_request(
+                method.as_str(),
+                path.as_str(),
+                resp.status,
+                dur_ms,
+                client_ip.as_str(),
+            ));
+            tui.record_request(resp.status, dur_ms);
         }
-        if self.config.http_request_log_enabled {
-            if let (Some(method), Some(path), Some(client_ip)) =
+        if self.config.http_request_log_enabled
+            && let (Some(method), Some(path), Some(client_ip)) =
                 (method.as_ref(), path.as_ref(), client_ip.as_ref())
-            {
-                self.emit_http_request_log(method.as_str(), path, resp.status, dur_ms, client_ip);
-            }
+        {
+            self.emit_http_request_log(method.as_str(), path, resp.status, dur_ms, client_ip);
         }
         resp
     }
@@ -3557,17 +3578,17 @@ impl HttpState {
 
         // Static file serving from optional web/ SPA directory.
         // Only serve for GET requests on non-API paths (legacy Python: _is_api_path check).
-        if let Some(ref web_root) = self.web_root {
-            if matches!(req.method, Http1Method::Get) && !self.path_allowed(path) {
-                if let Some((content_type, body)) = web_root.serve(path) {
-                    let mut resp = self.raw_response(req, 200, content_type, body);
-                    resp.headers.push((
-                        "cache-control".to_string(),
-                        "no-store, no-cache, must-revalidate".to_string(),
-                    ));
-                    return Some(resp);
-                }
-            }
+        if let Some(ref web_root) = self.web_root
+            && matches!(req.method, Http1Method::Get)
+            && !self.path_allowed(path)
+            && let Some((content_type, body)) = web_root.serve(path)
+        {
+            let mut resp = self.raw_response(req, 200, content_type, body);
+            resp.headers.push((
+                "cache-control".to_string(),
+                "no-store, no-cache, must-revalidate".to_string(),
+            ));
+            return Some(resp);
         }
 
         None
@@ -3581,10 +3602,10 @@ impl HttpState {
         if path == "/mail/archive/time-travel/snapshot" {
             return true;
         }
-        if let Some(rest) = path.strip_prefix("/mail/archive/browser/") {
-            if let Some((project_slug, tail)) = rest.split_once('/') {
-                return !project_slug.is_empty() && tail == "file";
-            }
+        if let Some(rest) = path.strip_prefix("/mail/archive/browser/")
+            && let Some((project_slug, tail)) = rest.split_once('/')
+        {
+            return !project_slug.is_empty() && tail == "file";
         }
         false
     }
@@ -3651,10 +3672,10 @@ impl HttpState {
         // Dev convenience: accept `/api/*` and `/mcp/*` interchangeably so different
         // MCP clients can talk to the same server without an extra HTTP_PATH export.
         // Only applies to the root bases (/api or /mcp); nested bases keep strict semantics.
-        if let Some(alias_no_slash) = mcp_base_alias_no_slash(&base_no_slash) {
-            if path_matches_base(path, alias_no_slash) {
-                return true;
-            }
+        if let Some(alias_no_slash) = mcp_base_alias_no_slash(&base_no_slash)
+            && path_matches_base(path, alias_no_slash)
+        {
+            return true;
         }
 
         false
@@ -3971,15 +3992,14 @@ impl HttpState {
         let redis = self.rate_limit_redis_client(&cx).await;
         let has_redis = redis.is_some();
 
-        if let Some(redis) = redis {
-            if let Ok(allowed) =
+        if let Some(redis) = redis
+            && let Ok(allowed) =
                 consume_rate_limit_redis(&cx, &redis, key, per_minute, burst, now).await
-            {
-                return allowed;
-            }
-            // Legacy parity: if Redis is configured, periodic cleanup is disabled even when
-            // a specific Redis call fails and we fall back to memory.
+        {
+            return allowed;
         }
+        // Legacy parity: if Redis is configured, periodic cleanup is disabled even when
+        // a specific Redis call fails and we fall back to memory.
 
         self.rate_limiter
             .allow_memory(key, per_minute, burst, now, !has_redis)
@@ -4095,10 +4115,10 @@ impl HttpState {
             "tools/call" => {
                 let mut params: fastmcp_protocol::CallToolParams = parse_params(request.params)?;
                 let tool_name = params.name.clone();
-                if tool_name == "send_message" {
-                    if let Some(arguments) = params.arguments.as_mut() {
-                        mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
-                    }
+                if tool_name == "send_message"
+                    && let Some(arguments) = params.arguments.as_mut()
+                {
+                    mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
                 }
                 // Extract format param before dispatch (TOON support)
                 let format_value = params
@@ -4467,10 +4487,10 @@ impl HttpState {
 fn extract_format_from_uri(uri: &str) -> Option<String> {
     let query = uri.split_once('?').map(|(_, q)| q)?;
     for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == "format" {
-                return Some(value.to_string());
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == "format"
+        {
+            return Some(value.to_string());
         }
     }
     None
@@ -4479,12 +4499,11 @@ fn extract_format_from_uri(uri: &str) -> Option<String> {
 fn extract_arg_str(arguments: Option<&serde_json::Value>, keys: &[&str]) -> Option<String> {
     let args = arguments?.as_object()?;
     for key in keys {
-        if let Some(value) = args.get(*key) {
-            if let Some(s) = value.as_str() {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
-            }
+        if let Some(value) = args.get(*key)
+            && let Some(s) = value.as_str()
+            && !s.is_empty()
+        {
+            return Some(s.to_string());
         }
     }
     None
@@ -4502,10 +4521,9 @@ fn parse_call_tool_result_payload(call_result: &serde_json::Value) -> Option<ser
     if let Some(structured) = call_result
         .get("structuredContent")
         .or_else(|| call_result.get("structured_content"))
+        && !structured.is_null()
     {
-        if !structured.is_null() {
-            return Some(structured.clone());
-        }
+        return Some(structured.clone());
     }
 
     let blocks = call_result.get("content")?.as_array()?;
@@ -4534,10 +4552,10 @@ fn parse_text_payload_json(text: &str) -> Option<serde_json::Value> {
             continue;
         }
         if let Ok(payload) = serde_json::from_str::<serde_json::Value>(candidate) {
-            if let serde_json::Value::String(inner) = &payload {
-                if let Ok(unwrapped) = serde_json::from_str::<serde_json::Value>(inner.trim()) {
-                    return Some(unwrapped);
-                }
+            if let serde_json::Value::String(inner) = &payload
+                && let Ok(unwrapped) = serde_json::from_str::<serde_json::Value>(inner.trim())
+            {
+                return Some(unwrapped);
             }
             return Some(payload);
         }
@@ -5221,10 +5239,9 @@ fn apply_toon_to_content(
         // Apply TOON format wrapping
         if let Ok(Some(envelope)) =
             mcp_agent_mail_core::toon::apply_toon_format(&payload, Some(format_value), config)
+            && let Ok(envelope_json) = serde_json::to_string(&envelope)
         {
-            if let Ok(envelope_json) = serde_json::to_string(&envelope) {
-                block["text"] = serde_json::Value::String(envelope_json);
-            }
+            block["text"] = serde_json::Value::String(envelope_json);
         }
     }
 }
@@ -5307,10 +5324,10 @@ impl std::fmt::Display for RequestKind {
 
 fn classify_request(req: &JsonRpcRequest) -> (RequestKind, Option<String>) {
     if req.method == "tools/call" {
-        if let Some(params) = req.params.as_ref() {
-            if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
-                return (RequestKind::Tools, Some(name.to_string()));
-            }
+        if let Some(params) = req.params.as_ref()
+            && let Some(name) = params.get("name").and_then(|v| v.as_str())
+        {
+            return (RequestKind::Tools, Some(name.to_string()));
         }
         return (RequestKind::Tools, None);
     }

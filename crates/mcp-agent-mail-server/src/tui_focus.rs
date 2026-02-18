@@ -35,7 +35,6 @@
 //! ```
 
 use ftui::{Style, layout::Rect};
-use ftui_extras::theme;
 
 #[cfg(test)]
 use crate::tui_screens::ALL_SCREEN_IDS;
@@ -917,10 +916,10 @@ impl FocusManager {
         }
 
         self.ring_index = 0;
-        if self.context == FocusContext::Screen {
-            if let Some(&first) = self.focus_ring.first() {
-                self.current = first;
-            }
+        if self.context == FocusContext::Screen
+            && let Some(&first) = self.focus_ring.first()
+        {
+            self.current = first;
         }
     }
 
@@ -1056,29 +1055,29 @@ impl FocusManager {
 /// Uses the current theme's accent color with optional bold/underline.
 #[must_use]
 pub fn focus_style() -> Style {
-    let p = theme::current_palette();
-    Style::default().fg(p.accent_primary).bold()
+    let p = crate::tui_theme::TuiThemePalette::current();
+    Style::default().fg(p.panel_border_focused).bold()
 }
 
 /// Style for a focused text input (search bar, filter, etc.).
 #[must_use]
 pub fn focus_input_style() -> Style {
-    let p = theme::current_palette();
-    Style::default().fg(p.fg_primary).bg(p.bg_highlight)
+    let p = crate::tui_theme::TuiThemePalette::current();
+    Style::default().fg(p.selection_fg).bg(p.selection_bg)
 }
 
 /// Style for a focused list item.
 #[must_use]
 pub fn focus_list_style() -> Style {
-    let p = theme::current_palette();
-    Style::default().fg(p.fg_primary).bg(p.bg_surface).bold()
+    let p = crate::tui_theme::TuiThemePalette::current();
+    Style::default().fg(p.text_primary).bg(p.bg_surface).bold()
 }
 
 /// Style for the focus indicator border.
 #[must_use]
 pub fn focus_border_style() -> Style {
-    let p = theme::current_palette();
-    Style::default().fg(p.accent_primary)
+    let p = crate::tui_theme::TuiThemePalette::current();
+    Style::default().fg(p.panel_border_focused)
 }
 
 /// Get the focus indicator character (used in margins/borders).

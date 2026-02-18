@@ -403,9 +403,9 @@ mod tests {
 
         let results = vec![
             make("10", 0.9),
-            make("bad", 0.5),     // invalid — skipped
+            make("bad", 0.5), // invalid — skipped
             make("20", 0.8),
-            make("", 0.1),        // invalid — skipped
+            make("", 0.1), // invalid — skipped
             make("30", 0.7),
         ];
         let converted = from_fs_scored_results(&results);
@@ -631,6 +631,9 @@ mod tests {
         assert_eq!(FsEmbedder::id(&adapter), "trait-stub");
         assert_eq!(FsEmbedder::model_name(&adapter), "trait-stub");
         assert!(FsEmbedder::is_semantic(&adapter));
-        assert_eq!(FsEmbedder::category(&adapter), FsModelCategory::StaticEmbedder);
+        assert_eq!(
+            FsEmbedder::category(&adapter),
+            FsModelCategory::StaticEmbedder
+        );
     }
 }

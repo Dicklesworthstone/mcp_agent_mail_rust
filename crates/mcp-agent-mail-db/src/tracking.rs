@@ -1141,7 +1141,10 @@ mod tests {
         let t = query_timer();
         let us1 = elapsed_us(t);
         let us2 = elapsed_us(t);
-        assert!(us2 >= us1, "elapsed_us should be monotonically non-decreasing");
+        assert!(
+            us2 >= us1,
+            "elapsed_us should be monotonically non-decreasing"
+        );
     }
 
     #[test]
@@ -1151,7 +1154,10 @@ mod tests {
         let _enabled = gt.is_enabled();
         // Calling it twice should return the same pointer
         let gt2 = global_tracker();
-        assert!(std::ptr::eq(gt, gt2), "global_tracker should return the same static reference");
+        assert!(
+            std::ptr::eq(gt, gt2),
+            "global_tracker should return the same static reference"
+        );
     }
 
     #[test]
@@ -1185,7 +1191,8 @@ mod tests {
         record_query("INSERT INTO agents (name) VALUES ('test')", 500);
 
         assert_eq!(
-            local.snapshot().total, 1,
+            local.snapshot().total,
+            1,
             "record_query should route to active tracker"
         );
     }

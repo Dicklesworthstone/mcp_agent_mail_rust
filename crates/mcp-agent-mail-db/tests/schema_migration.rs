@@ -1345,12 +1345,11 @@ fn schema_migrations_count_is_consistent() {
     // CREATE_FTS_TRIGGERS_SQL processing order.
     let mut version_set = std::collections::BTreeSet::new();
     for m in &migrations {
-        if let Some(v_str) = m.id.strip_prefix('v') {
-            if let Some(num_str) = v_str.split('_').next() {
-                if let Ok(v) = num_str.parse::<u32>() {
-                    version_set.insert(v);
-                }
-            }
+        if let Some(v_str) = m.id.strip_prefix('v')
+            && let Some(num_str) = v_str.split('_').next()
+            && let Ok(v) = num_str.parse::<u32>()
+        {
+            version_set.insert(v);
         }
     }
     for expected_v in 1..=8 {

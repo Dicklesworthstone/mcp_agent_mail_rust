@@ -792,18 +792,18 @@ impl Drop for SystemHealthScreen {
 
 impl MailScreen for SystemHealthScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                match key.code {
-                    KeyCode::Char('r') => self.request_refresh(),
-                    KeyCode::Char('v') => {
-                        self.view_mode = match self.view_mode {
-                            ViewMode::Text => ViewMode::Dashboard,
-                            ViewMode::Dashboard => ViewMode::Text,
-                        };
-                    }
-                    _ => {}
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('r') => self.request_refresh(),
+                KeyCode::Char('v') => {
+                    self.view_mode = match self.view_mode {
+                        ViewMode::Text => ViewMode::Dashboard,
+                        ViewMode::Dashboard => ViewMode::Text,
+                    };
                 }
+                _ => {}
             }
         }
         Cmd::None

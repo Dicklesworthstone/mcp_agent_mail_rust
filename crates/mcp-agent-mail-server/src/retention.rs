@@ -334,12 +334,11 @@ fn count_old_files_recursive(dir: &Path, cutoff: std::time::SystemTime) -> u64 {
 
             let p = entry.path();
             if ft.is_file() {
-                if let Ok(metadata) = p.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified < cutoff {
-                            count += 1;
-                        }
-                    }
+                if let Ok(metadata) = p.metadata()
+                    && let Ok(modified) = metadata.modified()
+                    && modified < cutoff
+                {
+                    count += 1;
                 }
             } else if ft.is_dir() {
                 count += count_old_files_recursive(&p, cutoff);

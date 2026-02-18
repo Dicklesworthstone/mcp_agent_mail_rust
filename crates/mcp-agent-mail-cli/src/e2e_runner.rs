@@ -115,29 +115,30 @@ impl SuiteRegistry {
             let path = entry.path();
 
             // Only consider test_*.sh files
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("test_") && name.ends_with(".sh") {
-                    let suite_name = name
-                        .strip_prefix("test_")
-                        .unwrap()
-                        .strip_suffix(".sh")
-                        .unwrap()
-                        .to_string();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with("test_")
+                && name.ends_with(".sh")
+            {
+                let suite_name = name
+                    .strip_prefix("test_")
+                    .unwrap()
+                    .strip_suffix(".sh")
+                    .unwrap()
+                    .to_string();
 
-                    let (description, tags) = Self::extract_metadata(&path);
-                    let duration_class = Self::classify_duration(&suite_name, &tags);
+                let (description, tags) = Self::extract_metadata(&path);
+                let duration_class = Self::classify_duration(&suite_name, &tags);
 
-                    self.suites.insert(
-                        suite_name.clone(),
-                        Suite {
-                            name: suite_name,
-                            script_path: path,
-                            description,
-                            tags,
-                            duration_class,
-                        },
-                    );
-                }
+                self.suites.insert(
+                    suite_name.clone(),
+                    Suite {
+                        name: suite_name,
+                        script_path: path,
+                        description,
+                        tags,
+                        duration_class,
+                    },
+                );
             }
         }
 
@@ -1643,23 +1644,22 @@ impl Runner {
                 for (i, word) in words.iter().enumerate() {
                     let word_lower = word.to_lowercase();
                     if word_lower == "pass:" {
-                        if let Some(num) = words.get(i + 1) {
-                            if let Ok(n) = num.parse::<u32>() {
-                                passed = n;
-                            }
+                        if let Some(num) = words.get(i + 1)
+                            && let Ok(n) = num.parse::<u32>()
+                        {
+                            passed = n;
                         }
                     } else if word_lower == "fail:" {
-                        if let Some(num) = words.get(i + 1) {
-                            if let Ok(n) = num.parse::<u32>() {
-                                failed = n;
-                            }
+                        if let Some(num) = words.get(i + 1)
+                            && let Ok(n) = num.parse::<u32>()
+                        {
+                            failed = n;
                         }
-                    } else if word_lower == "skip:" {
-                        if let Some(num) = words.get(i + 1) {
-                            if let Ok(n) = num.parse::<u32>() {
-                                skipped = n;
-                            }
-                        }
+                    } else if word_lower == "skip:"
+                        && let Some(num) = words.get(i + 1)
+                        && let Ok(n) = num.parse::<u32>()
+                    {
+                        skipped = n;
                     }
                 }
             }

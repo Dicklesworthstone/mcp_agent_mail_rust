@@ -2925,9 +2925,7 @@ fn handle_list_projects_with_database_url(
             "created_at": mcp_agent_mail_db::timestamps::micros_to_iso(created_at),
         });
 
-        if include_agents
-            && let Some(agent_list) = agents_by_project.get(&id)
-        {
+        if include_agents && let Some(agent_list) = agents_by_project.get(&id) {
             let agents_json: Vec<serde_json::Value> = agent_list
                 .iter()
                 .map(|(name, program, model)| {
@@ -3150,9 +3148,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             };
 
             // Save token to .env (unless dry-run)
-            if !dry_run
-                && let Err(e) = setup::save_token_to_env_file(&env_file, &resolved_token)
-            {
+            if !dry_run && let Err(e) = setup::save_token_to_env_file(&env_file, &resolved_token) {
                 output::warn(&format!("Could not save token to .env: {e}"));
             }
 
@@ -14206,7 +14202,9 @@ mod tests {
 
     #[test]
     fn integration_migrate_and_list_projects_json() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -14229,7 +14227,9 @@ mod tests {
 
     #[test]
     fn integration_doctor_check_on_fresh_db() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -14251,7 +14251,9 @@ mod tests {
 
     #[test]
     fn integration_doctor_check_reports_installed_agents_probe() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -14275,7 +14277,9 @@ mod tests {
 
     #[test]
     fn integration_doctor_check_reports_beads_issue_awareness_probe() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -14496,7 +14500,9 @@ mod tests {
 
     #[test]
     fn handle_beads_status_on_fresh_db() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
@@ -14519,7 +14525,9 @@ mod tests {
 
     #[test]
     fn handle_beads_ready_on_fresh_db_shows_empty() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
@@ -14539,7 +14547,9 @@ mod tests {
 
     #[test]
     fn integration_doctor_backups_empty_dir() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
@@ -14555,7 +14565,9 @@ mod tests {
 
     #[test]
     fn integration_config_show_port_returns_ok() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let capture = ftui_runtime::StdioCapture::install().unwrap();
         let result = handle_config(ConfigCommand::ShowPort);
         let output = capture.drain_to_string();
@@ -14569,7 +14581,9 @@ mod tests {
 
     #[test]
     fn integration_config_set_port_to_file() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let env_file = dir.path().join(".env");
         let result = handle_config(ConfigCommand::SetPort {
@@ -14736,7 +14750,9 @@ mod tests {
 
     #[test]
     fn integration_acks_pending_shows_unacked_messages() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14761,7 +14777,9 @@ mod tests {
 
     #[test]
     fn integration_acks_pending_empty_when_no_acks() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14786,7 +14804,9 @@ mod tests {
 
     #[test]
     fn integration_acks_overdue_finds_old_messages() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14813,7 +14833,9 @@ mod tests {
 
     #[test]
     fn integration_list_acks_shows_ack_required_messages() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14830,7 +14852,9 @@ mod tests {
 
     #[test]
     fn integration_list_acks_empty_for_nonexistent_agent() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14847,7 +14871,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_list_shows_active() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14871,7 +14897,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_active_shows_active() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14897,7 +14925,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_empty_project() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14921,7 +14951,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_reserve_creates_entries() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14961,7 +14993,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_reserve_detects_conflicts() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -14990,7 +15024,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_renew_extends_ttl() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15032,7 +15068,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_release_sets_released_ts() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15067,7 +15105,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_conflicts_detects_overlap() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15090,7 +15130,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_conflicts_no_overlap() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15113,7 +15155,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_reserve_invalid_project() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15135,7 +15179,9 @@ mod tests {
 
     #[test]
     fn integration_file_reservations_reserve_invalid_agent() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15157,7 +15203,9 @@ mod tests {
 
     #[test]
     fn integration_acks_remind_finds_stale() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -15279,7 +15327,9 @@ mod tests {
 
     #[test]
     fn integration_mail_status_shows_counts() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let project_path = "/tmp/mail-status-test-proj";
@@ -15307,7 +15357,9 @@ mod tests {
 
     #[test]
     fn integration_mail_status_empty_project() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         // Seed with one project path, then query with a different one
@@ -15335,7 +15387,9 @@ mod tests {
 
     #[test]
     fn integration_projects_mark_identity_writes_marker_file() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let result = handle_project_mark_identity(dir.path(), false);
         assert!(result.is_ok(), "mark-identity failed: {result:?}");
@@ -15351,7 +15405,9 @@ mod tests {
 
     #[test]
     fn integration_projects_discovery_init_writes_yaml() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let result = handle_project_discovery_init(dir.path(), Some("prod-alpha".to_string()));
         assert!(result.is_ok(), "discovery-init failed: {result:?}");
@@ -15487,7 +15543,9 @@ mod tests {
 
     #[test]
     fn integration_projects_adopt_apply_rekeys_and_moves_archive() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
@@ -16482,7 +16540,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_request_creates_link() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16519,7 +16579,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_respond_approve() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16570,7 +16632,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_respond_reject() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16620,7 +16684,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_list_json() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16663,7 +16729,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_list_empty() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16688,7 +16756,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_policy_set() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16722,7 +16792,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_policy_invalid() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16740,7 +16812,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_request_invalid_project() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16760,7 +16834,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_request_invalid_agent() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -16780,7 +16856,9 @@ mod tests {
 
     #[test]
     fn integration_contacts_request_upsert() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let conn = seed_acks_and_reservations_db(&db_path);
@@ -17004,8 +17082,10 @@ mod tests {
                 // The error should surface as a database error, NOT as
                 // "ensure_project failed" (the old misleading path).
                 assert!(
-                    err_msg.contains("database error") || err_msg.contains("not a database")
-                        || err_msg.contains("corrupt") || err_msg.contains("malformed")
+                    err_msg.contains("database error")
+                        || err_msg.contains("not a database")
+                        || err_msg.contains("corrupt")
+                        || err_msg.contains("malformed")
                         || err_msg.contains("project not found"),
                     "error should indicate DB issue, got: {err_msg}"
                 );
@@ -17014,7 +17094,8 @@ mod tests {
                 // Pool failed to create — that's also acceptable for a corrupt DB.
                 let err_msg = format!("{e}");
                 assert!(
-                    err_msg.contains("database") || err_msg.contains("sqlite")
+                    err_msg.contains("database")
+                        || err_msg.contains("sqlite")
                         || err_msg.contains("not a database"),
                     "pool creation error should mention database, got: {err_msg}"
                 );
@@ -17054,10 +17135,7 @@ mod tests {
         let result = block_on_async(|cx| async move {
             resolve_project_async(&cx, &pool, "nonexistent-project").await
         });
-        assert!(
-            result.is_err(),
-            "unknown relative path should return error"
-        );
+        assert!(result.is_err(), "unknown relative path should return error");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
             err_msg.contains("project not found"),
@@ -17088,7 +17166,9 @@ mod tests {
 
     #[test]
     fn doctor_check_healthy_db_reports_db_file_sanity_and_pool_init_ok() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("healthy.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -17147,7 +17227,9 @@ mod tests {
 
     #[test]
     fn doctor_check_zero_byte_db_reports_db_file_sanity_fail() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("empty.sqlite3");
 
@@ -17191,13 +17273,18 @@ mod tests {
 
     #[test]
     fn doctor_check_corrupt_db_reports_pool_init_fail() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("corrupt.sqlite3");
 
         // Write garbage bytes to create a corrupt DB file (non-zero but invalid)
-        std::fs::write(&db_path, b"THIS IS NOT A SQLITE FILE AT ALL - GARBAGE DATA HERE!")
-            .expect("write corrupt file");
+        std::fs::write(
+            &db_path,
+            b"THIS IS NOT A SQLITE FILE AT ALL - GARBAGE DATA HERE!",
+        )
+        .expect("write corrupt file");
 
         let db_url = format!("sqlite:///{}", db_path.display());
 
@@ -17224,7 +17311,9 @@ mod tests {
 
     #[test]
     fn doctor_repair_creates_valid_bak_sibling_file() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("repair_test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -17248,20 +17337,21 @@ mod tests {
 
         // Run doctor repair (not dry_run)
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result =
-            handle_doctor_repair_with(&db_url, &backup_dir, None, false, false);
+        let result = handle_doctor_repair_with(&db_url, &backup_dir, None, false, false);
         assert!(result.is_ok(), "repair failed: {result:?}");
 
         // Verify .bak sibling exists
         let bak_path = format!("{}.bak", db_path.display());
         let bak = std::path::Path::new(&bak_path);
         assert!(bak.exists(), ".bak sibling should exist at {bak_path}");
-        assert!(bak.metadata().unwrap().len() > 0, ".bak should be non-empty");
+        assert!(
+            bak.metadata().unwrap().len() > 0,
+            ".bak should be non-empty"
+        );
 
         // Verify .bak is a valid SQLite DB with same data
-        let bak_conn =
-            mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&bak_path)
-                .expect("open .bak");
+        let bak_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&bak_path)
+            .expect("open .bak");
         let rows = bak_conn
             .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
             .expect("query projects in .bak");
@@ -17297,7 +17387,9 @@ mod tests {
 
     #[test]
     fn doctor_repair_bak_found_by_pool_backup_candidates() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pool_test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -17314,22 +17406,16 @@ mod tests {
         drop(conn);
 
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_repair_with(&db_url, &backup_dir, None, false, false)
-            .expect("repair");
+        handle_doctor_repair_with(&db_url, &backup_dir, None, false, false).expect("repair");
 
         // Verify the .bak is a valid DB that passes quick_check
         let bak_path = format!("{}.bak", db_path.display());
-        let bak_conn =
-            mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&bak_path)
-                .expect("open .bak");
+        let bak_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&bak_path)
+            .expect("open .bak");
         let qc_rows = bak_conn
             .query_sync("PRAGMA quick_check", &[])
             .expect("quick_check");
-        let qc_result: String = qc_rows
-            .first()
-            .unwrap()
-            .get_named("quick_check")
-            .unwrap();
+        let qc_result: String = qc_rows.first().unwrap().get_named("quick_check").unwrap();
         assert_eq!(qc_result, "ok", ".bak should pass quick_check");
 
         // The .bak file uses the naming convention expected by
@@ -17345,7 +17431,9 @@ mod tests {
 
     #[test]
     fn doctor_repair_gracefully_handles_bak_creation_failure() {
-        let _guard = stdio_capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("readonly_test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -17361,8 +17449,7 @@ mod tests {
         std::fs::create_dir_all(&bak_path).expect("create .bak as directory");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result =
-            handle_doctor_repair_with(&db_url, &backup_dir, None, false, false);
+        let result = handle_doctor_repair_with(&db_url, &backup_dir, None, false, false);
         let output = capture.drain_to_string();
 
         // Repair should still complete (non-fatal .bak failure)
@@ -17750,9 +17837,7 @@ fn handle_am_run_with(
                 false
             };
 
-            if !server_released
-                && let Some(path) = lease_path_opt.as_ref()
-            {
+            if !server_released && let Some(path) = lease_path_opt.as_ref() {
                 let now = Utc::now().to_rfc3339();
                 if let Some(mut lease) = read_lease(path) {
                     lease.released_ts = Some(now.clone());
