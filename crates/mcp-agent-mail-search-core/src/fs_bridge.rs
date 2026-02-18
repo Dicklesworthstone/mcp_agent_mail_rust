@@ -379,4 +379,258 @@ mod tests {
         };
         assert!(from_fs_scored_result(&fs_result).is_none());
     }
+
+    // ── Batch conversion (from_fs_scored_results) ─────────────────────
+
+    #[test]
+    fn batch_scored_results_skips_invalid() {
+        use frankensearch::core::types::ScoreSource;
+
+        fn make(id: &str, score: f32) -> FsScoredResult {
+            FsScoredResult {
+                doc_id: id.to_string(),
+                score,
+                source: ScoreSource::SemanticFast,
+                index: None,
+                fast_score: Some(score),
+                quality_score: None,
+                lexical_score: None,
+                rerank_score: None,
+                explanation: None,
+                metadata: None,
+            }
+        }
+
+        let results = vec![
+            make("10", 0.9),
+            make("bad", 0.5),     // invalid — skipped
+            make("20", 0.8),
+            make("", 0.1),        // invalid — skipped
+            make("30", 0.7),
+        ];
+        let converted = from_fs_scored_results(&results);
+        assert_eq!(converted.len(), 3);
+        assert_eq!(converted[0].doc_id, 10);
+        assert_eq!(converted[1].doc_id, 20);
+        assert_eq!(converted[2].doc_id, 30);
+    }
+
+    #[test]
+    fn batch_scored_results_empty_input() {
+        let converted = from_fs_scored_results(&[]);
+        assert!(converted.is_empty());
+    }
+
+    // ── Doc ID boundary values ────────────────────────────────────────
+
+    #[test]
+    fn doc_id_zero() {
+        assert_eq!(doc_id_to_string(0), "0");
+        assert_eq!(doc_id_from_string("0"), Some(0));
+    }
+
+    #[test]
+    fn doc_id_u64_max() {
+        let max = u64::MAX;
+        let s = doc_id_to_string(max);
+        assert_eq!(s, "18446744073709551615");
+        assert_eq!(doc_id_from_string(&s), Some(max));
+    }
+
+    #[test]
+    fn doc_id_negative_string_returns_none() {
+        assert_eq!(doc_id_from_string("-1"), None);
+    }
+
+    #[test]
+    fn doc_id_overflow_string_returns_none() {
+        // u64::MAX + 1
+        assert_eq!(doc_id_from_string("18446744073709551616"), None);
+    }
+
+    // ── Config edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn config_quality_weight_precision_loss() {
+        // f64 → f32 → f64 may lose precision
+        let fs_config = FsTwoTierConfig {
+            quality_weight: 0.123_456_789_012_345_6_f64,
+            fast_only: false,
+            ..FsTwoTierConfig::default()
+        };
+        let domain = from_fs_config(&fs_config);
+        // f32 preserves ~7 significant digits
+        assert!((domain.quality_weight - 0.123_456_79).abs() < 1e-7);
+    }
+
+    #[test]
+    fn config_fast_only_false_roundtrip() {
+        let config = crate::two_tier::TwoTierConfig {
+            quality_weight: 0.5,
+            fast_only: false,
+            ..crate::two_tier::TwoTierConfig::default()
+        };
+        let fs = to_fs_config(&config);
+        assert!(!fs.fast_only);
+        let back = from_fs_config(&fs);
+        assert!(!back.fast_only);
+    }
+
+    // ── map_fs_error ──────────────────────────────────────────────────
+
+    #[test]
+    fn map_fs_error_model_not_found() {
+        let err = frankensearch::SearchError::ModelNotFound {
+            name: "bge-m3".to_string(),
+        };
+        let mapped = map_fs_error(err);
+        match mapped {
+            crate::error::SearchError::ModeUnavailable(msg) => {
+                assert!(msg.contains("bge-m3"));
+            }
+            other => panic!("expected ModeUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_fs_error_model_load_failed() {
+        let err = frankensearch::SearchError::ModelLoadFailed {
+            path: std::path::PathBuf::from("/models/bad.onnx"),
+            source: Box::new(std::io::Error::other("corrupt")),
+        };
+        let mapped = map_fs_error(err);
+        match mapped {
+            crate::error::SearchError::Internal(msg) => {
+                assert!(msg.contains("/models/bad.onnx"));
+                assert!(msg.contains("corrupt"));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_fs_error_embedding_failed() {
+        let err = frankensearch::SearchError::EmbeddingFailed {
+            model: "model2vec".to_string(),
+            source: Box::new(std::io::Error::other("OOM")),
+        };
+        let mapped = map_fs_error(err);
+        match mapped {
+            crate::error::SearchError::Internal(msg) => {
+                assert!(msg.contains("model2vec"));
+                assert!(msg.contains("OOM"));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_fs_error_cancelled() {
+        let err = frankensearch::SearchError::Cancelled {
+            phase: "embed_quality".to_string(),
+            reason: "budget exhausted".to_string(),
+        };
+        let mapped = map_fs_error(err);
+        match mapped {
+            crate::error::SearchError::Timeout(msg) => {
+                assert!(msg.contains("embed_quality"));
+                assert!(msg.contains("budget exhausted"));
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_fs_error_other_variant_falls_through() {
+        // Use a variant not explicitly matched (e.g., IndexCorrupted)
+        let err = frankensearch::SearchError::IndexCorrupted {
+            path: std::path::PathBuf::from("/idx"),
+            detail: "bad CRC".to_string(),
+        };
+        let mapped = map_fs_error(err);
+        match mapped {
+            crate::error::SearchError::Internal(msg) => {
+                assert!(!msg.is_empty());
+            }
+            other => panic!("expected Internal from catch-all, got {other:?}"),
+        }
+    }
+
+    // ── SyncEmbedderAdapter ───────────────────────────────────────────
+
+    /// Minimal `TwoTierEmbedder` impl for testing the adapter.
+    struct StubEmbedder {
+        dim: usize,
+        name: String,
+    }
+
+    impl StubEmbedder {
+        fn new(name: &str, dim: usize) -> Self {
+            Self {
+                dim,
+                name: name.to_string(),
+            }
+        }
+    }
+
+    impl crate::two_tier::TwoTierEmbedder for StubEmbedder {
+        fn embed(&self, _text: &str) -> crate::error::SearchResult<Vec<f32>> {
+            Ok(vec![0.0; self.dim])
+        }
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+        fn id(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[test]
+    fn adapter_fast_constructor() {
+        let emb = Arc::new(StubEmbedder::new("fast-stub", 64));
+        let adapter = SyncEmbedderAdapter::fast(emb);
+        assert!(adapter.is_semantic);
+        assert_eq!(adapter.category, FsModelCategory::StaticEmbedder);
+        assert_eq!(adapter.model_name, "fast-stub");
+    }
+
+    #[test]
+    fn adapter_quality_constructor() {
+        let emb = Arc::new(StubEmbedder::new("quality-stub", 384));
+        let adapter = SyncEmbedderAdapter::quality(emb);
+        assert!(adapter.is_semantic);
+        assert_eq!(adapter.category, FsModelCategory::TransformerEmbedder);
+        assert_eq!(adapter.model_name, "quality-stub");
+    }
+
+    #[test]
+    fn adapter_hash_constructor() {
+        let emb = Arc::new(StubEmbedder::new("hash-stub", 128));
+        let adapter = SyncEmbedderAdapter::hash(emb);
+        assert!(!adapter.is_semantic);
+        assert_eq!(adapter.category, FsModelCategory::HashEmbedder);
+        assert_eq!(adapter.model_name, "hash-stub");
+    }
+
+    #[test]
+    fn adapter_debug_format() {
+        let emb = Arc::new(StubEmbedder::new("dbg-stub", 32));
+        let adapter = SyncEmbedderAdapter::fast(emb);
+        let debug = format!("{adapter:?}");
+        assert!(debug.contains("SyncEmbedderAdapter"));
+        assert!(debug.contains("dbg-stub"));
+        assert!(debug.contains("32")); // dimension
+    }
+
+    #[test]
+    fn adapter_embedder_trait_methods() {
+        let emb = Arc::new(StubEmbedder::new("trait-stub", 16));
+        let adapter = SyncEmbedderAdapter::new(emb, true, FsModelCategory::StaticEmbedder);
+        // FsEmbedder trait methods
+        assert_eq!(FsEmbedder::dimension(&adapter), 16);
+        assert_eq!(FsEmbedder::id(&adapter), "trait-stub");
+        assert_eq!(FsEmbedder::model_name(&adapter), "trait-stub");
+        assert!(FsEmbedder::is_semantic(&adapter));
+        assert_eq!(FsEmbedder::category(&adapter), FsModelCategory::StaticEmbedder);
+    }
 }

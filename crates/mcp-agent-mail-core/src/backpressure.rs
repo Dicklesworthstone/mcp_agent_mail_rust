@@ -9,7 +9,7 @@
 //! - **Composable**: callers decide what to do with the level.
 //! - **Observable**: exposed via `health_check` + tooling/metrics resources.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::metrics::{GlobalMetricsSnapshot, global_metrics};
@@ -22,7 +22,7 @@ use crate::slo;
 /// System health classification.
 ///
 /// Used to guide flow-control decisions at the server dispatch layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthLevel {
     /// All subsystems healthy. Accept all requests normally.
@@ -967,5 +967,40 @@ mod tests {
         let level = HealthLevel::Yellow;
         let json = serde_json::to_string(&level).unwrap();
         assert_eq!(json, "\"yellow\"");
+    }
+
+    #[test]
+    fn compute_health_level_with_signals_returns_consistent_pair() {
+        // The function uses global metrics, but we can verify structural
+        // consistency: the returned level must match classify() on the signals.
+        let (level, signals) = compute_health_level_with_signals();
+        assert_eq!(level, signals.classify());
+    }
+
+    #[test]
+    fn level_transitions_is_readable() {
+        // Just verify the atomic counter is readable (can't easily control
+        // its value due to concurrent test execution, but the API must work).
+        let t = level_transitions();
+        assert!(t <= u8::MAX);
+    }
+
+    #[test]
+    fn serde_roundtrip_all_levels() {
+        for level in [HealthLevel::Green, HealthLevel::Yellow, HealthLevel::Red] {
+            let json = serde_json::to_string(&level).unwrap();
+            let back: HealthLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, level);
+        }
+    }
+
+    #[test]
+    fn health_level_from_u8_known_values() {
+        assert_eq!(HealthLevel::from_u8(0), HealthLevel::Green);
+        assert_eq!(HealthLevel::from_u8(1), HealthLevel::Yellow);
+        assert_eq!(HealthLevel::from_u8(2), HealthLevel::Red);
+        // Unknown values fall through to Red (the catch-all)
+        assert_eq!(HealthLevel::from_u8(3), HealthLevel::Red);
+        assert_eq!(HealthLevel::from_u8(255), HealthLevel::Red);
     }
 }

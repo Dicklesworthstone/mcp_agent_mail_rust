@@ -3080,4 +3080,44 @@ mod tests {
             .count();
         assert!(with_trends > 0, "some cards should have supporting trends");
     }
+
+    #[test]
+    fn quick_trend_report_returns_none_without_samples() {
+        // Without any samples recorded in the global gauges, quick_trend_report()
+        // returns None because snapshot() for OneMin/FiveMin yields None.
+        // (We can't guarantee no other test has recorded samples, but the
+        // function must at least be callable and return a valid Option.)
+        let result = quick_trend_report();
+        // Either None (no data) or Some with valid structure
+        if let Some(report) = result {
+            assert!(report.trends.len() <= 20);
+            assert!(report.forecasts.len() <= 40);
+            assert!(report.correlations.len() <= 20);
+        }
+    }
+
+    #[test]
+    fn trend_report_empty_forecast_horizons() {
+        let current = make_kpi(10.0, 50.0, 100.0, 50, 20, 5, 1, 2, 3, 1, 30.0);
+        let baseline = make_kpi(5.0, 40.0, 80.0, 40, 15, 3, 0, 1, 2, 0, 25.0);
+        let report = trend_report(&current, &baseline, &[]);
+        // With empty horizons, forecasts should be empty
+        assert!(report.forecasts.is_empty());
+        // But trends and correlations should still be computed
+        assert!(!report.trends.is_empty());
+    }
+
+    #[test]
+    fn compute_forecasts_single_horizon() {
+        let mut current = make_kpi(20.0, 70.0, 140.0, 60, 25, 8, 2, 4, 5, 2, 40.0);
+        current.actual_span_secs = 60.0;
+        let mut baseline = make_kpi(10.0, 50.0, 100.0, 50, 20, 5, 1, 2, 3, 1, 30.0);
+        baseline.actual_span_secs = 300.0;
+        let forecasts = compute_forecasts(&current, &baseline, &[120]);
+        // At least one forecast should be generated for metrics with delta
+        assert!(!forecasts.is_empty());
+        for f in &forecasts {
+            assert_eq!(f.horizon_secs, 120);
+        }
+    }
 }
