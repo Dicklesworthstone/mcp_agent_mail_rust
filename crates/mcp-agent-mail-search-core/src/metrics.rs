@@ -647,7 +647,9 @@ mod tests {
                 Some(Arc::new(FixedEmbedder::new("quality", vec![1.0, 0.0]))),
                 config,
             );
-            assert!(searcher.search("hello", 1).next().is_some());
+            // Consume ALL phases so every span fires (fast + refinement).
+            let phase_count = searcher.search("hello", 1).count();
+            assert!(phase_count > 0);
         });
 
         let names = capture.names();

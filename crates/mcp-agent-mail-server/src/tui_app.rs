@@ -8484,25 +8484,41 @@ mod tests {
 
     #[test]
     fn ctrl_t_cycles_theme() {
+        // Hold both locks: ScopedThemeLock for ThemeId global, NAMED_THEME_TEST_LOCK
+        // for named-theme index. Acquire named lock first to avoid deadlock.
+        let _ng = crate::tui_theme::NAMED_THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::tui_theme::init_named_theme("default");
+        let _tg = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let mut model = test_model();
         let before = crate::tui_theme::current_theme_id();
+        assert_eq!(before, ThemeId::CyberpunkAurora);
         let ctrl_t = Event::Key(KeyEvent::new(KeyCode::Char('t')).with_modifiers(Modifiers::CTRL));
         let cmd = model.update(MailMsg::Terminal(ctrl_t));
         assert!(matches!(cmd, Cmd::None));
         let after = crate::tui_theme::current_theme_id();
         assert_ne!(before, after);
+        crate::tui_theme::init_named_theme("default");
     }
 
     #[test]
     fn shift_t_cycles_theme_when_not_in_text_mode() {
+        let _ng = crate::tui_theme::NAMED_THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::tui_theme::init_named_theme("default");
+        let _tg = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let mut model = test_model();
         let before = crate::tui_theme::current_theme_id();
+        assert_eq!(before, ThemeId::CyberpunkAurora);
         let shift_t =
             Event::Key(KeyEvent::new(KeyCode::Char('T')).with_modifiers(Modifiers::SHIFT));
         let cmd = model.update(MailMsg::Terminal(shift_t));
         assert!(matches!(cmd, Cmd::None));
         let after = crate::tui_theme::current_theme_id();
         assert_ne!(before, after);
+        crate::tui_theme::init_named_theme("default");
     }
 
     #[test]

@@ -103,6 +103,10 @@ pub fn set_named_theme(index: usize) -> (&'static str, &'static str, TuiThemePal
     (cfg, display, TuiThemePalette::from_config_name(cfg))
 }
 
+/// Mutex to serialize tests that mutate `ACTIVE_NAMED_THEME_INDEX`.
+#[cfg(test)]
+pub(crate) static NAMED_THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ──────────────────────────────────────────────────────────────────────
 // Spacing system
 // ──────────────────────────────────────────────────────────────────────
@@ -1491,6 +1495,13 @@ mod tests {
     use super::*;
     use ftui_extras::theme::ScopedThemeLock;
 
+    /// Acquire the named-theme lock (poison-resilient).
+    fn named_theme_guard() -> std::sync::MutexGuard<'static, ()> {
+        super::NAMED_THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn srgb_channel_to_linear(c: u8) -> f64 {
         let cs = f64::from(c) / 255.0;
         if cs <= 0.04045 {
@@ -1637,6 +1648,7 @@ mod tests {
 
     #[test]
     fn current_palette_matches_active_named_theme() {
+        let _g = named_theme_guard();
         init_named_theme("nord");
         let current = TuiThemePalette::current();
         let explicit = TuiThemePalette::nord();
@@ -2291,6 +2303,7 @@ mod tests {
 
     #[test]
     fn init_named_theme_sets_index() {
+        let _g = named_theme_guard();
         init_named_theme("dracula");
         assert_eq!(active_named_theme_index(), 2);
         assert_eq!(active_named_theme_config_name(), "dracula");
@@ -2300,6 +2313,7 @@ mod tests {
 
     #[test]
     fn cycle_named_theme_wraps() {
+        let _g = named_theme_guard();
         init_named_theme("default");
         assert_eq!(active_named_theme_index(), 0);
 
@@ -2325,6 +2339,7 @@ mod tests {
 
     #[test]
     fn set_named_theme_by_index() {
+        let _g = named_theme_guard();
         let (cfg, display, palette) = set_named_theme(3);
         assert_eq!(cfg, "nord");
         assert_eq!(display, "Nordic Frost");
@@ -2335,6 +2350,7 @@ mod tests {
 
     #[test]
     fn active_named_palette_matches_index() {
+        let _g = named_theme_guard();
         init_named_theme("gruvbox");
         let palette = active_named_palette();
         let direct = TuiThemePalette::for_theme(ThemeId::HighContrast);
@@ -2441,6 +2457,7 @@ mod tests {
     /// Theme cycling via `cycle_named_theme` completes in under 1ms.
     #[test]
     fn cycle_named_theme_sub_millisecond() {
+        let _g = named_theme_guard();
         init_named_theme("default");
         let start = std::time::Instant::now();
         for _ in 0..100 {
@@ -2513,6 +2530,7 @@ mod tests {
     /// `init_named_theme` with each valid config name sets the correct index.
     #[test]
     fn init_named_theme_all_config_names() {
+        let _g = named_theme_guard();
         for (expected_idx, (cfg_name, _)) in NAMED_THEMES.iter().enumerate() {
             init_named_theme(cfg_name);
             assert_eq!(
@@ -2527,6 +2545,7 @@ mod tests {
     /// Invalid config name falls back to index 0 (default) via `init_named_theme`.
     #[test]
     fn init_named_theme_invalid_falls_back() {
+        let _g = named_theme_guard();
         init_named_theme("nonexistent_theme");
         assert_eq!(active_named_theme_index(), 0);
         assert_eq!(active_named_theme_config_name(), "default");
@@ -2536,6 +2555,7 @@ mod tests {
     /// `TuiThemePalette::current()` updates after `cycle_named_theme`.
     #[test]
     fn current_updates_after_cycle() {
+        let _g = named_theme_guard();
         init_named_theme("default");
         let before = TuiThemePalette::current();
 
@@ -2557,6 +2577,7 @@ mod tests {
     /// `set_named_theme` wraps on out-of-bounds index.
     #[test]
     fn set_named_theme_wraps_on_overflow() {
+        let _g = named_theme_guard();
         let (cfg, _, _) = set_named_theme(NAMED_THEME_COUNT + 2);
         let expected_idx = (NAMED_THEME_COUNT + 2) % NAMED_THEME_COUNT;
         assert_eq!(

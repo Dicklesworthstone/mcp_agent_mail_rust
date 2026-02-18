@@ -1104,8 +1104,8 @@ mod tests {
 
     #[test]
     fn index_max_vectors_rejects_upsert_at_capacity() {
-        // Note: upsert checks capacity BEFORE checking for existing entries,
-        // so updating an existing entry also fails when at max_vectors.
+        // Upsert checks for existing entries first — updating in-place succeeds
+        // even at capacity. Only truly new entries are rejected.
         let mut index = VectorIndex::new(VectorIndexConfig {
             dimension: 3,
             max_vectors: 1,
@@ -1115,8 +1115,14 @@ mod tests {
         index
             .upsert(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
             .unwrap();
-        // Even updating existing entry fails at capacity
-        let result = index.upsert(make_entry(1, DocKind::Message, &[0.0, 1.0, 0.0]));
+        // Updating existing entry succeeds (in-place update, no capacity change)
+        index
+            .upsert(make_entry(1, DocKind::Message, &[0.0, 1.0, 0.0]))
+            .unwrap();
+        assert_eq!(index.len(), 1);
+
+        // But adding a genuinely new entry fails at capacity
+        let result = index.upsert(make_entry(2, DocKind::Message, &[0.0, 0.0, 1.0]));
         assert!(result.is_err());
         assert_eq!(index.len(), 1);
     }
