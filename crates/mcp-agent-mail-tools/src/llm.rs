@@ -631,20 +631,20 @@ pub fn merge_single_thread_summary(heuristic: &ThreadSummary, llm_json: &Value) 
     // total_messages, open_actions, done_actions
     //
     // Legacy Python overlays only on truthy values; for integers, that means non-zero.
-    if let Some(v) = llm_json.get("total_messages").and_then(Value::as_i64) {
-        if v != 0 {
-            result.total_messages = v;
-        }
+    if let Some(v) = llm_json.get("total_messages").and_then(Value::as_i64)
+        && v != 0
+    {
+        result.total_messages = v;
     }
-    if let Some(v) = llm_json.get("open_actions").and_then(Value::as_i64) {
-        if v != 0 {
-            result.open_actions = v;
-        }
+    if let Some(v) = llm_json.get("open_actions").and_then(Value::as_i64)
+        && v != 0
+    {
+        result.open_actions = v;
     }
-    if let Some(v) = llm_json.get("done_actions").and_then(Value::as_i64) {
-        if v != 0 {
-            result.done_actions = v;
-        }
+    if let Some(v) = llm_json.get("done_actions").and_then(Value::as_i64)
+        && v != 0
+    {
+        result.done_actions = v;
     }
 
     result
@@ -1376,5 +1376,138 @@ mod tests {
         // Only 8 threads included
         assert!(prompt.contains("T-7"));
         assert!(!prompt.contains("T-8"));
+    }
+
+    // -- system prompt format tests --
+
+    #[test]
+    fn single_thread_system_prompt_contains_required_keys() {
+        let prompt = single_thread_system_prompt();
+        for key in &[
+            "participants",
+            "key_points",
+            "action_items",
+            "mentions",
+            "code_references",
+            "total_messages",
+            "open_actions",
+            "done_actions",
+        ] {
+            assert!(
+                prompt.contains(key),
+                "single_thread_system_prompt missing key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_thread_system_prompt_contains_required_keys() {
+        let prompt = multi_thread_system_prompt();
+        for key in &[
+            "thread_id",
+            "key_points",
+            "actions",
+            "top_mentions",
+            "action_items",
+        ] {
+            assert!(
+                prompt.contains(key),
+                "multi_thread_system_prompt missing key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_thread_system_prompt_requests_json() {
+        let prompt = single_thread_system_prompt();
+        assert!(prompt.contains("JSON"), "should request JSON output");
+    }
+
+    #[test]
+    fn multi_thread_system_prompt_requests_json() {
+        let prompt = multi_thread_system_prompt();
+        assert!(prompt.contains("JSON"), "should request JSON output");
+    }
+
+    // -- single_thread_user_prompt edge cases --
+
+    #[test]
+    fn single_thread_user_prompt_empty_messages() {
+        let messages: Vec<(i64, String, String, String)> = vec![];
+        let prompt = single_thread_user_prompt(&messages);
+        assert!(prompt.starts_with("Summarize this thread:"));
+        // Should not contain any message separator
+        assert!(!prompt.contains("Message "));
+    }
+
+    #[test]
+    fn single_thread_user_prompt_includes_all_fields() {
+        let messages = vec![(
+            42,
+            "BlueLake".to_string(),
+            "Design review".to_string(),
+            "Let's review the API changes.".to_string(),
+        )];
+        let prompt = single_thread_user_prompt(&messages);
+        assert!(prompt.contains("Message 42 from BlueLake"));
+        assert!(prompt.contains("Subject: Design review"));
+        assert!(prompt.contains("Let's review the API changes."));
+    }
+
+    #[test]
+    fn single_thread_user_prompt_respects_max_messages() {
+        let messages: Vec<_> = (0..MAX_MESSAGES_FOR_LLM + 5)
+            .map(|i| {
+                (
+                    i as i64,
+                    "Agent".to_string(),
+                    "Subj".to_string(),
+                    "body".to_string(),
+                )
+            })
+            .collect();
+        let prompt = single_thread_user_prompt(&messages);
+        // Should contain the last included message
+        let last_included = MAX_MESSAGES_FOR_LLM - 1;
+        assert!(prompt.contains(&format!("Message {last_included}")));
+        // Should NOT contain the first excluded message
+        assert!(!prompt.contains(&format!("Message {}", MAX_MESSAGES_FOR_LLM)));
+    }
+
+    // -- multi_thread_user_prompt edge cases --
+
+    #[test]
+    fn multi_thread_user_prompt_empty_threads() {
+        let threads: Vec<(String, Vec<String>, Vec<String>)> = vec![];
+        let prompt = multi_thread_user_prompt(&threads);
+        assert!(prompt.starts_with("Digest these threads:"));
+        assert!(!prompt.contains("Thread:"));
+    }
+
+    #[test]
+    fn multi_thread_user_prompt_truncates_key_points() {
+        let threads = vec![(
+            "T-1".to_string(),
+            (0..20).map(|i| format!("point-{i}")).collect(),
+            vec!["action".to_string()],
+        )];
+        let prompt = multi_thread_user_prompt(&threads);
+        // Should include up to MAX_KEY_POINTS_PER_THREAD
+        let last_included = MAX_KEY_POINTS_PER_THREAD - 1;
+        assert!(prompt.contains(&format!("point-{last_included}")));
+        assert!(!prompt.contains(&format!("point-{}", MAX_KEY_POINTS_PER_THREAD)));
+    }
+
+    #[test]
+    fn multi_thread_user_prompt_truncates_actions() {
+        let threads = vec![(
+            "T-1".to_string(),
+            vec!["kp".to_string()],
+            (0..20).map(|i| format!("action-{i}")).collect(),
+        )];
+        let prompt = multi_thread_user_prompt(&threads);
+        let last_included = MAX_ACTIONS_PER_THREAD - 1;
+        assert!(prompt.contains(&format!("action-{last_included}")));
+        assert!(!prompt.contains(&format!("action-{}", MAX_ACTIONS_PER_THREAD)));
     }
 }

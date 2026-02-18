@@ -359,10 +359,10 @@ pub mod tool_util {
         }
 
         // Check read cache first (slug lookups only; ensure_project always hits DB)
-        if !raw_identifier.starts_with('/') {
-            if let Some(cached) = mcp_agent_mail_db::read_cache().get_project(raw_identifier) {
-                return Ok(cached);
-            }
+        if !raw_identifier.starts_with('/')
+            && let Some(cached) = mcp_agent_mail_db::read_cache().get_project(raw_identifier)
+        {
+            return Ok(cached);
         }
         let out = if raw_identifier.starts_with('/') {
             mcp_agent_mail_db::queries::ensure_project(ctx.cx(), pool, raw_identifier).await
@@ -1103,4 +1103,103 @@ pub fn tool_cluster(tool_name: &str) -> Option<&'static str> {
         .iter()
         .find(|(name, _)| *name == tool_name)
         .map(|(_, cluster)| *cluster)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- tool_cluster tests --
+
+    #[test]
+    fn tool_cluster_known_tools() {
+        assert_eq!(tool_cluster("health_check"), Some(clusters::INFRASTRUCTURE));
+        assert_eq!(tool_cluster("register_agent"), Some(clusters::IDENTITY));
+        assert_eq!(tool_cluster("send_message"), Some(clusters::MESSAGING));
+        assert_eq!(tool_cluster("request_contact"), Some(clusters::CONTACT));
+        assert_eq!(
+            tool_cluster("file_reservation_paths"),
+            Some(clusters::FILE_RESERVATIONS)
+        );
+        assert_eq!(tool_cluster("search_messages"), Some(clusters::SEARCH));
+        assert_eq!(
+            tool_cluster("macro_start_session"),
+            Some(clusters::WORKFLOW_MACROS)
+        );
+        assert_eq!(tool_cluster("ensure_product"), Some(clusters::PRODUCT_BUS));
+        assert_eq!(
+            tool_cluster("acquire_build_slot"),
+            Some(clusters::BUILD_SLOTS)
+        );
+    }
+
+    #[test]
+    fn tool_cluster_unknown_tool_returns_none() {
+        assert_eq!(tool_cluster("nonexistent_tool"), None);
+        assert_eq!(tool_cluster(""), None);
+        assert_eq!(tool_cluster("HEALTH_CHECK"), None); // case-sensitive
+    }
+
+    #[test]
+    fn tool_cluster_all_entries_resolve() {
+        for (name, cluster) in TOOL_CLUSTER_MAP {
+            assert_eq!(
+                tool_cluster(name),
+                Some(*cluster),
+                "tool_cluster({name}) should match TOOL_CLUSTER_MAP"
+            );
+        }
+    }
+
+    // -- patterns_overlap tests --
+
+    #[test]
+    fn patterns_overlap_identical() {
+        assert!(patterns_overlap("src/*.rs", "src/*.rs"));
+    }
+
+    #[test]
+    fn patterns_overlap_literal_match() {
+        assert!(patterns_overlap("README.md", "README.md"));
+    }
+
+    #[test]
+    fn patterns_overlap_disjoint() {
+        assert!(!patterns_overlap("src/*.rs", "tests/*.py"));
+    }
+
+    #[test]
+    fn patterns_overlap_glob_subsumes() {
+        assert!(patterns_overlap("src/**", "src/main.rs"));
+    }
+
+    #[test]
+    fn patterns_overlap_star_overlap() {
+        assert!(patterns_overlap("*.rs", "lib.rs"));
+    }
+
+    #[test]
+    fn patterns_overlap_empty_patterns() {
+        // Empty patterns should not overlap with anything meaningful
+        assert!(!patterns_overlap("", "src/main.rs"));
+    }
+
+    // -- cluster constants test --
+
+    #[test]
+    fn cluster_constants_are_distinct() {
+        let all = [
+            clusters::INFRASTRUCTURE,
+            clusters::IDENTITY,
+            clusters::MESSAGING,
+            clusters::CONTACT,
+            clusters::FILE_RESERVATIONS,
+            clusters::SEARCH,
+            clusters::WORKFLOW_MACROS,
+            clusters::PRODUCT_BUS,
+            clusters::BUILD_SLOTS,
+        ];
+        let unique: std::collections::HashSet<&str> = all.iter().copied().collect();
+        assert_eq!(all.len(), unique.len(), "all cluster names must be unique");
+    }
 }
