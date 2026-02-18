@@ -510,4 +510,313 @@ mod tests {
         assert!(info.cpu_count >= 1);
         assert!(!info.os.is_empty());
     }
+
+    // -- health_recommendations direct tests --
+
+    fn zero_signals() -> HealthSignals {
+        HealthSignals {
+            pool_acquire_p95_us: 0,
+            pool_utilization_pct: 0,
+            pool_over_80_for_s: 0,
+            wbq_depth_pct: 0,
+            wbq_over_80_for_s: 0,
+            commit_depth_pct: 0,
+            commit_over_80_for_s: 0,
+        }
+    }
+
+    #[test]
+    fn health_rec_red_emits_critical() {
+        let signals = zero_signals();
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Red, &signals, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.severity == "critical" && r.subsystem == "health"),
+            "RED health should produce a critical health recommendation"
+        );
+    }
+
+    #[test]
+    fn health_rec_yellow_emits_warning() {
+        let signals = zero_signals();
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Yellow, &signals, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.severity == "warning" && r.subsystem == "health"),
+            "YELLOW health should produce a warning"
+        );
+    }
+
+    #[test]
+    fn health_rec_green_no_health_rec() {
+        let signals = zero_signals();
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Green, &signals, &mut recs);
+        assert!(
+            !recs.iter().any(|r| r.subsystem == "health"),
+            "GREEN health should not produce a health recommendation"
+        );
+    }
+
+    #[test]
+    fn health_rec_pool_90_pct_critical() {
+        let mut signals = zero_signals();
+        signals.pool_utilization_pct = 95;
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Green, &signals, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.severity == "critical" && r.subsystem == "database"),
+            "95% pool utilization should trigger critical database recommendation"
+        );
+    }
+
+    #[test]
+    fn health_rec_pool_75_pct_warning() {
+        let mut signals = zero_signals();
+        signals.pool_utilization_pct = 75;
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Green, &signals, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.severity == "warning" && r.subsystem == "database"),
+            "75% pool utilization should trigger warning"
+        );
+    }
+
+    #[test]
+    fn health_rec_pool_50_pct_no_rec() {
+        let mut signals = zero_signals();
+        signals.pool_utilization_pct = 50;
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Green, &signals, &mut recs);
+        assert!(
+            !recs.iter().any(|r| r.subsystem == "database"),
+            "50% pool utilization should not trigger any database recommendation"
+        );
+    }
+
+    #[test]
+    fn health_rec_high_acquire_latency() {
+        let mut signals = zero_signals();
+        signals.pool_acquire_p95_us = 150_000; // 150ms
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Green, &signals, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "database" && r.message.contains("latency")),
+            "high acquire latency should trigger recommendation"
+        );
+    }
+
+    #[test]
+    fn health_rec_wbq_depth_80() {
+        let mut signals = zero_signals();
+        signals.wbq_depth_pct = 85;
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Green, &signals, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "storage" && r.message.contains("Write-back")),
+            "high WBQ depth should trigger storage recommendation"
+        );
+    }
+
+    #[test]
+    fn health_rec_commit_depth_80() {
+        let mut signals = zero_signals();
+        signals.commit_depth_pct = 90;
+        let mut recs = Vec::new();
+        health_recommendations(HealthLevel::Green, &signals, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "storage" && r.message.contains("Commit queue")),
+            "high commit depth should trigger storage recommendation"
+        );
+    }
+
+    // -- operational_recommendations direct tests --
+
+    #[test]
+    fn ops_rec_slow_tools() {
+        let snap = GlobalMetricsSnapshot::default();
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 3, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "tools" && r.message.contains("3 tool(s)")),
+            "should warn about slow tools"
+        );
+    }
+
+    #[test]
+    fn ops_rec_high_error_rate() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.tools.tool_calls_total = 200;
+        snap.tools.tool_errors_total = 50; // 25%
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 0, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "tools" && r.message.contains("error rate")),
+            "25% error rate should trigger warning"
+        );
+    }
+
+    #[test]
+    fn ops_rec_low_error_rate_no_warning() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.tools.tool_calls_total = 200;
+        snap.tools.tool_errors_total = 5; // 2.5%
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 0, &mut recs);
+        assert!(
+            !recs.iter().any(|r| r.message.contains("error rate")),
+            "2.5% error rate should not trigger warning"
+        );
+    }
+
+    #[test]
+    fn ops_rec_few_calls_skips_error_rate() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.tools.tool_calls_total = 10;
+        snap.tools.tool_errors_total = 5; // 50% but only 10 calls
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 0, &mut recs);
+        assert!(
+            !recs.iter().any(|r| r.message.contains("error rate")),
+            "should not warn about error rate with < 100 calls"
+        );
+    }
+
+    #[test]
+    fn ops_rec_lock_contention() {
+        let snap = GlobalMetricsSnapshot::default();
+        let locks = vec![LockContentionEntry {
+            lock_name: "TestLock".to_string(),
+            rank: 1,
+            acquire_count: 500,
+            contended_count: 100,
+            total_wait_ns: 5_000_000,
+            total_hold_ns: 50_000_000,
+            max_wait_ns: 1_000_000,
+            max_hold_ns: 2_000_000,
+            contention_ratio: 0.2, // 20%
+        }];
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &locks, 0, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "locks" && r.message.contains("TestLock")),
+            "20% contention with 500 acquires should trigger warning"
+        );
+    }
+
+    #[test]
+    fn ops_rec_low_contention_no_warning() {
+        let snap = GlobalMetricsSnapshot::default();
+        let locks = vec![LockContentionEntry {
+            lock_name: "TestLock".to_string(),
+            rank: 1,
+            acquire_count: 500,
+            contended_count: 10,
+            total_wait_ns: 100_000,
+            total_hold_ns: 5_000_000,
+            max_wait_ns: 50_000,
+            max_hold_ns: 200_000,
+            contention_ratio: 0.02, // 2%
+        }];
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &locks, 0, &mut recs);
+        assert!(
+            !recs.iter().any(|r| r.subsystem == "locks"),
+            "2% contention should not trigger warning"
+        );
+    }
+
+    #[test]
+    fn ops_rec_disk_pressure() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.system.disk_pressure_level = 2;
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 0, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.severity == "critical" && r.subsystem == "disk"),
+            "disk pressure level 2 should trigger critical recommendation"
+        );
+    }
+
+    #[test]
+    fn ops_rec_search_fallback() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.search.fallback_to_legacy_total = 5;
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 0, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "search" && r.message.contains("fallback")),
+            "search fallback-to-legacy should trigger warning"
+        );
+    }
+
+    #[test]
+    fn ops_rec_shadow_errors() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.search.shadow_v3_errors_total = 3;
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 0, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "search" && r.message.contains("Shadow mode")),
+            "shadow V3 errors should trigger warning"
+        );
+    }
+
+    #[test]
+    fn ops_rec_low_shadow_equivalence() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.search.shadow_comparisons_total = 20;
+        snap.search.shadow_equivalent_pct = 60.0;
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 0, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.subsystem == "search" && r.message.contains("equivalence")),
+            "60% equivalence with 20+ comparisons should trigger warning"
+        );
+    }
+
+    #[test]
+    fn ops_rec_v3_queries_no_docs() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.search.queries_v3_total = 10;
+        snap.search.tantivy_doc_count = 0;
+        let mut recs = Vec::new();
+        operational_recommendations(&snap, &[], 0, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.severity == "critical" && r.subsystem == "search"),
+            "V3 queries with empty index should trigger critical warning"
+        );
+    }
+
+    // -- generate_recommendations aggregation --
+
+    #[test]
+    fn generate_recs_combines_health_and_ops() {
+        let mut snap = GlobalMetricsSnapshot::default();
+        snap.tools.tool_calls_total = 200;
+        snap.tools.tool_errors_total = 50;
+        let mut signals = zero_signals();
+        signals.pool_utilization_pct = 95;
+        let recs = generate_recommendations(&snap, HealthLevel::Red, &signals, &[], 2);
+        // Should have health (red), database (pool 95%), tools (slow + error rate)
+        assert!(recs.len() >= 3, "expected at least 3 recommendations, got {}", recs.len());
+        assert!(recs.iter().any(|r| r.subsystem == "health"));
+        assert!(recs.iter().any(|r| r.subsystem == "database"));
+        assert!(recs.iter().any(|r| r.subsystem == "tools"));
+    }
 }
