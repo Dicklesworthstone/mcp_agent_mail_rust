@@ -981,8 +981,7 @@ mod tests {
     fn level_transitions_is_readable() {
         // Just verify the atomic counter is readable (can't easily control
         // its value due to concurrent test execution, but the API must work).
-        let t = level_transitions();
-        assert!(t <= u8::MAX);
+        let _t: u8 = level_transitions();
     }
 
     #[test]
