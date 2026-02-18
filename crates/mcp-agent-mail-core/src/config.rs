@@ -3067,4 +3067,224 @@ mod tests {
             "postgres://localhost/db"
         );
     }
+
+    // ── SearchEngine coverage ─────────────────────────────────────────
+
+    #[test]
+    #[allow(deprecated)]
+    fn search_engine_parse_all_aliases() {
+        assert_eq!(SearchEngine::parse("legacy"), SearchEngine::Legacy);
+        assert_eq!(SearchEngine::parse("fts5"), SearchEngine::Legacy);
+        assert_eq!(SearchEngine::parse("fts"), SearchEngine::Legacy);
+        assert_eq!(SearchEngine::parse("sqlite"), SearchEngine::Legacy);
+        assert_eq!(SearchEngine::parse("lexical"), SearchEngine::Lexical);
+        assert_eq!(SearchEngine::parse("tantivy"), SearchEngine::Lexical);
+        assert_eq!(SearchEngine::parse("v3"), SearchEngine::Lexical);
+        assert_eq!(SearchEngine::parse("semantic"), SearchEngine::Semantic);
+        assert_eq!(SearchEngine::parse("vector"), SearchEngine::Semantic);
+        assert_eq!(SearchEngine::parse("embedding"), SearchEngine::Semantic);
+        assert_eq!(SearchEngine::parse("hybrid"), SearchEngine::Hybrid);
+        assert_eq!(SearchEngine::parse("fusion"), SearchEngine::Hybrid);
+        assert_eq!(SearchEngine::parse("auto"), SearchEngine::Auto);
+        assert_eq!(SearchEngine::parse("adaptive"), SearchEngine::Auto);
+        assert_eq!(SearchEngine::parse("shadow"), SearchEngine::Shadow);
+        // Unknown falls back to Legacy
+        assert_eq!(SearchEngine::parse("unknown"), SearchEngine::Legacy);
+        assert_eq!(SearchEngine::parse(""), SearchEngine::Legacy);
+        // Case insensitive
+        assert_eq!(SearchEngine::parse("HYBRID"), SearchEngine::Hybrid);
+        assert_eq!(SearchEngine::parse("  Semantic  "), SearchEngine::Semantic);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn search_engine_requires_semantic() {
+        assert!(!SearchEngine::Legacy.requires_semantic());
+        assert!(!SearchEngine::Lexical.requires_semantic());
+        assert!(SearchEngine::Semantic.requires_semantic());
+        assert!(SearchEngine::Hybrid.requires_semantic());
+        assert!(SearchEngine::Auto.requires_semantic());
+        assert!(!SearchEngine::Shadow.requires_semantic());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn search_engine_uses_lexical() {
+        assert!(SearchEngine::Legacy.uses_lexical());
+        assert!(SearchEngine::Lexical.uses_lexical());
+        assert!(!SearchEngine::Semantic.uses_lexical());
+        assert!(SearchEngine::Hybrid.uses_lexical());
+        assert!(SearchEngine::Auto.uses_lexical());
+        assert!(SearchEngine::Shadow.uses_lexical());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn search_engine_is_shadow() {
+        assert!(!SearchEngine::Legacy.is_shadow());
+        assert!(!SearchEngine::Lexical.is_shadow());
+        assert!(SearchEngine::Shadow.is_shadow());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn search_engine_display() {
+        assert_eq!(SearchEngine::Legacy.to_string(), "legacy");
+        assert_eq!(SearchEngine::Lexical.to_string(), "lexical");
+        assert_eq!(SearchEngine::Semantic.to_string(), "semantic");
+        assert_eq!(SearchEngine::Hybrid.to_string(), "hybrid");
+        assert_eq!(SearchEngine::Auto.to_string(), "auto");
+        assert_eq!(SearchEngine::Shadow.to_string(), "shadow");
+    }
+
+    // ── SearchShadowMode coverage ─────────────────────────────────────
+
+    #[test]
+    fn search_shadow_mode_parse_all_aliases() {
+        assert_eq!(SearchShadowMode::parse("log_only"), SearchShadowMode::LogOnly);
+        assert_eq!(SearchShadowMode::parse("log-only"), SearchShadowMode::LogOnly);
+        assert_eq!(SearchShadowMode::parse("logonly"), SearchShadowMode::LogOnly);
+        assert_eq!(SearchShadowMode::parse("log"), SearchShadowMode::LogOnly);
+        assert_eq!(SearchShadowMode::parse("compare"), SearchShadowMode::Compare);
+        assert_eq!(SearchShadowMode::parse("v3"), SearchShadowMode::Compare);
+        assert_eq!(SearchShadowMode::parse("new"), SearchShadowMode::Compare);
+        // Unknown falls back to Off
+        assert_eq!(SearchShadowMode::parse("unknown"), SearchShadowMode::Off);
+        assert_eq!(SearchShadowMode::parse(""), SearchShadowMode::Off);
+        // Case insensitive
+        assert_eq!(SearchShadowMode::parse("LOG_ONLY"), SearchShadowMode::LogOnly);
+    }
+
+    #[test]
+    fn search_shadow_mode_is_active() {
+        assert!(!SearchShadowMode::Off.is_active());
+        assert!(SearchShadowMode::LogOnly.is_active());
+        assert!(SearchShadowMode::Compare.is_active());
+    }
+
+    #[test]
+    fn search_shadow_mode_returns_v3() {
+        assert!(!SearchShadowMode::Off.returns_v3());
+        assert!(!SearchShadowMode::LogOnly.returns_v3());
+        assert!(SearchShadowMode::Compare.returns_v3());
+    }
+
+    #[test]
+    fn search_shadow_mode_display() {
+        assert_eq!(SearchShadowMode::Off.to_string(), "off");
+        assert_eq!(SearchShadowMode::LogOnly.to_string(), "log_only");
+        assert_eq!(SearchShadowMode::Compare.to_string(), "compare");
+    }
+
+    // ── SearchRolloutConfig coverage ──────────────────────────────────
+
+    #[test]
+    fn effective_engine_uses_global_default() {
+        let cfg = SearchRolloutConfig {
+            engine: SearchEngine::Lexical,
+            semantic_enabled: true,
+            ..SearchRolloutConfig::default()
+        };
+        assert_eq!(cfg.effective_engine("search_messages"), SearchEngine::Lexical);
+    }
+
+    #[test]
+    fn effective_engine_per_surface_override() {
+        let mut cfg = SearchRolloutConfig {
+            engine: SearchEngine::Legacy,
+            semantic_enabled: true,
+            ..SearchRolloutConfig::default()
+        };
+        cfg.surface_overrides.insert("search_messages".to_string(), SearchEngine::Hybrid);
+        assert_eq!(cfg.effective_engine("search_messages"), SearchEngine::Hybrid);
+        assert_eq!(cfg.effective_engine("other_tool"), SearchEngine::Legacy);
+    }
+
+    #[test]
+    fn effective_engine_kill_switch_degrades_semantic() {
+        let cfg = SearchRolloutConfig {
+            engine: SearchEngine::Semantic,
+            semantic_enabled: false,
+            ..SearchRolloutConfig::default()
+        };
+        assert_eq!(cfg.effective_engine("any"), SearchEngine::Legacy);
+    }
+
+    #[test]
+    fn effective_engine_kill_switch_degrades_hybrid_to_lexical() {
+        let cfg = SearchRolloutConfig {
+            engine: SearchEngine::Hybrid,
+            semantic_enabled: false,
+            ..SearchRolloutConfig::default()
+        };
+        assert_eq!(cfg.effective_engine("any"), SearchEngine::Lexical);
+    }
+
+    #[test]
+    fn effective_engine_kill_switch_degrades_auto_to_lexical() {
+        let cfg = SearchRolloutConfig {
+            engine: SearchEngine::Auto,
+            semantic_enabled: false,
+            ..SearchRolloutConfig::default()
+        };
+        assert_eq!(cfg.effective_engine("any"), SearchEngine::Lexical);
+    }
+
+    #[test]
+    fn should_shadow_delegates_to_mode() {
+        let cfg = SearchRolloutConfig::default();
+        assert!(!cfg.should_shadow());
+
+        let cfg2 = SearchRolloutConfig {
+            shadow_mode: SearchShadowMode::LogOnly,
+            ..SearchRolloutConfig::default()
+        };
+        assert!(cfg2.should_shadow());
+    }
+
+    // ── Console parser coverage ───────────────────────────────────────
+
+    #[test]
+    fn console_ui_anchor_parse() {
+        assert_eq!(ConsoleUiAnchor::parse("bottom"), Some(ConsoleUiAnchor::Bottom));
+        assert_eq!(ConsoleUiAnchor::parse("b"), Some(ConsoleUiAnchor::Bottom));
+        assert_eq!(ConsoleUiAnchor::parse("top"), Some(ConsoleUiAnchor::Top));
+        assert_eq!(ConsoleUiAnchor::parse("t"), Some(ConsoleUiAnchor::Top));
+        assert_eq!(ConsoleUiAnchor::parse("unknown"), None);
+        assert_eq!(ConsoleUiAnchor::parse("TOP"), Some(ConsoleUiAnchor::Top));
+    }
+
+    #[test]
+    fn console_split_mode_parse() {
+        assert_eq!(ConsoleSplitMode::parse("inline"), Some(ConsoleSplitMode::Inline));
+        assert_eq!(ConsoleSplitMode::parse("i"), Some(ConsoleSplitMode::Inline));
+        assert_eq!(ConsoleSplitMode::parse("left"), Some(ConsoleSplitMode::Left));
+        assert_eq!(ConsoleSplitMode::parse("l"), Some(ConsoleSplitMode::Left));
+        assert_eq!(ConsoleSplitMode::parse("unknown"), None);
+    }
+
+    #[test]
+    fn console_theme_id_parse() {
+        assert_eq!(ConsoleThemeId::parse("cyberpunk"), Some(ConsoleThemeId::CyberpunkAurora));
+        assert_eq!(ConsoleThemeId::parse("cyberpunk_aurora"), Some(ConsoleThemeId::CyberpunkAurora));
+        assert_eq!(ConsoleThemeId::parse("cyberpunk-aurora"), Some(ConsoleThemeId::CyberpunkAurora));
+        assert_eq!(ConsoleThemeId::parse("aurora"), Some(ConsoleThemeId::CyberpunkAurora));
+        assert_eq!(ConsoleThemeId::parse("darcula"), Some(ConsoleThemeId::Darcula));
+        assert_eq!(ConsoleThemeId::parse("lumen"), Some(ConsoleThemeId::LumenLight));
+        assert_eq!(ConsoleThemeId::parse("light"), Some(ConsoleThemeId::LumenLight));
+        assert_eq!(ConsoleThemeId::parse("nordic"), Some(ConsoleThemeId::NordicFrost));
+        assert_eq!(ConsoleThemeId::parse("hc"), Some(ConsoleThemeId::HighContrast));
+        assert_eq!(ConsoleThemeId::parse("high_contrast"), Some(ConsoleThemeId::HighContrast));
+        assert_eq!(ConsoleThemeId::parse("unknown"), None);
+    }
+
+    // ── Config::is_production ─────────────────────────────────────────
+
+    #[test]
+    fn config_is_production() {
+        let mut cfg = Config::default();
+        assert!(!cfg.is_production(), "default should be development");
+        cfg.app_environment = AppEnvironment::Production;
+        assert!(cfg.is_production());
+    }
 }
