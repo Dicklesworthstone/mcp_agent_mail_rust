@@ -37,7 +37,9 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
 use mcp_agent_mail_server::tui_macro::PlaybackState;
-use mcp_agent_mail_server::tui_persist::{PreferencePersister, TuiPreferences};
+use mcp_agent_mail_server::tui_persist::{
+    PreferencePersister, TuiPreferences, load_screen_filter_presets, screen_filter_presets_path,
+};
 use mcp_agent_mail_server::tui_screens::{DeepLinkTarget, MailScreenId, MailScreenMsg};
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -85,6 +87,12 @@ fn new_model() -> (MailAppModel, Arc<TuiSharedState>) {
     let config = Config::default();
     let state = TuiSharedState::new(&config);
     let model = MailAppModel::new(Arc::clone(&state));
+    (model, state)
+}
+
+fn new_model_with_config(config: &Config) -> (MailAppModel, Arc<TuiSharedState>) {
+    let state = TuiSharedState::new(config);
+    let model = MailAppModel::with_config(Arc::clone(&state), config);
     (model, state)
 }
 
@@ -585,6 +593,91 @@ fn preferences_export_import_json() {
     // Import back
     let imported = persister.import_json().expect("import");
     assert_eq!(prefs, imported);
+}
+
+#[test]
+fn timeline_preset_shortcuts_persist_and_reload_filters() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let mut config = Config::default();
+    config.console_persist_path = dir.path().join("console.env");
+    config.console_auto_save = true;
+    let preset_path = screen_filter_presets_path(&config.console_persist_path);
+
+    let (mut model, _state) = new_model_with_config(&config);
+    model.update(MailMsg::SwitchScreen(MailScreenId::Timeline));
+    ticks(&mut model, 2);
+
+    // Build a non-default filter state before saving.
+    model.update(key(KeyCode::Char('Z'))); // standard -> verbose
+    model.update(key(KeyCode::Char('t')));
+    model.update(key(KeyCode::Char('s')));
+    ticks(&mut model, 1);
+
+    // Save preset "alpha" via Ctrl+S dialog.
+    model.update(key_mod(KeyCode::Char('s'), Modifiers::CTRL));
+    for _ in 0..24 {
+        model.update(key(KeyCode::Backspace));
+    }
+    type_str(&mut model, "alpha");
+    model.update(key(KeyCode::Enter));
+    ticks(&mut model, 1);
+
+    let first_store = load_screen_filter_presets(&preset_path).expect("load alpha preset");
+    let alpha_values = first_store
+        .get("timeline", "alpha")
+        .expect("alpha preset exists")
+        .values
+        .clone();
+    assert_eq!(
+        alpha_values.get("verbosity").map(String::as_str),
+        Some("verbose")
+    );
+    let alpha_kind = alpha_values.get("kind").cloned().unwrap_or_default();
+    let alpha_source = alpha_values.get("source").cloned().unwrap_or_default();
+    assert!(!alpha_kind.is_empty(), "kind token should be captured");
+    assert!(!alpha_source.is_empty(), "source token should be captured");
+
+    // Clear filters, then reload alpha via Ctrl+L + Enter.
+    model.update(key(KeyCode::Char('c')));
+    ticks(&mut model, 1);
+    model.update(key_mod(KeyCode::Char('l'), Modifiers::CTRL));
+    model.update(key(KeyCode::Enter));
+    ticks(&mut model, 1);
+
+    // Save again as "beta" and verify loaded state matched alpha snapshot.
+    model.update(key_mod(KeyCode::Char('s'), Modifiers::CTRL));
+    for _ in 0..24 {
+        model.update(key(KeyCode::Backspace));
+    }
+    type_str(&mut model, "beta");
+    model.update(key(KeyCode::Enter));
+    ticks(&mut model, 1);
+
+    let second_store = load_screen_filter_presets(&preset_path).expect("load beta preset");
+    let beta_values = second_store
+        .get("timeline", "beta")
+        .expect("beta preset exists")
+        .values
+        .clone();
+    assert_eq!(
+        beta_values, alpha_values,
+        "loaded filters should round-trip through save dialog"
+    );
+
+    // Delete both presets from the load dialog to exercise lifecycle completion.
+    model.update(key_mod(KeyCode::Char('l'), Modifiers::CTRL));
+    model.update(key(KeyCode::Delete));
+    model.update(key(KeyCode::Delete));
+    model.update(key(KeyCode::Escape));
+    ticks(&mut model, 1);
+
+    let after_delete = load_screen_filter_presets(&preset_path).expect("load final preset store");
+    assert!(
+        after_delete.list_names("timeline").is_empty(),
+        "Ctrl+L/Delete should remove saved timeline presets"
+    );
+
+    render(&model, 120, 40);
 }
 
 // ── 7. Cross-Screen Interaction Workflows ───────────────────────────
