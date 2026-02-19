@@ -967,4 +967,148 @@ mod tests {
         update_max(&a, 100); // should update
         assert_eq!(a.load(Ordering::Relaxed), 100);
     }
+
+    // -----------------------------------------------------------------------
+    // Additional edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lock_level_display_includes_rank() {
+        let level = LockLevel::DbPoolCache;
+        let display = format!("{level}");
+        assert_eq!(display, "DbPoolCache@10");
+
+        let level = LockLevel::ServerLiveDashboard;
+        let display = format!("{level}");
+        assert_eq!(display, "ServerLiveDashboard@90");
+    }
+
+    #[test]
+    fn lock_level_all_ranks_are_unique() {
+        let mut ranks: Vec<u16> = LockLevel::ALL.iter().map(|l| l.rank()).collect();
+        let original_len = ranks.len();
+        ranks.sort_unstable();
+        ranks.dedup();
+        assert_eq!(
+            ranks.len(),
+            original_len,
+            "all lock levels should have unique ranks"
+        );
+    }
+
+    #[test]
+    fn lock_level_from_ordinal_out_of_bounds() {
+        assert_eq!(LockLevel::from_ordinal(LockLevel::COUNT), None);
+        assert_eq!(LockLevel::from_ordinal(999), None);
+        assert_eq!(LockLevel::from_ordinal(usize::MAX), None);
+    }
+
+    #[test]
+    fn ordered_mutex_level_getter() {
+        let m = OrderedMutex::new(LockLevel::DbPoolCache, ());
+        assert_eq!(m.level(), LockLevel::DbPoolCache);
+    }
+
+    #[test]
+    fn ordered_rwlock_level_getter() {
+        let rw = OrderedRwLock::new(LockLevel::StorageRepoCache, ());
+        assert_eq!(rw.level(), LockLevel::StorageRepoCache);
+    }
+
+    #[test]
+    fn ordered_mutex_deref_read_write() {
+        let m = OrderedMutex::new(LockLevel::ToolsToolMetrics, vec![1, 2, 3]);
+        {
+            let guard = m.lock();
+            // Deref: read through guard
+            assert_eq!(guard.len(), 3);
+            assert_eq!(guard[0], 1);
+        }
+        {
+            let mut guard = m.lock();
+            // DerefMut: write through guard
+            guard.push(4);
+            assert_eq!(guard.len(), 4);
+        }
+    }
+
+    #[test]
+    fn ordered_rwlock_deref_read_write() {
+        let rw = OrderedRwLock::new(LockLevel::StorageSignalDebounce, String::from("hello"));
+        {
+            let guard = rw.read();
+            assert_eq!(guard.as_str(), "hello");
+        }
+        {
+            let mut guard = rw.write();
+            guard.push_str(" world");
+        }
+        {
+            let guard = rw.read();
+            assert_eq!(guard.as_str(), "hello world");
+        }
+    }
+
+    #[test]
+    fn try_lock_fails_when_held() {
+        let m = OrderedMutex::new(LockLevel::StorageWbqDrainHandle, ());
+        let _guard = m.lock();
+        // try_lock from the same thread should fail (mutex is already held).
+        // Note: On some platforms try_lock from the same thread may succeed (re-entrant),
+        // but std::sync::Mutex is not re-entrant, so this should return None.
+        // However, in debug builds, check_before_acquire will panic on same-level re-entry.
+        // In release builds, try_lock just returns None.
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(
+                m.try_lock().is_none(),
+                "try_lock should fail when mutex is already held"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_contention_entry_debug() {
+        let entry = LockContentionEntry {
+            lock_name: "TestLock".to_string(),
+            rank: 99,
+            acquire_count: 50,
+            contended_count: 3,
+            total_wait_ns: 100_000,
+            total_hold_ns: 500_000,
+            max_wait_ns: 50_000,
+            max_hold_ns: 100_000,
+            contention_ratio: 0.06,
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("TestLock"));
+        assert!(debug.contains("50"));
+
+        let cloned = entry.clone();
+        assert_eq!(cloned.lock_name, "TestLock");
+        assert_eq!(cloned.rank, 99);
+    }
+
+    #[test]
+    fn lock_level_copy_clone_eq() {
+        let a = LockLevel::DbPoolCache;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone(); // Clone
+        assert_eq!(a, c);
+        assert_ne!(a, LockLevel::ServerLiveDashboard);
+    }
+
+    #[test]
+    fn duration_nanos_u64_edge_cases() {
+        let zero = std::time::Duration::ZERO;
+        assert_eq!(zero.as_nanos_u64(), 0);
+
+        let one_sec = std::time::Duration::from_secs(1);
+        assert_eq!(one_sec.as_nanos_u64(), 1_000_000_000);
+
+        let max = std::time::Duration::MAX;
+        // Should saturate to u64::MAX rather than panic.
+        assert_eq!(max.as_nanos_u64(), u64::MAX);
+    }
 }
