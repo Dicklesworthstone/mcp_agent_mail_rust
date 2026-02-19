@@ -321,6 +321,69 @@ mod tests {
     }
 
     #[test]
+    fn integrity_metrics_serializable() {
+        let m = integrity_metrics();
+        let json = serde_json::to_value(&m).expect("serialize IntegrityMetrics");
+        assert!(json.get("last_ok_ts").is_some());
+        assert!(json.get("last_check_ts").is_some());
+        assert!(json.get("checks_total").is_some());
+        assert!(json.get("failures_total").is_some());
+    }
+
+    #[test]
+    fn check_kind_equality() {
+        assert_eq!(CheckKind::Quick, CheckKind::Quick);
+        assert_ne!(CheckKind::Quick, CheckKind::Incremental);
+        assert_ne!(CheckKind::Incremental, CheckKind::Full);
+    }
+
+    #[test]
+    fn integrity_check_result_clone() {
+        let conn = open_test_db();
+        let result = quick_check(&conn).expect("quick_check");
+        let cloned = result.clone();
+        assert_eq!(cloned.ok, result.ok);
+        assert_eq!(cloned.details, result.details);
+        assert_eq!(cloned.kind, result.kind);
+    }
+
+    #[test]
+    fn is_full_check_due_zero_interval_always_false() {
+        // Regardless of state, interval=0 means disabled
+        assert!(!is_full_check_due(0));
+    }
+
+    #[test]
+    fn integrity_check_result_debug() {
+        let result = IntegrityCheckResult {
+            ok: true,
+            details: vec!["ok".to_string()],
+            duration_us: 42,
+            kind: CheckKind::Quick,
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("ok: true"));
+        assert!(debug.contains("Quick"));
+    }
+
+    #[test]
+    fn quick_and_incremental_both_pass_on_same_db() {
+        let conn = open_test_db();
+        // Insert some data
+        conn.execute_raw("INSERT INTO test (id, name) VALUES (1, 'alpha')")
+            .expect("insert");
+        conn.execute_raw("INSERT INTO test (id, name) VALUES (2, 'beta')")
+            .expect("insert");
+
+        let qr = quick_check(&conn).expect("quick_check");
+        assert!(qr.ok);
+        let ir = incremental_check(&conn).expect("incremental_check");
+        assert!(ir.ok);
+        let fr = full_check(&conn).expect("full_check");
+        assert!(fr.ok);
+    }
+
+    #[test]
     #[ignore = "VACUUM INTO not implemented in frankensqlite (no-op)"]
     fn vacuum_recovery_on_healthy_db() {
         let dir = tempfile::tempdir().expect("tempdir");

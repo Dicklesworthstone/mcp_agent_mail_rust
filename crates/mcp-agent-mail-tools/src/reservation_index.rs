@@ -334,4 +334,112 @@ mod tests {
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
     }
+
+    // ── Additional edge-case tests ─────────────────────────────
+
+    #[test]
+    fn root_exact_path_conflict() {
+        // A file at root level with no directory prefix
+        let idx =
+            ReservationIndex::build(vec![("Cargo.toml".to_string(), make_ref(1))].into_iter());
+        let req = CompiledPattern::new("Cargo.toml");
+        let conflicts = idx.find_conflicts(&req);
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
+    fn root_exact_path_no_conflict_with_different() {
+        let idx =
+            ReservationIndex::build(vec![("Cargo.toml".to_string(), make_ref(1))].into_iter());
+        let req = CompiledPattern::new("Cargo.lock");
+        let conflicts = idx.find_conflicts(&req);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn star_glob_matches_root_files() {
+        let idx = ReservationIndex::build(vec![("*.toml".to_string(), make_ref(1))].into_iter());
+        let req = CompiledPattern::new("Cargo.toml");
+        let conflicts = idx.find_conflicts(&req);
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
+    fn deeply_nested_exact_path() {
+        let idx = ReservationIndex::build(
+            vec![(
+                "crates/db/src/schema.rs".to_string(),
+                make_ref(1),
+            )]
+            .into_iter(),
+        );
+        let req = CompiledPattern::new("crates/db/src/schema.rs");
+        let conflicts = idx.find_conflicts(&req);
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
+    fn deeply_nested_no_conflict_different_subtree() {
+        let idx = ReservationIndex::build(
+            vec![(
+                "crates/db/src/schema.rs".to_string(),
+                make_ref(1),
+            )]
+            .into_iter(),
+        );
+        let req = CompiledPattern::new("crates/cli/src/schema.rs");
+        let conflicts = idx.find_conflicts(&req);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn multiple_agents_on_same_path() {
+        let idx = ReservationIndex::build(
+            vec![
+                ("src/main.rs".to_string(), make_ref(1)),
+                ("src/main.rs".to_string(), make_ref(2)),
+            ]
+            .into_iter(),
+        );
+        let req = CompiledPattern::new("src/main.rs");
+        let conflicts = idx.find_conflicts(&req);
+        assert_eq!(conflicts.len(), 2);
+        let ids: Vec<i64> = conflicts.iter().map(|r| r.agent_id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+    }
+
+    #[test]
+    fn glob_reservation_does_not_match_different_prefix() {
+        let idx =
+            ReservationIndex::build(vec![("src/**/*.rs".to_string(), make_ref(1))].into_iter());
+        let req = CompiledPattern::new("docs/readme.md");
+        let conflicts = idx.find_conflicts(&req);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn first_segment_helper() {
+        assert_eq!(first_segment("src/main.rs"), Some("src"));
+        assert_eq!(first_segment("Cargo.toml"), Some("Cargo.toml"));
+        assert_eq!(first_segment(""), None);
+    }
+
+    #[test]
+    fn reservation_ref_fields_preserved() {
+        let rref = ReservationRef {
+            agent_id: 42,
+            path_pattern: "src/**".to_string(),
+            exclusive: true,
+            expires_ts: 999_000,
+        };
+        let idx =
+            ReservationIndex::build(vec![("src/main.rs".to_string(), rref)].into_iter());
+        let req = CompiledPattern::new("src/main.rs");
+        let conflicts = idx.find_conflicts(&req);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].agent_id, 42);
+        assert!(conflicts[0].exclusive);
+        assert_eq!(conflicts[0].expires_ts, 999_000);
+    }
 }
