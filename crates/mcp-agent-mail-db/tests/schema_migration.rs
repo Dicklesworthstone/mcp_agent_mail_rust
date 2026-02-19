@@ -214,10 +214,18 @@ fn triggers_after_migration() {
 
     // FTS triggers should NOT exist (v11 drops them, Tantivy handles search).
     for name in &[
-        "messages_ai", "messages_ad", "messages_au",
-        "agents_ai", "agents_ad", "agents_au",
-        "projects_ai", "projects_ad", "projects_au",
-        "fts_messages_ai", "fts_messages_ad", "fts_messages_au",
+        "messages_ai",
+        "messages_ad",
+        "messages_au",
+        "agents_ai",
+        "agents_ad",
+        "agents_au",
+        "projects_ai",
+        "projects_ad",
+        "projects_au",
+        "fts_messages_ai",
+        "fts_messages_ad",
+        "fts_messages_au",
     ] {
         assert!(
             !trigger_names.contains(&name.to_string()),

@@ -946,10 +946,7 @@ fn like_fallback_quality() {
 
     // Verify scores are populated for LIKE results
     for result in &response.results {
-        assert!(
-            result.score.is_some(),
-            "LIKE results should have scores"
-        );
+        assert!(result.score.is_some(), "LIKE results should have scores");
     }
 }
 

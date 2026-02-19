@@ -206,10 +206,14 @@ fn parser_normal_words() {
     assert_eq!(plan.method, PlanMethod::Like);
     // LIKE path stores terms in params, not normalized_query.
     assert!(plan.normalized_query.is_none());
-    let param_strs: Vec<_> = plan.params.iter().filter_map(|p| match p {
-        PlanParam::Text(s) => Some(s.as_str()),
-        _ => None,
-    }).collect();
+    let param_strs: Vec<_> = plan
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            PlanParam::Text(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
     assert!(param_strs.iter().any(|s| s.contains("hello")));
     assert!(param_strs.iter().any(|s| s.contains("world")));
 }
@@ -220,10 +224,14 @@ fn parser_single_word() {
     assert_eq!(plan.method, PlanMethod::Like);
     // LIKE path stores terms in params, not normalized_query.
     assert!(plan.normalized_query.is_none());
-    let param_strs: Vec<_> = plan.params.iter().filter_map(|p| match p {
-        PlanParam::Text(s) => Some(s.as_str()),
-        _ => None,
-    }).collect();
+    let param_strs: Vec<_> = plan
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            PlanParam::Text(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
     assert!(param_strs.iter().any(|s| s.contains("deployment")));
 }
 
@@ -233,10 +241,14 @@ fn parser_hyphenated_token() {
     assert_eq!(plan.method, PlanMethod::Like);
     // LIKE path stores terms in params as %term% patterns.
     assert!(plan.normalized_query.is_none());
-    let param_strs: Vec<_> = plan.params.iter().filter_map(|p| match p {
-        PlanParam::Text(s) => Some(s.as_str()),
-        _ => None,
-    }).collect();
+    let param_strs: Vec<_> = plan
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            PlanParam::Text(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
     assert!(
         param_strs.iter().any(|s| s.contains("POL-358")),
         "expected hyphenated token in LIKE params: {param_strs:?}"
@@ -249,11 +261,18 @@ fn parser_wildcard_suffix() {
     assert_eq!(plan.method, PlanMethod::Like);
     // LIKE path: wildcard stripped by extract_like_terms, base term used.
     assert!(plan.normalized_query.is_none());
-    let param_strs: Vec<_> = plan.params.iter().filter_map(|p| match p {
-        PlanParam::Text(s) => Some(s.as_str()),
-        _ => None,
-    }).collect();
-    assert!(param_strs.iter().any(|s| s.contains("deploy")), "expected base term in LIKE params: {param_strs:?}");
+    let param_strs: Vec<_> = plan
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            PlanParam::Text(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        param_strs.iter().any(|s| s.contains("deploy")),
+        "expected base term in LIKE params: {param_strs:?}"
+    );
 }
 
 #[test]
@@ -617,7 +636,10 @@ fn malformed_unicode_queries() {
         assert!(
             matches!(
                 plan.method,
-                PlanMethod::TextMatch | PlanMethod::Like | PlanMethod::FilterOnly | PlanMethod::Empty
+                PlanMethod::TextMatch
+                    | PlanMethod::Like
+                    | PlanMethod::FilterOnly
+                    | PlanMethod::Empty
             ),
             "unicode input produced invalid method"
         );

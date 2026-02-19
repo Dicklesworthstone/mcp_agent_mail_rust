@@ -33,8 +33,7 @@ fn count_fts_artifacts(conn: &SqliteConnection) -> i64 {
 fn v11_migration_drops_all_fts_artifacts() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("v11_fts_cleanup.db");
-    let conn =
-        SqliteConnection::open_file(db_path.display().to_string()).expect("open fixture db");
+    let conn = SqliteConnection::open_file(db_path.display().to_string()).expect("open fixture db");
     conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
         .expect("apply init pragmas");
 
@@ -60,8 +59,7 @@ fn v11_migration_drops_all_fts_artifacts() {
 fn base_mode_cleanup_is_safe_on_clean_db() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("base_mode_clean.db");
-    let conn =
-        SqliteConnection::open_file(db_path.display().to_string()).expect("open fixture db");
+    let conn = SqliteConnection::open_file(db_path.display().to_string()).expect("open fixture db");
     conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
         .expect("apply init pragmas");
 

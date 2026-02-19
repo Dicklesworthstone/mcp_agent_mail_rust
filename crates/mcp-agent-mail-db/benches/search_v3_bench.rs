@@ -205,10 +205,7 @@ fn dir_size_bytes(dir: &Path) -> u64 {
 /// Every `NEEDLE_INTERVAL`-th document has "needle" in its subject (for selective queries).
 fn seed_tantivy_bridge(bridge: &TantivyBridge, count: usize) {
     let handles = bridge.handles();
-    let mut writer = bridge
-        .index()
-        .writer(50_000_000)
-        .expect("tantivy writer");
+    let mut writer = bridge.index().writer(50_000_000).expect("tantivy writer");
 
     for i in 0..count {
         let v = VOCAB[i % VOCAB.len()];
@@ -395,9 +392,7 @@ fn run_search_v3_harness_once() {
             == Some("1")
             && regressions > 0
         {
-            panic!(
-                "Search V3 bench budgets exceeded: {regressions} regressions (run_id={run_id})"
-            );
+            panic!("Search V3 bench budgets exceeded: {regressions} regressions (run_id={run_id})");
         }
     });
 }
@@ -424,16 +419,12 @@ fn bench_tantivy_lexical_search(c: &mut Criterion) {
         let query = SearchQuery::messages("needle", 1);
 
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::new(scenario.name(), count),
-            &count,
-            |b, _| {
-                b.iter(|| {
-                    let results = bridge.search(black_box(&query));
-                    black_box(&results);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new(scenario.name(), count), &count, |b, _| {
+            b.iter(|| {
+                let results = bridge.search(black_box(&query));
+                black_box(&results);
+            });
+        });
 
         // Keep bridge alive for the bench iteration.
         drop(bridge);
@@ -451,9 +442,9 @@ fn bench_tantivy_query_selectivity(c: &mut Criterion) {
     let bridge = create_seeded_bridge(&index_dir, 5_000);
 
     let queries: &[(&str, &str)] = &[
-        ("high_selectivity", "needle"),        // ~1% hit rate (every 97th doc)
-        ("medium_selectivity", "alpha beta"),   // ~20% hit rate
-        ("low_selectivity", "bench"),           // ~100% hit rate
+        ("high_selectivity", "needle"),       // ~1% hit rate (every 97th doc)
+        ("medium_selectivity", "alpha beta"), // ~20% hit rate
+        ("low_selectivity", "bench"),         // ~100% hit rate
         ("phrase_query", "\"bench 42 delta\""), // exact phrase
     ];
 
