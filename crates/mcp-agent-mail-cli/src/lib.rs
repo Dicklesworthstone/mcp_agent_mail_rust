@@ -134,8 +134,11 @@ pub enum Commands {
         /// Quick mode: warmup=1, runs=3 unless overridden.
         #[arg(long, short = 'q')]
         quick: bool,
-        /// Emit machine-readable JSON output.
-        #[arg(long)]
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
         json: bool,
         /// Path to baseline JSON for regression comparison.
         #[arg(long)]
@@ -533,7 +536,10 @@ pub enum FlakeTriageCommand {
         /// Directory to scan (default: tests/artifacts).
         #[arg(long, short = 'd')]
         dir: Option<PathBuf>,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -561,7 +567,10 @@ pub enum FlakeTriageCommand {
         /// Timeout per seed in seconds (default: 60).
         #[arg(long, default_value_t = 60)]
         timeout: u64,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -577,7 +586,10 @@ pub enum GoldenCommand {
         /// Optional filename glob filter (e.g. "am_*help*").
         #[arg(long)]
         filter: Option<String>,
-        /// Output machine-readable JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
         /// Print per-command details.
@@ -592,7 +604,10 @@ pub enum GoldenCommand {
         /// Optional filename glob filter (e.g. "mcp_deny_*").
         #[arg(long)]
         filter: Option<String>,
-        /// Output machine-readable JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
         /// Show inline diff context for mismatches.
@@ -607,7 +622,10 @@ pub enum GoldenCommand {
         /// Optional filename glob filter (e.g. "stub_*").
         #[arg(long)]
         filter: Option<String>,
-        /// Output machine-readable JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -619,8 +637,11 @@ pub enum E2eCommand {
     /// List available E2E test suites.
     #[command(name = "list")]
     List {
-        /// Output as JSON.
-        #[arg(long)]
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
         json: bool,
         /// Show suite details (descriptions, tags).
         #[arg(long, short = 'v')]
@@ -637,8 +658,11 @@ pub enum E2eCommand {
         /// Exclude suites matching pattern (repeatable).
         #[arg(long, short = 'e')]
         exclude: Vec<String>,
-        /// Output as JSON.
-        #[arg(long)]
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
         json: bool,
         /// Keep temporary directories.
         #[arg(long)]
@@ -1509,7 +1533,10 @@ pub enum AgentsCommand {
         /// Include undetected agents in the report.
         #[arg(long, default_value_t = false)]
         include_undetected: bool,
-        /// Output as JSON (default: true).
+        /// Output format: table, json, or toon.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json, default true for detect).
         #[arg(long, default_value_t = true)]
         json: bool,
     },
@@ -1872,6 +1899,7 @@ fn execute(cli: Cli) -> CliResult<()> {
         } => handle_ci(quick, report, format, json, parallel),
         Commands::Bench {
             quick,
+            format,
             json,
             baseline,
             save_baseline,
@@ -1881,6 +1909,7 @@ fn execute(cli: Cli) -> CliResult<()> {
             runs,
         } => handle_bench(
             quick,
+            format,
             json,
             baseline,
             save_baseline,
@@ -3457,10 +3486,12 @@ fn build_golden_specs(pattern: Option<&glob::Pattern>) -> Vec<golden::GoldenComm
 fn handle_golden_capture(
     dir: Option<PathBuf>,
     filter: Option<String>,
+    format: Option<output::CliOutputFormat>,
     json: bool,
     verbose: bool,
 ) -> CliResult<()> {
     let dir = golden_default_dir(dir);
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let filter_pattern = compile_golden_filter(filter.as_deref())?;
     let specs = build_golden_specs(filter_pattern.as_ref());
     if specs.is_empty() {
@@ -3543,21 +3574,16 @@ fn handle_golden_capture(
             .map_err(|err| CliError::Other(err.to_string()))?;
     }
 
-    if json {
-        let payload = serde_json::json!({
-            "mode": "capture",
-            "directory": dir.display().to_string(),
-            "total": rows.len(),
-            "passed": rows.len().saturating_sub(failures),
-            "failed": failures,
-            "checksums_written": failures == 0,
-            "rows": rows,
-        });
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        );
-    } else {
+    let payload = serde_json::json!({
+        "mode": "capture",
+        "directory": dir.display().to_string(),
+        "total": rows.len(),
+        "passed": rows.len().saturating_sub(failures),
+        "failed": failures,
+        "checksums_written": failures == 0,
+        "rows": rows,
+    });
+    output::emit_output(&payload, fmt, || {
         output::section("Golden capture");
         for row in &rows {
             let marker = match row.status.as_str() {
@@ -3597,7 +3623,7 @@ fn handle_golden_capture(
                 failures
             );
         }
-    }
+    });
 
     if failures > 0 {
         return Err(CliError::ExitCode(1));
@@ -3608,10 +3634,12 @@ fn handle_golden_capture(
 fn handle_golden_verify(
     dir: Option<PathBuf>,
     filter: Option<String>,
+    format: Option<output::CliOutputFormat>,
     json: bool,
     verbose: bool,
 ) -> CliResult<()> {
     let dir = golden_default_dir(dir);
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let checksums_path = dir.join("checksums.sha256");
     let checksums = golden::read_checksums_file(&checksums_path).map_err(|err| {
         CliError::Other(format!(
@@ -3723,20 +3751,15 @@ fn handle_golden_verify(
         });
     }
 
-    if json {
-        let payload = serde_json::json!({
-            "mode": "verify",
-            "directory": dir.display().to_string(),
-            "total": rows.len(),
-            "passed": rows.len().saturating_sub(failures),
-            "failed": failures,
-            "rows": rows,
-        });
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        );
-    } else {
+    let payload = serde_json::json!({
+        "mode": "verify",
+        "directory": dir.display().to_string(),
+        "total": rows.len(),
+        "passed": rows.len().saturating_sub(failures),
+        "failed": failures,
+        "rows": rows,
+    });
+    output::emit_output(&payload, fmt, || {
         output::section("Golden output verification");
         let width = rows.iter().map(|row| row.filename.len()).max().unwrap_or(0);
         for row in &rows {
@@ -3771,7 +3794,7 @@ fn handle_golden_verify(
             rows.len(),
             failures
         );
-    }
+    });
 
     if failures > 0 {
         return Err(CliError::ExitCode(1));
@@ -3779,8 +3802,14 @@ fn handle_golden_verify(
     Ok(())
 }
 
-fn handle_golden_list(dir: Option<PathBuf>, filter: Option<String>, json: bool) -> CliResult<()> {
+fn handle_golden_list(
+    dir: Option<PathBuf>,
+    filter: Option<String>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
     let dir = golden_default_dir(dir);
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let filter_pattern = compile_golden_filter(filter.as_deref())?;
     let specs = build_golden_specs(filter_pattern.as_ref());
     if specs.is_empty() {
@@ -3836,18 +3865,13 @@ fn handle_golden_list(dir: Option<PathBuf>, filter: Option<String>, json: bool) 
         });
     }
 
-    if json {
-        let payload = serde_json::json!({
-            "mode": "list",
-            "directory": dir.display().to_string(),
-            "total": rows.len(),
-            "rows": rows,
-        });
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        );
-    } else {
+    let payload = serde_json::json!({
+        "mode": "list",
+        "directory": dir.display().to_string(),
+        "total": rows.len(),
+        "rows": rows,
+    });
+    output::emit_output(&payload, fmt, || {
         output::section("Golden files");
         let width = rows.iter().map(|row| row.filename.len()).max().unwrap_or(0);
         for row in &rows {
@@ -3869,7 +3893,7 @@ fn handle_golden_list(dir: Option<PathBuf>, filter: Option<String>, json: bool) 
             stale,
             rows.len()
         );
-    }
+    });
 
     Ok(())
 }
@@ -3879,16 +3903,23 @@ fn handle_golden(action: GoldenCommand) -> CliResult<()> {
         GoldenCommand::Capture {
             dir,
             filter,
+            format,
             json,
             verbose,
-        } => handle_golden_capture(dir, filter, json, verbose),
+        } => handle_golden_capture(dir, filter, format, json, verbose),
         GoldenCommand::Verify {
             dir,
             filter,
+            format,
             json,
             verbose,
-        } => handle_golden_verify(dir, filter, json, verbose),
-        GoldenCommand::List { dir, filter, json } => handle_golden_list(dir, filter, json),
+        } => handle_golden_verify(dir, filter, format, json, verbose),
+        GoldenCommand::List {
+            dir,
+            filter,
+            format,
+            json,
+        } => handle_golden_list(dir, filter, format, json),
     }
 }
 
@@ -3896,35 +3927,35 @@ fn handle_flake_triage(action: FlakeTriageCommand) -> CliResult<()> {
     use mcp_agent_mail_core::flake_triage;
 
     match action {
-        FlakeTriageCommand::Scan { dir, json } => {
+        FlakeTriageCommand::Scan { dir, format, json } => {
             let scan_dir = dir.unwrap_or_else(|| PathBuf::from("tests/artifacts"));
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let artifacts = flake_triage::scan_artifacts(&scan_dir);
 
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&artifacts)
-                        .map_err(|e| CliError::Format(e.to_string()))?
-                );
-            } else if artifacts.is_empty() {
-                println!("No failure artifacts found in {}", scan_dir.display());
-            } else {
-                println!(
-                    "Found {} failure artifact(s) in {}:\n",
-                    artifacts.len(),
-                    scan_dir.display()
-                );
-                for (i, a) in artifacts.iter().enumerate() {
-                    println!(
-                        "  [{}] {} {} ({:?})",
-                        i + 1,
-                        &a.context.failure_ts[..19.min(a.context.failure_ts.len())],
-                        a.context.test_name,
-                        a.context.category
+            output::emit_output(&artifacts, fmt, || {
+                if artifacts.is_empty() {
+                    ftui_runtime::ftui_println!(
+                        "No failure artifacts found in {}",
+                        scan_dir.display()
                     );
-                    println!("      {}", a.path.display());
+                } else {
+                    ftui_runtime::ftui_println!(
+                        "Found {} failure artifact(s) in {}:\n",
+                        artifacts.len(),
+                        scan_dir.display()
+                    );
+                    for (i, a) in artifacts.iter().enumerate() {
+                        ftui_runtime::ftui_println!(
+                            "  [{}] {} {} ({:?})",
+                            i + 1,
+                            &a.context.failure_ts[..19.min(a.context.failure_ts.len())],
+                            a.context.test_name,
+                            a.context.category
+                        );
+                        ftui_runtime::ftui_println!("      {}", a.path.display());
+                    }
                 }
-            }
+            });
             Ok(())
         }
         FlakeTriageCommand::Reproduce {
@@ -3971,8 +4002,10 @@ fn handle_flake_triage(action: FlakeTriageCommand) -> CliResult<()> {
             seeds,
             packages,
             timeout,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let config = flake_triage::MultiSeedConfig {
                 test_name,
                 num_seeds: seeds,
@@ -3985,27 +4018,23 @@ fn handle_flake_triage(action: FlakeTriageCommand) -> CliResult<()> {
             };
             let report = flake_triage::run_multi_seed_subprocess(&config);
 
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report)
-                        .map_err(|e| CliError::Format(e.to_string()))?
-                );
-            } else {
+            output::emit_output(&report, fmt, || {
                 let total = report.runs.len();
                 let passed = report.runs.iter().filter(|r| r.passed).count();
                 let failed = total - passed;
 
-                println!("Results: {passed}/{total} passed, {failed}/{total} failed");
-                println!("Verdict: {:?}", report.verdict);
+                ftui_runtime::ftui_println!(
+                    "Results: {passed}/{total} passed, {failed}/{total} failed"
+                );
+                ftui_runtime::ftui_println!("Verdict: {:?}", report.verdict);
 
                 if !report.failing_seeds.is_empty() {
-                    println!("Failing seeds: {:?}", report.failing_seeds);
+                    ftui_runtime::ftui_println!("Failing seeds: {:?}", report.failing_seeds);
                 }
                 if !report.remediation.is_empty() {
-                    println!("Remediation: {}", report.remediation);
+                    ftui_runtime::ftui_println!("Remediation: {}", report.remediation);
                 }
-            }
+            });
             Ok(())
         }
     }
@@ -5741,6 +5770,7 @@ struct BenchRunReport {
 #[allow(clippy::too_many_arguments)]
 fn handle_bench(
     quick: bool,
+    format: Option<output::CliOutputFormat>,
     json: bool,
     baseline: Option<PathBuf>,
     save_baseline: Option<PathBuf>,
@@ -5749,6 +5779,7 @@ fn handle_bench(
     warmup_override: Option<u32>,
     runs_override: Option<u32>,
 ) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let profile = if quick {
         bench::BenchProfile::Quick
     } else {
@@ -5795,29 +5826,22 @@ fn handle_bench(
     }
 
     if list {
-        if json {
-            let payload: Vec<serde_json::Value> = configs
-                .iter()
-                .map(|cfg| {
-                    serde_json::json!({
-                        "name": cfg.name,
-                        "category": cfg.category,
-                        "command": cfg.command,
-                        "warmup": cfg.warmup,
-                        "runs": cfg.runs,
-                        "requires_seeded_db": cfg.requires_seeded_db,
-                        "conditional": cfg.conditional,
-                        "condition": cfg.condition,
-                    })
+        let payload: Vec<serde_json::Value> = configs
+            .iter()
+            .map(|cfg| {
+                serde_json::json!({
+                    "name": cfg.name,
+                    "category": cfg.category,
+                    "command": cfg.command,
+                    "warmup": cfg.warmup,
+                    "runs": cfg.runs,
+                    "requires_seeded_db": cfg.requires_seeded_db,
+                    "conditional": cfg.conditional,
+                    "condition": cfg.condition,
                 })
-                .collect();
-            ftui_runtime::ftui_println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).map_err(|err| {
-                    CliError::Other(format!("failed to serialize benchmark list: {err}"))
-                })?
-            );
-        } else {
+            })
+            .collect();
+        output::emit_output(&payload, fmt, || {
             ftui_runtime::ftui_println!(
                 "Benchmarks (profile={:?}, warmup={warmup}, runs={runs}):",
                 profile
@@ -5830,7 +5854,7 @@ fn handle_bench(
                     cfg.command.join(" ")
                 );
             }
-        }
+        });
         return Ok(());
     }
 
@@ -5969,9 +5993,7 @@ fn handle_bench(
     std::fs::write(&report_path, &encoded)
         .map_err(|err| CliError::Other(format!("failed to write bench report: {err}")))?;
 
-    if json {
-        ftui_runtime::ftui_println!("{encoded}");
-    } else {
+    output::emit_output(&report, fmt, || {
         ftui_runtime::ftui_println!(
             "[bench] profile={:?} warmup={} runs={}",
             report.profile,
@@ -6015,7 +6037,7 @@ fn handle_bench(
             }
         }
         ftui_runtime::ftui_println!("report: {}", report_path.display());
-    }
+    });
 
     let _ = temp_workspace;
     if !report.failures.is_empty() {
@@ -6153,28 +6175,29 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
     let cwd = std::env::current_dir()?;
 
     match action {
-        E2eCommand::List { json, verbose } => {
+        E2eCommand::List {
+            format,
+            json,
+            verbose,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let registry = SuiteRegistry::new(&cwd)?;
 
-            if json {
-                let suites: Vec<_> = registry
-                    .suites()
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "name": s.name,
-                            "script": s.script_path,
-                            "description": s.description,
-                            "tags": s.tags,
-                            "duration_class": s.duration_class.as_str(),
-                        })
+            let suites: Vec<_> = registry
+                .suites()
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "script": s.script_path,
+                        "description": s.description,
+                        "tags": s.tags,
+                        "duration_class": s.duration_class.as_str(),
                     })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&suites).unwrap_or_default()
-                );
-            } else {
+                })
+                .collect();
+
+            output::emit_output(&suites, fmt, || {
                 ftui_runtime::ftui_println!("Available E2E test suites ({}):", registry.len());
                 ftui_runtime::ftui_println!("");
                 for suite in registry.suites() {
@@ -6194,13 +6217,14 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
                         ftui_runtime::ftui_println!("  {}", suite.name);
                     }
                 }
-            }
+            });
             Ok(())
         }
         E2eCommand::Run {
             suites,
             include,
             exclude,
+            format,
             json,
             keep_tmp,
             force_build,
@@ -6208,6 +6232,7 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
             artifacts,
             timeout,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let project_root = project.unwrap_or(cwd);
 
             let config = RunConfig {
@@ -6240,14 +6265,9 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
                 runner.run(&[]) // Run all
             };
 
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).unwrap_or_default()
-                );
-            } else {
+            output::emit_output(&report, fmt, || {
                 print!("{}", report.format_summary());
-            }
+            });
 
             if report.success() {
                 Ok(())
@@ -7982,8 +8002,10 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
         AgentsCommand::Detect {
             only,
             include_undetected,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let only_connectors = only.map(|s| {
                 s.split(',')
                     .map(|v| v.trim().to_string())
@@ -7999,12 +8021,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 
             match mcp_agent_mail_core::detect_installed_agents(&opts) {
                 Ok(report) => {
-                    if json {
-                        ftui_runtime::ftui_println!(
-                            "{}",
-                            serde_json::to_string_pretty(&report).unwrap_or_default()
-                        );
-                    } else {
+                    output::emit_output(&report, fmt, || {
                         output::section(&format!(
                             "Installed Agents ({}/{} detected):",
                             report.summary.detected_count, report.summary.total_count
@@ -8020,7 +8037,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                                 ftui_runtime::ftui_println!("    root: {path}");
                             }
                         }
-                    }
+                    });
                     Ok(())
                 }
                 Err(e) => Err(CliError::Other(format!("agent detection failed: {e}"))),
@@ -9199,6 +9216,7 @@ mod tests {
         match cli.command.expect("expected command") {
             Commands::Bench {
                 quick,
+                format,
                 json,
                 baseline,
                 save_baseline,
@@ -9208,6 +9226,7 @@ mod tests {
                 runs,
             } => {
                 assert!(quick);
+                assert!(format.is_none());
                 assert!(json);
                 assert_eq!(baseline, Some(PathBuf::from("/tmp/base.json")));
                 assert_eq!(save_baseline, Some(PathBuf::from("/tmp/new.json")));
@@ -9227,6 +9246,7 @@ mod tests {
         match cli.command.expect("expected command") {
             Commands::Bench {
                 quick,
+                format,
                 json,
                 baseline,
                 save_baseline,
@@ -9236,6 +9256,7 @@ mod tests {
                 runs,
             } => {
                 assert!(!quick);
+                assert!(format.is_none());
                 assert!(!json);
                 assert!(baseline.is_none());
                 assert!(save_baseline.is_none());
@@ -9256,6 +9277,7 @@ mod tests {
         let capture = ftui_runtime::StdioCapture::install().expect("install capture");
         let result = handle_bench(
             false,
+            None,
             true,
             None,
             None,
@@ -9287,6 +9309,7 @@ mod tests {
 
         let result = handle_bench(
             true,
+            None,
             true,
             None,
             None,
@@ -10889,7 +10912,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_creates_fts_table() {
+    fn migrate_cleans_fts_tables() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -10915,8 +10938,8 @@ mod tests {
             .filter_map(|r| r.get_named::<String>("name").ok())
             .collect();
         assert!(
-            names.iter().any(|n| n.contains("fts")),
-            "FTS table should exist after migrate; found: {names:?}"
+            names.is_empty(),
+            "FTS tables should be absent after migrate (Search V3 decommission); found: {names:?}"
         );
     }
 
@@ -13461,12 +13484,14 @@ mod tests {
                     GoldenCommand::Capture {
                         dir,
                         filter,
+                        format,
                         json,
                         verbose,
                     },
             } => {
                 assert_eq!(dir, Some(PathBuf::from("benches/golden")));
                 assert_eq!(filter, Some("am_*".to_string()));
+                assert!(format.is_none());
                 assert!(json);
                 assert!(verbose);
             }
@@ -13483,12 +13508,14 @@ mod tests {
                     GoldenCommand::Verify {
                         dir,
                         filter,
+                        format,
                         json,
                         verbose,
                     },
             } => {
                 assert!(dir.is_none());
                 assert!(filter.is_none());
+                assert!(format.is_none());
                 assert!(!json);
                 assert!(!verbose);
             }
@@ -13511,13 +13538,98 @@ mod tests {
         .unwrap();
         match cli.command.expect("expected command") {
             Commands::Golden {
-                action: GoldenCommand::List { dir, filter, json },
+                action:
+                    GoldenCommand::List {
+                        dir,
+                        filter,
+                        format,
+                        json,
+                    },
             } => {
                 assert_eq!(dir, Some(PathBuf::from("benches/golden")));
                 assert_eq!(filter, Some("mcp_deny_*".to_string()));
+                assert!(format.is_none());
                 assert!(json);
             }
             other => panic!("expected Golden List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_golden_list_format_toon() {
+        let cli = Cli::try_parse_from(["am", "golden", "list", "--format", "toon"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Golden {
+                action: GoldenCommand::List { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected Golden List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_flake_triage_scan_format_toon() {
+        let cli = Cli::try_parse_from(["am", "flake-triage", "scan", "--format", "toon"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::FlakeTriage {
+                action: FlakeTriageCommand::Scan { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected flake-triage scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_flake_triage_detect_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "flake-triage",
+            "detect",
+            "my_test",
+            "--format",
+            "toon",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::FlakeTriage {
+                action: FlakeTriageCommand::Detect { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected flake-triage detect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_e2e_list_format_toon() {
+        let cli = Cli::try_parse_from(["am", "e2e", "list", "--format", "toon"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::E2e {
+                action: E2eCommand::List { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected e2e list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_e2e_run_format_toon() {
+        let cli = Cli::try_parse_from(["am", "e2e", "run", "--format", "toon"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::E2e {
+                action: E2eCommand::Run { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected e2e run, got {other:?}"),
         }
     }
 
@@ -14447,11 +14559,14 @@ mod tests {
                     AgentsCommand::Detect {
                         only,
                         include_undetected,
-                        ..
+                        format,
+                        json,
                     },
             } => {
                 assert_eq!(only.as_deref(), Some("claude,codex"));
                 assert!(include_undetected);
+                assert!(format.is_none());
+                assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
