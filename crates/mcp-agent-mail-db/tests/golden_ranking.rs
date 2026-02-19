@@ -15,6 +15,7 @@
 
 #![allow(
     dead_code,
+    deprecated,
     clippy::cast_precision_loss,
     clippy::too_many_lines,
     clippy::missing_const_for_fn,

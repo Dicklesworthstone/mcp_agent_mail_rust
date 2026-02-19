@@ -22194,6 +22194,7 @@ fn handle_tooling_decommission_fts(
     checks.push(FtsDecommissionCheck {
         name: "search_engine_not_legacy".to_string(),
         required: true,
+        #[allow(deprecated)]
         ok: !matches!(
             config.search_rollout.engine,
             mcp_agent_mail_core::config::SearchEngine::Legacy

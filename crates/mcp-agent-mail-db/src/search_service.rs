@@ -2436,53 +2436,6 @@ fn emit_hybrid_budget_evidence(
     }
 }
 
-/// Log a comparison between FTS5 and Tantivy results in shadow mode.
-fn log_shadow_comparison(
-    fts5: &[SearchResult],
-    tantivy: &[SearchResult],
-    query: &SearchQuery,
-    fts5_latency_us: u64,
-    tantivy_latency_us: u64,
-    v3_had_error: bool,
-) {
-    let fts5_ids: Vec<i64> = fts5.iter().map(|r| r.id).collect();
-    let tantivy_ids: Vec<i64> = tantivy.iter().map(|r| r.id).collect();
-    let overlap = fts5_ids
-        .iter()
-        .filter(|id| tantivy_ids.contains(id))
-        .count();
-
-    // Compute overlap percentage (0.0 - 1.0)
-    let max_count = fts5.len().max(tantivy.len()).max(1);
-    #[allow(clippy::cast_precision_loss)]
-    let overlap_pct = overlap as f64 / max_count as f64;
-
-    // Compute latency delta (V3 - legacy) in microseconds
-    #[allow(clippy::cast_possible_wrap)]
-    let latency_delta_us = tantivy_latency_us as i64 - fts5_latency_us as i64;
-
-    // Equivalent if ≥80% overlap and no V3 errors
-    let is_equivalent = overlap_pct >= 0.8 && !v3_had_error;
-
-    // Record to global metrics
-    global_metrics()
-        .search
-        .record_shadow_comparison(is_equivalent, v3_had_error, latency_delta_us);
-
-    tracing::info!(
-        target: "search.metrics",
-        query = %query.text,
-        fts5_count = fts5.len(),
-        tantivy_count = tantivy.len(),
-        overlap_count = overlap,
-        overlap_pct = %format!("{:.1}%", overlap_pct * 100.0),
-        latency_delta_us = latency_delta_us,
-        is_equivalent = is_equivalent,
-        v3_had_error = v3_had_error,
-        "shadow search comparison"
-    );
-}
-
 fn record_legacy_error_metrics(metric_key: &str, latency_us: u64, track_telemetry: bool) {
     if track_telemetry {
         record_query(metric_key, latency_us);
@@ -2605,7 +2558,7 @@ pub async fn execute_search(
             return resp;
         }
         maybe_record_v3_fallback(engine, query);
-        // Bridge not initialized → fall through to FTS5.
+        // Bridge not initialized → fall through to SQL LIKE fallback.
     }
 
     // ── Hybrid candidate orchestration path ─────────────────────────
@@ -2715,23 +2668,13 @@ pub async fn execute_search(
             return resp;
         }
         maybe_record_v3_fallback(engine, query);
-        // No lexical bridge available yet → fall through to legacy FTS.
+        // No lexical bridge available yet → fall through to SQL LIKE fallback.
     }
 
-    // ── Shadow: pre-fetch Tantivy results for comparison ────────────
-    #[allow(deprecated)]
-    let (shadow_tantivy, shadow_tantivy_latency_us) = if engine.is_shadow() {
-        let tantivy_timer = std::time::Instant::now();
-        let results = try_tantivy_search(query);
-        let latency = u64::try_from(tantivy_timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-        (results, latency)
-    } else {
-        (None, 0)
-    };
+    // ── SQL LIKE fallback (Tantivy bridge not available) ────────────
+    // NOTE: FTS5 path removed in Search V3 decommission (br-2tnl.8.4).
+    // The planner now generates LIKE-based SQL only.
 
-    // ── FTS5 path (default + Shadow primary) ────────────────────────
-
-    // Step 1: Plan the query
     let plan = plan_search(query);
 
     if plan.method == PlanMethod::Empty {
@@ -2754,7 +2697,7 @@ pub async fn execute_search(
         return Outcome::Ok(response);
     }
 
-    // Step 2: Acquire connection
+    // Acquire connection
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => {
@@ -2765,7 +2708,7 @@ pub async fn execute_search(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    // Step 3: Execute SQL
+    // Execute SQL
     let values: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
     let rows_out = map_sql_outcome(raw_query(cx, &*conn, &plan.sql, &values).await);
 
@@ -2780,37 +2723,18 @@ pub async fn execute_search(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let fts5_latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let fallback_latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
     if options.track_telemetry {
-        record_query("search_service", fts5_latency_us);
+        record_query("search_service_like_fallback", fallback_latency_us);
     }
-    // Record legacy FTS5 metrics
     global_metrics()
         .search
-        .record_legacy_query(fts5_latency_us, false);
+        .record_legacy_query(fallback_latency_us, false);
 
-    // Step 4: Map rows to SearchResult
     let raw_results = map_rows_to_results(&rows, query.doc_kind);
-
-    // Shadow comparison logging
-    if let Some(ref tantivy_results) = shadow_tantivy {
-        let v3_had_error = tantivy_results.is_empty() && !raw_results.is_empty();
-        log_shadow_comparison(
-            &raw_results,
-            tantivy_results,
-            query,
-            fts5_latency_us,
-            shadow_tantivy_latency_us,
-            v3_had_error,
-        );
-    }
-
     let sql_row_count = raw_results.len();
-
-    // Step 5: Compute pagination cursor
     let next_cursor = compute_next_cursor(&raw_results, query.effective_limit());
 
-    // Step 6: Apply scope enforcement
     let redaction = options.redaction_policy.clone().unwrap_or_default();
     let scope_ctx = options.scope_ctx.clone().unwrap_or_else(|| ScopeContext {
         viewer: None,
@@ -2822,7 +2746,6 @@ pub async fn execute_search(
 
     let (scoped_results, audit_summary) = apply_scope(raw_results, &scope_ctx, &redaction);
 
-    // Step 7: Build explain
     let explain = if query.explain {
         let mut e = plan.explain();
         e.denied_count = audit_summary.denied_count;
@@ -2906,10 +2829,8 @@ fn finish_scoped_response(
 
 /// Execute a simple (unscoped) search — for backward compatibility with existing tools.
 ///
-/// Always uses the FTS5 engine regardless of global config. Callers that want
-/// Tantivy routing should use [`execute_search`] with [`SearchOptions::search_engine`].
-///
-/// Returns a `SearchResponse` without scope enforcement or audit.
+/// Tries Tantivy first, falls back to LIKE-based SQL if the bridge is not
+/// initialized. Returns a `SearchResponse` without scope enforcement or audit.
 ///
 /// # Errors
 ///
@@ -2922,6 +2843,9 @@ pub async fn execute_search_simple(
     let timer = std::time::Instant::now();
     let assistance = query_assistance_payload(query);
 
+    // ── SQL LIKE path ─────────────────────────────────────────────
+    // execute_search_simple always uses the SQL planner (LIKE-based).
+    // Tantivy routing is handled by execute_search via SearchOptions.
     let plan = plan_search(query);
 
     if plan.method == PlanMethod::Empty {
@@ -2967,8 +2891,7 @@ pub async fn execute_search_simple(
     };
 
     let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-    record_query("search_service_simple", latency_us);
-    // Record legacy FTS5 metrics (simple search always uses FTS5)
+    record_query("search_service_simple_like", latency_us);
     global_metrics()
         .search
         .record_legacy_query(latency_us, false);
@@ -3627,31 +3550,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shadow_comparison_logging_updates_metrics_hook() {
-        let before = global_metrics().snapshot();
-        let query = SearchQuery::messages("shadow-hook", 1);
-        let fts5 = vec![
-            result_with_score(1, 0.9),
-            result_with_score(2, 0.8),
-            result_with_score(3, 0.7),
-        ];
-        let tantivy = vec![
-            result_with_score(1, 0.88),
-            result_with_score(2, 0.77),
-            result_with_score(9, 0.66),
-        ];
-
-        log_shadow_comparison(&fts5, &tantivy, &query, 1500, 1100, false);
-
-        let after = global_metrics().snapshot();
-        assert!(
-            after.search.shadow_comparisons_total > before.search.shadow_comparisons_total,
-            "expected shadow comparison counter to increase (before={}, after={})",
-            before.search.shadow_comparisons_total,
-            after.search.shadow_comparisons_total
-        );
-    }
+    // NOTE: shadow_comparison_logging test removed — shadow mode + FTS5 decommissioned (br-2tnl.8.4)
 
     #[test]
     fn v3_fallback_records_metric() {

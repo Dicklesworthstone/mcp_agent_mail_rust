@@ -1,3 +1,9 @@
+//! Tests verifying FTS5 artifacts are fully cleaned up after v11 migrations.
+//!
+//! With the Search V3 decommission (br-2tnl.8.4), v11 migrations drop all
+//! FTS5 tables and triggers. These tests verify the migration works correctly
+//! and that `enforce_runtime_fts_cleanup` is safe on a clean database.
+
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_db::pool::{DbPool, DbPoolConfig};
@@ -5,39 +11,30 @@ use mcp_agent_mail_db::schema;
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use tempfile::tempdir;
 
-fn count_identity_fts_artifacts(conn: &SqliteConnection) -> i64 {
+fn count_fts_artifacts(conn: &SqliteConnection) -> i64 {
     let rows = conn
         .query_sync(
             "SELECT COUNT(*) AS n FROM sqlite_master \
-             WHERE (type='table' AND name IN ('fts_agents', 'fts_projects')) \
+             WHERE (type='table' AND name LIKE 'fts_%') \
                 OR (type='trigger' AND name IN (\
+                    'messages_ai', 'messages_ad', 'messages_au', \
                     'agents_ai', 'agents_ad', 'agents_au', \
                     'projects_ai', 'projects_ad', 'projects_au'\
                 ))",
             &[],
         )
-        .expect("query identity FTS artifacts");
+        .expect("query FTS artifacts");
     rows.first()
         .and_then(|row| row.get_named::<i64>("n").ok())
         .unwrap_or_default()
 }
 
-fn count_message_fts_triggers(conn: &SqliteConnection) -> i64 {
-    let rows = conn
-        .query_sync(
-            "SELECT COUNT(*) AS n FROM sqlite_master \
-             WHERE type='trigger' AND name IN ('messages_ai', 'messages_ad', 'messages_au')",
-            &[],
-        )
-        .expect("query message FTS trigger artifacts");
-    rows.first()
-        .and_then(|row| row.get_named::<i64>("n").ok())
-        .unwrap_or_default()
-}
-
-fn create_fixture_with_identity_fts(db_path: &std::path::Path) {
-    let db_path_str = db_path.display().to_string();
-    let conn = SqliteConnection::open_file(db_path_str).expect("open fixture db");
+#[test]
+fn v11_migration_drops_all_fts_artifacts() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("v11_fts_cleanup.db");
+    let conn =
+        SqliteConnection::open_file(db_path.display().to_string()).expect("open fixture db");
     conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
         .expect("apply init pragmas");
 
@@ -52,55 +49,48 @@ fn create_fixture_with_identity_fts(db_path: &std::path::Path) {
             .expect("apply full migrations");
     });
 
-    assert!(
-        count_identity_fts_artifacts(&conn) > 0,
-        "fixture should contain identity FTS artifacts before startup cleanup"
+    assert_eq!(
+        count_fts_artifacts(&conn),
+        0,
+        "v11 migrations must drop all FTS tables and triggers"
     );
 }
 
 #[test]
-fn base_mode_cleanup_strips_identity_and_message_fts_artifacts() {
+fn base_mode_cleanup_is_safe_on_clean_db() {
     let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("identity_fts_cleanup.db");
-    let db_path_str = db_path.display().to_string();
+    let db_path = dir.path().join("base_mode_clean.db");
+    let conn =
+        SqliteConnection::open_file(db_path.display().to_string()).expect("open fixture db");
+    conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
+        .expect("apply init pragmas");
 
-    // Build a fixture DB that has full migrations (including identity and message FTS).
-    create_fixture_with_identity_fts(&db_path);
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    let cx = Cx::for_testing();
+    rt.block_on(async {
+        schema::migrate_to_latest(&cx, &conn)
+            .await
+            .into_result()
+            .expect("apply full migrations");
+    });
 
-    let conn = SqliteConnection::open_file(db_path_str).expect("reopen db");
-    schema::enforce_base_mode_cleanup(&conn).expect("base mode cleanup");
-
-    assert_eq!(
-        count_identity_fts_artifacts(&conn),
-        0,
-        "base mode cleanup must remove identity FTS artifacts to prevent rowid corruption regressions"
-    );
-    assert_eq!(
-        count_message_fts_triggers(&conn),
-        0,
-        "base mode cleanup must remove message FTS triggers to keep base-mode readers safe"
-    );
+    // enforce_runtime_fts_cleanup should be safe even when FTS is already gone
+    schema::enforce_runtime_fts_cleanup(&conn).expect("base mode cleanup on clean db");
+    assert_eq!(count_fts_artifacts(&conn), 0);
 }
 
 #[test]
-fn startup_runtime_strips_identity_fts_and_keeps_message_triggers() {
+fn pool_startup_produces_clean_fts_state() {
     let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("identity_fts_cleanup_no_migrations.db");
-    let db_path_str = db_path.display().to_string();
+    let db_path = dir.path().join("pool_startup_clean.db");
     let db_url = format!("sqlite:///{}", db_path.display());
-    create_fixture_with_identity_fts(&db_path);
 
     let config = DbPoolConfig {
         database_url: db_url,
         ..Default::default()
     };
-    let parsed_path = config
-        .sqlite_path()
-        .expect("parse sqlite path from database_url");
-    assert_eq!(
-        parsed_path, db_path_str,
-        "pool config must resolve to the same fixture DB path"
-    );
     let pool = DbPool::new(&config).expect("create pool");
 
     let rt = RuntimeBuilder::current_thread()
@@ -112,61 +102,13 @@ fn startup_runtime_strips_identity_fts_and_keeps_message_triggers() {
     });
     drop(pool);
 
-    let conn = SqliteConnection::open_file(parsed_path).expect("reopen db");
-    assert_eq!(
-        count_message_fts_triggers(&conn),
-        3,
-        "startup must keep message FTS triggers for runtime connections"
-    );
-    assert_eq!(
-        count_identity_fts_artifacts(&conn),
-        0,
-        "startup must remove identity FTS artifacts in runtime mode"
-    );
-}
-
-#[test]
-fn startup_runtime_strips_identity_fts_with_migrations_disabled() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir
-        .path()
-        .join("identity_fts_cleanup_migrations_disabled.db");
-    let db_path_str = db_path.display().to_string();
-    let db_url = format!("sqlite:///{}", db_path.display());
-    create_fixture_with_identity_fts(&db_path);
-
-    let config = DbPoolConfig {
-        database_url: db_url,
-        run_migrations: false,
-        ..Default::default()
-    };
     let parsed_path = config
         .sqlite_path()
         .expect("parse sqlite path from database_url");
-    assert_eq!(
-        parsed_path, db_path_str,
-        "pool config must resolve to the same fixture DB path"
-    );
-    let pool = DbPool::new(&config).expect("create pool");
-
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    let cx = Cx::for_testing();
-    rt.block_on(async {
-        let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
-    });
-    drop(pool);
-
     let conn = SqliteConnection::open_file(parsed_path).expect("reopen db");
     assert_eq!(
-        count_message_fts_triggers(&conn),
-        3,
-        "startup must keep message FTS triggers even when migrations are disabled"
-    );
-    assert_eq!(
-        count_identity_fts_artifacts(&conn),
+        count_fts_artifacts(&conn),
         0,
-        "startup must remove identity FTS artifacts even when migrations are disabled"
+        "pool startup should leave no FTS artifacts"
     );
 }

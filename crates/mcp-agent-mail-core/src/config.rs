@@ -282,10 +282,11 @@ impl std::fmt::Display for AppEnvironment {
 /// - `Shadow` — (deprecated) run both and compare; use `SearchShadowMode` instead
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchEngine {
-    /// `SQLite` FTS5 (legacy, current default for stability)
-    #[default]
+    /// `SQLite` FTS5 (legacy, **deprecated** — Tantivy is now default)
+    #[deprecated(since = "0.3.0", note = "FTS5 path removed; use Lexical or Hybrid")]
     Legacy,
-    /// Tantivy-based lexical search (Search V3)
+    /// Tantivy-based lexical search (Search V3, default)
+    #[default]
     Lexical,
     /// Vector embedding search (requires semantic feature)
     Semantic,
@@ -306,13 +307,14 @@ impl SearchEngine {
     pub fn parse(value: &str) -> Self {
         #[allow(deprecated)]
         match value.trim().to_ascii_lowercase().as_str() {
-            "legacy" | "fts5" | "fts" | "sqlite" => Self::Legacy,
+            // Legacy aliases map to Lexical (FTS5 path removed in br-2tnl.8.4)
+            "legacy" | "fts5" | "fts" | "sqlite" => Self::Lexical,
             "lexical" | "tantivy" | "v3" => Self::Lexical,
             "semantic" | "vector" | "embedding" => Self::Semantic,
             "hybrid" | "fusion" => Self::Hybrid,
             "auto" | "adaptive" => Self::Auto,
             "shadow" => Self::Shadow,
-            _ => Self::Legacy,
+            _ => Self::Lexical,
         }
     }
 
@@ -409,15 +411,15 @@ impl std::fmt::Display for SearchShadowMode {
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SearchRolloutConfig {
-    /// Primary search engine (default: Legacy).
+    /// Primary search engine (default: Lexical/Tantivy).
     pub engine: SearchEngine,
-    /// Shadow comparison mode (default: Off).
+    /// Shadow comparison mode (default: Off, deprecated with FTS removal).
     pub shadow_mode: SearchShadowMode,
     /// Kill switch for semantic search tier (default: false).
     pub semantic_enabled: bool,
     /// Kill switch for reranking tier (default: false).
     pub rerank_enabled: bool,
-    /// Fall back to legacy FTS on V3 error (default: true).
+    /// Fall back to SQL LIKE on Tantivy error (default: true).
     pub fallback_on_error: bool,
     /// Kill switch for post-fusion diversity reranking (default: true).
     pub diversity_enabled: bool,
@@ -454,7 +456,7 @@ impl SearchRolloutConfig {
 
         // Apply kill switch degradation
         match base {
-            SearchEngine::Semantic if !self.semantic_enabled => SearchEngine::Legacy,
+            SearchEngine::Semantic if !self.semantic_enabled => SearchEngine::Lexical,
             SearchEngine::Hybrid | SearchEngine::Auto if !self.semantic_enabled => {
                 SearchEngine::Lexical
             }
@@ -3073,10 +3075,11 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn search_engine_parse_all_aliases() {
-        assert_eq!(SearchEngine::parse("legacy"), SearchEngine::Legacy);
-        assert_eq!(SearchEngine::parse("fts5"), SearchEngine::Legacy);
-        assert_eq!(SearchEngine::parse("fts"), SearchEngine::Legacy);
-        assert_eq!(SearchEngine::parse("sqlite"), SearchEngine::Legacy);
+        // Legacy aliases now map to Lexical (FTS5 decommissioned in br-2tnl.8.4)
+        assert_eq!(SearchEngine::parse("legacy"), SearchEngine::Lexical);
+        assert_eq!(SearchEngine::parse("fts5"), SearchEngine::Lexical);
+        assert_eq!(SearchEngine::parse("fts"), SearchEngine::Lexical);
+        assert_eq!(SearchEngine::parse("sqlite"), SearchEngine::Lexical);
         assert_eq!(SearchEngine::parse("lexical"), SearchEngine::Lexical);
         assert_eq!(SearchEngine::parse("tantivy"), SearchEngine::Lexical);
         assert_eq!(SearchEngine::parse("v3"), SearchEngine::Lexical);
@@ -3088,9 +3091,9 @@ mod tests {
         assert_eq!(SearchEngine::parse("auto"), SearchEngine::Auto);
         assert_eq!(SearchEngine::parse("adaptive"), SearchEngine::Auto);
         assert_eq!(SearchEngine::parse("shadow"), SearchEngine::Shadow);
-        // Unknown falls back to Legacy
-        assert_eq!(SearchEngine::parse("unknown"), SearchEngine::Legacy);
-        assert_eq!(SearchEngine::parse(""), SearchEngine::Legacy);
+        // Unknown falls back to Lexical
+        assert_eq!(SearchEngine::parse("unknown"), SearchEngine::Lexical);
+        assert_eq!(SearchEngine::parse(""), SearchEngine::Lexical);
         // Case insensitive
         assert_eq!(SearchEngine::parse("HYBRID"), SearchEngine::Hybrid);
         assert_eq!(SearchEngine::parse("  Semantic  "), SearchEngine::Semantic);
@@ -3207,6 +3210,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn effective_engine_per_surface_override() {
         let mut cfg = SearchRolloutConfig {
             engine: SearchEngine::Legacy,
@@ -3229,7 +3233,7 @@ mod tests {
             semantic_enabled: false,
             ..SearchRolloutConfig::default()
         };
-        assert_eq!(cfg.effective_engine("any"), SearchEngine::Legacy);
+        assert_eq!(cfg.effective_engine("any"), SearchEngine::Lexical);
     }
 
     #[test]

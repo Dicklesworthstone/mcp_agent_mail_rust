@@ -302,10 +302,10 @@ fn seed_parity_corpus(pool: &DbPool) -> (i64, i64, i64) {
 #[test]
 fn conformance_method_selection() {
     let cases: Vec<(&str, Option<i64>, PlanMethod)> = vec![
-        // FTS: non-empty text that sanitizes to something
-        ("migration", Some(1), PlanMethod::Fts),
-        ("database schema", Some(1), PlanMethod::Fts),
-        ("FTS5 OR sqlite", Some(1), PlanMethod::Fts),
+        // LIKE: non-empty text that sanitizes to something
+        ("migration", Some(1), PlanMethod::Like),
+        ("database schema", Some(1), PlanMethod::Like),
+        ("FTS5 OR sqlite", Some(1), PlanMethod::Like),
         // Empty: no text, no facets
         ("", None, PlanMethod::Empty),
         // FilterOnly: no text but has facets
@@ -396,12 +396,13 @@ fn conformance_explain_contract() {
     let plan = plan_search(&q);
     let explain = plan.explain();
 
-    assert_eq!(explain.method, "fts5");
-    assert!(explain.normalized_query.is_some());
+    assert_eq!(explain.method, "like_fallback");
+    // LIKE path does not produce a normalized_query (no FTS normalization step).
+    assert!(explain.normalized_query.is_none());
     assert!(!explain.sql.is_empty());
     assert!(explain.facets_applied.contains(&"project_id".to_string()));
     assert!(explain.facet_count >= 1);
-    assert!(!explain.used_like_fallback);
+    assert!(explain.used_like_fallback);
 }
 
 /// Verify cursor encode/decode is lossless.
@@ -488,7 +489,7 @@ fn conformance_limit_clamping() {
 ///
 /// Agent and Project searches use LIKE fallback because identity FTS tables
 /// (`fts_agents`, `fts_projects`) are dropped at runtime by
-/// `enforce_runtime_identity_fts_cleanup`.  Only Message search uses FTS.
+/// `enforce_runtime_fts_cleanup`. Message search now uses Tantivy (Search V3).
 #[test]
 fn conformance_doc_kinds() {
     for kind in [DocKind::Message, DocKind::Agent, DocKind::Project] {
@@ -500,7 +501,7 @@ fn conformance_doc_kinds() {
         };
         let plan = plan_search(&q);
         let expected_method = match kind {
-            DocKind::Message | DocKind::Thread => PlanMethod::Fts,
+            DocKind::Message | DocKind::Thread => PlanMethod::Like,
             DocKind::Agent | DocKind::Project => PlanMethod::Like,
         };
         assert_eq!(
@@ -863,11 +864,11 @@ fn parity_plan_vs_execute() {
             );
         }
 
-        // FTS queries should return results for seeded content
-        if plan.method == PlanMethod::Fts && *doc_kind == DocKind::Message {
+        // LIKE queries should return results for seeded content
+        if plan.method == PlanMethod::Like && *doc_kind == DocKind::Message {
             assert!(
                 !response.results.is_empty(),
-                "FTS query {text:?} returned 0 results against seeded corpus"
+                "LIKE query {text:?} returned 0 results against seeded corpus"
             );
         }
 

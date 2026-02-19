@@ -24,7 +24,8 @@
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::similar_names,
-    clippy::redundant_clone
+    clippy::redundant_clone,
+    deprecated
 )]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -350,7 +351,7 @@ fn v3_conformance_planner_fts_selection() {
         ..Default::default()
     };
     let plan = plan_search(&q);
-    assert_eq!(plan.method, PlanMethod::Fts, "text query should use FTS");
+    assert_eq!(plan.method, PlanMethod::Like, "text query should use LIKE");
     assert!(plan.facets_applied.contains(&"project_id".to_string()));
 }
 
@@ -1149,10 +1150,10 @@ fn v3_conformance_project_isolation() {
 #[test]
 fn v3_conformance_engine_alias_parsing() {
     let cases = [
-        ("legacy", SearchEngine::Legacy),
-        ("fts5", SearchEngine::Legacy),
-        ("fts", SearchEngine::Legacy),
-        ("sqlite", SearchEngine::Legacy),
+        ("legacy", SearchEngine::Lexical),
+        ("fts5", SearchEngine::Lexical),
+        ("fts", SearchEngine::Lexical),
+        ("sqlite", SearchEngine::Lexical),
         ("lexical", SearchEngine::Lexical),
         ("tantivy", SearchEngine::Lexical),
         ("v3", SearchEngine::Lexical),

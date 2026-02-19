@@ -10,7 +10,8 @@
     clippy::too_many_lines,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,
-    clippy::redundant_clone
+    clippy::redundant_clone,
+    deprecated
 )]
 
 use asupersync::runtime::RuntimeBuilder;
@@ -600,6 +601,8 @@ fn search_scoped_with_telemetry() {
         };
         let opts = SearchOptions {
             track_telemetry: true,
+            // Force SQL path — test data is in SQLite only, not Tantivy index.
+            search_engine: Some(SearchEngine::Legacy),
             ..Default::default()
         };
         execute_search(&cx, &pool2, &query, &opts).await
@@ -744,8 +747,8 @@ fn search_engine_legacy_routes_to_fts_even_with_bridge_available() {
         execute_search(&cx, &pool2, &query, &opts).await
     });
 
-    // Legacy mode routes through FTS layer. With FTS tables present, it succeeds
-    // (returns empty results since no matching data exists).
+    // Legacy mode routes through LIKE fallback (FTS5 decommissioned).
+    // Returns empty results since no matching data exists.
     match result {
         Outcome::Ok(resp) => {
             assert!(

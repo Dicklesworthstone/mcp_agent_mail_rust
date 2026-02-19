@@ -589,9 +589,9 @@ pub enum PlanParam {
 /// What query strategy the planner chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanMethod {
-    /// FTS5 MATCH with BM25 ranking.
-    Fts,
-    /// LIKE fallback (FTS query was malformed or empty).
+    /// Text-matched search with relevance ranking (Tantivy BM25 or similar).
+    TextMatch,
+    /// LIKE fallback (query was malformed or empty after sanitization).
     Like,
     /// No text search, just filter/sort.
     FilterOnly,
@@ -603,7 +603,7 @@ impl PlanMethod {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Fts => "fts5",
+            Self::TextMatch => "text_match",
             Self::Like => "like_fallback",
             Self::FilterOnly => "filter_only",
             Self::Empty => "empty",
@@ -615,12 +615,17 @@ impl PlanMethod {
 // Planner implementation
 // ────────────────────────────────────────────────────────────────────
 
-use crate::queries::{extract_like_terms, sanitize_fts_query};
+use crate::queries::extract_like_terms;
 
 /// Plan a search query into SQL + params.
 ///
 /// This function does NOT execute the query — it produces a [`SearchPlan`]
 /// that the caller can execute against a database connection.
+///
+/// **Note:** As of Search V3, this planner only generates LIKE-based SQL
+/// for fallback scenarios. Primary text search is handled by the Tantivy
+/// engine. The planner is still used for facet-only, cursor pagination,
+/// and agent/project searches.
 ///
 /// Scope enforcement via SQL WHERE clauses is applied when the query has
 /// a `ProjectSet` scope policy. `CallerScoped` enforcement is deferred
@@ -683,19 +688,10 @@ const fn empty_plan_sql(kind: DocKind) -> &'static str {
 #[allow(clippy::too_many_lines)]
 fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     let limit = query.effective_limit();
-    let sanitized = if query.text.is_empty() {
-        None
-    } else {
-        sanitize_fts_query(&query.text)
-    };
     let mut facets_applied = Vec::new();
 
-    // Determine method
-    let has_text = sanitized.is_some();
-    let method = if has_text {
-        PlanMethod::Fts
-    } else if !query.text.is_empty() {
-        // Had text but sanitization killed it — try LIKE
+    // Determine method — LIKE-based SQL only (Tantivy handles relevance search).
+    let method = if !query.text.is_empty() {
         let terms = extract_like_terms(&query.text, 5);
         if terms.is_empty() {
             PlanMethod::Empty
@@ -718,25 +714,9 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     let mut where_clauses: Vec<String> = Vec::new();
 
     // ── SELECT + FROM + JOIN ───────────────────────────────────────
+    // NOTE: FTS5 MATCH SQL was removed in Search V3 decommission (br-2tnl.8.4).
+    // The planner now only generates LIKE-based SQL for fallback.
     let (select_cols, from_clause, order_clause) = match method {
-        PlanMethod::Fts => {
-            let sanitized_text = sanitized.as_ref().unwrap();
-            // FTS query param for MATCH
-            where_clauses.push("fts_messages MATCH ?".to_string());
-            params.push(PlanParam::Text(sanitized_text.clone()));
-
-            (
-                "m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
-                 m.thread_id, a.name AS from_name, m.body_md, m.project_id, \
-                 bm25(fts_messages, 10.0, 1.0) AS score"
-                    .to_string(),
-                "fts_messages \
-                 JOIN messages m ON m.id = fts_messages.message_id \
-                 JOIN agents a ON a.id = m.sender_id"
-                    .to_string(),
-                "ORDER BY score ASC, m.id ASC".to_string(),
-            )
-        }
         PlanMethod::Like => {
             let terms = extract_like_terms(&query.text, 5);
             let mut like_parts = Vec::new();
@@ -758,7 +738,9 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
                  0.0 AS score"
                     .to_string(),
                 "messages m JOIN agents a ON a.id = m.sender_id".to_string(),
-                "ORDER BY m.created_ts DESC, m.id ASC".to_string(),
+                // Use score ASC, id ASC for cursor-based pagination compatibility.
+                // All LIKE results have score=0.0, so this orders by id ASC.
+                "ORDER BY score ASC, m.id ASC".to_string(),
             )
         }
         PlanMethod::FilterOnly => (
@@ -773,7 +755,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
                 }
             },
         ),
-        PlanMethod::Empty => unreachable!(),
+        PlanMethod::Empty | PlanMethod::TextMatch => unreachable!(),
     };
 
     // ── Scope filters ──────────────────────────────────────────────
@@ -895,7 +877,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         sql,
         params,
         method,
-        normalized_query: sanitized,
+        normalized_query: None,
         facets_applied,
         scope_enforced,
         scope_label,
@@ -1368,24 +1350,22 @@ mod tests {
         assert_eq!(plan.method, PlanMethod::Empty);
     }
 
-    // ── plan_search: FTS path ──────────────────────────────────────
+    // ── plan_search: text query (LIKE path) ─────────────────────────
 
     #[test]
-    fn plan_fts_message_search() {
+    fn plan_text_message_search() {
         let q = SearchQuery::messages("hello world", 1);
         let plan = plan_search(&q);
-        assert_eq!(plan.method, PlanMethod::Fts);
-        assert!(plan.sql.contains("fts_messages MATCH ?"));
-        assert!(plan.sql.contains("bm25(fts_messages"));
+        assert_eq!(plan.method, PlanMethod::Like);
+        assert!(plan.sql.contains("LIKE ?"));
         assert!(plan.sql.contains("m.project_id = ?"));
-        assert!(plan.normalized_query.is_some());
     }
 
     #[test]
-    fn plan_fts_product_search() {
+    fn plan_text_product_search() {
         let q = SearchQuery::product_messages("needle", 7);
         let plan = plan_search(&q);
-        assert_eq!(plan.method, PlanMethod::Fts);
+        assert_eq!(plan.method, PlanMethod::Like);
         assert!(plan.sql.contains("product_project_links"));
         assert!(plan.facets_applied.contains(&"product_id".to_string()));
     }
@@ -1542,9 +1522,8 @@ mod tests {
         let q = SearchQuery::messages("test", 1);
         let plan = plan_search(&q);
         let explain = plan.explain();
-        assert_eq!(explain.method, "fts5");
-        assert!(!explain.used_like_fallback);
-        assert!(explain.normalized_query.is_some());
+        assert_eq!(explain.method, "like_fallback");
+        assert!(explain.used_like_fallback);
         assert!(!explain.sql.is_empty());
     }
 
@@ -1564,7 +1543,7 @@ mod tests {
 
     #[test]
     fn plan_method_as_str() {
-        assert_eq!(PlanMethod::Fts.as_str(), "fts5");
+        assert_eq!(PlanMethod::TextMatch.as_str(), "text_match");
         assert_eq!(PlanMethod::Like.as_str(), "like_fallback");
         assert_eq!(PlanMethod::FilterOnly.as_str(), "filter_only");
         assert_eq!(PlanMethod::Empty.as_str(), "empty");
@@ -1646,7 +1625,7 @@ mod tests {
             max_ts: Some(999),
         };
         let plan = plan_search(&q);
-        assert_eq!(plan.method, PlanMethod::Fts);
+        assert_eq!(plan.method, PlanMethod::Like);
         // All facets should be in the SQL
         assert!(plan.sql.contains("m.importance IN (?)"));
         assert!(plan.sql.contains("m.thread_id = ?"));
@@ -1734,7 +1713,7 @@ mod tests {
             allowed_project_ids: vec![1, 2, 3],
         };
         let plan = plan_search(&q);
-        assert_eq!(plan.method, PlanMethod::Fts);
+        assert_eq!(plan.method, PlanMethod::Like);
         assert!(plan.sql.contains("m.project_id IN (?, ?, ?)"));
         assert!(plan.scope_enforced);
         assert!(

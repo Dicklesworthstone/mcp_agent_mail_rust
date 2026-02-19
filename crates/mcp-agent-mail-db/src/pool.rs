@@ -391,9 +391,9 @@ impl DbPool {
                                     // artifacts. These can be reintroduced by historical/full
                                     // migration paths and have caused post-crash rowid/index
                                     // mismatch failures (e.g. fts_projects corruption paths).
-                                    // Use the runtime variant so message FTS triggers stay intact.
+                                    // Drop all FTS artifacts (Tantivy handles search now).
                                     if let Err(e) =
-                                        schema::enforce_runtime_identity_fts_cleanup(&mig_conn)
+                                        schema::enforce_runtime_fts_cleanup(&mig_conn)
                                     {
                                         return Err(Outcome::Err(e));
                                     }
@@ -1398,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_startup_preserves_fts_tables_for_search() {
+    fn pool_startup_drops_fts_tables() {
         use asupersync::runtime::RuntimeBuilder;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1406,7 +1406,7 @@ mod tests {
         let db_url = format!("sqlite:///{}", db_path.display());
         let db_path_str = db_path.display().to_string();
 
-        // Create pool - should run full migrations including FTS
+        // Create pool - runs migrations + FTS cleanup
         let pool = DbPool::new(&DbPoolConfig {
             database_url: db_url,
             ..Default::default()
@@ -1424,7 +1424,7 @@ mod tests {
         });
         drop(pool);
 
-        // Verify FTS tables exist after pool startup
+        // Verify FTS tables are dropped after pool startup (Tantivy handles search)
         let conn =
             sqlmodel_sqlite::SqliteConnection::open_file(db_path_str).expect("reopen sqlite db");
         let fts_rows = conn
@@ -1439,8 +1439,8 @@ mod tests {
             .and_then(|row| row.get_named::<i64>("n").ok())
             .unwrap_or_default();
         assert_eq!(
-            fts_count, 1,
-            "pool startup should create fts_messages table for search functionality"
+            fts_count, 0,
+            "pool startup should drop fts_messages table (Tantivy handles search)"
         );
     }
 

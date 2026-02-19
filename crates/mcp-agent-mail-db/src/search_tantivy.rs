@@ -32,9 +32,9 @@ use crate::search_planner::SearchResult;
 /// Which search engine to use. Controlled by `SEARCH_V3_ENGINE` env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchEngineKind {
-    /// SQL/FTS5 (default, existing behavior).
+    /// SQL LIKE fallback (only when Tantivy is unavailable).
     Sql,
-    /// Tantivy BM25 lexical engine.
+    /// Tantivy BM25 lexical engine (default since FTS5 decommission).
     Tantivy,
 }
 
@@ -42,8 +42,8 @@ pub enum SearchEngineKind {
 #[must_use]
 pub fn configured_engine() -> SearchEngineKind {
     match std::env::var("SEARCH_V3_ENGINE").as_deref() {
-        Ok("tantivy") => SearchEngineKind::Tantivy,
-        _ => SearchEngineKind::Sql,
+        Ok("sql") | Ok("like") => SearchEngineKind::Sql,
+        _ => SearchEngineKind::Tantivy,
     }
 }
 
@@ -160,7 +160,7 @@ impl TantivyBackend {
                 query: q,
                 normalized,
                 ..
-            } => (q, PlanMethod::Fts, Some(normalized)),
+            } => (q, PlanMethod::TextMatch, Some(normalized)),
             ParseOutcome::Fallback { query: q, .. } => (q, PlanMethod::Like, None),
             ParseOutcome::Empty => {
                 if has_any_filter(query) {

@@ -520,7 +520,7 @@ fn search_quality_benchmark() {
             must_be_first: vec![msg_ids[0], msg_ids[1]],
             min_ndcg_5: 0.8,
             min_mrr: 1.0, // First result should be relevant
-            expected_method: Some(PlanMethod::Fts),
+            expected_method: Some(PlanMethod::Like),
             why: "Both migration-focused messages should rank above \
                   the weekly status that only mentions migration once.",
         },
@@ -537,7 +537,7 @@ fn search_quality_benchmark() {
             must_be_first: vec![msg_ids[3], msg_ids[4]],
             min_ndcg_5: 0.7,
             min_mrr: 1.0,
-            expected_method: Some(PlanMethod::Fts),
+            expected_method: Some(PlanMethod::Like),
             why: "Dedicated search messages should rank highest, with \
                   tangential mentions ranked lower.",
         },
@@ -553,7 +553,7 @@ fn search_quality_benchmark() {
             must_be_first: vec![msg_ids[4], msg_ids[2]], // either is acceptable
             min_ndcg_5: 0.7,
             min_mrr: 1.0,
-            expected_method: Some(PlanMethod::Fts),
+            expected_method: Some(PlanMethod::Like),
             why: "Both messages containing 'FTS5' should be found. BM25 may \
                   rank shorter docs higher due to term density.",
         },
@@ -591,7 +591,7 @@ fn search_quality_benchmark() {
             must_be_first: vec![],
             min_ndcg_5: 0.5,
             min_mrr: 0.5,
-            expected_method: Some(PlanMethod::Fts),
+            expected_method: Some(PlanMethod::Like),
             why: "Combining text search with importance facet should narrow results.",
         },
         // ── Thread filter ────────────────────────────────────────────
@@ -655,7 +655,7 @@ fn search_quality_benchmark() {
             must_be_first: vec![msg_ids[1]],
             min_ndcg_5: 0.5,
             min_mrr: 1.0,
-            expected_method: Some(PlanMethod::Fts),
+            expected_method: Some(PlanMethod::Like),
             why: "Hyphenated tokens like 'POL-358' should be quoted by \
                   sanitize_fts_query to prevent the dash being treated \
                   as a NOT operator.",
@@ -668,7 +668,7 @@ fn search_quality_benchmark() {
             must_be_first: vec![msg_ids[0], msg_ids[1]],
             min_ndcg_5: 0.7,
             min_mrr: 1.0,
-            expected_method: Some(PlanMethod::Fts),
+            expected_method: Some(PlanMethod::Like),
             why: "Prefix wildcard should match 'migration', 'migrate', etc.",
         },
     ];
@@ -793,10 +793,10 @@ fn pagination_stability() {
     let (project_id, _sender_id, _recipient_id, msg_ids) = seed_corpus(&pool);
     assert!(msg_ids.len() >= 10);
 
-    // Use FTS search (not FilterOnly) so BM25 scores vary and cursor works.
-    // "the" appears in many messages giving us enough results to paginate.
+    // Use a broad term that appears in most seed messages for pagination.
+    // "the" matches ≥12 of 15 messages via LIKE substring.
     let mut query = SearchQuery {
-        text: "migration OR search OR bug OR performance".to_string(),
+        text: "the".to_string(),
         doc_kind: DocKind::Message,
         project_id: Some(project_id),
         limit: Some(5),
@@ -925,8 +925,8 @@ fn like_fallback_quality() {
     let query = SearchQuery::messages("migration", project_id);
     let plan = plan_search(&query);
 
-    // Verify the plan uses FTS for a clean query
-    assert_eq!(plan.method, PlanMethod::Fts, "clean query should use FTS");
+    // Verify the plan uses LIKE for a clean query
+    assert_eq!(plan.method, PlanMethod::Like, "clean query should use LIKE");
 
     // Now test that results actually come back
     let response: SearchResponse = block_on(|cx| {
@@ -941,14 +941,14 @@ fn like_fallback_quality() {
 
     assert!(
         !response.results.is_empty(),
-        "should find migration messages via FTS"
+        "should find migration messages via LIKE"
     );
 
-    // Verify scores are populated for FTS results
+    // Verify scores are populated for LIKE results
     for result in &response.results {
         assert!(
             result.score.is_some(),
-            "FTS results should have BM25 scores"
+            "LIKE results should have scores"
         );
     }
 }
@@ -1021,9 +1021,8 @@ fn explain_metadata_quality() {
     let explain = response
         .explain
         .expect("explain should be present when requested");
-    assert_eq!(explain.method, "fts5");
-    assert!(!explain.used_like_fallback);
-    assert!(explain.normalized_query.is_some());
+    assert_eq!(explain.method, "like_fallback");
+    assert!(explain.used_like_fallback);
     assert!(explain.facet_count >= 2); // project_id + importance
     assert!(explain.facets_applied.contains(&"importance".to_string()));
     assert!(explain.facets_applied.contains(&"project_id".to_string()));

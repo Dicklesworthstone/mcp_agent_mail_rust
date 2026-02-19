@@ -61,8 +61,9 @@ fn make_result(id: i64, project_id: i64) -> SearchResult {
 #[test]
 fn method_fts_when_sanitizable_text() {
     let plan = plan_search(&msg_query("hello world", 1));
-    assert_eq!(plan.method, PlanMethod::Fts);
-    assert!(plan.normalized_query.is_some());
+    assert_eq!(plan.method, PlanMethod::Like);
+    // LIKE path does not produce a normalized_query (no FTS normalization step).
+    assert!(plan.normalized_query.is_none());
 }
 
 #[test]
@@ -74,7 +75,7 @@ fn method_like_when_sanitization_fails_but_terms_exist() {
     // sanitize_fts_query strips parens; "ab" is ≥2 chars so it should survive
     // Method depends on whether sanitization produces a result
     assert!(
-        plan.method == PlanMethod::Fts || plan.method == PlanMethod::Like,
+        plan.method == PlanMethod::TextMatch || plan.method == PlanMethod::Like,
         "expected Fts or Like, got {:?}",
         plan.method
     );
@@ -202,43 +203,57 @@ fn method_filter_only_with_each_individual_facet() {
 #[test]
 fn parser_normal_words() {
     let plan = plan_search(&msg_query("hello world", 1));
-    assert_eq!(plan.method, PlanMethod::Fts);
-    let nq = plan.normalized_query.unwrap();
-    assert!(nq.contains("hello"));
-    assert!(nq.contains("world"));
+    assert_eq!(plan.method, PlanMethod::Like);
+    // LIKE path stores terms in params, not normalized_query.
+    assert!(plan.normalized_query.is_none());
+    let param_strs: Vec<_> = plan.params.iter().filter_map(|p| match p {
+        PlanParam::Text(s) => Some(s.as_str()),
+        _ => None,
+    }).collect();
+    assert!(param_strs.iter().any(|s| s.contains("hello")));
+    assert!(param_strs.iter().any(|s| s.contains("world")));
 }
 
 #[test]
 fn parser_single_word() {
     let plan = plan_search(&msg_query("deployment", 1));
-    assert_eq!(plan.method, PlanMethod::Fts);
-    assert!(
-        plan.normalized_query
-            .as_deref()
-            .unwrap()
-            .contains("deployment")
-    );
+    assert_eq!(plan.method, PlanMethod::Like);
+    // LIKE path stores terms in params, not normalized_query.
+    assert!(plan.normalized_query.is_none());
+    let param_strs: Vec<_> = plan.params.iter().filter_map(|p| match p {
+        PlanParam::Text(s) => Some(s.as_str()),
+        _ => None,
+    }).collect();
+    assert!(param_strs.iter().any(|s| s.contains("deployment")));
 }
 
 #[test]
 fn parser_hyphenated_token() {
     let plan = plan_search(&msg_query("POL-358", 1));
-    assert_eq!(plan.method, PlanMethod::Fts);
-    // Hyphenated tokens should be quoted for FTS5
-    let nq = plan.normalized_query.unwrap();
+    assert_eq!(plan.method, PlanMethod::Like);
+    // LIKE path stores terms in params as %term% patterns.
+    assert!(plan.normalized_query.is_none());
+    let param_strs: Vec<_> = plan.params.iter().filter_map(|p| match p {
+        PlanParam::Text(s) => Some(s.as_str()),
+        _ => None,
+    }).collect();
     assert!(
-        nq.contains("\"POL-358\"") || nq.contains("POL-358"),
-        "expected hyphenated token in normalized query: {nq}"
+        param_strs.iter().any(|s| s.contains("POL-358")),
+        "expected hyphenated token in LIKE params: {param_strs:?}"
     );
 }
 
 #[test]
 fn parser_wildcard_suffix() {
     let plan = plan_search(&msg_query("deploy*", 1));
-    assert_eq!(plan.method, PlanMethod::Fts);
-    // Wildcard suffix should be preserved for FTS5
-    let nq = plan.normalized_query.unwrap();
-    assert!(nq.contains("deploy"), "expected base term in query: {nq}");
+    assert_eq!(plan.method, PlanMethod::Like);
+    // LIKE path: wildcard stripped by extract_like_terms, base term used.
+    assert!(plan.normalized_query.is_none());
+    let param_strs: Vec<_> = plan.params.iter().filter_map(|p| match p {
+        PlanParam::Text(s) => Some(s.as_str()),
+        _ => None,
+    }).collect();
+    assert!(param_strs.iter().any(|s| s.contains("deploy")), "expected base term in LIKE params: {param_strs:?}");
 }
 
 #[test]
@@ -246,7 +261,7 @@ fn parser_leading_wildcard_stripped() {
     let plan = plan_search(&msg_query("*deploy", 1));
     // Leading wildcards are invalid for FTS5, sanitizer should handle
     assert!(
-        plan.method == PlanMethod::Fts || plan.method == PlanMethod::Like,
+        plan.method == PlanMethod::TextMatch || plan.method == PlanMethod::Like,
         "expected Fts or Like after leading wildcard strip, got {:?}",
         plan.method
     );
@@ -310,7 +325,7 @@ fn facet_all_message_facets_combined() {
         ..Default::default()
     };
     let plan = plan_search(&q);
-    assert_eq!(plan.method, PlanMethod::Fts);
+    assert_eq!(plan.method, PlanMethod::Like);
 
     // All facets should appear
     assert!(plan.facets_applied.contains(&"project_id".to_string()));
@@ -471,7 +486,7 @@ fn facet_project_id_takes_priority_over_product_id() {
 #[test]
 fn ranking_fts_orders_by_score_asc() {
     let plan = plan_search(&msg_query("hello", 1));
-    assert_eq!(plan.method, PlanMethod::Fts);
+    assert_eq!(plan.method, PlanMethod::Like);
     assert!(
         plan.sql.contains("ORDER BY score ASC"),
         "FTS should order by score ASC: {}",
@@ -575,7 +590,7 @@ fn malformed_sql_injection_attempt() {
         assert!(
             matches!(
                 plan.method,
-                PlanMethod::Fts | PlanMethod::Like | PlanMethod::Empty
+                PlanMethod::TextMatch | PlanMethod::Like | PlanMethod::Empty
             ),
             "hostile input {input:?} produced invalid method {:?}",
             plan.method
@@ -602,7 +617,7 @@ fn malformed_unicode_queries() {
         assert!(
             matches!(
                 plan.method,
-                PlanMethod::Fts | PlanMethod::Like | PlanMethod::FilterOnly | PlanMethod::Empty
+                PlanMethod::TextMatch | PlanMethod::Like | PlanMethod::FilterOnly | PlanMethod::Empty
             ),
             "unicode input produced invalid method"
         );
@@ -616,7 +631,7 @@ fn malformed_very_long_query() {
     // Should not panic, should produce some valid plan
     assert!(matches!(
         plan.method,
-        PlanMethod::Fts | PlanMethod::Like | PlanMethod::Empty
+        PlanMethod::TextMatch | PlanMethod::Like | PlanMethod::Empty
     ));
 }
 
@@ -640,7 +655,7 @@ fn malformed_special_chars() {
         assert!(
             matches!(
                 plan.method,
-                PlanMethod::Fts | PlanMethod::Like | PlanMethod::Empty
+                PlanMethod::TextMatch | PlanMethod::Like | PlanMethod::Empty
             ),
             "special chars input {input:?} produced invalid method {:?}",
             plan.method
@@ -940,9 +955,9 @@ fn scope_label_in_explain() {
 fn explain_fts_output() {
     let plan = plan_search(&msg_query("hello", 1));
     let explain = plan.explain();
-    assert_eq!(explain.method, "fts5");
-    assert!(!explain.used_like_fallback);
-    assert!(explain.normalized_query.is_some());
+    assert_eq!(explain.method, "like_fallback");
+    assert!(explain.used_like_fallback);
+    assert!(explain.normalized_query.is_none());
     assert!(!explain.sql.is_empty());
     assert_eq!(explain.denied_count, 0);
     assert_eq!(explain.redacted_count, 0);
@@ -1217,11 +1232,11 @@ fn doc_kind_project_uses_project_tables() {
 #[test]
 fn param_count_fts_message_basic() {
     let plan = plan_search(&msg_query("hello", 1));
-    // Params: FTS text, project_id, LIMIT → 3
+    // Params: LIKE subject, LIKE body, project_id, LIMIT → 4
     assert_eq!(
         plan.params.len(),
-        3,
-        "expected 3 params, got {:?}",
+        4,
+        "expected 4 params, got {:?}",
         plan.params
     );
 }
@@ -1232,8 +1247,8 @@ fn param_count_fts_message_with_facets() {
     q.importance = vec![Importance::High, Importance::Urgent];
     q.thread_id = Some("t1".to_string());
     let plan = plan_search(&q);
-    // Params: FTS text, project_id, importance×2, thread_id, LIMIT → 6
-    assert_eq!(plan.params.len(), 6);
+    // Params: LIKE subject, LIKE body, project_id, importance×2, thread_id, LIMIT → 7
+    assert_eq!(plan.params.len(), 7);
 }
 
 #[test]
@@ -1245,8 +1260,8 @@ fn param_count_with_cursor() {
     let mut q = msg_query("hello", 1);
     q.cursor = Some(cursor.encode());
     let plan = plan_search(&q);
-    // Params: FTS text, project_id, score×2, id, LIMIT → 6
-    assert_eq!(plan.params.len(), 6);
+    // Params: LIKE subject, LIKE body, project_id, score×2, id, LIMIT → 7
+    assert_eq!(plan.params.len(), 7);
 }
 
 #[test]
@@ -1256,8 +1271,8 @@ fn param_count_project_set_scope() {
         allowed_project_ids: vec![1, 2, 3],
     };
     let plan = plan_search(&q);
-    // Params: FTS text, project_id, scope×3, LIMIT → 6
-    assert_eq!(plan.params.len(), 6);
+    // Params: LIKE subject, LIKE body, project_id, scope×3, LIMIT → 7
+    assert_eq!(plan.params.len(), 7);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1336,7 +1351,7 @@ fn agent_like_fallback_when_fts_fails() {
     let q = SearchQuery::agents("((( ab )))", 1);
     let plan = plan_search(&q);
     assert!(
-        plan.method == PlanMethod::Fts || plan.method == PlanMethod::Like,
+        plan.method == PlanMethod::TextMatch || plan.method == PlanMethod::Like,
         "agent search should use FTS or LIKE fallback, got {:?}",
         plan.method
     );
@@ -1353,7 +1368,7 @@ fn project_like_fallback_when_fts_fails() {
     let q = SearchQuery::projects("((( ab )))");
     let plan = plan_search(&q);
     assert!(
-        plan.method == PlanMethod::Fts || plan.method == PlanMethod::Like,
+        plan.method == PlanMethod::TextMatch || plan.method == PlanMethod::Like,
         "project search should use FTS or LIKE fallback, got {:?}",
         plan.method
     );
@@ -1422,34 +1437,23 @@ fn empty_plan_sql_for_hostile_message_text() {
 
 #[test]
 fn hostile_agent_text_falls_to_like() {
-    // Agent search: non-empty text that fails FTS sanitization always becomes LIKE
-    // (unlike messages, agent planner doesn't check extract_like_terms)
+    // Agent search: "***" has no extractable LIKE terms → Empty plan.
     let plan = plan_search(&SearchQuery::agents("***", 1));
     assert_eq!(
         plan.method,
-        PlanMethod::Like,
-        "agent search with hostile text should fall to LIKE"
-    );
-    assert!(
-        plan.sql.contains("agents"),
-        "should still reference agents table: {}",
-        plan.sql
+        PlanMethod::Empty,
+        "agent search with hostile text should produce Empty plan"
     );
 }
 
 #[test]
 fn hostile_project_text_falls_to_like() {
-    // Project search: same behavior as agent search — non-empty always becomes LIKE
+    // Project search: "***" has no extractable LIKE terms → Empty plan.
     let plan = plan_search(&SearchQuery::projects("***"));
     assert_eq!(
         plan.method,
-        PlanMethod::Like,
-        "project search with hostile text should fall to LIKE"
-    );
-    assert!(
-        plan.sql.contains("projects"),
-        "should still reference projects table: {}",
-        plan.sql
+        PlanMethod::Empty,
+        "project search with hostile text should produce Empty plan"
     );
 }
 
@@ -1490,7 +1494,7 @@ fn cursor_with_fts_message_search() {
     let mut q = msg_query("hello", 1);
     q.cursor = Some(cursor.encode());
     let plan = plan_search(&q);
-    assert_eq!(plan.method, PlanMethod::Fts);
+    assert_eq!(plan.method, PlanMethod::Like);
     assert!(plan.facets_applied.contains(&"cursor".to_string()));
     // Should have the compound cursor clause
     assert!(plan.sql.contains("(score > ? OR (score = ? AND m.id > ?))"));
@@ -1505,7 +1509,7 @@ fn fts_ignores_recency_ranking_mode() {
     let mut q = msg_query("hello world", 1);
     q.ranking = RankingMode::Recency;
     let plan = plan_search(&q);
-    assert_eq!(plan.method, PlanMethod::Fts);
+    assert_eq!(plan.method, PlanMethod::Like);
     // FTS always uses score ordering, regardless of ranking mode
     assert!(
         plan.sql.contains("ORDER BY score ASC"),
@@ -1519,20 +1523,20 @@ fn fts_relevance_mode_uses_score() {
     let mut q = msg_query("hello world", 1);
     q.ranking = RankingMode::Relevance;
     let plan = plan_search(&q);
-    assert_eq!(plan.method, PlanMethod::Fts);
+    assert_eq!(plan.method, PlanMethod::Like);
     assert!(plan.sql.contains("ORDER BY score ASC"));
 }
 
 #[test]
 fn like_always_uses_recency_ordering() {
-    // If we can trigger LIKE, ranking mode should not affect ordering
+    // LIKE path uses score ASC, id ASC for cursor-based pagination compatibility.
     let mut q = msg_query("🔥 xy 🔥", 1);
     q.ranking = RankingMode::Relevance;
     let plan = plan_search(&q);
     if plan.method == PlanMethod::Like {
         assert!(
-            plan.sql.contains("ORDER BY m.created_ts DESC"),
-            "LIKE should always order by recency: {}",
+            plan.sql.contains("ORDER BY score ASC, m.id ASC"),
+            "LIKE should order by score ASC, id ASC for cursor pagination: {}",
             plan.sql
         );
     }
@@ -1561,7 +1565,6 @@ fn explain_filter_only_output() {
 
 #[test]
 fn explain_like_output() {
-    // Trigger LIKE: input that fails FTS but has recoverable terms
     let q = SearchQuery {
         text: "🔥 deployment 🔥".to_string(),
         doc_kind: DocKind::Message,
@@ -1570,11 +1573,10 @@ fn explain_like_output() {
         ..Default::default()
     };
     let plan = plan_search(&q);
-    if plan.method == PlanMethod::Like {
-        let explain = plan.explain();
-        assert_eq!(explain.method, "like");
-        assert!(explain.used_like_fallback);
-    }
+    assert_eq!(plan.method, PlanMethod::Like);
+    let explain = plan.explain();
+    assert_eq!(explain.method, "like_fallback");
+    assert!(explain.used_like_fallback);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1595,7 +1597,7 @@ fn direction_agent_exhaustive_matrix() {
             let plan = plan_search(&q);
 
             // Should always produce a valid plan
-            assert_eq!(plan.method, PlanMethod::Fts, "dir={dir:?} agent={agent:?}");
+            assert_eq!(plan.method, PlanMethod::Like, "dir={dir:?} agent={agent:?}");
 
             // Direction without agent is silently ignored
             if dir.is_some() && agent.is_none() {
@@ -1664,7 +1666,7 @@ fn complex_combined_query() {
     };
 
     let plan = plan_search(&q);
-    assert_eq!(plan.method, PlanMethod::Fts);
+    assert_eq!(plan.method, PlanMethod::Like);
     assert!(plan.scope_enforced);
 
     // All facets should be tracked
@@ -1688,11 +1690,11 @@ fn complex_combined_query() {
 
     // Explain should have all metadata
     let explain = plan.explain();
-    assert_eq!(explain.method, "fts5");
+    assert_eq!(explain.method, "like_fallback");
     assert!(explain.facet_count >= 9);
 
-    // SQL should have all components
-    assert!(plan.sql.contains("fts_messages MATCH ?"));
+    // SQL should have all components (LIKE path)
+    assert!(plan.sql.contains("LIKE ? ESCAPE")); // LIKE text matching
     assert!(plan.sql.contains("m.project_id = ?"));
     assert!(plan.sql.contains("m.importance IN (?, ?)"));
     assert!(plan.sql.contains("message_recipients")); // Inbox direction
@@ -1805,7 +1807,7 @@ fn time_range_with_extreme_values() {
     };
     let plan = plan_search(&q);
     // Should not panic with extreme timestamps
-    assert_eq!(plan.method, PlanMethod::Fts);
+    assert_eq!(plan.method, PlanMethod::Like);
     // Verify the params contain the extreme values
     let has_min = plan
         .params

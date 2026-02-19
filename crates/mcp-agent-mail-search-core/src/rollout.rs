@@ -469,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_rollout_controller_effective_engine() {
         let mut config = SearchRolloutConfig::default();
         config.engine = SearchEngine::Lexical;
@@ -784,7 +785,7 @@ mod tests {
     #[test]
     fn rollout_controller_default_trait() {
         let ctrl = RolloutController::default();
-        assert_eq!(ctrl.effective_engine("any"), SearchEngine::Legacy);
+        assert_eq!(ctrl.effective_engine("any"), SearchEngine::Lexical);
         assert!(!ctrl.should_shadow());
         assert!(!ctrl.should_return_v3());
         assert!(ctrl.should_fallback_on_error());

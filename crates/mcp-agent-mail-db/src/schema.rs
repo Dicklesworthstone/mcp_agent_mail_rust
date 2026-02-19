@@ -935,6 +935,89 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v11: Decommission FTS5 message search (Search V3: br-2tnl.8.4) ──
+    //
+    // ── v11: FTS5 decommission (br-2tnl.8.4) ────────────────────────
+    //
+    // Tantivy now handles all text search. Drop every FTS5 virtual table
+    // and synchronization trigger. Each statement is its own migration
+    // because sqlmodel_sqlite's execute only processes one statement.
+    //
+    // Message FTS (created v1, rebuilt v5 with porter stemmer):
+    migrations.push(Migration::new(
+        "v11_drop_trigger_messages_ai".to_string(),
+        "drop FTS5 messages insert trigger".to_string(),
+        "DROP TRIGGER IF EXISTS messages_ai".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_trigger_messages_ad".to_string(),
+        "drop FTS5 messages delete trigger".to_string(),
+        "DROP TRIGGER IF EXISTS messages_ad".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_trigger_messages_au".to_string(),
+        "drop FTS5 messages update trigger".to_string(),
+        "DROP TRIGGER IF EXISTS messages_au".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_fts_messages_table".to_string(),
+        "drop FTS5 messages virtual table".to_string(),
+        "DROP TABLE IF EXISTS fts_messages".to_string(),
+        String::new(),
+    ));
+    // Identity FTS (created v7):
+    migrations.push(Migration::new(
+        "v11_drop_trigger_agents_ai".to_string(),
+        "drop FTS5 agents insert trigger".to_string(),
+        "DROP TRIGGER IF EXISTS agents_ai".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_trigger_agents_ad".to_string(),
+        "drop FTS5 agents delete trigger".to_string(),
+        "DROP TRIGGER IF EXISTS agents_ad".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_trigger_agents_au".to_string(),
+        "drop FTS5 agents update trigger".to_string(),
+        "DROP TRIGGER IF EXISTS agents_au".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_fts_agents_table".to_string(),
+        "drop FTS5 agents virtual table".to_string(),
+        "DROP TABLE IF EXISTS fts_agents".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_trigger_projects_ai".to_string(),
+        "drop FTS5 projects insert trigger".to_string(),
+        "DROP TRIGGER IF EXISTS projects_ai".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_trigger_projects_ad".to_string(),
+        "drop FTS5 projects delete trigger".to_string(),
+        "DROP TRIGGER IF EXISTS projects_ad".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_trigger_projects_au".to_string(),
+        "drop FTS5 projects update trigger".to_string(),
+        "DROP TRIGGER IF EXISTS projects_au".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v11_drop_fts_projects_table".to_string(),
+        "drop FTS5 projects virtual table".to_string(),
+        "DROP TABLE IF EXISTS fts_projects".to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -1038,13 +1121,6 @@ fn base_trigger_cleanup_migrations() -> Vec<Migration> {
         .collect()
 }
 
-fn identity_fts_cleanup_migrations() -> Vec<Migration> {
-    base_trigger_cleanup_migrations()
-        .into_iter()
-        .filter(|migration| migration.id.starts_with("base_v2_"))
-        .collect()
-}
-
 /// Re-apply base-mode cleanup statements at startup.
 ///
 /// This is intentionally separate from migration history so servers can recover
@@ -1058,18 +1134,20 @@ pub fn enforce_base_mode_cleanup(conn: &SqliteConnection) -> std::result::Result
     Ok(())
 }
 
-/// Re-apply runtime-safe cleanup statements for legacy identity FTS artifacts.
+/// Re-apply runtime cleanup for ALL FTS artifacts (messages + identity).
 ///
-/// Unlike [`enforce_base_mode_cleanup`], this keeps message FTS triggers intact
-/// so normal runtime indexing behavior is preserved while removing known
-/// corruption-prone identity FTS objects (`fts_agents`/`fts_projects`).
+/// Since Search V3 decommission (br-2tnl.8.4), Tantivy handles all text search.
+/// This drops `fts_messages`, `fts_agents`, `fts_projects` and all their triggers.
 #[allow(clippy::result_large_err)]
-pub fn enforce_runtime_identity_fts_cleanup(
+pub fn enforce_runtime_fts_cleanup(
     conn: &SqliteConnection,
 ) -> std::result::Result<(), SqlError> {
-    for migration in identity_fts_cleanup_migrations() {
+    // Drop all FTS artifacts — same as base mode cleanup
+    for migration in base_trigger_cleanup_migrations() {
         conn.execute_raw(&migration.up)?;
     }
+    // Also drop fts_messages table itself
+    conn.execute_raw("DROP TABLE IF EXISTS fts_messages")?;
     Ok(())
 }
 
@@ -1513,9 +1591,9 @@ mod tests {
     }
 
     #[test]
-    fn enforce_runtime_identity_cleanup_keeps_message_triggers() {
+    fn enforce_runtime_fts_cleanup_drops_all_fts() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime_cleanup_identity_fts.db");
+        let db_path = dir.path().join("runtime_cleanup_all_fts.db");
         let conn = SqliteConnection::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
@@ -1528,8 +1606,9 @@ mod tests {
                 .expect("apply full migrations");
         });
 
-        enforce_runtime_identity_fts_cleanup(&conn).expect("runtime identity cleanup");
+        enforce_runtime_fts_cleanup(&conn).expect("runtime fts cleanup");
 
+        // All message FTS triggers should be dropped (Tantivy handles search now)
         let message_trigger_rows = conn
             .query_sync(
                 "SELECT name FROM sqlite_master \
@@ -1537,12 +1616,12 @@ mod tests {
                 &[],
             )
             .expect("query message trigger names");
-        assert_eq!(
-            message_trigger_rows.len(),
-            3,
-            "runtime cleanup should keep message FTS triggers"
+        assert!(
+            message_trigger_rows.is_empty(),
+            "runtime cleanup should remove ALL FTS triggers (Search V3 decommission)"
         );
 
+        // All identity FTS triggers should also be dropped
         let identity_trigger_rows = conn
             .query_sync(
                 "SELECT name FROM sqlite_master \
@@ -1558,16 +1637,17 @@ mod tests {
             "runtime cleanup should remove identity FTS triggers"
         );
 
-        let identity_fts_rows = conn
+        // All FTS tables should be dropped
+        let fts_rows = conn
             .query_sync(
                 "SELECT name FROM sqlite_master \
-                 WHERE type='table' AND name IN ('fts_agents', 'fts_projects')",
+                 WHERE type='table' AND name IN ('fts_messages', 'fts_agents', 'fts_projects')",
                 &[],
             )
-            .expect("query identity fts table names");
+            .expect("query fts table names");
         assert!(
-            identity_fts_rows.is_empty(),
-            "runtime cleanup should remove identity FTS tables"
+            fts_rows.is_empty(),
+            "runtime cleanup should remove ALL FTS tables"
         );
     }
 
@@ -1902,233 +1982,12 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
-    #[test]
-    fn v5_fts_porter_stemming_and_prefix() {
-        use sqlmodel_core::Value;
+    // NOTE: v5_fts_porter_stemming_and_prefix removed — FTS5 decommissioned
+    // in Search V3 cutover (br-2tnl.8.4).  Tantivy handles stemming/prefix.
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("v5_fts.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
-
-        // Apply all migrations (creates schema + FTS with porter tokenizer).
-        block_on({
-            let conn = &conn;
-            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
-        });
-
-        // Insert a project and agent for foreign keys.
-        conn.execute_sync(
-            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
-            &[
-                Value::Text("p".to_string()),
-                Value::Text("/p".to_string()),
-                Value::BigInt(1),
-            ],
-        )
-        .expect("insert project");
-        conn.execute_sync(
-            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) VALUES (?, ?, ?, ?, ?, ?)",
-            &[
-                Value::BigInt(1),
-                Value::Text("A".to_string()),
-                Value::Text("cc".to_string()),
-                Value::Text("o".to_string()),
-                Value::BigInt(1),
-                Value::BigInt(1),
-            ],
-        )
-        .expect("insert agent");
-
-        // Insert messages with various word forms for stemming tests.
-        for (i, (subj, body)) in [
-            ("Running tests", "The tests are running smoothly"),
-            ("Test runner", "We ran the full suite"),
-            ("Connection pool", "Testing the connection pooling"),
-        ]
-        .iter()
-        .enumerate()
-        {
-            conn.execute_sync(
-                "INSERT INTO messages (project_id, sender_id, subject, body_md, created_ts) VALUES (?, ?, ?, ?, ?)",
-                &[
-                    Value::BigInt(1),
-                    Value::BigInt(1),
-                    Value::Text(subj.to_string()),
-                    Value::Text(body.to_string()),
-                    Value::BigInt(i64::try_from(i).unwrap() + 100),
-                ],
-            )
-            .expect("insert message");
-        }
-
-        // Porter stemming: "running" should match when searching for "run".
-        let rows = conn
-            .query_sync(
-                "SELECT message_id FROM fts_messages WHERE fts_messages MATCH 'running'",
-                &[],
-            )
-            .expect("FTS search for 'running'");
-        assert!(
-            !rows.is_empty(),
-            "porter stemming: 'running' should match documents with 'running'"
-        );
-
-        // Prefix search: "connect*" should match "Connection" / "connection".
-        let rows = conn
-            .query_sync(
-                "SELECT message_id FROM fts_messages WHERE fts_messages MATCH 'connect*'",
-                &[],
-            )
-            .expect("FTS prefix search for 'connect*'");
-        assert!(
-            !rows.is_empty(),
-            "prefix search 'connect*' should match 'Connection'/'connection'"
-        );
-
-        // Verify bm25 with column weights works.
-        let rows = conn
-            .query_sync(
-                "SELECT message_id, bm25(fts_messages, 10.0, 1.0) as score \
-                 FROM fts_messages WHERE fts_messages MATCH 'test' \
-                 ORDER BY bm25(fts_messages, 10.0, 1.0) ASC",
-                &[],
-            )
-            .expect("FTS search with bm25 weights");
-        assert!(
-            !rows.is_empty(),
-            "bm25 weighted search should return results"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn v7_fts_agents_and_projects_backfill_and_triggers_work() {
-        use sqlmodel_core::Value;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("v7_fts_identity.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
-
-        // Simulate a pre-v7 DB: identity tables exist, but there are no fts_agents/fts_projects.
-        conn.execute_raw(PRAGMA_SETTINGS_SQL)
-            .expect("apply PRAGMAs");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS projects (\
-                id INTEGER PRIMARY KEY AUTOINCREMENT,\
-                slug TEXT NOT NULL UNIQUE,\
-                human_key TEXT NOT NULL,\
-                created_at INTEGER NOT NULL\
-            )",
-            &[],
-        )
-        .expect("create projects table");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agents (\
-                id INTEGER PRIMARY KEY AUTOINCREMENT,\
-                project_id INTEGER NOT NULL REFERENCES projects(id),\
-                name TEXT NOT NULL,\
-                program TEXT NOT NULL,\
-                model TEXT NOT NULL,\
-                task_description TEXT NOT NULL DEFAULT '',\
-                inception_ts INTEGER NOT NULL,\
-                last_active_ts INTEGER NOT NULL,\
-                attachments_policy TEXT NOT NULL DEFAULT 'auto',\
-                contact_policy TEXT NOT NULL DEFAULT 'auto',\
-                UNIQUE(project_id, name)\
-            )",
-            &[],
-        )
-        .expect("create agents table");
-
-        conn.execute_sync(
-            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
-            &[
-                Value::Text("preproj".to_string()),
-                Value::Text("/alpha/workspace".to_string()),
-                Value::BigInt(1),
-            ],
-        )
-        .expect("insert project");
-        conn.execute_sync(
-            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            &[
-                Value::BigInt(1),
-                Value::Text("BlueDog".to_string()),
-                Value::Text("codex".to_string()),
-                Value::Text("gpt-5".to_string()),
-                Value::Text("alpha agent".to_string()),
-                Value::BigInt(1),
-                Value::BigInt(1),
-            ],
-        )
-        .expect("insert agent");
-
-        // Applying migrations should create fts_agents/fts_projects and backfill from existing rows.
-        block_on({
-            let conn = &conn;
-            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
-        });
-
-        let rows = conn
-            .query_sync(
-                "SELECT project_id FROM fts_projects WHERE fts_projects MATCH 'preproj'",
-                &[],
-            )
-            .expect("fts_projects search");
-        assert_eq!(rows.len(), 1);
-
-        let rows = conn
-            .query_sync(
-                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'alpha'",
-                &[],
-            )
-            .expect("fts_agents search");
-        assert_eq!(rows.len(), 1);
-
-        // Update triggers should keep identity indexes fresh.
-        conn.execute_sync(
-            "UPDATE projects SET human_key = ? WHERE id = 1",
-            &[Value::Text("/beta/workspace".to_string())],
-        )
-        .expect("update project");
-        let rows = conn
-            .query_sync(
-                "SELECT project_id FROM fts_projects WHERE fts_projects MATCH 'beta'",
-                &[],
-            )
-            .expect("fts_projects search after update");
-        assert_eq!(rows.len(), 1);
-        let rows = conn
-            .query_sync(
-                "SELECT project_id FROM fts_projects WHERE fts_projects MATCH 'alpha'",
-                &[],
-            )
-            .expect("fts_projects search for old term");
-        assert!(rows.is_empty());
-
-        conn.execute_sync(
-            "UPDATE agents SET task_description = ? WHERE id = 1",
-            &[Value::Text("beta agent".to_string())],
-        )
-        .expect("update agent");
-        let rows = conn
-            .query_sync(
-                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'beta'",
-                &[],
-            )
-            .expect("fts_agents search after update");
-        assert_eq!(rows.len(), 1);
-        let rows = conn
-            .query_sync(
-                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'alpha'",
-                &[],
-            )
-            .expect("fts_agents search for old term");
-        assert!(rows.is_empty());
-    }
+    // NOTE: v7_fts_agents_and_projects_backfill_and_triggers_work removed —
+    // identity FTS tables and triggers dropped by v11 migrations (br-2tnl.8.4).
+    // Tantivy handles full-text search for agents and projects now.
 
     #[test]
     fn schema_migrations_include_tool_metrics_snapshot_table() {
