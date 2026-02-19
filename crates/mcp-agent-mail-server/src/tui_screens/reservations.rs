@@ -1,7 +1,8 @@
 //! Reservations screen — active file reservations with TTL progress bars.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use asupersync::Cx;
 use fastmcp::prelude::McpContext;
@@ -26,6 +27,10 @@ use serde::Deserialize;
 use crate::tui_action_menu::{ActionEntry, reservations_actions, reservations_batch_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{DbStatSnapshot, MailEvent, ReservationSnapshot};
+use crate::tui_persist::{
+    ScreenFilterPresetStore, console_persist_path_from_env_or_default,
+    load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
+};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
 use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::{MetricTile, MetricTrend};
@@ -50,6 +55,7 @@ const RESERVATION_TTL_PRESETS: [(&str, i64); 5] = [
 ];
 const RESERVATION_TTL_CUSTOM_INDEX: usize = RESERVATION_TTL_PRESETS.len() - 1;
 const RESERVATION_PATH_MIN_ROWS: u16 = 4;
+const RESERVATIONS_PRESET_SCREEN_ID: &str = "reservations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReservationCreateField {
@@ -90,6 +96,28 @@ impl ReservationCreateField {
                     Self::Ttl
                 }
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresetDialogMode {
+    None,
+    Save,
+    Load,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavePresetField {
+    Name,
+    Description,
+}
+
+impl SavePresetField {
+    const fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Description,
+            Self::Description => Self::Name,
         }
     }
 }
@@ -285,11 +313,29 @@ pub struct ReservationsScreen {
     prev_counts: (u64, u64, u64, u64),
     /// Reservation create modal form state.
     create_form: Option<ReservationCreateFormState>,
+    /// On-disk path for persisted screen filter presets.
+    filter_presets_path: PathBuf,
+    /// Preset store loaded from `filter_presets_path`.
+    filter_presets: ScreenFilterPresetStore,
+    /// Active preset dialog mode (save/load/none).
+    preset_dialog_mode: PresetDialogMode,
+    /// Save dialog field focus.
+    save_preset_field: SavePresetField,
+    /// Save dialog: preset name input buffer.
+    save_preset_name: String,
+    /// Save dialog: optional description input buffer.
+    save_preset_description: String,
+    /// Load dialog selected preset row.
+    load_preset_cursor: usize,
 }
 
 impl ReservationsScreen {
-    #[must_use]
-    pub fn new() -> Self {
+    fn build(filter_presets_path_override: Option<PathBuf>) -> Self {
+        let filter_presets_path = filter_presets_path_override.unwrap_or_else(|| {
+            let console_path = console_persist_path_from_env_or_default();
+            screen_filter_presets_path(&console_path)
+        });
+        let filter_presets = load_screen_filter_presets_or_default(&filter_presets_path);
         Self {
             table_state: TableState::default(),
             reservations: HashMap::new(),
@@ -308,7 +354,24 @@ impl ReservationsScreen {
             last_fallback_probe_tick: 0,
             prev_counts: (0, 0, 0, 0),
             create_form: None,
+            filter_presets_path,
+            filter_presets,
+            preset_dialog_mode: PresetDialogMode::None,
+            save_preset_field: SavePresetField::Name,
+            save_preset_name: String::new(),
+            save_preset_description: String::new(),
+            load_preset_cursor: 0,
         }
+    }
+
+    #[cfg(test)]
+    fn with_filter_presets_path_for_test(path: &std::path::Path) -> Self {
+        Self::build(Some(path.to_path_buf()))
+    }
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::build(None)
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected reservation.
@@ -830,6 +893,186 @@ impl ReservationsScreen {
         self.create_form = Some(form);
     }
 
+    fn preset_names(&self) -> Vec<String> {
+        self.filter_presets
+            .list_names(RESERVATIONS_PRESET_SCREEN_ID)
+    }
+
+    fn persist_filter_presets(&self) {
+        if let Err(err) =
+            save_screen_filter_presets(&self.filter_presets_path, &self.filter_presets)
+        {
+            eprintln!(
+                "reservations: failed to save presets to {}: {err}",
+                self.filter_presets_path.display()
+            );
+        }
+    }
+
+    fn snapshot_filter_values(&self) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        values.insert("sort_col".to_string(), self.sort_col.to_string());
+        values.insert("sort_asc".to_string(), self.sort_asc.to_string());
+        values.insert("show_released".to_string(), self.show_released.to_string());
+        values
+    }
+
+    fn save_named_preset(&mut self, name: &str, description: Option<String>) -> bool {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            return false;
+        }
+        let trimmed_description = description.and_then(|text| {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+        self.filter_presets.upsert(
+            RESERVATIONS_PRESET_SCREEN_ID,
+            trimmed_name.to_string(),
+            trimmed_description,
+            self.snapshot_filter_values(),
+        );
+        self.persist_filter_presets();
+        true
+    }
+
+    fn apply_preset_values(&mut self, values: &BTreeMap<String, String>) {
+        if let Some(sort_col) = values
+            .get("sort_col")
+            .and_then(|raw| raw.parse::<usize>().ok())
+        {
+            self.sort_col = sort_col.min(SORT_LABELS.len().saturating_sub(1));
+        }
+        if let Some(sort_asc) = values.get("sort_asc") {
+            self.sort_asc = matches!(
+                sort_asc.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if let Some(show_released) = values.get("show_released") {
+            self.show_released = matches!(
+                show_released.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        self.rebuild_sorted();
+    }
+
+    fn apply_named_preset(&mut self, name: &str) -> bool {
+        let Some(preset) = self
+            .filter_presets
+            .get(RESERVATIONS_PRESET_SCREEN_ID, name)
+            .cloned()
+        else {
+            return false;
+        };
+        self.apply_preset_values(&preset.values);
+        true
+    }
+
+    fn remove_named_preset(&mut self, name: &str) -> bool {
+        let removed = self
+            .filter_presets
+            .remove(RESERVATIONS_PRESET_SCREEN_ID, name);
+        if removed {
+            self.persist_filter_presets();
+        }
+        removed
+    }
+
+    fn open_save_preset_dialog(&mut self) {
+        self.preset_dialog_mode = PresetDialogMode::Save;
+        self.save_preset_field = SavePresetField::Name;
+        self.save_preset_description.clear();
+        if self.save_preset_name.is_empty() {
+            self.save_preset_name = "reservations-preset".to_string();
+        }
+    }
+
+    fn open_load_preset_dialog(&mut self) {
+        self.preset_dialog_mode = PresetDialogMode::Load;
+        let names = self.preset_names();
+        if names.is_empty() {
+            self.load_preset_cursor = 0;
+        } else {
+            self.load_preset_cursor = self.load_preset_cursor.min(names.len().saturating_sub(1));
+        }
+    }
+
+    fn handle_save_dialog_key(&mut self, key: &ftui::KeyEvent) {
+        match key.code {
+            KeyCode::Escape => {
+                self.preset_dialog_mode = PresetDialogMode::None;
+            }
+            KeyCode::Tab => {
+                self.save_preset_field = self.save_preset_field.next();
+            }
+            KeyCode::Backspace => match self.save_preset_field {
+                SavePresetField::Name => {
+                    self.save_preset_name.pop();
+                }
+                SavePresetField::Description => {
+                    self.save_preset_description.pop();
+                }
+            },
+            KeyCode::Enter => {
+                let preset_name = self.save_preset_name.clone();
+                if self.save_named_preset(&preset_name, Some(self.save_preset_description.clone()))
+                {
+                    self.preset_dialog_mode = PresetDialogMode::None;
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(Modifiers::CTRL) => {
+                match self.save_preset_field {
+                    SavePresetField::Name => self.save_preset_name.push(ch),
+                    SavePresetField::Description => self.save_preset_description.push(ch),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_load_dialog_key(&mut self, key: &ftui::KeyEvent) {
+        let names = self.preset_names();
+        match key.code {
+            KeyCode::Escape => {
+                self.preset_dialog_mode = PresetDialogMode::None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !names.is_empty() {
+                    self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
+            }
+            KeyCode::Delete => {
+                if let Some(name) = names.get(self.load_preset_cursor) {
+                    let _ = self.remove_named_preset(name);
+                }
+                let refreshed = self.preset_names();
+                if refreshed.is_empty() {
+                    self.load_preset_cursor = 0;
+                } else {
+                    self.load_preset_cursor = self
+                        .load_preset_cursor
+                        .min(refreshed.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(name) = names.get(self.load_preset_cursor) {
+                    let _ = self.apply_named_preset(name);
+                    self.preset_dialog_mode = PresetDialogMode::None;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn parse_custom_ttl_seconds(raw: &str) -> Result<i64, String> {
         let value = raw.trim();
         if value.is_empty() {
@@ -1092,6 +1335,29 @@ impl MailScreen for ReservationsScreen {
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
         {
+            if self.preset_dialog_mode != PresetDialogMode::None {
+                match self.preset_dialog_mode {
+                    PresetDialogMode::Save => self.handle_save_dialog_key(key),
+                    PresetDialogMode::Load => self.handle_load_dialog_key(key),
+                    PresetDialogMode::None => {}
+                }
+                return Cmd::None;
+            }
+
+            if key.modifiers.contains(Modifiers::CTRL) {
+                match key.code {
+                    KeyCode::Char('s') => {
+                        self.open_save_preset_dialog();
+                        return Cmd::None;
+                    }
+                    KeyCode::Char('l') => {
+                        self.open_load_preset_dialog();
+                        return Cmd::None;
+                    }
+                    _ => {}
+                }
+            }
+
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.move_selection(1);
@@ -1496,6 +1762,21 @@ impl MailScreen for ReservationsScreen {
         if let Some(form) = &self.create_form {
             render_reservation_create_modal(frame, area, form);
         }
+
+        match self.preset_dialog_mode {
+            PresetDialogMode::Save => render_save_preset_dialog(
+                frame,
+                area,
+                &self.save_preset_name,
+                &self.save_preset_description,
+                self.save_preset_field,
+            ),
+            PresetDialogMode::Load => {
+                let names = self.preset_names();
+                render_load_preset_dialog(frame, area, &names, self.load_preset_cursor);
+            }
+            PresetDialogMode::None => {}
+        }
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -1529,6 +1810,18 @@ impl MailScreen for ReservationsScreen {
                 action: "Open create reservation form",
             },
             HelpEntry {
+                key: "Ctrl+S",
+                action: "Save current filter preset",
+            },
+            HelpEntry {
+                key: "Ctrl+L",
+                action: "Load preset list",
+            },
+            HelpEntry {
+                key: "Delete",
+                action: "Delete selected preset (load dialog)",
+            },
+            HelpEntry {
                 key: ".",
                 action: "Open actions (single or batch)",
             },
@@ -1541,7 +1834,7 @@ impl MailScreen for ReservationsScreen {
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some(
-            "File reservations held by agents. Press n to create; Space/v/A/C for multi-select; . opens actions.",
+            "File reservations held by agents. Press n to create; Space/v/A/C for multi-select; Ctrl+S/Ctrl+L for presets.",
         )
     }
 
@@ -1920,6 +2213,107 @@ fn render_reservation_create_modal(
         .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
 }
 
+fn centered_overlay_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.clamp(24, area.width.saturating_sub(2));
+    let height = height.clamp(6, area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn render_save_preset_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    name: &str,
+    description: &str,
+    active_field: SavePresetField,
+) {
+    if area.width < 36 || area.height < 8 {
+        return;
+    }
+    let overlay = centered_overlay_rect(area, 64, 9);
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Save Reservation Preset")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay));
+    let inner = block.inner(overlay);
+    block.render(overlay, frame);
+    if inner.height == 0 {
+        return;
+    }
+    let name_marker = if active_field == SavePresetField::Name {
+        ">"
+    } else {
+        " "
+    };
+    let desc_marker = if active_field == SavePresetField::Description {
+        ">"
+    } else {
+        " "
+    };
+    let description = if description.is_empty() {
+        "<optional>".to_string()
+    } else {
+        description.to_string()
+    };
+    let lines = vec![
+        ftui::text::Line::from(ftui::text::Span::styled(
+            "Enter to save · Tab to switch field · Esc to cancel",
+            crate::tui_theme::text_meta(&tp),
+        )),
+        ftui::text::Line::from(ftui::text::Span::raw(format!("{name_marker} Name: {name}"))),
+        ftui::text::Line::from(ftui::text::Span::raw(format!(
+            "{desc_marker} Description: {description}"
+        ))),
+    ];
+    Paragraph::new(ftui::text::Text::from_lines(lines)).render(inner, frame);
+}
+
+fn render_load_preset_dialog(frame: &mut Frame<'_>, area: Rect, names: &[String], cursor: usize) {
+    if area.width < 36 || area.height < 8 {
+        return;
+    }
+    let overlay = centered_overlay_rect(area, 64, 12);
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Load Reservation Preset")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay));
+    let inner = block.inner(overlay);
+    block.render(overlay, frame);
+    if inner.height == 0 {
+        return;
+    }
+    let mut lines = vec![ftui::text::Line::from(ftui::text::Span::styled(
+        "Enter apply · Del delete · j/k move · Esc cancel",
+        crate::tui_theme::text_meta(&tp),
+    ))];
+    if names.is_empty() {
+        lines.push(ftui::text::Line::from(ftui::text::Span::styled(
+            "No saved presets for Reservations.",
+            crate::tui_theme::text_warning(&tp),
+        )));
+    } else {
+        let visible_rows = usize::from(inner.height.saturating_sub(2)).max(1);
+        let start = cursor.saturating_sub(visible_rows.saturating_sub(1));
+        let end = (start + visible_rows).min(names.len());
+        for (idx, name) in names.iter().enumerate().take(end).skip(start) {
+            let marker = if idx == cursor {
+                crate::tui_theme::SELECTION_PREFIX
+            } else {
+                crate::tui_theme::SELECTION_PREFIX_EMPTY
+            };
+            lines.push(ftui::text::Line::from(ftui::text::Span::raw(format!(
+                "{marker}{name}"
+            ))));
+        }
+    }
+    Paragraph::new(ftui::text::Text::from_lines(lines)).render(inner, frame);
+}
+
 /// Format remaining seconds as a human-readable string.
 fn format_ttl(secs: u64) -> String {
     if secs == 0 {
@@ -2109,11 +2503,13 @@ mod tests {
         assert!(bindings.iter().any(|b| b.key == "v / A / C"));
         assert!(bindings.iter().any(|b| b.key == "x"));
         assert!(bindings.iter().any(|b| b.key == "n"));
+        assert!(bindings.iter().any(|b| b.key == "Ctrl+S"));
+        assert!(bindings.iter().any(|b| b.key == "Ctrl+L"));
         assert!(bindings.iter().any(|b| b.key == "."));
         assert_eq!(
             screen.context_help_tip(),
             Some(
-                "File reservations held by agents. Press n to create; Space/v/A/C for multi-select; . opens actions.",
+                "File reservations held by agents. Press n to create; Space/v/A/C for multi-select; Ctrl+S/Ctrl+L for presets.",
             )
         );
     }
@@ -2344,6 +2740,76 @@ mod tests {
         let s = Event::Key(ftui::KeyEvent::new(KeyCode::Char('s')));
         screen.update(&s, &state);
         assert_ne!(screen.sort_col, initial);
+    }
+
+    #[test]
+    fn reservations_presets_save_load_delete_lifecycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("screen_filter_presets.json");
+        let mut screen = ReservationsScreen::with_filter_presets_path_for_test(&path);
+
+        screen.sort_col = COL_AGENT;
+        screen.sort_asc = false;
+        screen.show_released = true;
+        assert!(screen.save_named_preset("triage", Some("desc".to_string())));
+
+        let loaded = crate::tui_persist::load_screen_filter_presets(&path).expect("load presets");
+        let preset = loaded
+            .get(RESERVATIONS_PRESET_SCREEN_ID, "triage")
+            .expect("saved preset");
+        assert_eq!(preset.values.get("sort_col").map(String::as_str), Some("0"));
+        assert_eq!(
+            preset.values.get("sort_asc").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            preset.values.get("show_released").map(String::as_str),
+            Some("true")
+        );
+
+        screen.sort_col = COL_TTL;
+        screen.sort_asc = true;
+        screen.show_released = false;
+        assert!(screen.apply_named_preset("triage"));
+        assert_eq!(screen.sort_col, COL_AGENT);
+        assert!(!screen.sort_asc);
+        assert!(screen.show_released);
+
+        assert!(screen.remove_named_preset("triage"));
+        assert!(screen.preset_names().is_empty());
+    }
+
+    #[test]
+    fn ctrl_shortcuts_drive_reservation_preset_dialog_flow() {
+        let state = test_state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("screen_filter_presets.json");
+        let mut screen = ReservationsScreen::with_filter_presets_path_for_test(&path);
+
+        let ctrl_s = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('s'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::CTRL,
+        });
+        screen.update(&ctrl_s, &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::Save);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
+        assert!(!screen.preset_names().is_empty());
+
+        let ctrl_l = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('l'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::CTRL,
+        });
+        screen.update(&ctrl_l, &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::Load);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Delete)), &state);
+        assert!(screen.preset_names().is_empty());
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
     }
 
     #[test]

@@ -5,6 +5,8 @@
 //! keyboard-first navigation.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +39,10 @@ use crate::tui_action_menu::{ActionEntry, messages_actions, messages_batch_actio
 use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_layout::{DockLayout, DockPosition};
+use crate::tui_persist::{
+    ScreenFilterPresetStore, console_persist_path_from_env_or_default,
+    load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
+};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -45,6 +51,7 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, S
 
 /// Number of results per page.
 const PAGE_SIZE: usize = 50;
+const MESSAGES_PRESET_SCREEN_ID: &str = "messages";
 
 /// Debounce delay in ticks. Zero means immediate search-as-you-type.
 const DEBOUNCE_TICKS: u8 = 0;
@@ -65,6 +72,7 @@ const MESSAGE_STACKED_WIDTH_THRESHOLD: u16 = 68;
 const MESSAGE_STACKED_MIN_HEIGHT: u16 = 12;
 const MESSAGE_STACKED_DOCK_RATIO: f32 = 0.38;
 const MESSAGE_DEFAULT_DOCK_RATIO: f32 = 0.40;
+const MESSAGE_SPLIT_GAP_THRESHOLD: u16 = 60;
 const MESSAGE_WIDE_DOCK_MIN_WIDTH: u16 = 150;
 const MESSAGE_ULTRAWIDE_DOCK_MIN_WIDTH: u16 = 220;
 
@@ -95,6 +103,44 @@ const fn responsive_message_dock_ratio(width: u16) -> f32 {
         0.47
     } else {
         MESSAGE_DEFAULT_DOCK_RATIO
+    }
+}
+
+fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, active: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
+    // Repaint the whole splitter gap first so prior layout artifacts never
+    // remain visible as stray borders across list/detail content.
+    let separator_color = crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border_dim, 0.58);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.fg = separator_color;
+                cell.bg = tp.panel_bg;
+            }
+        }
+    }
+
+    if active && ((vertical && area.height >= 5) || (!vertical && area.width >= 5)) {
+        let x = if vertical {
+            area.x.saturating_add(area.width / 2)
+        } else {
+            area.x.saturating_add(area.width.saturating_sub(1) / 2)
+        };
+        let y = if vertical {
+            area.y.saturating_add(area.height.saturating_sub(1) / 2)
+        } else {
+            area.y.saturating_add(area.height / 2)
+        };
+        if let Some(cell) = frame.buffer.get_mut(x, y) {
+            *cell = ftui::Cell::from_char('·');
+            cell.fg = tp.selection_indicator;
+            cell.bg = tp.panel_bg;
+        }
     }
 }
 
@@ -505,6 +551,28 @@ enum Focus {
 enum DockDragState {
     Idle,
     Dragging,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresetDialogMode {
+    None,
+    Save,
+    Load,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavePresetField {
+    Name,
+    Description,
+}
+
+impl SavePresetField {
+    const fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Description,
+            Self::Description => Self::Name,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -964,11 +1032,29 @@ pub struct MessageBrowserScreen {
     /// Cache for rendered message body with inline images:
     /// (`message_id`, `width`, `rendered_content`).
     detail_cache: RefCell<Option<(i64, u16, String)>>,
+    /// On-disk path for persisted screen filter presets.
+    filter_presets_path: PathBuf,
+    /// Preset store loaded from `filter_presets_path`.
+    filter_presets: ScreenFilterPresetStore,
+    /// Active preset dialog mode (save/load/none).
+    preset_dialog_mode: PresetDialogMode,
+    /// Save dialog field focus.
+    save_preset_field: SavePresetField,
+    /// Save dialog: preset name input buffer.
+    save_preset_name: String,
+    /// Save dialog: optional description input buffer.
+    save_preset_description: String,
+    /// Load dialog selected preset row.
+    load_preset_cursor: usize,
 }
 
 impl MessageBrowserScreen {
-    #[must_use]
-    pub fn new() -> Self {
+    fn build(filter_presets_path_override: Option<PathBuf>) -> Self {
+        let filter_presets_path = filter_presets_path_override.unwrap_or_else(|| {
+            let console_path = console_persist_path_from_env_or_default();
+            screen_filter_presets_path(&console_path)
+        });
+        let filter_presets = load_screen_filter_presets_or_default(&filter_presets_path);
         Self {
             search_input: TextInput::new()
                 .with_placeholder("Search messages... (/ to focus)")
@@ -1003,7 +1089,24 @@ impl MessageBrowserScreen {
             quick_reply_form: None,
             compose_form: None,
             detail_cache: RefCell::new(None),
+            filter_presets_path,
+            filter_presets,
+            preset_dialog_mode: PresetDialogMode::None,
+            save_preset_field: SavePresetField::Name,
+            save_preset_name: String::new(),
+            save_preset_description: String::new(),
+            load_preset_cursor: 0,
         }
+    }
+
+    #[cfg(test)]
+    fn with_filter_presets_path_for_test(path: &std::path::Path) -> Self {
+        Self::build(Some(path.to_path_buf()))
+    }
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::build(None)
     }
 
     fn update_urgent_pulse(&self, tick_count: u64) {
@@ -1553,6 +1656,223 @@ impl MessageBrowserScreen {
         self.debounce_remaining = 0;
     }
 
+    fn preset_names(&self) -> Vec<String> {
+        self.filter_presets.list_names(MESSAGES_PRESET_SCREEN_ID)
+    }
+
+    fn persist_filter_presets(&self) {
+        if let Err(err) =
+            save_screen_filter_presets(&self.filter_presets_path, &self.filter_presets)
+        {
+            eprintln!(
+                "messages: failed to save presets to {}: {err}",
+                self.filter_presets_path.display()
+            );
+        }
+    }
+
+    fn snapshot_filter_values(&self) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        values.insert(
+            "query".to_string(),
+            self.search_input.value().trim().to_string(),
+        );
+        values.insert("preset_index".to_string(), self.preset_index.to_string());
+        match &self.inbox_mode {
+            InboxMode::Local(project_slug) => {
+                values.insert("inbox_mode".to_string(), "local".to_string());
+                values.insert("local_project".to_string(), project_slug.clone());
+            }
+            InboxMode::Global => {
+                values.insert("inbox_mode".to_string(), "global".to_string());
+                if let Some(slug) = &self.last_local_project {
+                    values.insert("last_local_project".to_string(), slug.clone());
+                }
+            }
+        }
+        values
+    }
+
+    fn save_named_preset(&mut self, name: &str, description: Option<String>) -> bool {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            return false;
+        }
+        let trimmed_description = description.and_then(|text| {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+        self.filter_presets.upsert(
+            MESSAGES_PRESET_SCREEN_ID,
+            trimmed_name.to_string(),
+            trimmed_description,
+            self.snapshot_filter_values(),
+        );
+        self.persist_filter_presets();
+        true
+    }
+
+    fn apply_preset_values(&mut self, values: &BTreeMap<String, String>) {
+        let query = values.get("query").cloned().unwrap_or_default();
+        self.search_input.set_value(&query);
+        if let Some(raw_index) = values
+            .get("preset_index")
+            .and_then(|raw| raw.parse::<usize>().ok())
+        {
+            self.preset_index = raw_index.min(QUERY_PRESETS.len().saturating_sub(1));
+        } else if let Some((idx, _)) = QUERY_PRESETS
+            .iter()
+            .enumerate()
+            .find(|(_, preset)| preset.query == query)
+        {
+            self.preset_index = idx;
+        } else {
+            self.preset_index = 0;
+        }
+
+        match values
+            .get("inbox_mode")
+            .map(|raw| raw.trim().to_ascii_lowercase())
+        {
+            Some(mode) if mode == "local" => {
+                let local = values
+                    .get("local_project")
+                    .cloned()
+                    .or_else(|| self.last_local_project.clone())
+                    .filter(|slug| !slug.is_empty())
+                    .unwrap_or_else(|| "default".to_string());
+                self.last_local_project = Some(local.clone());
+                self.inbox_mode = InboxMode::Local(local);
+            }
+            _ => {
+                self.inbox_mode = InboxMode::Global;
+                if let Some(last_local) = values
+                    .get("last_local_project")
+                    .cloned()
+                    .filter(|slug| !slug.is_empty())
+                {
+                    self.last_local_project = Some(last_local);
+                }
+            }
+        }
+
+        self.search_dirty = true;
+        self.debounce_remaining = 0;
+    }
+
+    fn apply_named_preset(&mut self, name: &str) -> bool {
+        let Some(preset) = self
+            .filter_presets
+            .get(MESSAGES_PRESET_SCREEN_ID, name)
+            .cloned()
+        else {
+            return false;
+        };
+        self.apply_preset_values(&preset.values);
+        true
+    }
+
+    fn remove_named_preset(&mut self, name: &str) -> bool {
+        let removed = self.filter_presets.remove(MESSAGES_PRESET_SCREEN_ID, name);
+        if removed {
+            self.persist_filter_presets();
+        }
+        removed
+    }
+
+    fn open_save_preset_dialog(&mut self) {
+        self.preset_dialog_mode = PresetDialogMode::Save;
+        self.save_preset_field = SavePresetField::Name;
+        self.save_preset_description.clear();
+        if self.save_preset_name.is_empty() {
+            self.save_preset_name = "messages-preset".to_string();
+        }
+    }
+
+    fn open_load_preset_dialog(&mut self) {
+        self.preset_dialog_mode = PresetDialogMode::Load;
+        let names = self.preset_names();
+        if names.is_empty() {
+            self.load_preset_cursor = 0;
+        } else {
+            self.load_preset_cursor = self.load_preset_cursor.min(names.len().saturating_sub(1));
+        }
+    }
+
+    fn handle_save_dialog_key(&mut self, key: &ftui::KeyEvent) {
+        match key.code {
+            KeyCode::Escape => {
+                self.preset_dialog_mode = PresetDialogMode::None;
+            }
+            KeyCode::Tab => {
+                self.save_preset_field = self.save_preset_field.next();
+            }
+            KeyCode::Backspace => match self.save_preset_field {
+                SavePresetField::Name => {
+                    self.save_preset_name.pop();
+                }
+                SavePresetField::Description => {
+                    self.save_preset_description.pop();
+                }
+            },
+            KeyCode::Enter => {
+                let preset_name = self.save_preset_name.clone();
+                if self.save_named_preset(&preset_name, Some(self.save_preset_description.clone()))
+                {
+                    self.preset_dialog_mode = PresetDialogMode::None;
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(Modifiers::CTRL) => {
+                match self.save_preset_field {
+                    SavePresetField::Name => self.save_preset_name.push(ch),
+                    SavePresetField::Description => self.save_preset_description.push(ch),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_load_dialog_key(&mut self, key: &ftui::KeyEvent) {
+        let names = self.preset_names();
+        match key.code {
+            KeyCode::Escape => {
+                self.preset_dialog_mode = PresetDialogMode::None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !names.is_empty() {
+                    self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
+            }
+            KeyCode::Delete => {
+                if let Some(name) = names.get(self.load_preset_cursor) {
+                    let _ = self.remove_named_preset(name);
+                }
+                let refreshed = self.preset_names();
+                if refreshed.is_empty() {
+                    self.load_preset_cursor = 0;
+                } else {
+                    self.load_preset_cursor = self
+                        .load_preset_cursor
+                        .min(refreshed.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(name) = names.get(self.load_preset_cursor) {
+                    let _ = self.apply_named_preset(name);
+                    self.preset_dialog_mode = PresetDialogMode::None;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn set_cursor_from_results_click(&mut self, y: u16) {
         if self.results.is_empty() {
             return;
@@ -2015,6 +2335,31 @@ impl MailScreen for MessageBrowserScreen {
         }
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
+        {
+            if self.preset_dialog_mode != PresetDialogMode::None {
+                match self.preset_dialog_mode {
+                    PresetDialogMode::Save => self.handle_save_dialog_key(key),
+                    PresetDialogMode::Load => self.handle_load_dialog_key(key),
+                    PresetDialogMode::None => {}
+                }
+                return Cmd::None;
+            }
+            if key.modifiers.contains(Modifiers::CTRL) {
+                match key.code {
+                    KeyCode::Char('s') => {
+                        self.open_save_preset_dialog();
+                        return Cmd::None;
+                    }
+                    KeyCode::Char('l') => {
+                        self.open_load_preset_dialog();
+                        return Cmd::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
             && key.code == KeyCode::Escape
             && state.keyboard_move_snapshot().is_some()
         {
@@ -2434,9 +2779,75 @@ impl MailScreen for MessageBrowserScreen {
         );
 
         let split = dock.split(content_area);
-        self.last_results_area.set(split.primary);
+        let mut results_area = split.primary;
+        let mut detail_area = split.dock;
+        if let Some(mut dock_area) = detail_area {
+            let split_extent = if dock.position.is_horizontal() {
+                content_area.height
+            } else {
+                content_area.width
+            };
+            let split_gap = u16::from(split_extent >= MESSAGE_SPLIT_GAP_THRESHOLD);
+            if split_gap > 0 {
+                let splitter_area = match dock.position {
+                    DockPosition::Right => {
+                        dock_area.x = dock_area.x.saturating_add(split_gap);
+                        dock_area.width = dock_area.width.saturating_sub(split_gap);
+                        Rect::new(
+                            split.primary.x.saturating_add(split.primary.width),
+                            content_area.y,
+                            split_gap,
+                            content_area.height,
+                        )
+                    }
+                    DockPosition::Left => {
+                        results_area.x = results_area.x.saturating_add(split_gap);
+                        results_area.width = results_area.width.saturating_sub(split_gap);
+                        Rect::new(
+                            dock_area.x.saturating_add(dock_area.width),
+                            content_area.y,
+                            split_gap,
+                            content_area.height,
+                        )
+                    }
+                    DockPosition::Bottom => {
+                        dock_area.y = dock_area.y.saturating_add(split_gap);
+                        dock_area.height = dock_area.height.saturating_sub(split_gap);
+                        Rect::new(
+                            content_area.x,
+                            split.primary.y.saturating_add(split.primary.height),
+                            content_area.width,
+                            split_gap,
+                        )
+                    }
+                    DockPosition::Top => {
+                        results_area.y = results_area.y.saturating_add(split_gap);
+                        results_area.height = results_area.height.saturating_sub(split_gap);
+                        Rect::new(
+                            content_area.x,
+                            dock_area.y.saturating_add(dock_area.height),
+                            content_area.width,
+                            split_gap,
+                        )
+                    }
+                };
+                render_splitter_handle(
+                    frame,
+                    splitter_area,
+                    !dock.position.is_horizontal(),
+                    self.dock_drag == DockDragState::Dragging,
+                );
+            }
+            detail_area = if dock_area.width > 0 && dock_area.height > 0 {
+                Some(dock_area)
+            } else {
+                None
+            };
+        }
+
+        self.last_results_area.set(results_area);
         self.last_detail_area
-            .set(split.dock.unwrap_or(Rect::new(0, 0, 0, 0)));
+            .set(detail_area.unwrap_or(Rect::new(0, 0, 0, 0)));
 
         // Sync and borrow list state for rendering
         self.sync_list_state();
@@ -2455,7 +2866,7 @@ impl MailScreen for MessageBrowserScreen {
             .map(|marker| marker.message_id);
         render_results_list(
             frame,
-            split.primary,
+            results_area,
             &self.results,
             &mut list_state,
             results_focused,
@@ -2467,7 +2878,7 @@ impl MailScreen for MessageBrowserScreen {
         );
         drop(list_state);
 
-        if let Some(detail_area) = split.dock {
+        if let Some(detail_area) = detail_area {
             render_detail_panel(
                 frame,
                 detail_area,
@@ -2482,6 +2893,21 @@ impl MailScreen for MessageBrowserScreen {
             render_quick_reply_modal(frame, area, form);
         } else if let Some(form) = &self.compose_form {
             render_compose_modal(frame, area, form);
+        }
+
+        match self.preset_dialog_mode {
+            PresetDialogMode::Save => render_save_preset_dialog(
+                frame,
+                area,
+                &self.save_preset_name,
+                &self.save_preset_description,
+                self.save_preset_field,
+            ),
+            PresetDialogMode::Load => {
+                let names = self.preset_names();
+                render_load_preset_dialog(frame, area, &names, self.load_preset_cursor);
+            }
+            PresetDialogMode::None => {}
         }
     }
 
@@ -2548,6 +2974,18 @@ impl MailScreen for MessageBrowserScreen {
                 action: "Next/prev preset",
             },
             HelpEntry {
+                key: "Ctrl+S",
+                action: "Save current preset",
+            },
+            HelpEntry {
+                key: "Ctrl+L",
+                action: "Load saved preset",
+            },
+            HelpEntry {
+                key: "Delete",
+                action: "Delete selected preset (load dialog)",
+            },
+            HelpEntry {
                 key: "c",
                 action: "Compose message",
             },
@@ -2564,7 +3002,7 @@ impl MailScreen for MessageBrowserScreen {
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some(
-            "Browse and triage messages. Space/v/A/C manage multi-select; c composes; r quick-replies; Enter jumps timeline.",
+            "Browse and triage messages. Space/v/A/C manage multi-select; Ctrl+S/Ctrl+L manage saved presets; Enter jumps timeline.",
         )
     }
 
@@ -3599,6 +4037,108 @@ fn render_compose_error_line(
 }
 
 #[must_use]
+fn preset_modal_rect(area: Rect, width: u16, height: u16) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let width = width.clamp(24, area.width.saturating_sub(2));
+    let height = height.clamp(6, area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn render_save_preset_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    name: &str,
+    description: &str,
+    active_field: SavePresetField,
+) {
+    if area.width < 36 || area.height < 8 {
+        return;
+    }
+    let overlay = preset_modal_rect(area, 64, 9);
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Save Message Preset")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay));
+    let inner = block.inner(overlay);
+    block.render(overlay, frame);
+    if inner.height == 0 {
+        return;
+    }
+    let name_marker = if active_field == SavePresetField::Name {
+        ">"
+    } else {
+        " "
+    };
+    let desc_marker = if active_field == SavePresetField::Description {
+        ">"
+    } else {
+        " "
+    };
+    let description = if description.is_empty() {
+        "<optional>".to_string()
+    } else {
+        description.to_string()
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            "Enter save · Tab switch field · Esc cancel",
+            crate::tui_theme::text_meta(&tp),
+        )),
+        Line::from(Span::raw(format!("{name_marker} Name: {name}"))),
+        Line::from(Span::raw(format!(
+            "{desc_marker} Description: {description}"
+        ))),
+    ];
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+fn render_load_preset_dialog(frame: &mut Frame<'_>, area: Rect, names: &[String], cursor: usize) {
+    if area.width < 36 || area.height < 8 {
+        return;
+    }
+    let overlay = preset_modal_rect(area, 64, 12);
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Load Message Preset")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay));
+    let inner = block.inner(overlay);
+    block.render(overlay, frame);
+    if inner.height == 0 {
+        return;
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "Enter apply · Del delete · j/k move · Esc cancel",
+        crate::tui_theme::text_meta(&tp),
+    ))];
+    if names.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No saved presets for Messages.",
+            crate::tui_theme::text_warning(&tp),
+        )));
+    } else {
+        let visible_rows = usize::from(inner.height.saturating_sub(2)).max(1);
+        let start = cursor.saturating_sub(visible_rows.saturating_sub(1));
+        let end = (start + visible_rows).min(names.len());
+        for (idx, name) in names.iter().enumerate().take(end).skip(start) {
+            let marker = if idx == cursor {
+                crate::tui_theme::SELECTION_PREFIX
+            } else {
+                crate::tui_theme::SELECTION_PREFIX_EMPTY
+            };
+            lines.push(Line::from(Span::raw(format!("{marker}{name}"))));
+        }
+    }
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
 fn compose_modal_rect(area: Rect) -> Rect {
     if area.width < 40 || area.height < 16 {
         return Rect::new(area.x, area.y, 0, 0);
@@ -4779,6 +5319,57 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_over_invalid_target_sets_warning_snapshot() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        screen.results = vec![test_message_entry(10, "thread-a", "Subject A")];
+        screen.last_results_area.set(Rect::new(0, 4, 40, 10));
+
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5);
+        let _ = screen.update(&down, &state);
+        if let MessageDragState::Pending(pending) = &mut screen.message_drag {
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
+        }
+
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 70, 2);
+        let _ = screen.update(&drag, &state);
+        let snapshot = state.message_drag_snapshot().expect("drag snapshot");
+        assert!(snapshot.invalid_hover);
+        assert!(!snapshot.hovered_is_valid);
+        assert!(snapshot.hovered_thread_id.is_none());
+    }
+
+    #[test]
+    fn mouse_drop_on_invalid_target_is_noop() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        screen.results = vec![test_message_entry(10, "thread-a", "Subject A")];
+        screen.last_results_area.set(Rect::new(0, 4, 40, 10));
+
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5);
+        let _ = screen.update(&down, &state);
+        if let MessageDragState::Pending(pending) = &mut screen.message_drag {
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
+        }
+
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 70, 2);
+        let _ = screen.update(&drag, &state);
+        let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 70, 2);
+        let cmd = screen.update(&up, &state);
+        assert!(matches!(cmd, Cmd::None));
+        assert!(state.message_drag_snapshot().is_none());
+        assert!(matches!(screen.message_drag, MessageDragState::Idle));
+    }
+
+    #[test]
     fn mouse_drop_on_different_thread_dispatches_rethread_action() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
@@ -4904,6 +5495,29 @@ mod tests {
             _ => panic!("expected ActionExecute command"),
         }
         assert!(state.keyboard_move_snapshot().is_none());
+    }
+
+    #[test]
+    fn ctrl_v_same_thread_is_noop_and_preserves_marker() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        screen.results = vec![test_message_entry(10, "thread-a", "Subject A")];
+        screen.cursor = 0;
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: 10,
+            subject: "Subject A".to_string(),
+            source_thread_id: "thread-a".to_string(),
+            source_project_slug: "proj".to_string(),
+        }));
+
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('v')), &state);
+        assert!(matches!(cmd, Cmd::None));
+        let marker = state
+            .keyboard_move_snapshot()
+            .expect("keyboard move marker should remain");
+        assert_eq!(marker.message_id, 10);
+        assert_eq!(marker.source_thread_id, "thread-a");
     }
 
     #[test]
@@ -5723,6 +6337,89 @@ mod tests {
         assert_eq!(screen.active_preset().label, "Ack");
     }
 
+    #[test]
+    fn messages_saved_presets_save_load_delete_lifecycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("screen_filter_presets.json");
+        let mut screen = MessageBrowserScreen::with_filter_presets_path_for_test(&path);
+
+        screen.search_input.set_value("urgent ack");
+        screen.preset_index = 3;
+        screen.inbox_mode = InboxMode::Local("proj-alpha".to_string());
+        assert!(screen.save_named_preset("triage", Some("desc".to_string())));
+
+        let loaded = crate::tui_persist::load_screen_filter_presets(&path).expect("load presets");
+        let preset = loaded
+            .get(MESSAGES_PRESET_SCREEN_ID, "triage")
+            .expect("saved preset");
+        assert_eq!(
+            preset.values.get("query").map(String::as_str),
+            Some("urgent ack")
+        );
+        assert_eq!(
+            preset.values.get("preset_index").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            preset.values.get("inbox_mode").map(String::as_str),
+            Some("local")
+        );
+        assert_eq!(
+            preset.values.get("local_project").map(String::as_str),
+            Some("proj-alpha")
+        );
+
+        screen.search_input.set_value("reset");
+        screen.preset_index = 0;
+        screen.inbox_mode = InboxMode::Global;
+        screen.search_dirty = false;
+        assert!(screen.apply_named_preset("triage"));
+        assert_eq!(screen.search_input.value(), "urgent ack");
+        assert_eq!(screen.preset_index, 3);
+        assert!(screen.search_dirty);
+        assert_eq!(screen.debounce_remaining, 0);
+        match &screen.inbox_mode {
+            InboxMode::Local(project) => assert_eq!(project, "proj-alpha"),
+            InboxMode::Global => panic!("expected local mode from preset"),
+        }
+
+        assert!(screen.remove_named_preset("triage"));
+        assert!(screen.preset_names().is_empty());
+    }
+
+    #[test]
+    fn ctrl_shortcuts_drive_message_preset_dialog_flow() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("screen_filter_presets.json");
+        let mut screen = MessageBrowserScreen::with_filter_presets_path_for_test(&path);
+
+        let ctrl_s = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('s'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::CTRL,
+        });
+        screen.update(&ctrl_s, &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::Save);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
+        assert!(!screen.preset_names().is_empty());
+
+        let ctrl_l = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('l'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::CTRL,
+        });
+        screen.update(&ctrl_l, &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::Load);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Delete)), &state);
+        assert!(screen.preset_names().is_empty());
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+        assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
+    }
+
     // ── Search method explainability ───────────────────────────────
 
     #[test]
@@ -5787,6 +6484,8 @@ mod tests {
         let screen = MessageBrowserScreen::new();
         let bindings = screen.keybindings();
         assert!(bindings.iter().any(|b| b.key == "p/P"));
+        assert!(bindings.iter().any(|b| b.key == "Ctrl+S"));
+        assert!(bindings.iter().any(|b| b.key == "Ctrl+L"));
     }
 
     #[test]
