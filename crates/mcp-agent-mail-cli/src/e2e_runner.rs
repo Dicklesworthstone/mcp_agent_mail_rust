@@ -2107,4 +2107,539 @@ exit 1
         assert_eq!(summary["e2e_pass"], 30);
         assert_eq!(summary["e2e_fail"], 2);
     }
+
+    // ── DurationClass ────────────────────────────────────────────────────
+
+    #[test]
+    fn duration_class_as_str_all_variants() {
+        assert_eq!(DurationClass::Fast.as_str(), "fast");
+        assert_eq!(DurationClass::Normal.as_str(), "normal");
+        assert_eq!(DurationClass::Slow.as_str(), "slow");
+    }
+
+    #[test]
+    fn duration_class_default_is_normal() {
+        assert_eq!(DurationClass::default(), DurationClass::Normal);
+    }
+
+    #[test]
+    fn duration_class_serde_roundtrip() {
+        for variant in [DurationClass::Fast, DurationClass::Normal, DurationClass::Slow] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: DurationClass = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn duration_class_serde_rename_all_lowercase() {
+        assert_eq!(serde_json::to_string(&DurationClass::Fast).unwrap(), "\"fast\"");
+        assert_eq!(serde_json::to_string(&DurationClass::Normal).unwrap(), "\"normal\"");
+        assert_eq!(serde_json::to_string(&DurationClass::Slow).unwrap(), "\"slow\"");
+    }
+
+    // ── classify_duration comprehensive ──────────────────────────────────
+
+    #[test]
+    fn classify_duration_all_known_slow_suites() {
+        let slow_names = [
+            "concurrent_agents",
+            "crash_restart_test",
+            "fault_injection_suite",
+            "large_inputs_check",
+            "db_corruption_recovery",
+            "db_migration_v3",
+        ];
+        for name in slow_names {
+            assert_eq!(
+                SuiteRegistry::classify_duration(name, &[]),
+                DurationClass::Slow,
+                "expected Slow for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_duration_all_known_fast_suites() {
+        let fast_names = ["cli_basic", "archive_export", "console_output"];
+        for name in fast_names {
+            assert_eq!(
+                SuiteRegistry::classify_duration(name, &[]),
+                DurationClass::Fast,
+                "expected Fast for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_duration_unknown_suite_is_normal() {
+        assert_eq!(
+            SuiteRegistry::classify_duration("http_transport", &[]),
+            DurationClass::Normal
+        );
+    }
+
+    #[test]
+    fn classify_duration_slow_tag_overrides_name() {
+        // Even a "fast" name becomes Slow with the tag
+        assert_eq!(
+            SuiteRegistry::classify_duration("cli_fast", &["slow".to_string()]),
+            DurationClass::Slow
+        );
+    }
+
+    // ── matches_pattern edge cases ───────────────────────────────────────
+
+    #[test]
+    fn matches_pattern_exact_match() {
+        assert!(SuiteRegistry::matches_pattern("guard", "guard"));
+    }
+
+    #[test]
+    fn matches_pattern_substring_match() {
+        assert!(SuiteRegistry::matches_pattern("test_guard_foo", "guard"));
+    }
+
+    #[test]
+    fn matches_pattern_wildcard_prefix() {
+        assert!(SuiteRegistry::matches_pattern("foo_guard", "*guard"));
+        assert!(!SuiteRegistry::matches_pattern("guard_foo", "*guard"));
+    }
+
+    #[test]
+    fn matches_pattern_wildcard_suffix() {
+        assert!(SuiteRegistry::matches_pattern("guard_foo", "guard*"));
+        assert!(!SuiteRegistry::matches_pattern("foo_guard", "guard*"));
+    }
+
+    #[test]
+    fn matches_pattern_double_wildcard_falls_through_to_substring() {
+        // "*guard*" splits into 3 parts so the 2-part wildcard logic doesn't apply
+        // Falls through to substring check: name.contains("*guard*") which is false
+        assert!(!SuiteRegistry::matches_pattern("test_guard_extra", "*guard*"));
+    }
+
+    #[test]
+    fn matches_pattern_multiple_wildcards_falls_through() {
+        // pattern "a*b*c" has 3 parts, split('*') len==3 so the if parts.len()==2 doesn't match
+        // Falls through to substring check: name.contains("a*b*c") which is false
+        assert!(!SuiteRegistry::matches_pattern("axbxc", "a*b*c"));
+    }
+
+    #[test]
+    fn matches_pattern_no_match() {
+        assert!(!SuiteRegistry::matches_pattern("http", "guard"));
+    }
+
+    #[test]
+    fn matches_pattern_empty_name() {
+        assert!(!SuiteRegistry::matches_pattern("", "guard"));
+    }
+
+    // ── parse_assertions edge cases ──────────────────────────────────────
+
+    #[test]
+    fn parse_assertions_empty_string() {
+        assert_eq!(Runner::parse_assertions(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn parse_assertions_no_matching_lines() {
+        assert_eq!(
+            Runner::parse_assertions("some random output\nnothing useful"),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn parse_assertions_only_pass() {
+        assert_eq!(Runner::parse_assertions("Pass: 10"), (10, 0, 0));
+    }
+
+    #[test]
+    fn parse_assertions_only_fail() {
+        assert_eq!(Runner::parse_assertions("Fail: 3"), (0, 3, 0));
+    }
+
+    #[test]
+    fn parse_assertions_case_insensitive() {
+        assert_eq!(Runner::parse_assertions("PASS: 5  FAIL: 2  SKIP: 1"), (5, 2, 1));
+    }
+
+    #[test]
+    fn parse_assertions_mixed_case() {
+        assert_eq!(Runner::parse_assertions("pass: 8  fail: 0  skip: 3"), (8, 0, 3));
+    }
+
+    #[test]
+    fn parse_assertions_multiline_takes_last_summary() {
+        let output = "some output\nPass: 1  Fail: 0\nmore output\nPass: 5  Fail: 2  Skip: 1\n";
+        // The last matching line wins because it overwrites
+        assert_eq!(Runner::parse_assertions(output), (5, 2, 1));
+    }
+
+    #[test]
+    fn parse_assertions_ansi_codes_stripped() {
+        let output = "\x1b[32mPass: 12\x1b[0m  \x1b[31mFail: 0\x1b[0m";
+        assert_eq!(Runner::parse_assertions(output), (12, 0, 0));
+    }
+
+    #[test]
+    fn parse_assertions_total_prefix_line() {
+        let output = "Total: 30  Pass: 27  Fail: 1  Skip: 2";
+        assert_eq!(Runner::parse_assertions(output), (27, 1, 2));
+    }
+
+    // ── output_excerpt ───────────────────────────────────────────────────
+
+    #[test]
+    fn output_excerpt_empty() {
+        assert_eq!(Runner::output_excerpt(b"", 100), "");
+    }
+
+    #[test]
+    fn output_excerpt_short_fits() {
+        assert_eq!(Runner::output_excerpt(b"hello", 100), "hello");
+    }
+
+    #[test]
+    fn output_excerpt_exactly_at_limit() {
+        assert_eq!(Runner::output_excerpt(b"abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn output_excerpt_over_limit_truncates() {
+        let result = Runner::output_excerpt(b"abcdefgh", 5);
+        assert_eq!(result, "abcde...");
+    }
+
+    // ── truncate_output ──────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_output_empty() {
+        assert_eq!(Runner::truncate_output(b"", 100), "");
+    }
+
+    #[test]
+    fn truncate_output_short_fits() {
+        assert_eq!(Runner::truncate_output(b"hello world", 100), "hello world");
+    }
+
+    #[test]
+    fn truncate_output_exactly_at_limit() {
+        assert_eq!(Runner::truncate_output(b"12345", 5), "12345");
+    }
+
+    #[test]
+    fn truncate_output_over_limit() {
+        let result = Runner::truncate_output(b"1234567890", 5);
+        assert!(result.starts_with("12345"));
+        assert!(result.contains("output truncated at 5 bytes"));
+    }
+
+    // ── RunConfig default ────────────────────────────────────────────────
+
+    #[test]
+    fn run_config_default_values() {
+        let cfg = RunConfig::default();
+        assert_eq!(cfg.project_root, PathBuf::from("."));
+        assert!(cfg.artifact_dir.is_none());
+        assert_eq!(cfg.max_output_bytes, 256 * 1024);
+        assert_eq!(cfg.timeout, Some(Duration::from_secs(600)));
+        assert_eq!(cfg.retries, 0);
+        assert!(cfg.env.is_empty());
+        assert!(!cfg.parallel);
+        assert!(!cfg.keep_tmp);
+        assert!(!cfg.force_build);
+    }
+
+    // ── SuiteResult serde ────────────────────────────────────────────────
+
+    #[test]
+    fn suite_result_serde_roundtrip() {
+        let result = SuiteResult {
+            name: "guard".to_string(),
+            passed: true,
+            exit_code: 0,
+            duration_ms: 1234,
+            stdout: "PASS guard_install".to_string(),
+            stderr: String::new(),
+            assertions_passed: 5,
+            assertions_failed: 0,
+            assertions_skipped: 1,
+            started_at: "2026-02-12T00:00:00Z".to_string(),
+            ended_at: "2026-02-12T00:00:01Z".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: SuiteResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "guard");
+        assert!(back.passed);
+        assert_eq!(back.assertions_passed, 5);
+        assert_eq!(back.assertions_skipped, 1);
+    }
+
+    // ── RunReport serde + format_summary ─────────────────────────────────
+
+    #[test]
+    fn run_report_serde_roundtrip() {
+        let report = RunReport {
+            total: 2,
+            passed: 2,
+            failed: 0,
+            skipped: 0,
+            duration_ms: 500,
+            started_at: "2026-02-12T00:00:00Z".to_string(),
+            ended_at: "2026-02-12T00:00:01Z".to_string(),
+            results: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: RunReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total, 2);
+        assert_eq!(back.passed, 2);
+        assert!(back.success());
+    }
+
+    #[test]
+    fn run_report_format_summary_all_pass() {
+        let report = RunReport {
+            total: 3,
+            passed: 3,
+            failed: 0,
+            skipped: 0,
+            duration_ms: 100,
+            started_at: "2026-02-12T00:00:00Z".to_string(),
+            ended_at: "2026-02-12T00:00:01Z".to_string(),
+            results: vec![],
+        };
+        let summary = report.format_summary();
+        assert!(summary.contains("E2E Run: PASS"));
+        assert!(!summary.contains("Failed suites:"));
+    }
+
+    // ── Suite serde ──────────────────────────────────────────────────────
+
+    #[test]
+    fn suite_serde_roundtrip() {
+        let suite = Suite {
+            name: "alpha".to_string(),
+            script_path: PathBuf::from("/tmp/test_alpha.sh"),
+            description: Some("Alpha test".to_string()),
+            tags: vec!["slow".to_string(), "flaky".to_string()],
+            duration_class: DurationClass::Slow,
+        };
+        let json = serde_json::to_string(&suite).unwrap();
+        let back: Suite = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "alpha");
+        assert_eq!(back.description.as_deref(), Some("Alpha test"));
+        assert_eq!(back.tags, vec!["slow", "flaky"]);
+        assert_eq!(back.duration_class, DurationClass::Slow);
+    }
+
+    // ── SuiteRegistry edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn suite_registry_no_e2e_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert!(registry.suite_names().is_empty());
+    }
+
+    #[test]
+    fn suite_registry_empty_e2e_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("tests/e2e")).unwrap();
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn suite_registry_ignores_non_test_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let e2e = temp.path().join("tests/e2e");
+        fs::create_dir_all(&e2e).unwrap();
+        // Not matching test_*.sh pattern
+        fs::write(e2e.join("helper.sh"), "#!/bin/bash\necho hi").unwrap();
+        fs::write(e2e.join("test_foo.py"), "# python").unwrap();
+        fs::write(e2e.join("setup_test.sh"), "#!/bin/bash").unwrap();
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn suite_registry_get_nonexistent() {
+        let temp = TempDir::new().expect("tempdir");
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+        assert!(registry.get("nonexistent").is_none());
+    }
+
+    // ── extract_metadata edge cases ──────────────────────────────────────
+
+    #[test]
+    fn extract_metadata_shebang_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("test.sh");
+        fs::write(&script, "#!/usr/bin/env bash\n").unwrap();
+        let (desc, tags) = SuiteRegistry::extract_metadata(&script);
+        assert!(desc.is_none());
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn extract_metadata_skips_e2e_lib_source() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("test.sh");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\n# source e2e_lib.sh\n# Real description\n",
+        )
+        .unwrap();
+        let (desc, tags) = SuiteRegistry::extract_metadata(&script);
+        assert_eq!(desc.as_deref(), Some("Real description"));
+    }
+
+    #[test]
+    fn extract_metadata_tags_normalized() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("test.sh");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\n# @tags: Slow, FLAKY, integration\n",
+        )
+        .unwrap();
+        let (_, tags) = SuiteRegistry::extract_metadata(&script);
+        assert_eq!(tags, vec!["slow", "flaky", "integration"]);
+    }
+
+    #[test]
+    fn extract_metadata_empty_tags_filtered() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("test.sh");
+        fs::write(&script, "#!/usr/bin/env bash\n# @tags: , ,slow,,\n").unwrap();
+        let (_, tags) = SuiteRegistry::extract_metadata(&script);
+        assert_eq!(tags, vec!["slow"]);
+    }
+
+    #[test]
+    fn extract_metadata_nonexistent_file() {
+        let (desc, tags) = SuiteRegistry::extract_metadata(Path::new("/nonexistent/path"));
+        assert!(desc.is_none());
+        assert!(tags.is_empty());
+    }
+
+    // ── filter combinations ──────────────────────────────────────────────
+
+    #[test]
+    fn filter_no_include_no_exclude_returns_all() {
+        let temp = TempDir::new().expect("tempdir");
+        write_suite_script(temp.path(), "alpha", "#!/bin/bash\necho ok");
+        write_suite_script(temp.path(), "beta", "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+        let filtered = registry.filter(None, None);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn filter_include_and_exclude_combined() {
+        let temp = TempDir::new().expect("tempdir");
+        write_suite_script(temp.path(), "alpha_fast", "#!/bin/bash\necho ok");
+        write_suite_script(temp.path(), "alpha_slow", "#!/bin/bash\necho ok");
+        write_suite_script(temp.path(), "beta", "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+        let include = vec!["alpha*".to_string()];
+        let exclude = vec!["*slow".to_string()];
+        let filtered = registry.filter(Some(&include), Some(&exclude));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "alpha_fast");
+    }
+
+    // ── write_dual_mode_step_artifact: pass case ─────────────────────────
+
+    #[test]
+    fn write_dual_mode_step_artifact_pass_no_failure_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("dm");
+        fs::create_dir_all(root.join("steps")).expect("steps dir");
+        fs::create_dir_all(root.join("failures")).expect("failures dir");
+
+        let artifact_root = Some(root.clone());
+        let mut step_index = 0usize;
+        Runner::write_dual_mode_step_artifact(
+            &artifact_root,
+            &mut step_index,
+            "am",
+            "migrate --help",
+            "cli",
+            "allow",
+            0,
+            "usage: ...",
+            "",
+            true, // passed
+        );
+
+        assert_eq!(step_index, 1);
+        assert!(root.join("steps/step_001.json").exists());
+        assert!(!root.join("failures/fail_001.json").exists());
+
+        let step: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("steps/step_001.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(step["passed"], true);
+        assert_eq!(step["actual_exit_code"], 0);
+    }
+
+    #[test]
+    fn write_dual_mode_step_artifact_none_root_is_noop() {
+        let mut step_index = 0usize;
+        Runner::write_dual_mode_step_artifact(
+            &None, &mut step_index, "am", "cmd", "cli", "allow", 0, "", "", true,
+        );
+        // step_index not incremented when root is None
+        assert_eq!(step_index, 0);
+    }
+
+    // ── RunReport exit_code ──────────────────────────────────────────────
+
+    #[test]
+    fn run_report_exit_code_zero_on_success() {
+        let r = RunReport {
+            total: 1, passed: 1, failed: 0, skipped: 0,
+            duration_ms: 0,
+            started_at: String::new(), ended_at: String::new(),
+            results: vec![],
+        };
+        assert_eq!(r.exit_code(), 0);
+    }
+
+    #[test]
+    fn run_report_exit_code_one_on_failure() {
+        let r = RunReport {
+            total: 2, passed: 1, failed: 1, skipped: 0,
+            duration_ms: 0,
+            started_at: String::new(), ended_at: String::new(),
+            results: vec![],
+        };
+        assert_eq!(r.exit_code(), 1);
+    }
+
+    // ── native suite constants ───────────────────────────────────────────
+
+    #[test]
+    fn native_suite_constants_match_is_native_suite() {
+        assert_eq!(Runner::NATIVE_HTTP_SUITE, "http");
+        assert_eq!(Runner::NATIVE_DUAL_MODE_SUITE, "dual_mode");
+        assert_eq!(Runner::NATIVE_MODE_MATRIX_SUITE, "mode_matrix");
+        assert_eq!(Runner::NATIVE_SECURITY_PRIVACY_SUITE, "security_privacy");
+        assert_eq!(Runner::NATIVE_TUI_A11Y_SUITE, "tui_a11y");
+    }
+
+    #[test]
+    fn is_native_suite_prefix_not_matched() {
+        // "http_extra" is NOT a native suite (exact match only)
+        assert!(!Runner::is_native_suite("http_extra"));
+        assert!(!Runner::is_native_suite("dual_mode_v2"));
+        assert!(!Runner::is_native_suite(""));
+    }
 }
