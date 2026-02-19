@@ -123,11 +123,34 @@ fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (
     align_metrics_tools(&mut actual, &expected);
 
     for ptr in &norm.ignore_json_pointers {
-        if let Some(v) = actual.pointer_mut(ptr) {
-            *v = Value::Null;
-        }
-        if let Some(v) = expected.pointer_mut(ptr) {
-            *v = Value::Null;
+        let in_expected = expected.pointer(ptr).is_some();
+        if in_expected {
+            // Both sides have the key — null it in both for comparison.
+            if let Some(v) = actual.pointer_mut(ptr) {
+                *v = Value::Null;
+            }
+            if let Some(v) = expected.pointer_mut(ptr) {
+                *v = Value::Null;
+            }
+        } else {
+            // Key only in actual — remove it so it doesn't cause a mismatch.
+            // Supports top-level and nested keys via JSON pointer segments.
+            let segments: Vec<&str> = ptr.trim_start_matches('/').split('/').collect();
+            if let Some(key) = segments.last() {
+                let parent_ptr = if segments.len() == 1 {
+                    String::new()
+                } else {
+                    format!("/{}", segments[..segments.len() - 1].join("/"))
+                };
+                let parent = if parent_ptr.is_empty() {
+                    Some(&mut actual)
+                } else {
+                    actual.pointer_mut(&parent_ptr)
+                };
+                if let Some(Value::Object(map)) = parent {
+                    map.remove(*key);
+                }
+            }
         }
     }
 

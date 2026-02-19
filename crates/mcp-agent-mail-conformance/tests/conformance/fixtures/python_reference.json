@@ -1001,7 +1001,8 @@
           "normalize": {
             "ignore_json_pointers": [
               "/result/0/created_ts",
-              "/result/1/created_ts"
+              "/result/1/created_ts",
+              "/diagnostics"
             ]
           }
         },
@@ -1289,7 +1290,8 @@
           "normalize": {
             "ignore_json_pointers": [
               "/result/0/created_ts",
-              "/result/1/created_ts"
+              "/result/1/created_ts",
+              "/diagnostics"
             ]
           }
         }

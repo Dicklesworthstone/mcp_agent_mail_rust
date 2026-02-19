@@ -179,6 +179,7 @@ fn error_code_catalog_is_stable() {
         "INVALID_AGENT_NAME",
         "INVALID_ARGUMENT",
         "INVALID_LIMIT",
+        "INVALID_PATH",
         "INVALID_THREAD_ID",
         "INVALID_TIMESTAMP",
         "MISSING_FIELD",
