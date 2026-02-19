@@ -38,6 +38,7 @@ const RELOAD_INTERVAL_TICKS: u64 = 50;
 
 /// Maximum attachments to fetch from DB.
 const FETCH_LIMIT: usize = 500;
+const ATTACHMENTS_DETAIL_GAP_THRESHOLD: u16 = 24;
 
 // ──────────────────────────────────────────────────────────────────────
 // AttachmentEntry — parsed attachment with provenance
@@ -806,6 +807,7 @@ impl MailScreen for AttachmentExplorerScreen {
     }
 
     #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         if area.height < 3 || area.width < 40 {
             return;
@@ -829,7 +831,11 @@ impl MailScreen for AttachmentExplorerScreen {
         } else {
             0
         };
-        let table_h = remaining_for_content.saturating_sub(detail_h);
+        let section_gap =
+            u16::from(detail_h > 0 && remaining_for_content >= ATTACHMENTS_DETAIL_GAP_THRESHOLD);
+        let table_h = remaining_for_content
+            .saturating_sub(detail_h)
+            .saturating_sub(section_gap);
 
         let mut y = area.y;
 
@@ -912,6 +918,19 @@ impl MailScreen for AttachmentExplorerScreen {
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);
+
+        if section_gap > 0 {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let gap_area = Rect::new(area.x, y, area.width, section_gap);
+            for gy in gap_area.y..gap_area.y.saturating_add(gap_area.height) {
+                for gx in gap_area.x..gap_area.x.saturating_add(gap_area.width) {
+                    if let Some(cell) = frame.buffer.get_mut(gx, gy) {
+                        cell.bg = tp.panel_bg;
+                    }
+                }
+            }
+            y += section_gap;
+        }
 
         // ── Detail panel ──────────────────────────────────────────
         if detail_h > 0 {

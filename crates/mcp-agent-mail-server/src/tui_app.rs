@@ -80,7 +80,9 @@ const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
 fn command_palette_theme_style() -> PaletteStyle {
     let tp = crate::tui_theme::TuiThemePalette::current();
     PaletteStyle {
-        border: Style::default().fg(tp.panel_border_focused).bg(tp.bg_overlay),
+        border: Style::default()
+            .fg(tp.panel_border_focused)
+            .bg(tp.bg_overlay),
         input: Style::default().fg(tp.text_primary).bg(tp.bg_overlay),
         item: Style::default().fg(tp.text_secondary).bg(tp.bg_overlay),
         item_selected: Style::default().fg(tp.selection_fg).bg(tp.selection_bg),
@@ -2046,7 +2048,8 @@ impl MailAppModel {
     }
 
     fn refresh_palette_theme_style(&mut self) {
-        self.command_palette.set_style(command_palette_theme_style());
+        let palette = std::mem::replace(&mut self.command_palette, CommandPalette::new());
+        self.command_palette = palette.with_style(command_palette_theme_style());
     }
 
     fn theme_id_for_named_config(cfg: &str) -> ThemeId {
@@ -5389,16 +5392,16 @@ fn render_panel_focus_outline(bounds: Rect, area: Rect, frame: &mut Frame) {
     }
 
     if has_top_space && has_left_space {
-        set_focus_cell(frame, left_col, top_row, '┌', color);
+        set_focus_cell(frame, left_col, top_row, '╭', color);
     }
     if has_top_space && has_right_space {
-        set_focus_cell(frame, right_col, top_row, '┐', color);
+        set_focus_cell(frame, right_col, top_row, '╮', color);
     }
     if has_bottom_space && has_left_space {
-        set_focus_cell(frame, left_col, bottom_row, '└', color);
+        set_focus_cell(frame, left_col, bottom_row, '╰', color);
     }
     if has_bottom_space && has_right_space {
-        set_focus_cell(frame, right_col, bottom_row, '┘', color);
+        set_focus_cell(frame, right_col, bottom_row, '╯', color);
     }
 }
 
@@ -8245,6 +8248,59 @@ mod tests {
         let text = ftui_harness::buffer_to_text(&frame.buffer);
 
         assert!(text.contains("Command Palette"));
+    }
+
+    #[test]
+    fn palette_overlay_uses_rounded_border_corners() {
+        let mut model = test_model();
+        model.open_palette();
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 30, &mut pool);
+        model.view(&mut frame);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let palette_width = (area.width * 3 / 5).max(30).min(area.width - 2);
+        let result_rows = model
+            .command_palette
+            .result_count()
+            .min(PALETTE_MAX_VISIBLE);
+        let palette_height = (result_rows as u16 + 3)
+            .max(5)
+            .min(area.height.saturating_sub(2));
+        let palette_x = area.x + (area.width.saturating_sub(palette_width)) / 2;
+        let palette_y = area.y + area.height / 6;
+        let right = palette_x + palette_width - 1;
+        let bottom = palette_y + palette_height - 1;
+
+        assert_eq!(
+            frame
+                .buffer
+                .get(palette_x, palette_y)
+                .and_then(|c| c.content.as_char()),
+            Some('╭')
+        );
+        assert_eq!(
+            frame
+                .buffer
+                .get(right, palette_y)
+                .and_then(|c| c.content.as_char()),
+            Some('╮')
+        );
+        assert_eq!(
+            frame
+                .buffer
+                .get(palette_x, bottom)
+                .and_then(|c| c.content.as_char()),
+            Some('╰')
+        );
+        assert_eq!(
+            frame
+                .buffer
+                .get(right, bottom)
+                .and_then(|c| c.content.as_char()),
+            Some('╯')
+        );
     }
 
     #[test]

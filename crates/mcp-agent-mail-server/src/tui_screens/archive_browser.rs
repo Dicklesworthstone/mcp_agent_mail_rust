@@ -22,6 +22,34 @@ use crate::tui_theme::TuiThemePalette;
 use crate::tui_widgets::fancy::SummaryFooter;
 
 const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
+const ARCHIVE_SPLIT_GAP_THRESHOLD: u16 = 70;
+
+fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, active: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = TuiThemePalette::current();
+    let separator_color = crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border_dim, 0.58);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.fg = separator_color;
+                cell.bg = tp.panel_bg;
+            }
+        }
+    }
+
+    if active && area.height >= 5 {
+        let x = area.x.saturating_add(area.width.saturating_sub(1) / 2);
+        let y = area.y.saturating_add(area.height.saturating_sub(1) / 2);
+        if let Some(cell) = frame.buffer.get_mut(x, y) {
+            *cell = ftui::Cell::from_char('·');
+            cell.fg = tp.selection_indicator;
+            cell.bg = tp.panel_bg;
+        }
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Archive Entry types
@@ -942,6 +970,7 @@ impl MailScreen for ArchiveBrowserScreen {
                 let tp = TuiThemePalette::current();
                 let filter_block = Block::bordered()
                     .title(" Filter: ")
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(tp.metric_reservations));
                 let inner = filter_block.inner(tree_chunks[1]);
                 filter_block.render(tree_chunks[1], frame);
@@ -959,10 +988,25 @@ impl MailScreen for ArchiveBrowserScreen {
                 ])
                 .split(content_area);
 
+            let tree_area = chunks[0];
+            let mut preview_area = chunks[1];
+            let split_gap = u16::from(content_area.width >= ARCHIVE_SPLIT_GAP_THRESHOLD);
+            if split_gap > 0 && preview_area.width > split_gap {
+                preview_area.x = preview_area.x.saturating_add(split_gap);
+                preview_area.width = preview_area.width.saturating_sub(split_gap);
+                let splitter_area = Rect::new(
+                    chunks[0].x.saturating_add(chunks[0].width),
+                    content_area.y,
+                    split_gap,
+                    content_area.height,
+                );
+                render_splitter_handle(frame, splitter_area, false);
+            }
+
             if self.filter_active {
                 let tree_chunks = Flex::vertical()
                     .constraints([Constraint::Min(3), Constraint::Fixed(3)])
-                    .split(chunks[0]);
+                    .split(tree_area);
 
                 self.render_tree(frame, tree_chunks[0], state);
 
@@ -970,16 +1014,17 @@ impl MailScreen for ArchiveBrowserScreen {
                 let tp = TuiThemePalette::current();
                 let filter_block = Block::bordered()
                     .title(" Filter: ")
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(tp.metric_reservations));
                 let inner = filter_block.inner(tree_chunks[1]);
                 filter_block.render(tree_chunks[1], frame);
                 let filter_text = Paragraph::new(format!("{}\u{258e}", self.filter));
                 filter_text.render(inner, frame);
             } else {
-                self.render_tree(frame, chunks[0], state);
+                self.render_tree(frame, tree_area, state);
             }
 
-            self.render_preview(frame, chunks[1]);
+            self.render_preview(frame, preview_area);
         }
 
         // ── Footer summary ─────────────────────────────────────────────

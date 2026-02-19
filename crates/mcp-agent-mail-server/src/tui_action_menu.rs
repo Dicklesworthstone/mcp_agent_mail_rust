@@ -365,13 +365,13 @@ impl<'a> ActionMenu<'a> {
         };
 
         // Top border
-        frame.buffer.set_fast(area.x, area.y, border_cell('┌'));
+        frame.buffer.set_fast(area.x, area.y, border_cell('╭'));
         for col in (area.x + 1)..area.right().saturating_sub(1) {
             frame.buffer.set_fast(col, area.y, border_cell('─'));
         }
         frame
             .buffer
-            .set_fast(area.right().saturating_sub(1), area.y, border_cell('┐'));
+            .set_fast(area.right().saturating_sub(1), area.y, border_cell('╮'));
 
         // Side borders
         for row in (area.y + 1)..area.bottom().saturating_sub(1) {
@@ -384,7 +384,7 @@ impl<'a> ActionMenu<'a> {
         // Bottom border
         frame
             .buffer
-            .set_fast(area.x, area.bottom().saturating_sub(1), border_cell('└'));
+            .set_fast(area.x, area.bottom().saturating_sub(1), border_cell('╰'));
         for col in (area.x + 1)..area.right().saturating_sub(1) {
             frame
                 .buffer
@@ -393,7 +393,7 @@ impl<'a> ActionMenu<'a> {
         frame.buffer.set_fast(
             area.right().saturating_sub(1),
             area.bottom().saturating_sub(1),
-            border_cell('┘'),
+            border_cell('╯'),
         );
 
         // Title
