@@ -632,4 +632,128 @@ mod tests {
         }
         assert_eq!(detector.observation_count(), 42);
     }
+
+    // ── Additional edge-case tests ──────────────────────────────────
+
+    /// `with_prior` constructor applies custom prior parameters.
+    #[test]
+    fn bocpd_with_prior_custom_params() {
+        let mut detector = BocpdDetector::with_prior(
+            1.0 / 50.0,
+            0.5,
+            200,
+            10.0, // prior_mu centered at 10
+            1.0,  // stronger prior
+            2.0,  // alpha
+            2.0,  // beta
+        );
+
+        // Feed data at the prior mean — should be stable.
+        for _ in 0..100 {
+            let _ = detector.observe(10.0);
+        }
+        let rl = detector.most_probable_run_length();
+        assert!(
+            rl >= 50,
+            "stable data at prior mean should have long run length, got {rl}"
+        );
+    }
+
+    /// `ChangePoint` struct fields are accessible (Debug + Clone).
+    #[test]
+    fn change_point_debug_clone() {
+        let cp = ChangePoint {
+            index: 42,
+            probability: 0.85,
+            pre_mean: 0.0,
+            post_mean: 5.0,
+        };
+        let cloned = cp.clone();
+        assert_eq!(cloned.index, 42);
+        assert!((cloned.probability - 0.85).abs() < f64::EPSILON);
+        let debug = format!("{cp:?}");
+        assert!(debug.contains("42"));
+    }
+
+    /// `ln_gamma` returns infinity for non-positive arguments.
+    #[test]
+    fn ln_gamma_non_positive() {
+        assert_eq!(ln_gamma(0.0), f64::INFINITY);
+        assert_eq!(ln_gamma(-1.0), f64::INFINITY);
+        assert_eq!(ln_gamma(-100.0), f64::INFINITY);
+    }
+
+    /// `log_sum_exp` with all-NEG_INFINITY values returns NEG_INFINITY.
+    #[test]
+    fn log_sum_exp_all_neg_inf() {
+        let vals = vec![f64::NEG_INFINITY, f64::NEG_INFINITY];
+        assert_eq!(log_sum_exp(&vals), f64::NEG_INFINITY);
+    }
+
+    /// `log_sum_exp` with a single element returns that element.
+    #[test]
+    fn log_sum_exp_single_element() {
+        assert!((log_sum_exp(&[5.0]) - 5.0).abs() < 1e-10);
+        assert!((log_sum_exp(&[-3.0]) - (-3.0)).abs() < 1e-10);
+    }
+
+    /// `NigStats::update` produces sensible parameters.
+    #[test]
+    fn nig_stats_update() {
+        let prior = NigStats::default_prior();
+        let updated = prior.update(5.0);
+
+        // kappa should increase by 1
+        assert!((updated.kappa - (prior.kappa + 1.0)).abs() < 1e-10);
+        // alpha should increase by 0.5
+        assert!((updated.alpha - (prior.alpha + 0.5)).abs() < 1e-10);
+        // mu should shift toward the observation
+        assert!(updated.mu > prior.mu);
+    }
+
+    /// `NigStats::log_predictive` returns finite values for typical inputs.
+    #[test]
+    fn nig_log_predictive_finite() {
+        let stats = NigStats::default_prior();
+        let lp = stats.log_predictive(0.0);
+        assert!(lp.is_finite(), "log_predictive(0.0) = {lp}");
+        let lp2 = stats.log_predictive(100.0);
+        assert!(lp2.is_finite(), "log_predictive(100.0) = {lp2}");
+        // Observation at the mean should have higher predictive prob
+        assert!(lp > lp2, "closer to mean should be more probable");
+    }
+
+    /// Startup suppression: no change point detected during initial warmup.
+    #[test]
+    fn bocpd_startup_suppression() {
+        let mut detector = BocpdDetector::new(1.0 / 50.0, 0.5, 300);
+        // Even with dramatic data, the first CHANGE_WINDOW observations
+        // should not produce a change point due to in_change = true at startup.
+        let mut early_cps = Vec::new();
+        for _ in 0..15 {
+            if let Some(cp) = detector.observe(100.0) {
+                early_cps.push(cp);
+            }
+        }
+        assert!(
+            early_cps.is_empty(),
+            "should not detect change points during startup warmup"
+        );
+    }
+
+    /// `run_length_distribution` returns valid probabilities.
+    #[test]
+    fn run_length_distribution_valid_probabilities() {
+        let mut detector = BocpdDetector::new(1.0 / 100.0, 0.5, 300);
+        for _ in 0..50 {
+            let _ = detector.observe(1.0);
+        }
+        let dist = detector.run_length_distribution();
+        for (i, &p) in dist.iter().enumerate() {
+            assert!(
+                p >= 0.0 && p <= 1.0 + 1e-10,
+                "probability at index {i} out of range: {p}"
+            );
+        }
+    }
 }
