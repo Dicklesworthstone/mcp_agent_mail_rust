@@ -12,8 +12,8 @@
 #![forbid(unsafe_code)]
 
 use mcp_agent_mail_core::{Config, kpi_record_sample};
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::now_micros;
 use mcp_agent_mail_tools::{
@@ -177,7 +177,7 @@ fn metrics_loop(config: &Config) {
     }
 }
 
-fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
+fn open_metrics_connection(database_url: &str) -> Option<SqliteConnection> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return None;
     }
@@ -186,12 +186,12 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
-    let conn = DbConn::open_file(&path).ok()?;
+    let conn = SqliteConnection::open_file(&path).ok()?;
     let _ = conn.execute_raw("PRAGMA busy_timeout = 60000;");
     Some(conn)
 }
 
-fn ensure_metrics_schema(conn: &DbConn) {
+fn ensure_metrics_schema(conn: &SqliteConnection) {
     let _ = conn.execute_sync(
         "CREATE TABLE IF NOT EXISTS tool_metrics_snapshots (\
              id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -234,7 +234,7 @@ const fn i64_from_u64_saturating(value: u64) -> i64 {
 }
 
 fn persist_snapshot_rows(
-    conn: &DbConn,
+    conn: &SqliteConnection,
     collected_ts: i64,
     snapshot: &[MetricsSnapshotEntry],
 ) -> Result<(), String> {
@@ -279,7 +279,7 @@ fn persist_snapshot_rows(
     Ok(())
 }
 
-fn prune_old_snapshot_rows(conn: &DbConn, collected_ts: i64) {
+fn prune_old_snapshot_rows(conn: &SqliteConnection, collected_ts: i64) {
     let cutoff = collected_ts.saturating_sub(METRICS_RETENTION_DAYS * 86_400_000_000);
     let _ = conn.execute_sync(
         "DELETE FROM tool_metrics_snapshots WHERE collected_ts < ?",
