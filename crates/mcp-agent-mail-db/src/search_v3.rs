@@ -478,4 +478,419 @@ mod tests {
             temp.path().display()
         );
     }
+
+    // -- measure_index_dir_bytes edge cases --------------------------------
+
+    #[test]
+    fn measure_index_dir_bytes_nonexistent() {
+        let size = measure_index_dir_bytes(Path::new("/tmp/nonexistent-dir-xyzzy-12345"));
+        assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn measure_index_dir_bytes_empty_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let size = measure_index_dir_bytes(temp.path());
+        assert_eq!(size, 0);
+    }
+
+    // -- build_search_filter tests -----------------------------------------
+
+    #[test]
+    fn filter_default_query_has_message_doc_kind() {
+        let query = PlannerQuery::messages("test", 1);
+        let filter = build_search_filter(&query);
+        assert_eq!(
+            filter.doc_kind,
+            Some(mcp_agent_mail_search_core::document::DocKind::Message)
+        );
+        assert_eq!(filter.project_id, Some(1));
+        assert!(filter.sender.is_none());
+        assert!(filter.thread_id.is_none());
+        assert!(filter.importance.is_none());
+        assert!(filter.date_range.is_none());
+    }
+
+    #[test]
+    fn filter_agent_doc_kind() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Agent,
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(
+            filter.doc_kind,
+            Some(mcp_agent_mail_search_core::document::DocKind::Agent)
+        );
+    }
+
+    #[test]
+    fn filter_project_doc_kind() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Project,
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(
+            filter.doc_kind,
+            Some(mcp_agent_mail_search_core::document::DocKind::Project)
+        );
+    }
+
+    #[test]
+    fn filter_thread_doc_kind() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Thread,
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(
+            filter.doc_kind,
+            Some(mcp_agent_mail_search_core::document::DocKind::Thread)
+        );
+    }
+
+    #[test]
+    fn filter_with_sender() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(filter.sender.as_deref(), Some("BlueLake"));
+    }
+
+    #[test]
+    fn filter_with_thread_id() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            thread_id: Some("br-42".to_string()),
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(filter.thread_id.as_deref(), Some("br-42"));
+    }
+
+    #[test]
+    fn filter_importance_urgent_only() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::Urgent],
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(filter.importance, Some(ImportanceFilter::Urgent));
+    }
+
+    #[test]
+    fn filter_importance_high_only() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::High],
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(filter.importance, Some(ImportanceFilter::High));
+    }
+
+    #[test]
+    fn filter_importance_normal_only() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::Normal],
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(filter.importance, Some(ImportanceFilter::Normal));
+    }
+
+    #[test]
+    fn filter_importance_low_only() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::Low],
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert_eq!(filter.importance, Some(ImportanceFilter::Low));
+    }
+
+    #[test]
+    fn filter_importance_high_and_urgent_combined() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::High, Importance::Urgent],
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        // High + Urgent without Normal/Low maps to ImportanceFilter::High.
+        assert_eq!(filter.importance, Some(ImportanceFilter::High));
+    }
+
+    #[test]
+    fn filter_importance_mixed_leaves_none() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::High, Importance::Low],
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        // Non-adjacent levels can't be expressed as a single filter → None.
+        assert!(filter.importance.is_none());
+    }
+
+    #[test]
+    fn filter_with_time_range() {
+        use crate::search_planner::TimeRange;
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            time_range: TimeRange {
+                min_ts: Some(1_000_000),
+                max_ts: Some(2_000_000),
+            },
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        let date_range = filter.date_range.expect("should have date_range");
+        assert_eq!(date_range.start, Some(1_000_000));
+        assert_eq!(date_range.end, Some(2_000_000));
+    }
+
+    #[test]
+    fn filter_empty_time_range_no_date_filter() {
+        use crate::search_planner::TimeRange;
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            time_range: TimeRange {
+                min_ts: None,
+                max_ts: None,
+            },
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        assert!(filter.date_range.is_none());
+    }
+
+    #[test]
+    fn filter_half_open_time_range() {
+        use crate::search_planner::TimeRange;
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            time_range: TimeRange {
+                min_ts: Some(1_000_000),
+                max_ts: None,
+            },
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query);
+        let date_range = filter.date_range.expect("should have date_range");
+        assert_eq!(date_range.start, Some(1_000_000));
+        assert!(date_range.end.is_none());
+    }
+
+    // -- convert_results tests ---------------------------------------------
+
+    fn make_search_results(hits: Vec<mcp_agent_mail_search_core::results::SearchHit>) -> SearchResults {
+        use mcp_agent_mail_search_core::query::SearchMode;
+        SearchResults {
+            total_count: hits.len(),
+            hits,
+            mode_used: SearchMode::Lexical,
+            explain: None,
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+
+    fn make_hit(
+        doc_id: i64,
+        score: f64,
+        snippet: Option<&str>,
+        metadata: std::collections::HashMap<String, serde_json::Value>,
+    ) -> mcp_agent_mail_search_core::results::SearchHit {
+        use mcp_agent_mail_search_core::document::DocKind as CoreDocKind;
+        mcp_agent_mail_search_core::results::SearchHit {
+            doc_id,
+            doc_kind: CoreDocKind::Message,
+            score,
+            snippet: snippet.map(str::to_string),
+            highlight_ranges: vec![],
+            metadata,
+        }
+    }
+
+    #[test]
+    fn convert_empty_results() {
+        let results = make_search_results(vec![]);
+        let converted = convert_results(&results, DocKind::Message);
+        assert!(converted.is_empty());
+    }
+
+    #[test]
+    fn convert_results_preserves_doc_kind() {
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("subject".to_string(), serde_json::json!("Test Subject"));
+        meta.insert("sender".to_string(), serde_json::json!("RedPeak"));
+        let hit = make_hit(42, 1.5, Some("snippet"), meta);
+        let results = make_search_results(vec![hit]);
+
+        for kind in &[DocKind::Message, DocKind::Agent, DocKind::Project, DocKind::Thread] {
+            let converted = convert_results(&results, *kind);
+            assert_eq!(converted.len(), 1);
+            assert_eq!(converted[0].doc_kind, *kind);
+        }
+    }
+
+    #[test]
+    fn convert_results_extracts_all_metadata_fields() {
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("subject".to_string(), serde_json::json!("Important Mail"));
+        meta.insert("sender".to_string(), serde_json::json!("GoldHawk"));
+        meta.insert("importance".to_string(), serde_json::json!("urgent"));
+        meta.insert("thread_id".to_string(), serde_json::json!("br-500"));
+        meta.insert("created_ts".to_string(), serde_json::json!(9_876_543_210i64));
+        meta.insert("project_id".to_string(), serde_json::json!(3i64));
+        let hit = make_hit(99, 2.5, Some("snippet text"), meta);
+        let results = make_search_results(vec![hit]);
+        let converted = convert_results(&results, DocKind::Message);
+        let r = &converted[0];
+
+        assert_eq!(r.id, 99);
+        assert_eq!(r.score, Some(2.5));
+        assert_eq!(r.title, "Important Mail");
+        assert_eq!(r.body, "snippet text");
+        assert_eq!(r.from_agent.as_deref(), Some("GoldHawk"));
+        assert_eq!(r.importance.as_deref(), Some("urgent"));
+        assert_eq!(r.thread_id.as_deref(), Some("br-500"));
+        assert_eq!(r.created_ts, Some(9_876_543_210));
+        assert_eq!(r.project_id, Some(3));
+        assert!(!r.redacted);
+        assert!(r.redaction_reason.is_none());
+        assert!(r.ack_required.is_none());
+    }
+
+    #[test]
+    fn convert_results_handles_missing_metadata() {
+        let hit = make_hit(1, 0.5, None, std::collections::HashMap::new());
+        let results = make_search_results(vec![hit]);
+        let converted = convert_results(&results, DocKind::Message);
+        let r = &converted[0];
+
+        assert_eq!(r.id, 1);
+        assert_eq!(r.title, "");
+        assert_eq!(r.body, "");
+        assert!(r.from_agent.is_none());
+        assert!(r.importance.is_none());
+        assert!(r.thread_id.is_none());
+        assert!(r.created_ts.is_none());
+        assert!(r.project_id.is_none());
+    }
+
+    // -- TantivyBridge in_memory and accessors ------------------------------
+
+    #[test]
+    fn in_memory_bridge_has_empty_index_dir() {
+        let bridge = TantivyBridge::in_memory();
+        assert_eq!(bridge.index_dir(), Path::new(""));
+    }
+
+    #[test]
+    fn in_memory_bridge_provides_index_and_handles() {
+        let bridge = TantivyBridge::in_memory();
+        // Should be able to get a reader (empty index is valid).
+        let reader = bridge.index().reader().expect("reader");
+        assert_eq!(reader.searcher().num_docs(), 0);
+        // handles should have non-zero field references.
+        let _subject = bridge.handles().subject;
+        let _body = bridge.handles().body;
+    }
+
+    // -- TantivyBridge::open with temp directory ----------------------------
+
+    #[test]
+    fn open_creates_new_index_in_empty_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bridge = TantivyBridge::open(temp.path()).expect("open bridge");
+        assert_eq!(bridge.index_dir(), temp.path());
+
+        // meta.json should exist after index creation.
+        assert!(temp.path().join("meta.json").exists());
+
+        // Empty index should have 0 docs.
+        let reader = bridge.index().reader().expect("reader");
+        assert_eq!(reader.searcher().num_docs(), 0);
+    }
+
+    #[test]
+    fn open_reuses_existing_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // Create an index and add a doc.
+        let bridge1 = TantivyBridge::open(temp.path()).expect("open1");
+        let handles = bridge1.handles();
+        let mut writer = bridge1.index().writer(15_000_000).expect("writer");
+        writer
+            .add_document(doc!(
+                handles.id => 42u64,
+                handles.doc_kind => "message",
+                handles.subject => "Reopen test",
+                handles.body => "Body content",
+                handles.sender => "TestAgent",
+                handles.project_slug => "proj",
+                handles.project_id => 1u64,
+                handles.thread_id => "t-1",
+                handles.importance => "normal",
+                handles.created_ts => 1_000_000i64
+            ))
+            .expect("add doc");
+        writer.commit().expect("commit");
+        drop(bridge1);
+
+        // Reopen the same directory — should find the existing doc.
+        let bridge2 = TantivyBridge::open(temp.path()).expect("open2");
+        let reader = bridge2.index().reader().expect("reader");
+        assert_eq!(reader.searcher().num_docs(), 1);
+    }
+
+    #[test]
+    fn open_creates_missing_parent_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("a").join("b").join("c");
+        let bridge = TantivyBridge::open(&nested).expect("open nested");
+        assert!(nested.join("meta.json").exists());
+        assert_eq!(bridge.index_dir(), nested.as_path());
+    }
+
+    // -- Search with multiple hits -----------------------------------------
+
+    #[test]
+    fn search_returns_hits_with_scores() {
+        let bridge = setup_bridge_with_docs();
+        // "plan" appears in doc 1 subject ("Migration plan review") and body.
+        let query = PlannerQuery::messages("plan", 1);
+        let results = bridge.search(&query);
+        assert!(!results.is_empty(), "should find at least one result");
+        for r in &results {
+            assert!(r.score.is_some(), "every result should have a score");
+            assert!(
+                r.score.unwrap() > 0.0,
+                "score should be positive, got {:?}",
+                r.score
+            );
+        }
+    }
 }
