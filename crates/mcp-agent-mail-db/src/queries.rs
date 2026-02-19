@@ -650,12 +650,10 @@ static MVCC_MAX_RETRIES: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| 
 });
 
 /// Global counter: total MVCC retries performed.
-static MVCC_RETRIES_TOTAL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static MVCC_RETRIES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Global counter: MVCC conflicts that exhausted all retries.
-static MVCC_EXHAUSTED_TOTAL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static MVCC_EXHAUSTED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Check if a [`DbError`] is an MVCC write conflict.
 fn is_mvcc_error(e: &DbError) -> bool {

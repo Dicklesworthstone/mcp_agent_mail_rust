@@ -1139,9 +1139,7 @@ pub fn enforce_base_mode_cleanup(conn: &SqliteConnection) -> std::result::Result
 /// Since Search V3 decommission (br-2tnl.8.4), Tantivy handles all text search.
 /// This drops `fts_messages`, `fts_agents`, `fts_projects` and all their triggers.
 #[allow(clippy::result_large_err)]
-pub fn enforce_runtime_fts_cleanup(
-    conn: &SqliteConnection,
-) -> std::result::Result<(), SqlError> {
+pub fn enforce_runtime_fts_cleanup(conn: &SqliteConnection) -> std::result::Result<(), SqlError> {
     // Drop all FTS artifacts — same as base mode cleanup
     for migration in base_trigger_cleanup_migrations() {
         conn.execute_raw(&migration.up)?;
@@ -2059,10 +2057,8 @@ mod tests {
 
     #[test]
     fn extract_ident_keyword_not_found() {
-        let result = extract_ident_after_keyword(
-            "SELECT * FROM foo",
-            "create table if not exists ",
-        );
+        let result =
+            extract_ident_after_keyword("SELECT * FROM foo", "create table if not exists ");
         assert_eq!(result, None);
     }
 
@@ -2152,22 +2148,28 @@ mod tests {
     #[test]
     fn derive_migration_id_table() {
         let result = derive_migration_id_and_description(
-            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)"
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)",
         );
         assert_eq!(
             result,
-            Some(("v1_create_table_messages".to_string(), "create table messages".to_string()))
+            Some((
+                "v1_create_table_messages".to_string(),
+                "create table messages".to_string()
+            ))
         );
     }
 
     #[test]
     fn derive_migration_id_index() {
         let result = derive_migration_id_and_description(
-            "CREATE INDEX IF NOT EXISTS idx_ts ON messages (ts)"
+            "CREATE INDEX IF NOT EXISTS idx_ts ON messages (ts)",
         );
         assert_eq!(
             result,
-            Some(("v1_create_index_idx_ts".to_string(), "create index idx_ts".to_string()))
+            Some((
+                "v1_create_index_idx_ts".to_string(),
+                "create index idx_ts".to_string()
+            ))
         );
     }
 

@@ -26,6 +26,11 @@ use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configur
 use asupersync::{Budget, Cx, Outcome, Time};
 #[cfg(feature = "hybrid")]
 use half::f16;
+use mcp_agent_mail_search_core::SearchMode;
+use mcp_agent_mail_search_core::cache::{
+    CacheConfig, InvalidationTrigger, QueryCache, QueryCacheKey, WarmResource, WarmWorker,
+    WarmWorkerConfig,
+};
 use mcp_agent_mail_search_core::{
     CandidateBudget, CandidateBudgetConfig, CandidateBudgetDecision, CandidateBudgetDerivation,
     CandidateHit, CandidateMode, CandidateStageCounts, QueryAssistance, QueryClass,
@@ -43,11 +48,6 @@ use mcp_agent_mail_search_core::{
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
-use mcp_agent_mail_search_core::cache::{
-    CacheConfig, InvalidationTrigger, QueryCache, QueryCacheKey, WarmResource,
-    WarmWorker, WarmWorkerConfig,
-};
-use mcp_agent_mail_search_core::SearchMode;
 #[cfg(feature = "hybrid")]
 use std::collections::BTreeMap;
 #[cfg(feature = "hybrid")]
@@ -97,10 +97,7 @@ pub fn invalidate_search_cache(trigger: InvalidationTrigger) {
 /// Get search cache metrics snapshot (for diagnostics).
 #[must_use]
 pub fn search_cache_metrics() -> mcp_agent_mail_search_core::cache::CacheMetrics {
-    SEARCH_CACHE
-        .get()
-        .map(|c| c.metrics())
-        .unwrap_or_default()
+    SEARCH_CACHE.get().map(|c| c.metrics()).unwrap_or_default()
 }
 
 /// Get warm worker status snapshot (for diagnostics).
@@ -915,7 +912,10 @@ pub fn enqueue_semantic_document(
     title: &str,
     body: &str,
 ) -> bool {
-    let Some(bridge) = get_or_init_semantic_bridge() else {
+    // Avoid heavyweight model initialization on normal write paths.
+    // If semantic indexing has not been initialized, skip enqueue and let
+    // lexical search remain available.
+    let Some(bridge) = get_semantic_bridge() else {
         return false;
     };
     bridge.enqueue_document(
@@ -960,9 +960,10 @@ pub const fn semantic_indexing_snapshot() -> Option<()> {
 #[cfg(feature = "hybrid")]
 #[must_use]
 pub fn semantic_indexing_health() -> Option<SemanticIndexingHealth> {
-    semantic_indexing_snapshot().map(|snapshot| SemanticIndexingHealth {
-        queue: snapshot.queue,
-        metrics: snapshot.metrics,
+    let bridge = get_semantic_bridge()?;
+    Some(SemanticIndexingHealth {
+        queue: bridge.queue_stats(),
+        metrics: bridge.metrics_snapshot(),
     })
 }
 
@@ -998,7 +999,7 @@ fn build_two_tier_indexing_health(bridge: &TwoTierBridge) -> TwoTierIndexingHeal
 #[cfg(feature = "hybrid")]
 #[must_use]
 pub fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
-    let bridge = get_or_init_two_tier_bridge()?;
+    let bridge = get_two_tier_bridge()?;
     Some(build_two_tier_indexing_health(&bridge))
 }
 
@@ -1012,7 +1013,7 @@ pub const fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
 #[cfg(feature = "hybrid")]
 #[must_use]
 pub fn two_tier_metrics_snapshot() -> Option<TwoTierMetricsSnapshot> {
-    let bridge = get_or_init_two_tier_bridge()?;
+    let bridge = get_two_tier_bridge()?;
     Some(bridge.metrics())
 }
 
@@ -2490,18 +2491,17 @@ pub async fn execute_search(
         let mode = engine_to_search_mode(engine_mode);
         // Cursor-based pagination: hash cursor string into offset for cache key
         // differentiation. Different cursors = different result pages.
-        let offset_proxy = query
-            .cursor
-            .as_ref()
-            .map_or(0_usize, |c| {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                c.hash(&mut h);
-                // Truncation is intentional: this is a hash-based discriminator,
-                // not a precise offset. Losing high bits on 32-bit is fine.
-                #[allow(clippy::cast_possible_truncation)]
-                { h.finish() as usize }
-            });
+        let offset_proxy = query.cursor.as_ref().map_or(0_usize, |c| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            c.hash(&mut h);
+            // Truncation is intentional: this is a hash-based discriminator,
+            // not a precise offset. Losing high bits on 32-bit is fine.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                h.finish() as usize
+            }
+        });
         QueryCacheKey::new(
             &query.text,
             mode,
@@ -2545,13 +2545,8 @@ pub async fn execute_search(
             }
             // Record V3 metrics
             global_metrics().search.record_v3_query(latency_us, false);
-            let resp = finish_scoped_response(
-                raw_results,
-                query,
-                options,
-                assistance.clone(),
-                explain,
-            );
+            let resp =
+                finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
             if let Outcome::Ok(ref val) = resp {
                 cache.put(cache_key, val.clone());
             }
@@ -2655,13 +2650,8 @@ pub async fn execute_search(
                 record_query("search_service_hybrid_candidates", latency_us);
             }
             global_metrics().search.record_v3_query(latency_us, false);
-            let resp = finish_scoped_response(
-                raw_results,
-                query,
-                options,
-                assistance.clone(),
-                explain,
-            );
+            let resp =
+                finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
             if let Outcome::Ok(ref val) = resp {
                 cache.put(cache_key, val.clone());
             }

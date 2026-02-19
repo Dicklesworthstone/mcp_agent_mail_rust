@@ -131,7 +131,11 @@ pub fn full_check(conn: &SqliteConnection) -> DbResult<IntegrityCheckResult> {
     run_check(conn, "PRAGMA integrity_check", CheckKind::Full)
 }
 
-fn run_check(conn: &SqliteConnection, pragma: &str, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
+fn run_check(
+    conn: &SqliteConnection,
+    pragma: &str,
+    kind: CheckKind,
+) -> DbResult<IntegrityCheckResult> {
     let start = std::time::Instant::now();
 
     let rows: Vec<Row> = conn
