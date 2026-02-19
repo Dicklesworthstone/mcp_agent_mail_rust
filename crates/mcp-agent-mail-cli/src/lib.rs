@@ -9313,8 +9313,10 @@ mod tests {
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "bench --list --json failed: {result:?}");
+        let trimmed = output.trim();
+        let json_start = trimmed.find('[').unwrap_or(0);
         let parsed: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("valid benchmark list json");
+            serde_json::from_str(&trimmed[json_start..]).expect("valid benchmark list json");
         let rows = parsed.as_array().expect("benchmark list array");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["name"], "help");
@@ -9345,8 +9347,9 @@ mod tests {
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "bench --quick --json failed: {result:?}");
+        let json_str = extract_json_block(&output).expect("expected JSON in bench output");
         let parsed: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("valid benchmark json");
+            serde_json::from_str(json_str).expect("valid benchmark json");
         assert_eq!(parsed["warmup"], 1);
         assert_eq!(parsed["runs"], 3);
         assert!(parsed["summary"]["benchmarks"]["help"].is_object());
@@ -11143,21 +11146,30 @@ mod tests {
 
         let out = String::from_utf8_lossy(&sink);
         let lines: Vec<&str> = out.lines().collect();
+        // Filter to migrate-specific lines (other tests may leak ftui_println output
+        // through StdioCapture, e.g. "Stopping preview server...").
+        let migrate_lines: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| {
+                l.contains("Database schema created") || l.contains("delete storage.sqlite3")
+            })
+            .collect();
         assert_eq!(
-            lines.len(),
+            migrate_lines.len(),
             2,
-            "expected exactly 2 output lines, got {}: {lines:?}",
-            lines.len()
+            "expected exactly 2 migrate output lines, got {}: {migrate_lines:?} (raw: {lines:?})",
+            migrate_lines.len()
         );
         assert!(
-            lines[0].contains("Database schema created from model definitions"),
+            migrate_lines[0].contains("Database schema created from model definitions"),
             "line 0: {:?}",
-            lines[0]
+            migrate_lines[0]
         );
         assert!(
-            lines[1].contains("delete storage.sqlite3"),
+            migrate_lines[1].contains("delete storage.sqlite3"),
             "line 1: {:?}",
-            lines[1]
+            migrate_lines[1]
         );
     }
 
@@ -14463,8 +14475,12 @@ mod tests {
         let output = capture.drain_to_string();
         assert!(result.is_ok(), "list-projects --json failed: {result:?}");
 
-        // Parse JSON output - should be empty array
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        // Parse JSON output - should be empty array.
+        // Extract from first JSON-like character to tolerate leaked ftui_println.
+        let trimmed = output.trim();
+        let json_start = trimmed.find(|c: char| c == '[' || c == '{').unwrap_or(0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&trimmed[json_start..]).unwrap();
         assert!(parsed.is_array(), "expected JSON array, got: {parsed}");
         assert_eq!(parsed.as_array().unwrap().len(), 0);
     }
@@ -14486,9 +14502,10 @@ mod tests {
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "doctor check failed: {result:?}");
-        // JSON output should have "healthy" field
-        if !output.trim().is_empty() {
-            let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        // JSON output should have "healthy" field.
+        // Use extract_json_block to tolerate leaked ftui_println from concurrent tests.
+        if let Some(json_str) = extract_json_block(&output) {
+            let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
             assert!(parsed["healthy"].is_boolean());
         }
     }
@@ -14509,7 +14526,9 @@ mod tests {
         let output = capture.drain_to_string();
         assert!(result.is_ok(), "doctor check failed: {result:?}");
 
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).expect("json");
+        // Use extract_json_block to tolerate leaked ftui_println from concurrent tests.
+        let json_str = extract_json_block(&output).expect("expected JSON in doctor output");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("json");
         let checks = parsed["checks"].as_array().expect("checks array");
         assert!(
             checks
@@ -14535,7 +14554,9 @@ mod tests {
         let output = capture.drain_to_string();
         assert!(result.is_ok(), "doctor check failed: {result:?}");
 
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).expect("json");
+        // Use extract_json_block to tolerate leaked ftui_println from concurrent tests.
+        let json_str = extract_json_block(&output).expect("expected JSON in doctor output");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("json");
         let checks = parsed["checks"].as_array().expect("checks array");
         let bead_check = checks
             .iter()
@@ -14763,8 +14784,10 @@ mod tests {
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "beads status failed: {result:?}");
+        // Use extract_json_block to tolerate leaked ftui_println from concurrent tests.
+        let json_str = extract_json_block(&output).expect("expected JSON in beads status output");
         let parsed: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("should be valid JSON");
+            serde_json::from_str(json_str).expect("should be valid JSON");
         assert_eq!(parsed["open"], 0);
         assert_eq!(parsed["closed"], 0);
         assert_eq!(parsed["total"], 0);
@@ -14787,8 +14810,11 @@ mod tests {
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "beads ready failed: {result:?}");
+        // Extract JSON array from potentially polluted capture output.
+        let trimmed = output.trim();
+        let json_start = trimmed.find('[').unwrap_or(0);
         let parsed: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("should be valid JSON");
+            serde_json::from_str(&trimmed[json_start..]).expect("should be valid JSON");
         assert!(parsed.as_array().expect("should be array").is_empty());
     }
 
@@ -14804,8 +14830,11 @@ mod tests {
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "doctor backups --json failed: {result:?}");
-        if !output.trim().is_empty() {
-            let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        // Extract JSON array from potentially polluted capture output.
+        let trimmed = output.trim();
+        if let Some(start) = trimmed.find('[') {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&trimmed[start..]).unwrap();
             assert!(parsed.is_array());
         }
     }
@@ -14819,11 +14848,12 @@ mod tests {
         let result = handle_config(ConfigCommand::ShowPort);
         let output = capture.drain_to_string();
         assert!(result.is_ok(), "config show-port failed: {result:?}");
-        // Should output a port number
-        assert!(
-            output.trim().parse::<u16>().is_ok() || output.contains("8765"),
-            "expected port number, got: {output}"
-        );
+        // Should output a port number. Find last line that looks like a port number
+        // to tolerate leaked ftui_println from concurrent tests.
+        let has_port = output.trim().lines().any(|l| {
+            l.trim().parse::<u16>().is_ok()
+        }) || output.contains("8765");
+        assert!(has_port, "expected port number, got: {output}");
     }
 
     #[test]
