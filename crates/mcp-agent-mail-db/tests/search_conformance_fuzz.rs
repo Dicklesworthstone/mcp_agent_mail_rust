@@ -500,10 +500,8 @@ fn conformance_doc_kinds() {
             ..Default::default()
         };
         let plan = plan_search(&q);
-        let expected_method = match kind {
-            DocKind::Message | DocKind::Thread => PlanMethod::Like,
-            DocKind::Agent | DocKind::Project => PlanMethod::Like,
-        };
+        // All doc kinds now use LIKE (FTS5 decommissioned in br-2tnl.8.4).
+        let expected_method = PlanMethod::Like;
         assert_eq!(
             plan.method, expected_method,
             "{kind:?} with text should use {expected_method:?}"
