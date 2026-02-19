@@ -1407,4 +1407,235 @@ mod tests {
         let restored: ScannedArtifact = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.context.test_name, "serde_scan");
     }
+
+    // ── FailureCategory serde roundtrip ───────────────────────────────
+
+    #[test]
+    fn failure_category_serde_all_variants() {
+        for (variant, expected_json) in [
+            (FailureCategory::Assertion, "\"assertion\""),
+            (FailureCategory::Timing, "\"timing\""),
+            (FailureCategory::Contention, "\"contention\""),
+            (FailureCategory::Nondeterministic, "\"nondeterministic\""),
+            (FailureCategory::CiEnvironment, "\"ci_environment\""),
+            (FailureCategory::Unknown, "\"unknown\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_json, "variant {variant:?}");
+            let restored: FailureCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, variant);
+        }
+    }
+
+    // ── FlakeVerdict serde roundtrip ──────────────────────────────────
+
+    #[test]
+    fn flake_verdict_serde_all_variants() {
+        for (variant, expected_json) in [
+            (FlakeVerdict::Stable, "\"stable\""),
+            (FlakeVerdict::DeterministicFailure, "\"deterministic_failure\""),
+            (FlakeVerdict::Flaky, "\"flaky\""),
+            (FlakeVerdict::Inconclusive, "\"inconclusive\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_json, "variant {variant:?}");
+            let restored: FlakeVerdict = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, variant);
+        }
+    }
+
+    // ── Additional classify_failure keywords ──────────────────────────
+
+    #[test]
+    fn classify_deadline_exceeded() {
+        let env = BTreeMap::new();
+        assert_eq!(
+            classify_failure("deadline exceeded for query", &env),
+            FailureCategory::Timing
+        );
+    }
+
+    #[test]
+    fn classify_budget() {
+        let env = BTreeMap::new();
+        assert_eq!(
+            classify_failure("operation exceeded time budget", &env),
+            FailureCategory::Timing
+        );
+    }
+
+    #[test]
+    fn classify_disk_io_error() {
+        let env = BTreeMap::new();
+        assert_eq!(
+            classify_failure("disk I/O error reading page", &env),
+            FailureCategory::Contention
+        );
+    }
+
+    #[test]
+    fn classify_too_many_open_files() {
+        let env = BTreeMap::new();
+        assert_eq!(
+            classify_failure("too many open files (EMFILE)", &env),
+            FailureCategory::Contention
+        );
+    }
+
+    #[test]
+    fn classify_out_of_memory() {
+        let env = BTreeMap::new();
+        assert_eq!(
+            classify_failure("out of memory allocating 4096 bytes", &env),
+            FailureCategory::CiEnvironment
+        );
+    }
+
+    #[test]
+    fn classify_connection_refused() {
+        let env = BTreeMap::new();
+        assert_eq!(
+            classify_failure("connection refused: 127.0.0.1:5432", &env),
+            FailureCategory::CiEnvironment
+        );
+    }
+
+    #[test]
+    fn classify_expected_keyword() {
+        let env = BTreeMap::new();
+        assert_eq!(
+            classify_failure("expected 3 but got 5", &env),
+            FailureCategory::Assertion
+        );
+    }
+
+    #[test]
+    fn classify_github_actions_killed() {
+        let mut env = BTreeMap::new();
+        env.insert("GITHUB_ACTIONS".to_string(), "true".to_string());
+        assert_eq!(
+            classify_failure("process killed by OOM killer", &env),
+            FailureCategory::CiEnvironment
+        );
+    }
+
+    // ── extend_seeds edge cases ──────────────────────────────────────
+
+    #[test]
+    fn extend_seeds_empty_base() {
+        let extended = extend_seeds(&[], 5);
+        assert_eq!(extended.len(), 5);
+        // No duplicates
+        let mut uniq = extended.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 5);
+    }
+
+    #[test]
+    fn extend_seeds_zero_target() {
+        let extended = extend_seeds(&[1, 2, 3], 0);
+        assert!(extended.is_empty());
+    }
+
+    // ── FlakeReport multiline failure message ────────────────────────
+
+    #[test]
+    fn flake_report_histogram_takes_first_line() {
+        let runs = vec![
+            RunOutcome {
+                run: 1,
+                passed: false,
+                duration_ms: 10,
+                failure_message: Some("first line\nsecond line\nthird line".to_string()),
+                seed: Some(1),
+            },
+            RunOutcome {
+                run: 2,
+                passed: false,
+                duration_ms: 10,
+                failure_message: Some("first line\ndifferent second line".to_string()),
+                seed: Some(2),
+            },
+            RunOutcome {
+                run: 3,
+                passed: true,
+                duration_ms: 10,
+                failure_message: None,
+                seed: Some(3),
+            },
+        ];
+        let report = FlakeReport::from_runs("multiline_test", runs);
+        // Histogram should use first line only
+        assert_eq!(report.failure_histogram["first line"], 2);
+        assert_eq!(report.failure_histogram.len(), 1);
+    }
+
+    // ── RunOutcome serde roundtrip ───────────────────────────────────
+
+    #[test]
+    fn run_outcome_serde_roundtrip() {
+        let outcome = RunOutcome {
+            run: 3,
+            passed: false,
+            duration_ms: 123,
+            failure_message: Some("timeout".to_string()),
+            seed: Some(42),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let restored: RunOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.run, 3);
+        assert!(!restored.passed);
+        assert_eq!(restored.failure_message.as_deref(), Some("timeout"));
+        assert_eq!(restored.seed, Some(42));
+    }
+
+    #[test]
+    fn run_outcome_serde_none_fields_skipped() {
+        let outcome = RunOutcome {
+            run: 1,
+            passed: true,
+            duration_ms: 5,
+            failure_message: None,
+            seed: None,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("failure_message").is_none());
+        assert!(parsed.get("seed").is_none());
+    }
+
+    // ── FailureContext clone/debug ────────────────────────────────────
+
+    #[test]
+    fn failure_context_clone() {
+        let ctx = FailureContext::capture("clone_test", Some(42), "assertion failed");
+        let cloned = ctx.clone();
+        assert_eq!(cloned.test_name, "clone_test");
+        assert_eq!(cloned.harness_seed, Some(42));
+        assert_eq!(cloned.category, FailureCategory::Assertion);
+    }
+
+    #[test]
+    fn failure_context_debug() {
+        let ctx = FailureContext::capture("debug_test", None, "fail");
+        let debug = format!("{ctx:?}");
+        assert!(debug.contains("debug_test"));
+    }
+
+    // ── ReproductionConfig debug/clone ────────────────────────────────
+
+    #[test]
+    fn reproduction_config_debug_clone() {
+        let config = ReproductionConfig {
+            artifact_path: std::path::PathBuf::from("/tmp/test"),
+            verbose: true,
+            timeout: std::time::Duration::from_secs(30),
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.artifact_path, Path::new("/tmp/test"));
+        assert!(cloned.verbose);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("artifact_path"));
+    }
 }

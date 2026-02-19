@@ -660,4 +660,297 @@ mod tests {
             );
         }
     }
+
+    // -- percentile_nearest_rank edge cases --
+
+    #[test]
+    fn percentile_empty_window_returns_zero() {
+        let window = VecDeque::new();
+        assert_eq!(percentile_nearest_rank(&window, 50), 0);
+        assert_eq!(percentile_nearest_rank(&window, 95), 0);
+    }
+
+    #[test]
+    fn percentile_single_element() {
+        let window = VecDeque::from([42]);
+        assert_eq!(percentile_nearest_rank(&window, 0), 42);
+        assert_eq!(percentile_nearest_rank(&window, 50), 42);
+        assert_eq!(percentile_nearest_rank(&window, 100), 42);
+    }
+
+    #[test]
+    fn percentile_two_elements() {
+        let window = VecDeque::from([10, 90]);
+        assert_eq!(percentile_nearest_rank(&window, 50), 10);
+        assert_eq!(percentile_nearest_rank(&window, 51), 90);
+        assert_eq!(percentile_nearest_rank(&window, 100), 90);
+    }
+
+    #[test]
+    fn percentile_sorted_and_unsorted_same_result() {
+        let sorted = VecDeque::from([1, 2, 3, 4, 5]);
+        let unsorted = VecDeque::from([5, 3, 1, 4, 2]);
+        assert_eq!(
+            percentile_nearest_rank(&sorted, 50),
+            percentile_nearest_rank(&unsorted, 50)
+        );
+        assert_eq!(
+            percentile_nearest_rank(&sorted, 95),
+            percentile_nearest_rank(&unsorted, 95)
+        );
+    }
+
+    // -- push_window --
+
+    #[test]
+    fn push_window_respects_max_len() {
+        let mut window = VecDeque::new();
+        for i in 0..10 {
+            push_window(&mut window, i, 5);
+        }
+        assert_eq!(window.len(), 5);
+        // Should contain last 5 values
+        assert_eq!(window, VecDeque::from([5, 6, 7, 8, 9]));
+    }
+
+    #[test]
+    fn push_window_single_capacity() {
+        let mut window = VecDeque::new();
+        push_window(&mut window, 1, 1);
+        push_window(&mut window, 2, 1);
+        push_window(&mut window, 3, 1);
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0], 3);
+    }
+
+    // -- TwoTierSearchMetrics computed latencies --
+
+    #[test]
+    fn search_metrics_latency_accessors() {
+        let m = TwoTierSearchMetrics {
+            fast_embed_us: 100,
+            fast_search_us: 200,
+            quality_embed_us: 1_000,
+            quality_score_us: 500,
+            blend_us: 50,
+            ..TwoTierSearchMetrics::default()
+        };
+        assert_eq!(m.fast_latency_us(), 300);
+        assert_eq!(m.quality_latency_us(), 1_550);
+        assert_eq!(m.total_latency_us(), 1_850);
+    }
+
+    #[test]
+    fn search_metrics_default_all_zero() {
+        let m = TwoTierSearchMetrics::default();
+        assert_eq!(m.fast_latency_us(), 0);
+        assert_eq!(m.quality_latency_us(), 0);
+        assert_eq!(m.total_latency_us(), 0);
+        assert!(!m.was_refined);
+        assert!(!m.ranking_changed);
+    }
+
+    #[test]
+    fn search_metrics_for_query_deterministic() {
+        let m1 = TwoTierSearchMetrics::for_query("hello world");
+        let m2 = TwoTierSearchMetrics::for_query("hello world");
+        assert_eq!(m1.query_hash, m2.query_hash);
+
+        let m3 = TwoTierSearchMetrics::for_query("different query");
+        assert_ne!(m1.query_hash, m3.query_hash);
+    }
+
+    // -- TwoTierIndexMetrics --
+
+    #[test]
+    fn index_metrics_zero_docs_coverage_one() {
+        let index = TwoTierIndexMetrics::from_counts(0, 0, 0, 0);
+        assert!((index.quality_coverage - 1.0).abs() < f32::EPSILON);
+        assert_eq!(index.total_memory_bytes, 0);
+    }
+
+    #[test]
+    fn index_metrics_memory_saturating() {
+        let index = TwoTierIndexMetrics::from_counts(1, 1, usize::MAX, 1);
+        assert_eq!(index.total_memory_bytes, usize::MAX);
+    }
+
+    #[test]
+    fn index_metrics_default_all_zero() {
+        let index = TwoTierIndexMetrics::default();
+        assert_eq!(index.doc_count, 0);
+        assert_eq!(index.quality_doc_count, 0);
+        assert_eq!(index.total_memory_bytes, 0);
+    }
+
+    // -- TwoTierAlertConfig defaults --
+
+    #[test]
+    fn alert_config_defaults_reasonable() {
+        let config = TwoTierAlertConfig::default();
+        assert_eq!(config.fast_latency_warn_us, 5_000);
+        assert_eq!(config.quality_latency_warn_us, 300_000);
+        assert!((config.quality_coverage_warn_pct - 50.0).abs() < f32::EPSILON);
+        assert_eq!(config.index_size_warn_docs, 80_000);
+        assert_eq!(config.memory_warn_bytes, 500 * 1024 * 1024);
+    }
+
+    // -- TwoTierAlertState --
+
+    #[test]
+    fn alert_state_default_all_false() {
+        let state = TwoTierAlertState::default();
+        assert!(!state.slow_fast_search);
+        assert!(!state.slow_quality_refinement);
+        assert!(!state.low_quality_coverage);
+        assert!(!state.large_index);
+        assert!(!state.high_memory);
+    }
+
+    // -- check_alerts additional scenarios --
+
+    #[test]
+    fn alert_slow_quality_refinement() {
+        let mut metrics = TwoTierMetrics::default();
+        let mut search = TwoTierSearchMetrics::for_query("slow-quality");
+        search.quality_embed_us = 200_000;
+        search.quality_score_us = 150_000;
+        metrics.record_search(search);
+
+        let state = metrics.check_alerts(&TwoTierAlertConfig::default());
+        assert!(state.slow_quality_refinement);
+        assert!(!state.slow_fast_search); // fast latency is fine
+    }
+
+    #[test]
+    fn alert_high_memory() {
+        let mut metrics = TwoTierMetrics::default();
+        metrics.record_index(TwoTierIndexMetrics::from_counts(
+            1_000,
+            1_000,
+            300 * 1024 * 1024,
+            300 * 1024 * 1024,
+        ));
+
+        let state = metrics.check_alerts(&TwoTierAlertConfig::default());
+        assert!(state.high_memory);
+    }
+
+    #[test]
+    fn alert_custom_thresholds() {
+        let mut metrics = TwoTierMetrics::default();
+        let mut search = TwoTierSearchMetrics::for_query("custom");
+        search.fast_search_us = 100; // Very fast
+        metrics.record_search(search);
+
+        // Strict threshold: 50µs
+        let config = TwoTierAlertConfig {
+            fast_latency_warn_us: 50,
+            ..TwoTierAlertConfig::default()
+        };
+        let state = metrics.check_alerts(&config);
+        assert!(state.slow_fast_search);
+    }
+
+    // -- TwoTierMetrics window and recording --
+
+    #[test]
+    fn metrics_new_min_window_size() {
+        // Window size 0 should be promoted to 1
+        let metrics = TwoTierMetrics::new(0);
+        assert_eq!(metrics.latency_window_size, 1);
+    }
+
+    #[test]
+    fn record_search_no_refinement() {
+        let mut metrics = TwoTierMetrics::default();
+        let search = TwoTierSearchMetrics {
+            fast_embed_us: 100,
+            fast_search_us: 200,
+            was_refined: false,
+            ranking_changed: false,
+            ..TwoTierSearchMetrics::default()
+        };
+        metrics.record_search(search);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.aggregated.total_searches, 1);
+        assert_eq!(snap.aggregated.refined_searches, 0);
+        assert_eq!(snap.aggregated.ranking_changed_count, 0);
+    }
+
+    #[test]
+    fn snapshot_initial_state() {
+        let metrics = TwoTierMetrics::default();
+        let snap = metrics.snapshot();
+        assert!(snap.init.is_none());
+        assert!(snap.search.is_none());
+        assert_eq!(snap.index, TwoTierIndexMetrics::default());
+        assert_eq!(snap.aggregated, TwoTierAggregatedMetrics::default());
+    }
+
+    #[test]
+    fn aggregated_metrics_default_all_zero() {
+        let agg = TwoTierAggregatedMetrics::default();
+        assert_eq!(agg.total_searches, 0);
+        assert_eq!(agg.refined_searches, 0);
+        assert_eq!(agg.ranking_changed_count, 0);
+        assert_eq!(agg.fast_latency_p50_us, 0);
+        assert_eq!(agg.fast_latency_p95_us, 0);
+    }
+
+    // -- Serde roundtrips --
+
+    #[test]
+    fn search_metrics_serde_roundtrip() {
+        let m = TwoTierSearchMetrics {
+            query_hash: 12345,
+            fast_embed_us: 100,
+            fast_search_us: 200,
+            quality_embed_us: 1_000,
+            quality_score_us: 500,
+            blend_us: 50,
+            fast_candidate_count: 20,
+            refined_count: 10,
+            was_refined: true,
+            ranking_changed: true,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: TwoTierSearchMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, m);
+    }
+
+    #[test]
+    fn alert_state_serde_roundtrip() {
+        let state = TwoTierAlertState {
+            slow_fast_search: true,
+            slow_quality_refinement: false,
+            low_quality_coverage: true,
+            large_index: false,
+            high_memory: true,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: TwoTierAlertState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn metrics_snapshot_serde_roundtrip() {
+        let snap = TwoTierMetricsSnapshot {
+            init: Some(TwoTierInitMetrics {
+                init_timestamp: 1_700_000_000,
+                fast_embedder_load_ms: 25,
+                quality_embedder_load_ms: 180,
+                availability: TwoTierAvailability::Full,
+                init_attempts: 1,
+            }),
+            search: None,
+            index: TwoTierIndexMetrics::from_counts(100, 80, 1_000, 2_000),
+            aggregated: TwoTierAggregatedMetrics::default(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: TwoTierMetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.init, snap.init);
+        assert_eq!(restored.aggregated, snap.aggregated);
+    }
 }

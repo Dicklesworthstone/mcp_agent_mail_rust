@@ -1058,6 +1058,189 @@ mod tests {
         );
     }
 
+    // -- normalize_mime direct tests --
+
+    #[test]
+    fn normalize_mime_application_json() {
+        assert_eq!(normalize_mime("application/json"), Some("json"));
+    }
+
+    #[test]
+    fn normalize_mime_text_json() {
+        assert_eq!(normalize_mime("text/json"), Some("json"));
+    }
+
+    #[test]
+    fn normalize_mime_application_toon() {
+        assert_eq!(normalize_mime("application/toon"), Some("toon"));
+    }
+
+    #[test]
+    fn normalize_mime_text_toon() {
+        assert_eq!(normalize_mime("text/toon"), Some("toon"));
+    }
+
+    #[test]
+    fn normalize_mime_unknown_returns_none() {
+        assert_eq!(normalize_mime("text/plain"), None);
+        assert_eq!(normalize_mime("application/xml"), None);
+        assert_eq!(normalize_mime(""), None);
+    }
+
+    // -- parse_token_line direct tests --
+
+    #[test]
+    fn parse_token_line_ascii_arrow() {
+        let line = "Token estimates: ~42 (JSON) -> ~18 (TOON)";
+        let (json, toon) = parse_token_line(line).unwrap();
+        assert_eq!(json, 42);
+        assert_eq!(toon, 18);
+    }
+
+    #[test]
+    fn parse_token_line_unicode_arrow() {
+        let line = "Token estimates: ~100 (JSON) \u{2192} ~35 (TOON)";
+        let (json, toon) = parse_token_line(line).unwrap();
+        assert_eq!(json, 100);
+        assert_eq!(toon, 35);
+    }
+
+    #[test]
+    fn parse_token_line_missing_arrow_returns_none() {
+        assert!(parse_token_line("Token estimates: ~42 (JSON) ~18 (TOON)").is_none());
+    }
+
+    #[test]
+    fn parse_token_line_missing_tilde_returns_none() {
+        assert!(parse_token_line("Token estimates: 42 (JSON) -> 18 (TOON)").is_none());
+    }
+
+    #[test]
+    fn parse_token_line_no_prefix_returns_none() {
+        assert!(parse_token_line("~42 (JSON) -> ~18 (TOON)").is_none());
+    }
+
+    // -- parse_saved_line direct tests --
+
+    #[test]
+    fn parse_saved_line_normal() {
+        let (tokens, pct) = parse_saved_line("Saved ~24 tokens (-57.1%)").unwrap();
+        assert_eq!(tokens, 24);
+        assert!((pct - (-57.1)).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_saved_line_zero_savings() {
+        let (tokens, pct) = parse_saved_line("Saved ~0 tokens (0.0%)").unwrap();
+        assert_eq!(tokens, 0);
+        assert!((pct - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_saved_line_missing_tilde_returns_none() {
+        assert!(parse_saved_line("Saved 24 tokens (-57.1%)").is_none());
+    }
+
+    #[test]
+    fn parse_saved_line_missing_paren_returns_none() {
+        assert!(parse_saved_line("Saved ~24 tokens -57.1%").is_none());
+    }
+
+    #[test]
+    fn parse_saved_line_not_saved_prefix() {
+        assert!(parse_saved_line("Lost ~24 tokens (-57.1%)").is_none());
+    }
+
+    // -- resolve_output_format case insensitivity --
+
+    #[test]
+    fn resolve_format_case_insensitive() {
+        let config = test_config();
+        let d = resolve_output_format(Some("TOON"), &config).unwrap();
+        assert_eq!(d.resolved, "toon");
+
+        let d = resolve_output_format(Some("JSON"), &config).unwrap();
+        assert_eq!(d.resolved, "json");
+
+        let d = resolve_output_format(Some("Toon"), &config).unwrap();
+        assert_eq!(d.resolved, "toon");
+    }
+
+    #[test]
+    fn resolve_format_whitespace_trimmed() {
+        let config = test_config();
+        let d = resolve_output_format(Some("  toon  "), &config).unwrap();
+        assert_eq!(d.resolved, "toon");
+    }
+
+    // -- resolve_encoder edge case --
+
+    #[test]
+    fn resolve_encoder_empty_string_uses_default() {
+        let config = Config {
+            toon_bin: Some(String::new()),
+            ..test_config()
+        };
+        let parts = resolve_encoder(&config);
+        assert_eq!(parts, vec!["tru".to_string()]);
+    }
+
+    // -- Derive trait tests --
+
+    #[test]
+    fn toon_stats_clone_debug() {
+        let stats = ToonStats {
+            json_tokens: 42,
+            toon_tokens: 18,
+            saved_tokens: Some(24),
+            saved_percent: Some(-57.1),
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.json_tokens, 42);
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("json_tokens"));
+    }
+
+    #[test]
+    fn format_decision_clone_debug() {
+        let decision = FormatDecision {
+            resolved: "toon".to_string(),
+            source: "param".to_string(),
+            requested: Some("toon".to_string()),
+        };
+        let cloned = decision.clone();
+        assert_eq!(cloned.resolved, "toon");
+        let debug = format!("{decision:?}");
+        assert!(debug.contains("resolved"));
+    }
+
+    #[test]
+    fn toon_meta_clone_debug() {
+        let meta = ToonMeta {
+            requested: Some("toon".to_string()),
+            source: "param".to_string(),
+            encoder: None,
+            toon_error: None,
+            toon_stderr: None,
+            toon_stats: None,
+            toon_stats_raw: None,
+        };
+        let cloned = meta.clone();
+        assert_eq!(cloned.source, "param");
+        let debug = format!("{meta:?}");
+        assert!(debug.contains("source"));
+    }
+
+    #[test]
+    fn encoder_error_debug() {
+        let err = EncoderError::NonZeroExit {
+            code: 42,
+            stderr: "oops".to_string(),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("42"));
+    }
+
     // -- looks_like_toon_rust_encoder basename rejection --
 
     #[test]
