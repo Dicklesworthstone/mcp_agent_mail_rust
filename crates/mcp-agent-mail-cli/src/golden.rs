@@ -503,4 +503,337 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("invalid sha256 hash"));
     }
+
+    // ── br-3h13: Additional golden.rs test coverage ──────────────────
+
+    // ── GoldenCommandSpec builder ────────────────────────────────────
+
+    #[test]
+    fn golden_command_spec_new_defaults() {
+        let spec = GoldenCommandSpec::new("test.txt", vec!["echo".to_string()]);
+        assert_eq!(spec.filename, "test.txt");
+        assert_eq!(spec.command, vec!["echo"]);
+        assert_eq!(spec.expected_exit_code, 0);
+        assert_eq!(spec.stream, GoldenStream::Stdout);
+        assert!(spec.stdin.is_none());
+        assert!(spec.env.is_empty());
+    }
+
+    #[test]
+    fn golden_command_spec_builder_chain() {
+        let spec = GoldenCommandSpec::new("out.txt", vec!["cmd".to_string()])
+            .expected_exit_code(1)
+            .stream(GoldenStream::Combined)
+            .stdin("input data")
+            .env("KEY", "VALUE")
+            .env("KEY2", "VALUE2");
+
+        assert_eq!(spec.expected_exit_code, 1);
+        assert_eq!(spec.stream, GoldenStream::Combined);
+        assert_eq!(spec.stdin, Some("input data".to_string()));
+        assert_eq!(spec.env.len(), 2);
+        assert_eq!(spec.env[0], ("KEY".to_string(), "VALUE".to_string()));
+        assert_eq!(spec.env[1], ("KEY2".to_string(), "VALUE2".to_string()));
+    }
+
+    // ── GoldenStream serde ───────────────────────────────────────────
+
+    #[test]
+    fn golden_stream_serde_roundtrip_stdout() {
+        let json = serde_json::to_string(&GoldenStream::Stdout).unwrap();
+        assert_eq!(json, "\"stdout\"");
+        let back: GoldenStream = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, GoldenStream::Stdout);
+    }
+
+    #[test]
+    fn golden_stream_serde_roundtrip_stderr() {
+        let json = serde_json::to_string(&GoldenStream::Stderr).unwrap();
+        assert_eq!(json, "\"stderr\"");
+        let back: GoldenStream = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, GoldenStream::Stderr);
+    }
+
+    #[test]
+    fn golden_stream_serde_roundtrip_combined() {
+        let json = serde_json::to_string(&GoldenStream::Combined).unwrap();
+        assert_eq!(json, "\"combined\"");
+        let back: GoldenStream = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, GoldenStream::Combined);
+    }
+
+    // ── GoldenCommandSpec serde ──────────────────────────────────────
+
+    #[test]
+    fn golden_command_spec_serde_roundtrip() {
+        let spec = GoldenCommandSpec::new("test.golden", vec!["echo".to_string(), "hello".to_string()])
+            .expected_exit_code(0)
+            .stream(GoldenStream::Stdout);
+
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: GoldenCommandSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn golden_command_spec_serde_omits_none_stdin() {
+        let spec = GoldenCommandSpec::new("test.golden", vec!["ls".to_string()]);
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("stdin"));
+    }
+
+    #[test]
+    fn golden_command_spec_serde_omits_empty_env() {
+        let spec = GoldenCommandSpec::new("test.golden", vec!["ls".to_string()]);
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("env"));
+    }
+
+    // ── select_stream_output ─────────────────────────────────────────
+
+    #[test]
+    fn select_stream_output_stdout() {
+        let captured = CapturedCommandOutput {
+            stdout: "out\n".to_string(),
+            stderr: "err\n".to_string(),
+            exit_code: 0,
+        };
+        assert_eq!(select_stream_output(GoldenStream::Stdout, &captured), "out\n");
+    }
+
+    #[test]
+    fn select_stream_output_stderr() {
+        let captured = CapturedCommandOutput {
+            stdout: "out\n".to_string(),
+            stderr: "err\n".to_string(),
+            exit_code: 0,
+        };
+        assert_eq!(select_stream_output(GoldenStream::Stderr, &captured), "err\n");
+    }
+
+    #[test]
+    fn select_stream_output_combined() {
+        let captured = CapturedCommandOutput {
+            stdout: "out\n".to_string(),
+            stderr: "err\n".to_string(),
+            exit_code: 0,
+        };
+        assert_eq!(
+            select_stream_output(GoldenStream::Combined, &captured),
+            "out\nerr\n"
+        );
+    }
+
+    // ── sha256_hex edge cases ────────────────────────────────────────
+
+    #[test]
+    fn sha256_hex_empty_string() {
+        // Well-known SHA-256 of empty string
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_unicode() {
+        let hash = sha256_hex("日本語");
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sha256_hex_deterministic() {
+        let a = sha256_hex("determinism test");
+        let b = sha256_hex("determinism test");
+        assert_eq!(a, b);
+    }
+
+    // ── normalize_output edge cases ──────────────────────────────────
+
+    #[test]
+    fn normalize_output_no_matches_returns_unchanged() {
+        let input = "plain text with no special content";
+        assert_eq!(normalize_output(input), input);
+    }
+
+    #[test]
+    fn normalize_output_multiple_timestamps() {
+        let input = "start=2026-01-01T00:00:00Z end=2026-12-31T23:59:59.999Z";
+        let result = normalize_output(input);
+        assert_eq!(result, "start=TIMESTAMP end=TIMESTAMP");
+    }
+
+    #[test]
+    fn normalize_output_multiple_pids() {
+        let input = "parent pid=100 child pid=200";
+        let result = normalize_output(input);
+        assert_eq!(result, "parent pid=PID child pid=PID");
+    }
+
+    #[test]
+    fn normalize_output_empty_string() {
+        assert_eq!(normalize_output(""), "");
+    }
+
+    // ── normalize_captured_output ────────────────────────────────────
+
+    #[test]
+    fn normalize_captured_output_preserves_exit_code() {
+        let captured = CapturedCommandOutput {
+            stdout: "pid=42\n".to_string(),
+            stderr: "pid=99\n".to_string(),
+            exit_code: 42,
+        };
+        let normalized = normalize_captured_output(&captured);
+        assert_eq!(normalized.exit_code, 42);
+        assert_eq!(normalized.stdout, "pid=PID\n");
+        assert_eq!(normalized.stderr, "pid=PID\n");
+    }
+
+    // ── read_checksums_file edge cases ───────────────────────────────
+
+    #[test]
+    fn read_checksums_file_empty_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("checksums.sha256");
+        std::fs::write(&path, "").expect("write");
+        let checksums = read_checksums_file(&path).expect("read");
+        assert!(checksums.is_empty());
+    }
+
+    #[test]
+    fn read_checksums_file_blank_lines_skipped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("checksums.sha256");
+        let hash = sha256_hex("content");
+        std::fs::write(&path, format!("\n{hash}  file.txt\n\n")).expect("write");
+        let checksums = read_checksums_file(&path).expect("read");
+        assert_eq!(checksums.len(), 1);
+        assert_eq!(checksums["file.txt"], hash);
+    }
+
+    #[test]
+    fn read_checksums_file_hash_only_no_filename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("checksums.sha256");
+        let hash = sha256_hex("x");
+        // Hash with trailing whitespace: trim() removes it, leaving no separator
+        std::fs::write(&path, format!("{hash}  \n")).expect("write");
+        let err = read_checksums_file(&path).expect_err("must fail");
+        // After trim(), the line is just the hash with no internal whitespace
+        assert!(err.to_string().contains("expected"));
+    }
+
+    #[test]
+    fn read_checksums_file_nonexistent_file() {
+        let path = Path::new("/nonexistent/checksums.sha256");
+        let err = read_checksums_file(path).expect_err("must fail");
+        assert!(matches!(err, GoldenChecksumError::Io(_)));
+    }
+
+    #[test]
+    fn read_checksums_file_no_separator() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("checksums.sha256");
+        std::fs::write(&path, "noseparator\n").expect("write");
+        let err = read_checksums_file(&path).expect_err("must fail");
+        assert!(err.to_string().contains("expected"));
+    }
+
+    // ── build_inline_diff edge cases ─────────────────────────────────
+
+    #[test]
+    fn build_inline_diff_added_lines() {
+        let diff = build_inline_diff("line1\n", "line1\nline2\n", 1);
+        assert!(diff.contains("+"));
+    }
+
+    #[test]
+    fn build_inline_diff_removed_lines() {
+        let diff = build_inline_diff("line1\nline2\n", "line1\n", 1);
+        assert!(diff.contains("-"));
+    }
+
+    #[test]
+    fn build_inline_diff_identical_returns_context() {
+        let diff = build_inline_diff("same", "same", 3);
+        // Mismatch index should be at shared_len (1), diff should show context
+        assert!(diff.contains("@@ mismatch around line"));
+    }
+
+    #[test]
+    fn build_inline_diff_completely_different() {
+        let diff = build_inline_diff("alpha\nbeta\n", "gamma\ndelta\n", 0);
+        assert!(diff.contains("@@ mismatch around line 1 @@"));
+        assert!(diff.contains("-    1 | alpha"));
+        assert!(diff.contains("+    1 | gamma"));
+    }
+
+    // ── compare_text additional cases ────────────────────────────────
+
+    #[test]
+    fn compare_text_empty_strings() {
+        let cmp = compare_text("", "");
+        assert!(cmp.matches);
+        assert!(cmp.inline_diff.is_none());
+    }
+
+    #[test]
+    fn compare_text_one_empty() {
+        let cmp = compare_text("some content", "");
+        assert!(!cmp.matches);
+        assert!(cmp.inline_diff.is_some());
+    }
+
+    // ── Error Display ────────────────────────────────────────────────
+
+    #[test]
+    fn golden_capture_error_empty_command_display() {
+        let err = GoldenCaptureError::EmptyCommand;
+        assert_eq!(err.to_string(), "command must not be empty");
+    }
+
+    #[test]
+    fn golden_checksum_error_parse_display() {
+        let err = GoldenChecksumError::Parse {
+            line: 5,
+            reason: "bad hash".to_string(),
+        };
+        assert!(err.to_string().contains("line 5"));
+        assert!(err.to_string().contains("bad hash"));
+    }
+
+    // ── GoldenCommandRun serde ───────────────────────────────────────
+
+    #[test]
+    fn golden_command_run_serde_roundtrip() {
+        let run = GoldenCommandRun {
+            filename: "test.txt".to_string(),
+            expected_exit_code: 0,
+            exit_code: 0,
+            normalized_stdout: "output\n".to_string(),
+            normalized_stderr: String::new(),
+            normalized_output: "output\n".to_string(),
+        };
+        let json = serde_json::to_string(&run).unwrap();
+        let back: GoldenCommandRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, run);
+    }
+
+    // ── write_checksums_file deterministic order ─────────────────────
+
+    #[test]
+    fn write_checksums_file_deterministic_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("checksums.sha256");
+        let mut checksums = BTreeMap::new();
+        checksums.insert("z.txt".to_string(), sha256_hex("z"));
+        checksums.insert("a.txt".to_string(), sha256_hex("a"));
+        write_checksums_file(&path, &checksums).expect("write");
+        let content = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = content.lines().collect();
+        assert!(lines[0].contains("a.txt"));
+        assert!(lines[1].contains("z.txt"));
+    }
 }

@@ -382,4 +382,210 @@ mod tests {
         let b = a.clone();
         assert!(a.ptr_eq(&b));
     }
+
+    // ── br-3h13: Additional intern.rs test coverage ──────────────────
+
+    #[test]
+    fn into_arc_returns_arc() {
+        let s = intern("arc_test");
+        let arc = s.clone().into_arc();
+        assert_eq!(&*arc, "arc_test");
+        // The returned Arc should be the same as the interned one
+        assert!(Arc::ptr_eq(&arc, &s.0));
+    }
+
+    #[test]
+    fn from_arc_str_re_interns() {
+        let original = intern("from_arc");
+        let arc: Arc<str> = Arc::from("from_arc");
+        let from_arc = InternedStr::from(arc);
+        // Should deduplicate via re-interning
+        assert!(from_arc.ptr_eq(&original));
+    }
+
+    #[test]
+    fn from_string_conversion() {
+        let s = String::from("from_owned");
+        let interned = InternedStr::from(s);
+        assert_eq!(&*interned, "from_owned");
+    }
+
+    #[test]
+    fn from_str_conversion() {
+        let interned: InternedStr = "from_ref".into();
+        assert_eq!(&*interned, "from_ref");
+    }
+
+    #[test]
+    fn as_ref_str() {
+        let s = intern("as_ref_test");
+        let r: &str = s.as_ref();
+        assert_eq!(r, "as_ref_test");
+    }
+
+    #[test]
+    fn borrow_str() {
+        use std::borrow::Borrow;
+        let s = intern("borrow_test");
+        let r: &str = s.borrow();
+        assert_eq!(r, "borrow_test");
+    }
+
+    #[test]
+    fn empty_string_interning() {
+        let a = intern("");
+        let b = intern("");
+        assert!(a.ptr_eq(&b));
+        assert_eq!(a.len(), 0);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn unicode_string_interning() {
+        let a = intern("日本語テスト");
+        let b = intern("日本語テスト");
+        assert!(a.ptr_eq(&b));
+        assert_eq!(&*a, "日本語テスト");
+    }
+
+    #[test]
+    fn emoji_string_interning() {
+        let a = intern("🦀🔧✅");
+        let b = intern("🦀🔧✅");
+        assert!(a.ptr_eq(&b));
+    }
+
+    #[test]
+    fn long_string_interning() {
+        let long = "x".repeat(10_000);
+        let a = intern(&long);
+        let b = intern(&long);
+        assert!(a.ptr_eq(&b));
+        assert_eq!(a.len(), 10_000);
+    }
+
+    #[test]
+    fn partial_ord_consistent_with_ord() {
+        let a = intern("alpha_ord");
+        let b = intern("beta_ord");
+        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less));
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn eq_with_owned_string() {
+        let s = intern("eq_owned");
+        assert!(s == "eq_owned".to_string());
+    }
+
+    #[test]
+    fn eq_with_str_ref() {
+        let s = intern("eq_ref");
+        assert!(s == "eq_ref");
+    }
+
+    #[test]
+    fn eq_with_double_ref() {
+        let s = intern("eq_double");
+        let r: &str = "eq_double";
+        assert!(s == r);
+    }
+
+    #[test]
+    fn ne_with_different_string() {
+        let a = intern("ne_a");
+        let b = intern("ne_b");
+        assert_ne!(a, b);
+        assert!(a != "ne_b");
+    }
+
+    #[test]
+    fn hash_in_hashset() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(intern("hash_set_item"));
+        assert!(set.contains(&intern("hash_set_item")));
+        assert!(!set.contains(&intern("other_item")));
+    }
+
+    #[test]
+    fn pre_intern_multiple_values() {
+        pre_intern(&["pre_a", "pre_b", "pre_c"]);
+        let a = intern("pre_a");
+        let b = intern("pre_b");
+        let c = intern("pre_c");
+        // All should be valid
+        assert_eq!(&*a, "pre_a");
+        assert_eq!(&*b, "pre_b");
+        assert_eq!(&*c, "pre_c");
+    }
+
+    #[test]
+    fn pre_intern_idempotent() {
+        let before = intern("pre_idem");
+        pre_intern(&["pre_idem"]);
+        let after = intern("pre_idem");
+        assert!(before.ptr_eq(&after));
+    }
+
+    #[test]
+    fn concurrent_interning() {
+        use std::thread;
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                thread::spawn(move || {
+                    let key = format!("concurrent_{i}");
+                    let a = intern(&key);
+                    let b = intern(&key);
+                    assert!(a.ptr_eq(&b));
+                    a
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn intern_count_reflects_unique_strings() {
+        let unique_prefix = format!("count_test_{}", std::process::id());
+        let before = intern_count();
+        let _ = intern(&format!("{unique_prefix}_1"));
+        let _ = intern(&format!("{unique_prefix}_2"));
+        let _ = intern(&format!("{unique_prefix}_1")); // duplicate
+        assert_eq!(intern_count(), before + 2);
+    }
+
+    #[test]
+    fn serde_roundtrip_unicode() {
+        let original = intern("日本語");
+        let json = serde_json::to_string(&original).unwrap();
+        let back: InternedStr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn display_vs_debug_format() {
+        let s = intern("fmt_test");
+        // Display is bare string
+        assert_eq!(format!("{s}"), "fmt_test");
+        // Debug wraps in InternedStr(...)
+        assert_eq!(format!("{s:?}"), "InternedStr(\"fmt_test\")");
+    }
+
+    #[test]
+    fn ptr_eq_different_strings() {
+        let a = intern("ptr_a");
+        let b = intern("ptr_b");
+        assert!(!a.ptr_eq(&b));
+    }
+
+    #[test]
+    fn ptr_eq_same_string() {
+        let a = intern("ptr_same");
+        let b = intern("ptr_same");
+        assert!(a.ptr_eq(&b));
+    }
 }
