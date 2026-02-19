@@ -1270,4 +1270,373 @@ mod tests {
             "legacy circuit reset is 30s"
         );
     }
+
+    // -- remaining_open_secs tests ------------------------------------------
+
+    #[test]
+    fn remaining_open_secs_zero_when_closed() {
+        let cb = CircuitBreaker::with_params(3, Duration::from_secs(30));
+        assert_eq!(cb.remaining_open_secs(), 0.0);
+    }
+
+    #[test]
+    fn remaining_open_secs_positive_when_open() {
+        let cb = CircuitBreaker::with_params(2, Duration::from_secs(10));
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        let remaining = cb.remaining_open_secs();
+        // Should be close to 10s (some time elapsed since record_failure).
+        assert!(
+            remaining > 8.0 && remaining <= 10.0,
+            "expected ~10s remaining, got {remaining}"
+        );
+    }
+
+    #[test]
+    fn remaining_open_secs_zero_after_expiry() {
+        let cb = CircuitBreaker::with_params(2, Duration::from_millis(30));
+        cb.record_failure();
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(cb.remaining_open_secs(), 0.0);
+    }
+
+    #[test]
+    fn remaining_open_secs_zero_after_reset() {
+        let cb = CircuitBreaker::with_params(2, Duration::from_secs(30));
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.remaining_open_secs() > 0.0);
+        cb.reset();
+        assert_eq!(cb.remaining_open_secs(), 0.0);
+    }
+
+    // -- CircuitState Display tests -----------------------------------------
+
+    #[test]
+    fn circuit_state_display() {
+        assert_eq!(CircuitState::Closed.to_string(), "closed");
+        assert_eq!(CircuitState::Open.to_string(), "open");
+        assert_eq!(CircuitState::HalfOpen.to_string(), "half_open");
+    }
+
+    // -- record_success in Open state (defensive branch) --------------------
+
+    #[test]
+    fn record_success_in_open_state_closes_circuit() {
+        let cb = CircuitBreaker::with_params(2, Duration::from_secs(300));
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Directly call record_success while open (shouldn't happen in practice
+        // since check() blocks, but test the defensive branch).
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.failure_count(), 0);
+        assert_eq!(cb.half_open_success_count(), 0);
+    }
+
+    // -- with_params defaults to "db" subsystem label -----------------------
+
+    #[test]
+    fn with_params_uses_db_subsystem() {
+        let cb = CircuitBreaker::with_params(5, Duration::from_secs(30));
+        assert_eq!(cb.subsystem(), "db");
+    }
+
+    #[test]
+    fn default_circuit_breaker_uses_db_subsystem() {
+        let cb = CircuitBreaker::default();
+        assert_eq!(cb.subsystem(), "db");
+        assert_eq!(cb.threshold(), 5);
+        assert_eq!(cb.reset_duration(), Duration::from_secs(30));
+    }
+
+    // -- Jitter range validation --------------------------------------------
+
+    #[test]
+    fn jitter_factor_stays_in_range() {
+        for _ in 0..100 {
+            let j = jitter_factor();
+            assert!(
+                (-1.0..=1.0).contains(&j),
+                "jitter_factor out of [-1.0, 1.0]: {j}"
+            );
+        }
+    }
+
+    // -- delay_for_attempt minimum floor ------------------------------------
+
+    #[test]
+    fn delay_for_attempt_has_minimum_floor() {
+        let config = RetryConfig {
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_secs(1),
+            use_circuit_breaker: false,
+            ..Default::default()
+        };
+        // Even with very small base_delay, should be at least 10ms.
+        for attempt in 0..5 {
+            let delay = config.delay_for_attempt(attempt);
+            assert!(
+                delay.as_millis() >= 10,
+                "attempt {attempt}: delay {}ms below 10ms floor",
+                delay.as_millis()
+            );
+        }
+    }
+
+    // -- retry_sync with circuit breaker blocking ---------------------------
+
+    #[test]
+    fn retry_sync_blocked_by_open_circuit_breaker() {
+        let _lock = HEALTH_TEST_MUTEX.lock().unwrap();
+        // Open the DB circuit.
+        CIRCUIT_DB.reset();
+        for _ in 0..5 {
+            CIRCUIT_DB.record_failure();
+        }
+        assert_eq!(CIRCUIT_DB.state(), CircuitState::Open);
+
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            use_circuit_breaker: true,
+            subsystem: Subsystem::Db,
+        };
+
+        let attempt = std::cell::Cell::new(0u32);
+        let result: DbResult<()> = retry_sync(&config, || {
+            attempt.set(attempt.get() + 1);
+            Ok(())
+        });
+
+        // Should fail without calling op (circuit breaker blocks before first attempt).
+        assert!(result.is_err());
+        assert_eq!(attempt.get(), 0, "op should not be called when CB is open");
+        let err = result.unwrap_err();
+        assert!(matches!(err, DbError::CircuitBreakerOpen { .. }));
+
+        // Clean up.
+        CIRCUIT_DB.reset();
+    }
+
+    // -- Health status serialization ----------------------------------------
+
+    #[test]
+    fn health_status_serializes_to_json() {
+        let _lock = HEALTH_TEST_MUTEX.lock().unwrap();
+        CIRCUIT_DB.reset();
+        CIRCUIT_GIT.reset();
+        CIRCUIT_SIGNAL.reset();
+        CIRCUIT_LLM.reset();
+
+        let status = db_health_status();
+        let json = serde_json::to_value(&status).expect("serialize DbHealthStatus");
+
+        assert_eq!(json["circuit_state"], "closed");
+        assert_eq!(json["circuit_failures"], 0);
+        // recommendation should be absent (skip_serializing_if = None).
+        assert!(json.get("recommendation").is_none());
+
+        let circuits = json["circuits"].as_array().expect("circuits array");
+        assert_eq!(circuits.len(), 4);
+        for circuit in circuits {
+            assert!(circuit["subsystem"].is_string());
+            assert_eq!(circuit["state"], "closed");
+            assert_eq!(circuit["failures"], 0);
+            assert!(circuit["threshold"].is_number());
+            assert!(circuit["reset_secs"].is_number());
+            assert_eq!(circuit["half_open_successes"], 0);
+            // No recommendation when closed.
+            assert!(circuit.get("recommendation").is_none());
+        }
+    }
+
+    #[test]
+    fn health_status_open_circuit_has_recommendation() {
+        let _lock = HEALTH_TEST_MUTEX.lock().unwrap();
+        CIRCUIT_DB.reset();
+        CIRCUIT_GIT.reset();
+        CIRCUIT_SIGNAL.reset();
+        CIRCUIT_LLM.reset();
+
+        // Open DB circuit.
+        for _ in 0..5 {
+            CIRCUIT_DB.record_failure();
+        }
+
+        let status = db_health_status();
+        assert_eq!(status.circuit_state, "open");
+        assert!(status.recommendation.is_some());
+        assert!(status.recommendation.as_ref().unwrap().contains("OPEN"));
+
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert!(json["recommendation"].is_string());
+
+        // Verify per-subsystem recommendations.
+        let db_circuit = json["circuits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["subsystem"] == "db")
+            .unwrap();
+        assert!(db_circuit["recommendation"].is_string());
+
+        // Other circuits should have no recommendation.
+        let git_circuit = json["circuits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["subsystem"] == "git")
+            .unwrap();
+        assert!(git_circuit.get("recommendation").is_none());
+
+        CIRCUIT_DB.reset();
+    }
+
+    // -- Subsystem::ALL completeness ----------------------------------------
+
+    #[test]
+    fn subsystem_all_covers_every_variant() {
+        // Ensure ALL contains exactly the variants we expect.
+        let all_set: std::collections::HashSet<Subsystem> =
+            Subsystem::ALL.iter().copied().collect();
+        assert!(all_set.contains(&Subsystem::Db));
+        assert!(all_set.contains(&Subsystem::Git));
+        assert!(all_set.contains(&Subsystem::Signal));
+        assert!(all_set.contains(&Subsystem::Llm));
+        assert_eq!(all_set.len(), 4);
+    }
+
+    // -- Per-subsystem recommendation strings -------------------------------
+
+    #[test]
+    fn each_open_subsystem_has_recommendation() {
+        let _lock = HEALTH_TEST_MUTEX.lock().unwrap();
+        CIRCUIT_DB.reset();
+        CIRCUIT_GIT.reset();
+        CIRCUIT_SIGNAL.reset();
+        CIRCUIT_LLM.reset();
+
+        let subsystem_info: [(Subsystem, u32, &str); 4] = [
+            (Subsystem::Db, 5, "busy_timeout"),
+            (Subsystem::Git, 8, "index.lock"),
+            (Subsystem::Signal, 5, "filesystem"),
+            (Subsystem::Llm, 3, "API keys"),
+        ];
+
+        for (sub, threshold, _keyword) in &subsystem_info {
+            let cb = circuit_for(*sub);
+            for _ in 0..*threshold {
+                cb.record_failure();
+            }
+            assert_eq!(
+                cb.state(),
+                CircuitState::Open,
+                "{sub} should be open after {threshold} failures"
+            );
+        }
+
+        let status = db_health_status();
+        for (sub, _, expected_keyword) in &subsystem_info {
+            let circuit_status = status
+                .circuits
+                .iter()
+                .find(|c| c.subsystem == sub.to_string())
+                .unwrap_or_else(|| panic!("missing circuit for {sub}"));
+            assert_eq!(circuit_status.state, "open", "{sub} should be open");
+            let rec = circuit_status
+                .recommendation
+                .as_ref()
+                .unwrap_or_else(|| panic!("{sub}: expected recommendation"));
+            assert!(
+                rec.contains(expected_keyword),
+                "{sub}: recommendation should contain '{expected_keyword}', got: {rec}"
+            );
+        }
+
+        // Clean up.
+        CIRCUIT_DB.reset();
+        CIRCUIT_GIT.reset();
+        CIRCUIT_SIGNAL.reset();
+        CIRCUIT_LLM.reset();
+    }
+
+    // -- micros_from_duration edge cases ------------------------------------
+
+    #[test]
+    fn micros_from_duration_normal() {
+        assert_eq!(micros_from_duration(Duration::from_secs(1)), 1_000_000);
+        assert_eq!(micros_from_duration(Duration::from_millis(500)), 500_000);
+        assert_eq!(micros_from_duration(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn micros_from_duration_saturates_on_huge_duration() {
+        // Duration::MAX is enormous; micros_from_duration should saturate to u64::MAX.
+        let huge = Duration::new(u64::MAX, 999_999_999);
+        assert_eq!(micros_from_duration(huge), u64::MAX);
+    }
+
+    // -- retry_sync records failures to circuit breaker ---------------------
+
+    #[test]
+    fn retry_sync_records_failures_on_exhaustion() {
+        let _lock = HEALTH_TEST_MUTEX.lock().unwrap();
+        CIRCUIT_DB.reset();
+        assert_eq!(CIRCUIT_DB.failure_count(), 0);
+
+        let config = RetryConfig {
+            max_retries: 2,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            use_circuit_breaker: true,
+            subsystem: Subsystem::Db,
+        };
+
+        let _err: DbResult<()> = retry_sync(&config, || {
+            Err(DbError::Sqlite("database is locked".to_string()))
+        });
+
+        // Should have recorded failures (3 attempts = 3 failures recorded).
+        assert!(
+            CIRCUIT_DB.failure_count() >= 3,
+            "expected at least 3 failures recorded, got {}",
+            CIRCUIT_DB.failure_count()
+        );
+
+        CIRCUIT_DB.reset();
+    }
+
+    // -- retry_sync resets CB on success ------------------------------------
+
+    #[test]
+    fn retry_sync_resets_cb_on_success() {
+        let _lock = HEALTH_TEST_MUTEX.lock().unwrap();
+        CIRCUIT_DB.reset();
+
+        // Inject some failures first.
+        CIRCUIT_DB.record_failure();
+        CIRCUIT_DB.record_failure();
+        assert_eq!(CIRCUIT_DB.failure_count(), 2);
+
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            use_circuit_breaker: true,
+            subsystem: Subsystem::Db,
+        };
+
+        let result = retry_sync(&config, || Ok(42));
+        assert_eq!(result.unwrap(), 42);
+        // record_success should have cleared failure count.
+        assert_eq!(CIRCUIT_DB.failure_count(), 0);
+
+        CIRCUIT_DB.reset();
+    }
 }
