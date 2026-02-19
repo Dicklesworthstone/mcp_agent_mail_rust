@@ -252,6 +252,7 @@ impl TuiSharedState {
     }
 
     #[must_use]
+    #[allow(clippy::needless_pass_by_value)] // 80+ call sites; by-value is clearer API intent
     pub fn push_event(&self, event: MailEvent) -> bool {
         // Keep event publication non-blocking so HTTP/tool handlers cannot stall
         // behind a contended TUI ring-buffer lock.
