@@ -18,7 +18,7 @@ use ftui::render::frame::HitId;
 use ftui::text::display_width;
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
-use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
+use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction, PaletteStyle};
 use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
 use ftui::widgets::inspector::{InspectorState, WidgetInfo};
 use ftui::widgets::modal::{Dialog, DialogResult, DialogState};
@@ -39,7 +39,7 @@ use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
 use crate::tui_bridge::{RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_compose::{ComposeAction, ComposePanel, ComposeState};
-use crate::tui_events::MailEvent;
+use crate::tui_events::{EventSeverity, MailEvent};
 use crate::tui_focus::{FocusManager, FocusTarget, focus_graph_for_screen, focus_ring_for_screen};
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
@@ -50,6 +50,9 @@ use crate::tui_screens::{
     reservations::ReservationsScreen, screen_from_jump_key, screen_meta,
     search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
     timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+};
+use crate::tui_widgets::{
+    AmbientEffectRenderer, AmbientHealthInput, AmbientMode, AmbientRenderTelemetry,
 };
 
 /// How often the TUI ticks (16 ms ≈ 60 fps).
@@ -72,6 +75,21 @@ const TOAST_EXIT_TICKS: u8 = 15;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
+const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
+
+fn command_palette_theme_style() -> PaletteStyle {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    PaletteStyle {
+        border: Style::default().fg(tp.panel_border_focused).bg(tp.bg_overlay),
+        input: Style::default().fg(tp.text_primary).bg(tp.bg_overlay),
+        item: Style::default().fg(tp.text_secondary).bg(tp.bg_overlay),
+        item_selected: Style::default().fg(tp.selection_fg).bg(tp.selection_bg),
+        match_highlight: Style::default().fg(tp.status_accent).bg(tp.bg_overlay),
+        description: Style::default().fg(tp.text_muted).bg(tp.bg_overlay),
+        category: Style::default().fg(tp.help_key_fg).bg(tp.bg_overlay),
+        hint: Style::default().fg(tp.text_disabled).bg(tp.bg_overlay),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuitConfirmSource {
@@ -289,6 +307,8 @@ fn toast_reduced_motion_enabled(accessibility: &crate::tui_persist::Accessibilit
 const SLOW_TOOL_THRESHOLD_MS: u64 = 5000;
 /// How far ahead (in microseconds) to warn about expiring reservations (5 min).
 const RESERVATION_EXPIRY_WARN_MICROS: i64 = 5 * 60 * 1_000_000;
+/// Keep top-row KPI/header bands free from transient toast borders.
+const TOAST_OVERLAY_CONTENT_TOP_INSET_ROWS: u16 = 2;
 
 /// Toast border/icon colors resolved from the active theme palette.
 fn toast_color_error() -> PackedRgba {
@@ -953,6 +973,9 @@ pub struct MailAppModel {
     help_scroll: u16,
     keymap: crate::tui_keymap::KeymapRegistry,
     command_palette: CommandPalette,
+    ambient_renderer: RefCell<AmbientEffectRenderer>,
+    ambient_mode: AmbientMode,
+    ambient_last_telemetry: Cell<AmbientRenderTelemetry>,
     hint_ranker: HintRanker,
     palette_hint_ids: HashMap<String, usize>,
     palette_usage_path: Option<PathBuf>,
@@ -1041,7 +1064,9 @@ impl MailAppModel {
         let screen_manager = ScreenManager::new(&state);
 
         let static_actions = build_palette_actions_static();
-        let mut command_palette = CommandPalette::new().with_max_visible(PALETTE_MAX_VISIBLE);
+        let mut command_palette = CommandPalette::new()
+            .with_style(command_palette_theme_style())
+            .with_max_visible(PALETTE_MAX_VISIBLE);
         command_palette.replace_actions(static_actions.clone());
         let mut hint_ranker = HintRanker::new(RankerConfig::default());
         let mut palette_hint_ids: HashMap<String, usize> = HashMap::new();
@@ -1069,6 +1094,9 @@ impl MailAppModel {
             help_scroll: 0,
             keymap: crate::tui_keymap::KeymapRegistry::default(),
             command_palette,
+            ambient_renderer: RefCell::new(AmbientEffectRenderer::new()),
+            ambient_mode: AmbientMode::Subtle,
+            ambient_last_telemetry: Cell::new(AmbientRenderTelemetry::default()),
             hint_ranker,
             palette_hint_ids,
             palette_usage_path: None,
@@ -1137,6 +1165,7 @@ impl MailAppModel {
         model.toast_info_dismiss_secs = config.tui_toast_info_dismiss_secs.max(1);
         model.toast_warn_dismiss_secs = config.tui_toast_warn_dismiss_secs.max(1);
         model.toast_error_dismiss_secs = config.tui_toast_error_dismiss_secs.max(1);
+        model.ambient_mode = AmbientMode::parse(config.tui_ambient.as_str());
         let max_visible = if config.tui_toast_enabled {
             config.tui_toast_max_visible.max(1)
         } else {
@@ -1167,6 +1196,7 @@ impl MailAppModel {
             let _ = crate::tui_theme::set_theme_and_get_name(ThemeId::HighContrast);
             model.sync_theme_snapshot();
         }
+        model.refresh_palette_theme_style();
         model.accessibility.high_contrast = model.accessibility.high_contrast
             || crate::tui_theme::current_theme_id() == ThemeId::HighContrast;
         model
@@ -1399,6 +1429,33 @@ impl MailAppModel {
                 format!("Message send failed: {context}")
             };
             (msg, ToastIcon::Error, Duration::from_secs(5))
+        };
+        self.notifications
+            .notify(Toast::new(message).icon(icon).duration(duration));
+    }
+
+    fn notify_reservation_create_result(&mut self, status: &str, context: &str) {
+        let (prefix, icon, duration) = match status {
+            "ok" => (
+                "Reservation created",
+                ToastIcon::Info,
+                Duration::from_secs(3),
+            ),
+            "warn" => (
+                "Reservation created with conflicts",
+                ToastIcon::Warning,
+                Duration::from_secs(4),
+            ),
+            _ => (
+                "Reservation create failed",
+                ToastIcon::Error,
+                Duration::from_secs(5),
+            ),
+        };
+        let message = if context.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix}: {context}")
         };
         self.notifications
             .notify(Toast::new(message).icon(icon).duration(duration));
@@ -1658,6 +1715,10 @@ impl MailAppModel {
                 self.notify_compose_result(arg == "ok", context);
                 Cmd::none()
             }
+            "reservation_create_result" => {
+                self.notify_reservation_create_result(arg, context);
+                Cmd::none()
+            }
             "rethread_message" => {
                 if let Some((message_id, target_thread_id)) = parse_rethread_operation_arg(arg) {
                     self.execute_rethread_message(message_id, &target_thread_id);
@@ -1869,6 +1930,58 @@ impl MailAppModel {
         decayed_palette_usage_weight(usage_count, last_used_micros, ranking_now_micros)
     }
 
+    fn ambient_mode_for_frame(&self) -> AmbientMode {
+        if self.state.config_snapshot().tui_effects {
+            self.ambient_mode
+        } else {
+            AmbientMode::Off
+        }
+    }
+
+    fn ambient_health_input(&self, now_micros: i64) -> AmbientHealthInput {
+        let ring_stats = self.state.event_ring_stats();
+        let event_buffer_utilization = f64::from(ring_stats.fill_pct()) / 100.0;
+        let recent_events = self.state.recent_events(AMBIENT_HEALTH_LOOKBACK_EVENTS);
+
+        let mut critical_alerts_active = false;
+        let mut warning_events = 0_u32;
+        let mut last_event_ts = 0_i64;
+        for event in recent_events {
+            last_event_ts = last_event_ts.max(event.timestamp_micros());
+            match event.severity() {
+                EventSeverity::Error => critical_alerts_active = true,
+                EventSeverity::Warn => warning_events = warning_events.saturating_add(1),
+                _ => {}
+            }
+        }
+
+        let seconds_since_last_event = if last_event_ts > 0 {
+            let delta_micros = now_micros.saturating_sub(last_event_ts).max(0);
+            u64::try_from(delta_micros / 1_000_000).unwrap_or(u64::MAX)
+        } else {
+            self.state.uptime().as_secs()
+        };
+
+        let failed_probe_count = if critical_alerts_active {
+            2
+        } else {
+            u32::from(warning_events > 0)
+        };
+
+        AmbientHealthInput {
+            critical_alerts_active,
+            failed_probe_count,
+            total_probe_count: if failed_probe_count > 0 { 2 } else { 0 },
+            event_buffer_utilization,
+            seconds_since_last_event,
+        }
+    }
+
+    #[cfg(test)]
+    const fn ambient_last_telemetry(&self) -> AmbientRenderTelemetry {
+        self.ambient_last_telemetry.get()
+    }
+
     fn persist_palette_usage(&mut self) {
         if !self.palette_usage_dirty {
             return;
@@ -1932,6 +2045,10 @@ impl MailAppModel {
         self.state.update_config_snapshot(snapshot);
     }
 
+    fn refresh_palette_theme_style(&mut self) {
+        self.command_palette.set_style(command_palette_theme_style());
+    }
+
     fn theme_id_for_named_config(cfg: &str) -> ThemeId {
         match cfg {
             "solarized" | "lumen_light" | "lumen" | "light" => ThemeId::LumenLight,
@@ -1960,6 +2077,7 @@ impl MailAppModel {
         let _ = crate::tui_theme::set_named_theme(
             crate::tui_theme::TuiThemePalette::config_name_to_index(named_cfg),
         );
+        self.refresh_palette_theme_style();
         self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
         if theme_id != ThemeId::HighContrast {
             self.last_non_hc_theme = theme_id;
@@ -1973,6 +2091,7 @@ impl MailAppModel {
         let (cfg, display, _palette) = crate::tui_theme::cycle_named_theme();
         let theme_id = Self::theme_id_for_named_config(cfg);
         let _ = crate::tui_theme::set_theme_and_get_name(theme_id);
+        self.refresh_palette_theme_style();
         self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
         if theme_id != ThemeId::HighContrast {
             self.last_non_hc_theme = theme_id;
@@ -2663,6 +2782,7 @@ impl MailAppModel {
                 );
                 let theme_id = Self::theme_id_for_named_config(cfg);
                 let _ = crate::tui_theme::set_theme_and_get_name(theme_id);
+                self.refresh_palette_theme_style();
                 self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
                 if theme_id != ThemeId::HighContrast {
                     self.last_non_hc_theme = theme_id;
@@ -3416,27 +3536,44 @@ impl Model for MailAppModel {
                     {
                         return Cmd::none();
                     }
-                    if self.help_visible {
-                        match key.code {
-                            KeyCode::Escape | KeyCode::Char('?') => {
-                                self.help_visible = false;
-                            }
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                self.help_scroll = self.help_scroll.saturating_add(1);
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                self.help_scroll = self.help_scroll.saturating_sub(1);
-                            }
-                            _ => {}
-                        }
-                        return Cmd::none();
-                    }
-
                     let is_escape = matches!(key.code, KeyCode::Escape);
                     let is_ctrl_c = key.modifiers.contains(Modifiers::CTRL)
                         && matches!(key.code, KeyCode::Char('c' | 'C'));
                     let is_ctrl_d = key.modifiers.contains(Modifiers::CTRL)
                         && matches!(key.code, KeyCode::Char('d' | 'D'));
+
+                    if self.help_visible {
+                        match key.code {
+                            KeyCode::Escape | KeyCode::Char('?') => {
+                                self.help_visible = false;
+                                return Cmd::none();
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                self.help_scroll = self.help_scroll.saturating_add(1);
+                                return Cmd::none();
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                self.help_scroll = self.help_scroll.saturating_sub(1);
+                                return Cmd::none();
+                            }
+                            KeyCode::Char('q') if !text_mode => {
+                                self.clear_quit_confirmation();
+                                self.flush_before_shutdown();
+                                self.state.request_shutdown();
+                                return Cmd::quit();
+                            }
+                            _ => {}
+                        }
+
+                        if is_ctrl_d {
+                            return self.detach_tui_headless();
+                        }
+                        if is_ctrl_c {
+                            return self.handle_quit_confirmation_input(QuitConfirmSource::CtrlC);
+                        }
+
+                        return Cmd::none();
+                    }
 
                     if !(is_escape || is_ctrl_c) {
                         self.clear_quit_confirmation();
@@ -3641,6 +3778,14 @@ impl Model for MailAppModel {
         // Hard guarantee that each frame paints the full terminal surface.
         let tp = crate::tui_theme::TuiThemePalette::current();
         clear_rect(frame, area, tp.bg_deep, tp.text_primary);
+        let ambient_telemetry = self.ambient_renderer.borrow_mut().render(
+            area,
+            frame,
+            self.ambient_mode_for_frame(),
+            self.ambient_health_input(now_micros()),
+            self.state.uptime().as_secs_f64(),
+        );
+        self.ambient_last_telemetry.set(ambient_telemetry);
         let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();
         *self.last_content_area.borrow_mut() = chrome.content;
@@ -3742,12 +3887,19 @@ impl Model for MailAppModel {
         // 4. Toast notifications (z=4, overlay)
         let toast_started = Instant::now();
         let reduced_motion = toast_reduced_motion_enabled(&self.accessibility);
+        let toast_area = toast_overlay_area(chrome.content, area);
         if reduced_motion {
             NotificationStack::new(&self.notifications)
                 .margin(1)
-                .render(area, frame);
+                .render(toast_area, frame);
         } else {
-            render_animated_toast_stack(&self.notifications, &self.toast_age_ticks, area, 1, frame);
+            render_animated_toast_stack(
+                &self.notifications,
+                &self.toast_age_ticks,
+                toast_area,
+                1,
+                frame,
+            );
         }
 
         // 4b. Toast focus highlight overlay
@@ -3755,7 +3907,7 @@ impl Model for MailAppModel {
             render_toast_focus_highlight(
                 &self.notifications,
                 focus_idx,
-                area,
+                toast_area,
                 1, // margin
                 frame,
             );
@@ -5002,14 +5154,6 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
                 .style(Style::default().fg(toast_color_warning()))
                 .duration(Duration::from_secs(8)),
         ),
-        MailEvent::ServerStarted { endpoint, .. } => (
-            ToastIcon::Success,
-            Toast::new(format!("Server started at {endpoint}"))
-                .icon(ToastIcon::Success)
-                .style(Style::default().fg(toast_color_success()))
-                .duration(Duration::from_secs(5)),
-        ),
-
         _ => return None,
     };
 
@@ -5284,6 +5428,24 @@ fn render_toast_focus_highlight(
 
     highlight_toast_border(x, y, tw, th, frame);
     render_focus_hint(visible, &positions, area, x, y.saturating_add(th), frame);
+}
+
+fn toast_overlay_area(content_area: Rect, fallback_area: Rect) -> Rect {
+    if content_area.is_empty() {
+        return fallback_area;
+    }
+
+    let inset = TOAST_OVERLAY_CONTENT_TOP_INSET_ROWS.min(content_area.height.saturating_sub(1));
+    if inset == 0 {
+        return content_area;
+    }
+
+    Rect::new(
+        content_area.x,
+        content_area.y.saturating_add(inset),
+        content_area.width,
+        content_area.height.saturating_sub(inset),
+    )
 }
 
 fn render_animated_toast_stack(
@@ -5919,6 +6081,90 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn ambient_mode_off_disables_renderer_in_view() {
+        let config = Config {
+            tui_ambient: "off".to_string(),
+            ..Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let model = MailAppModel::with_config(state, &config);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+
+        model.view(&mut frame);
+
+        let telemetry = model.ambient_last_telemetry();
+        assert_eq!(telemetry.mode, AmbientMode::Off);
+        assert_eq!(
+            telemetry.effect,
+            crate::tui_widgets::AmbientEffectKind::None
+        );
+    }
+
+    #[test]
+    fn ambient_health_input_flags_error_events_as_critical() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let _ = state.push_event(MailEvent::http_request("GET", "/mcp/", 503, 4, "127.0.0.1"));
+        let model = MailAppModel::with_config(state, &config);
+
+        let input = model.ambient_health_input(now_micros());
+        assert!(input.critical_alerts_active);
+        assert_eq!(input.failed_probe_count, 2);
+        assert_eq!(
+            crate::tui_widgets::determine_ambient_health_state(input),
+            crate::tui_widgets::AmbientHealthState::Critical
+        );
+    }
+
+    #[test]
+    fn ambient_health_input_flags_idle_when_events_are_stale() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let stale_ts = now_micros().saturating_sub(301 * 1_000_000);
+        let _ = state.push_event(MailEvent::ServerStarted {
+            seq: 0,
+            timestamp_micros: stale_ts,
+            source: crate::tui_events::EventSource::Lifecycle,
+            redacted: false,
+            endpoint: "http://127.0.0.1:8765/mcp/".to_string(),
+            config_summary: "test".to_string(),
+        });
+        let model = MailAppModel::with_config(state, &config);
+
+        let input = model.ambient_health_input(now_micros());
+        assert!(input.seconds_since_last_event >= 301);
+        assert_eq!(
+            crate::tui_widgets::determine_ambient_health_state(input),
+            crate::tui_widgets::AmbientHealthState::Idle
+        );
+    }
+
+    #[test]
+    fn ambient_health_input_uses_ring_utilization_warning_threshold() {
+        let config = Config::default();
+        let state = TuiSharedState::with_event_capacity(&config, 5);
+        for idx in 0..5 {
+            let _ = state.push_event(MailEvent::message_sent(
+                i64::from(idx),
+                "from",
+                vec!["to".to_string()],
+                "subject",
+                "thread",
+                "project",
+            ));
+        }
+        let model = MailAppModel::with_config(state, &config);
+
+        let input = model.ambient_health_input(now_micros());
+        assert!(input.event_buffer_utilization >= 0.8);
+        assert_eq!(
+            crate::tui_widgets::determine_ambient_health_state(input),
+            crate::tui_widgets::AmbientHealthState::Warning
+        );
     }
 
     #[test]
@@ -6866,6 +7112,18 @@ mod tests {
     }
 
     #[test]
+    fn q_key_quits_even_when_help_overlay_visible() {
+        let mut model = test_model();
+        model.help_visible = true;
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('q')));
+        let cmd = model.update(MailMsg::Terminal(key));
+
+        assert!(model.state.is_shutdown_requested());
+        assert!(matches!(cmd, Cmd::Quit));
+    }
+
+    #[test]
     fn escape_requires_confirmation_then_quits() {
         let mut model = test_model();
         let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
@@ -6882,6 +7140,21 @@ mod tests {
     #[test]
     fn ctrl_c_requires_confirmation_then_quits() {
         let mut model = test_model();
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL));
+
+        let first = model.update(MailMsg::Terminal(ctrl_c.clone()));
+        assert!(!model.state.is_shutdown_requested());
+        assert!(matches!(first, Cmd::None));
+
+        let second = model.update(MailMsg::Terminal(ctrl_c));
+        assert!(model.state.is_shutdown_requested());
+        assert!(matches!(second, Cmd::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_requires_confirmation_then_quits_with_help_overlay_visible() {
+        let mut model = test_model();
+        model.help_visible = true;
         let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL));
 
         let first = model.update(MailMsg::Terminal(ctrl_c.clone()));
@@ -8828,10 +9101,9 @@ mod tests {
         let event = MailEvent::server_started("http://127.0.0.1:8765", "test");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
         assert!(
-            toast.is_some(),
-            "ServerStarted should generate a toast (regression)"
+            toast.is_none(),
+            "ServerStarted toast is intentionally suppressed"
         );
-        assert_eq!(toast.unwrap().content.icon, Some(ToastIcon::Success));
     }
 
     #[test]
@@ -9133,6 +9405,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn toast_overlay_area_insets_content_header_rows() {
+        let content = Rect::new(0, 1, 100, 20);
+        let fallback = Rect::new(0, 0, 100, 22);
+        let area = toast_overlay_area(content, fallback);
+        assert_eq!(area.x, 0);
+        assert_eq!(area.y, 3);
+        assert_eq!(area.width, 100);
+        assert_eq!(area.height, 18);
+    }
+
+    #[test]
+    fn toast_overlay_area_falls_back_when_content_is_empty() {
+        let content = Rect::new(0, 0, 0, 0);
+        let fallback = Rect::new(0, 0, 80, 24);
+        let area = toast_overlay_area(content, fallback);
+        assert_eq!(area, fallback);
+    }
+
     // ── Toast severity coloring tests ───────────────────────────
     //
     // Toast.style is private, so we verify coloring by rendering to a
@@ -9228,17 +9519,17 @@ mod tests {
         let (_, th) = queue.visible()[0].calculate_dimensions();
         let hint_y = py + th;
 
-        // At least one cell in the hint row should have toast_focus_highlight() fg.
-        let mut found = false;
-        for x in 0..80 {
-            if let Some(cell) = frame.buffer.get(x, hint_y) {
-                if cell.fg == toast_focus_highlight() {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        assert!(found, "Hint text should be rendered with highlight color");
+        // Assert the operator hint text itself is present in the expected row.
+        let snapshot = ftui_harness::buffer_to_text(&frame.buffer);
+        let hint_row = snapshot
+            .lines()
+            .nth(hint_y as usize)
+            .unwrap_or_default()
+            .trim_end();
+        assert!(
+            hint_row.contains("Ctrl+Y"),
+            "Hint text should be rendered below the focused toast",
+        );
     }
 
     // ── Modal manager tests ─────────────────────────────────────

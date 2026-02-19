@@ -2607,7 +2607,7 @@ fn render_dashboard_frame(
         Paragraph::new("MCP Agent Mail Dashboard")
             .block(
                 Block::bordered()
-                    .border_type(BorderType::Ascii)
+                    .border_type(BorderType::Rounded)
                     .title("Dashboard"),
             )
             .render(area, frame);
@@ -2643,7 +2643,7 @@ fn render_dashboard_frame(
     Paragraph::new(header_text)
         .block(
             Block::bordered()
-                .border_type(BorderType::Double)
+                .border_type(BorderType::Rounded)
                 .title(" Live Console "),
         )
         .style(header_style)
@@ -2870,7 +2870,7 @@ fn render_dashboard_frame(
     Paragraph::new(footer_text)
         .block(
             Block::bordered()
-                .border_type(BorderType::Ascii)
+                .border_type(BorderType::Rounded)
                 .title(" Last Request "),
         )
         .style(title_style)

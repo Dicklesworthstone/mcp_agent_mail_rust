@@ -1315,6 +1315,13 @@ impl MailScreen for ThreadExplorerScreen {
                                     ));
                                 }
                             }
+                            KeyCode::Char('r') if !key.modifiers.contains(Modifiers::CTRL) => {
+                                if let Some(message) = self.selected_message() {
+                                    return Cmd::msg(MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::ReplyToMessage(message.id),
+                                    ));
+                                }
+                            }
                             _ => {}
                         },
                         _ => match key.code {
@@ -1345,6 +1352,13 @@ impl MailScreen for ThreadExplorerScreen {
                                         DeepLinkTarget::TimelineAtTime(
                                             thread.last_timestamp_micros,
                                         ),
+                                    ));
+                                }
+                            }
+                            KeyCode::Char('r') if !key.modifiers.contains(Modifiers::CTRL) => {
+                                if let Some(message) = self.selected_message() {
+                                    return Cmd::msg(MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::ReplyToMessage(message.id),
                                     ));
                                 }
                             }
@@ -1707,6 +1721,10 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Toggle preview or branch state",
             },
             HelpEntry {
+                key: "r",
+                action: "Quick reply selected message",
+            },
+            HelpEntry {
                 key: "e / c",
                 action: "Expand all / collapse all",
             },
@@ -1742,7 +1760,9 @@ impl MailScreen for ThreadExplorerScreen {
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("Thread conversations grouped by topic. Enter to expand, h to collapse.")
+        Some(
+            "Thread conversations grouped by topic. Enter to expand, r to quick-reply, h to collapse.",
+        )
     }
 
     fn consumes_text_input(&self) -> bool {
@@ -2014,7 +2034,7 @@ fn render_compact_focus_hint(
     } else {
         match focus {
             Focus::ThreadList => " Enter/l: detail | Esc/h: list | Tab: tree/preview",
-            Focus::DetailPanel => " Esc/h: list | Enter/l: detail | Tab: tree/preview",
+            Focus::DetailPanel => " Esc/h: list | r:quick reply | Tab: tree/preview",
         }
     };
 
@@ -3489,6 +3509,40 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn r_key_deep_links_to_quick_reply_from_detail_tree_focus() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.focus = Focus::DetailPanel;
+        screen.detail_messages.push(make_message(77));
+        screen.detail_tree_focus = true;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let r = Event::Key(ftui::KeyEvent::new(KeyCode::Char('r')));
+        let cmd = screen.update(&r, &state);
+        assert!(matches!(
+            cmd,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::ReplyToMessage(77)))
+        ));
+    }
+
+    #[test]
+    fn r_key_deep_links_to_quick_reply_from_detail_preview_focus() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.focus = Focus::DetailPanel;
+        screen.detail_messages.push(make_message(88));
+        screen.detail_tree_focus = false;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let r = Event::Key(ftui::KeyEvent::new(KeyCode::Char('r')));
+        let cmd = screen.update(&r, &state);
+        assert!(matches!(
+            cmd,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::ReplyToMessage(88)))
+        ));
+    }
+
     // ── Cursor navigation ───────────────────────────────────────────
 
     #[test]
@@ -3884,7 +3938,7 @@ mod tests {
             0,
             true,
             ViewLens::Activity,
-            SortMode::Newest,
+            SortMode::LastActivity,
             false,
             None,
             None,
@@ -4482,6 +4536,7 @@ mod tests {
         assert!(bindings.iter().any(|b| b.key == "v"));
         assert!(bindings.iter().any(|b| b.key == "t"));
         assert!(bindings.iter().any(|b| b.key == "g"));
+        assert!(bindings.iter().any(|b| b.key == "r"));
         assert!(bindings.iter().any(|b| b.key == "Enter/Space"));
         assert!(bindings.iter().any(|b| b.key == "e / c"));
     }

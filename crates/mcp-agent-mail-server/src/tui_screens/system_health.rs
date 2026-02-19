@@ -219,16 +219,27 @@ impl SystemHealthScreen {
         let refresh_requested = Arc::new(AtomicBool::new(true)); // run once immediately
         let stop = Arc::new(AtomicBool::new(false));
 
-        let worker_snapshot = Arc::clone(&snapshot);
-        let worker_refresh = Arc::clone(&refresh_requested);
-        let worker_stop = Arc::clone(&stop);
-
-        let worker = thread::Builder::new()
-            .name("tui-connection-diagnostics".into())
-            .spawn(move || {
-                diagnostics_worker_loop(&state, &worker_snapshot, &worker_refresh, &worker_stop);
-            })
-            .ok();
+        let worker = {
+            let state = state;
+            let snapshot = Arc::clone(&snapshot);
+            let refresh_requested = Arc::clone(&refresh_requested);
+            let stop = Arc::clone(&stop);
+            thread::Builder::new()
+                .name("am-system-health".to_string())
+                .spawn(move || {
+                    diagnostics_worker_loop(&state, &snapshot, &refresh_requested, &stop);
+                })
+                .map_or_else(
+                    |error| {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to spawn system health diagnostics worker"
+                        );
+                        None
+                    },
+                    Some,
+                )
+        };
 
         Self {
             snapshot,

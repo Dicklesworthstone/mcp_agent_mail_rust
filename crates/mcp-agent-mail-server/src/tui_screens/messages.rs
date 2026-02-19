@@ -4589,6 +4589,14 @@ mod tests {
     }
 
     #[test]
+    fn quick_reply_modal_consumes_text_input() {
+        let mut screen = MessageBrowserScreen::new();
+        let entry = test_message_entry(1, "thread-1", "Need follow-up");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+        assert!(screen.consumes_text_input());
+    }
+
+    #[test]
     fn compose_modal_click_outside_dismisses_modal() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
@@ -4631,6 +4639,118 @@ mod tests {
         });
         let _ = screen.update(&click, &state);
         assert!(screen.compose_form.is_some());
+    }
+
+    #[test]
+    fn quick_reply_modal_click_outside_dismisses_modal() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.last_search_area.set(Rect::new(0, 0, 120, 5));
+        screen.last_content_area.set(Rect::new(0, 5, 120, 35));
+        let entry = test_message_entry(2, "thread-2", "Reply target");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: 0,
+            y: 0,
+            modifiers: ftui::Modifiers::empty(),
+        });
+        let _ = screen.update(&click, &state);
+        assert!(screen.quick_reply_form.is_none());
+    }
+
+    #[test]
+    fn quick_reply_modal_click_inside_keeps_modal_open() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.last_search_area.set(Rect::new(0, 0, 120, 5));
+        screen.last_content_area.set(Rect::new(0, 5, 120, 35));
+        let entry = test_message_entry(3, "thread-3", "Reply target");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+
+        let modal = quick_reply_modal_rect(Rect::new(0, 0, 120, 40));
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: modal.x.saturating_add(2),
+            y: modal.y.saturating_add(2),
+            modifiers: ftui::Modifiers::empty(),
+        });
+        let _ = screen.update(&click, &state);
+        assert!(screen.quick_reply_form.is_some());
+    }
+
+    #[test]
+    fn quick_reply_escape_closes_modal() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        let entry = test_message_entry(4, "thread-4", "Reply target");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+
+        let cmd = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+        assert!(matches!(cmd, Cmd::None));
+        assert!(screen.quick_reply_form.is_none());
+    }
+
+    #[test]
+    fn quick_reply_tab_and_backtab_cycle_focus() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        let entry = test_message_entry(5, "thread-5", "Reply target");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+
+        let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
+        let _ = screen.update(&tab, &state);
+        let form = screen.quick_reply_form.as_ref().expect("quick reply form");
+        assert!(matches!(form.focus, QuickReplyField::AckRequired));
+
+        let backtab = Event::Key(ftui::KeyEvent::new(KeyCode::BackTab));
+        let _ = screen.update(&backtab, &state);
+        let form = screen.quick_reply_form.as_ref().expect("quick reply form");
+        assert!(matches!(form.focus, QuickReplyField::Body));
+    }
+
+    #[test]
+    fn quick_reply_ack_focus_toggles_with_space() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        let entry = test_message_entry(6, "thread-6", "Reply target");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+        if let Some(form) = screen.quick_reply_form.as_mut() {
+            form.set_focus(QuickReplyField::AckRequired);
+            assert!(!form.ack_required);
+        }
+
+        let space = Event::Key(ftui::KeyEvent::new(KeyCode::Char(' ')));
+        let _ = screen.update(&space, &state);
+        let form = screen.quick_reply_form.as_ref().expect("quick reply form");
+        assert!(form.ack_required);
+    }
+
+    #[test]
+    fn quick_reply_submit_with_empty_body_sets_validation_error() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        let entry = test_message_entry(7, "thread-7", "Reply target");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+
+        let cmd = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::F(5))), &state);
+        assert!(matches!(cmd, Cmd::None));
+        let form = screen.quick_reply_form.as_ref().expect("quick reply form");
+        assert_eq!(form.errors.body.as_deref(), Some("Reply body is required."));
+    }
+
+    #[test]
+    fn quick_reply_ctrl_enter_with_empty_body_sets_validation_error() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        let entry = test_message_entry(8, "thread-8", "Reply target");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+
+        let cmd = screen.update(&ctrl_key(KeyCode::Enter), &state);
+        assert!(matches!(cmd, Cmd::None));
+        let form = screen.quick_reply_form.as_ref().expect("quick reply form");
+        assert_eq!(form.errors.body.as_deref(), Some("Reply body is required."));
     }
 
     #[test]
@@ -5469,6 +5589,22 @@ mod tests {
     }
 
     #[test]
+    fn receive_deep_link_reply_opens_quick_reply_modal() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(77, "thread-77", "Escalation update"));
+
+        let handled = screen.receive_deep_link(&DeepLinkTarget::ReplyToMessage(77));
+        assert!(handled);
+        let form = screen.quick_reply_form.expect("quick reply form");
+        assert_eq!(form.context.message_id, 77);
+        assert_eq!(form.context.to_agent, "GoldFox");
+        assert_eq!(form.context.thread_id.as_deref(), Some("thread-77"));
+        assert_eq!(form.context.subject, "Re: Escalation update");
+    }
+
+    #[test]
     fn c_key_opens_compose_modal() {
         let mut screen = MessageBrowserScreen::new();
         screen.results.push(MessageEntry {
@@ -5489,6 +5625,22 @@ mod tests {
         let event = Event::Key(ftui::KeyEvent::new(KeyCode::Char('c')));
         let _ = screen.update(&event, &state);
         assert!(screen.compose_form.is_some());
+    }
+
+    #[test]
+    fn r_key_opens_quick_reply_modal_for_selected_message() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(55, "thread-55", "Status report"));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let event = Event::Key(ftui::KeyEvent::new(KeyCode::Char('r')));
+        let _ = screen.update(&event, &state);
+        let form = screen.quick_reply_form.expect("quick reply form");
+        assert_eq!(form.context.message_id, 55);
+        assert_eq!(form.context.subject, "Re: Status report");
+        assert_eq!(form.context.to_agent, "GoldFox");
     }
 
     // ── Query presets ──────────────────────────────────────────────
@@ -5642,6 +5794,7 @@ mod tests {
         let screen = MessageBrowserScreen::new();
         let bindings = screen.keybindings();
         assert!(bindings.iter().any(|b| b.key == "c"));
+        assert!(bindings.iter().any(|b| b.key == "r"));
         assert!(bindings.iter().any(|b| b.key == "F5/Ctrl+Enter"));
     }
 
@@ -5656,6 +5809,14 @@ mod tests {
         assert!(err.to.is_some());
         assert!(err.subject.is_some());
         assert!(err.body.is_some());
+    }
+
+    #[test]
+    fn quick_reply_validation_flags_required_body() {
+        let entry = test_message_entry(90, "thread-90", "Follow-up");
+        let form = QuickReplyFormState::from_entry(&entry).expect("quick reply form");
+        let err = validate_quick_reply_form(&form).expect_err("expected validation error");
+        assert_eq!(err.body.as_deref(), Some("Reply body is required."));
     }
 
     #[test]

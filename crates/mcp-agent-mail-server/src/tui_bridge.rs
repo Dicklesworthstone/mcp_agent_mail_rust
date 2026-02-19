@@ -253,15 +253,25 @@ impl TuiSharedState {
 
     #[must_use]
     pub fn push_event(&self, event: MailEvent) -> bool {
-        // Fast path: non-blocking push.
+        // Keep event publication non-blocking so HTTP/tool handlers cannot stall
+        // behind a contended TUI ring-buffer lock.
         if self.events.try_push(event.clone()).is_some() {
             return true;
         }
-        // Never drop business-significant events due transient lock contention.
-        if event.severity() >= EventSeverity::Info {
-            let _ = self.events.push(event);
-            return true;
+
+        if event.severity() < EventSeverity::Info {
+            return false;
         }
+
+        // Give important events a few non-blocking retries, then drop instead of
+        // risking transport stalls while the UI thread is rendering.
+        for _ in 0..3 {
+            std::thread::yield_now();
+            if self.events.try_push(event.clone()).is_some() {
+                return true;
+            }
+        }
+
         false
     }
 

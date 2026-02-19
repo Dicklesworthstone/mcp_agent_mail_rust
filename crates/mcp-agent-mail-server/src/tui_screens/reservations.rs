@@ -3,6 +3,9 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
+use asupersync::Cx;
+use fastmcp::prelude::McpContext;
+use fastmcp_core::block_on;
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
 use ftui::text::display_width;
@@ -12,10 +15,13 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
+use ftui_widgets::input::TextInput;
 use ftui_widgets::progress::ProgressBar;
+use ftui_widgets::textarea::TextArea;
+use serde::Deserialize;
 
 use crate::tui_action_menu::{ActionEntry, reservations_actions, reservations_batch_actions};
 use crate::tui_bridge::TuiSharedState;
@@ -35,6 +41,160 @@ const SORT_LABELS: &[&str] = &["Agent", "Path", "Excl", "TTL", "Project"];
 const EMPTY_SNAPSHOT_HOLD_CYCLES: u8 = 1;
 /// Minimum tick spacing between direct DB fallback probes.
 const FALLBACK_DB_REFRESH_TICKS: u64 = 10;
+const RESERVATION_TTL_PRESETS: [(&str, i64); 5] = [
+    ("1h", 3600),
+    ("4h", 14_400),
+    ("12h", 43_200),
+    ("24h", 86_400),
+    ("Custom", 0),
+];
+const RESERVATION_TTL_CUSTOM_INDEX: usize = RESERVATION_TTL_PRESETS.len() - 1;
+const RESERVATION_PATH_MIN_ROWS: u16 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationCreateField {
+    Paths,
+    Exclusive,
+    Ttl,
+    CustomTtl,
+    Reason,
+}
+
+impl ReservationCreateField {
+    const fn next(self, custom_ttl_enabled: bool) -> Self {
+        match self {
+            Self::Paths => Self::Exclusive,
+            Self::Exclusive => Self::Ttl,
+            Self::Ttl => {
+                if custom_ttl_enabled {
+                    Self::CustomTtl
+                } else {
+                    Self::Reason
+                }
+            }
+            Self::CustomTtl => Self::Reason,
+            Self::Reason => Self::Paths,
+        }
+    }
+
+    const fn prev(self, custom_ttl_enabled: bool) -> Self {
+        match self {
+            Self::Paths => Self::Reason,
+            Self::Exclusive => Self::Paths,
+            Self::Ttl => Self::Exclusive,
+            Self::CustomTtl => Self::Ttl,
+            Self::Reason => {
+                if custom_ttl_enabled {
+                    Self::CustomTtl
+                } else {
+                    Self::Ttl
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReservationCreateValidationErrors {
+    paths: Option<String>,
+    ttl: Option<String>,
+    general: Option<String>,
+}
+
+impl ReservationCreateValidationErrors {
+    const fn has_any(&self) -> bool {
+        self.paths.is_some() || self.ttl.is_some() || self.general.is_some()
+    }
+}
+
+struct ReservationCreateFormState {
+    project_slug: String,
+    agent_name: String,
+    paths_input: TextArea,
+    custom_ttl_input: TextInput,
+    reason_input: TextInput,
+    exclusive: bool,
+    ttl_idx: usize,
+    focus: ReservationCreateField,
+    errors: ReservationCreateValidationErrors,
+}
+
+impl ReservationCreateFormState {
+    fn new(project_slug: String, agent_name: String) -> Self {
+        let mut form = Self {
+            project_slug,
+            agent_name,
+            paths_input: TextArea::new()
+                .with_placeholder("One path/glob per line (e.g., crates/**, src/*.rs)"),
+            custom_ttl_input: TextInput::new().with_placeholder("e.g. 90m or 2h"),
+            reason_input: TextInput::new().with_placeholder("Optional reason (e.g., br-3oavg)"),
+            exclusive: true,
+            ttl_idx: 0,
+            focus: ReservationCreateField::Paths,
+            errors: ReservationCreateValidationErrors::default(),
+        };
+        form.update_focus();
+        form
+    }
+
+    const fn custom_ttl_enabled(&self) -> bool {
+        self.ttl_idx == RESERVATION_TTL_CUSTOM_INDEX
+    }
+
+    fn update_focus(&mut self) {
+        self.paths_input
+            .set_focused(matches!(self.focus, ReservationCreateField::Paths));
+        self.custom_ttl_input
+            .set_focused(matches!(self.focus, ReservationCreateField::CustomTtl));
+        self.reason_input
+            .set_focused(matches!(self.focus, ReservationCreateField::Reason));
+    }
+
+    fn cycle_focus_next(&mut self) {
+        self.focus = self.focus.next(self.custom_ttl_enabled());
+        self.update_focus();
+    }
+
+    fn cycle_focus_prev(&mut self) {
+        self.focus = self.focus.prev(self.custom_ttl_enabled());
+        self.update_focus();
+    }
+
+    fn paths(&self) -> Vec<String> {
+        self.paths_input
+            .text()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+}
+
+struct ReservationCreatePayload {
+    project_key: String,
+    agent_name: String,
+    paths: Vec<String>,
+    ttl_seconds: i64,
+    exclusive: bool,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReservationCreateToolResponse {
+    granted: Vec<ReservationCreateGranted>,
+    conflicts: Vec<ReservationCreateConflict>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReservationCreateGranted {
+    path_pattern: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReservationCreateConflict {
+    path: String,
+}
 
 /// Tracked reservation state from events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +283,8 @@ pub struct ReservationsScreen {
     last_fallback_probe_tick: u64,
     /// Previous summary counts for `MetricTrend` computation.
     prev_counts: (u64, u64, u64, u64),
+    /// Reservation create modal form state.
+    create_form: Option<ReservationCreateFormState>,
 }
 
 impl ReservationsScreen {
@@ -145,6 +307,7 @@ impl ReservationsScreen {
             fallback_issue: None,
             last_fallback_probe_tick: 0,
             prev_counts: (0, 0, 0, 0),
+            create_form: None,
         }
     }
 
@@ -634,6 +797,284 @@ impl ReservationsScreen {
         let absolute_row = self.last_render_offset.get().saturating_add(visual_row);
         (absolute_row < self.sorted_keys.len()).then_some(absolute_row)
     }
+
+    fn infer_create_form_context(&self) -> (String, String) {
+        let selected = self
+            .table_state
+            .selected
+            .and_then(|idx| self.sorted_keys.get(idx))
+            .and_then(|key| self.reservations.get(key))
+            .map(|res| (res.project.clone(), res.agent.clone()));
+        if let Some(ctx) = selected {
+            return ctx;
+        }
+
+        self.sorted_keys
+            .iter()
+            .find_map(|key| self.reservations.get(key))
+            .map_or_else(
+                || (String::new(), String::new()),
+                |res| (res.project.clone(), res.agent.clone()),
+            )
+    }
+
+    fn open_create_form(&mut self) {
+        let (project_slug, agent_name) = self.infer_create_form_context();
+        let mut form = ReservationCreateFormState::new(project_slug, agent_name);
+        if form.project_slug.is_empty() || form.agent_name.is_empty() {
+            form.errors.general = Some(
+                "Select a reservation row first so project/agent context can be inferred."
+                    .to_string(),
+            );
+        }
+        self.create_form = Some(form);
+    }
+
+    fn parse_custom_ttl_seconds(raw: &str) -> Result<i64, String> {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err("Custom TTL is required (example: 90m or 2h).".to_string());
+        }
+        if value.len() < 2 {
+            return Err("Custom TTL must include a numeric value and suffix (m or h).".to_string());
+        }
+
+        let (num_part, unit_part) = value.split_at(value.len() - 1);
+        let qty = num_part
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| "Custom TTL must start with a positive integer.".to_string())?;
+        if qty <= 0 {
+            return Err("Custom TTL must be greater than zero.".to_string());
+        }
+
+        let unit = unit_part.to_ascii_lowercase();
+        let multiplier = match unit.as_str() {
+            "m" => 60_i64,
+            "h" => 3600_i64,
+            _ => {
+                return Err("Custom TTL suffix must be 'm' (minutes) or 'h' (hours).".to_string());
+            }
+        };
+        let seconds = qty
+            .checked_mul(multiplier)
+            .ok_or_else(|| "Custom TTL is too large.".to_string())?;
+        if seconds < 60 {
+            return Err("TTL must be at least 60 seconds.".to_string());
+        }
+        Ok(seconds)
+    }
+
+    fn validate_create_form(
+        form: &ReservationCreateFormState,
+    ) -> Result<ReservationCreatePayload, ReservationCreateValidationErrors> {
+        let mut errors = ReservationCreateValidationErrors::default();
+
+        if form.project_slug.trim().is_empty() || form.agent_name.trim().is_empty() {
+            errors.general = Some(
+                "Unable to infer project/agent context. Select a reservation row first."
+                    .to_string(),
+            );
+        }
+
+        let paths = form.paths();
+        if paths.is_empty() {
+            errors.paths = Some("Provide at least one path/glob pattern.".to_string());
+        }
+
+        let ttl_seconds = if form.custom_ttl_enabled() {
+            match Self::parse_custom_ttl_seconds(form.custom_ttl_input.value()) {
+                Ok(v) => v,
+                Err(err) => {
+                    errors.ttl = Some(err);
+                    0
+                }
+            }
+        } else {
+            RESERVATION_TTL_PRESETS
+                .get(form.ttl_idx)
+                .map_or(3600, |(_, secs)| *secs)
+        };
+
+        if errors.has_any() {
+            return Err(errors);
+        }
+
+        let reason = form.reason_input.value().trim();
+        Ok(ReservationCreatePayload {
+            project_key: form.project_slug.trim().to_string(),
+            agent_name: form.agent_name.trim().to_string(),
+            paths,
+            ttl_seconds,
+            exclusive: form.exclusive,
+            reason: (!reason.is_empty()).then(|| reason.to_string()),
+        })
+    }
+
+    fn submit_create_form(&mut self) -> Cmd<MailScreenMsg> {
+        let (payload, errors) = match self.create_form.as_ref() {
+            Some(form) => match Self::validate_create_form(form) {
+                Ok(payload) => (Some(payload), ReservationCreateValidationErrors::default()),
+                Err(errors) => (None, errors),
+            },
+            None => return Cmd::None,
+        };
+
+        if errors.has_any() {
+            if let Some(form) = self.create_form.as_mut() {
+                form.errors = errors;
+            }
+            return Cmd::None;
+        }
+
+        let Some(payload) = payload else {
+            return Cmd::None;
+        };
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+            &ctx,
+            payload.project_key.clone(),
+            payload.agent_name.clone(),
+            payload.paths.clone(),
+            Some(payload.ttl_seconds),
+            Some(payload.exclusive),
+            payload.reason,
+        ));
+
+        match result {
+            Ok(raw_json) => {
+                self.create_form = None;
+                let parsed = serde_json::from_str::<ReservationCreateToolResponse>(&raw_json).ok();
+                let (status, summary) = if let Some(resp) = parsed {
+                    let granted_count = resp.granted.len();
+                    let conflict_count = resp.conflicts.len();
+                    let granted_hint = resp.granted.first().map_or(String::new(), |row| {
+                        format!(" (e.g., {})", row.path_pattern)
+                    });
+                    let conflict_hint = resp
+                        .conflicts
+                        .first()
+                        .map_or(String::new(), |row| format!(" (first: {})", row.path));
+                    if conflict_count > 0 {
+                        (
+                            "warn",
+                            format!(
+                                "{granted_count} granted{granted_hint}, {conflict_count} conflicts{conflict_hint}"
+                            ),
+                        )
+                    } else {
+                        ("ok", format!("{granted_count} granted{granted_hint}"))
+                    }
+                } else {
+                    ("ok", "Reservation request completed.".to_string())
+                };
+                Cmd::msg(MailScreenMsg::ActionExecute(
+                    format!("reservation_create_result:{status}"),
+                    summary,
+                ))
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if let Some(form) = self.create_form.as_mut() {
+                    form.errors.general = Some(message.clone());
+                }
+                Cmd::msg(MailScreenMsg::ActionExecute(
+                    "reservation_create_result:error".to_string(),
+                    message,
+                ))
+            }
+        }
+    }
+
+    fn handle_create_form_event(&mut self, event: &Event) -> Cmd<MailScreenMsg> {
+        let Event::Key(key) = event else {
+            return Cmd::None;
+        };
+        if key.kind != KeyEventKind::Press {
+            return Cmd::None;
+        }
+
+        let ctrl_enter = key.modifiers.contains(Modifiers::CTRL) && key.code == KeyCode::Enter;
+        if ctrl_enter || key.code == KeyCode::F(5) {
+            return self.submit_create_form();
+        }
+        if key.code == KeyCode::Escape {
+            self.create_form = None;
+            return Cmd::None;
+        }
+        if key.code == KeyCode::Tab {
+            if let Some(form) = self.create_form.as_mut() {
+                form.cycle_focus_next();
+            }
+            return Cmd::None;
+        }
+        if key.code == KeyCode::BackTab {
+            if let Some(form) = self.create_form.as_mut() {
+                form.cycle_focus_prev();
+            }
+            return Cmd::None;
+        }
+
+        let Some(form) = self.create_form.as_mut() else {
+            return Cmd::None;
+        };
+
+        match form.focus {
+            ReservationCreateField::Paths => {
+                let before = form.paths_input.text();
+                let _ = form.paths_input.handle_event(event);
+                if form.paths_input.text() != before {
+                    form.errors.paths = None;
+                    form.errors.general = None;
+                }
+            }
+            ReservationCreateField::Exclusive => match key.code {
+                KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Left | KeyCode::Right => {
+                    form.exclusive = !form.exclusive;
+                    form.errors.general = None;
+                }
+                _ => {}
+            },
+            ReservationCreateField::Ttl => match key.code {
+                KeyCode::Left | KeyCode::Up => {
+                    if form.ttl_idx == 0 {
+                        form.ttl_idx = RESERVATION_TTL_PRESETS.len() - 1;
+                    } else {
+                        form.ttl_idx -= 1;
+                    }
+                    form.errors.ttl = None;
+                    form.errors.general = None;
+                    form.update_focus();
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    form.ttl_idx = (form.ttl_idx + 1) % RESERVATION_TTL_PRESETS.len();
+                    form.errors.ttl = None;
+                    form.errors.general = None;
+                    form.update_focus();
+                }
+                KeyCode::Enter => form.cycle_focus_next(),
+                _ => {}
+            },
+            ReservationCreateField::CustomTtl => {
+                let before = form.custom_ttl_input.value().to_string();
+                let _ = form.custom_ttl_input.handle_event(event);
+                if form.custom_ttl_input.value() != before {
+                    form.errors.ttl = None;
+                    form.errors.general = None;
+                }
+            }
+            ReservationCreateField::Reason => {
+                let before = form.reason_input.value().to_string();
+                let _ = form.reason_input.handle_event(event);
+                if form.reason_input.value() != before {
+                    form.errors.general = None;
+                }
+            }
+        }
+        Cmd::None
+    }
 }
 
 impl Default for ReservationsScreen {
@@ -644,6 +1085,10 @@ impl Default for ReservationsScreen {
 
 impl MailScreen for ReservationsScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        if self.create_form.is_some() {
+            return self.handle_create_form_event(event);
+        }
+
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
         {
@@ -689,6 +1134,7 @@ impl MailScreen for ReservationsScreen {
                     self.show_released = !self.show_released;
                     self.rebuild_sorted();
                 }
+                KeyCode::Char('n') => self.open_create_form(),
                 _ => {}
             }
         }
@@ -1046,6 +1492,10 @@ impl MailScreen for ReservationsScreen {
             let footer_area = Rect::new(area.x, y, area.width, footer_h);
             self.render_footer(frame, footer_area);
         }
+
+        if let Some(form) = &self.create_form {
+            render_reservation_create_modal(frame, area, form);
+        }
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -1075,6 +1525,10 @@ impl MailScreen for ReservationsScreen {
                 action: "Toggle show released",
             },
             HelpEntry {
+                key: "n",
+                action: "Open create reservation form",
+            },
+            HelpEntry {
                 key: ".",
                 action: "Open actions (single or batch)",
             },
@@ -1087,8 +1541,12 @@ impl MailScreen for ReservationsScreen {
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some(
-            "File reservations held by agents. Space/v/A/C manage multi-select; use . for single/batch actions.",
+            "File reservations held by agents. Press n to create; Space/v/A/C for multi-select; . opens actions.",
         )
+    }
+
+    fn consumes_text_input(&self) -> bool {
+        self.create_form.is_some()
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
@@ -1225,6 +1683,241 @@ fn render_ttl_overlays(
         }
         gauge.render(Rect::new(ttl_x, y, ttl_width, 1), frame);
     }
+}
+
+fn render_create_form_label(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    cursor_y: &mut u16,
+    bottom: u16,
+    label: &str,
+    focused: bool,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    if *cursor_y >= bottom {
+        return;
+    }
+    let style = if focused {
+        Style::default().fg(tp.selection_indicator).bold()
+    } else {
+        crate::tui_theme::text_meta(tp)
+    };
+    Paragraph::new(label)
+        .style(style)
+        .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
+    *cursor_y = (*cursor_y).saturating_add(1);
+}
+
+fn render_create_form_error(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    cursor_y: &mut u16,
+    bottom: u16,
+    error: Option<&str>,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    if let Some(error) = error
+        && *cursor_y < bottom
+    {
+        Paragraph::new(error)
+            .style(crate::tui_theme::text_warning(tp))
+            .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
+        *cursor_y = (*cursor_y).saturating_add(1);
+    }
+}
+
+#[must_use]
+fn reservation_create_modal_rect(area: Rect) -> Rect {
+    if area.width < 46 || area.height < 16 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let modal_width = ((u32::from(area.width) * 86) / 100).clamp(62, 110) as u16;
+    let modal_height = ((u32::from(area.height) * 86) / 100).clamp(18, 34) as u16;
+    let width = modal_width.min(area.width.saturating_sub(2));
+    let height = modal_height.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_reservation_create_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &ReservationCreateFormState,
+) {
+    if area.width < 46 || area.height < 16 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    Paragraph::new("")
+        .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay))
+        .render(area, frame);
+
+    let modal = reservation_create_modal_rect(area);
+    let title = "Create Reservation";
+    let block = Block::default()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.selection_indicator));
+    let inner = block.inner(modal);
+    block.render(modal, frame);
+    if inner.height < 10 || inner.width < 18 {
+        return;
+    }
+
+    let mut cursor_y = inner.y;
+    let bottom = inner.y + inner.height;
+
+    let project_label = if form.project_slug.is_empty() {
+        "(unknown)"
+    } else {
+        &form.project_slug
+    };
+    let agent_label = if form.agent_name.is_empty() {
+        "(unknown)"
+    } else {
+        &form.agent_name
+    };
+    Paragraph::new(format!("Project: {project_label}"))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+    cursor_y = cursor_y.saturating_add(1);
+    Paragraph::new(format!("Agent:   {agent_label}"))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+    cursor_y = cursor_y.saturating_add(1);
+
+    render_create_form_label(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        "Paths* (one glob per line)",
+        matches!(form.focus, ReservationCreateField::Paths),
+        &tp,
+    );
+    let suggested_rows = if inner.height >= 24 {
+        7
+    } else if inner.height >= 20 {
+        6
+    } else {
+        RESERVATION_PATH_MIN_ROWS
+    };
+    let max_rows = bottom.saturating_sub(cursor_y).saturating_sub(7);
+    let path_rows = suggested_rows.min(max_rows.max(1));
+    if cursor_y < bottom && path_rows > 0 {
+        ftui_widgets::Widget::render(
+            &form.paths_input,
+            Rect::new(inner.x, cursor_y, inner.width, path_rows),
+            frame,
+        );
+        cursor_y = cursor_y.saturating_add(path_rows);
+    }
+    render_create_form_error(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.paths.as_deref(),
+        &tp,
+    );
+
+    if cursor_y < bottom {
+        let exclusive = if form.exclusive {
+            "Exclusive: [x]"
+        } else {
+            "Exclusive: [ ]"
+        };
+        let style = if matches!(form.focus, ReservationCreateField::Exclusive) {
+            Style::default().fg(tp.selection_indicator).bold()
+        } else {
+            Style::default().fg(tp.text_secondary)
+        };
+        Paragraph::new(exclusive)
+            .style(style)
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+
+    if cursor_y < bottom {
+        let ttl_options = RESERVATION_TTL_PRESETS
+            .iter()
+            .enumerate()
+            .map(|(idx, (label, _))| {
+                if idx == form.ttl_idx {
+                    format!("[{label}]")
+                } else {
+                    label.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ttl_line = format!("TTL: {ttl_options}");
+        let style = if matches!(form.focus, ReservationCreateField::Ttl) {
+            Style::default().fg(tp.selection_indicator).bold()
+        } else {
+            Style::default().fg(tp.text_secondary)
+        };
+        Paragraph::new(ttl_line)
+            .style(style)
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+    if form.custom_ttl_enabled() {
+        render_create_form_label(
+            frame,
+            inner,
+            &mut cursor_y,
+            bottom,
+            "Custom TTL* (Nh or Nm)",
+            matches!(form.focus, ReservationCreateField::CustomTtl),
+            &tp,
+        );
+        if cursor_y < bottom {
+            form.custom_ttl_input
+                .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+            cursor_y = cursor_y.saturating_add(1);
+        }
+    }
+    render_create_form_error(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.ttl.as_deref(),
+        &tp,
+    );
+
+    render_create_form_label(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        "Reason (optional)",
+        matches!(form.focus, ReservationCreateField::Reason),
+        &tp,
+    );
+    if cursor_y < bottom {
+        form.reason_input
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+
+    render_create_form_error(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.general.as_deref(),
+        &tp,
+    );
+
+    let footer_y = bottom.saturating_sub(1);
+    let footer = "Tab/Shift+Tab fields • ←/→ TTL • Space toggle exclusive • F5/Ctrl+Enter submit • Esc cancel";
+    Paragraph::new(footer)
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
 }
 
 /// Format remaining seconds as a human-readable string.
@@ -1415,13 +2108,130 @@ mod tests {
         assert!(bindings.iter().any(|b| b.key == "Space"));
         assert!(bindings.iter().any(|b| b.key == "v / A / C"));
         assert!(bindings.iter().any(|b| b.key == "x"));
+        assert!(bindings.iter().any(|b| b.key == "n"));
         assert!(bindings.iter().any(|b| b.key == "."));
         assert_eq!(
             screen.context_help_tip(),
             Some(
-                "File reservations held by agents. Space/v/A/C manage multi-select; use . for single/batch actions.",
+                "File reservations held by agents. Press n to create; Space/v/A/C for multi-select; . opens actions.",
             )
         );
+    }
+
+    #[test]
+    fn n_opens_create_form_and_escape_closes_it() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+
+        let key = reservation_key("proj", "BlueLake", "src/**");
+        screen.reservations.insert(
+            key.clone(),
+            ActiveReservation {
+                reservation_id: Some(1),
+                agent: "BlueLake".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                granted_ts: 1_000_000,
+                ttl_s: 3600,
+                project: "proj".into(),
+                released: false,
+            },
+        );
+        screen.sorted_keys.push(key);
+        screen.table_state.selected = Some(0);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('n'))), &state);
+        assert!(screen.create_form.is_some());
+        assert!(screen.consumes_text_input());
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+        assert!(screen.create_form.is_none());
+        assert!(!screen.consumes_text_input());
+    }
+
+    #[test]
+    fn parse_custom_ttl_seconds_accepts_minutes_and_hours() {
+        assert_eq!(
+            ReservationsScreen::parse_custom_ttl_seconds("90m").unwrap(),
+            5400
+        );
+        assert_eq!(
+            ReservationsScreen::parse_custom_ttl_seconds("2h").unwrap(),
+            7200
+        );
+        assert_eq!(
+            ReservationsScreen::parse_custom_ttl_seconds(" 3H ").unwrap(),
+            10_800
+        );
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("0m").is_err());
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("15s").is_err());
+    }
+
+    #[test]
+    fn validate_create_form_rejects_missing_context_and_paths() {
+        let form = ReservationCreateFormState::new(String::new(), String::new());
+        let errors = match ReservationsScreen::validate_create_form(&form) {
+            Ok(payload) => panic!(
+                "expected validation error, got payload: {:?}",
+                payload.paths
+            ),
+            Err(errors) => errors,
+        };
+        assert!(
+            errors
+                .paths
+                .as_deref()
+                .is_some_and(|msg| msg.contains("at least one")),
+            "expected paths error, got: {:?}",
+            errors.paths
+        );
+        assert!(
+            errors
+                .general
+                .as_deref()
+                .is_some_and(|msg| msg.contains("infer project/agent")),
+            "expected context inference error, got: {:?}",
+            errors.general
+        );
+    }
+
+    #[test]
+    fn validate_create_form_accepts_custom_ttl_reason_and_paths() {
+        let mut form = ReservationCreateFormState::new("proj".to_string(), "BlueLake".to_string());
+        form.paths_input.set_text("src/**\n tests/**\n");
+        form.ttl_idx = RESERVATION_TTL_CUSTOM_INDEX;
+        form.custom_ttl_input.set_value("2h");
+        form.reason_input.set_value("br-3oavg");
+
+        let payload = ReservationsScreen::validate_create_form(&form).expect("valid payload");
+        assert_eq!(payload.project_key, "proj");
+        assert_eq!(payload.agent_name, "BlueLake");
+        assert_eq!(
+            payload.paths,
+            vec!["src/**".to_string(), "tests/**".to_string()]
+        );
+        assert_eq!(payload.ttl_seconds, 7200);
+        assert!(payload.exclusive);
+        assert_eq!(payload.reason.as_deref(), Some("br-3oavg"));
+    }
+
+    #[test]
+    fn submit_create_form_keeps_modal_open_when_validation_fails() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+        screen.create_form = Some(ReservationCreateFormState::new(
+            String::new(),
+            String::new(),
+        ));
+
+        let cmd = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::F(5))), &state);
+        assert!(matches!(cmd, Cmd::None));
+        let form = screen
+            .create_form
+            .as_ref()
+            .expect("validation failure should keep create form open");
+        assert!(form.errors.paths.is_some());
+        assert!(form.errors.general.is_some());
     }
 
     #[test]

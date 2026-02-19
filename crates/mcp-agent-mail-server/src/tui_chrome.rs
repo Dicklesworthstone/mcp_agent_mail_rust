@@ -1181,7 +1181,7 @@ pub fn render_inspector_overlay(
 
     let tree_area = panes[0];
     let tree_block = Block::bordered()
-        .border_type(BorderType::Square)
+        .border_type(BorderType::Rounded)
         .title(" Widget Tree ")
         .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
     let tree_inner = tree_block.inner(tree_area);
@@ -1223,7 +1223,7 @@ pub fn render_inspector_overlay(
     if panes.len() > 1 {
         let props_area = panes[1];
         let props_block = Block::bordered()
-            .border_type(BorderType::Square)
+            .border_type(BorderType::Rounded)
             .title(" Properties ")
             .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
         let props_inner = props_block.inner(props_area);

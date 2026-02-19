@@ -590,8 +590,6 @@ fn derive_tui_degraded_diagnostics(
 #[derive(Debug, Clone)]
 struct SearchResultRow {
     entry: ResultEntry,
-    /// Cached highlight terms for rendering (shared across all rows).
-    highlight_terms: Arc<Vec<QueryTerm>>,
     /// Lowercased positive needles cached once per result refresh.
     highlight_needles: Arc<Vec<String>>,
     /// Sort direction for displaying score or date.
@@ -685,15 +683,15 @@ impl RenderItem for SearchResultRow {
         let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
 
         let highlight_enabled = selected && !self.highlight_needles.is_empty();
-        if !highlight_enabled {
-            spans.push(Span::styled(title, primary_style));
-        } else {
+        if highlight_enabled {
             spans.extend(highlight_spans_with_needles(
                 &title,
                 &self.highlight_needles,
                 Some(primary_style),
                 highlight_style,
             ));
+        } else {
+            spans.push(Span::styled(title, primary_style));
         }
 
         let mut lines = vec![Line::from_spans(spans)];
@@ -1230,15 +1228,13 @@ impl SearchCockpitScreen {
     }
 
     fn rebuild_result_rows(&mut self) {
-        let shared_terms = Arc::new(self.highlight_terms.clone());
-        let shared_needles = Arc::new(build_highlight_needles(shared_terms.as_slice()));
+        let shared_needles = Arc::new(build_highlight_needles(&self.highlight_terms));
         self.result_rows = self
             .results
             .iter()
             .cloned()
             .map(|entry| SearchResultRow {
                 entry,
-                highlight_terms: Arc::clone(&shared_terms),
                 highlight_needles: Arc::clone(&shared_needles),
                 sort_direction: self.sort_direction,
             })
@@ -3063,6 +3059,7 @@ struct SearchableLine {
     text: String,
 }
 
+#[cfg(test)]
 fn markdown_to_searchable_lines(markdown: &str) -> Vec<SearchableLine> {
     markdown_to_searchable_lines_with_caps(
         markdown,
@@ -6088,7 +6085,6 @@ mod tests {
         };
         let row = SearchResultRow {
             entry,
-            highlight_terms: Arc::new(Vec::new()),
             highlight_needles: Arc::new(Vec::new()),
             sort_direction: SortDirection::NewestFirst,
         };
