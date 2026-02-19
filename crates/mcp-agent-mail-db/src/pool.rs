@@ -285,7 +285,7 @@ pub struct DbPool {
 impl DbPool {
     /// Create a new pool (does not open connections until first acquire).
     pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
-        let sqlite_path = config.sqlite_path()?;
+        let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let init_sql = Arc::new(schema::build_conn_pragmas(config.max_connections));
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
 
@@ -820,6 +820,44 @@ fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[must_use]
+fn resolve_sqlite_path_with_absolute_fallback(sqlite_path: &str) -> String {
+    if sqlite_path == ":memory:" {
+        return sqlite_path.to_string();
+    }
+
+    let relative_path = Path::new(sqlite_path);
+    if relative_path.is_absolute() {
+        return sqlite_path.to_string();
+    }
+
+    // Preserve explicitly relative paths exactly as configured.
+    if sqlite_path.starts_with("./") || sqlite_path.starts_with("../") {
+        return sqlite_path.to_string();
+    }
+
+    let absolute_candidate = Path::new("/").join(relative_path);
+    if !absolute_candidate.exists() {
+        return sqlite_path.to_string();
+    }
+
+    let relative_health = sqlite_file_is_healthy(relative_path).ok();
+    let absolute_health = sqlite_file_is_healthy(&absolute_candidate).ok();
+    if matches!(
+        (relative_health, absolute_health),
+        (Some(false), Some(true))
+    ) {
+        tracing::warn!(
+            relative_path = %relative_path.display(),
+            absolute_candidate = %absolute_candidate.display(),
+            "detected malformed relative sqlite path with healthy absolute sibling; using absolute path (did you mean sqlite:////...?)"
+        );
+        return absolute_candidate.to_string_lossy().into_owned();
+    }
+
+    sqlite_path.to_string()
 }
 
 #[allow(clippy::result_large_err)]
@@ -1889,6 +1927,59 @@ mod tests {
         drop(conn);
         let healthy = sqlite_file_is_healthy(&path).expect("should not error");
         assert!(healthy, "valid DB should be healthy");
+    }
+
+    #[test]
+    fn resolve_sqlite_path_prefers_healthy_absolute_when_relative_is_malformed() {
+        let absolute_dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = absolute_dir.path().join("storage.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&absolute_db_str).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let relative_path = PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        if let Some(parent) = relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create relative parent");
+        }
+        std::fs::write(&relative_path, b"not-a-database").expect("write malformed relative db");
+
+        let resolved =
+            resolve_sqlite_path_with_absolute_fallback(relative_path.to_string_lossy().as_ref());
+        assert_eq!(resolved, absolute_db_str);
+
+        let _ = std::fs::remove_file(&relative_path);
+        if let Some(parent) = relative_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn resolve_sqlite_path_keeps_explicit_dot_relative_paths() {
+        let absolute_dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = absolute_dir.path().join("storage.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&absolute_db_str).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let explicit_relative = format!("./{}", absolute_db_str.trim_start_matches('/'));
+        let explicit_relative_path = PathBuf::from(&explicit_relative);
+        if let Some(parent) = explicit_relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create explicit relative parent");
+        }
+        std::fs::write(&explicit_relative_path, b"not-a-database")
+            .expect("write malformed explicit relative db");
+
+        let resolved = resolve_sqlite_path_with_absolute_fallback(&explicit_relative);
+        assert_eq!(resolved, explicit_relative);
+
+        let _ = std::fs::remove_file(&explicit_relative_path);
+        if let Some(parent) = explicit_relative_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     /// Verify `quarantine_sidecar` renames WAL/SHM files with corrupt- prefix.

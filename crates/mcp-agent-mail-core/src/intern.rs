@@ -475,7 +475,8 @@ mod tests {
     #[test]
     fn eq_with_owned_string() {
         let s = intern("eq_owned");
-        assert!(s == "eq_owned".to_string());
+        let owned = "eq_owned".to_string();
+        assert!(s == owned);
     }
 
     #[test]

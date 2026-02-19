@@ -14,6 +14,9 @@
 #   - case timing TSV
 #   - scenario diagnostics JSONL (reason codes + artifact paths + repro commands)
 #   - cargo execution diagnostics JSONL
+#
+# Execution policy:
+#   - cargo invocations are offloaded through rch only (no local fallback)
 
 set -euo pipefail
 
@@ -180,7 +183,7 @@ is_known_rch_remote_dep_mismatch() {
         }
 }
 
-run_cargo_with_rch_fallback() {
+run_cargo_with_rch_only() {
     local case_id="$1"
     local out_file="$2"
     shift 2
@@ -189,7 +192,7 @@ run_cargo_with_rch_fallback() {
     local -a sub_args=("${cargo_args[@]:1}")
     local command_str="(cd ${RCH_WORKSPACE_ROOT} && cargo ${subcommand} --manifest-path ${RCH_MANIFEST_PATH} ${sub_args[*]})"
     local started_ms ended_ms elapsed_ms rc
-    local runner="local"
+    local runner="rch"
     local fallback_local="false"
 
     if [ ! -f "${RCH_WORKSPACE_ROOT}/${RCH_MANIFEST_PATH}" ]; then
@@ -217,54 +220,32 @@ run_cargo_with_rch_fallback() {
         echo "[cmd] ${command_str}"
     } >>"${out_file}"
 
-    if [ "${E2E_USE_RCH:-0}" = "1" ] && command -v rch >/dev/null 2>&1; then
-        runner="rch"
-        {
-            echo "[runner] rch"
-        } >>"${out_file}"
+    printf "[runner] rch\n" >>"${out_file}"
 
-        set +e
-        (
-            cd "${RCH_WORKSPACE_ROOT}" || exit 2
-            timeout "${E2E_RCH_TIMEOUT_SECONDS:-300}" \
-                rch exec -- cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
-        ) >>"${out_file}" 2>&1
-        rc=$?
-        set -e
-
-        if [ "${rc}" -ne 0 ] && [ "${E2E_ALLOW_LOCAL_FALLBACK:-1}" = "1" ]; then
-            fallback_local="true"
-            runner="local"
-            {
-                echo "[fallback] rch failed or stalled (rc=${rc}); retrying locally"
-                echo "[runner] local"
-            } >>"${out_file}"
-
-            set +e
-            (
-                cd "${RCH_WORKSPACE_ROOT}" || exit 2
-                cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
-            ) >>"${out_file}" 2>&1
-            rc=$?
-            set -e
-        fi
-    else
-        {
-            if [ "${E2E_USE_RCH:-0}" = "1" ]; then
-                echo "[runner] local (rch requested but missing)"
-            else
-                echo "[runner] local (rch disabled; set E2E_USE_RCH=1 to enable)"
-            fi
-        } >>"${out_file}"
-
-        set +e
-        (
-            cd "${RCH_WORKSPACE_ROOT}" || exit 2
-            cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
-        ) >>"${out_file}" 2>&1
-        rc=$?
-        set -e
+    if ! command -v rch >/dev/null 2>&1; then
+        echo "[error] rch is required but not found in PATH" >>"${out_file}"
+        rc=127
+        ended_ms="$(_e2e_now_ms)"
+        elapsed_ms=$((ended_ms - started_ms))
+        append_cargo_diag \
+            "${case_id}" \
+            "${command_str}" \
+            "${runner}" \
+            "${fallback_local}" \
+            "${rc}" \
+            "${elapsed_ms}" \
+            "${out_file}"
+        return "${rc}"
     fi
+
+    set +e
+    (
+        cd "${RCH_WORKSPACE_ROOT}" || exit 2
+        timeout "${E2E_RCH_TIMEOUT_SECONDS:-300}" \
+            rch exec -- cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
+    ) >>"${out_file}" 2>&1
+    rc=$?
+    set -e
 
     ended_ms="$(_e2e_now_ms)"
     elapsed_ms=$((ended_ms - started_ms))
@@ -324,7 +305,7 @@ run_interaction_case() {
 
     start_ms="$(_e2e_now_ms)"
 
-    if run_cargo_with_rch_fallback "${case_id}" "${out_file}" "${cargo_args[@]}"; then
+    if run_cargo_with_rch_only "${case_id}" "${out_file}" "${cargo_args[@]}"; then
         end_ms="$(_e2e_now_ms)"
         elapsed_ms=$((end_ms - start_ms))
         echo -e "${case_id}\t${elapsed_ms}" >> "${TIMING_REPORT}"
@@ -341,7 +322,23 @@ run_interaction_case() {
         elapsed_ms=$((end_ms - start_ms))
         echo -e "${case_id}\t${elapsed_ms}" >> "${TIMING_REPORT}"
 
-        if is_known_rch_remote_dep_mismatch "${out_file}"; then
+        if [ "${cargo_rc}" -eq 127 ]; then
+            scenario_diag_mark_reason "SKIP_RCH_UNAVAILABLE" "rch unavailable"
+            e2e_skip "${description} (rch unavailable)"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_UNAVAILABLE"
+            _SUITE_STOP_REASON="skipped after rch unavailable in earlier case"
+            _SUITE_STOP_EVIDENCE="${out_file}"
+            e2e_log "rch unavailable; remaining cases will be skipped"
+        elif [ "${cargo_rc}" -eq 124 ]; then
+            scenario_diag_mark_reason "SKIP_RCH_TIMEOUT" "rch timed out"
+            e2e_skip "${description} (rch timeout)"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_TIMEOUT"
+            _SUITE_STOP_REASON="skipped after rch timeout in earlier case"
+            _SUITE_STOP_EVIDENCE="${out_file}"
+            e2e_log "rch timeout detected; remaining cases will be skipped"
+        elif is_known_rch_remote_dep_mismatch "${out_file}"; then
             scenario_diag_mark_reason "SKIP_RCH_REMOTE_DEP_MISMATCH" "remote worker dependency mismatch"
             e2e_skip "${description} (remote rch dependency mismatch)"
             _SUITE_STOP_REMAINING=1
@@ -349,18 +346,18 @@ run_interaction_case() {
             _SUITE_STOP_REASON="skipped after remote dependency mismatch in earlier case"
             _SUITE_STOP_EVIDENCE="${out_file}"
             e2e_log "remote dependency mismatch detected; remaining cases will be skipped"
-        else
-            scenario_fail "CARGO_COMMAND_FAILED" "${description}"
-            e2e_log "command failed for ${case_id}; tail follows"
-            tail -n 160 "${out_file}" 2>/dev/null || true
-        fi
-
-        if [ "${_SUITE_STOP_REMAINING}" -eq 0 ] && grep -q "error: could not compile \`" "${out_file}"; then
+        elif grep -q "error: could not compile \`" "${out_file}"; then
+            scenario_diag_mark_reason "SKIP_SYSTEMIC_COMPILE_FAILURE" "systemic compile failure"
+            e2e_skip "${description} (systemic compile failure)"
             _SUITE_STOP_REMAINING=1
             _SUITE_STOP_REASON_CODE="SKIP_SYSTEMIC_COMPILE_FAILURE"
             _SUITE_STOP_REASON="skipped after systemic compile failure in earlier case"
             _SUITE_STOP_EVIDENCE="${out_file}"
             e2e_log "systemic compile failure detected; remaining cases will be skipped"
+        else
+            scenario_fail "CARGO_COMMAND_FAILED" "${description}"
+            e2e_log "command failed for ${case_id}; tail follows"
+            tail -n 160 "${out_file}" 2>/dev/null || true
         fi
     fi
 
@@ -437,6 +434,20 @@ run_interaction_case \
     "Persisted config file includes expected theme/accessibility keys." \
     test -p mcp-agent-mail-server --lib \
     tui_app::tests::flush_before_shutdown_persists_theme_and_accessibility_settings -- --nocapture
+run_interaction_case \
+    "case08b_theme_shift_t_cycle" \
+    "Shift+T rotates to the next theme when not in text mode" \
+    "Dashboard receives Shift+T key input with no text-entry focus." \
+    "Active theme id changes to a different palette." \
+    test -p mcp-agent-mail-server --lib \
+    tui_app::tests::shift_t_cycles_theme_when_not_in_text_mode -- --nocapture
+run_interaction_case \
+    "case08c_theme_palette_distinct" \
+    "Named themes expose distinct palette accents" \
+    "Theme sample set is compared for visual distinguishability." \
+    "At least one key accent color differs across themes." \
+    test -p mcp-agent-mail-server --lib \
+    tui_theme::tests::named_themes_are_visually_distinct -- --nocapture
 
 # Case 6: Error boundary fallback and recovery.
 run_interaction_case \

@@ -1149,30 +1149,38 @@ mod tests {
     #[test]
     fn playback_state_is_active() {
         assert!(!PlaybackState::Idle.is_active());
-        assert!(PlaybackState::Playing {
-            name: "t".into(),
-            step: 0,
-            total: 1,
-            mode: PlaybackMode::Continuous,
-        }
-        .is_active());
-        assert!(PlaybackState::Paused {
-            name: "t".into(),
-            step: 0,
-            total: 1,
-        }
-        .is_active());
-        assert!(!PlaybackState::Completed {
-            name: "t".into(),
-            steps_executed: 1,
-        }
-        .is_active());
-        assert!(!PlaybackState::Failed {
-            name: "t".into(),
-            step: 0,
-            reason: "x".into(),
-        }
-        .is_active());
+        assert!(
+            PlaybackState::Playing {
+                name: "t".into(),
+                step: 0,
+                total: 1,
+                mode: PlaybackMode::Continuous,
+            }
+            .is_active()
+        );
+        assert!(
+            PlaybackState::Paused {
+                name: "t".into(),
+                step: 0,
+                total: 1,
+            }
+            .is_active()
+        );
+        assert!(
+            !PlaybackState::Completed {
+                name: "t".into(),
+                steps_executed: 1,
+            }
+            .is_active()
+        );
+        assert!(
+            !PlaybackState::Failed {
+                name: "t".into(),
+                step: 0,
+                reason: "x".into(),
+            }
+            .is_active()
+        );
     }
 
     #[test]
@@ -1211,10 +1219,7 @@ mod tests {
         engine.mark_last_playback_error("something went wrong");
 
         let log = engine.playback_log();
-        assert_eq!(
-            log[0].error.as_deref(),
-            Some("something went wrong")
-        );
+        assert_eq!(log[0].error.as_deref(), Some("something went wrong"));
     }
 
     #[test]

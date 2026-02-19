@@ -786,7 +786,13 @@ mod tests {
         ensure_metrics_schema(&conn);
 
         // Record multiple known tools (record_call rejects unknown names)
-        for tool in ["send_message", "fetch_inbox", "health_check", "whois", "search_messages"] {
+        for tool in [
+            "send_message",
+            "fetch_inbox",
+            "health_check",
+            "whois",
+            "search_messages",
+        ] {
             record_call(tool);
             record_latency(tool, 50_000);
         }

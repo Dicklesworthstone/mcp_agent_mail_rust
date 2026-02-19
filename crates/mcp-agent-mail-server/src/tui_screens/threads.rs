@@ -15,7 +15,7 @@ use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
-use ftui::widgets::borders::{BorderType, Borders};
+use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{
     Buffer, Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind,
@@ -1009,8 +1009,7 @@ impl ThreadExplorerScreen {
             "Mermaid Thread Flow [g]"
         };
         let title = fit_panel_title(raw_title, area.width);
-        let block = Block::default()
-            .borders(Borders::ALL)
+        let block = Block::bordered()
             .title(title.as_str())
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -2087,8 +2086,7 @@ fn render_thread_list(
     } else {
         crate::tui_theme::focus_border_color(&tp, focused)
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
@@ -2451,8 +2449,7 @@ fn render_thread_detail(
     let title = fit_panel_title(&title, area.width);
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));

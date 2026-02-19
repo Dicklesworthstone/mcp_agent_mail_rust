@@ -736,7 +736,7 @@ mod tests {
         assert!(recent[0].actual.is_none());
     }
 
-    /// `EvidenceLedgerEntry` PartialEq works.
+    /// `EvidenceLedgerEntry` `PartialEq` works.
     #[test]
     fn entry_partial_eq() {
         let e1 = EvidenceLedgerEntry::new("d", "dp", "a", 0.5, serde_json::json!(null));

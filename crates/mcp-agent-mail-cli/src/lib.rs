@@ -3024,7 +3024,7 @@ fn handle_list_projects_with_database_url(
 /// Open a synchronous SQLite connection for CLI commands.
 fn open_db_sync_with_database_url(
     database_url: &str,
-) -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
+) -> CliResult<mcp_agent_mail_db::DbConn> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -3032,16 +3032,16 @@ fn open_db_sync_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path)
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path)
         .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
     // Run schema init so tables exist even if first use
-    let init_sql = mcp_agent_mail_db::schema::init_schema_sql();
+    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
     conn.execute_raw(&init_sql)
         .map_err(|e| CliError::Other(format!("schema init failed: {e}")))?;
     Ok(conn)
 }
 
-pub(crate) fn open_db_sync() -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
+pub(crate) fn open_db_sync() -> CliResult<mcp_agent_mail_db::DbConn> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     open_db_sync_with_database_url(&cfg.database_url)
 }
@@ -4079,7 +4079,7 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
 }
 
 fn handle_file_reservations_with_conn(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     action: FileReservationsCommand,
 ) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -4640,7 +4640,7 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
 }
 
 fn handle_acks_with_conn(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     action: AcksCommand,
 ) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -4802,7 +4802,7 @@ fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
 }
 
 fn handle_contacts_with_conn(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     action: ContactsCommand,
 ) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -5469,7 +5469,7 @@ fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResul
 }
 
 fn handle_list_acks_with_conn(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     project_key: &str,
     agent_name: &str,
     limit: i64,
@@ -5527,7 +5527,7 @@ fn handle_list_acks_with_conn(
 fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
     use asupersync::runtime::RuntimeBuilder;
     use mcp_agent_mail_db::schema;
-    use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+    use mcp_agent_mail_db::DbConn;
 
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
@@ -5537,7 +5537,7 @@ fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
 
-    let conn = SqliteConnection::open_file(&path)
+    let conn = DbConn::open_file(&path)
         .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
     conn.execute_raw(schema::PRAGMA_SETTINGS_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply PRAGMAs: {e}")))?;
@@ -6482,7 +6482,7 @@ fn git_common_dir(path: &Path) -> Option<PathBuf> {
 }
 
 fn find_project_for_adopt(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     slug_or_key: &str,
 ) -> CliResult<ProjectsAdoptRecord> {
     let rows = conn
@@ -6723,7 +6723,7 @@ fn handle_project_discovery_init(project_path: &Path, product: Option<String>) -
 
 #[allow(clippy::too_many_lines)]
 fn handle_projects_adopt_with_conn(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     config: &Config,
     source: &str,
     target: &str,
@@ -7053,7 +7053,7 @@ fn handle_doctor_check_with(
                         "detail": "Database file is 0 bytes (empty/corrupt)",
                     }));
                 } else if let Ok(conn) =
-                    mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&db_path)
+                    mcp_agent_mail_db::DbConn::open_file(&db_path)
                 {
                     let qc_ok = conn
                         .query_sync("PRAGMA quick_check", &[])
@@ -7287,7 +7287,7 @@ fn handle_mail(action: MailCommand) -> CliResult<()> {
 }
 
 fn handle_mail_status_sync(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     action: MailCommand,
 ) -> CliResult<()> {
     let MailCommand::Status { project_path } = action else {
@@ -11004,7 +11004,7 @@ mod tests {
 
         handle_migrate_with_database_url(&url).unwrap();
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+        let conn = mcp_agent_mail_db::DbConn::open_file(
             db_path.display().to_string(),
         )
         .expect("reopen");
@@ -11058,7 +11058,7 @@ mod tests {
 
         handle_migrate_with_database_url(&url).unwrap();
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+        let conn = mcp_agent_mail_db::DbConn::open_file(
             db_path.display().to_string(),
         )
         .expect("reopen");
@@ -11192,7 +11192,7 @@ mod tests {
     }
 
     fn seed_mailbox_db(db_path: &Path) {
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+        let conn = mcp_agent_mail_db::DbConn::open_file(
             db_path.display().to_string(),
         )
         .expect("open test sqlite db");
@@ -11479,7 +11479,7 @@ mod tests {
         );
 
         // Restored DB should contain only the scoped project.
-        let restored_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+        let restored_conn = mcp_agent_mail_db::DbConn::open_file(
             restore_db.display().to_string(),
         )
         .unwrap();
@@ -11675,7 +11675,7 @@ mod tests {
         let proj_beta_key = proj_beta_dir.canonicalize().unwrap().display().to_string();
 
         let db_path = root.path().join("mailbox.sqlite3");
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+        let conn = mcp_agent_mail_db::DbConn::open_file(
             db_path.display().to_string(),
         )
         .expect("open products test sqlite db");
@@ -11933,11 +11933,10 @@ mod tests {
         assert_eq!(ensure_json["name"].as_str(), Some("My Product"));
 
         // Normalize created_at for stable snapshots.
-        // Drop pool (closes FrankenConnection) before opening SqliteConnection:
-        // FrankenConnection and SqliteConnection must not be open simultaneously.
+        // Drop pool before opening a standalone connection on the same file.
         drop(pool);
         {
-            let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            let conn = mcp_agent_mail_db::DbConn::open_file(
                 db_path.display().to_string(),
             )
             .unwrap();
@@ -14478,9 +14477,8 @@ mod tests {
         // Parse JSON output - should be empty array.
         // Extract from first JSON-like character to tolerate leaked ftui_println.
         let trimmed = output.trim();
-        let json_start = trimmed.find(|c: char| c == '[' || c == '{').unwrap_or(0);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&trimmed[json_start..]).unwrap();
+        let json_start = trimmed.find(['[', '{']).unwrap_or(0);
+        let parsed: serde_json::Value = serde_json::from_str(&trimmed[json_start..]).unwrap();
         assert!(parsed.is_array(), "expected JSON array, got: {parsed}");
         assert_eq!(parsed.as_array().unwrap().len(), 0);
     }
@@ -14833,8 +14831,7 @@ mod tests {
         // Extract JSON array from potentially polluted capture output.
         let trimmed = output.trim();
         if let Some(start) = trimmed.find('[') {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&trimmed[start..]).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&trimmed[start..]).unwrap();
             assert!(parsed.is_array());
         }
     }
@@ -14850,9 +14847,11 @@ mod tests {
         assert!(result.is_ok(), "config show-port failed: {result:?}");
         // Should output a port number. Find last line that looks like a port number
         // to tolerate leaked ftui_println from concurrent tests.
-        let has_port = output.trim().lines().any(|l| {
-            l.trim().parse::<u16>().is_ok()
-        }) || output.contains("8765");
+        let has_port = output
+            .trim()
+            .lines()
+            .any(|l| l.trim().parse::<u16>().is_ok())
+            || output.contains("8765");
         assert!(has_port, "expected port number, got: {output}");
     }
 

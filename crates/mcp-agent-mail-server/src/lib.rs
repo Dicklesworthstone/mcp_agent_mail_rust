@@ -826,6 +826,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ));
 
     let runtime = RuntimeBuilder::new()
+        .worker_threads(std::thread::available_parallelism().map_or(4, |n| n.get().min(32)))
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 
@@ -990,6 +991,7 @@ fn run_http_server_thread(
     ));
 
     let runtime = RuntimeBuilder::new()
+        .worker_threads(std::thread::available_parallelism().map_or(4, |n| n.get().min(32)))
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 

@@ -1332,9 +1332,11 @@ impl MailAppModel {
     /// Show a one-shot coach hint toast for the given screen if eligible.
     fn show_coach_hint_if_eligible(&mut self, screen: MailScreenId) {
         if let Some(msg) = self.coach_hints.on_screen_visit(screen) {
+            let tp = crate::tui_theme::TuiThemePalette::current();
             self.notifications.notify(
                 Toast::new(msg)
                     .icon(ToastIcon::Info)
+                    .style(Style::default().fg(tp.panel_border))
                     .duration(Duration::from_secs(8)),
             );
             self.coach_hints.flush_if_dirty();
@@ -2068,6 +2070,8 @@ impl MailAppModel {
             "gruvbox" | "high_contrast" | "high-contrast" | "contrast" | "hc" => {
                 ThemeId::HighContrast
             }
+            "doom" => ThemeId::Doom,
+            "quake" => ThemeId::Quake,
             _ => ThemeId::CyberpunkAurora,
         }
     }
@@ -2079,6 +2083,8 @@ impl MailAppModel {
             ThemeId::LumenLight => "solarized",
             ThemeId::NordicFrost => "nord",
             ThemeId::HighContrast => "gruvbox",
+            ThemeId::Doom => "default",
+            ThemeId::Quake => "default",
         }
     }
 
@@ -3801,7 +3807,10 @@ impl Model for MailAppModel {
         // frame.  By only re-rendering every 6th frame the ambient animation
         // runs at ~5 fps which is imperceptibly smooth for a subtle background
         // wash while keeping terminal output minimal on intervening frames.
-        if self.tick_count.is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES) {
+        if self
+            .tick_count
+            .is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES)
+        {
             let ambient_telemetry = self.ambient_renderer.borrow_mut().render(
                 area,
                 frame,

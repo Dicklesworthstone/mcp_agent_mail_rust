@@ -1492,13 +1492,19 @@ mod tests {
     fn table_id_as_str_all_variants() {
         assert_eq!(TableId::Projects.as_str(), "projects");
         assert_eq!(TableId::Products.as_str(), "products");
-        assert_eq!(TableId::ProductProjectLinks.as_str(), "product_project_links");
+        assert_eq!(
+            TableId::ProductProjectLinks.as_str(),
+            "product_project_links"
+        );
         assert_eq!(TableId::Agents.as_str(), "agents");
         assert_eq!(TableId::Messages.as_str(), "messages");
         assert_eq!(TableId::MessageRecipients.as_str(), "message_recipients");
         assert_eq!(TableId::FileReservations.as_str(), "file_reservations");
         assert_eq!(TableId::AgentLinks.as_str(), "agent_links");
-        assert_eq!(TableId::ProjectSiblingSuggestions.as_str(), "project_sibling_suggestions");
+        assert_eq!(
+            TableId::ProjectSiblingSuggestions.as_str(),
+            "project_sibling_suggestions"
+        );
         assert_eq!(TableId::FtsMessages.as_str(), "fts_messages");
         assert_eq!(TableId::Unknown.as_str(), "unknown");
     }

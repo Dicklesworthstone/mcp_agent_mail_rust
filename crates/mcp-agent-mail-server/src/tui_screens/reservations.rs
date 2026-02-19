@@ -2452,8 +2452,10 @@ mod tests {
             text.contains("DB reports 1 active reservations"),
             "missing mismatch warning text: {text}"
         );
+        // The full fallback message wraps across lines in the bordered block,
+        // so check for a substring that fits on a single rendered row.
         assert!(
-            text.contains("DB snapshots are"),
+            text.contains("DB snapshots"),
             "missing fallback context text: {text}"
         );
     }

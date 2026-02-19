@@ -12,7 +12,7 @@ use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
-use ftui::widgets::borders::{BorderType, Borders};
+use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_extras::canvas::{Canvas, Mode, Painter};
@@ -2106,8 +2106,7 @@ fn render_summary_band(
                     MetricTrend::Flat => color,
                 };
                 tile = tile.block(
-                    Block::default()
-                        .borders(Borders::ALL)
+                    Block::bordered()
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(crate::tui_theme::lerp_color(
                             tp.panel_border,
@@ -2155,8 +2154,7 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
             .rationale(&anomaly.rationale)
             .selected(i == 0)
             .block(
-                Block::default()
-                    .borders(Borders::ALL)
+                Block::bordered()
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(crate::tui_theme::lerp_color(
                         tp.panel_border,
@@ -2175,8 +2173,7 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
 
 fn accent_panel_block(title: &str, accent: PackedRgba) -> Block<'_> {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    Block::default()
-        .borders(Borders::ALL)
+    Block::bordered()
         .title(title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::lerp_color(
@@ -2189,6 +2186,15 @@ fn accent_panel_block(title: &str, accent: PackedRgba) -> Block<'_> {
                 .fg(tp.text_primary)
                 .bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.07)),
         )
+}
+
+fn neutral_panel_block(title: &str) -> Block<'_> {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    Block::bordered()
+        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2212,8 +2218,9 @@ fn render_primary_cluster(
         return;
     }
 
-    let query_visible =
-        query_active || !query_text.trim().is_empty() || (area.width >= 120 && area.height >= 14);
+    // Keep the dashboard clean by only showing the live filter bar when the
+    // operator is actively filtering.
+    let query_visible = query_active || !query_text.trim().is_empty();
     let mut query_h = if query_visible {
         if area.height >= 15 { 3 } else { 2 }
     } else {
@@ -2321,8 +2328,7 @@ fn render_dashboard_query_bar(
     } else {
         Style::default().fg(tp.panel_border)
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(title)
         .border_type(BorderType::Rounded)
         .border_style(border);
@@ -2937,8 +2943,7 @@ fn render_agents_snapshot_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Agents · {}", rows.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3050,8 +3055,7 @@ fn render_contacts_snapshot_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Contacts · {} (p:{pending})", rows.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3164,8 +3168,7 @@ fn render_projects_snapshot_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Projects · {}", rows.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3277,8 +3280,7 @@ fn render_project_load_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Project Load · {}", rows.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3393,8 +3395,7 @@ fn render_reservation_watch_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Reservations · {} (≤5m:{soon_count})", rows.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3531,8 +3532,7 @@ fn render_reservation_ttl_buckets_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Reservation TTL · {}", filtered.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -3683,7 +3683,11 @@ fn render_signal_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Signals · anomalies:{}", anomalies.len());
-    let block = accent_panel_block(&title, tp.status_accent);
+    let block = if anomalies.is_empty() {
+        neutral_panel_block(&title)
+    } else {
+        accent_panel_block(&title, tp.status_accent)
+    };
     let inner = block.inner(area);
     block.render(area, frame);
     if inner.width == 0 || inner.height == 0 {
@@ -4013,8 +4017,7 @@ fn render_event_mix_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Event Mix · {}", filtered.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -4184,8 +4187,7 @@ fn render_recent_activity_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Recent Activity · {}", filtered.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -4307,8 +4309,7 @@ fn render_message_flow_panel(
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Message Flow · {}", filtered.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -4439,8 +4440,7 @@ fn render_runtime_digest_panel(
     let total = u64::try_from(filtered.len()).unwrap_or(0).max(1);
     let tp = crate::tui_theme::TuiThemePalette::current();
     let title = format!("Runtime Digest · {}", filtered.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -4588,8 +4588,7 @@ fn render_query_matches_panel(
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title("Live Search")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));
@@ -5177,8 +5176,7 @@ fn render_event_log(
     );
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border));

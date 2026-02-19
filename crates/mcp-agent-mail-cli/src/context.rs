@@ -22,7 +22,7 @@ use crate::{CliError, CliResult};
 
 /// Shared context for sync CLI handlers (read-only queries).
 pub struct CliContext {
-    pub conn: mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    pub conn: mcp_agent_mail_db::DbConn,
     pub config: Config,
 }
 
@@ -106,7 +106,7 @@ pub struct ResolvedProject {
 ///
 /// Tries slug match first, then `human_key` match.
 pub fn resolve_project(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     key: &str,
 ) -> CliResult<ResolvedProject> {
     // Try slug first
@@ -158,7 +158,7 @@ pub struct ResolvedAgent {
 
 /// Look up an agent by name within a project.
 pub fn resolve_agent(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     project_id: i64,
     agent_name: &str,
 ) -> CliResult<ResolvedAgent> {
@@ -256,13 +256,13 @@ pub fn resolve_bool(primary: bool, negated: bool, default: bool) -> bool {
 
 fn open_conn(
     cfg: &DbPoolConfig,
-) -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
+) -> CliResult<mcp_agent_mail_db::DbConn> {
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path)
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path)
         .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
-    let init_sql = mcp_agent_mail_db::schema::init_schema_sql();
+    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
     conn.execute_raw(&init_sql)
         .map_err(|e| CliError::Other(format!("schema init failed: {e}")))?;
     Ok(conn)

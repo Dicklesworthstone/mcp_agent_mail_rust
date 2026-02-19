@@ -591,7 +591,7 @@ mod tests {
         std::fs::create_dir_all(&storage_root).unwrap();
 
         let config = Config {
-            storage_root: storage_root.clone(),
+            storage_root,
             database_url: "sqlite:///:memory:".to_string(),
             disk_space_warning_mb: 0,
             disk_space_critical_mb: 0,
@@ -633,6 +633,8 @@ mod tests {
         assert_eq!(cloned.pressure, DiskPressure::Warning);
         assert_eq!(cloned.effective_free_bytes, Some(1000));
         assert_eq!(cloned.errors.len(), 1);
+        // Use `sample` after clone to prove it produced an independent copy.
+        assert_eq!(sample.errors.len(), 1);
     }
 
     #[test]

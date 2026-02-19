@@ -707,7 +707,7 @@ mod tests {
         cache.insert("b", 2);
         assert_eq!(cache.get(&"b"), Some(&2));
         // "a" may be in main (promoted) or evicted, depending on budget loop
-        assert!(cache.len() >= 1);
+        assert!(!cache.is_empty());
     }
 
     #[test]
@@ -827,7 +827,10 @@ mod tests {
         let keys: Vec<&i32> = cache.keys().collect();
         // All promoted items should appear in keys
         for i in 0..3 {
-            assert!(keys.contains(&&i), "key {i} should be in keys after promotion");
+            assert!(
+                keys.contains(&&i),
+                "key {i} should be in keys after promotion"
+            );
         }
     }
 

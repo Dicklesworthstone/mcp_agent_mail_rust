@@ -921,7 +921,10 @@ mod tests {
             .iter()
             .find(|e| e.name == "mark_message_read")
             .unwrap();
-        assert!(entry.latency.is_some(), "latency should be recorded by name");
+        assert!(
+            entry.latency.is_some(),
+            "latency should be recorded by name"
+        );
     }
 
     #[test]

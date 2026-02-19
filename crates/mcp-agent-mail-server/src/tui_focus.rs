@@ -1712,8 +1712,7 @@ mod tests {
         for &screen in ALL_SCREEN_IDS {
             let ring = focus_ring_for_screen(screen);
             let graph = FocusGraph::for_screen(screen, Rect::new(0, 0, 120, 40));
-            let graph_targets: Vec<FocusTarget> =
-                graph.nodes().iter().map(|n| n.target).collect();
+            let graph_targets: Vec<FocusTarget> = graph.nodes().iter().map(|n| n.target).collect();
             assert_eq!(
                 ring, graph_targets,
                 "screen {screen:?}: focus_ring_for_screen should match graph targets"

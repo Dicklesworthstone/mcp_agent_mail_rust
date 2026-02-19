@@ -1160,7 +1160,7 @@ mod tests {
             "INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
              VALUES
-                (1, 111, 222, 'src/**', 1, 1_000_000, 2_000_000, NULL)",
+                (1, 111, 222, 'src/**', 1, 1000000, 2000000, NULL)",
             &[],
         )
         .expect("insert orphan reservation");

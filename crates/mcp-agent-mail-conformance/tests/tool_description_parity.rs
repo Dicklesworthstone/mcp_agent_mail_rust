@@ -576,16 +576,17 @@ fn check_cluster_descriptions(tool_names: &[&str]) {
             || (rust_desc.len() > py_tool.description.len()
                 && rust_desc
                     .starts_with(&py_tool.description[..py_tool.description.len().min(200)]));
-        if rust_desc != py_tool.description && !is_extended {
-            if let Some((_pos, detail)) = diff_position(&py_tool.description, rust_desc) {
-                failures.push(format!(
-                    "[{name}] {detail}\n  Python ({} chars): {}\n  Rust   ({} chars): {}",
-                    py_tool.description.len(),
-                    &py_tool.description[..py_tool.description.len().min(150)],
-                    rust_desc.len(),
-                    &rust_desc[..rust_desc.len().min(150)]
-                ));
-            }
+        if rust_desc != py_tool.description
+            && !is_extended
+            && let Some((_pos, detail)) = diff_position(&py_tool.description, rust_desc)
+        {
+            failures.push(format!(
+                "[{name}] {detail}\n  Python ({} chars): {}\n  Rust   ({} chars): {}",
+                py_tool.description.len(),
+                &py_tool.description[..py_tool.description.len().min(150)],
+                rust_desc.len(),
+                &rust_desc[..rust_desc.len().min(150)]
+            ));
         }
     }
 

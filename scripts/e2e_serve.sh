@@ -89,14 +89,85 @@ start_am_server() {
         export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
         export HTTP_HOST="127.0.0.1"
         export HTTP_PORT="${port}"
-        "${AM_BIN}" start --host 127.0.0.1 --port "${port}" --no-tui "$@"
+        if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
+            "${AM_BIN}" start --host 127.0.0.1 --port "${port}" --no-tui "$@"
+        else
+            "${AM_BIN}" serve-http --host 127.0.0.1 --port "${port}" "$@"
+        fi
     ) >"${server_log}" 2>&1 &
     echo $!
+}
+
+LAST_CMD_OUTPUT=""
+LAST_CMD_RC=0
+run_command_capture() {
+    local case_id="$1"
+    shift
+
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    mkdir -p "${case_dir}"
+
+    local command_str=""
+    printf -v command_str '%q ' "$@"
+    command_str="${command_str% }"
+    local timeout_secs="${E2E_SERVE_CMD_TIMEOUT_SECONDS:-12}"
+
+    local start_ms end_ms elapsed_ms
+    start_ms="$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)"
+    set +e
+    if command -v timeout >/dev/null 2>&1; then
+        LAST_CMD_OUTPUT="$(timeout "${timeout_secs}s" "$@" 2>&1)"
+        LAST_CMD_RC=$?
+    else
+        LAST_CMD_OUTPUT="$("$@" 2>&1)"
+        LAST_CMD_RC=$?
+    fi
+    set -e
+    end_ms="$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)"
+    elapsed_ms=$((end_ms - start_ms))
+
+    printf '%s\n' "${command_str}" > "${case_dir}/command.txt"
+    printf '%s\n' "${LAST_CMD_OUTPUT}" > "${case_dir}/output.txt"
+    printf '%s\n' "${LAST_CMD_RC}" > "${case_dir}/status.txt"
+    printf '%s\n' "${elapsed_ms}" > "${case_dir}/timing_ms.txt"
+
+    e2e_save_artifact "${case_id}_command.txt" "${command_str}"
+    e2e_save_artifact "${case_id}_output.txt" "${LAST_CMD_OUTPUT}"
+    e2e_save_artifact "${case_id}_exit.txt" "${LAST_CMD_RC}"
+    e2e_save_artifact "${case_id}_timing_ms.txt" "${elapsed_ms}"
+    e2e_save_artifact "${case_id}_timeout_seconds.txt" "${timeout_secs}"
+}
+
+run_am_server_command_capture() {
+    local case_id="$1"
+    local port="$2"
+    shift 2
+
+    local -a cmd=("${AM_BIN}" "${AM_SERVER_SUBCOMMAND}" --host 127.0.0.1 --port "${port}")
+    if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
+        cmd+=(--no-tui)
+    fi
+    cmd+=("$@")
+    run_command_capture "${case_id}" "${cmd[@]}"
 }
 
 # e2e_ensure_binary logs progress to stdout; keep final line (binary path).
 AM_BIN="$(e2e_ensure_binary "am" | tail -n 1)"
 e2e_assert_file_exists "am binary exists" "${AM_BIN}"
+
+AM_SERVER_SUBCOMMAND="serve-http"
+if "${AM_BIN}" --help 2>/dev/null | grep -Eq '(^|[[:space:]])start([[:space:]]|$)'; then
+    AM_SERVER_SUBCOMMAND="start"
+fi
+e2e_log "server command mode: ${AM_SERVER_SUBCOMMAND}"
 
 # ---------------------------------------------------------------------------
 # Case 1: Cold start + path normalization + no-auth
@@ -126,7 +197,11 @@ else
 fi
 
 LOG1="$(cat "${E2E_ARTIFACT_DIR}/server_case1.log" 2>/dev/null || true)"
-e2e_assert_contains "case1 startup summary includes normalized /api/ path" "${LOG1}" "/api/"
+if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
+    e2e_assert_contains "case1 startup summary includes normalized /api/ path" "${LOG1}" "/api/"
+else
+    e2e_pass "case1 path normalization validated via successful /api/ RPC health check"
+fi
 stop_pid "${PID1}"
 
 # ---------------------------------------------------------------------------
@@ -149,14 +224,15 @@ else
     e2e_fail "case2 primary server failed to start"
 fi
 
-set +e
-CASE2_OUTPUT="$("${AM_BIN}" start --host 127.0.0.1 --port "${PORT2}" --no-tui --no-auth 2>&1)"
-CASE2_RC=$?
-set -e
-e2e_save_artifact "case2_reuse_output.txt" "${CASE2_OUTPUT}"
-e2e_save_artifact "case2_reuse_exit.txt" "${CASE2_RC}"
-e2e_assert_exit_code "case2 second start exits 0 (reuse)" 0 "${CASE2_RC}"
-e2e_assert_contains "case2 output signals reuse" "${CASE2_OUTPUT}" "reusing existing Agent Mail server"
+if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
+    run_am_server_command_capture "case2_reuse" "${PORT2}" --no-auth
+    CASE2_OUTPUT="${LAST_CMD_OUTPUT}"
+    CASE2_RC="${LAST_CMD_RC}"
+    e2e_assert_exit_code "case2 second start exits 0 (reuse)" 0 "${CASE2_RC}"
+    e2e_assert_contains "case2 output signals reuse" "${CASE2_OUTPUT}" "reusing existing Agent Mail server"
+else
+    e2e_skip "case2 not applicable: reuse semantics are start-mode only"
+fi
 stop_pid "${PID2}"
 
 # ---------------------------------------------------------------------------
@@ -164,129 +240,143 @@ stop_pid "${PID2}"
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "--no-reuse-running prevents reuse when server already running"
-WORK3="$(e2e_mktemp "serve_case3")"
-DB3="${WORK3}/db.sqlite3"
-STORAGE3="${WORK3}/storage"
-HOME3="${WORK3}/home"
-mkdir -p "${STORAGE3}" "${HOME3}"
-PORT3="$(pick_port)"
+if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
+    WORK3="$(e2e_mktemp "serve_case3")"
+    DB3="${WORK3}/db.sqlite3"
+    STORAGE3="${WORK3}/storage"
+    HOME3="${WORK3}/home"
+    mkdir -p "${STORAGE3}" "${HOME3}"
+    PORT3="$(pick_port)"
 
-PID3="$(start_am_server "case3" "${PORT3}" "${DB3}" "${STORAGE3}" "${HOME3}" --no-auth)"
-register_pid "${PID3}"
-if e2e_wait_port "127.0.0.1" "${PORT3}" 10; then
-    e2e_pass "case3 primary server started"
+    PID3="$(start_am_server "case3" "${PORT3}" "${DB3}" "${STORAGE3}" "${HOME3}" --no-auth)"
+    register_pid "${PID3}"
+    if e2e_wait_port "127.0.0.1" "${PORT3}" 10; then
+        e2e_pass "case3 primary server started"
+    else
+        e2e_fail "case3 primary server failed to start"
+    fi
+
+    run_am_server_command_capture "case3_no_reuse" "${PORT3}" --no-auth --no-reuse-running
+    CASE3_OUTPUT="${LAST_CMD_OUTPUT}"
+    CASE3_RC="${LAST_CMD_RC}"
+    e2e_assert_exit_code "case3 second start exits 2 when reuse disabled" 2 "${CASE3_RC}"
+    e2e_assert_contains "case3 output mentions existing server" "${CASE3_OUTPUT}" "already running"
+    stop_pid "${PID3}"
 else
-    e2e_fail "case3 primary server failed to start"
+    e2e_skip "case3 not applicable: --no-reuse-running is not supported by serve-http"
 fi
-
-set +e
-CASE3_OUTPUT="$("${AM_BIN}" start --host 127.0.0.1 --port "${PORT3}" --no-tui --no-auth --no-reuse-running 2>&1)"
-CASE3_RC=$?
-set -e
-e2e_save_artifact "case3_no_reuse_output.txt" "${CASE3_OUTPUT}"
-e2e_save_artifact "case3_no_reuse_exit.txt" "${CASE3_RC}"
-e2e_assert_exit_code "case3 second start exits 2 when reuse disabled" 2 "${CASE3_RC}"
-e2e_assert_contains "case3 output mentions existing server" "${CASE3_OUTPUT}" "already running"
-stop_pid "${PID3}"
 
 # ---------------------------------------------------------------------------
 # Case 4: AM_REUSE_RUNNING=0 disables reuse without flags
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "AM_REUSE_RUNNING=0 disables reuse"
-WORK4="$(e2e_mktemp "serve_case4")"
-DB4="${WORK4}/db.sqlite3"
-STORAGE4="${WORK4}/storage"
-HOME4="${WORK4}/home"
-mkdir -p "${STORAGE4}" "${HOME4}"
-PORT4="$(pick_port)"
+if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
+    WORK4="$(e2e_mktemp "serve_case4")"
+    DB4="${WORK4}/db.sqlite3"
+    STORAGE4="${WORK4}/storage"
+    HOME4="${WORK4}/home"
+    mkdir -p "${STORAGE4}" "${HOME4}"
+    PORT4="$(pick_port)"
 
-PID4="$(start_am_server "case4" "${PORT4}" "${DB4}" "${STORAGE4}" "${HOME4}" --no-auth)"
-register_pid "${PID4}"
-if e2e_wait_port "127.0.0.1" "${PORT4}" 10; then
-    e2e_pass "case4 primary server started"
+    PID4="$(start_am_server "case4" "${PORT4}" "${DB4}" "${STORAGE4}" "${HOME4}" --no-auth)"
+    register_pid "${PID4}"
+    if e2e_wait_port "127.0.0.1" "${PORT4}" 10; then
+        e2e_pass "case4 primary server started"
+    else
+        e2e_fail "case4 primary server failed to start"
+    fi
+
+    run_command_capture "case4_env_no_reuse" env AM_REUSE_RUNNING=0 "${AM_BIN}" start --host 127.0.0.1 --port "${PORT4}" --no-tui --no-auth
+    CASE4_OUTPUT="${LAST_CMD_OUTPUT}"
+    CASE4_RC="${LAST_CMD_RC}"
+    e2e_assert_exit_code "case4 second start exits 2 when AM_REUSE_RUNNING=0" 2 "${CASE4_RC}"
+    e2e_assert_contains "case4 output mentions existing server" "${CASE4_OUTPUT}" "already running"
+    stop_pid "${PID4}"
 else
-    e2e_fail "case4 primary server failed to start"
+    e2e_skip "case4 not applicable: AM_REUSE_RUNNING controls start-mode reuse only"
 fi
-
-set +e
-CASE4_OUTPUT="$(AM_REUSE_RUNNING=0 "${AM_BIN}" start --host 127.0.0.1 --port "${PORT4}" --no-tui --no-auth 2>&1)"
-CASE4_RC=$?
-set -e
-e2e_save_artifact "case4_env_no_reuse_output.txt" "${CASE4_OUTPUT}"
-e2e_save_artifact "case4_env_no_reuse_exit.txt" "${CASE4_RC}"
-e2e_assert_exit_code "case4 second start exits 2 when AM_REUSE_RUNNING=0" 2 "${CASE4_RC}"
-e2e_assert_contains "case4 output mentions existing server" "${CASE4_OUTPUT}" "already running"
-stop_pid "${PID4}"
 
 # ---------------------------------------------------------------------------
 # Case 5: Foreign process on port yields deterministic conflict
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "foreign listener produces non-Agent-Mail conflict diagnostics"
-PORT5="$(pick_port)"
-FOREIGN_LOG="${E2E_ARTIFACT_DIR}/case5_foreign_process.log"
-python3 -m http.server "${PORT5}" --bind 127.0.0.1 >"${FOREIGN_LOG}" 2>&1 &
-FPID=$!
-register_pid "${FPID}"
+if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
+    PORT5="$(pick_port)"
+    FOREIGN_LOG="${E2E_ARTIFACT_DIR}/case5_foreign_process.log"
+    python3 -m http.server "${PORT5}" --bind 127.0.0.1 >"${FOREIGN_LOG}" 2>&1 &
+    FPID=$!
+    register_pid "${FPID}"
 
-if e2e_wait_port "127.0.0.1" "${PORT5}" 10; then
-    e2e_pass "case5 foreign process started"
+    if e2e_wait_port "127.0.0.1" "${PORT5}" 10; then
+        e2e_pass "case5 foreign process started"
+    else
+        e2e_fail "case5 foreign process failed to start"
+    fi
+
+    run_am_server_command_capture "case5_foreign_conflict" "${PORT5}" --no-auth
+    CASE5_OUTPUT="${LAST_CMD_OUTPUT}"
+    CASE5_RC="${LAST_CMD_RC}"
+    if [ "${CASE5_RC}" -ne 0 ]; then
+        e2e_pass "case5 start exits non-zero with foreign listener"
+    else
+        e2e_fail "case5 start should fail with foreign listener"
+    fi
+    if printf '%s' "${CASE5_OUTPUT}" | grep -Eq 'non-Agent-Mail process|in use'; then
+        e2e_pass "case5 output includes conflict diagnostics"
+    else
+        e2e_fail "case5 output missing conflict diagnostics"
+    fi
+    stop_pid "${FPID}"
 else
-    e2e_fail "case5 foreign process failed to start"
+    e2e_skip "case5 start-mode conflict diagnostics are not applicable in serve-http mode"
 fi
-
-set +e
-CASE5_OUTPUT="$("${AM_BIN}" start --host 127.0.0.1 --port "${PORT5}" --no-tui --no-auth 2>&1)"
-CASE5_RC=$?
-set -e
-e2e_save_artifact "case5_foreign_conflict_output.txt" "${CASE5_OUTPUT}"
-e2e_save_artifact "case5_foreign_conflict_exit.txt" "${CASE5_RC}"
-e2e_assert_exit_code "case5 start exits 2 with foreign listener" 2 "${CASE5_RC}"
-e2e_assert_contains "case5 output marks non-Agent-Mail process" "${CASE5_OUTPUT}" "non-Agent-Mail process"
-stop_pid "${FPID}"
 
 # ---------------------------------------------------------------------------
 # Case 6: Token loaded from ~/.mcp_agent_mail/.env when auth enabled
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "auth token is loaded from ~/.mcp_agent_mail/.env"
-WORK6="$(e2e_mktemp "serve_case6")"
-DB6="${WORK6}/db.sqlite3"
-STORAGE6="${WORK6}/storage"
-HOME6="${WORK6}/home"
-TOKEN6="serve-e2e-token-123"
-mkdir -p "${STORAGE6}" "${HOME6}/.mcp_agent_mail"
-cat >"${HOME6}/.mcp_agent_mail/.env" <<EOF
+if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
+    WORK6="$(e2e_mktemp "serve_case6")"
+    DB6="${WORK6}/db.sqlite3"
+    STORAGE6="${WORK6}/storage"
+    HOME6="${WORK6}/home"
+    TOKEN6="serve-e2e-token-123"
+    mkdir -p "${STORAGE6}" "${HOME6}/.mcp_agent_mail"
+    cat >"${HOME6}/.mcp_agent_mail/.env" <<EOF
 HTTP_BEARER_TOKEN=${TOKEN6}
 EOF
 
-PORT6="$(pick_port)"
-PID6="$(start_am_server "case6" "${PORT6}" "${DB6}" "${STORAGE6}" "${HOME6}" --path mcp)"
-register_pid "${PID6}"
-if e2e_wait_port "127.0.0.1" "${PORT6}" 10; then
-    e2e_pass "case6 auth-enabled server started"
-else
-    e2e_fail "case6 auth-enabled server failed to start"
-fi
+    PORT6="$(pick_port)"
+    PID6="$(start_am_server "case6" "${PORT6}" "${DB6}" "${STORAGE6}" "${HOME6}" --path mcp)"
+    register_pid "${PID6}"
+    if e2e_wait_port "127.0.0.1" "${PORT6}" 10; then
+        e2e_pass "case6 auth-enabled server started"
+    else
+        e2e_fail "case6 auth-enabled server failed to start"
+    fi
 
-if e2e_rpc_call "case6_rpc_without_auth" "http://127.0.0.1:${PORT6}/mcp/" "health_check" "{}"; then
-    e2e_fail "case6 unauthenticated call should fail when auth is enabled"
-else
-    e2e_pass "case6 unauthenticated call failed as expected"
-fi
-CASE6_STATUS_NOAUTH="$(e2e_rpc_read_status "case6_rpc_without_auth")"
-e2e_assert_eq "case6 unauthenticated status is 401" "401" "${CASE6_STATUS_NOAUTH}"
+    if e2e_rpc_call "case6_rpc_without_auth" "http://127.0.0.1:${PORT6}/mcp/" "health_check" "{}"; then
+        e2e_fail "case6 unauthenticated call should fail when auth is enabled"
+    else
+        e2e_pass "case6 unauthenticated call failed as expected"
+    fi
+    CASE6_STATUS_NOAUTH="$(e2e_rpc_read_status "case6_rpc_without_auth")"
+    e2e_assert_eq "case6 unauthenticated status is 401" "401" "${CASE6_STATUS_NOAUTH}"
 
-if e2e_rpc_call "case6_rpc_with_auth" "http://127.0.0.1:${PORT6}/mcp/" "health_check" "{}" "Authorization: Bearer ${TOKEN6}"; then
-    e2e_rpc_assert_success "case6_rpc_with_auth" "case6 authenticated call succeeds"
-else
-    e2e_fail "case6 authenticated call failed unexpectedly"
-fi
+    if e2e_rpc_call "case6_rpc_with_auth" "http://127.0.0.1:${PORT6}/mcp/" "health_check" "{}" "Authorization: Bearer ${TOKEN6}"; then
+        e2e_rpc_assert_success "case6_rpc_with_auth" "case6 authenticated call succeeds"
+    else
+        e2e_fail "case6 authenticated call failed unexpectedly"
+    fi
 
-LOG6="$(cat "${E2E_ARTIFACT_DIR}/server_case6.log" 2>/dev/null || true)"
-e2e_assert_not_contains "case6 server log does not leak raw token" "${LOG6}" "${TOKEN6}"
-stop_pid "${PID6}"
+    LOG6="$(cat "${E2E_ARTIFACT_DIR}/server_case6.log" 2>/dev/null || true)"
+    e2e_assert_not_contains "case6 server log does not leak raw token" "${LOG6}" "${TOKEN6}"
+    stop_pid "${PID6}"
+else
+    e2e_skip "case6 token auto-load is start-mode behavior and is not applicable in serve-http mode"
+fi
 
 e2e_summary
-

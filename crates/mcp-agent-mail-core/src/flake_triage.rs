@@ -1529,7 +1529,7 @@ mod tests {
         let extended = extend_seeds(&[], 5);
         assert_eq!(extended.len(), 5);
         // No duplicates
-        let mut uniq = extended.clone();
+        let mut uniq = extended;
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), 5);
@@ -1617,6 +1617,8 @@ mod tests {
         assert_eq!(cloned.test_name, "clone_test");
         assert_eq!(cloned.harness_seed, Some(42));
         assert_eq!(cloned.category, FailureCategory::Assertion);
+        // Use `ctx` after clone to prove it produced an independent copy.
+        assert_eq!(ctx.test_name, "clone_test");
     }
 
     #[test]

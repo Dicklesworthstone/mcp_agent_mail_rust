@@ -1193,7 +1193,12 @@ mod tests {
 
     #[test]
     fn counts_serde_roundtrip() {
-        let c = Counts { total: 10, pass: 7, fail: 2, skip: 1 };
+        let c = Counts {
+            total: 10,
+            pass: 7,
+            fail: 2,
+            skip: 1,
+        };
         let json = serde_json::to_string(&c).unwrap();
         let back: Counts = serde_json::from_str(&json).unwrap();
         assert_eq!(back.total, c.total);
@@ -1237,7 +1242,12 @@ mod tests {
             started_at: "start".to_string(),
             start_epoch_s: 100,
         };
-        let counts = Counts { total: 5, pass: 4, fail: 1, skip: 0 };
+        let counts = Counts {
+            total: 5,
+            pass: 4,
+            fail: 1,
+            skip: 0,
+        };
         let s = Summary::new(&ctx, &counts, "end");
         assert_eq!(s.schema_version, 1);
         assert_eq!(s.suite, "s");
@@ -1346,7 +1356,12 @@ mod tests {
             kind: "pass".to_string(),
             case: "test_case".to_string(),
             message: "ok".to_string(),
-            counters: Counts { total: 1, pass: 1, fail: 0, skip: 0 },
+            counters: Counts {
+                total: 1,
+                pass: 1,
+                fail: 0,
+                skip: 0,
+            },
         };
         let line = e.to_jsonl();
         assert!(!line.contains('\n'));
@@ -1409,11 +1424,17 @@ mod tests {
 
     #[test]
     fn artifact_ref_optional_schema() {
-        let with = ArtifactRef { path: "p".to_string(), schema: Some("v1".to_string()) };
+        let with = ArtifactRef {
+            path: "p".to_string(),
+            schema: Some("v1".to_string()),
+        };
         let json_with = serde_json::to_string(&with).unwrap();
         assert!(json_with.contains("\"schema\""));
 
-        let without = ArtifactRef { path: "p".to_string(), schema: None };
+        let without = ArtifactRef {
+            path: "p".to_string(),
+            schema: None,
+        };
         let json_without = serde_json::to_string(&without).unwrap();
         assert!(!json_without.contains("\"schema\""));
     }

@@ -145,6 +145,142 @@ with open(out_path, "w", encoding="utf-8") as f:
 PY
 }
 
+startup_case_dir() {
+    local label="$1"
+    printf '%s\n' "${E2E_ARTIFACT_DIR}/server_startup_${label}"
+}
+
+startup_write_start_artifacts() {
+    local label="$1"
+    local started_ms="$2"
+    local pid="$3"
+    local log_path="$4"
+    local timeout_s="$5"
+    local mode="$6"
+    local command_text="$7"
+
+    local case_id="server_startup_${label}"
+    local case_dir
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+
+    printf '%s\n' "${command_text}" > "${case_dir}/command.txt"
+    printf '%s\n' "${started_ms}" > "${case_dir}/start_ms.txt"
+    printf '%s\n' "${pid}" > "${case_dir}/pid.txt"
+    printf '%s\n' "${log_path}" > "${case_dir}/log_path.txt"
+    printf '%s\n' "${timeout_s}" > "${case_dir}/server_timeout_seconds.txt"
+    printf '%s\n' "${mode}" > "${case_dir}/mode.txt"
+
+    e2e_save_artifact "${case_id}_command.txt" "${command_text}"
+    e2e_save_artifact "${case_id}_pid.txt" "${pid}"
+    e2e_save_artifact "${case_id}_log_path.txt" "${log_path}"
+    e2e_save_artifact "${case_id}_server_timeout_seconds.txt" "${timeout_s}"
+    e2e_save_artifact "${case_id}_mode.txt" "${mode}"
+}
+
+startup_finalize_artifacts() {
+    local label="$1"
+    local status="$2"
+    local detail="${3:-}"
+
+    local case_id="server_startup_${label}"
+    local case_dir
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+
+    local finished_ms elapsed_ms started_ms
+    finished_ms="$(_e2e_now_ms)"
+    elapsed_ms=0
+    started_ms=0
+
+    if [ -f "${case_dir}/start_ms.txt" ]; then
+        started_ms="$(cat "${case_dir}/start_ms.txt" 2>/dev/null || echo 0)"
+    fi
+    if [[ "${started_ms}" =~ ^[0-9]+$ ]] && [ "${started_ms}" -gt 0 ]; then
+        elapsed_ms=$(( finished_ms - started_ms ))
+    fi
+
+    printf '%s\n' "${status}" > "${case_dir}/status.txt"
+    printf '%s\n' "${detail}" > "${case_dir}/detail.txt"
+    printf '%s\n' "${finished_ms}" > "${case_dir}/finished_ms.txt"
+    printf '%s\n' "${elapsed_ms}" > "${case_dir}/startup_elapsed_ms.txt"
+
+    e2e_save_artifact "${case_id}_status.txt" "${status}"
+    e2e_save_artifact "${case_id}_detail.txt" "${detail}"
+    e2e_save_artifact "${case_id}_startup_elapsed_ms.txt" "${elapsed_ms}"
+}
+
+startup_write_failure_diagnostics() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local timeout_s="$4"
+
+    local case_id="server_startup_${label}"
+    local case_dir diag_file log_path
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+    diag_file="${case_dir}/startup_failure_diagnostics.txt"
+    log_path=""
+    if [ -f "${case_dir}/log_path.txt" ]; then
+        log_path="$(cat "${case_dir}/log_path.txt" 2>/dev/null || true)"
+    fi
+
+    {
+        echo "TUI startup server failure diagnostics"
+        echo "====================================="
+        echo "timestamp: $(_e2e_now_rfc3339)"
+        echo "label: ${label}"
+        echo "port: ${port}"
+        echo "startup_timeout_seconds: ${timeout_s}"
+        echo "pid: ${pid}"
+        echo "log_path: ${log_path}"
+        echo ""
+        echo "=== startup command ==="
+        if [ -f "${case_dir}/command.txt" ]; then
+            cat "${case_dir}/command.txt"
+        else
+            echo "(command file missing)"
+        fi
+        echo ""
+        echo "=== process status ==="
+        if [ -n "${pid}" ]; then
+            ps -p "${pid}" -o pid=,ppid=,etime=,stat=,args= 2>/dev/null || echo "(process not running)"
+        else
+            echo "(no pid)"
+        fi
+        echo ""
+        echo "=== server log tail (last 200 lines) ==="
+        if [ -n "${log_path}" ] && [ -f "${log_path}" ]; then
+            tail -n 200 "${log_path}"
+        else
+            echo "(log path missing or unreadable)"
+        fi
+        echo ""
+        echo "=== listeners ==="
+        ss -tlnp 2>/dev/null | head -40 || netstat -tlnp 2>/dev/null | head -40 || echo "(unable to inspect listeners)"
+    } > "${diag_file}"
+
+    e2e_save_artifact "${case_id}_startup_failure_diagnostics.txt" "$(cat "${diag_file}" 2>/dev/null || true)"
+}
+
+wait_for_server_start_or_fail() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local fatal_msg="$4"
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+
+    if ! e2e_wait_port 127.0.0.1 "${port}" "${startup_timeout_s}"; then
+        startup_finalize_artifacts "${label}" "failed" "port did not open within ${startup_timeout_s}s"
+        startup_write_failure_diagnostics "${label}" "${pid}" "${port}" "${startup_timeout_s}"
+        stop_server "${pid}"
+        e2e_fatal "${fatal_msg}"
+    fi
+
+    startup_finalize_artifacts "${label}" "ready" "port opened at http://127.0.0.1:${port}"
+}
+
 start_server_pty() {
     local label="$1"
     local port="$2"
@@ -158,23 +294,38 @@ start_server_pty() {
     e2e_log "  typescript: ${typescript}"
 
     local timeout_s="${AM_E2E_SERVER_TIMEOUT_S:-15}"
+    local started_ms="$(_e2e_now_ms)"
+    local -a cmd_parts=(
+        env
+        "DATABASE_URL=sqlite:////${db_path}"
+        "STORAGE_ROOT=${storage_root}"
+        "HTTP_HOST=127.0.0.1"
+        "HTTP_PORT=${port}"
+        "HTTP_RBAC_ENABLED=0"
+        "HTTP_RATE_LIMIT_ENABLED=0"
+        "HTTP_JWT_ENABLED=0"
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1"
+    )
+    while [ "$#" -gt 0 ]; do
+        cmd_parts+=("$1")
+        shift
+    done
+    cmd_parts+=(timeout "${timeout_s}s" "${bin}" serve --host 127.0.0.1 --port "${port}")
+    local server_cmd=""
+    local part
+    for part in "${cmd_parts[@]}"; do
+        printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
+    done
+    server_cmd="${server_cmd# }"
 
     (
-        script -q -f -c "env \
-DATABASE_URL=sqlite:////${db_path} \
-STORAGE_ROOT=${storage_root} \
-HTTP_HOST=127.0.0.1 \
-HTTP_PORT=${port} \
-HTTP_RBAC_ENABLED=0 \
-HTTP_RATE_LIMIT_ENABLED=0 \
-HTTP_JWT_ENABLED=0 \
-HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
-${*} \
-timeout ${timeout_s}s ${bin} serve --host 127.0.0.1 --port ${port}" \
+        script -q -f -c "${server_cmd}" \
             "${typescript}"
     ) >/dev/null 2>&1 &
 
-    echo $!
+    local pid="$!"
+    startup_write_start_artifacts "${label}" "${started_ms}" "${pid}" "${typescript}" "${timeout_s}" "pty" "${server_cmd}"
+    echo "${pid}"
 }
 
 # Headless mode (--no-tui) captures stderr directly (no PTY needed).
@@ -188,6 +339,30 @@ start_server_headless() {
 
     local logfile="${E2E_ARTIFACT_DIR}/server_${label}.log"
     e2e_log "Starting headless server (${label}): 127.0.0.1:${port}"
+    local timeout_s="${AM_E2E_SERVER_TIMEOUT_S:-15}"
+    local started_ms="$(_e2e_now_ms)"
+    local -a cmd_parts=(
+        env
+        "DATABASE_URL=sqlite:////${db_path}"
+        "STORAGE_ROOT=${storage_root}"
+        "HTTP_HOST=127.0.0.1"
+        "HTTP_PORT=${port}"
+        "HTTP_RBAC_ENABLED=0"
+        "HTTP_RATE_LIMIT_ENABLED=0"
+        "HTTP_JWT_ENABLED=0"
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1"
+    )
+    local extra
+    for extra in "$@"; do
+        cmd_parts+=("${extra}")
+    done
+    cmd_parts+=(timeout "${timeout_s}s" "${bin}" serve --host 127.0.0.1 --port "${port}" --no-tui)
+    local server_cmd=""
+    local part
+    for part in "${cmd_parts[@]}"; do
+        printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
+    done
+    server_cmd="${server_cmd# }"
 
     (
         export DATABASE_URL="sqlite:////${db_path}"
@@ -202,10 +377,12 @@ start_server_headless() {
             export "$1"
             shift
         done
-        timeout 15s "${bin}" serve --host 127.0.0.1 --port "${port}" --no-tui
+        timeout "${timeout_s}s" "${bin}" serve --host 127.0.0.1 --port "${port}" --no-tui
     ) >"${logfile}" 2>&1 &
 
-    echo $!
+    local pid="$!"
+    startup_write_start_artifacts "${label}" "${started_ms}" "${pid}" "${logfile}" "${timeout_s}" "headless" "${server_cmd}"
+    echo "${pid}"
 }
 
 stop_server() {
@@ -567,10 +744,7 @@ mkdir -p "${STORAGE1}"
 PORT1="$(pick_port)"
 
 PID1="$(start_server_headless "banner" "${PORT1}" "${DB1}" "${STORAGE1}" "${BIN}")"
-if ! e2e_wait_port 127.0.0.1 "${PORT1}" 10; then
-    stop_server "${PID1}"
-    e2e_fatal "server failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "banner" "${PID1}" "${PORT1}" "server failed to start (port not open)"
 sleep 0.3
 stop_server "${PID1}"
 sleep 0.3
@@ -598,10 +772,7 @@ mkdir -p "${STORAGE2}"
 PORT2="$(pick_port)"
 
 PID2="$(start_server_pty "tui_ready" "${PORT2}" "${DB2}" "${STORAGE2}" "${BIN}" "LOG_RICH_ENABLED=true")"
-if ! e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
-    stop_server "${PID2}"
-    e2e_fatal "TUI server failed to reach ready state (port not open after 10s)"
-fi
+wait_for_server_start_or_fail "tui_ready" "${PID2}" "${PORT2}" "TUI server failed to reach ready state (port not open after timeout)"
 
 # Verify the server responds to MCP tools/list
 tools_list_call "case2_tools_list" "http://127.0.0.1:${PORT2}/mcp/"
@@ -637,10 +808,7 @@ mkdir -p "${STORAGE3}"
 PORT3="$(pick_port)"
 
 PID3="$(start_server_headless "api_mode" "${PORT3}" "${DB3}" "${STORAGE3}" "${BIN}" "HTTP_PATH=/api/")"
-if ! e2e_wait_port 127.0.0.1 "${PORT3}" 10; then
-    stop_server "${PID3}"
-    e2e_fatal "API mode server failed to start"
-fi
+wait_for_server_start_or_fail "api_mode" "${PID3}" "${PORT3}" "API mode server failed to start"
 
 # Verify API path responds
 tools_list_call "case3_api_tools_list" "http://127.0.0.1:${PORT3}/api/"
@@ -681,10 +849,7 @@ echo 'HTTP_BEARER_TOKEN=test-secret-token-e2e-12345' > "${USER_ENV_DIR}/.env"
 
 # Start server with HOME pointing to our temp dir (so it finds our .env)
 PID4="$(start_server_headless "token_auto" "${PORT4}" "${DB4}" "${STORAGE4}" "${BIN}" "HOME=${WORK4}" "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0")"
-if ! e2e_wait_port 127.0.0.1 "${PORT4}" 10; then
-    stop_server "${PID4}"
-    e2e_fatal "token auto-discovery server failed to start"
-fi
+wait_for_server_start_or_fail "token_auto" "${PID4}" "${PORT4}" "token auto-discovery server failed to start"
 
 # Verify unauthenticated request is rejected
 tools_list_call "case4_unauth_tools_list" "http://127.0.0.1:${PORT4}/mcp/"
@@ -732,10 +897,7 @@ mkdir -p "${STORAGE5}"
 PORT5="$(pick_port)"
 
 PID5="$(start_server_headless "mcp_default" "${PORT5}" "${DB5}" "${STORAGE5}" "${BIN}")"
-if ! e2e_wait_port 127.0.0.1 "${PORT5}" 10; then
-    stop_server "${PID5}"
-    e2e_fatal "MCP default server failed to start"
-fi
+wait_for_server_start_or_fail "mcp_default" "${PID5}" "${PORT5}" "MCP default server failed to start"
 sleep 0.3
 stop_server "${PID5}"
 sleep 0.3
@@ -756,6 +918,9 @@ PORT6="$(pick_port)"
 
 # Use env -i to strip all environment variables, providing only essentials
 LOG6="${E2E_ARTIFACT_DIR}/server_clean_shell.log"
+START6_TIMEOUT_S="${AM_E2E_SERVER_TIMEOUT_S:-15}"
+START6_STARTED_MS="$(_e2e_now_ms)"
+START6_CMD="env -i PATH=${PATH} HOME=${WORK6} DATABASE_URL=sqlite:////${DB6} STORAGE_ROOT=${STORAGE6} HTTP_HOST=127.0.0.1 HTTP_PORT=${PORT6} HTTP_RBAC_ENABLED=0 HTTP_RATE_LIMIT_ENABLED=0 HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 timeout ${START6_TIMEOUT_S}s ${BIN} serve --host 127.0.0.1 --port ${PORT6} --no-tui"
 (
     env -i \
         PATH="${PATH}" \
@@ -767,14 +932,12 @@ LOG6="${E2E_ARTIFACT_DIR}/server_clean_shell.log"
         HTTP_RBAC_ENABLED=0 \
         HTTP_RATE_LIMIT_ENABLED=0 \
         HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
-        timeout 15s "${BIN}" serve --host 127.0.0.1 --port "${PORT6}" --no-tui
+        timeout "${START6_TIMEOUT_S}s" "${BIN}" serve --host 127.0.0.1 --port "${PORT6}" --no-tui
 ) >"${LOG6}" 2>&1 &
 PID6=$!
+startup_write_start_artifacts "clean_shell" "${START6_STARTED_MS}" "${PID6}" "${LOG6}" "${START6_TIMEOUT_S}" "headless_clean_env" "${START6_CMD}"
 
-if ! e2e_wait_port 127.0.0.1 "${PORT6}" 10; then
-    stop_server "${PID6}"
-    e2e_fatal "clean shell server failed to start"
-fi
+wait_for_server_start_or_fail "clean_shell" "${PID6}" "${PORT6}" "clean shell server failed to start"
 sleep 0.3
 stop_server "${PID6}"
 sleep 0.3

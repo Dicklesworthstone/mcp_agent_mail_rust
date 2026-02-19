@@ -282,6 +282,142 @@ PY
 # Server runner (per-config)
 # ---------------------------------------------------------------------------
 
+startup_case_dir() {
+    local label="$1"
+    printf '%s\n' "${E2E_ARTIFACT_DIR}/server_startup_${label}"
+}
+
+startup_write_start_artifacts() {
+    local label="$1"
+    local started_ms="$2"
+    local pid="$3"
+    local log_path="$4"
+    local mode="$5"
+    local command_text="$6"
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+
+    local case_id="server_startup_${label}"
+    local case_dir
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+
+    printf '%s\n' "${command_text}" > "${case_dir}/command.txt"
+    printf '%s\n' "${started_ms}" > "${case_dir}/start_ms.txt"
+    printf '%s\n' "${pid}" > "${case_dir}/pid.txt"
+    printf '%s\n' "${log_path}" > "${case_dir}/log_path.txt"
+    printf '%s\n' "${mode}" > "${case_dir}/mode.txt"
+    printf '%s\n' "${startup_timeout_s}" > "${case_dir}/startup_timeout_seconds.txt"
+
+    e2e_save_artifact "${case_id}_command.txt" "${command_text}"
+    e2e_save_artifact "${case_id}_pid.txt" "${pid}"
+    e2e_save_artifact "${case_id}_log_path.txt" "${log_path}"
+    e2e_save_artifact "${case_id}_mode.txt" "${mode}"
+    e2e_save_artifact "${case_id}_startup_timeout_seconds.txt" "${startup_timeout_s}"
+}
+
+startup_finalize_artifacts() {
+    local label="$1"
+    local status="$2"
+    local detail="${3:-}"
+
+    local case_id="server_startup_${label}"
+    local case_dir
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+
+    local finished_ms elapsed_ms started_ms
+    finished_ms="$(_e2e_now_ms)"
+    elapsed_ms=0
+    started_ms=0
+
+    if [ -f "${case_dir}/start_ms.txt" ]; then
+        started_ms="$(cat "${case_dir}/start_ms.txt" 2>/dev/null || echo 0)"
+    fi
+    if [[ "${started_ms}" =~ ^[0-9]+$ ]] && [ "${started_ms}" -gt 0 ]; then
+        elapsed_ms=$(( finished_ms - started_ms ))
+    fi
+
+    printf '%s\n' "${status}" > "${case_dir}/status.txt"
+    printf '%s\n' "${detail}" > "${case_dir}/detail.txt"
+    printf '%s\n' "${finished_ms}" > "${case_dir}/finished_ms.txt"
+    printf '%s\n' "${elapsed_ms}" > "${case_dir}/startup_elapsed_ms.txt"
+
+    e2e_save_artifact "${case_id}_status.txt" "${status}"
+    e2e_save_artifact "${case_id}_detail.txt" "${detail}"
+    e2e_save_artifact "${case_id}_startup_elapsed_ms.txt" "${elapsed_ms}"
+}
+
+startup_write_failure_diagnostics() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local startup_timeout_s="$4"
+
+    local case_id="server_startup_${label}"
+    local case_dir diag_file log_path
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+    diag_file="${case_dir}/startup_failure_diagnostics.txt"
+    log_path=""
+    if [ -f "${case_dir}/log_path.txt" ]; then
+        log_path="$(cat "${case_dir}/log_path.txt" 2>/dev/null || true)"
+    fi
+
+    {
+        echo "HTTP E2E server startup failure diagnostics"
+        echo "==========================================="
+        echo "timestamp: $(_e2e_now_rfc3339)"
+        echo "label: ${label}"
+        echo "port: ${port}"
+        echo "startup_timeout_seconds: ${startup_timeout_s}"
+        echo "pid: ${pid}"
+        echo "log_path: ${log_path}"
+        echo ""
+        echo "=== startup command ==="
+        if [ -f "${case_dir}/command.txt" ]; then
+            cat "${case_dir}/command.txt"
+        else
+            echo "(command file missing)"
+        fi
+        echo ""
+        echo "=== process status ==="
+        if [ -n "${pid}" ]; then
+            ps -p "${pid}" -o pid=,ppid=,etime=,stat=,args= 2>/dev/null || echo "(process not running)"
+        else
+            echo "(no pid)"
+        fi
+        echo ""
+        echo "=== server log tail (last 200 lines) ==="
+        if [ -n "${log_path}" ] && [ -f "${log_path}" ]; then
+            tail -n 200 "${log_path}"
+        else
+            echo "(log path missing or unreadable)"
+        fi
+        echo ""
+        echo "=== listeners ==="
+        ss -tlnp 2>/dev/null | head -40 || netstat -tlnp 2>/dev/null | head -40 || echo "(unable to inspect listeners)"
+    } > "${diag_file}"
+
+    e2e_save_artifact "${case_id}_startup_failure_diagnostics.txt" "$(cat "${diag_file}" 2>/dev/null || true)"
+}
+
+wait_for_server_start_or_fail() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local fatal_msg="$4"
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+
+    if ! e2e_wait_port 127.0.0.1 "${port}" "${startup_timeout_s}"; then
+        startup_finalize_artifacts "${label}" "failed" "port did not open within ${startup_timeout_s}s"
+        startup_write_failure_diagnostics "${label}" "${pid}" "${port}" "${startup_timeout_s}"
+        stop_server "${pid}"
+        e2e_fatal "${fatal_msg}"
+    fi
+
+    startup_finalize_artifacts "${label}" "ready" "port opened at http://127.0.0.1:${port}"
+}
+
 start_server() {
     local label="$1"
     local port="$2"
@@ -289,10 +425,35 @@ start_server() {
     local storage_root="$4"
     local bin="$5"
     shift 5
+    local -a env_overrides=("$@")
 
     local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
     e2e_log "Starting server (${label}): 127.0.0.1:${port}"
     e2e_log "  log: ${server_log}"
+    local started_ms="$(_e2e_now_ms)"
+    local -a cmd_parts=(
+        env
+        "DATABASE_URL=sqlite:////${db_path}"
+        "STORAGE_ROOT=${storage_root}"
+        "HTTP_HOST=127.0.0.1"
+        "HTTP_PORT=${port}"
+        "HTTP_RBAC_ENABLED=0"
+        "HTTP_RATE_LIMIT_ENABLED=0"
+        "HTTP_JWT_ENABLED=0"
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0"
+        "HTTP_BEARER_TOKEN="
+    )
+    local override
+    for override in "${env_overrides[@]}"; do
+        cmd_parts+=("${override}")
+    done
+    cmd_parts+=("${bin}" serve --host 127.0.0.1 --port "${port}")
+    local server_cmd=""
+    local part
+    for part in "${cmd_parts[@]}"; do
+        printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
+    done
+    server_cmd="${server_cmd# }"
 
     (
         export DATABASE_URL="sqlite:////${db_path}"
@@ -310,14 +471,15 @@ start_server() {
         export HTTP_BEARER_TOKEN=""
 
         # Optional overrides passed as KEY=VALUE pairs in remaining args.
-        while [ $# -gt 0 ]; do
-            export "$1"
-            shift
+        for override in "${env_overrides[@]}"; do
+            export "${override}"
         done
 
         "${bin}" serve --host 127.0.0.1 --port "${port}"
     ) >"${server_log}" 2>&1 &
-    echo $!
+    local pid="$!"
+    startup_write_start_artifacts "${label}" "${started_ms}" "${pid}" "${server_log}" "headless" "${server_cmd}"
+    echo "${pid}"
 }
 
 stop_server() {
@@ -403,9 +565,7 @@ PID1="$(start_server "run1" "${PORT1}" "${DB1}" "${STORAGE1}" "${BIN}" \
 )"
 trap 'stop_server "${PID1}" || true' EXIT
 
-if ! e2e_wait_port 127.0.0.1 "${PORT1}" 10; then
-    e2e_fatal "server run1 failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "run1" "${PID1}" "${PORT1}" "server run1 failed to start (port not open)"
 
 AUTHZ="Authorization: Bearer ${TOKEN}"
 
@@ -485,9 +645,7 @@ PID2="$(start_server "run2" "${PORT2}" "${DB2}" "${STORAGE2}" "${BIN}" \
 )"
 trap 'stop_server "${PID2}" || true' EXIT
 
-if ! e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
-    e2e_fatal "server run2 failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "run2" "${PID2}" "${PORT2}" "server run2 failed to start (port not open)"
 
 http_request "run2_health_liveness" "GET" "${URL2}/health/liveness"
 e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run2_health_liveness_status.txt")"
@@ -525,7 +683,7 @@ PID3A="$(start_server "run3_full" "${PORT3A}" "${DB3A}" "${STORAGE3A}" "${BIN}" 
     "TOOLS_FILTER_ENABLED=0" \
 )"
 trap 'stop_server "${PID3A}" || true' EXIT
-e2e_wait_port 127.0.0.1 "${PORT3A}" 10 || e2e_fatal "server run3_full failed to start"
+wait_for_server_start_or_fail "run3_full" "${PID3A}" "${PORT3A}" "server run3_full failed to start"
 
 e2e_case_banner "tools/list baseline (filter disabled)"
 run_tools_list "run3_full_tools_list" "${URL3A}"
@@ -547,7 +705,7 @@ PID3B="$(start_server "run3_minimal" "${PORT3B}" "${DB3B}" "${STORAGE3B}" "${BIN
     "TOOLS_FILTER_PROFILE=minimal" \
 )"
 trap 'stop_server "${PID3B}" || true' EXIT
-e2e_wait_port 127.0.0.1 "${PORT3B}" 10 || e2e_fatal "server run3_minimal failed to start"
+wait_for_server_start_or_fail "run3_minimal" "${PID3B}" "${PORT3B}" "server run3_minimal failed to start"
 
 e2e_case_banner "tools/list minimal profile returns fewer tools"
 run_tools_list "run3_min_tools_list" "${URL3B}"
@@ -581,7 +739,7 @@ PID3C="$(start_server "run3_custom" "${PORT3C}" "${DB3C}" "${STORAGE3C}" "${BIN}
     "TOOLS_FILTER_TOOLS=health_check" \
 )"
 trap 'stop_server "${PID3C}" || true' EXIT
-e2e_wait_port 127.0.0.1 "${PORT3C}" 10 || e2e_fatal "server run3_custom failed to start"
+wait_for_server_start_or_fail "run3_custom" "${PID3C}" "${PORT3C}" "server run3_custom failed to start"
 
 e2e_case_banner "custom exclude removes health_check tool"
 run_tools_list "run3_custom_tools_list" "${URL3C}"
@@ -628,7 +786,7 @@ PID4="$(start_server "run4" "${PORT4}" "${DB4}" "${STORAGE4}" "${BIN}" \
     "LOG_JSON_ENABLED=0" \
 )"
 trap 'stop_server "${PID4}" || true' EXIT
-e2e_wait_port 127.0.0.1 "${PORT4}" 10 || e2e_fatal "server run4 failed to start"
+wait_for_server_start_or_fail "run4" "${PID4}" "${PORT4}" "server run4 failed to start"
 
 e2e_case_banner "ensure_project triggers DB-backed tool call"
 PAYLOAD_EP="$(jsonrpc_tools_call_payload "ensure_project" "$(python3 -c "import json,sys; print(json.dumps({'human_key': sys.argv[1]}))" "${PROJECT_DIR4}")")"
@@ -671,7 +829,7 @@ PID5="$(start_server "run5" "${PORT5}" "${DB5}" "${STORAGE5}" "${BIN}" \
     "ACK_ESCALATION_CLAIM_HOLDER_NAME=AckBot" \
 )"
 trap 'stop_server "${PID5}" || true' EXIT
-e2e_wait_port 127.0.0.1 "${PORT5}" 10 || e2e_fatal "server run5 failed to start"
+wait_for_server_start_or_fail "run5" "${PID5}" "${PORT5}" "server run5 failed to start"
 
 e2e_case_banner "Create ack_required message"
 PAYLOAD_PROJ="$(jsonrpc_tools_call_payload "ensure_project" "$(python3 -c "import json,sys; print(json.dumps({'human_key': sys.argv[1]}))" "${PROJECT_DIR5}")")"

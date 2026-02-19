@@ -270,7 +270,6 @@ mod tests {
             let tree = strategy.new_tree(&mut runner).unwrap();
             let val = tree.current();
             assert!(val >= 0, "timestamp must be non-negative, got {val}");
-            assert!(val <= i64::MAX);
         }
     }
 }

@@ -226,6 +226,125 @@ with open(out_path, "w", encoding="utf-8") as f:
 PY
 }
 
+startup_case_dir() {
+    local label="$1"
+    printf '%s\n' "${E2E_ARTIFACT_DIR}/server_startup_${label}"
+}
+
+startup_write_start_artifacts() {
+    local label="$1"
+    local started_ms="$2"
+    local pid="$3"
+    local log_path="$4"
+    local mode="$5"
+    local command_text="$6"
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+
+    local case_id="server_startup_${label}"
+    local case_dir
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+
+    printf '%s\n' "${command_text}" > "${case_dir}/command.txt"
+    printf '%s\n' "${started_ms}" > "${case_dir}/start_ms.txt"
+    printf '%s\n' "${pid}" > "${case_dir}/pid.txt"
+    printf '%s\n' "${log_path}" > "${case_dir}/log_path.txt"
+    printf '%s\n' "${mode}" > "${case_dir}/mode.txt"
+    printf '%s\n' "${startup_timeout_s}" > "${case_dir}/startup_timeout_seconds.txt"
+
+    e2e_save_artifact "${case_id}_command.txt" "${command_text}"
+    e2e_save_artifact "${case_id}_pid.txt" "${pid}"
+    e2e_save_artifact "${case_id}_log_path.txt" "${log_path}"
+    e2e_save_artifact "${case_id}_mode.txt" "${mode}"
+    e2e_save_artifact "${case_id}_startup_timeout_seconds.txt" "${startup_timeout_s}"
+}
+
+startup_finalize_artifacts() {
+    local label="$1"
+    local status="$2"
+    local detail="${3:-}"
+
+    local case_id="server_startup_${label}"
+    local case_dir
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+
+    local finished_ms elapsed_ms started_ms
+    finished_ms="$(_e2e_now_ms)"
+    elapsed_ms=0
+    started_ms=0
+
+    if [ -f "${case_dir}/start_ms.txt" ]; then
+        started_ms="$(cat "${case_dir}/start_ms.txt" 2>/dev/null || echo 0)"
+    fi
+    if [[ "${started_ms}" =~ ^[0-9]+$ ]] && [ "${started_ms}" -gt 0 ]; then
+        elapsed_ms=$(( finished_ms - started_ms ))
+    fi
+
+    printf '%s\n' "${status}" > "${case_dir}/status.txt"
+    printf '%s\n' "${detail}" > "${case_dir}/detail.txt"
+    printf '%s\n' "${finished_ms}" > "${case_dir}/finished_ms.txt"
+    printf '%s\n' "${elapsed_ms}" > "${case_dir}/startup_elapsed_ms.txt"
+
+    e2e_save_artifact "${case_id}_status.txt" "${status}"
+    e2e_save_artifact "${case_id}_detail.txt" "${detail}"
+    e2e_save_artifact "${case_id}_startup_elapsed_ms.txt" "${elapsed_ms}"
+}
+
+startup_write_failure_diagnostics() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local startup_timeout_s="$4"
+
+    local case_id="server_startup_${label}"
+    local case_dir diag_file log_path
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+    diag_file="${case_dir}/startup_failure_diagnostics.txt"
+    log_path=""
+    if [ -f "${case_dir}/log_path.txt" ]; then
+        log_path="$(cat "${case_dir}/log_path.txt" 2>/dev/null || true)"
+    fi
+
+    {
+        echo "Console E2E server startup failure diagnostics"
+        echo "=============================================="
+        echo "timestamp: $(_e2e_now_rfc3339)"
+        echo "label: ${label}"
+        echo "port: ${port}"
+        echo "startup_timeout_seconds: ${startup_timeout_s}"
+        echo "pid: ${pid}"
+        echo "log_path: ${log_path}"
+        echo ""
+        echo "=== startup command ==="
+        if [ -f "${case_dir}/command.txt" ]; then
+            cat "${case_dir}/command.txt"
+        else
+            echo "(command file missing)"
+        fi
+        echo ""
+        echo "=== process status ==="
+        if [ -n "${pid}" ]; then
+            ps -p "${pid}" -o pid=,ppid=,etime=,stat=,args= 2>/dev/null || echo "(process not running)"
+        else
+            echo "(no pid)"
+        fi
+        echo ""
+        echo "=== server transcript tail (last 200 lines) ==="
+        if [ -n "${log_path}" ] && [ -f "${log_path}" ]; then
+            tail -n 200 "${log_path}"
+        else
+            echo "(log path missing or unreadable)"
+        fi
+        echo ""
+        echo "=== listeners ==="
+        ss -tlnp 2>/dev/null | head -40 || netstat -tlnp 2>/dev/null | head -40 || echo "(unable to inspect listeners)"
+    } > "${diag_file}"
+
+    e2e_save_artifact "${case_id}_startup_failure_diagnostics.txt" "$(cat "${diag_file}" 2>/dev/null || true)"
+}
+
 start_server_pty() {
     local label="$1"
     local port="$2"
@@ -233,31 +352,47 @@ start_server_pty() {
     local storage_root="$4"
     local bin="$5"
     shift 5
+    local -a env_overrides=("$@")
 
     local typescript="${E2E_ARTIFACT_DIR}/server_${label}.typescript"
     e2e_log "Starting PTY server (${label}): 127.0.0.1:${port}"
     e2e_log "  typescript: ${typescript}"
 
     local timeout_s="${AM_E2E_SERVER_TIMEOUT_S:-15}"
+    local started_ms="$(_e2e_now_ms)"
+    local -a cmd_parts=(
+        env
+        "DATABASE_URL=sqlite:////${db_path}"
+        "STORAGE_ROOT=${storage_root}"
+        "HTTP_HOST=127.0.0.1"
+        "HTTP_PORT=${port}"
+        "HTTP_RBAC_ENABLED=0"
+        "HTTP_RATE_LIMIT_ENABLED=0"
+        "HTTP_JWT_ENABLED=0"
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0"
+    )
+    local override
+    for override in "${env_overrides[@]}"; do
+        cmd_parts+=("${override}")
+    done
+    cmd_parts+=(timeout "${timeout_s}s" "${bin}" serve --host 127.0.0.1 --port "${port}")
+    local server_cmd=""
+    local part
+    for part in "${cmd_parts[@]}"; do
+        printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
+    done
+    server_cmd="${server_cmd# }"
 
     # Run the server in a PTY so stdout/stderr are treated as a real terminal.
     # Use `timeout` to guarantee the process eventually exits even if a test fails.
     (
-        script -q -f -c "env \
-DATABASE_URL=sqlite:////${db_path} \
-STORAGE_ROOT=${storage_root} \
-HTTP_HOST=127.0.0.1 \
-HTTP_PORT=${port} \
-HTTP_RBAC_ENABLED=0 \
-HTTP_RATE_LIMIT_ENABLED=0 \
-HTTP_JWT_ENABLED=0 \
-HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0 \
-${*} \
-timeout ${timeout_s}s ${bin} serve --host 127.0.0.1 --port ${port}" \
+        script -q -f -c "${server_cmd}" \
             "${typescript}"
     ) >/dev/null 2>&1 &
 
-    echo $!
+    local pid="$!"
+    startup_write_start_artifacts "${label}" "${started_ms}" "${pid}" "${typescript}" "pty" "${server_cmd}"
+    echo "${pid}"
 }
 
 stop_server_pty() {
@@ -267,6 +402,23 @@ stop_server_pty() {
         sleep 0.2
         kill -9 "${pid}" 2>/dev/null || true
     fi
+}
+
+wait_for_server_start_or_fail() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local fatal_msg="$4"
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+
+    if ! e2e_wait_port 127.0.0.1 "${port}" "${startup_timeout_s}"; then
+        startup_finalize_artifacts "${label}" "failed" "port did not open within ${startup_timeout_s}s"
+        startup_write_failure_diagnostics "${label}" "${pid}" "${port}" "${startup_timeout_s}"
+        stop_server_pty "${pid}"
+        e2e_fatal "${fatal_msg}"
+    fi
+
+    startup_finalize_artifacts "${label}" "ready" "port opened at http://127.0.0.1:${port}"
 }
 
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
@@ -279,10 +431,7 @@ mkdir -p "${STORAGE1}"
 PORT1="$(pick_port)"
 
 PID1="$(start_server_pty "default_rich" "${PORT1}" "${DB1}" "${STORAGE1}" "${BIN}")"
-if ! e2e_wait_port 127.0.0.1 "${PORT1}" 10; then
-    stop_server_pty "${PID1}"
-    e2e_fatal "server failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "default_rich" "${PID1}" "${PORT1}" "server failed to start (port not open)"
 sleep 0.6
 stop_server_pty "${PID1}"
 sleep 0.3
@@ -301,10 +450,7 @@ mkdir -p "${STORAGE2}"
 PORT2="$(pick_port)"
 
 PID2="$(start_server_pty "no_rich" "${PORT2}" "${DB2}" "${STORAGE2}" "${BIN}" "LOG_RICH_ENABLED=false")"
-if ! e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
-    stop_server_pty "${PID2}"
-    e2e_fatal "server failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "no_rich" "${PID2}" "${PORT2}" "server failed to start (port not open)"
 sleep 0.6
 stop_server_pty "${PID2}"
 sleep 0.3
@@ -329,10 +475,7 @@ CONSOLE_THEME=darcula
 EOF
 
 PID3="$(start_server_pty "persisted" "${PORT3}" "${DB3}" "${STORAGE3}" "${BIN}" "CONSOLE_PERSIST_PATH=${PERSIST_ENV}")"
-if ! e2e_wait_port 127.0.0.1 "${PORT3}" 10; then
-    stop_server_pty "${PID3}"
-    e2e_fatal "server failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "persisted" "${PID3}" "${PORT3}" "server failed to start (port not open)"
 sleep 0.6
 stop_server_pty "${PID3}"
 sleep 0.3
@@ -359,10 +502,7 @@ PIDT1="$(start_server_pty "tool_calls_on" "${PORTT}" "${DBT}" "${STORAGET}" "${B
     "TOOLS_LOG_ENABLED=true" \
     "LOG_TOOL_CALLS_ENABLED=true" \
 )"
-if ! e2e_wait_port 127.0.0.1 "${PORTT}" 10; then
-    stop_server_pty "${PIDT1}"
-    e2e_fatal "server failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "tool_calls_on" "${PIDT1}" "${PORTT}" "server failed to start (port not open)"
 PAYLOAD_HC="$(jsonrpc_tools_call_payload "health_check" "{}")"
 http_post_json "tool_calls_on_health_check" "${API_URLT}" "${PAYLOAD_HC}" "${AUTHZ_T}"
 e2e_assert_file_contains "health_check call returns 200" "${E2E_ARTIFACT_DIR}/tool_calls_on_health_check_status.txt" "200"
@@ -383,10 +523,7 @@ PIDT2="$(start_server_pty "tool_calls_off" "${PORTT2}" "${DBT}" "${STORAGET}" "$
     "TOOLS_LOG_ENABLED=true" \
     "LOG_TOOL_CALLS_ENABLED=false" \
 )"
-if ! e2e_wait_port 127.0.0.1 "${PORTT2}" 10; then
-    stop_server_pty "${PIDT2}"
-    e2e_fatal "server failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "tool_calls_off" "${PIDT2}" "${PORTT2}" "server failed to start (port not open)"
 PAYLOAD_HC2="$(jsonrpc_tools_call_payload "health_check" "{}")"
 http_post_json "tool_calls_off_health_check" "${API_URLT2}" "${PAYLOAD_HC2}" "${AUTHZ_T}"
 e2e_assert_file_contains "health_check call returns 200 (tool call panels off)" "${E2E_ARTIFACT_DIR}/tool_calls_off_health_check_status.txt" "200"
@@ -409,10 +546,7 @@ URLR_BASE="http://127.0.0.1:${PORTR}"
 PIDR="$(start_server_pty "request_panel" "${PORTR}" "${DBR}" "${STORAGER}" "${BIN}" \
     "HTTP_REQUEST_LOG_ENABLED=true" \
 )"
-if ! e2e_wait_port 127.0.0.1 "${PORTR}" 10; then
-    stop_server_pty "${PIDR}"
-    e2e_fatal "server failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "request_panel" "${PIDR}" "${PORTR}" "server failed to start (port not open)"
 http_request "request_panel_health_liveness" "GET" "${URLR_BASE}/health/liveness"
 e2e_assert_file_contains "GET /health/liveness returns 200" "${E2E_ARTIFACT_DIR}/request_panel_health_liveness_status.txt" "200"
 sleep 0.6
@@ -435,10 +569,7 @@ PIDS="$(start_server_pty "left_split" "${PORTS}" "${DBS}" "${STORAGES}" "${BIN}"
     "CONSOLE_SPLIT_MODE=left" \
     "CONSOLE_SPLIT_RATIO_PERCENT=30" \
 )"
-if ! e2e_wait_port 127.0.0.1 "${PORTS}" 10; then
-    stop_server_pty "${PIDS}"
-    e2e_fatal "server failed to start (port not open)"
-fi
+wait_for_server_start_or_fail "left_split" "${PIDS}" "${PORTS}" "server failed to start (port not open)"
 sleep 0.8
 stop_server_pty "${PIDS}"
 sleep 0.3

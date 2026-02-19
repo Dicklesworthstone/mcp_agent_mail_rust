@@ -73,13 +73,9 @@ pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
-/// Currently `SqliteConnection` (C-backed `SQLite`).  The MVCC infrastructure
-/// (`begin_concurrent_tx`, retry helpers, `FSQLITE_CONCURRENT_*` config) is
-/// ready for a one-line switch to `FrankenConnection` once frankensqlite's
-/// INSERT codegen supports `INSERT ... VALUES` with explicit column lists
-/// (currently returns "not implemented: INSERT ... SELECT with VALUES body").
+/// Runtime DB traffic uses `FrankenConnection` to enable pure-Rust `SQLite` with
+/// `BEGIN CONCURRENT` write paths.
 ///
-/// The `begin_concurrent_tx` helper already falls back to `BEGIN IMMEDIATE`
-/// when the backend does not support `BEGIN CONCURRENT`, so this alias can
-/// be changed without modifying any transaction call-sites.
-pub type DbConn = sqlmodel_sqlite::SqliteConnection;
+/// C-backed `sqlmodel_sqlite::SqliteConnection` remains available for any
+/// explicitly isolated legacy/offline paths while they are being migrated.
+pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;

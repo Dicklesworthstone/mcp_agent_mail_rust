@@ -2627,9 +2627,18 @@ mod tests {
 
     #[test]
     fn severity_filter_next_cycles() {
-        assert_eq!(AnalyticsSeverityFilter::All.next(), AnalyticsSeverityFilter::HighAndUp);
-        assert_eq!(AnalyticsSeverityFilter::HighAndUp.next(), AnalyticsSeverityFilter::CriticalOnly);
-        assert_eq!(AnalyticsSeverityFilter::CriticalOnly.next(), AnalyticsSeverityFilter::All);
+        assert_eq!(
+            AnalyticsSeverityFilter::All.next(),
+            AnalyticsSeverityFilter::HighAndUp
+        );
+        assert_eq!(
+            AnalyticsSeverityFilter::HighAndUp.next(),
+            AnalyticsSeverityFilter::CriticalOnly
+        );
+        assert_eq!(
+            AnalyticsSeverityFilter::CriticalOnly.next(),
+            AnalyticsSeverityFilter::All
+        );
     }
 
     #[test]
@@ -2662,9 +2671,18 @@ mod tests {
 
     #[test]
     fn sort_mode_next_cycles() {
-        assert_eq!(AnalyticsSortMode::Priority.next(), AnalyticsSortMode::Severity);
-        assert_eq!(AnalyticsSortMode::Severity.next(), AnalyticsSortMode::Confidence);
-        assert_eq!(AnalyticsSortMode::Confidence.next(), AnalyticsSortMode::Priority);
+        assert_eq!(
+            AnalyticsSortMode::Priority.next(),
+            AnalyticsSortMode::Severity
+        );
+        assert_eq!(
+            AnalyticsSortMode::Severity.next(),
+            AnalyticsSortMode::Confidence
+        );
+        assert_eq!(
+            AnalyticsSortMode::Confidence.next(),
+            AnalyticsSortMode::Priority
+        );
     }
 
     #[test]
@@ -2692,12 +2710,18 @@ mod tests {
 
     #[test]
     fn severity_rank_descending() {
-        assert!(AnalyticsScreen::severity_rank(AnomalySeverity::Critical)
-            > AnalyticsScreen::severity_rank(AnomalySeverity::High));
-        assert!(AnalyticsScreen::severity_rank(AnomalySeverity::High)
-            > AnalyticsScreen::severity_rank(AnomalySeverity::Medium));
-        assert!(AnalyticsScreen::severity_rank(AnomalySeverity::Medium)
-            > AnalyticsScreen::severity_rank(AnomalySeverity::Low));
+        assert!(
+            AnalyticsScreen::severity_rank(AnomalySeverity::Critical)
+                > AnalyticsScreen::severity_rank(AnomalySeverity::High)
+        );
+        assert!(
+            AnalyticsScreen::severity_rank(AnomalySeverity::High)
+                > AnalyticsScreen::severity_rank(AnomalySeverity::Medium)
+        );
+        assert!(
+            AnalyticsScreen::severity_rank(AnomalySeverity::Medium)
+                > AnalyticsScreen::severity_rank(AnomalySeverity::Low)
+        );
     }
 
     // ── format_error_rate_percent ──────────────────────────────────────
@@ -2804,9 +2828,9 @@ mod tests {
         };
         screen.sort_mode = AnalyticsSortMode::Severity;
         let active = screen.active_cards();
-        assert_eq!(active[0].id, "crit");   // rank 4
-        assert_eq!(active[1].id, "med");   // rank 2
-        assert_eq!(active[2].id, "low");   // rank 1
+        assert_eq!(active[0].id, "crit"); // rank 4
+        assert_eq!(active[1].id, "med"); // rank 2
+        assert_eq!(active[2].id, "low"); // rank 1
     }
 
     // ── cycle_severity_filter / cycle_sort_mode ────────────────────────
@@ -2818,7 +2842,10 @@ mod tests {
         screen.cycle_severity_filter();
         assert_eq!(screen.severity_filter, AnalyticsSeverityFilter::HighAndUp);
         screen.cycle_severity_filter();
-        assert_eq!(screen.severity_filter, AnalyticsSeverityFilter::CriticalOnly);
+        assert_eq!(
+            screen.severity_filter,
+            AnalyticsSeverityFilter::CriticalOnly
+        );
         screen.cycle_severity_filter();
         assert_eq!(screen.severity_filter, AnalyticsSeverityFilter::All);
     }
@@ -2973,16 +3000,10 @@ mod tests {
         screen.focus = AnalyticsFocus::Detail;
         screen.detail_scroll = 0;
 
-        screen.update(
-            &Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))),
-            &state,
-        );
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
         assert_eq!(screen.detail_scroll, 5);
 
-        screen.update(
-            &Event::Key(ftui::KeyEvent::new(KeyCode::Char('K'))),
-            &state,
-        );
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('K'))), &state);
         assert_eq!(screen.detail_scroll, 0);
     }
 }

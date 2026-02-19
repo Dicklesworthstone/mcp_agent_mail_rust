@@ -2124,7 +2124,11 @@ exit 1
 
     #[test]
     fn duration_class_serde_roundtrip() {
-        for variant in [DurationClass::Fast, DurationClass::Normal, DurationClass::Slow] {
+        for variant in [
+            DurationClass::Fast,
+            DurationClass::Normal,
+            DurationClass::Slow,
+        ] {
             let json = serde_json::to_string(&variant).unwrap();
             let back: DurationClass = serde_json::from_str(&json).unwrap();
             assert_eq!(back, variant);
@@ -2133,9 +2137,18 @@ exit 1
 
     #[test]
     fn duration_class_serde_rename_all_lowercase() {
-        assert_eq!(serde_json::to_string(&DurationClass::Fast).unwrap(), "\"fast\"");
-        assert_eq!(serde_json::to_string(&DurationClass::Normal).unwrap(), "\"normal\"");
-        assert_eq!(serde_json::to_string(&DurationClass::Slow).unwrap(), "\"slow\"");
+        assert_eq!(
+            serde_json::to_string(&DurationClass::Fast).unwrap(),
+            "\"fast\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DurationClass::Normal).unwrap(),
+            "\"normal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DurationClass::Slow).unwrap(),
+            "\"slow\""
+        );
     }
 
     // ── classify_duration comprehensive ──────────────────────────────────
@@ -2216,7 +2229,10 @@ exit 1
     fn matches_pattern_double_wildcard_falls_through_to_substring() {
         // "*guard*" splits into 3 parts so the 2-part wildcard logic doesn't apply
         // Falls through to substring check: name.contains("*guard*") which is false
-        assert!(!SuiteRegistry::matches_pattern("test_guard_extra", "*guard*"));
+        assert!(!SuiteRegistry::matches_pattern(
+            "test_guard_extra",
+            "*guard*"
+        ));
     }
 
     #[test]
@@ -2263,12 +2279,18 @@ exit 1
 
     #[test]
     fn parse_assertions_case_insensitive() {
-        assert_eq!(Runner::parse_assertions("PASS: 5  FAIL: 2  SKIP: 1"), (5, 2, 1));
+        assert_eq!(
+            Runner::parse_assertions("PASS: 5  FAIL: 2  SKIP: 1"),
+            (5, 2, 1)
+        );
     }
 
     #[test]
     fn parse_assertions_mixed_case() {
-        assert_eq!(Runner::parse_assertions("pass: 8  fail: 0  skip: 3"), (8, 0, 3));
+        assert_eq!(
+            Runner::parse_assertions("pass: 8  fail: 0  skip: 3"),
+            (8, 0, 3)
+        );
     }
 
     #[test]
@@ -2495,7 +2517,7 @@ exit 1
             "#!/usr/bin/env bash\n# source e2e_lib.sh\n# Real description\n",
         )
         .unwrap();
-        let (desc, tags) = SuiteRegistry::extract_metadata(&script);
+        let (desc, _tags) = SuiteRegistry::extract_metadata(&script);
         assert_eq!(desc.as_deref(), Some("Real description"));
     }
 
@@ -2582,10 +2604,9 @@ exit 1
         assert!(root.join("steps/step_001.json").exists());
         assert!(!root.join("failures/fail_001.json").exists());
 
-        let step: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("steps/step_001.json")).unwrap(),
-        )
-        .unwrap();
+        let step: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("steps/step_001.json")).unwrap())
+                .unwrap();
         assert_eq!(step["passed"], true);
         assert_eq!(step["actual_exit_code"], 0);
     }
@@ -2594,7 +2615,16 @@ exit 1
     fn write_dual_mode_step_artifact_none_root_is_noop() {
         let mut step_index = 0usize;
         Runner::write_dual_mode_step_artifact(
-            &None, &mut step_index, "am", "cmd", "cli", "allow", 0, "", "", true,
+            &None,
+            &mut step_index,
+            "am",
+            "cmd",
+            "cli",
+            "allow",
+            0,
+            "",
+            "",
+            true,
         );
         // step_index not incremented when root is None
         assert_eq!(step_index, 0);
@@ -2605,9 +2635,13 @@ exit 1
     #[test]
     fn run_report_exit_code_zero_on_success() {
         let r = RunReport {
-            total: 1, passed: 1, failed: 0, skipped: 0,
+            total: 1,
+            passed: 1,
+            failed: 0,
+            skipped: 0,
             duration_ms: 0,
-            started_at: String::new(), ended_at: String::new(),
+            started_at: String::new(),
+            ended_at: String::new(),
             results: vec![],
         };
         assert_eq!(r.exit_code(), 0);
@@ -2616,9 +2650,13 @@ exit 1
     #[test]
     fn run_report_exit_code_one_on_failure() {
         let r = RunReport {
-            total: 2, passed: 1, failed: 1, skipped: 0,
+            total: 2,
+            passed: 1,
+            failed: 1,
+            skipped: 0,
             duration_ms: 0,
-            started_at: String::new(), ended_at: String::new(),
+            started_at: String::new(),
+            ended_at: String::new(),
             results: vec![],
         };
         assert_eq!(r.exit_code(), 1);

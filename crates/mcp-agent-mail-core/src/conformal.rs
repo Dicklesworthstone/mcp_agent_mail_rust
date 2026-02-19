@@ -525,19 +525,20 @@ mod tests {
         );
     }
 
-    /// Exactly MIN_CALIBRATION observations: interval is available.
+    /// Exactly `MIN_CALIBRATION` observations: interval is available.
     #[test]
     fn conformal_exactly_min_calibration() {
         let mut predictor = ConformalPredictor::new(100, 0.90);
         for i in 0..MIN_CALIBRATION {
-            predictor.observe(f64::from(i as i32));
+            #[allow(clippy::cast_precision_loss)] // MIN_CALIBRATION is 30, well within f64 mantissa
+            predictor.observe(i as f64);
         }
         assert_eq!(predictor.calibration_size(), MIN_CALIBRATION);
         let interval = predictor.predict().unwrap();
         assert_eq!(interval.calibration_size, MIN_CALIBRATION);
     }
 
-    /// Window size of exactly 1 never produces a prediction (< MIN_CALIBRATION).
+    /// Window size of exactly 1 never produces a prediction (< `MIN_CALIBRATION`).
     #[test]
     fn conformal_tiny_window() {
         let mut predictor = ConformalPredictor::new(1, 0.90);

@@ -566,9 +566,10 @@ mod tests {
 
     #[test]
     fn golden_command_spec_serde_roundtrip() {
-        let spec = GoldenCommandSpec::new("test.golden", vec!["echo".to_string(), "hello".to_string()])
-            .expected_exit_code(0)
-            .stream(GoldenStream::Stdout);
+        let spec =
+            GoldenCommandSpec::new("test.golden", vec!["echo".to_string(), "hello".to_string()])
+                .expected_exit_code(0)
+                .stream(GoldenStream::Stdout);
 
         let json = serde_json::to_string(&spec).unwrap();
         let back: GoldenCommandSpec = serde_json::from_str(&json).unwrap();
@@ -598,7 +599,10 @@ mod tests {
             stderr: "err\n".to_string(),
             exit_code: 0,
         };
-        assert_eq!(select_stream_output(GoldenStream::Stdout, &captured), "out\n");
+        assert_eq!(
+            select_stream_output(GoldenStream::Stdout, &captured),
+            "out\n"
+        );
     }
 
     #[test]
@@ -608,7 +612,10 @@ mod tests {
             stderr: "err\n".to_string(),
             exit_code: 0,
         };
-        assert_eq!(select_stream_output(GoldenStream::Stderr, &captured), "err\n");
+        assert_eq!(
+            select_stream_output(GoldenStream::Stderr, &captured),
+            "err\n"
+        );
     }
 
     #[test]

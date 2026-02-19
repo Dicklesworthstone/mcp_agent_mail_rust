@@ -61,6 +61,125 @@ PY
 # Helpers
 # ---------------------------------------------------------------------------
 
+startup_case_dir() {
+    local label="$1"
+    printf '%s\n' "${E2E_ARTIFACT_DIR}/server_startup_${label}"
+}
+
+startup_write_start_artifacts() {
+    local label="$1"
+    local started_ms="$2"
+    local pid="$3"
+    local log_path="$4"
+    local mode="$5"
+    local command_text="$6"
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+
+    local case_id="server_startup_${label}"
+    local case_dir
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+
+    printf '%s\n' "${command_text}" > "${case_dir}/command.txt"
+    printf '%s\n' "${started_ms}" > "${case_dir}/start_ms.txt"
+    printf '%s\n' "${pid}" > "${case_dir}/pid.txt"
+    printf '%s\n' "${log_path}" > "${case_dir}/log_path.txt"
+    printf '%s\n' "${mode}" > "${case_dir}/mode.txt"
+    printf '%s\n' "${startup_timeout_s}" > "${case_dir}/startup_timeout_seconds.txt"
+
+    e2e_save_artifact "${case_id}_command.txt" "${command_text}"
+    e2e_save_artifact "${case_id}_pid.txt" "${pid}"
+    e2e_save_artifact "${case_id}_log_path.txt" "${log_path}"
+    e2e_save_artifact "${case_id}_mode.txt" "${mode}"
+    e2e_save_artifact "${case_id}_startup_timeout_seconds.txt" "${startup_timeout_s}"
+}
+
+startup_finalize_artifacts() {
+    local label="$1"
+    local status="$2"
+    local detail="${3:-}"
+
+    local case_id="server_startup_${label}"
+    local case_dir
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+
+    local finished_ms elapsed_ms started_ms
+    finished_ms="$(_e2e_now_ms)"
+    elapsed_ms=0
+    started_ms=0
+
+    if [ -f "${case_dir}/start_ms.txt" ]; then
+        started_ms="$(cat "${case_dir}/start_ms.txt" 2>/dev/null || echo 0)"
+    fi
+    if [[ "${started_ms}" =~ ^[0-9]+$ ]] && [ "${started_ms}" -gt 0 ]; then
+        elapsed_ms=$(( finished_ms - started_ms ))
+    fi
+
+    printf '%s\n' "${status}" > "${case_dir}/status.txt"
+    printf '%s\n' "${detail}" > "${case_dir}/detail.txt"
+    printf '%s\n' "${finished_ms}" > "${case_dir}/finished_ms.txt"
+    printf '%s\n' "${elapsed_ms}" > "${case_dir}/startup_elapsed_ms.txt"
+
+    e2e_save_artifact "${case_id}_status.txt" "${status}"
+    e2e_save_artifact "${case_id}_detail.txt" "${detail}"
+    e2e_save_artifact "${case_id}_startup_elapsed_ms.txt" "${elapsed_ms}"
+}
+
+startup_write_failure_diagnostics() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local startup_timeout_s="$4"
+
+    local case_id="server_startup_${label}"
+    local case_dir diag_file log_path
+    case_dir="$(startup_case_dir "${label}")"
+    mkdir -p "${case_dir}"
+    diag_file="${case_dir}/startup_failure_diagnostics.txt"
+    log_path=""
+    if [ -f "${case_dir}/log_path.txt" ]; then
+        log_path="$(cat "${case_dir}/log_path.txt" 2>/dev/null || true)"
+    fi
+
+    {
+        echo "MCP/API parity server startup failure diagnostics"
+        echo "==============================================="
+        echo "timestamp: $(_e2e_now_rfc3339)"
+        echo "label: ${label}"
+        echo "port: ${port}"
+        echo "startup_timeout_seconds: ${startup_timeout_s}"
+        echo "pid: ${pid}"
+        echo "log_path: ${log_path}"
+        echo ""
+        echo "=== startup command ==="
+        if [ -f "${case_dir}/command.txt" ]; then
+            cat "${case_dir}/command.txt"
+        else
+            echo "(command file missing)"
+        fi
+        echo ""
+        echo "=== process status ==="
+        if [ -n "${pid}" ]; then
+            ps -p "${pid}" -o pid=,ppid=,etime=,stat=,args= 2>/dev/null || echo "(process not running)"
+        else
+            echo "(no pid)"
+        fi
+        echo ""
+        echo "=== server log tail (last 200 lines) ==="
+        if [ -n "${log_path}" ] && [ -f "${log_path}" ]; then
+            tail -n 200 "${log_path}"
+        else
+            echo "(log path missing or unreadable)"
+        fi
+        echo ""
+        echo "=== listeners ==="
+        ss -tlnp 2>/dev/null | head -40 || netstat -tlnp 2>/dev/null | head -40 || echo "(unable to inspect listeners)"
+    } > "${diag_file}"
+
+    e2e_save_artifact "${case_id}_startup_failure_diagnostics.txt" "$(cat "${diag_file}" 2>/dev/null || true)"
+}
+
 start_server() {
     local label="$1"
     local port="$2"
@@ -68,9 +187,34 @@ start_server() {
     local storage_root="$4"
     local bin="$5"
     shift 5
+    local -a env_overrides=("$@")
+    local timeout_s=20
 
     local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
     e2e_log "Starting server (${label}): 127.0.0.1:${port}"
+    local started_ms="$(_e2e_now_ms)"
+    local -a cmd_parts=(
+        env
+        "DATABASE_URL=sqlite:////${db_path}"
+        "STORAGE_ROOT=${storage_root}"
+        "HTTP_HOST=127.0.0.1"
+        "HTTP_PORT=${port}"
+        "HTTP_RBAC_ENABLED=0"
+        "HTTP_RATE_LIMIT_ENABLED=0"
+        "HTTP_JWT_ENABLED=0"
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1"
+    )
+    local override
+    for override in "${env_overrides[@]}"; do
+        cmd_parts+=("${override}")
+    done
+    cmd_parts+=(timeout "${timeout_s}s" "${bin}" serve --host 127.0.0.1 --port "${port}" --no-tui)
+    local server_cmd=""
+    local part
+    for part in "${cmd_parts[@]}"; do
+        printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
+    done
+    server_cmd="${server_cmd# }"
 
     (
         export DATABASE_URL="sqlite:////${db_path}"
@@ -82,14 +226,15 @@ start_server() {
         export HTTP_JWT_ENABLED=0
         export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1
 
-        while [ $# -gt 0 ]; do
-            export "$1"
-            shift
+        for override in "${env_overrides[@]}"; do
+            export "${override}"
         done
 
-        timeout 20s "${bin}" serve --host 127.0.0.1 --port "${port}" --no-tui
+        timeout "${timeout_s}s" "${bin}" serve --host 127.0.0.1 --port "${port}" --no-tui
     ) >"${server_log}" 2>&1 &
-    echo $!
+    local pid="$!"
+    startup_write_start_artifacts "${label}" "${started_ms}" "${pid}" "${server_log}" "headless" "${server_cmd}"
+    echo "${pid}"
 }
 
 stop_server() {
@@ -99,6 +244,28 @@ stop_server() {
         sleep 0.2
         kill -9 "${pid}" 2>/dev/null || true
     fi
+}
+
+wait_for_server_start_or_fail() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local fatal_msg="$4"
+    shift 4 || true
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+
+    if ! e2e_wait_port 127.0.0.1 "${port}" "${startup_timeout_s}"; then
+        startup_finalize_artifacts "${label}" "failed" "port did not open within ${startup_timeout_s}s"
+        startup_write_failure_diagnostics "${label}" "${pid}" "${port}" "${startup_timeout_s}"
+        stop_server "${pid}"
+        while [ "$#" -gt 0 ]; do
+            stop_server "$1"
+            shift
+        done
+        e2e_fatal "${fatal_msg}"
+    fi
+
+    startup_finalize_artifacts "${label}" "ready" "port opened at http://127.0.0.1:${port}"
 }
 
 http_request() {
@@ -387,8 +554,8 @@ PORT_API="$(pick_port)"
 PID_MCP="$(start_server "mcp_mode" "${PORT_MCP}" "${DB1}" "${STORAGE1}" "${BIN}" "HTTP_PATH=/mcp/")"
 PID_API="$(start_server "api_mode" "${PORT_API}" "${DB1}" "${STORAGE1}" "${BIN}" "HTTP_PATH=/api/")"
 
-e2e_wait_port 127.0.0.1 "${PORT_MCP}" 10 || { stop_server "${PID_MCP}"; stop_server "${PID_API}"; e2e_fatal "MCP server failed to start"; }
-e2e_wait_port 127.0.0.1 "${PORT_API}" 10 || { stop_server "${PID_MCP}"; stop_server "${PID_API}"; e2e_fatal "API server failed to start"; }
+wait_for_server_start_or_fail "mcp_mode" "${PID_MCP}" "${PORT_MCP}" "MCP server failed to start" "${PID_API}"
+wait_for_server_start_or_fail "api_mode" "${PID_API}" "${PORT_API}" "API server failed to start" "${PID_MCP}"
 
 PAYLOAD_TL="$(jsonrpc_tools_list_payload)"
 http_post_json "c1_mcp_tools_list" "http://127.0.0.1:${PORT_MCP}/mcp/" "${PAYLOAD_TL}"
@@ -428,8 +595,8 @@ PORT_API2="$(pick_port)"
 PID_MCP2="$(start_server "mcp_res" "${PORT_MCP2}" "${DB2}" "${STORAGE2}" "${BIN}" "HTTP_PATH=/mcp/")"
 PID_API2="$(start_server "api_res" "${PORT_API2}" "${DB2}" "${STORAGE2}" "${BIN}" "HTTP_PATH=/api/")"
 
-e2e_wait_port 127.0.0.1 "${PORT_MCP2}" 10 || { stop_server "${PID_MCP2}"; stop_server "${PID_API2}"; e2e_fatal "MCP res server failed"; }
-e2e_wait_port 127.0.0.1 "${PORT_API2}" 10 || { stop_server "${PID_MCP2}"; stop_server "${PID_API2}"; e2e_fatal "API res server failed"; }
+wait_for_server_start_or_fail "mcp_res" "${PID_MCP2}" "${PORT_MCP2}" "MCP res server failed" "${PID_API2}"
+wait_for_server_start_or_fail "api_res" "${PID_API2}" "${PORT_API2}" "API res server failed" "${PID_MCP2}"
 
 PAYLOAD_RL="$(jsonrpc_resources_list_payload)"
 http_post_json "c2_mcp_res_list" "http://127.0.0.1:${PORT_MCP2}/mcp/" "${PAYLOAD_RL}"
@@ -466,8 +633,8 @@ PORT_API3="$(pick_port)"
 PID_MCP3="$(start_server "mcp_tools" "${PORT_MCP3}" "${DB3_MCP}" "${STORAGE3_MCP}" "${BIN}" "HTTP_PATH=/mcp/")"
 PID_API3="$(start_server "api_tools" "${PORT_API3}" "${DB3_API}" "${STORAGE3_API}" "${BIN}" "HTTP_PATH=/api/")"
 
-e2e_wait_port 127.0.0.1 "${PORT_MCP3}" 10 || { stop_server "${PID_MCP3}"; stop_server "${PID_API3}"; e2e_fatal "MCP tools server failed"; }
-e2e_wait_port 127.0.0.1 "${PORT_API3}" 10 || { stop_server "${PID_MCP3}"; stop_server "${PID_API3}"; e2e_fatal "API tools server failed"; }
+wait_for_server_start_or_fail "mcp_tools" "${PID_MCP3}" "${PORT_MCP3}" "MCP tools server failed" "${PID_API3}"
+wait_for_server_start_or_fail "api_tools" "${PID_API3}" "${PORT_API3}" "API tools server failed" "${PID_MCP3}"
 
 # ensure_project
 EP_ARGS='{"human_key":"/tmp/e2e_parity_project"}'
@@ -540,7 +707,7 @@ PORT_ALIAS="$(pick_port)"
 
 # Start with MCP path
 PID_ALIAS="$(start_server "alias_mcp" "${PORT_ALIAS}" "${DB4}" "${STORAGE4}" "${BIN}" "HTTP_PATH=/mcp/")"
-e2e_wait_port 127.0.0.1 "${PORT_ALIAS}" 10 || { stop_server "${PID_ALIAS}"; e2e_fatal "alias server failed"; }
+wait_for_server_start_or_fail "alias_mcp" "${PID_ALIAS}" "${PORT_ALIAS}" "alias server failed"
 
 # /mcp/ should respond
 http_post_json "c4_primary_mcp" "http://127.0.0.1:${PORT_ALIAS}/mcp/" "${PAYLOAD_TL}"
@@ -563,7 +730,7 @@ sleep 0.3
 # Now start with API path and verify /mcp/ alias works
 PORT_ALIAS2="$(pick_port)"
 PID_ALIAS2="$(start_server "alias_api" "${PORT_ALIAS2}" "${DB4}" "${STORAGE4}" "${BIN}" "HTTP_PATH=/api/")"
-e2e_wait_port 127.0.0.1 "${PORT_ALIAS2}" 10 || { stop_server "${PID_ALIAS2}"; e2e_fatal "alias api server failed"; }
+wait_for_server_start_or_fail "alias_api" "${PID_ALIAS2}" "${PORT_ALIAS2}" "alias api server failed"
 
 # /api/ primary responds
 http_post_json "c4_primary_api" "http://127.0.0.1:${PORT_ALIAS2}/api/" "${PAYLOAD_TL}"
@@ -596,6 +763,8 @@ PORT5="$(pick_port)"
 
 # Start with --transport api (should set /api/ path)
 LOG5="${E2E_ARTIFACT_DIR}/server_transport_api.log"
+START5_MS="$(_e2e_now_ms)"
+START5_CMD="env DATABASE_URL=sqlite:////${DB5} STORAGE_ROOT=${STORAGE5} HTTP_HOST=127.0.0.1 HTTP_PORT=${PORT5} HTTP_RBAC_ENABLED=0 HTTP_RATE_LIMIT_ENABLED=0 HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 timeout 15s ${BIN} serve --host 127.0.0.1 --port ${PORT5} --transport api --no-tui"
 (
     export DATABASE_URL="sqlite:////${DB5}"
     export STORAGE_ROOT="${STORAGE5}"
@@ -607,8 +776,9 @@ LOG5="${E2E_ARTIFACT_DIR}/server_transport_api.log"
     timeout 15s "${BIN}" serve --host 127.0.0.1 --port "${PORT5}" --transport api --no-tui
 ) >"${LOG5}" 2>&1 &
 PID5=$!
+startup_write_start_artifacts "transport_api" "${START5_MS}" "${PID5}" "${LOG5}" "headless_manual" "${START5_CMD}"
 
-e2e_wait_port 127.0.0.1 "${PORT5}" 10 || { stop_server "${PID5}"; e2e_fatal "transport api server failed"; }
+wait_for_server_start_or_fail "transport_api" "${PID5}" "${PORT5}" "transport api server failed"
 
 # /api/ should respond
 http_post_json "c5_transport_api" "http://127.0.0.1:${PORT5}/api/" "${PAYLOAD_TL}"
@@ -625,6 +795,8 @@ sleep 0.3
 PORT5M="$(pick_port)"
 DB5M="${WORK5}/db_mcp.sqlite3"
 LOG5M="${E2E_ARTIFACT_DIR}/server_transport_mcp.log"
+START5M_MS="$(_e2e_now_ms)"
+START5M_CMD="env DATABASE_URL=sqlite:////${DB5M} STORAGE_ROOT=${STORAGE5} HTTP_HOST=127.0.0.1 HTTP_PORT=${PORT5M} HTTP_RBAC_ENABLED=0 HTTP_RATE_LIMIT_ENABLED=0 HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 timeout 15s ${BIN} serve --host 127.0.0.1 --port ${PORT5M} --transport mcp --no-tui"
 (
     export DATABASE_URL="sqlite:////${DB5M}"
     export STORAGE_ROOT="${STORAGE5}"
@@ -636,8 +808,9 @@ LOG5M="${E2E_ARTIFACT_DIR}/server_transport_mcp.log"
     timeout 15s "${BIN}" serve --host 127.0.0.1 --port "${PORT5M}" --transport mcp --no-tui
 ) >"${LOG5M}" 2>&1 &
 PID5M=$!
+startup_write_start_artifacts "transport_mcp" "${START5M_MS}" "${PID5M}" "${LOG5M}" "headless_manual" "${START5M_CMD}"
 
-e2e_wait_port 127.0.0.1 "${PORT5M}" 10 || { stop_server "${PID5M}"; e2e_fatal "transport mcp server failed"; }
+wait_for_server_start_or_fail "transport_mcp" "${PID5M}" "${PORT5M}" "transport mcp server failed"
 
 http_post_json "c5_transport_mcp" "http://127.0.0.1:${PORT5M}/mcp/" "${PAYLOAD_TL}"
 S5_MCP="$(cat "${E2E_ARTIFACT_DIR}/c5_transport_mcp_status.txt")"
@@ -660,6 +833,8 @@ mkdir -p "${STORAGE6}"
 
 PORT6="$(pick_port)"
 LOG6="${E2E_ARTIFACT_DIR}/server_path_override.log"
+START6_MS="$(_e2e_now_ms)"
+START6_CMD="env DATABASE_URL=sqlite:////${DB6} STORAGE_ROOT=${STORAGE6} HTTP_HOST=127.0.0.1 HTTP_PORT=${PORT6} HTTP_RBAC_ENABLED=0 HTTP_RATE_LIMIT_ENABLED=0 HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 timeout 15s ${BIN} serve --host 127.0.0.1 --port ${PORT6} --transport mcp --path /custom/ --no-tui"
 (
     export DATABASE_URL="sqlite:////${DB6}"
     export STORAGE_ROOT="${STORAGE6}"
@@ -671,8 +846,9 @@ LOG6="${E2E_ARTIFACT_DIR}/server_path_override.log"
     timeout 15s "${BIN}" serve --host 127.0.0.1 --port "${PORT6}" --transport mcp --path /custom/ --no-tui
 ) >"${LOG6}" 2>&1 &
 PID6=$!
+startup_write_start_artifacts "path_override" "${START6_MS}" "${PID6}" "${LOG6}" "headless_manual" "${START6_CMD}"
 
-e2e_wait_port 127.0.0.1 "${PORT6}" 10 || { stop_server "${PID6}"; e2e_fatal "path override server failed"; }
+wait_for_server_start_or_fail "path_override" "${PID6}" "${PORT6}" "path override server failed"
 
 # /custom/ should respond
 http_post_json "c6_custom_path" "http://127.0.0.1:${PORT6}/custom/" "${PAYLOAD_TL}"
@@ -701,7 +877,7 @@ mkdir -p "${STORAGE7}"
 PORT7="$(pick_port)"
 
 PID7="$(start_server "health_test" "${PORT7}" "${DB7}" "${STORAGE7}" "${BIN}" "HTTP_PATH=/api/")"
-e2e_wait_port 127.0.0.1 "${PORT7}" 10 || { stop_server "${PID7}"; e2e_fatal "health test server failed"; }
+wait_for_server_start_or_fail "health_test" "${PID7}" "${PORT7}" "health test server failed"
 
 # /health/liveness
 if http_request "c7_health_liveness" "GET" "http://127.0.0.1:${PORT7}/health/liveness"; then
@@ -740,8 +916,8 @@ PORT_API8="$(pick_port)"
 PID_MCP8="$(start_server "msg_mcp" "${PORT_MCP8}" "${DB8_MCP}" "${STORAGE8_MCP}" "${BIN}" "HTTP_PATH=/mcp/")"
 PID_API8="$(start_server "msg_api" "${PORT_API8}" "${DB8_API}" "${STORAGE8_API}" "${BIN}" "HTTP_PATH=/api/")"
 
-e2e_wait_port 127.0.0.1 "${PORT_MCP8}" 10 || { stop_server "${PID_MCP8}"; stop_server "${PID_API8}"; e2e_fatal "msg mcp server failed"; }
-e2e_wait_port 127.0.0.1 "${PORT_API8}" 10 || { stop_server "${PID_MCP8}"; stop_server "${PID_API8}"; e2e_fatal "msg api server failed"; }
+wait_for_server_start_or_fail "msg_mcp" "${PID_MCP8}" "${PORT_MCP8}" "msg mcp server failed" "${PID_API8}"
+wait_for_server_start_or_fail "msg_api" "${PID_API8}" "${PORT_API8}" "msg api server failed" "${PID_MCP8}"
 
 # Setup: ensure project + register agents on both
 PROJ_KEY="/tmp/e2e_parity_msg_proj"
@@ -805,7 +981,7 @@ mkdir -p "${STORAGE9}"
 PORT9="$(pick_port)"
 
 PID9="$(start_server "wrong_path" "${PORT9}" "${DB9}" "${STORAGE9}" "${BIN}" "HTTP_PATH=/custom/")"
-e2e_wait_port 127.0.0.1 "${PORT9}" 10 || { stop_server "${PID9}"; e2e_fatal "wrong path server failed"; }
+wait_for_server_start_or_fail "wrong_path" "${PID9}" "${PORT9}" "wrong path server failed"
 
 # /badpath/ should fail (not 200)
 http_post_json "c9_badpath" "http://127.0.0.1:${PORT9}/badpath/" "${PAYLOAD_TL}"

@@ -146,7 +146,7 @@ pub(crate) struct TimelineEntry {
 }
 
 impl RenderItem for TimelineEntry {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
         use ftui::widgets::Widget;
 
         if area.height == 0 || area.width < 10 {
@@ -256,7 +256,7 @@ impl CommitTimelineEntry {
 }
 
 impl RenderItem for CommitTimelineEntry {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
         use ftui::widgets::Widget;
 
         if area.height == 0 || area.width < 10 {
@@ -321,10 +321,10 @@ impl CombinedTimelineRow {
 }
 
 impl RenderItem for CombinedTimelineRow {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, skip_rows: u16) {
         match self {
-            Self::Event(entry) => entry.render(area, frame, selected),
-            Self::Commit(entry) => entry.render(area, frame, selected),
+            Self::Event(entry) => entry.render(area, frame, selected, skip_rows),
+            Self::Commit(entry) => entry.render(area, frame, selected, skip_rows),
         }
     }
 
@@ -4377,7 +4377,7 @@ mod tests {
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 1, &mut pool);
-        entry.render(Rect::new(0, 0, 80, 1), &mut frame, false);
+        entry.render(Rect::new(0, 0, 80, 1), &mut frame, false, 0);
         // Should contain HTTP source badge and Error badge
         let text = buffer_to_text(&frame.buffer);
         assert!(text.contains("HTTP"), "row text: {text}");

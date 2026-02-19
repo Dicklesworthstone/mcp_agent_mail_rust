@@ -1023,12 +1023,14 @@ mod tests {
             // Deref: read through guard
             assert_eq!(guard.len(), 3);
             assert_eq!(guard[0], 1);
+            drop(guard);
         }
         {
             let mut guard = m.lock();
             // DerefMut: write through guard
             guard.push(4);
             assert_eq!(guard.len(), 4);
+            drop(guard);
         }
     }
 
@@ -1038,14 +1040,17 @@ mod tests {
         {
             let guard = rw.read();
             assert_eq!(guard.as_str(), "hello");
+            drop(guard);
         }
         {
             let mut guard = rw.write();
             guard.push_str(" world");
+            drop(guard);
         }
         {
             let guard = rw.read();
             assert_eq!(guard.as_str(), "hello world");
+            drop(guard);
         }
     }
 
@@ -1087,6 +1092,8 @@ mod tests {
         let cloned = entry.clone();
         assert_eq!(cloned.lock_name, "TestLock");
         assert_eq!(cloned.rank, 99);
+        // Use `entry` after clone to prove independent copy.
+        assert_eq!(entry.lock_name, "TestLock");
     }
 
     #[test]
@@ -1094,7 +1101,7 @@ mod tests {
         let a = LockLevel::DbPoolCache;
         let b = a; // Copy
         assert_eq!(a, b);
-        let c = a.clone(); // Clone
+        let c = a; // Copy (also works as Clone)
         assert_eq!(a, c);
         assert_ne!(a, LockLevel::ServerLiveDashboard);
     }

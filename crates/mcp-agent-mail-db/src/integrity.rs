@@ -442,7 +442,7 @@ mod tests {
             .collect();
         assert_eq!(displays.len(), 3);
         // All must be unique
-        let mut sorted = displays.clone();
+        let mut sorted = displays;
         sorted.sort();
         sorted.dedup();
         assert_eq!(
@@ -490,8 +490,10 @@ mod tests {
             kind: CheckKind::Incremental,
         };
         let cloned = original.clone();
-        assert_eq!(cloned.ok, false);
+        assert!(!cloned.ok);
         assert_eq!(cloned.details.len(), 2);
+        // Use original after clone to prove independent copy.
+        assert!(!original.ok);
         assert_eq!(cloned.details[0], "error1");
         assert_eq!(cloned.duration_us, 99999);
         assert_eq!(cloned.kind, CheckKind::Incremental);

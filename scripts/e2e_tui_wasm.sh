@@ -167,6 +167,11 @@ resolve_binary() {
 }
 
 SERVER_PID=""
+SERVER_START_CASE_ID=""
+SERVER_START_CASE_DIR=""
+SERVER_START_STARTED_MS=0
+SERVER_START_LOG_PATH=""
+SERVER_START_DIAG_FILE=""
 stop_server() {
     local pid="$1"
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
@@ -185,31 +190,134 @@ cleanup_server() {
 
 trap cleanup_server EXIT
 
+record_server_start_result() {
+    local status="$1"
+    local detail="${2:-}"
+    local finished_ms elapsed_ms
+
+    if [ -z "${SERVER_START_CASE_DIR}" ]; then
+        return 0
+    fi
+
+    finished_ms="$(_e2e_now_ms)"
+    elapsed_ms=0
+    if [ "${SERVER_START_STARTED_MS:-0}" -gt 0 ]; then
+        elapsed_ms=$(( finished_ms - SERVER_START_STARTED_MS ))
+    fi
+
+    printf '%s\n' "${status}" > "${SERVER_START_CASE_DIR}/status.txt"
+    printf '%s\n' "${detail}" > "${SERVER_START_CASE_DIR}/detail.txt"
+    printf '%s\n' "${finished_ms}" > "${SERVER_START_CASE_DIR}/finished_ms.txt"
+    printf '%s\n' "${elapsed_ms}" > "${SERVER_START_CASE_DIR}/startup_elapsed_ms.txt"
+
+    e2e_save_artifact "${SERVER_START_CASE_ID}_status.txt" "${status}"
+    e2e_save_artifact "${SERVER_START_CASE_ID}_detail.txt" "${detail}"
+    e2e_save_artifact "${SERVER_START_CASE_ID}_startup_elapsed_ms.txt" "${elapsed_ms}"
+}
+
+write_server_startup_failure_diagnostics() {
+    local label="$1"
+    local base_url="$2"
+    local port="$3"
+    local timeout_s="$4"
+
+    if [ -z "${SERVER_START_CASE_DIR}" ]; then
+        return 0
+    fi
+
+    SERVER_START_DIAG_FILE="${SERVER_START_CASE_DIR}/startup_failure_diagnostics.txt"
+    {
+        echo "TUI WASM server startup failure diagnostics"
+        echo "=========================================="
+        echo "timestamp: $(_e2e_now_rfc3339)"
+        echo "label: ${label}"
+        echo "base_url: ${base_url}"
+        echo "port: ${port}"
+        echo "startup_timeout_seconds: ${timeout_s}"
+        echo "pid: ${SERVER_PID:-}"
+        echo "log_path: ${SERVER_START_LOG_PATH:-}"
+        echo ""
+        echo "=== startup command ==="
+        if [ -f "${SERVER_START_CASE_DIR}/command.txt" ]; then
+            cat "${SERVER_START_CASE_DIR}/command.txt"
+        else
+            echo "(command file missing)"
+        fi
+        echo ""
+        echo "=== process status ==="
+        if [ -n "${SERVER_PID}" ]; then
+            ps -p "${SERVER_PID}" -o pid=,ppid=,etime=,stat=,args= 2>/dev/null || echo "(process not running)"
+        else
+            echo "(no pid captured)"
+        fi
+        echo ""
+        echo "=== server transcript (tail -n 200) ==="
+        if [ -n "${SERVER_START_LOG_PATH}" ] && [ -f "${SERVER_START_LOG_PATH}" ]; then
+            tail -n 200 "${SERVER_START_LOG_PATH}"
+        else
+            echo "(no transcript available)"
+        fi
+        echo ""
+        echo "=== listeners ==="
+        ss -tlnp 2>/dev/null | head -40 || netstat -tlnp 2>/dev/null | head -40 || echo "(unable to inspect listeners)"
+    } > "${SERVER_START_DIAG_FILE}"
+
+    e2e_save_artifact "${SERVER_START_CASE_ID}_startup_failure_diagnostics.txt" "$(cat "${SERVER_START_DIAG_FILE}" 2>/dev/null || true)"
+}
+
 start_tui_server() {
     local label="$1"
     local bin="$2"
     local port="$3"
     local db_path="$4"
     local storage_root="$5"
+    local server_timeout_s="${E2E_SERVER_TIMEOUT_SECONDS:-180}"
     local log_path="${E2E_ARTIFACT_DIR}/server_${label}.typescript"
+    local case_id="server_startup_${label}"
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local command_file="${case_dir}/command.txt"
+    local timeout_file="${case_dir}/server_timeout_seconds.txt"
+    local log_file="${case_dir}/server_log_path.txt"
+    local started_ms_file="${case_dir}/start_ms.txt"
+
+    mkdir -p "${case_dir}"
+    SERVER_START_CASE_ID="${case_id}"
+    SERVER_START_CASE_DIR="${case_dir}"
+    SERVER_START_LOG_PATH="${log_path}"
+    SERVER_START_DIAG_FILE=""
+    SERVER_START_STARTED_MS="$(_e2e_now_ms)"
+
+    local server_cmd
+    printf -v server_cmd 'env DATABASE_URL=%q STORAGE_ROOT=%q HTTP_HOST=%q HTTP_PORT=%q HTTP_RBAC_ENABLED=%q HTTP_RATE_LIMIT_ENABLED=%q HTTP_JWT_ENABLED=%q HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=%q LINES=%q COLUMNS=%q timeout %qs %q serve --host 127.0.0.1 --port %q' \
+        "sqlite:////${db_path}" \
+        "${storage_root}" \
+        "127.0.0.1" \
+        "${port}" \
+        "0" \
+        "0" \
+        "0" \
+        "1" \
+        "40" \
+        "120" \
+        "${server_timeout_s}" \
+        "${bin}" \
+        "${port}"
+
+    printf '%s\n' "${server_cmd}" > "${command_file}"
+    printf '%s\n' "${server_timeout_s}" > "${timeout_file}"
+    printf '%s\n' "${log_path}" > "${log_file}"
+    printf '%s\n' "${SERVER_START_STARTED_MS}" > "${started_ms_file}"
+    e2e_save_artifact "${case_id}_command.txt" "${server_cmd}"
+    e2e_save_artifact "${case_id}_server_timeout_seconds.txt" "${server_timeout_s}"
+    e2e_save_artifact "${case_id}_server_log_path.txt" "${log_path}"
 
     (
-        script -q -f -c "env \
-DATABASE_URL=sqlite:////${db_path} \
-STORAGE_ROOT=${storage_root} \
-HTTP_HOST=127.0.0.1 \
-HTTP_PORT=${port} \
-HTTP_RBAC_ENABLED=0 \
-HTTP_RATE_LIMIT_ENABLED=0 \
-HTTP_JWT_ENABLED=0 \
-HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
-LINES=40 \
-COLUMNS=120 \
-timeout ${E2E_SERVER_TIMEOUT_SECONDS:-180}s ${bin} serve --host 127.0.0.1 --port ${port}" \
+        script -q -f -c "${server_cmd}" \
             "${log_path}"
     ) >/dev/null 2>&1 &
 
-    echo $!
+    SERVER_PID="$!"
+    return 0
 }
 
 HTTP_LAST_CASE_DIR=""
@@ -379,19 +487,24 @@ STORAGE_ROOT="${WORK}/storage"
 mkdir -p "${STORAGE_ROOT}"
 PORT="$(pick_port)"
 BASE_URL="http://127.0.0.1:${PORT}"
+STARTUP_TIMEOUT_SECONDS="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-20}"
 
-SERVER_PID="$(start_tui_server "wasm_contract" "${BIN}" "${PORT}" "${DB_PATH}" "${STORAGE_ROOT}")"
+start_tui_server "wasm_contract" "${BIN}" "${PORT}" "${DB_PATH}" "${STORAGE_ROOT}"
 e2e_log "started server pid=${SERVER_PID} on ${BASE_URL}"
+e2e_save_artifact "${SERVER_START_CASE_ID}_pid.txt" "${SERVER_PID}"
 
-if ! e2e_wait_port "127.0.0.1" "${PORT}" 20; then
+if ! e2e_wait_port "127.0.0.1" "${PORT}" "${STARTUP_TIMEOUT_SECONDS}"; then
+    record_server_start_result "failed" "port did not open within ${STARTUP_TIMEOUT_SECONDS}s"
+    write_server_startup_failure_diagnostics "wasm_contract" "${BASE_URL}" "${PORT}" "${STARTUP_TIMEOUT_SECONDS}"
     e2e_fail "server failed to bind ${BASE_URL} within timeout"
     scenario_diag_begin "server_startup"
-    scenario_diag_mark_reason "SERVER_START_TIMEOUT" "port did not open within 20s"
-    scenario_diag_finish "${E2E_ARTIFACT_DIR}/server_wasm_contract.typescript"
+    scenario_diag_mark_reason "SERVER_START_TIMEOUT" "port did not open within ${STARTUP_TIMEOUT_SECONDS}s"
+    scenario_diag_finish "${SERVER_START_DIAG_FILE:-${E2E_ARTIFACT_DIR}/server_wasm_contract.typescript}"
     cleanup_server
     e2e_summary
     exit 1
 fi
+record_server_start_result "ready" "port opened at ${BASE_URL}"
 
 # ═══════════════════════════════════════════════════════════════════════
 # Case 3: /mail/ws-state snapshot contract

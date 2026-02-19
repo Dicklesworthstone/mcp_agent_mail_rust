@@ -678,16 +678,20 @@ mod tests {
     /// `ln_gamma` returns infinity for non-positive arguments.
     #[test]
     fn ln_gamma_non_positive() {
-        assert_eq!(ln_gamma(0.0), f64::INFINITY);
-        assert_eq!(ln_gamma(-1.0), f64::INFINITY);
-        assert_eq!(ln_gamma(-100.0), f64::INFINITY);
+        let g0 = ln_gamma(0.0);
+        assert!(g0.is_infinite() && g0.is_sign_positive());
+        let g1 = ln_gamma(-1.0);
+        assert!(g1.is_infinite() && g1.is_sign_positive());
+        let g100 = ln_gamma(-100.0);
+        assert!(g100.is_infinite() && g100.is_sign_positive());
     }
 
-    /// `log_sum_exp` with all-NEG_INFINITY values returns NEG_INFINITY.
+    /// `log_sum_exp` with all-`NEG_INFINITY` values returns `NEG_INFINITY`.
     #[test]
     fn log_sum_exp_all_neg_inf() {
         let vals = vec![f64::NEG_INFINITY, f64::NEG_INFINITY];
-        assert_eq!(log_sum_exp(&vals), f64::NEG_INFINITY);
+        let result = log_sum_exp(&vals);
+        assert!(result.is_infinite() && result.is_sign_negative());
     }
 
     /// `log_sum_exp` with a single element returns that element.
@@ -751,7 +755,7 @@ mod tests {
         let dist = detector.run_length_distribution();
         for (i, &p) in dist.iter().enumerate() {
             assert!(
-                p >= 0.0 && p <= 1.0 + 1e-10,
+                (0.0..=1.0 + 1e-10).contains(&p),
                 "probability at index {i} out of range: {p}"
             );
         }

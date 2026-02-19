@@ -3810,6 +3810,13 @@ mod tests {
     #[cfg(feature = "hybrid")]
     #[test]
     fn semantic_enqueue_auto_initializes_bridge_and_tracks_dedup() {
+        // The bridge must be initialized before enqueue_semantic_document will
+        // accept documents (it deliberately avoids heavyweight auto-init on
+        // normal write paths).  If the OnceLock was already set by a previous
+        // test in the same process, init_semantic_bridge_default returns Err
+        // — that's fine; the bridge is usable either way.
+        let _ = init_semantic_bridge_default();
+
         assert!(enqueue_semantic_document(
             DocKind::Message,
             4242,

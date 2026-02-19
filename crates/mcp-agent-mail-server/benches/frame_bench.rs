@@ -261,8 +261,10 @@ fn prepare_messages_model(message_count: usize) -> (MailAppModel, TempDir) {
     let db_path = tmp.path().join("messages_bench.sqlite3");
     init_messages_bench_db(&db_path, message_count);
 
-    let mut config = Config::default();
-    config.database_url = format!("sqlite:///{}", db_path.display());
+    let config = Config {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        ..Config::default()
+    };
 
     let state = TuiSharedState::new(&config);
     let mut model = MailAppModel::new(state);

@@ -1782,7 +1782,7 @@ mod tests {
             agent_name: "RedFox".into(),
             ..Default::default()
         };
-        run_setup(&params);
+        let _ = run_setup(&params);
         let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap_or_default();
         assert!(gi.contains(".env"));
         assert!(gi.contains(".claude/settings.local.json"));

@@ -8,7 +8,7 @@ use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
-use ftui::widgets::borders::{BorderType, Borders};
+use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{
     Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, PackedRgba, Style,
@@ -598,7 +598,7 @@ struct SearchResultRow {
 
 impl RenderItem for SearchResultRow {
     #[allow(clippy::too_many_lines)]
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
         use ftui::widgets::Widget;
 
         if area.height == 0 || area.width < 10 {
@@ -3453,7 +3453,7 @@ fn query_help_popup_rect(area: Rect, query_area: Rect) -> Option<Rect> {
         return None;
     }
     let width = area.width.saturating_sub(2).min(60);
-    let height = 8_u16.min(area.height.saturating_sub(2));
+    let height = 12_u16.min(area.height.saturating_sub(2));
     if width < 24 || height < 5 {
         return None;
     }
@@ -3477,10 +3477,10 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
     };
     let tp = crate::tui_theme::TuiThemePalette::current();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title("Query Syntax Help")
         .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border))
         .style(Style::default().fg(FACET_LABEL_FG()).bg(QUERY_HELP_BG()));
     let inner = block.inner(popup_area);
     block.render(popup_area, frame);
@@ -5446,9 +5446,11 @@ mod tests {
         screen.query_input.set_focused(true);
         screen.query_help_visible = true;
 
+        // Tall frame so the help popup has enough inner rows (after
+        // Block::bordered() padding) to display all syntax examples.
         let mut pool = ftui::GraphemePool::new();
-        let mut frame = ftui::Frame::new(100, 30, &mut pool);
-        screen.view(&mut frame, Rect::new(0, 0, 100, 30), &state);
+        let mut frame = ftui::Frame::new(120, 50, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 50), &state);
         let text = buffer_to_text(&frame.buffer);
         assert!(
             text.contains("Query Syntax Help"),
@@ -6088,7 +6090,7 @@ mod tests {
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(60, 1, &mut pool);
-        row.render(Rect::new(0, 0, 60, 1), &mut frame, false);
+        row.render(Rect::new(0, 0, 60, 1), &mut frame, false, 0);
         let text = buffer_to_text(&frame.buffer);
         // Should contain type badge [M] and importance !!
         assert!(text.contains("[M]"), "row text: {text}");
