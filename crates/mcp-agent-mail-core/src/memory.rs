@@ -260,6 +260,115 @@ mod tests {
         }
     }
 
+    // ── br-3h13: Additional memory.rs test coverage ────────────────
+
+    #[test]
+    fn classify_pressure_exactly_at_warning_boundary() {
+        // When RSS == warning threshold exactly, it's NOT above so should be Ok
+        let threshold = 2048;
+        let at_threshold = threshold * MIB;
+        assert_eq!(
+            classify_pressure(at_threshold, threshold, 4096, 8192),
+            MemoryPressure::Ok
+        );
+        assert_eq!(
+            classify_pressure(at_threshold + 1, threshold, 4096, 8192),
+            MemoryPressure::Warning
+        );
+    }
+
+    #[test]
+    fn classify_pressure_exactly_at_critical_boundary() {
+        let threshold = 4096;
+        let at_threshold = threshold * MIB;
+        assert_eq!(
+            classify_pressure(at_threshold, 2048, threshold, 8192),
+            MemoryPressure::Warning
+        );
+        assert_eq!(
+            classify_pressure(at_threshold + 1, 2048, threshold, 8192),
+            MemoryPressure::Critical
+        );
+    }
+
+    #[test]
+    fn classify_pressure_exactly_at_fatal_boundary() {
+        let threshold = 8192;
+        let at_threshold = threshold * MIB;
+        assert_eq!(
+            classify_pressure(at_threshold, 2048, 4096, threshold),
+            MemoryPressure::Critical
+        );
+        assert_eq!(
+            classify_pressure(at_threshold + 1, 2048, 4096, threshold),
+            MemoryPressure::Fatal
+        );
+    }
+
+    #[test]
+    fn classify_pressure_saturating_mul_no_panic() {
+        // u64::MAX * MIB saturates to u64::MAX; rss == threshold means NOT above,
+        // so all checks fail and result is Ok. Key point: no panic from overflow.
+        assert_eq!(
+            classify_pressure(u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+            MemoryPressure::Ok
+        );
+    }
+
+    #[test]
+    fn classify_pressure_zero_rss_always_ok() {
+        assert_eq!(
+            classify_pressure(0, 2048, 4096, 8192),
+            MemoryPressure::Ok
+        );
+    }
+
+    #[test]
+    fn memory_pressure_from_u64_all_unknown_values() {
+        for v in [4, 5, 100, 255, u64::MAX] {
+            assert_eq!(MemoryPressure::from_u64(v), MemoryPressure::Ok);
+        }
+    }
+
+    #[test]
+    fn memory_sample_error_path() {
+        // Construct a sample with error (simulating non-Linux platform)
+        let sample = MemorySample {
+            rss_bytes: None,
+            pressure: MemoryPressure::Ok,
+            error: Some("not available".into()),
+        };
+        assert!(sample.rss_bytes.is_none());
+        assert!(sample.error.is_some());
+        assert_eq!(sample.pressure, MemoryPressure::Ok);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sample_memory_rss_within_reasonable_range() {
+        let config = Config::default();
+        let sample = sample_memory(&config);
+        let rss = sample.rss_bytes.expect("should have RSS on Linux");
+        // A Rust test process should use between 1 MB and 10 GB
+        assert!(rss > MIB, "RSS too small: {rss}");
+        assert!(rss < 10 * 1024 * MIB, "RSS too large: {rss}");
+    }
+
+    #[test]
+    fn sample_memory_with_extreme_thresholds() {
+        // warning_mb = 1 means warning threshold = 1 MiB; any real process exceeds that
+        let config = Config {
+            memory_warning_mb: 1,
+            memory_critical_mb: 0,
+            memory_fatal_mb: 0,
+            ..Config::default()
+        };
+        let sample = sample_memory(&config);
+        if sample.rss_bytes.is_some() {
+            assert_eq!(sample.pressure, MemoryPressure::Warning);
+        }
+    }
+
     #[test]
     fn sample_and_record_updates_memory_metrics() {
         let config = Config::default();

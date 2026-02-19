@@ -245,6 +245,76 @@ mod tests {
         assert_eq!(PoolHealth::classify(u64::MAX), PoolHealth::Red);
     }
 
+    // ── br-3h13: Additional slo.rs test coverage ──────────────────
+
+    #[test]
+    fn slo_constants_have_expected_values() {
+        // Verify key constants haven't drifted from spec
+        assert_eq!(TOOL_P95_US, 100_000);
+        assert_eq!(TOOL_P99_US, 250_000);
+        assert_eq!(READ_P95_US, 50_000);
+        assert_eq!(READ_P99_US, 150_000);
+        assert_eq!(SEND_P95_US, 150_000);
+        assert_eq!(SEND_P99_US, 400_000);
+        assert_eq!(SEND_ATTACH_P95_US, 500_000);
+        assert_eq!(SEND_ATTACH_P99_US, 1_500_000);
+    }
+
+    #[test]
+    fn workload_model_constants() {
+        assert_eq!(WORKLOAD_AGENTS, 1000);
+        assert_eq!(WORKLOAD_PROJECTS, 50);
+        assert_eq!(WORKLOAD_AGENTS_PER_PROJECT, 20);
+        assert_eq!(WORKLOAD_CONCURRENCY, 200);
+    }
+
+    #[test]
+    fn pool_acquire_constants() {
+        assert_eq!(POOL_ACQUIRE_GREEN_US, 10_000);
+        assert_eq!(POOL_ACQUIRE_YELLOW_US, 50_000);
+        assert_eq!(POOL_ACQUIRE_RED_US, 200_000);
+    }
+
+    #[test]
+    fn queue_and_error_constants() {
+        assert_eq!(WBQ_MAX_DEPTH, 500);
+        assert_eq!(COMMIT_BACKLOG_MAX, 100);
+        assert_eq!(WBQ_DRAIN_RATE_PER_SEC, 50);
+        assert_eq!(ERROR_RATE_MAX_BP, 10);
+        assert_eq!(RSS_GROWTH_MAX_BYTES_PER_HOUR, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn pool_health_boundary_values() {
+        // Exact boundaries between zones
+        assert_eq!(PoolHealth::classify(10_000), PoolHealth::Green);
+        assert_eq!(PoolHealth::classify(10_001), PoolHealth::Yellow);
+        assert_eq!(PoolHealth::classify(50_000), PoolHealth::Yellow);
+        assert_eq!(PoolHealth::classify(50_001), PoolHealth::Red);
+    }
+
+    #[test]
+    fn pool_health_zero_is_green() {
+        assert_eq!(PoolHealth::classify(0), PoolHealth::Green);
+    }
+
+    #[test]
+    fn op_class_debug_format() {
+        // Ensure Debug is implemented and produces reasonable output
+        let debug = format!("{:?}", OpClass::Tool);
+        assert!(debug.contains("Tool"));
+        let debug = format!("{:?}", OpClass::SendAttach);
+        assert!(debug.contains("SendAttach"));
+    }
+
+    #[test]
+    fn pool_health_debug_format() {
+        let debug = format!("{:?}", PoolHealth::Green);
+        assert!(debug.contains("Green"));
+        let debug = format!("{:?}", PoolHealth::Red);
+        assert!(debug.contains("Red"));
+    }
+
     #[test]
     fn op_class_budget_ordering_invariants() {
         let ordered = [

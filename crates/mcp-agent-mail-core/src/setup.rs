@@ -1453,4 +1453,412 @@ mod tests {
         let (_, wrong_url) = check_config_file(&path, "http://127.0.0.1:9999/mcp/");
         assert!(!wrong_url);
     }
+
+    // ── br-3h13: Additional setup.rs test coverage ──────────────────
+
+    #[test]
+    fn agent_platform_from_slug_all_aliases() {
+        // Primary slugs
+        assert_eq!(AgentPlatform::from_slug("claude"), Some(AgentPlatform::Claude));
+        assert_eq!(AgentPlatform::from_slug("codex"), Some(AgentPlatform::Codex));
+        assert_eq!(AgentPlatform::from_slug("cursor"), Some(AgentPlatform::Cursor));
+        assert_eq!(AgentPlatform::from_slug("gemini"), Some(AgentPlatform::Gemini));
+        assert_eq!(AgentPlatform::from_slug("opencode"), Some(AgentPlatform::OpenCode));
+        assert_eq!(AgentPlatform::from_slug("factory"), Some(AgentPlatform::FactoryDroid));
+        assert_eq!(AgentPlatform::from_slug("cline"), Some(AgentPlatform::Cline));
+        assert_eq!(AgentPlatform::from_slug("windsurf"), Some(AgentPlatform::Windsurf));
+        assert_eq!(AgentPlatform::from_slug("github-copilot"), Some(AgentPlatform::GithubCopilot));
+        // Alias slugs
+        assert_eq!(AgentPlatform::from_slug("claude-code"), Some(AgentPlatform::Claude));
+        assert_eq!(AgentPlatform::from_slug("codex-cli"), Some(AgentPlatform::Codex));
+        assert_eq!(AgentPlatform::from_slug("gemini-cli"), Some(AgentPlatform::Gemini));
+        assert_eq!(AgentPlatform::from_slug("open-code"), Some(AgentPlatform::OpenCode));
+        assert_eq!(AgentPlatform::from_slug("factory-droid"), Some(AgentPlatform::FactoryDroid));
+        assert_eq!(AgentPlatform::from_slug("copilot"), Some(AgentPlatform::GithubCopilot));
+        // Unknown
+        assert_eq!(AgentPlatform::from_slug("vscode"), None);
+        assert_eq!(AgentPlatform::from_slug(""), None);
+    }
+
+    #[test]
+    fn agent_platform_slug_roundtrip() {
+        for &p in AgentPlatform::ALL {
+            let slug = p.slug();
+            assert_eq!(
+                AgentPlatform::from_slug(slug),
+                Some(p),
+                "from_slug(slug()) should roundtrip for {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_platform_display_name_all() {
+        let names: Vec<&str> = AgentPlatform::ALL.iter().map(|p| p.display_name()).collect();
+        assert!(names.contains(&"Claude Code"));
+        assert!(names.contains(&"Codex CLI"));
+        assert!(names.contains(&"Cursor"));
+        assert!(names.contains(&"Gemini CLI"));
+        assert!(names.contains(&"OpenCode"));
+        assert!(names.contains(&"Factory Droid"));
+        assert!(names.contains(&"Cline"));
+        assert!(names.contains(&"Windsurf"));
+        assert!(names.contains(&"GitHub Copilot"));
+    }
+
+    #[test]
+    fn agent_platform_display_trait_matches_display_name() {
+        for &p in AgentPlatform::ALL {
+            assert_eq!(format!("{p}"), p.display_name());
+        }
+    }
+
+    #[test]
+    fn setup_params_server_url_format() {
+        let params = SetupParams {
+            host: "10.0.0.1".into(),
+            port: 9000,
+            path: "/api/".into(),
+            ..Default::default()
+        };
+        assert_eq!(params.server_url(), "http://10.0.0.1:9000/api/");
+    }
+
+    #[test]
+    fn setup_params_default_values() {
+        let params = SetupParams::default();
+        assert_eq!(params.host, "127.0.0.1");
+        assert_eq!(params.port, 8765);
+        assert_eq!(params.path, "/mcp/");
+        assert!(params.token.is_empty());
+        assert_eq!(params.project_dir, PathBuf::from("."));
+        assert!(!params.dry_run);
+        assert!(!params.skip_user_config);
+        assert!(!params.skip_hooks);
+    }
+
+    #[test]
+    fn action_outcome_display_all_variants() {
+        assert_eq!(ActionOutcome::Created.to_string(), "created");
+        assert_eq!(ActionOutcome::Updated.to_string(), "updated");
+        assert_eq!(ActionOutcome::Unchanged.to_string(), "unchanged");
+        assert_eq!(ActionOutcome::Skipped.to_string(), "skipped (dry-run)");
+        assert_eq!(
+            ActionOutcome::BackedUp("/tmp/bak".into()).to_string(),
+            "backed up to /tmp/bak"
+        );
+        assert_eq!(
+            ActionOutcome::Failed("disk full".into()).to_string(),
+            "FAILED: disk full"
+        );
+    }
+
+    #[test]
+    fn parse_agent_list_empty_string_returns_empty() {
+        let list = parse_agent_list("").unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn parse_agent_list_alias_slugs() {
+        let list = parse_agent_list("claude-code, codex-cli, copilot").unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], AgentPlatform::Claude);
+        assert_eq!(list[1], AgentPlatform::Codex);
+        assert_eq!(list[2], AgentPlatform::GithubCopilot);
+    }
+
+    #[test]
+    fn parse_agent_list_case_insensitive() {
+        let list = parse_agent_list("Claude, CURSOR, Gemini-CLI").unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], AgentPlatform::Claude);
+        assert_eq!(list[1], AgentPlatform::Cursor);
+        assert_eq!(list[2], AgentPlatform::Gemini);
+    }
+
+    #[test]
+    fn parse_agent_list_trailing_commas() {
+        let list = parse_agent_list(",claude,,cursor,").unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn merge_mcp_server_invalid_json_returns_error() {
+        let result = merge_mcp_server(
+            Some("not valid json"),
+            "mcpServers",
+            "test",
+            json!({"url": "http://a"}),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn merge_mcp_server_array_top_level_returns_error() {
+        let result = merge_mcp_server(
+            Some("[1, 2, 3]"),
+            "mcpServers",
+            "test",
+            json!({"url": "http://a"}),
+        );
+        assert!(matches!(result.unwrap_err(), SetupError::NotJsonObject));
+    }
+
+    #[test]
+    fn merge_mcp_server_whitespace_only_treated_as_empty() {
+        let result = merge_mcp_server(
+            Some("   "),
+            "mcpServers",
+            "test",
+            json!({"url": "http://a"}),
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(doc["mcpServers"]["test"]["url"], "http://a");
+    }
+
+    #[test]
+    fn save_token_to_env_file_appends_when_no_existing_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "OTHER=value\n").unwrap();
+        save_token_to_env_file(&env_path, "new-token").unwrap();
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert!(content.contains("OTHER=value"));
+        assert!(content.contains("HTTP_BEARER_TOKEN=new-token"));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn save_token_to_env_file_creates_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("deep").join("nested").join(".env");
+        save_token_to_env_file(&env_path, "tok").unwrap();
+        assert!(env_path.exists());
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(content, "HTTP_BEARER_TOKEN=tok\n");
+    }
+
+    #[test]
+    fn ensure_gitignore_entries_creates_new_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gi = tmp.path().join(".gitignore");
+        let changed = ensure_gitignore_entries(&gi, &[".env", "*.log"]).unwrap();
+        assert!(changed);
+        let content = std::fs::read_to_string(&gi).unwrap();
+        assert!(content.contains(".env"));
+        assert!(content.contains("*.log"));
+    }
+
+    #[test]
+    fn ensure_gitignore_entries_no_trailing_newline_handled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gi = tmp.path().join(".gitignore");
+        std::fs::write(&gi, "existing").unwrap(); // no trailing newline
+        let changed = ensure_gitignore_entries(&gi, &[".env"]).unwrap();
+        assert!(changed);
+        let content = std::fs::read_to_string(&gi).unwrap();
+        // Should have newline between existing and new entry
+        assert!(content.contains("existing\n.env\n"));
+    }
+
+    #[test]
+    fn claude_config_actions_full_set() {
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            project_slug: "my-proj".into(),
+            agent_name: "RedFox".into(),
+            skip_user_config: false,
+            skip_hooks: false,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Claude.config_actions(&params);
+        // project-local, user-level, hooks = 3 actions
+        assert_eq!(actions.len(), 3);
+        assert!(actions[0]
+            .file_path
+            .ends_with(".claude/settings.local.json"));
+        assert!(actions[1].file_path.ends_with(".claude/settings.json"));
+        // Third action is hooks
+        assert!(matches!(
+            actions[2].content,
+            ConfigContent::HooksMerge { .. }
+        ));
+    }
+
+    #[test]
+    fn claude_config_actions_skip_user_and_hooks() {
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Claude.config_actions(&params);
+        assert_eq!(actions.len(), 1, "only project-local action");
+    }
+
+    #[test]
+    fn run_setup_dry_run_produces_skipped_outcomes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: tmp.path().to_path_buf(),
+            agents: Some(vec![AgentPlatform::Cline]),
+            dry_run: true,
+            ..Default::default()
+        };
+        let results = run_setup(&params);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].platform, "Cline");
+        for action in &results[0].actions {
+            assert_eq!(action.outcome, ActionOutcome::Skipped);
+        }
+    }
+
+    #[test]
+    fn run_setup_creates_gitignore_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: tmp.path().to_path_buf(),
+            agents: Some(vec![AgentPlatform::Claude]),
+            skip_user_config: true,
+            skip_hooks: true,
+            project_slug: "test".into(),
+            agent_name: "RedFox".into(),
+            ..Default::default()
+        };
+        run_setup(&params);
+        let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap_or_default();
+        assert!(gi.contains(".env"));
+        assert!(gi.contains(".claude/settings.local.json"));
+    }
+
+    #[test]
+    fn hook_is_ours_detects_all_markers() {
+        assert!(hook_is_ours(&json!({"command": "mcp-agent-mail serve"})));
+        assert!(hook_is_ours(&json!({"command": "am file_reservations active proj"})));
+        assert!(hook_is_ours(&json!({"command": "am acks pending proj agent"})));
+        assert!(hook_is_ours(&json!({"command": "am mail inbox --project proj"})));
+        assert!(!hook_is_ours(&json!({"command": "echo hello"})));
+        assert!(!hook_is_ours(&json!({"command": "cargo build"})));
+    }
+
+    #[test]
+    fn check_config_file_httpurl_key() {
+        // Gemini uses httpUrl instead of url
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.json");
+        let content = merge_mcp_server(
+            None,
+            "mcpServers",
+            "mcp-agent-mail",
+            json!({"httpUrl": "http://127.0.0.1:8765/mcp/"}),
+        )
+        .unwrap();
+        std::fs::write(&path, &content).unwrap();
+        let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
+        assert!(has_server);
+        assert!(url_matches);
+    }
+
+    #[test]
+    fn check_config_file_nonexistent_returns_false() {
+        let (has, matches) = check_config_file(Path::new("/nonexistent/config.json"), "http://a");
+        assert!(!has);
+        assert!(!matches);
+    }
+
+    #[test]
+    fn check_config_file_invalid_json_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bad.json");
+        std::fs::write(&path, "not json").unwrap();
+        let (has, matches) = check_config_file(&path, "http://a");
+        assert!(!has);
+        assert!(!matches);
+    }
+
+    #[test]
+    fn setup_error_display() {
+        let io_err = SetupError::Io(std::io::Error::other("disk full"));
+        assert!(io_err.to_string().contains("disk full"));
+
+        let json_err: serde_json::Error = serde_json::from_str::<i32>("bad").unwrap_err();
+        let json_setup_err = SetupError::Json(json_err);
+        assert!(json_setup_err.to_string().contains("json parse error"));
+
+        assert_eq!(
+            SetupError::NotJsonObject.to_string(),
+            "expected JSON object at top level or servers key"
+        );
+
+        assert!(SetupError::UnknownPlatform("foo".into())
+            .to_string()
+            .contains("foo"));
+
+        assert_eq!(SetupError::Other("oops".into()).to_string(), "oops");
+    }
+
+    #[test]
+    fn agent_platform_serde_roundtrip() {
+        for &p in AgentPlatform::ALL {
+            let json = serde_json::to_string(&p).unwrap();
+            let back: AgentPlatform = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, p, "serde roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn agent_platform_serde_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&AgentPlatform::GithubCopilot).unwrap(),
+            "\"github-copilot\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentPlatform::FactoryDroid).unwrap(),
+            "\"factory-droid\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentPlatform::OpenCode).unwrap(),
+            "\"open-code\""
+        );
+    }
+
+    #[test]
+    fn resolve_token_env_file_quoted_values() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "HTTP_BEARER_TOKEN=\"double-quoted-token\"\n",
+        )
+        .unwrap();
+        let t = resolve_token(None, tmp.path());
+        assert_eq!(t, "double-quoted-token");
+    }
+
+    #[test]
+    fn resolve_token_env_file_single_quoted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "HTTP_BEARER_TOKEN='single-quoted-token'\n",
+        )
+        .unwrap();
+        let t = resolve_token(None, tmp.path());
+        assert_eq!(t, "single-quoted-token");
+    }
+
+    #[test]
+    fn resolve_token_empty_explicit_falls_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-env");
+        let t = resolve_token(Some(""), &missing);
+        // Empty explicit should not be used; should fall through to generate
+        assert_eq!(t.len(), 64);
+    }
 }

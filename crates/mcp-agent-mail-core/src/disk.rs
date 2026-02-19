@@ -496,6 +496,142 @@ mod tests {
         );
     }
 
+    // ── br-3h13: Additional disk.rs test coverage ─────────────────
+
+    #[test]
+    fn sqlite_url_fragment_stripped() {
+        // Fragment (#) should be stripped just like query (?)
+        assert_eq!(
+            sqlite_file_path_from_database_url("sqlite:///db.sqlite3#frag")
+                .unwrap()
+                .to_string_lossy(),
+            "db.sqlite3"
+        );
+    }
+
+    #[test]
+    fn sqlite_url_aiosqlite_memory() {
+        assert!(is_sqlite_memory_database_url(
+            "sqlite+aiosqlite:///:memory:"
+        ));
+        assert!(sqlite_file_path_from_database_url("sqlite+aiosqlite:///:memory:").is_none());
+    }
+
+    #[test]
+    fn sqlite_url_aiosqlite_absolute_path() {
+        assert_eq!(
+            sqlite_file_path_from_database_url("sqlite+aiosqlite:////var/data/db.sqlite3")
+                .unwrap()
+                .to_string_lossy(),
+            "/var/data/db.sqlite3"
+        );
+    }
+
+    #[test]
+    fn sqlite_path_component_bare_returns_none_for_non_sqlite() {
+        assert!(sqlite_path_component("mysql://localhost/db").is_none());
+        assert!(sqlite_path_component("postgres://host/db").is_none());
+    }
+
+    #[test]
+    fn sqlite_path_component_strips_query_and_fragment() {
+        assert_eq!(
+            sqlite_path_component("sqlite:///path.db?mode=rwc#frag"),
+            Some("/path.db")
+        );
+    }
+
+    #[test]
+    fn classify_pressure_exactly_at_warning_boundary() {
+        // When free_bytes == warning threshold exactly, it's not below so should be Ok
+        let threshold = 500;
+        let at_threshold = threshold * MIB;
+        assert_eq!(
+            classify_pressure(at_threshold, threshold, 100, 10),
+            DiskPressure::Ok
+        );
+        assert_eq!(
+            classify_pressure(at_threshold - 1, threshold, 100, 10),
+            DiskPressure::Warning
+        );
+    }
+
+    #[test]
+    fn classify_pressure_exactly_at_critical_boundary() {
+        let threshold = 100;
+        let at_threshold = threshold * MIB;
+        assert_eq!(
+            classify_pressure(at_threshold, 500, threshold, 10),
+            DiskPressure::Warning // above critical but below warning
+        );
+        assert_eq!(
+            classify_pressure(at_threshold - 1, 500, threshold, 10),
+            DiskPressure::Critical
+        );
+    }
+
+    #[test]
+    fn classify_pressure_exactly_at_fatal_boundary() {
+        let threshold = 10;
+        let at_threshold = threshold * MIB;
+        assert_eq!(
+            classify_pressure(at_threshold, 500, 100, threshold),
+            DiskPressure::Critical // above fatal but below critical
+        );
+        assert_eq!(
+            classify_pressure(at_threshold - 1, 500, 100, threshold),
+            DiskPressure::Fatal
+        );
+    }
+
+    #[test]
+    fn sample_disk_with_memory_database_url() {
+        let tmp = tempdir().expect("tempdir");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+
+        let config = Config {
+            storage_root: storage_root.clone(),
+            database_url: "sqlite:///:memory:".to_string(),
+            disk_space_warning_mb: 0,
+            disk_space_critical_mb: 0,
+            disk_space_fatal_mb: 0,
+            ..Config::default()
+        };
+
+        let sample = sample_disk(&config);
+        assert!(sample.storage_free_bytes.is_some());
+        assert!(sample.db_probe_path.is_none(), "memory DB has no probe path");
+        assert!(sample.db_free_bytes.is_none());
+        // effective should be storage-only
+        assert_eq!(sample.effective_free_bytes, sample.storage_free_bytes);
+    }
+
+    #[test]
+    fn normalize_probe_path_existing_file() {
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("existing.db");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(normalize_probe_path(&file), file);
+    }
+
+    #[test]
+    fn disk_sample_clone() {
+        let sample = DiskSample {
+            storage_probe_path: PathBuf::from("/tmp"),
+            db_probe_path: Some(PathBuf::from("/var")),
+            storage_free_bytes: Some(1000),
+            db_free_bytes: Some(2000),
+            effective_free_bytes: Some(1000),
+            pressure: DiskPressure::Warning,
+            errors: vec!["test error".to_string()],
+        };
+        let cloned = sample.clone();
+        assert_eq!(cloned.pressure, DiskPressure::Warning);
+        assert_eq!(cloned.effective_free_bytes, Some(1000));
+        assert_eq!(cloned.errors.len(), 1);
+    }
+
     #[test]
     fn sample_and_record_updates_disk_metrics() {
         let tmp = tempdir().expect("tempdir should be created");
