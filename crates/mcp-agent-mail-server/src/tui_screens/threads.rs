@@ -3394,6 +3394,61 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_over_invalid_target_sets_warning_snapshot() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.detail_messages.push(make_message(77));
+        screen.focus = Focus::DetailPanel;
+        screen.last_list_area.set(Rect::new(0, 1, 40, 10));
+        screen.last_detail_area.set(Rect::new(40, 1, 40, 10));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 45, 3);
+        let _ = screen.update(&down, &state);
+        if let MessageDragState::Pending(pending) = &mut screen.message_drag {
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
+        }
+
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 79, 20);
+        let _ = screen.update(&drag, &state);
+        let snapshot = state.message_drag_snapshot().expect("drag snapshot");
+        assert!(snapshot.invalid_hover);
+        assert!(!snapshot.hovered_is_valid);
+        assert!(snapshot.hovered_thread_id.is_none());
+    }
+
+    #[test]
+    fn mouse_drop_on_invalid_target_is_noop() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.detail_messages.push(make_message(77));
+        screen.focus = Focus::DetailPanel;
+        screen.last_list_area.set(Rect::new(0, 1, 40, 10));
+        screen.last_detail_area.set(Rect::new(40, 1, 40, 10));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 45, 3);
+        let _ = screen.update(&down, &state);
+        if let MessageDragState::Pending(pending) = &mut screen.message_drag {
+            let hold_plus = MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1);
+            pending.started_at = Instant::now()
+                .checked_sub(hold_plus)
+                .unwrap_or_else(Instant::now);
+        }
+
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 79, 20);
+        let _ = screen.update(&drag, &state);
+        let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 79, 20);
+        let cmd = screen.update(&up, &state);
+        assert!(matches!(cmd, Cmd::None));
+        assert!(matches!(screen.message_drag, MessageDragState::Idle));
+        assert!(state.message_drag_snapshot().is_none());
+    }
+
+    #[test]
     fn mouse_drop_on_same_thread_is_noop() {
         let mut screen = ThreadExplorerScreen::new();
         screen.threads.push(make_thread("t1", 3, 2));
@@ -3462,6 +3517,28 @@ mod tests {
             _ => panic!("expected ActionExecute command"),
         }
         assert!(state.keyboard_move_snapshot().is_none());
+    }
+
+    #[test]
+    fn ctrl_v_same_thread_is_noop_and_preserves_marker() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        screen.cursor = 0;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: 88,
+            subject: "Subj".to_string(),
+            source_thread_id: "t1".to_string(),
+            source_project_slug: "project".to_string(),
+        }));
+
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('v')), &state);
+        assert!(matches!(cmd, Cmd::None));
+        let marker = state
+            .keyboard_move_snapshot()
+            .expect("keyboard move marker should remain");
+        assert_eq!(marker.message_id, 88);
+        assert_eq!(marker.source_thread_id, "t1");
     }
 
     #[test]

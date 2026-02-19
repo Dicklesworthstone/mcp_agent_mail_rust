@@ -25,7 +25,7 @@ use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListStat
 use crate::tui_action_menu::{ActionEntry, ActionKind, timeline_actions, timeline_batch_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
-use crate::tui_layout::{DockLayout, DockPreset};
+use crate::tui_layout::{DockLayout, DockPosition, DockPreset};
 use crate::tui_persist::{
     PreferencePersister, ScreenFilterPresetStore, TuiPreferences,
     console_persist_path_from_env_or_default, load_screen_filter_presets_or_default,
@@ -53,11 +53,50 @@ const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
 const COMMIT_REFRESH_EVERY_TICKS: u64 = 20;
 const COMMIT_LIMIT_PER_PROJECT: usize = 200;
 const TIMELINE_PRESET_SCREEN_ID: &str = "timeline";
+const TIMELINE_SPLIT_GAP_THRESHOLD: u16 = 60;
 
 /// Result of a background commit refresh operation.
 struct CommitRefreshResult {
     commits: Vec<CommitTimelineEntry>,
     stats: CommitTimelineStats,
+}
+
+fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, active: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
+    // Repaint the whole splitter gap first so prior layout artifacts never
+    // remain visible as stray borders across list/detail content.
+    let separator_color = crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border_dim, 0.58);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                *cell = ftui::Cell::from_char(' ');
+                cell.fg = separator_color;
+                cell.bg = tp.panel_bg;
+            }
+        }
+    }
+
+    if active && ((vertical && area.height >= 5) || (!vertical && area.width >= 5)) {
+        let x = if vertical {
+            area.x.saturating_add(area.width / 2)
+        } else {
+            area.x.saturating_add(area.width.saturating_sub(1) / 2)
+        };
+        let y = if vertical {
+            area.y.saturating_add(area.height.saturating_sub(1) / 2)
+        } else {
+            area.y.saturating_add(area.height / 2)
+        };
+        if let Some(cell) = frame.buffer.get_mut(x, y) {
+            *cell = ftui::Cell::from_char('·');
+            cell.fg = tp.selection_indicator;
+            cell.bg = tp.panel_bg;
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -676,9 +715,15 @@ pub struct TimelineScreen {
 }
 
 impl TimelineScreen {
-    fn build(dock: DockLayout, persister: Option<PreferencePersister>) -> Self {
-        let console_path = console_persist_path_from_env_or_default();
-        let filter_presets_path = screen_filter_presets_path(&console_path);
+    fn build(
+        dock: DockLayout,
+        persister: Option<PreferencePersister>,
+        filter_presets_path_override: Option<PathBuf>,
+    ) -> Self {
+        let filter_presets_path = filter_presets_path_override.unwrap_or_else(|| {
+            let console_path = console_persist_path_from_env_or_default();
+            screen_filter_presets_path(&console_path)
+        });
         let filter_presets = load_screen_filter_presets_or_default(&filter_presets_path);
         Self {
             pane: TimelinePane::new(),
@@ -706,23 +751,25 @@ impl TimelineScreen {
 
     #[cfg(test)]
     fn with_filter_presets_path_for_test(path: &Path) -> Self {
-        let mut screen = Self::build(DockLayout::right_40(), None);
-        screen.filter_presets_path = path.to_path_buf();
-        screen.filter_presets = load_screen_filter_presets_or_default(path);
-        screen
+        Self::build(DockLayout::right_40(), None, Some(path.to_path_buf()))
     }
 
     /// Create with default layout (no persistence).
     #[must_use]
     pub fn new() -> Self {
-        Self::build(DockLayout::right_40(), None)
+        Self::build(DockLayout::right_40(), None, None)
     }
 
     /// Create with layout loaded from config and auto-persistence.
     #[must_use]
     pub fn with_config(config: &mcp_agent_mail_core::Config) -> Self {
         let prefs = TuiPreferences::from_config(config);
-        Self::build(prefs.dock, Some(PreferencePersister::new(config)))
+        let filter_presets_path = screen_filter_presets_path(&config.console_persist_path);
+        Self::build(
+            prefs.dock,
+            Some(PreferencePersister::new(config)),
+            Some(filter_presets_path),
+        )
     }
 
     /// Sync `VirtualizedListState` with `TimelinePane` cursor.
@@ -1461,9 +1508,75 @@ impl MailScreen for TimelineScreen {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         self.last_area.set(area);
         let split = self.dock.split(area);
+        let mut primary_area = split.primary;
+        let mut detail_area = split.dock;
+        if let Some(mut dock_area) = detail_area {
+            let split_extent = if self.dock.position.is_horizontal() {
+                area.height
+            } else {
+                area.width
+            };
+            let split_gap = u16::from(split_extent >= TIMELINE_SPLIT_GAP_THRESHOLD);
+            if split_gap > 0 {
+                let splitter_area = match self.dock.position {
+                    DockPosition::Right => {
+                        dock_area.x = dock_area.x.saturating_add(split_gap);
+                        dock_area.width = dock_area.width.saturating_sub(split_gap);
+                        Rect::new(
+                            split.primary.x.saturating_add(split.primary.width),
+                            area.y,
+                            split_gap,
+                            area.height,
+                        )
+                    }
+                    DockPosition::Left => {
+                        primary_area.x = primary_area.x.saturating_add(split_gap);
+                        primary_area.width = primary_area.width.saturating_sub(split_gap);
+                        Rect::new(
+                            dock_area.x.saturating_add(dock_area.width),
+                            area.y,
+                            split_gap,
+                            area.height,
+                        )
+                    }
+                    DockPosition::Bottom => {
+                        dock_area.y = dock_area.y.saturating_add(split_gap);
+                        dock_area.height = dock_area.height.saturating_sub(split_gap);
+                        Rect::new(
+                            area.x,
+                            split.primary.y.saturating_add(split.primary.height),
+                            area.width,
+                            split_gap,
+                        )
+                    }
+                    DockPosition::Top => {
+                        primary_area.y = primary_area.y.saturating_add(split_gap);
+                        primary_area.height = primary_area.height.saturating_sub(split_gap);
+                        Rect::new(
+                            area.x,
+                            dock_area.y.saturating_add(dock_area.height),
+                            area.width,
+                            split_gap,
+                        )
+                    }
+                };
+                render_splitter_handle(
+                    frame,
+                    splitter_area,
+                    !self.dock.position.is_horizontal(),
+                    self.dock_drag == DockDragState::Dragging,
+                );
+            }
+            detail_area = if dock_area.width > 0 && dock_area.height > 0 {
+                Some(dock_area)
+            } else {
+                None
+            };
+        }
         let effects_enabled = state.config_snapshot().tui_effects;
         let selected_key_set: HashSet<TimelineSelectionKey> = self
             .selected_timeline_keys
@@ -1477,7 +1590,7 @@ impl MailScreen for TimelineScreen {
                 let mut list_state = self.list_state.borrow_mut();
                 render_timeline(
                     frame,
-                    split.primary,
+                    primary_area,
                     &self.pane,
                     self.dock,
                     &mut list_state,
@@ -1490,7 +1603,7 @@ impl MailScreen for TimelineScreen {
                 let mut list_state = self.list_state.borrow_mut();
                 render_commit_timeline(
                     frame,
-                    split.primary,
+                    primary_area,
                     &self.commit_entries,
                     &self.commit_stats,
                     self.pane.cursor,
@@ -1510,7 +1623,7 @@ impl MailScreen for TimelineScreen {
                 let mut list_state = self.list_state.borrow_mut();
                 render_combined_timeline(
                     frame,
-                    split.primary,
+                    primary_area,
                     &rows,
                     &self.commit_stats,
                     self.pane.cursor,
@@ -1523,16 +1636,10 @@ impl MailScreen for TimelineScreen {
             }
             TimelineViewMode::LogViewer => {
                 let mut viewer = self.log_viewer.borrow_mut();
-                render_timeline_log_viewer(
-                    frame,
-                    split.primary,
-                    &self.pane,
-                    self.dock,
-                    &mut viewer,
-                );
+                render_timeline_log_viewer(frame, primary_area, &self.pane, self.dock, &mut viewer);
             }
         }
-        if let Some(dock_area) = split.dock {
+        if let Some(dock_area) = detail_area {
             let event_ref = if self.view_mode == TimelineViewMode::Events {
                 self.pane.selected_event()
             } else {
@@ -4481,5 +4588,31 @@ mod tests {
         let escape = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
         screen.update(&escape, &state);
         assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
+    }
+
+    #[test]
+    fn with_config_uses_console_persist_path_for_presets() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = mcp_agent_mail_core::Config {
+            console_persist_path: dir.path().join("console.env"),
+            console_auto_save: true,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let presets_path = screen_filter_presets_path(&config.console_persist_path);
+
+        let mut store = ScreenFilterPresetStore::default();
+        let mut values = BTreeMap::new();
+        values.insert("verbosity".to_string(), "minimal".to_string());
+        store.upsert(
+            TIMELINE_PRESET_SCREEN_ID,
+            "from-config".to_string(),
+            Some("preset seeded via config path".to_string()),
+            values,
+        );
+        save_screen_filter_presets(&presets_path, &store).expect("save seeded preset");
+
+        let mut screen = TimelineScreen::with_config(&config);
+        assert!(screen.apply_named_preset("from-config"));
+        assert_eq!(screen.pane.verbosity, VerbosityTier::Minimal);
     }
 }
