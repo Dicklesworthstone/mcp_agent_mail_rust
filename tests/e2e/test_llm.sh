@@ -33,72 +33,39 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 0
 fi
 
-pick_port() {
-python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-}
-
-e2e_ensure_binary "am"
-BIN="$(command -v am)"
-
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 WORK="$(e2e_mktemp "e2e_llm")"
 DB_PATH="${WORK}/storage.sqlite3"
 STORAGE_ROOT="${WORK}/archive"
-SERVER_LOG="${E2E_ARTIFACT_DIR}/server.log"
-PORT="$(pick_port)"
 TOKEN="test-token-llm"
 PROJECT_DIR="/tmp/e2e_llm_project"
 THREAD_ID="LLM-E2E-1"
 
 mkdir -p "$STORAGE_ROOT"
 
-# Initialize database
-DATABASE_URL="sqlite:///${DB_PATH}" "$BIN" migrate >/dev/null 2>&1
-
 # ---------------------------------------------------------------------------
 # Start server with LLM stub enabled
 # ---------------------------------------------------------------------------
-e2e_log "Starting MCP server: port=${PORT}, LLM stub=on"
+e2e_log "Starting MCP server: LLM stub=on"
 
-(
-    export DATABASE_URL="sqlite:///${DB_PATH}"
-    export STORAGE_ROOT="${STORAGE_ROOT}"
-    export HTTP_BEARER_TOKEN="${TOKEN}"
-    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="1"
-    export HTTP_RBAC_ENABLED="0"
-    export HTTP_RATE_LIMIT_ENABLED="0"
-    export HTTP_JWT_ENABLED="0"
-    export MCP_AGENT_MAIL_LLM_STUB="1"
-    export LLM_ENABLED="1"
-    "$BIN" serve-http --host 127.0.0.1 --port "${PORT}"
-) >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-
-cleanup_server() {
-    if kill -0 "${SERVER_PID}" 2>/dev/null; then
-        kill "${SERVER_PID}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${SERVER_PID}" 2>/dev/null || true
-    fi
-}
-trap cleanup_server EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT}" 10; then
-    e2e_fail "server failed to start (port not open)"
+if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "llm" \
+    "HTTP_BEARER_TOKEN=${TOKEN}" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "HTTP_JWT_ENABLED=0" \
+    "MCP_AGENT_MAIL_LLM_STUB=1" \
+    "LLM_ENABLED=1"; then
+    e2e_fail "server failed to start"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
+trap 'e2e_stop_server || true' EXIT
 
-URL="http://127.0.0.1:${PORT}/api"
+URL="${E2E_SERVER_URL}"
 
 # Helper: call MCP tool via HTTP
 mcp_call() {

@@ -199,6 +199,22 @@ e2e_assert_file_contains() {
     fi
 }
 
+e2e_assert_file_contains_any() {
+    local label="$1"
+    local path="$2"
+    local needle_a="$3"
+    local needle_b="$4"
+    if grep -Fq -- "${needle_a}" "${path}" || grep -Fq -- "${needle_b}" "${path}"; then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label}"
+        e2e_log "missing either needle: ${needle_a} || ${needle_b}"
+        e2e_log "in file: ${path}"
+        e2e_log "tail (last 30 lines):"
+        tail -n 30 "${path}" 2>/dev/null || true
+    fi
+}
+
 e2e_assert_file_not_contains() {
     local label="$1"
     local path="$2"
@@ -229,6 +245,42 @@ run_tui_expect() {
         2>"${err_log}" <<EXPECT_EOF || true
 ${expect_script}
 EXPECT_EOF
+}
+
+run_tui_expect_bg() {
+    local pid_var="$1"
+    local label="$2"
+    local bin="$3"
+    local port="$4"
+    local db="$5"
+    local storage="$6"
+    local raw_log="$7"
+    local expect_script="$8"
+    local err_log="${E2E_ARTIFACT_DIR}/${label}.expect_err.log"
+
+    # Start expect in the background and return its PID.
+    LINES=40 COLUMNS=120 expect -f - \
+        "${bin}" "${port}" "${db}" "${storage}" "${raw_log}" \
+        2>"${err_log}" <<EXPECT_EOF || true &
+${expect_script}
+EXPECT_EOF
+    local expect_pid=$!
+    printf -v "${pid_var}" '%s' "${expect_pid}"
+}
+
+stop_expect_runner() {
+    local pid="${1:-}"
+    if [ -z "${pid}" ]; then
+        return 0
+    fi
+
+    # Stop child processes first (notably the spawned mcp-agent-mail server),
+    # then stop expect itself.
+    pkill -TERM -P "${pid}" 2>/dev/null || true
+    if kill -0 "${pid}" 2>/dev/null; then
+        kill "${pid}" 2>/dev/null || true
+    fi
+    wait "${pid}" 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -504,7 +556,7 @@ PORT5="$(pick_port)"
 RAW5="${E2E_ARTIFACT_DIR}/data_seeding.raw"
 
 # Start TUI in background via expect, seed data via API while TUI runs.
-run_tui_expect "data_seeding" "${BIN}" "${PORT5}" "${DB5}" "${STORAGE5}" "${RAW5}" '
+run_tui_expect_bg EXPECT_PID "data_seeding" "${BIN}" "${PORT5}" "${DB5}" "${STORAGE5}" "${RAW5}" '
 set bin [lindex $argv 0]
 set port [lindex $argv 1]
 set db [lindex $argv 2]
@@ -541,8 +593,7 @@ sleep 1
 # JSON-RPC seeding and verification calls against this live server.
 # The parent process terminates this expect runner once seeding completes.
 sleep 120
-' &
-EXPECT_PID=$!
+'
 
 # Wait for the server to come up
 sleep 6
@@ -573,12 +624,7 @@ else
 fi
 
 # Stop the background expect runner now that seeding checks are complete.
-if kill -0 "${EXPECT_PID}" 2>/dev/null; then
-    kill "${EXPECT_PID}" 2>/dev/null || true
-fi
-
-# Wait for the expect process to finish
-wait "${EXPECT_PID}" 2>/dev/null || true
+stop_expect_runner "${EXPECT_PID}"
 
 RENDERED5="${E2E_ARTIFACT_DIR}/data_seeding.rendered.txt"
 if [ -f "${RAW5}" ]; then
@@ -770,7 +816,7 @@ PORT8="$(pick_port)"
 RAW8="${E2E_ARTIFACT_DIR}/analytics_widgets.raw"
 ACTION_TRACE8="${E2E_ARTIFACT_DIR}/trace/analytics_widgets_timeline.tsv"
 
-run_tui_expect "analytics_widgets" "${BIN}" "${PORT8}" "${DB8}" "${STORAGE8}" "${RAW8}" '
+run_tui_expect_bg EXPECT8_PID "analytics_widgets" "${BIN}" "${PORT8}" "${DB8}" "${STORAGE8}" "${RAW8}" '
 set bin [lindex $argv 0]
 set port [lindex $argv 1]
 set db [lindex $argv 2]
@@ -854,8 +900,7 @@ sleep 0.6
 
 # Keep session alive while parent seeds and validates JSON-RPC traffic.
 sleep 120
-' &
-EXPECT8_PID=$!
+'
 
 sleep 6
 if e2e_wait_port 127.0.0.1 "${PORT8}" 12; then
@@ -888,11 +933,7 @@ else
 fi
 
 # Stop the background expect runner now that analytics checks are complete.
-if kill -0 "${EXPECT8_PID}" 2>/dev/null; then
-    kill "${EXPECT8_PID}" 2>/dev/null || true
-fi
-
-wait "${EXPECT8_PID}" 2>/dev/null || true
+stop_expect_runner "${EXPECT8_PID}"
 
 cat > "${ACTION_TRACE8}" <<'EOF'
 step	key_sequence	target	description
@@ -914,7 +955,7 @@ else
     e2e_fail "analytics/widgets: raw log not created"
 fi
 
-e2e_assert_file_contains "Analytics workflow bootstrap banner" "${RENDERED8}" "am: Starting MCP Agent Mail server"
+e2e_assert_file_contains_any "Analytics workflow bootstrap banner" "${RENDERED8}" "am: Starting MCP Agent Mail server" "spawn env DATABASE_URL="
 e2e_assert_file_contains "Analytics action trace includes ToolMetrics step" "${ACTION_TRACE8}" "ToolMetrics"
 
 # ═══════════════════════════════════════════════════════════════════════

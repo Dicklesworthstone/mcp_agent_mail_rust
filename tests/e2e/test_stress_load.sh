@@ -43,13 +43,8 @@ DURATION_SECS="${STRESS_DURATION_SECS:-30}"
 PORT="${STRESS_PORT:-0}"  # 0 = auto-select free port
 
 # ---------------------------------------------------------------------------
-# Setup: build binary, create temp workspace, start server
+# Setup: create temp workspace, start server
 # ---------------------------------------------------------------------------
-
-if [ "${STRESS_SKIP_BUILD:-0}" != "1" ]; then
-    e2e_ensure_binary "am" >/dev/null
-fi
-export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
 
 WORK="$(e2e_mktemp "e2e_stress")"
 STRESS_DB="${WORK}/stress.sqlite3"
@@ -61,60 +56,33 @@ if [ "$PORT" = "0" ]; then
     PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()" 2>/dev/null || echo 18765)
 fi
 
-SERVER_URL="http://127.0.0.1:${PORT}"
-MCP_URL="${SERVER_URL}/mcp/"
-
 echo "  Work dir: $WORK"
 echo "  DB: $STRESS_DB"
-echo "  Server: $SERVER_URL"
+echo "  Server (planned): http://127.0.0.1:${PORT}"
 echo "  Agents: $N_AGENTS, Concurrency: $CONCURRENCY, Msgs/agent: $MSGS_PER_AGENT"
 echo ""
 
-# Start the HTTP server in headless mode
-DATABASE_URL="sqlite:////${STRESS_DB}" \
-    STORAGE_ROOT="$STRESS_STORAGE" \
-    HTTP_PORT="$PORT" \
-    HTTP_HOST="127.0.0.1" \
-    TUI_ENABLED=false \
-    HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true \
-    RUST_LOG=warn \
-    am serve-http --no-tui --no-auth 2>"${WORK}/server_stderr.log" &
-SERVER_PID=$!
-echo "  Server PID: $SERVER_PID"
-
-cleanup() {
-    echo ""
-    echo "=== Cleanup ==="
-    if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-        echo "  Server stopped"
-    fi
-}
-trap cleanup EXIT
-
-# Wait for server to be ready
-echo -n "  Waiting for server..."
-for i in $(seq 1 60); do
-    if curl -sf "${SERVER_URL}/health" >/dev/null 2>&1; then
-        echo " ready (${i}s)"
-        break
-    fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo " FAILED (server died)"
-        echo "Server stderr:"
-        cat "${WORK}/server_stderr.log" 2>/dev/null || true
-        exit 1
-    fi
-    sleep 1
-done
-
-# Verify server is responding
-if ! curl -sf "${SERVER_URL}/health" >/dev/null 2>&1; then
-    echo "  Server failed to start within 60s"
-    cat "${WORK}/server_stderr.log" 2>/dev/null || true
+# Start the server via helper-managed lifecycle + log capture.
+if ! HTTP_PORT="$PORT" e2e_start_server_with_logs \
+    "${STRESS_DB}" \
+    "${STRESS_STORAGE}" \
+    "stress_load" \
+    "TUI_ENABLED=false" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1" \
+    "HTTP_RBAC_ENABLED=0" \
+    "HTTP_RATE_LIMIT_ENABLED=0" \
+    "HTTP_JWT_ENABLED=0" \
+    "RUST_LOG=warn"; then
+    e2e_fail "server failed to start"
+    e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     exit 1
 fi
+trap 'e2e_stop_server || true' EXIT
+
+SERVER_URL="${E2E_SERVER_URL%/mcp/}"
+MCP_URL="${E2E_SERVER_URL}"
+echo "  Server: ${SERVER_URL}"
+echo "  Server PID: ${E2E_SERVER_PID}"
 
 # ---------------------------------------------------------------------------
 # Helper: send MCP tool call via HTTP
@@ -171,7 +139,7 @@ PROJECT_KEY="/tmp/stress-test-project-$$"
 echo ""
 echo "=== Phase 0: Project Setup ==="
 
-INIT_RESP=$(mcp_call "ensure_project" "{\"project_key\":\"${PROJECT_KEY}\"}")
+INIT_RESP=$(mcp_call "ensure_project" "{\"human_key\":\"${PROJECT_KEY}\"}")
 if echo "$INIT_RESP" | grep -q '"error"'; then
     echo "  FAIL: ensure_project failed: $INIT_RESP"
     exit 1
@@ -219,7 +187,8 @@ for i in $(seq 0 $((N_AGENTS - 1))); do
     done
 
     (
-        resp=$(mcp_call "register_agent" "{\"project_key\":\"${PROJECT_KEY}\",\"program\":\"stress-test\",\"model\":\"test-model\"}")
+        agent_name="${AGENT_NAMES[$i]}"
+        resp=$(mcp_call "register_agent" "{\"project_key\":\"${PROJECT_KEY}\",\"name\":\"${agent_name}\",\"program\":\"stress-test\",\"model\":\"test-model\"}")
         if echo "$resp" | grep -q '"error"'; then
             exit 1
         fi
@@ -245,6 +214,20 @@ elif [ "$REG_FAIL" -lt $((N_AGENTS / 10)) ]; then
     e2e_pass "Agent registration: ${REG_OK}/${N_AGENTS} ok (${REG_FAIL} transient failures)"
 else
     e2e_fail "Agent registration: ${REG_FAIL}/${N_AGENTS} failed (too many errors)"
+fi
+
+# Ensure inter-agent messaging is allowed for stress workload.
+POLICY_FAIL=0
+for agent in "${AGENT_NAMES[@]}"; do
+    resp=$(mcp_call "set_contact_policy" "{\"project_key\":\"${PROJECT_KEY}\",\"agent_name\":\"${agent}\",\"policy\":\"open\"}")
+    if echo "$resp" | grep -q '"error"'; then
+        POLICY_FAIL=$((POLICY_FAIL + 1))
+    fi
+done
+if [ "$POLICY_FAIL" -eq 0 ]; then
+    e2e_pass "Contact policy set to open for all agents"
+else
+    e2e_fail "Contact policy setup failures: ${POLICY_FAIL}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -286,7 +269,7 @@ for i in $(seq 0 $((N_AGENTS - 1))); do
         thread_id="stress-t${i}-m${m}"
 
         (
-            resp=$(mcp_call "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"from_agent\":\"${from_agent}\",\"to_agent\":\"${to_agent}\",\"subject\":\"Stress msg ${i}-${m}\",\"body_md\":\"Load test message body ${i}-${m} with enough content to exercise FTS indexing\",\"thread_id\":\"${thread_id}\"}")
+            resp=$(mcp_call "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"sender_name\":\"${from_agent}\",\"to\":[\"${to_agent}\"],\"subject\":\"Stress msg ${i}-${m}\",\"body_md\":\"Load test message body ${i}-${m} with enough content to exercise FTS indexing\",\"thread_id\":\"${thread_id}\"}")
             if echo "$resp" | grep -q '"error"'; then
                 exit 1
             fi
@@ -363,7 +346,7 @@ for w in $(seq 0 $((CONCURRENCY / 2 - 1))); do
             to_idx=$(( (w + msg_idx + 1) % N_AGENTS ))
             from_agent="${AGENT_NAMES[$from_idx]}"
             to_agent="${AGENT_NAMES[$to_idx]}"
-            resp=$(mcp_call "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"from_agent\":\"${from_agent}\",\"to_agent\":\"${to_agent}\",\"subject\":\"Mix msg ${w}-${msg_idx}\",\"body_md\":\"Mixed workload body\",\"thread_id\":\"mix-${w}-${msg_idx}\"}")
+            resp=$(mcp_call "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"sender_name\":\"${from_agent}\",\"to\":[\"${to_agent}\"],\"subject\":\"Mix msg ${w}-${msg_idx}\",\"body_md\":\"Mixed workload body\",\"thread_id\":\"mix-${w}-${msg_idx}\"}")
             if echo "$resp" | grep -q '"error"'; then
                 fail=$((fail + 1))
             else
@@ -559,9 +542,6 @@ echo "  Phase 5 (Search):        ${SEARCH_OK}/${CONCURRENCY} ok"
 echo "  Phase 6 (Health):        ${HEALTH_OK}/100 ok, avg ${HEALTH_AVG_MS}ms"
 echo "================================================================"
 
-# Copy server logs to artifacts
-if [ -d "$E2E_ARTIFACT_DIR" ]; then
-    cp "${WORK}/server_stderr.log" "${E2E_ARTIFACT_DIR}/server_stderr.log" 2>/dev/null || true
-fi
+e2e_save_artifact "server_log_path.txt" "${E2E_ARTIFACT_DIR}/logs/server_stress_load.log"
 
 e2e_summary

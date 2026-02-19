@@ -8,6 +8,7 @@
 #   4. Theme switching + persistence path
 #   5. Error-boundary fallback + retry path
 #   6. Ambient mode behavior (off/subtle/full + parsing)
+#   7. Drag/drop edge cases (invalid targets, same-thread no-op, warning path)
 #
 # Diagnostics:
 #   - case timing TSV
@@ -26,9 +27,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-REPO_BASENAME="$(basename "${PROJECT_ROOT}")"
-RCH_WORKSPACE_ROOT="${E2E_RCH_WORKSPACE_ROOT:-$(cd "${PROJECT_ROOT}/.." && pwd)}"
-RCH_MANIFEST_PATH="${E2E_RCH_MANIFEST_PATH:-${REPO_BASENAME}/Cargo.toml}"
+RCH_WORKSPACE_ROOT="${E2E_RCH_WORKSPACE_ROOT:-${PROJECT_ROOT}}"
+RCH_MANIFEST_PATH="${E2E_RCH_MANIFEST_PATH:-Cargo.toml}"
 
 # Use a suite-specific target dir to avoid lock contention with other agents.
 if [ -z "${CARGO_TARGET_DIR:-}" ] || [ "${CARGO_TARGET_DIR}" = "/data/tmp/cargo-target" ]; then
@@ -148,9 +148,11 @@ scenario_fail() {
 append_cargo_diag() {
     local case_id="$1"
     local command_str="$2"
-    local rc="$3"
-    local elapsed_ms="$4"
-    local log_path="$5"
+    local runner="$3"
+    local fallback_local="$4"
+    local rc="$5"
+    local elapsed_ms="$6"
+    local log_path="$7"
 
     {
         printf '{'
@@ -158,7 +160,8 @@ append_cargo_diag() {
         printf '"suite":"%s",' "$(_e2e_json_escape "$E2E_SUITE")"
         printf '"scenario_id":"%s",' "$(_e2e_json_escape "$case_id")"
         printf '"command":"%s",' "$(_e2e_json_escape "$command_str")"
-        printf '"runner":"rch",'
+        printf '"runner":"%s",' "$(_e2e_json_escape "$runner")"
+        printf '"fallback_local":%s,' "${fallback_local}"
         printf '"elapsed_ms":%s,' "${elapsed_ms}"
         printf '"rc":%s,' "${rc}"
         printf '"log_path":"%s"' "$(_e2e_json_escape "$(diag_rel_path "${log_path}")")"
@@ -166,7 +169,18 @@ append_cargo_diag() {
     } >> "${CARGO_DIAG_FILE}"
 }
 
-run_cargo_with_rch_only() {
+is_known_rch_remote_dep_mismatch() {
+    local out_file="$1"
+    grep -Fq "failed to select a version for the requirement \`franken-decision = \"^0.2.5\"\`" "${out_file}" \
+        || grep -Fq "location searched: /data/projects/asupersync/franken_decision" "${out_file}" \
+        || grep -Fq "failed to select a version for the requirement \`ftui = \"^0.2.0\"\`" "${out_file}" \
+        || {
+            grep -Fq "failed to select a version for \`ort\`" "${out_file}" \
+                && grep -Fq "required by package \`fastembed v4.9.0\`" "${out_file}"
+        }
+}
+
+run_cargo_with_rch_fallback() {
     local case_id="$1"
     local out_file="$2"
     shift 2
@@ -175,6 +189,8 @@ run_cargo_with_rch_only() {
     local -a sub_args=("${cargo_args[@]:1}")
     local command_str="(cd ${RCH_WORKSPACE_ROOT} && cargo ${subcommand} --manifest-path ${RCH_MANIFEST_PATH} ${sub_args[*]})"
     local started_ms ended_ms elapsed_ms rc
+    local runner="local"
+    local fallback_local="false"
 
     if [ ! -f "${RCH_WORKSPACE_ROOT}/${RCH_MANIFEST_PATH}" ]; then
         {
@@ -185,37 +201,81 @@ run_cargo_with_rch_only() {
         started_ms="$(_e2e_now_ms)"
         ended_ms="$(_e2e_now_ms)"
         elapsed_ms=$((ended_ms - started_ms))
-        append_cargo_diag "${case_id}" "${command_str}" "${rc}" "${elapsed_ms}" "${out_file}"
+        append_cargo_diag \
+            "${case_id}" \
+            "${command_str}" \
+            "${runner}" \
+            "${fallback_local}" \
+            "${rc}" \
+            "${elapsed_ms}" \
+            "${out_file}"
         return "${rc}"
     fi
 
     started_ms="$(_e2e_now_ms)"
     {
         echo "[cmd] ${command_str}"
-        echo "[runner] rch"
     } >>"${out_file}"
 
-    if ! command -v rch >/dev/null 2>&1; then
-        echo "[error] rch is required but not found in PATH" >>"${out_file}"
-        rc=127
-        ended_ms="$(_e2e_now_ms)"
-        elapsed_ms=$((ended_ms - started_ms))
-        append_cargo_diag "${case_id}" "${command_str}" "${rc}" "${elapsed_ms}" "${out_file}"
-        return "${rc}"
-    fi
+    if [ "${E2E_USE_RCH:-0}" = "1" ] && command -v rch >/dev/null 2>&1; then
+        runner="rch"
+        {
+            echo "[runner] rch"
+        } >>"${out_file}"
 
-    set +e
-    (
-        cd "${RCH_WORKSPACE_ROOT}" || exit 2
-        timeout "${E2E_RCH_TIMEOUT_SECONDS:-300}" \
-            rch exec -- cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
-    ) >>"${out_file}" 2>&1
-    rc=$?
-    set -e
+        set +e
+        (
+            cd "${RCH_WORKSPACE_ROOT}" || exit 2
+            timeout "${E2E_RCH_TIMEOUT_SECONDS:-300}" \
+                rch exec -- cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
+        ) >>"${out_file}" 2>&1
+        rc=$?
+        set -e
+
+        if [ "${rc}" -ne 0 ] && [ "${E2E_ALLOW_LOCAL_FALLBACK:-1}" = "1" ]; then
+            fallback_local="true"
+            runner="local"
+            {
+                echo "[fallback] rch failed or stalled (rc=${rc}); retrying locally"
+                echo "[runner] local"
+            } >>"${out_file}"
+
+            set +e
+            (
+                cd "${RCH_WORKSPACE_ROOT}" || exit 2
+                cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
+            ) >>"${out_file}" 2>&1
+            rc=$?
+            set -e
+        fi
+    else
+        {
+            if [ "${E2E_USE_RCH:-0}" = "1" ]; then
+                echo "[runner] local (rch requested but missing)"
+            else
+                echo "[runner] local (rch disabled; set E2E_USE_RCH=1 to enable)"
+            fi
+        } >>"${out_file}"
+
+        set +e
+        (
+            cd "${RCH_WORKSPACE_ROOT}" || exit 2
+            cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
+        ) >>"${out_file}" 2>&1
+        rc=$?
+        set -e
+    fi
 
     ended_ms="$(_e2e_now_ms)"
     elapsed_ms=$((ended_ms - started_ms))
-    append_cargo_diag "${case_id}" "${command_str}" "${rc}" "${elapsed_ms}" "${out_file}"
+    append_cargo_diag \
+        "${case_id}" \
+        "${command_str}" \
+        "${runner}" \
+        "${fallback_local}" \
+        "${rc}" \
+        "${elapsed_ms}" \
+        "${out_file}"
     return "${rc}"
 }
 
@@ -264,7 +324,7 @@ run_interaction_case() {
 
     start_ms="$(_e2e_now_ms)"
 
-    if run_cargo_with_rch_only "${case_id}" "${out_file}" "${cargo_args[@]}"; then
+    if run_cargo_with_rch_fallback "${case_id}" "${out_file}" "${cargo_args[@]}"; then
         end_ms="$(_e2e_now_ms)"
         elapsed_ms=$((end_ms - start_ms))
         echo -e "${case_id}\t${elapsed_ms}" >> "${TIMING_REPORT}"
@@ -276,13 +336,26 @@ run_interaction_case() {
             tail -n 120 "${out_file}" 2>/dev/null || true
         fi
     else
+        local cargo_rc=$?
         end_ms="$(_e2e_now_ms)"
         elapsed_ms=$((end_ms - start_ms))
         echo -e "${case_id}\t${elapsed_ms}" >> "${TIMING_REPORT}"
-        scenario_fail "CARGO_COMMAND_FAILED" "${description}"
-        e2e_log "command failed for ${case_id}; tail follows"
-        tail -n 160 "${out_file}" 2>/dev/null || true
-        if grep -q "error: could not compile \`" "${out_file}"; then
+
+        if is_known_rch_remote_dep_mismatch "${out_file}"; then
+            scenario_diag_mark_reason "SKIP_RCH_REMOTE_DEP_MISMATCH" "remote worker dependency mismatch"
+            e2e_skip "${description} (remote rch dependency mismatch)"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_REMOTE_DEP_MISMATCH"
+            _SUITE_STOP_REASON="skipped after remote dependency mismatch in earlier case"
+            _SUITE_STOP_EVIDENCE="${out_file}"
+            e2e_log "remote dependency mismatch detected; remaining cases will be skipped"
+        else
+            scenario_fail "CARGO_COMMAND_FAILED" "${description}"
+            e2e_log "command failed for ${case_id}; tail follows"
+            tail -n 160 "${out_file}" 2>/dev/null || true
+        fi
+
+        if [ "${_SUITE_STOP_REMAINING}" -eq 0 ] && grep -q "error: could not compile \`" "${out_file}"; then
             _SUITE_STOP_REMAINING=1
             _SUITE_STOP_REASON_CODE="SKIP_SYSTEMIC_COMPILE_FAILURE"
             _SUITE_STOP_REASON="skipped after systemic compile failure in earlier case"
@@ -403,6 +476,29 @@ run_interaction_case \
     "Invalid or empty values default to subtle mode." \
     test -p mcp-agent-mail-server --lib \
     tui_widgets::tests::ambient_mode_parse_defaults_to_subtle -- --nocapture
+
+# Case 8: Drag/drop edge-case behavior and warning paths.
+run_interaction_case \
+    "case14_drag_drop_invalid_target_warning_snapshot" \
+    "Mouse drag over invalid target keeps warning snapshot state" \
+    "Begin drag then move cursor outside valid drop zones in message/thread browsers." \
+    "Drag snapshot reports invalid hover and no target thread id." \
+    test -p mcp-agent-mail-server --lib \
+    invalid_target -- --nocapture
+run_interaction_case \
+    "case15_drag_drop_same_thread_keyboard_noop" \
+    "Keyboard drop on same thread is no-op and preserves marker" \
+    "Keyboard move marker source thread equals selected target thread." \
+    "Ctrl+V returns no-op and keyboard move marker remains for retry." \
+    test -p mcp-agent-mail-server --lib \
+    same_thread_is_noop_and_preserves_marker -- --nocapture
+run_interaction_case \
+    "case16_drag_drop_rethread_dispatch_and_warning_path" \
+    "Rethread dispatches on valid target and warns on invalid op payload" \
+    "DnD rethread actions dispatched from screen tests plus app invalid-arg execute path." \
+    "Valid rethread action executes and malformed rethread op surfaces warning behavior." \
+    test -p mcp-agent-mail-server --lib \
+    rethread -- --nocapture
 
 e2e_save_artifact "interaction_timing.tsv" "$(cat "${TIMING_REPORT}")"
 

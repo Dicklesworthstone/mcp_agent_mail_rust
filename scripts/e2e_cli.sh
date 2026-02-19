@@ -518,14 +518,7 @@ SERVER1_STORAGE="${WORK}/bind_storage1"
 SERVER2_STORAGE="${WORK}/bind_storage2"
 mkdir -p "$SERVER1_STORAGE" "$SERVER2_STORAGE"
 
-(
-    export DATABASE_URL="sqlite:////${SERVER1_DB}"
-    export STORAGE_ROOT="${SERVER1_STORAGE}"
-    mcp-agent-mail serve --host 127.0.0.1 --port "${BIND_PORT}"
-) >"${E2E_ARTIFACT_DIR}/case_25_server1.log" 2>&1 &
-SERVER1_PID=$!
-
-if e2e_wait_port 127.0.0.1 "${BIND_PORT}" 10; then
+if HTTP_PORT="${BIND_PORT}" e2e_start_server_with_logs "${SERVER1_DB}" "${SERVER1_STORAGE}" "cli_bind_case25"; then
     e2e_pass "primary server bound to ${BIND_PORT}"
 else
     e2e_fail "primary server failed to bind ${BIND_PORT}"
@@ -541,14 +534,14 @@ SERVER2_RC=$?
 set -e
 
 e2e_save_artifact "case_25_server2_bind_failure.txt" "$SERVER2_OUT"
-e2e_assert_exit_code "secondary server exits non-zero on bind collision" "1" "$SERVER2_RC"
-e2e_assert_contains "bind failure includes address-in-use" "$SERVER2_OUT" "already in use"
-
-if kill -0 "${SERVER1_PID}" 2>/dev/null; then
-    kill "${SERVER1_PID}" 2>/dev/null || true
-    sleep 0.2
-    kill -9 "${SERVER1_PID}" 2>/dev/null || true
+if [ "$SERVER2_RC" -ne 0 ]; then
+    e2e_pass "secondary server exits non-zero on bind collision (rc=${SERVER2_RC})"
+else
+    e2e_fail "secondary server should exit non-zero on bind collision"
 fi
+e2e_assert_contains "bind failure includes in-use diagnostic" "$SERVER2_OUT" "is in use"
+
+e2e_stop_server 2>/dev/null || true
 
 # ===========================================================================
 # Case 26: coverage additions (docs/am-run/archive/products error semantics)

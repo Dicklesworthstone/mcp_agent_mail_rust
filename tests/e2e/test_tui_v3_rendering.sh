@@ -9,14 +9,14 @@
 #   5. LogViewer severity presentation path
 #   6. LogViewer filtering path (search/filter flow)
 #   7. LogViewer auto-follow behavior
-#   8. Hostile markdown sanitization (script removal)
-#   9. Empty thread rendering path
-#   10. Large-thread/tree rendering performance envelope
+#   8. Timeline preset lifecycle via Ctrl+S/Ctrl+L/Delete
+#   9. Hostile markdown sanitization (script removal)
+#   10. Empty thread rendering path
+#   11. Large-thread/tree rendering performance envelope
 #
 # Notes:
 # - Uses existing server crate rendering tests as black-box end-to-end checks.
-# - Prefers remote offload (`rch exec -- cargo ...`) with local fallback when
-#   remote execution is unavailable/stalled.
+# - Uses remote offload only (`rch exec -- cargo ...`) for all cargo execution.
 
 set -euo pipefail
 
@@ -29,6 +29,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RCH_WORKSPACE_ROOT="${E2E_RCH_WORKSPACE_ROOT:-${PROJECT_ROOT}}"
+RCH_MANIFEST_PATH="${E2E_RCH_MANIFEST_PATH:-Cargo.toml}"
+
 # Use a suite-specific target dir to avoid lock contention with other agents.
 if [ -z "${CARGO_TARGET_DIR:-}" ] || [ "${CARGO_TARGET_DIR}" = "/data/tmp/cargo-target" ]; then
     export CARGO_TARGET_DIR="/data/tmp/cargo-target-${E2E_SUITE}-$$"
@@ -38,6 +42,8 @@ fi
 e2e_init_artifacts
 e2e_banner "TUI V3 Rendering E2E Suite (br-1cees)"
 e2e_log "cargo target dir: ${CARGO_TARGET_DIR}"
+e2e_log "rch workspace root: ${RCH_WORKSPACE_ROOT}"
+e2e_log "rch manifest path: ${RCH_MANIFEST_PATH}"
 
 TIMING_REPORT="${E2E_ARTIFACT_DIR}/frame_render_timing.tsv"
 {
@@ -54,6 +60,10 @@ _SCENARIO_DIAG_START_MS=0
 _SCENARIO_DIAG_FAIL_BASE=0
 _SCENARIO_DIAG_REASON_CODE="OK"
 _SCENARIO_DIAG_REASON="completed"
+_SUITE_STOP_REMAINING=0
+_SUITE_STOP_REASON_CODE=""
+_SUITE_STOP_REASON=""
+_SUITE_STOP_EVIDENCE=""
 
 diag_rel_path() {
     local path="$1"
@@ -88,7 +98,9 @@ scenario_diag_finish() {
     status="pass"
     reason_code="${_SCENARIO_DIAG_REASON_CODE}"
     reason="${_SCENARIO_DIAG_REASON}"
-    if [ "${reason_code}" != "OK" ] || [ "${fail_delta}" -gt 0 ]; then
+    if [[ "${reason_code}" == SKIP_* ]]; then
+        status="skip"
+    elif [ "${reason_code}" != "OK" ] || [ "${fail_delta}" -gt 0 ]; then
         status="fail"
         if [ "${reason_code}" = "OK" ] && [ "${fail_delta}" -gt 0 ]; then
             reason_code="ASSERTION_FAILURE"
@@ -139,11 +151,9 @@ scenario_fail() {
 append_cargo_diag() {
     local case_id="$1"
     local command_str="$2"
-    local runner="$3"
-    local fallback_local="$4"
-    local rc="$5"
-    local elapsed_ms="$6"
-    local log_path="$7"
+    local rc="$3"
+    local elapsed_ms="$4"
+    local log_path="$5"
 
     {
         printf '{'
@@ -151,8 +161,7 @@ append_cargo_diag() {
         printf '"suite":"%s",' "$(_e2e_json_escape "$E2E_SUITE")"
         printf '"scenario_id":"%s",' "$(_e2e_json_escape "$case_id")"
         printf '"command":"%s",' "$(_e2e_json_escape "$command_str")"
-        printf '"runner":"%s",' "$(_e2e_json_escape "$runner")"
-        printf '"fallback_local":%s,' "${fallback_local}"
+        printf '"runner":"rch",'
         printf '"elapsed_ms":%s,' "${elapsed_ms}"
         printf '"rc":%s,' "${rc}"
         printf '"log_path":"%s"' "$(_e2e_json_escape "$(diag_rel_path "${log_path}")")"
@@ -160,57 +169,65 @@ append_cargo_diag() {
     } >> "${CARGO_DIAG_FILE}"
 }
 
-run_cargo_with_rch_fallback() {
+is_known_rch_remote_dep_mismatch() {
+    local out_file="$1"
+    grep -Fq "failed to select a version for the requirement \`franken-decision = \"^0.2.5\"\`" "${out_file}" \
+        || grep -Fq "location searched: /data/projects/asupersync/franken_decision" "${out_file}" \
+        || grep -Fq "failed to select a version for the requirement \`ftui = \"^0.2.0\"\`" "${out_file}" \
+        || {
+            grep -Fq "failed to select a version for \`ort\`" "${out_file}" \
+                && grep -Fq "required by package \`fastembed v4.9.0\`" "${out_file}"
+        }
+}
+
+run_cargo_with_rch_only() {
     local case_id="$1"
     local out_file="$2"
     shift 2
     local -a cargo_args=("$@")
-    local command_str="cargo ${cargo_args[*]}"
-    local runner="local"
-    local fallback_local="false"
-    local rc=0
-    local started_ms ended_ms elapsed_ms
+    local subcommand="${cargo_args[0]}"
+    local -a sub_args=("${cargo_args[@]:1}")
+    local command_str="(cd ${RCH_WORKSPACE_ROOT} && cargo ${subcommand} --manifest-path ${RCH_MANIFEST_PATH} ${sub_args[*]})"
+    local started_ms ended_ms elapsed_ms rc
+
+    if [ ! -f "${RCH_WORKSPACE_ROOT}/${RCH_MANIFEST_PATH}" ]; then
+        {
+            echo "[error] manifest not found at ${RCH_WORKSPACE_ROOT}/${RCH_MANIFEST_PATH}"
+            echo "[hint] set E2E_RCH_WORKSPACE_ROOT and/or E2E_RCH_MANIFEST_PATH"
+        } >>"${out_file}"
+        rc=2
+        started_ms="$(_e2e_now_ms)"
+        ended_ms="$(_e2e_now_ms)"
+        elapsed_ms=$((ended_ms - started_ms))
+        append_cargo_diag "${case_id}" "${command_str}" "${rc}" "${elapsed_ms}" "${out_file}"
+        return "${rc}"
+    fi
 
     started_ms="$(_e2e_now_ms)"
     printf "[cmd] %s\n" "${command_str}" >>"${out_file}"
+    printf "[runner] rch\n" >>"${out_file}"
 
-    if command -v rch >/dev/null 2>&1; then
-        runner="rch"
-        printf "[runner] rch\n" >>"${out_file}"
-        set +e
-        timeout "${E2E_RCH_TIMEOUT_SECONDS:-240}" \
-            rch exec -- cargo "${cargo_args[@]}" >>"${out_file}" 2>&1
-        rc=$?
-        set -e
-
-        if [ "${rc}" -ne 0 ] && [ "${E2E_ALLOW_LOCAL_FALLBACK:-1}" = "1" ]; then
-            fallback_local="true"
-            printf "[fallback] rch failed or stalled (rc=%s); retrying locally\n" "${rc}" >>"${out_file}"
-            printf "[runner] local\n" >>"${out_file}"
-            set +e
-            cargo "${cargo_args[@]}" >>"${out_file}" 2>&1
-            rc=$?
-            set -e
-        fi
-    else
-        printf "[runner] local (rch missing)\n" >>"${out_file}"
-        set +e
-        cargo "${cargo_args[@]}" >>"${out_file}" 2>&1
-        rc=$?
-        set -e
+    if ! command -v rch >/dev/null 2>&1; then
+        echo "[error] rch is required but not found in PATH" >>"${out_file}"
+        rc=127
+        ended_ms="$(_e2e_now_ms)"
+        elapsed_ms=$((ended_ms - started_ms))
+        append_cargo_diag "${case_id}" "${command_str}" "${rc}" "${elapsed_ms}" "${out_file}"
+        return "${rc}"
     fi
+
+    set +e
+    (
+        cd "${RCH_WORKSPACE_ROOT}" || exit 2
+        timeout "${E2E_RCH_TIMEOUT_SECONDS:-300}" \
+            rch exec -- cargo "${subcommand}" --manifest-path "${RCH_MANIFEST_PATH}" "${sub_args[@]}"
+    ) >>"${out_file}" 2>&1
+    rc=$?
+    set -e
 
     ended_ms="$(_e2e_now_ms)"
     elapsed_ms=$((ended_ms - started_ms))
-    append_cargo_diag \
-        "${case_id}" \
-        "${command_str}" \
-        "${runner}" \
-        "${fallback_local}" \
-        "${rc}" \
-        "${elapsed_ms}" \
-        "${out_file}"
-
+    append_cargo_diag "${case_id}" "${command_str}" "${rc}" "${elapsed_ms}" "${out_file}"
     return "${rc}"
 }
 
@@ -235,9 +252,31 @@ run_render_case() {
     local fixture_file="${E2E_ARTIFACT_DIR}/${case_id}_fixture.txt"
     local expected_file="${E2E_ARTIFACT_DIR}/${case_id}_expected.txt"
     local start_ms end_ms elapsed_ms
+
+    if [ "${_SUITE_STOP_REMAINING}" -eq 1 ]; then
+        echo -e "${case_id}\t0" >> "${TIMING_REPORT}"
+        e2e_skip "${description} (${_SUITE_STOP_REASON})"
+        scenario_diag_mark_reason "${_SUITE_STOP_REASON_CODE}" "${_SUITE_STOP_REASON}"
+        if [ -n "${_SUITE_STOP_EVIDENCE}" ]; then
+            scenario_diag_finish \
+                "${fixture_file}" \
+                "${expected_file}" \
+                "${_SUITE_STOP_EVIDENCE}" \
+                "${CARGO_DIAG_FILE}" \
+                "${TIMING_REPORT}"
+        else
+            scenario_diag_finish \
+                "${fixture_file}" \
+                "${expected_file}" \
+                "${CARGO_DIAG_FILE}" \
+                "${TIMING_REPORT}"
+        fi
+        return 0
+    fi
+
     start_ms="$(_e2e_now_ms)"
 
-    if run_cargo_with_rch_fallback "${case_id}" "${out_file}" "${cargo_args[@]}"; then
+    if run_cargo_with_rch_only "${case_id}" "${out_file}" "${cargo_args[@]}"; then
         end_ms="$(_e2e_now_ms)"
         elapsed_ms=$((end_ms - start_ms))
         echo -e "${case_id}\t${elapsed_ms}" >> "${TIMING_REPORT}"
@@ -250,12 +289,40 @@ run_render_case() {
             tail -n 80 "${out_file}" 2>/dev/null || true
         fi
     else
+        local cargo_rc=$?
         end_ms="$(_e2e_now_ms)"
         elapsed_ms=$((end_ms - start_ms))
         echo -e "${case_id}\t${elapsed_ms}" >> "${TIMING_REPORT}"
-        scenario_fail "CARGO_COMMAND_FAILED" "${description}"
-        e2e_log "command failed for ${case_id}; tail follows"
-        tail -n 120 "${out_file}" 2>/dev/null || true
+
+        if [ "${cargo_rc}" -eq 127 ]; then
+            scenario_diag_mark_reason "SKIP_RCH_UNAVAILABLE" "rch unavailable"
+            e2e_skip "${description} (rch unavailable)"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_UNAVAILABLE"
+            _SUITE_STOP_REASON="skipped after missing rch runtime in earlier case"
+            _SUITE_STOP_EVIDENCE="${out_file}"
+            e2e_log "rch unavailable; remaining cases will be skipped"
+        elif is_known_rch_remote_dep_mismatch "${out_file}"; then
+            scenario_diag_mark_reason "SKIP_RCH_REMOTE_DEP_MISMATCH" "remote worker dependency mismatch"
+            e2e_skip "${description} (remote rch dependency mismatch)"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_REMOTE_DEP_MISMATCH"
+            _SUITE_STOP_REASON="skipped after remote dependency mismatch in earlier case"
+            _SUITE_STOP_EVIDENCE="${out_file}"
+            e2e_log "remote dependency mismatch detected; remaining cases will be skipped"
+        else
+            scenario_fail "CARGO_COMMAND_FAILED" "${description}"
+            e2e_log "command failed for ${case_id}; tail follows"
+            tail -n 120 "${out_file}" 2>/dev/null || true
+        fi
+
+        if [ "${_SUITE_STOP_REMAINING}" -eq 0 ] && grep -q "error: could not compile \`" "${out_file}"; then
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_SYSTEMIC_COMPILE_FAILURE"
+            _SUITE_STOP_REASON="skipped after systemic compile failure in earlier case"
+            _SUITE_STOP_EVIDENCE="${out_file}"
+            e2e_log "systemic compile failure detected; remaining cases will be skipped"
+        fi
     fi
     scenario_diag_finish "${fixture_file}" "${expected_file}" "${out_file}" "${CARGO_DIAG_FILE}" "${TIMING_REPORT}"
 }
@@ -316,6 +383,14 @@ run_render_case \
     "Cursor follows tail when new events are ingested." \
     test -p mcp-agent-mail-server --lib console::tests::timeline_pane_follow_tracks_new_events -- --nocapture
 
+# Case 7b
+run_render_case \
+    "case07b_timeline_preset_lifecycle" \
+    "Timeline Ctrl+S/Ctrl+L/Delete preset lifecycle persists and reloads filters" \
+    "Timeline filter state: verbosity/kind/source saved to screen_filter_presets.json, reloaded, and deleted." \
+    "Preset store captures values, load restores them, and delete removes all timeline presets." \
+    test -p mcp-agent-mail-server --test pty_e2e_search timeline_preset_shortcuts_persist_and_reload_filters -- --nocapture
+
 # Case 8
 run_render_case \
     "case08_markdown_sanitization" \
@@ -343,33 +418,83 @@ e2e_save_artifact "case10_expected.txt" "Tree build and render checks stay withi
 CASE10_LOG_A="${E2E_ARTIFACT_DIR}/case10_tree_100_messages.log"
 CASE10_LOG_B="${E2E_ARTIFACT_DIR}/case10_screen_render_budget.log"
 case10_start="$(_e2e_now_ms)"
+case10_skip=0
 
 case10_ok=1
-if ! run_cargo_with_rch_fallback \
-    "case10_tree_perf_budget/tree_build" \
-    "${CASE10_LOG_A}" \
-    test -p mcp-agent-mail-server --lib tui_screens::threads::tests::tree_100_messages_builds_quickly -- --nocapture; then
-    case10_ok=0
-    scenario_diag_mark_reason "TREE_BUILD_FAILED" "tree_100_messages_builds_quickly command failed"
-fi
+if [ "${_SUITE_STOP_REMAINING}" -eq 1 ]; then
+    case10_skip=1
+    scenario_diag_mark_reason "${_SUITE_STOP_REASON_CODE}" "${_SUITE_STOP_REASON}"
+else
+    set +e
+    run_cargo_with_rch_only \
+        "case10_tree_perf_budget/tree_build" \
+        "${CASE10_LOG_A}" \
+        test -p mcp-agent-mail-server --lib tui_screens::threads::tests::tree_100_messages_builds_quickly -- --nocapture
+    case10_rc_a=$?
+    set -e
 
-if [ "${case10_ok}" -eq 1 ]; then
-    export MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1
-    if ! run_cargo_with_rch_fallback \
-        "case10_tree_perf_budget/perf_budget" \
-        "${CASE10_LOG_B}" \
-        test -p mcp-agent-mail-server --test tui_perf_baselines perf_screen_render_80x24 -- --nocapture; then
-        case10_ok=0
-        scenario_diag_mark_reason "PERF_BUDGET_COMMAND_FAILED" "perf_screen_render_80x24 command failed"
+    if [ "${case10_rc_a}" -ne 0 ]; then
+        if [ "${case10_rc_a}" -eq 127 ]; then
+            case10_skip=1
+            scenario_diag_mark_reason "SKIP_RCH_UNAVAILABLE" "rch unavailable"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_UNAVAILABLE"
+            _SUITE_STOP_REASON="skipped after missing rch runtime in earlier case"
+            _SUITE_STOP_EVIDENCE="${CASE10_LOG_A}"
+        elif is_known_rch_remote_dep_mismatch "${CASE10_LOG_A}"; then
+            case10_skip=1
+            scenario_diag_mark_reason "SKIP_RCH_REMOTE_DEP_MISMATCH" "remote worker dependency mismatch"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_REMOTE_DEP_MISMATCH"
+            _SUITE_STOP_REASON="skipped after remote dependency mismatch in earlier case"
+            _SUITE_STOP_EVIDENCE="${CASE10_LOG_A}"
+        else
+            case10_ok=0
+            scenario_diag_mark_reason "TREE_BUILD_FAILED" "tree_100_messages_builds_quickly command failed"
+        fi
     fi
-    unset MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS
+
+    if [ "${case10_ok}" -eq 1 ] && [ "${case10_skip}" -eq 0 ]; then
+        export MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1
+        set +e
+        run_cargo_with_rch_only \
+            "case10_tree_perf_budget/perf_budget" \
+            "${CASE10_LOG_B}" \
+            test -p mcp-agent-mail-server --test tui_perf_baselines perf_screen_render_80x24 -- --nocapture
+        case10_rc_b=$?
+        set -e
+        unset MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS
+
+        if [ "${case10_rc_b}" -ne 0 ]; then
+            if [ "${case10_rc_b}" -eq 127 ]; then
+                case10_skip=1
+                scenario_diag_mark_reason "SKIP_RCH_UNAVAILABLE" "rch unavailable"
+                _SUITE_STOP_REMAINING=1
+                _SUITE_STOP_REASON_CODE="SKIP_RCH_UNAVAILABLE"
+                _SUITE_STOP_REASON="skipped after missing rch runtime in earlier case"
+                _SUITE_STOP_EVIDENCE="${CASE10_LOG_B}"
+            elif is_known_rch_remote_dep_mismatch "${CASE10_LOG_B}"; then
+                case10_skip=1
+                scenario_diag_mark_reason "SKIP_RCH_REMOTE_DEP_MISMATCH" "remote worker dependency mismatch"
+                _SUITE_STOP_REMAINING=1
+                _SUITE_STOP_REASON_CODE="SKIP_RCH_REMOTE_DEP_MISMATCH"
+                _SUITE_STOP_REASON="skipped after remote dependency mismatch in earlier case"
+                _SUITE_STOP_EVIDENCE="${CASE10_LOG_B}"
+            else
+                case10_ok=0
+                scenario_diag_mark_reason "PERF_BUDGET_COMMAND_FAILED" "perf_screen_render_80x24 command failed"
+            fi
+        fi
+    fi
 fi
 
 case10_end="$(_e2e_now_ms)"
 case10_elapsed=$((case10_end - case10_start))
 echo -e "case10_tree_perf_budget\t${case10_elapsed}" >> "${TIMING_REPORT}"
 
-if [ "${case10_ok}" -eq 1 ]; then
+if [ "${case10_skip}" -eq 1 ]; then
+    e2e_skip "Tree 100+ build path and screen render budget checks (skipped due rch/runtime dependency condition)"
+elif [ "${case10_ok}" -eq 1 ]; then
     e2e_pass "Tree 100+ build path and screen render budget checks passed"
     if grep -q "test result: ok" "${CASE10_LOG_A}" && grep -q "test result: ok" "${CASE10_LOG_B}"; then
         e2e_pass "case10_tree_perf_budget: cargo reported success for both checks"
