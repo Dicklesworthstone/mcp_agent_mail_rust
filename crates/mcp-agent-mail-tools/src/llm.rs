@@ -1538,8 +1538,11 @@ mod tests {
             thread_id: id.to_string(),
             summary: ThreadSummary {
                 participants: vec![],
-                key_points: kp.iter().map(|s| s.to_string()).collect(),
-                action_items: actions.iter().map(|s| s.to_string()).collect(),
+                key_points: kp.iter().map(std::string::ToString::to_string).collect(),
+                action_items: actions
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
                 total_messages: 0,
                 open_actions: 0,
                 done_actions: 0,
@@ -1620,8 +1623,11 @@ mod tests {
     fn make_aggregate(kp: &[&str], actions: &[&str]) -> AggregateSummary {
         AggregateSummary {
             top_mentions: vec![],
-            key_points: kp.iter().map(|s| s.to_string()).collect(),
-            action_items: actions.iter().map(|s| s.to_string()).collect(),
+            key_points: kp.iter().map(std::string::ToString::to_string).collect(),
+            action_items: actions
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
         }
     }
 
@@ -1660,7 +1666,7 @@ mod tests {
         assert_eq!(result.top_mentions.len(), 2);
         match &result.top_mentions[0] {
             TopMention::Name(n) => assert_eq!(n, "Alice"),
-            other => panic!("expected Name, got {other:?}"),
+            other @ TopMention::Count(_) => panic!("expected Name, got {other:?}"),
         }
     }
 
@@ -1682,14 +1688,14 @@ mod tests {
                 assert_eq!(mc.name, "Alice");
                 assert_eq!(mc.count, 5);
             }
-            other => panic!("expected Count, got {other:?}"),
+            other @ TopMention::Name(_) => panic!("expected Count, got {other:?}"),
         }
         match &result.top_mentions[1] {
             TopMention::Count(mc) => {
                 assert_eq!(mc.name, "Bob");
                 assert_eq!(mc.count, 0); // default when missing
             }
-            other => panic!("expected Count, got {other:?}"),
+            other @ TopMention::Name(_) => panic!("expected Count, got {other:?}"),
         }
     }
 

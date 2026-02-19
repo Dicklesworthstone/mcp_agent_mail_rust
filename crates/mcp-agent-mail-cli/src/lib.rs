@@ -348,6 +348,12 @@ pub enum ContactsCommand {
         /// TTL in seconds (default: 7 days).
         #[arg(long, default_value_t = 604_800)]
         ttl_seconds: i64,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Approve or reject a contact request.
     Respond {
@@ -369,6 +375,12 @@ pub enum ContactsCommand {
         /// TTL in seconds for approved link (default: 30 days).
         #[arg(long, default_value_t = 2_592_000)]
         ttl_seconds: i64,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// List contacts for an agent.
     #[command(name = "list")]
@@ -396,6 +408,12 @@ pub enum ContactsCommand {
         agent_name: String,
         /// Policy: open, auto, contacts_only, block_all.
         policy: String,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -722,8 +740,11 @@ pub enum DeployCommand {
 pub struct DeployValidateArgs {
     /// Path to the bundle directory to validate.
     pub bundle: PathBuf,
-    /// Output as JSON instead of human-readable table.
-    #[arg(long)]
+    /// Output format: table, json, or toon (default: auto-detect).
+    #[arg(long, value_parser)]
+    pub format: Option<output::CliOutputFormat>,
+    /// Output JSON (shorthand for --format json).
+    #[arg(long, default_value_t = false)]
     pub json: bool,
 }
 
@@ -737,8 +758,11 @@ pub struct DeployToolingArgs {
 pub struct DeployVerifyArgs {
     /// Deployed URL to verify (e.g., `https://example.github.io/agent-mail`).
     pub url: String,
-    /// Output as JSON instead of human-readable table.
-    #[arg(long)]
+    /// Output format: table, json, or toon (default: auto-detect).
+    #[arg(long, value_parser)]
+    pub format: Option<output::CliOutputFormat>,
+    /// Output JSON (shorthand for --format json).
+    #[arg(long, default_value_t = false)]
     pub json: bool,
 }
 
@@ -749,8 +773,11 @@ pub struct DeployVerifyLiveArgs {
     /// Local bundle directory for content-match checks.
     #[arg(long)]
     pub bundle: Option<PathBuf>,
-    /// Output JSON report instead of human-readable summary.
-    #[arg(long)]
+    /// Output format: table, json, or toon (default: auto-detect).
+    #[arg(long, value_parser)]
+    pub format: Option<output::CliOutputFormat>,
+    /// Output JSON report (shorthand for --format json).
+    #[arg(long, default_value_t = false)]
     pub json: bool,
     /// Promote warnings to errors for exit code.
     #[arg(long)]
@@ -905,8 +932,11 @@ pub struct ShareWizardArgs {
     /// Non-interactive mode (fail if prompts needed).
     #[arg(long)]
     pub non_interactive: bool,
-    /// Output JSON instead of human-readable format.
-    #[arg(long)]
+    /// Output format: table, json, or toon (default: auto-detect).
+    #[arg(long, value_parser)]
+    pub format: Option<output::CliOutputFormat>,
+    /// Output JSON (shorthand for --format json).
+    #[arg(long, default_value_t = false)]
     pub json: bool,
 }
 
@@ -2335,11 +2365,8 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
         DeployCommand::Validate(args) => {
             ensure_dir(&args.bundle)?;
             let report = share::deploy::validate_bundle(&args.bundle)?;
-            if args.json {
-                let json =
-                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
-                ftui_runtime::ftui_println!("{json}");
-            } else {
+            let fmt = output::CliOutputFormat::resolve(args.format, args.json);
+            output::emit_output(&report, fmt, || {
                 ftui_runtime::ftui_println!("=== Deploy Validation Report ===");
                 ftui_runtime::ftui_println!("Generated: {}", report.generated_at);
                 ftui_runtime::ftui_println!("Ready: {}", if report.ready { "YES" } else { "NO" });
@@ -2411,7 +2438,7 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
                 for step in &report.rollback.steps {
                     ftui_runtime::ftui_println!("  [{}] {}", step.platform, step.instruction);
                 }
-            }
+            });
             if !report.ready {
                 return Err(CliError::ExitCode(1));
             }
@@ -2428,10 +2455,8 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
         }
         DeployCommand::VerifyUrl(args) => {
             let plan = share::deploy::build_verify_plan(&args.url);
-            if args.json {
-                let json = serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string());
-                ftui_runtime::ftui_println!("{json}");
-            } else {
+            let fmt = output::CliOutputFormat::resolve(args.format, args.json);
+            output::emit_output(&plan, fmt, || {
                 ftui_runtime::ftui_println!("=== Deployment Verification Plan ===");
                 ftui_runtime::ftui_println!("URL: {}", plan.url);
                 ftui_runtime::ftui_println!("");
@@ -2457,7 +2482,7 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
                     "  ./scripts/validate_deploy.sh <bundle_dir> {}",
                     plan.url
                 );
-            }
+            });
             Ok(())
         }
         DeployCommand::VerifyLive(args) => handle_deploy_verify_live(args),
@@ -2482,13 +2507,11 @@ fn build_verify_live_options(args: &DeployVerifyLiveArgs) -> share::deploy::Veri
 }
 
 fn handle_deploy_verify_live(args: DeployVerifyLiveArgs) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(args.format, args.json);
     let opts = build_verify_live_options(&args);
     let report = share::deploy::run_verify_live(&opts);
 
-    if args.json {
-        let json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
-        ftui_runtime::ftui_println!("{json}");
-    } else {
+    output::emit_output(&report, fmt, || {
         ftui_runtime::ftui_println!("verify-live: {}", args.url);
         ftui_runtime::ftui_println!("");
 
@@ -2521,7 +2544,7 @@ fn handle_deploy_verify_live(args: DeployVerifyLiveArgs) -> CliResult<()> {
             report.summary.warnings,
             report.summary.elapsed_ms
         );
-    }
+    });
 
     // Exit code per SPEC
     let code = report.exit_code();
@@ -4791,7 +4814,10 @@ fn handle_contacts_with_conn(
             to_agent,
             reason,
             ttl_seconds,
+            format,
+            json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let ttl = ttl_seconds.max(60);
             let expires_us = now_us + ttl.saturating_mul(1_000_000);
 
@@ -4862,17 +4888,21 @@ fn handle_contacts_with_conn(
             .map_err(|e| CliError::Other(format!("insert failed: {e}")))?;
 
             let result = serde_json::json!({
-                "from": from_agent,
-                "to": to_agent,
+                "from": from_agent.clone(),
+                "to": to_agent.clone(),
                 "status": "pending",
-                "reason": reason,
+                "reason": reason.clone(),
                 "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires_us),
             });
-            ftui_runtime::ftui_println!(
-                "{}",
-                serde_json::to_string_pretty(&result).unwrap_or_default()
-            );
-            output::success(&format!("Contact request sent: {from_agent} → {to_agent}"));
+            output::emit_output(&result, fmt, || {
+                output::success(&format!("Contact request sent: {from_agent} → {to_agent}"));
+                output::kv("Status", "pending");
+                output::kv("Reason", &reason);
+                output::kv(
+                    "Expires",
+                    &mcp_agent_mail_db::timestamps::micros_to_iso(expires_us),
+                );
+            });
             Ok(())
         }
         ContactsCommand::Respond {
@@ -4882,7 +4912,10 @@ fn handle_contacts_with_conn(
             accept,
             reject,
             ttl_seconds,
+            format,
+            json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let approved = if reject { false } else { accept };
             let new_status = if approved { "approved" } else { "blocked" };
             let ttl = ttl_seconds.max(60);
@@ -4951,20 +4984,19 @@ fn handle_contacts_with_conn(
                 .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
 
             let result = serde_json::json!({
-                "from": from_agent,
-                "to": agent_name,
+                "from": from_agent.clone(),
+                "to": agent_name.clone(),
                 "approved": approved,
                 "status": new_status,
                 "updated": true,
             });
-            ftui_runtime::ftui_println!(
-                "{}",
-                serde_json::to_string_pretty(&result).unwrap_or_default()
-            );
             let verb = if approved { "Approved" } else { "Rejected" };
-            output::success(&format!(
-                "{verb} contact request: {from_agent} → {agent_name}"
-            ));
+            output::emit_output(&result, fmt, || {
+                output::success(&format!(
+                    "{verb} contact request: {from_agent} → {agent_name}"
+                ));
+                output::kv("Status", new_status);
+            });
             Ok(())
         }
         ContactsCommand::ListContacts {
@@ -5102,7 +5134,10 @@ fn handle_contacts_with_conn(
             project_key,
             agent_name,
             policy,
+            format,
+            json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             // Validate policy.
             let valid = ["open", "auto", "contacts_only", "block_all"];
             if !valid.contains(&policy.as_str()) {
@@ -5136,14 +5171,12 @@ fn handle_contacts_with_conn(
             .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
 
             let result = serde_json::json!({
-                "agent": agent_name,
-                "policy": policy,
+                "agent": agent_name.clone(),
+                "policy": policy.clone(),
             });
-            ftui_runtime::ftui_println!(
-                "{}",
-                serde_json::to_string_pretty(&result).unwrap_or_default()
-            );
-            output::success(&format!("Contact policy set: {agent_name} → {policy}"));
+            output::emit_output(&result, fmt, || {
+                output::success(&format!("Contact policy set: {agent_name} → {policy}"));
+            });
             Ok(())
         }
     }
@@ -6302,6 +6335,8 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
 // ── Native Share Wizard ─────────────────────────────────────────────────
 
 fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(args.format, args.json);
+
     // Parse provider if specified
     let provider = args.provider.as_ref().and_then(|s| {
         share::HostingProvider::parse(s).or_else(|| {
@@ -6329,7 +6364,7 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
             dry_run: args.dry_run,
         },
         non_interactive: args.non_interactive,
-        json_output: args.json,
+        json_output: !matches!(fmt, output::CliOutputFormat::Table),
         skip_detection: false,
     };
 
@@ -6337,31 +6372,29 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
     let outcome = match share::run_interactive_wizard(config) {
         Ok(outcome) => outcome,
         Err(err) => {
-            if args.json {
-                let output = share::WizardJsonOutput::failure(err.clone(), None);
-                let json =
-                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string());
-                ftui_runtime::ftui_println!("{json}");
-            } else {
+            let output = share::WizardJsonOutput::failure(err.clone(), None);
+            output::emit_output(&output, fmt, || {
                 ftui_runtime::ftui_eprintln!("Error: {err}");
                 if let Some(ref hint) = err.hint {
                     ftui_runtime::ftui_eprintln!("Hint: {hint}");
                 }
-            }
+            });
             return Err(CliError::ExitCode(err.exit_code()));
         }
     };
 
     // Handle outcome
-    if args.json {
+    if !matches!(fmt, output::CliOutputFormat::Table) {
         let json = share::format_json_output(&outcome, outcome.confirmed, None);
-        ftui_runtime::ftui_println!("{json}");
+        let payload = serde_json::from_str::<serde_json::Value>(&json)
+            .map_err(|e| CliError::Other(format!("wizard output encode failed: {e}")))?;
+        output::emit_output(&payload, fmt, || {});
     }
 
     if !outcome.confirmed {
         if args.dry_run {
             // Dry-run mode: show what would happen
-            if !args.json {
+            if matches!(fmt, output::CliOutputFormat::Table) {
                 ftui_runtime::ftui_println!("\n[Dry run] No changes were made.");
             }
             return Ok(());
@@ -6375,36 +6408,27 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
         interactive: !args.non_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin()),
         skip_confirm: args.yes,
         dry_run: args.dry_run,
-        verbose: !args.json,
+        verbose: matches!(fmt, output::CliOutputFormat::Table),
     };
 
     let result = match share::execute_plan(&outcome.plan, &exec_config) {
         Ok(result) => result,
         Err(err) => {
-            if args.json {
-                let output = share::WizardJsonOutput::failure(
-                    err.clone(),
-                    outcome.inputs.bundle_path.clone(),
-                );
-                let json =
-                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string());
-                ftui_runtime::ftui_println!("{json}");
-            } else {
+            let output =
+                share::WizardJsonOutput::failure(err.clone(), outcome.inputs.bundle_path.clone());
+            output::emit_output(&output, fmt, || {
                 ftui_runtime::ftui_eprintln!("Execution error: {err}");
                 if let Some(ref hint) = err.hint {
                     ftui_runtime::ftui_eprintln!("Hint: {hint}");
                 }
-            }
+            });
             return Err(CliError::ExitCode(err.exit_code()));
         }
     };
 
     // Report success
-    if args.json {
-        let output = share::WizardJsonOutput::success(result);
-        let json = serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string());
-        ftui_runtime::ftui_println!("{json}");
-    } else {
+    let output = share::WizardJsonOutput::success(result);
+    output::emit_output(&output, fmt, || {
         ftui_runtime::ftui_println!("\nDeployment complete.");
         if let Some(ref url) = outcome.plan.expected_url {
             ftui_runtime::ftui_println!("Expected URL: {url}");
@@ -6415,7 +6439,7 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
                 ftui_runtime::ftui_eprintln!("  - {warning}");
             }
         }
-    }
+    });
 
     Ok(())
 }
@@ -9923,6 +9947,62 @@ mod tests {
     }
 
     #[test]
+    fn clap_parses_share_deploy_validate_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "share",
+            "deploy",
+            "validate",
+            "/tmp/bundle",
+            "--format",
+            "toon",
+        ])
+        .expect("failed to parse deploy validate format");
+
+        match cli.command.expect("expected command") {
+            Commands::Share {
+                action:
+                    ShareCommand::Deploy {
+                        action: DeployCommand::Validate(args),
+                    },
+            } => {
+                assert_eq!(args.bundle, PathBuf::from("/tmp/bundle"));
+                assert_eq!(args.format, Some(output::CliOutputFormat::Toon));
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_share_deploy_verify_url_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "share",
+            "deploy",
+            "verify",
+            "https://example.test/agent-mail",
+            "--format",
+            "toon",
+        ])
+        .expect("failed to parse deploy verify format");
+
+        match cli.command.expect("expected command") {
+            Commands::Share {
+                action:
+                    ShareCommand::Deploy {
+                        action: DeployCommand::VerifyUrl(args),
+                    },
+            } => {
+                assert_eq!(args.url, "https://example.test/agent-mail");
+                assert_eq!(args.format, Some(output::CliOutputFormat::Toon));
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_parses_share_deploy_verify_live_defaults() {
         let cli = Cli::try_parse_from([
             "am",
@@ -9942,6 +10022,7 @@ mod tests {
             } => {
                 assert_eq!(args.url, "https://example.test/agent-mail");
                 assert_eq!(args.bundle, None);
+                assert!(args.format.is_none());
                 assert!(!args.json);
                 assert!(!args.strict);
                 assert!(!args.fail_fast);
@@ -9949,6 +10030,34 @@ mod tests {
                 assert_eq!(args.timeout, 10_000);
                 assert_eq!(args.retries, 2);
                 assert_eq!(args.retry_delay, 1_000);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_share_deploy_verify_live_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "share",
+            "deploy",
+            "verify-live",
+            "https://example.test/agent-mail",
+            "--format",
+            "toon",
+        ])
+        .expect("failed to parse deploy verify-live --format toon");
+
+        match cli.command.expect("expected command") {
+            Commands::Share {
+                action:
+                    ShareCommand::Deploy {
+                        action: DeployCommand::VerifyLive(args),
+                    },
+            } => {
+                assert_eq!(args.url, "https://example.test/agent-mail");
+                assert_eq!(args.format, Some(output::CliOutputFormat::Toon));
+                assert!(!args.json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -9986,6 +10095,7 @@ mod tests {
             } => {
                 assert_eq!(args.url, "https://example.test/agent-mail");
                 assert_eq!(args.bundle, Some(PathBuf::from("/tmp/live_bundle")));
+                assert!(args.format.is_none());
                 assert!(args.json);
                 assert!(args.strict);
                 assert!(args.fail_fast);
@@ -10003,6 +10113,7 @@ mod tests {
         let args = DeployVerifyLiveArgs {
             url: "https://example.test/agent-mail".to_string(),
             bundle: Some(PathBuf::from("/tmp/live_bundle")),
+            format: None,
             json: true,
             strict: true,
             fail_fast: true,
@@ -10371,7 +10482,23 @@ mod tests {
                 assert!(args.yes);
                 assert!(args.dry_run);
                 assert!(args.non_interactive);
+                assert!(args.format.is_none());
                 assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_share_wizard_format_toon() {
+        let cli = Cli::try_parse_from(["am", "share", "wizard", "--format", "toon"])
+            .expect("failed to parse share wizard --format toon");
+        match cli.command.expect("expected command") {
+            Commands::Share {
+                action: ShareCommand::Wizard(args),
+            } => {
+                assert_eq!(args.format, Some(output::CliOutputFormat::Toon));
+                assert!(!args.json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -10397,6 +10524,7 @@ mod tests {
             yes: false,
             dry_run: false,
             non_interactive: true,
+            format: None,
             json: false,
         };
         let result = run_native_wizard(args);
@@ -10430,6 +10558,7 @@ mod tests {
             yes: true,
             dry_run: true,
             non_interactive: true,
+            format: None,
             json: true,
         };
 
@@ -10477,6 +10606,7 @@ mod tests {
             yes: true,     // Skip confirmation
             dry_run: true, // Don't actually execute
             non_interactive: true,
+            format: None,
             json: true,
         };
         let _ = run_native_wizard(args);
@@ -10521,6 +10651,7 @@ mod tests {
             yes: true,
             dry_run: true,
             non_interactive: true,
+            format: None,
             json: false,
         };
         let result = run_native_wizard(args);
@@ -10558,6 +10689,7 @@ mod tests {
             yes: true,
             dry_run: true,
             non_interactive: true,
+            format: None,
             json: false,
         };
         let result = run_native_wizard(args);
@@ -16472,6 +16604,8 @@ mod tests {
                         to_agent,
                         reason,
                         ttl_seconds,
+                        format,
+                        json,
                     },
             } => {
                 assert_eq!(project_key, "my-proj");
@@ -16479,6 +16613,8 @@ mod tests {
                 assert_eq!(to_agent, "RedFox");
                 assert_eq!(reason, "need to coordinate");
                 assert_eq!(ttl_seconds, 604_800); // default 7 days
+                assert!(format.is_none());
+                assert!(!json);
             }
             other => panic!("expected contacts request, got {other:?}"),
         }
@@ -16506,11 +16642,15 @@ mod tests {
                     ContactsCommand::Request {
                         ttl_seconds,
                         reason,
+                        format,
+                        json,
                         ..
                     },
             } => {
                 assert_eq!(ttl_seconds, 86400);
                 assert_eq!(reason, ""); // default
+                assert!(format.is_none());
+                assert!(!json);
             }
             other => panic!("expected contacts request, got {other:?}"),
         }
@@ -16531,6 +16671,8 @@ mod tests {
                         from_agent,
                         accept,
                         reject,
+                        format,
+                        json,
                         ..
                     },
             } => {
@@ -16539,6 +16681,8 @@ mod tests {
                 assert_eq!(from_agent, "BlueLake");
                 assert!(accept);
                 assert!(!reject);
+                assert!(format.is_none());
+                assert!(!json);
             }
             other => panic!("expected contacts respond, got {other:?}"),
         }
@@ -16555,10 +16699,16 @@ mod tests {
             Commands::Contacts {
                 action:
                     ContactsCommand::Respond {
-                        accept: _, reject, ..
+                        accept: _,
+                        reject,
+                        format,
+                        json,
+                        ..
                     },
             } => {
                 assert!(reject);
+                assert!(format.is_none());
+                assert!(!json);
             }
             other => panic!("expected contacts respond, got {other:?}"),
         }
@@ -16641,11 +16791,95 @@ mod tests {
                         project_key,
                         agent_name,
                         policy,
+                        format,
+                        json,
                     },
             } => {
                 assert_eq!(project_key, "proj");
                 assert_eq!(agent_name, "BlueLake");
                 assert_eq!(policy, "contacts_only");
+                assert!(format.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected contacts policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_request_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "contacts",
+            "request",
+            "--project",
+            "proj",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+            "--format",
+            "toon",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Contacts {
+                action: ContactsCommand::Request { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected contacts request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_respond_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "contacts",
+            "respond",
+            "--project",
+            "proj",
+            "--agent",
+            "RedFox",
+            "--from",
+            "BlueLake",
+            "--format",
+            "toon",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Contacts {
+                action: ContactsCommand::Respond { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected contacts respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_policy_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "contacts",
+            "policy",
+            "--project",
+            "proj",
+            "--agent",
+            "BlueLake",
+            "contacts_only",
+            "--format",
+            "toon",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Contacts {
+                action: ContactsCommand::Policy { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
             }
             other => panic!("expected contacts policy, got {other:?}"),
         }
@@ -16671,6 +16905,8 @@ mod tests {
                 to_agent: "RedFox".to_string(),
                 reason: "need coordination".to_string(),
                 ttl_seconds: 3600,
+                format: None,
+                json: true,
             },
         );
         let output = capture.drain_to_string();
@@ -16710,6 +16946,8 @@ mod tests {
                 to_agent: "RedFox".to_string(),
                 reason: "collab".to_string(),
                 ttl_seconds: 3600,
+                format: None,
+                json: false,
             },
         )
         .unwrap();
@@ -16725,6 +16963,8 @@ mod tests {
                 accept: true,
                 reject: false,
                 ttl_seconds: 86400,
+                format: None,
+                json: true,
             },
         );
         let output = capture.drain_to_string();
@@ -16763,6 +17003,8 @@ mod tests {
                 to_agent: "BlueLake".to_string(),
                 reason: "test".to_string(),
                 ttl_seconds: 3600,
+                format: None,
+                json: false,
             },
         )
         .unwrap();
@@ -16777,6 +17019,8 @@ mod tests {
                 accept: false,
                 reject: true,
                 ttl_seconds: 86400,
+                format: None,
+                json: true,
             },
         );
         let output = capture.drain_to_string();
@@ -16815,6 +17059,8 @@ mod tests {
                 to_agent: "RedFox".to_string(),
                 reason: "x".to_string(),
                 ttl_seconds: 3600,
+                format: None,
+                json: false,
             },
         )
         .unwrap();
@@ -16885,6 +17131,8 @@ mod tests {
                 project_key: "test-proj".to_string(),
                 agent_name: "BlueLake".to_string(),
                 policy: "contacts_only".to_string(),
+                format: None,
+                json: true,
             },
         );
         let output = capture.drain_to_string();
@@ -16920,6 +17168,8 @@ mod tests {
                 project_key: "test-proj".to_string(),
                 agent_name: "BlueLake".to_string(),
                 policy: "invalid_policy".to_string(),
+                format: None,
+                json: false,
             },
         );
         assert!(result.is_err(), "should fail for invalid policy");
@@ -16942,6 +17192,8 @@ mod tests {
                 to_agent: "RedFox".to_string(),
                 reason: String::new(),
                 ttl_seconds: 3600,
+                format: None,
+                json: false,
             },
         );
         assert!(result.is_err(), "should fail for nonexistent project");
@@ -16964,6 +17216,8 @@ mod tests {
                 to_agent: "RedFox".to_string(),
                 reason: String::new(),
                 ttl_seconds: 3600,
+                format: None,
+                json: false,
             },
         );
         assert!(result.is_err(), "should fail for nonexistent agent");
@@ -16987,6 +17241,8 @@ mod tests {
                 to_agent: "RedFox".to_string(),
                 reason: "first".to_string(),
                 ttl_seconds: 3600,
+                format: None,
+                json: false,
             },
         )
         .unwrap();
@@ -17000,6 +17256,8 @@ mod tests {
                 to_agent: "RedFox".to_string(),
                 reason: "updated".to_string(),
                 ttl_seconds: 7200,
+                format: None,
+                json: false,
             },
         )
         .unwrap();
