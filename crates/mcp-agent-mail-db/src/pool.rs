@@ -358,9 +358,9 @@ impl DbPool {
                                 async move {
                                     // Use C-backed SqliteConnection for DB-wide init.
                                     //
-                                    // Since DbConn = SqliteConnection (not FrankenConnection),
-                                    // we can safely run full migrations including FTS5 virtual
-                                    // tables and triggers for optimal search performance.
+                                    // DbConn = FrankenConnection, but schema migrations and
+                                    // integrity PRAGMAs require C SQLite for trigger execution
+                                    // and PRAGMA support.
                                     if let Err(e) =
                                         ensure_sqlite_file_healthy(Path::new(&sqlite_path))
                                     {
@@ -392,9 +392,7 @@ impl DbPool {
                                     // migration paths and have caused post-crash rowid/index
                                     // mismatch failures (e.g. fts_projects corruption paths).
                                     // Drop all FTS artifacts (Tantivy handles search now).
-                                    if let Err(e) =
-                                        schema::enforce_runtime_fts_cleanup(&mig_conn)
-                                    {
+                                    if let Err(e) = schema::enforce_runtime_fts_cleanup(&mig_conn) {
                                         return Err(Outcome::Err(e));
                                     }
                                     // Close migration connection first. Some paths can leave
@@ -508,7 +506,9 @@ impl DbPool {
             });
         }
 
-        let conn = DbConn::open_file(&self.sqlite_path)
+        // Use C-backed SqliteConnection for integrity PRAGMAs (FrankenConnection
+        // does not implement PRAGMA quick_check / integrity_check).
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("startup integrity check: open failed: {e}")))?;
 
         match integrity::quick_check(&conn) {
@@ -526,11 +526,12 @@ impl DbPool {
                 }
 
                 // Re-open and re-verify
-                let conn = DbConn::open_file(&self.sqlite_path).map_err(|e| {
-                    DbError::Sqlite(format!(
-                        "startup integrity check (post-recovery): open failed: {e}"
-                    ))
-                })?;
+                let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "startup integrity check (post-recovery): open failed: {e}"
+                        ))
+                    })?;
                 integrity::quick_check(&conn)
             }
             Err(e) => Err(e),
@@ -560,7 +561,8 @@ impl DbPool {
             });
         }
 
-        let conn = DbConn::open_file(&self.sqlite_path)
+        // Use C-backed SqliteConnection for integrity PRAGMAs.
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("full integrity check: open failed: {e}")))?;
 
         integrity::full_check(&conn)
@@ -647,7 +649,8 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
         }
-        let conn = DbConn::open_file(&self.sqlite_path)
+        // Use C-backed SqliteConnection for WAL checkpoint PRAGMAs.
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
 
         // Apply busy_timeout so the checkpoint waits for active readers/writers.
@@ -1012,9 +1015,9 @@ mod tests {
 
     #[test]
     fn test_schema_init_in_memory() {
-        // Use base schema (no FTS5/triggers) because DbConn is FrankenConnection.
+        // Use base schema (no FTS5/triggers) for FrankenConnection pool connections.
 
-        // Open in-memory connection
+        // Open in-memory FrankenConnection
         let conn = DbConn::open_memory().expect("failed to open in-memory db");
 
         // Get base schema SQL (no FTS5 virtual tables or triggers)

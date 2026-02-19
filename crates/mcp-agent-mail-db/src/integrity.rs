@@ -16,9 +16,9 @@
 //! - Returns an `IntegrityCorruption` error so callers can set health to Red.
 //! - Optionally attempts recovery via `VACUUM INTO` to create a clean copy.
 
-use crate::DbConn;
 use crate::error::{DbError, DbResult};
 use sqlmodel_core::{Row, Value};
+use sqlmodel_sqlite::SqliteConnection;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -111,7 +111,7 @@ pub fn integrity_metrics() -> IntegrityMetrics {
 ///
 /// This is fast (typically <100ms) and catches most common corruption.
 /// Suitable for startup validation.
-pub fn quick_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
+pub fn quick_check(conn: &SqliteConnection) -> DbResult<IntegrityCheckResult> {
     run_check(conn, "PRAGMA quick_check", CheckKind::Quick)
 }
 
@@ -119,7 +119,7 @@ pub fn quick_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
 ///
 /// Faster than a full check but provides less detail. Suitable for
 /// periodic connection-recycle checks.
-pub fn incremental_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
+pub fn incremental_check(conn: &SqliteConnection) -> DbResult<IntegrityCheckResult> {
     run_check(conn, "PRAGMA integrity_check(1)", CheckKind::Incremental)
 }
 
@@ -127,11 +127,11 @@ pub fn incremental_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
 ///
 /// This scans the entire database and can take seconds on large databases.
 /// Run on a dedicated connection, not from the pool hot path.
-pub fn full_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
+pub fn full_check(conn: &SqliteConnection) -> DbResult<IntegrityCheckResult> {
     run_check(conn, "PRAGMA integrity_check", CheckKind::Full)
 }
 
-fn run_check(conn: &DbConn, pragma: &str, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
+fn run_check(conn: &SqliteConnection, pragma: &str, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
     let start = std::time::Instant::now();
 
     let rows: Vec<Row> = conn
@@ -201,7 +201,7 @@ fn run_check(conn: &DbConn, pragma: &str, kind: CheckKind) -> DbResult<Integrity
 /// Attempt recovery by creating a clean copy via `VACUUM INTO`.
 ///
 /// Returns the path of the clean copy on success.
-pub fn attempt_vacuum_recovery(conn: &DbConn, original_path: &str) -> DbResult<String> {
+pub fn attempt_vacuum_recovery(conn: &SqliteConnection, original_path: &str) -> DbResult<String> {
     let recovery_path = format!("{original_path}.recovery");
 
     // Remove any leftover recovery file.
@@ -211,7 +211,7 @@ pub fn attempt_vacuum_recovery(conn: &DbConn, original_path: &str) -> DbResult<S
         .map_err(|e| DbError::Sqlite(format!("VACUUM INTO recovery failed: {e}")))?;
 
     // Verify the recovery copy is valid.
-    let recovery_conn = DbConn::open_file(&recovery_path)
+    let recovery_conn = SqliteConnection::open_file(&recovery_path)
         .map_err(|e| DbError::Sqlite(format!("failed to open recovery copy: {e}")))?;
 
     match quick_check(&recovery_conn) {
@@ -249,8 +249,8 @@ pub fn is_full_check_due(interval_hours: u64) -> bool {
 mod tests {
     use super::*;
 
-    fn open_test_db() -> DbConn {
-        let conn = DbConn::open_memory().expect("open memory db");
+    fn open_test_db() -> SqliteConnection {
+        let conn = SqliteConnection::open_memory().expect("open memory db");
         conn.execute_raw("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)")
             .expect("create table");
         conn
@@ -323,7 +323,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db_str = db_path.to_str().expect("path str");
 
-        let conn = DbConn::open_file(db_str).expect("open db");
+        let conn = SqliteConnection::open_file(db_str).expect("open db");
         conn.execute_raw("CREATE TABLE foo (id INTEGER PRIMARY KEY)")
             .expect("create table");
         conn.execute_raw("INSERT INTO foo VALUES (1)")
@@ -336,7 +336,7 @@ mod tests {
         );
 
         // Verify recovery copy has data.
-        let recovery_conn = DbConn::open_file(&recovery_path).expect("open recovery");
+        let recovery_conn = SqliteConnection::open_file(&recovery_path).expect("open recovery");
         let rows: Vec<Row> = recovery_conn
             .query_sync("SELECT COUNT(*) AS cnt FROM foo", &[])
             .expect("query");

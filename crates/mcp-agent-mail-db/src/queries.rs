@@ -556,11 +556,24 @@ fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
 // Transaction helpers
 // =============================================================================
 
+/// Whether `BEGIN CONCURRENT` is enabled (MVCC page-level writes).
+///
+/// Read once from `FSQLITE_CONCURRENT_MODE` env var; defaults to `true`.
+/// When `false`, all transactions use `BEGIN IMMEDIATE` (single-writer).
+static CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("FSQLITE_CONCURRENT_MODE")
+        .ok()
+        .is_none_or(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+});
+
 /// Begin a concurrent write transaction (MVCC page-level concurrent writes).
 ///
 /// Falls back to `BEGIN IMMEDIATE` on backends that do not support
-/// `BEGIN CONCURRENT`.
+/// `BEGIN CONCURRENT`, or when `FSQLITE_CONCURRENT_MODE=false`.
 async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    if !*CONCURRENT_MODE_ENABLED {
+        return begin_immediate_tx(cx, tracked).await;
+    }
     match map_sql_outcome(tracked.execute(cx, "BEGIN CONCURRENT", &[]).await).map(|_| ()) {
         Outcome::Err(DbError::Sqlite(msg))
             if msg.to_ascii_lowercase().contains("near \"concurrent\"") =>
@@ -620,6 +633,66 @@ macro_rules! try_in_tx {
             }
         }
     };
+}
+
+// =============================================================================
+// MVCC conflict retry helpers
+// =============================================================================
+
+/// Maximum retry attempts for MVCC write conflicts (`BEGIN CONCURRENT`
+/// page-level collisions). Read once from `FSQLITE_CONCURRENT_RETRIES`
+/// env var; default 5.
+static MVCC_MAX_RETRIES: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+    std::env::var("FSQLITE_CONCURRENT_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+});
+
+/// Global counter: total MVCC retries performed.
+static MVCC_RETRIES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Global counter: MVCC conflicts that exhausted all retries.
+static MVCC_EXHAUSTED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Check if a [`DbError`] is an MVCC write conflict.
+fn is_mvcc_error(e: &DbError) -> bool {
+    matches!(e, DbError::Sqlite(msg) if crate::error::is_mvcc_conflict(msg))
+}
+
+/// Sleep with exponential backoff for MVCC retry.
+///
+/// Base: 10 ms, max: 200 ms, ±25 % jitter (via existing LCG in `retry` module).
+fn mvcc_backoff(attempt: u32) {
+    use crate::retry::RetryConfig;
+    let config = RetryConfig {
+        base_delay: std::time::Duration::from_millis(10),
+        max_delay: std::time::Duration::from_millis(200),
+        use_circuit_breaker: false,
+        ..Default::default()
+    };
+    std::thread::sleep(config.delay_for_attempt(attempt));
+}
+
+/// Snapshot of MVCC retry metrics for health/diagnostics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MvccRetryMetrics {
+    pub max_retries: u32,
+    pub retries_total: u64,
+    pub exhausted_total: u64,
+}
+
+/// Get current MVCC retry metrics.
+#[must_use]
+pub fn mvcc_retry_metrics() -> MvccRetryMetrics {
+    use std::sync::atomic::Ordering;
+    MvccRetryMetrics {
+        max_retries: *MVCC_MAX_RETRIES,
+        retries_total: MVCC_RETRIES_TOTAL.load(Ordering::Relaxed),
+        exhausted_total: MVCC_EXHAUSTED_TOTAL.load(Ordering::Relaxed),
+    }
 }
 
 /// Ensure a project exists, creating if necessary.
@@ -1579,16 +1652,23 @@ pub struct ThreadMessageRow {
 async fn reload_inserted_message_id(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
-    _row: &MessageRow,
+    row: &MessageRow,
 ) -> Outcome<i64, DbError> {
-    // Use last_insert_rowid() to get the ID of the row we just inserted.
-    // This is transaction-safe and standard for SQLite.
-    let sql = "SELECT last_insert_rowid()";
-    match map_sql_outcome(traw_query(cx, tracked, sql, &[]).await) {
+    // Re-select the just-inserted row by its unique key within the transaction.
+    // This avoids `SELECT last_insert_rowid()` which returns 0 on FrankenConnection
+    // (frankensqlite does not track rowids).
+    let sql = "SELECT MAX(id) FROM messages \
+               WHERE project_id = ? AND sender_id = ? AND created_ts = ?";
+    let params = [
+        Value::BigInt(row.project_id),
+        Value::BigInt(row.sender_id),
+        Value::BigInt(row.created_ts),
+    ];
+    match map_sql_outcome(traw_query(cx, tracked, sql, &params).await) {
         Outcome::Ok(rows) => rows.first().and_then(row_first_i64).map_or_else(
             || {
                 Outcome::Err(DbError::Internal(
-                    "message insert succeeded but last_insert_rowid() returned NULL".to_string(),
+                    "message insert succeeded but re-select returned NULL".to_string(),
                 ))
             },
             Outcome::Ok,
@@ -1658,6 +1738,10 @@ pub async fn create_message(
 ///
 /// This eliminates N+2 separate auto-commit writes (1 message INSERT + N
 /// recipient INSERTs) into a single transaction with 1 fsync.
+///
+/// On MVCC write conflicts (`BEGIN CONCURRENT` page collision), the entire
+/// transaction is retried up to `FSQLITE_CONCURRENT_RETRIES` times (default 5)
+/// with exponential backoff (10–200 ms).
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients(
     cx: &Cx,
@@ -1682,10 +1766,81 @@ pub async fn create_message_with_recipients(
     };
 
     let tracked = tracked(&*conn);
+    let max = *MVCC_MAX_RETRIES;
 
-    // `BEGIN CONCURRENT` has produced backend-specific `OpenWrite` failures for
-    // message inserts on some persistent DBs; use immediate transaction here.
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    for attempt in 0..=max {
+        match create_message_with_recipients_tx(
+            cx,
+            &tracked,
+            project_id,
+            sender_id,
+            subject,
+            body_md,
+            thread_id,
+            importance,
+            ack_required,
+            attachments,
+            recipients,
+            now,
+        )
+        .await
+        {
+            Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
+                MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    attempt,
+                    max_retries = max,
+                    error = %e,
+                    "MVCC write conflict in create_message, retrying"
+                );
+                mvcc_backoff(attempt);
+            }
+            Outcome::Err(e) if is_mvcc_error(&e) => {
+                MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    attempts = max + 1,
+                    error = %e,
+                    "MVCC retries exhausted in create_message"
+                );
+                return Outcome::Err(e);
+            }
+            Outcome::Ok(row) => {
+                // Invalidate cached inbox stats for all recipients.
+                let cache = crate::cache::read_cache();
+                let cache_scope = pool.sqlite_path();
+                for (agent_id, _kind) in recipients {
+                    cache.invalidate_inbox_stats_scoped(cache_scope, *agent_id);
+                }
+                return Outcome::Ok(row);
+            }
+            other => return other,
+        }
+    }
+    // Unreachable: loop always returns via `attempt == max` or success.
+    Outcome::Err(DbError::Internal("MVCC retry loop fell through".into()))
+}
+
+/// Inner transaction body for [`create_message_with_recipients`].
+///
+/// Runs BEGIN CONCURRENT → INSERT message → INSERT recipients → COMMIT.
+/// On any failure the `try_in_tx!` macro rolls back before returning.
+#[allow(clippy::too_many_arguments)]
+async fn create_message_with_recipients_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    recipients: &[(i64, &str)],
+    now: i64,
+) -> Outcome<MessageRow, DbError> {
+    // Use MVCC concurrent transaction for page-level parallelism.
+    try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
 
     // Insert message
     let mut row = MessageRow {
@@ -1703,13 +1858,13 @@ pub async fn create_message_with_recipients(
 
     try_in_tx!(
         cx,
-        &tracked,
-        map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
+        tracked,
+        map_sql_outcome(insert!(&row).execute(cx, tracked).await)
     );
     let message_id = try_in_tx!(
         cx,
-        &tracked,
-        reload_inserted_message_id(cx, &tracked, &row).await
+        tracked,
+        reload_inserted_message_id(cx, tracked, &row).await
     );
     row.id = Some(message_id);
 
@@ -1734,20 +1889,13 @@ pub async fn create_message_with_recipients(
 
         try_in_tx!(
             cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, &query, &params).await)
+            tracked,
+            map_sql_outcome(traw_execute(cx, tracked, &query, &params).await)
         );
     }
 
     // COMMIT (single fsync)
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-
-    // Invalidate cached inbox stats for all recipients.
-    let cache = crate::cache::read_cache();
-    let cache_scope = pool.sqlite_path();
-    for (agent_id, _kind) in recipients {
-        cache.invalidate_inbox_stats_scoped(cache_scope, *agent_id);
-    }
+    try_in_tx!(cx, tracked, commit_tx(cx, tracked).await);
 
     Outcome::Ok(row)
 }

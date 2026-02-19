@@ -36,6 +36,7 @@ pub mod tracking;
 pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
 pub use error::{DbError, DbResult, is_lock_error, is_pool_exhausted_error};
+pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use integrity::{
     CheckKind, IntegrityCheckResult, IntegrityMetrics, attempt_vacuum_recovery, full_check,
     incremental_check, integrity_metrics, is_full_check_due, quick_check,
@@ -72,6 +73,13 @@ pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
-/// We use `SqliteConnection` for runtime durability and parity with CLI/share
-/// tooling that also operates through the C-backed `SQLite` driver.
+/// Currently `SqliteConnection` (C-backed `SQLite`).  The MVCC infrastructure
+/// (`begin_concurrent_tx`, retry helpers, `FSQLITE_CONCURRENT_*` config) is
+/// ready for a one-line switch to `FrankenConnection` once frankensqlite's
+/// INSERT codegen supports `INSERT ... VALUES` with explicit column lists
+/// (currently returns "not implemented: INSERT ... SELECT with VALUES body").
+///
+/// The `begin_concurrent_tx` helper already falls back to `BEGIN IMMEDIATE`
+/// when the backend does not support `BEGIN CONCURRENT`, so this alias can
+/// be changed without modifying any transaction call-sites.
 pub type DbConn = sqlmodel_sqlite::SqliteConnection;
