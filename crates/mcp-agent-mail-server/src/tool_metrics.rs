@@ -670,6 +670,137 @@ mod tests {
         assert!(row.collected_ts > 0);
     }
 
+    // ── br-3h13: Additional tool_metrics.rs test coverage ──────────
+
+    #[test]
+    fn i64_from_u64_saturating_boundaries() {
+        assert_eq!(i64_from_u64_saturating(0), 0);
+        assert_eq!(i64_from_u64_saturating(1), 1);
+        assert_eq!(i64_from_u64_saturating(i64::MAX as u64), i64::MAX);
+        assert_eq!(i64_from_u64_saturating(i64::MAX as u64 + 1), i64::MAX);
+        assert_eq!(i64_from_u64_saturating(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn persisted_tool_metric_clone_and_debug() {
+        let metric = PersistedToolMetric {
+            tool_name: "send_message".to_string(),
+            calls: 42,
+            errors: 3,
+            cluster: "messaging".to_string(),
+            complexity: "medium".to_string(),
+            avg_ms: 150.5,
+            p50_ms: 120.0,
+            p95_ms: 300.0,
+            p99_ms: 500.0,
+            is_slow: false,
+            collected_ts: 1_000_000,
+        };
+        let cloned = metric.clone();
+        assert_eq!(cloned.tool_name, "send_message");
+        assert_eq!(cloned.calls, 42);
+        assert_eq!(cloned.errors, 3);
+        assert!(!cloned.is_slow);
+        let debug = format!("{metric:?}");
+        assert!(debug.contains("send_message"));
+    }
+
+    #[test]
+    fn ensure_metrics_schema_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("idempotent_schema.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+        // Call twice — should not error
+        ensure_metrics_schema(&conn);
+        ensure_metrics_schema(&conn);
+        // Verify table exists by querying it
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS c FROM tool_metrics_snapshots", &[])
+            .expect("query should work");
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn persist_snapshot_rows_empty_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("empty_persist.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+        ensure_metrics_schema(&conn);
+        // Persisting empty snapshot should succeed silently
+        persist_snapshot_rows(&conn, now_micros(), &[]).expect("empty persist");
+        let count = persisted_metric_store_size(&database_url);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn prune_old_snapshot_rows_removes_old_data() {
+        let _guard = lock_metrics_test();
+        reset_tool_metrics();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("prune_test.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+        ensure_metrics_schema(&conn);
+
+        record_call("fetch_inbox");
+        record_latency("fetch_inbox", 100_000);
+        let snapshot = tool_metrics_snapshot();
+
+        // Insert with a very old timestamp (1 day old in micros)
+        let old_ts = now_micros() - 86_400_000_000 * (METRICS_RETENTION_DAYS + 1);
+        persist_snapshot_rows(&conn, old_ts, &snapshot).expect("persist old");
+
+        let before = persisted_metric_store_size(&database_url);
+        assert!(before >= 1);
+
+        // Prune with current timestamp
+        prune_old_snapshot_rows(&conn, now_micros());
+
+        let after = persisted_metric_store_size(&database_url);
+        assert!(after < before, "old rows should have been pruned");
+    }
+
+    #[test]
+    fn load_latest_persisted_metrics_memory_db_returns_empty() {
+        let result = load_latest_persisted_metrics("sqlite:///:memory:", 50);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn persisted_metric_store_size_memory_db_returns_zero() {
+        assert_eq!(persisted_metric_store_size("sqlite:///:memory:"), 0);
+    }
+
+    #[test]
+    fn load_latest_persisted_metrics_respects_limit() {
+        let _guard = lock_metrics_test();
+        reset_tool_metrics();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("limit_test.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+        ensure_metrics_schema(&conn);
+
+        // Record multiple known tools (record_call rejects unknown names)
+        for tool in ["send_message", "fetch_inbox", "health_check", "whois", "search_messages"] {
+            record_call(tool);
+            record_latency(tool, 50_000);
+        }
+        let snapshot = tool_metrics_snapshot();
+        persist_snapshot_rows(&conn, now_micros(), &snapshot).expect("persist");
+
+        let limited = load_latest_persisted_metrics(&database_url, 2);
+        assert!(
+            limited.len() <= 2,
+            "should respect limit, got {}",
+            limited.len()
+        );
+    }
+
     #[test]
     fn persisted_store_size_counts_rows() {
         let _guard = lock_metrics_test();

@@ -786,6 +786,159 @@ mod tests {
         assert_eq!(hex_encode(&[0xAB, 0xCD]), "abcd");
     }
 
+    // ── br-3h13: Additional static_export.rs test coverage ─────────
+
+    #[test]
+    fn sanitize_filename_control_chars() {
+        let input = "file\x00name\x1f.html";
+        let result = sanitize_filename(input);
+        assert!(!result.contains('\x00'));
+        assert!(!result.contains('\x1f'));
+        assert!(result.contains("file_name_.html"));
+    }
+
+    #[test]
+    fn sanitize_filename_all_special_chars() {
+        let input = r#"a/b\c:d*e?f"g<h>i|j"#;
+        let result = sanitize_filename(input);
+        for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|'] {
+            assert!(!result.contains(ch), "should replace '{ch}'");
+        }
+        assert_eq!(result, "a_b_c_d_e_f_g_h_i_j");
+    }
+
+    #[test]
+    fn sanitize_filename_normal_chars_unchanged() {
+        let input = "my-file_v2.0.html";
+        assert_eq!(sanitize_filename(input), input);
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 100), "");
+        // Empty string with max=0 still returns "" because len(0) <= max(0)
+        assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_multibyte_chars() {
+        // Each emoji is 4 bytes
+        let s = "🎉🎊🎈";
+        let result = truncate(s, 5);
+        // Should truncate on char boundary (4 bytes for first emoji)
+        assert!(result.ends_with('…'));
+        assert!(result.len() <= 8); // 4 bytes + 3 bytes for …
+    }
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        // SHA-256 of empty string
+        let hash = sha256_hex(b"");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_hello() {
+        let hash = sha256_hex(b"hello");
+        assert_eq!(
+            hash,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn content_hash_empty_files() {
+        let files = BTreeMap::new();
+        let hash = compute_content_hash(&files);
+        assert_eq!(hash.len(), 64);
+        // Empty files should produce the SHA-256 of empty string
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn content_hash_different_files_differ() {
+        let mut files1 = BTreeMap::new();
+        files1.insert(
+            "a.html".to_string(),
+            ManifestEntry {
+                route: "/a".to_string(),
+                size: 10,
+                sha256: "abc".to_string(),
+            },
+        );
+
+        let mut files2 = BTreeMap::new();
+        files2.insert(
+            "b.html".to_string(),
+            ManifestEntry {
+                route: "/b".to_string(),
+                size: 10,
+                sha256: "def".to_string(),
+            },
+        );
+
+        assert_ne!(compute_content_hash(&files1), compute_content_hash(&files2));
+    }
+
+    #[test]
+    fn manifest_entry_debug_and_clone() {
+        let entry = ManifestEntry {
+            route: "/test".to_string(),
+            size: 42,
+            sha256: "abc123".to_string(),
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.route, "/test");
+        assert_eq!(cloned.size, 42);
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("/test"));
+    }
+
+    #[test]
+    fn export_manifest_serializes() {
+        let manifest = ExportManifest {
+            schema_version: "1.0.0".to_string(),
+            generated_at: "2026-02-19T00:00:00Z".to_string(),
+            file_count: 2,
+            total_bytes: 100,
+            content_hash: "abc".repeat(22),
+            files: BTreeMap::new(),
+        };
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        assert!(json.contains("schema_version"));
+        assert!(json.contains("1.0.0"));
+        assert!(json.contains("total_bytes"));
+        assert!(json.contains("content_hash"));
+    }
+
+    #[test]
+    fn write_html_creates_nested_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a").join("b").join("c").join("page.html");
+        write_html(&dest, "<html></html>").unwrap();
+        assert!(dest.exists());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "<html></html>");
+    }
+
+    #[test]
+    fn write_to_file_creates_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("nested").join("data.json");
+        write_to_file(&dest, b"{}").unwrap();
+        assert!(dest.exists());
+    }
+
     #[test]
     fn hosting_files_are_emitted() {
         let dir = PathBuf::from("/tmp/static_export_test_hosting");

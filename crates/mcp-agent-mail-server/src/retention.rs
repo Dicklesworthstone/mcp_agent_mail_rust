@@ -457,4 +457,134 @@ mod tests {
         assert!(!config.retention_report_enabled);
         assert!(!config.quota_enabled);
     }
+
+    // ── br-3h13: Additional retention.rs test coverage ──────────────
+
+    #[test]
+    fn should_ignore_whitespace_in_patterns() {
+        let patterns = vec!["  demo  ".to_string()];
+        assert!(should_ignore("demo", &patterns));
+    }
+
+    #[test]
+    fn should_ignore_empty_pattern_skipped() {
+        let patterns = vec!["".to_string(), "   ".to_string()];
+        assert!(!should_ignore("anything", &patterns));
+    }
+
+    #[test]
+    fn dir_size_nested_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("level1").join("level2");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(tmp.path().join("root.txt"), "abc").unwrap(); // 3 bytes
+        std::fs::write(sub.join("nested.txt"), "defgh").unwrap(); // 5 bytes
+        let size = dir_size(tmp.path());
+        assert_eq!(size, 8);
+    }
+
+    #[test]
+    fn dir_size_empty_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(dir_size(tmp.path()), 0);
+    }
+
+    #[test]
+    fn count_inbox_files_no_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        // agents_dir exists but empty
+        assert_eq!(count_inbox_files(tmp.path()), 0);
+    }
+
+    #[test]
+    fn count_inbox_files_multiple_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent1 = tmp.path().join("RedFox").join("inbox");
+        let agent2 = tmp.path().join("BlueBear").join("inbox");
+        std::fs::create_dir_all(&agent1).unwrap();
+        std::fs::create_dir_all(&agent2).unwrap();
+        std::fs::write(agent1.join("a.md"), "msg").unwrap();
+        std::fs::write(agent1.join("b.md"), "msg").unwrap();
+        std::fs::write(agent2.join("c.md"), "msg").unwrap();
+        assert_eq!(count_inbox_files(tmp.path()), 3);
+    }
+
+    #[test]
+    fn count_md_files_recursive_ignores_non_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.md"), "x").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "x").unwrap();
+        std::fs::write(tmp.path().join("c.json"), "x").unwrap();
+        assert_eq!(count_md_files_recursive(tmp.path()), 1);
+    }
+
+    #[test]
+    fn count_old_messages_no_old_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("Agent").join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join("fresh.md"), "new").unwrap();
+        // max_age_days = 365000 (~1000 years), so nothing should be old
+        assert_eq!(count_old_messages(tmp.path(), 365_000), 0);
+    }
+
+    #[test]
+    fn count_old_messages_nonexistent_dir() {
+        assert_eq!(count_old_messages(Path::new("/nonexistent"), 30), 0);
+    }
+
+    #[test]
+    fn retention_cycle_with_ignored_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("projects").join("test-proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut config = Config::from_env();
+        config.storage_root = tmp.path().to_path_buf();
+        config.retention_report_enabled = true;
+        config.retention_ignore_project_patterns = vec!["test*".to_string()];
+
+        let report = run_retention_cycle(&config).unwrap();
+        assert_eq!(
+            report.projects_scanned, 0,
+            "ignored project should not be scanned"
+        );
+    }
+
+    #[test]
+    fn retention_cycle_inbox_quota_exceeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("projects").join("big-proj");
+        let inbox = project.join("agents").join("Fox").join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        for i in 0..5 {
+            std::fs::write(inbox.join(format!("msg{i}.md")), "hi").unwrap();
+        }
+
+        let mut config = Config::from_env();
+        config.storage_root = tmp.path().to_path_buf();
+        config.quota_enabled = true;
+        config.quota_inbox_limit_count = 2; // Low limit
+        config.quota_attachments_limit_bytes = 0; // Disabled
+
+        let report = run_retention_cycle(&config).unwrap();
+        assert_eq!(report.total_inbox_count, 5);
+        assert_eq!(report.warnings, 1, "inbox quota should be exceeded");
+    }
+
+    #[test]
+    fn retention_cycle_multiple_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["proj-a", "proj-b", "proj-c"] {
+            let proj = tmp.path().join("projects").join(name);
+            std::fs::create_dir_all(proj.join("attachments")).unwrap();
+        }
+
+        let mut config = Config::from_env();
+        config.storage_root = tmp.path().to_path_buf();
+        config.retention_report_enabled = true;
+
+        let report = run_retention_cycle(&config).unwrap();
+        assert_eq!(report.projects_scanned, 3);
+    }
 }

@@ -383,6 +383,120 @@ mod tests {
         assert!(fr.ok);
     }
 
+    // ── br-3h13: Additional integrity.rs test coverage ─────────────
+
+    #[test]
+    fn quick_check_with_populated_db() {
+        let conn = open_test_db();
+        for i in 0..100 {
+            conn.execute_raw(&format!(
+                "INSERT INTO test (id, name) VALUES ({i}, 'item{i}')"
+            ))
+            .expect("insert");
+        }
+        let result = quick_check(&conn).expect("quick_check on populated DB");
+        assert!(result.ok);
+        assert_eq!(result.details, vec!["ok"]);
+    }
+
+    #[test]
+    fn full_check_with_multiple_tables() {
+        let conn = open_test_db();
+        conn.execute_raw("CREATE TABLE other (val REAL)")
+            .expect("create other");
+        conn.execute_raw("INSERT INTO other VALUES (3.14)")
+            .expect("insert");
+        let result = full_check(&conn).expect("full check with multiple tables");
+        assert!(result.ok);
+    }
+
+    #[test]
+    fn integrity_metrics_failures_start_at_zero_or_above() {
+        let m = integrity_metrics();
+        // failures_total is cumulative from all tests, but should be non-negative
+        assert!(m.failures_total < 1000, "unexpected failure count");
+    }
+
+    #[test]
+    fn integrity_check_result_debug_with_failure_details() {
+        let result = IntegrityCheckResult {
+            ok: false,
+            details: vec![
+                "*** in database main ***".to_string(),
+                "row 5 missing from index idx_test_name".to_string(),
+            ],
+            duration_us: 12345,
+            kind: CheckKind::Full,
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("ok: false"));
+        assert!(debug.contains("Full"));
+        assert!(debug.contains("12345"));
+    }
+
+    #[test]
+    fn check_kind_all_display_values_are_distinct() {
+        let displays: Vec<String> = [CheckKind::Quick, CheckKind::Incremental, CheckKind::Full]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(displays.len(), 3);
+        // All must be unique
+        let mut sorted = displays.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            3,
+            "all CheckKind display values must be distinct"
+        );
+    }
+
+    #[test]
+    fn integrity_metrics_serde_has_all_fields() {
+        let m = integrity_metrics();
+        let json = serde_json::to_value(&m).expect("serialize");
+        let obj = json.as_object().expect("should be object");
+        assert_eq!(
+            obj.len(),
+            4,
+            "IntegrityMetrics should have exactly 4 fields"
+        );
+        for key in &[
+            "last_ok_ts",
+            "last_check_ts",
+            "checks_total",
+            "failures_total",
+        ] {
+            assert!(obj.contains_key(*key), "missing field: {key}");
+        }
+    }
+
+    #[test]
+    fn is_full_check_due_with_large_interval_is_false_after_recent_check() {
+        // Run a check to update last_check_ts to now
+        let conn = open_test_db();
+        let _ = quick_check(&conn);
+        // interval of 1 billion hours should NOT be due
+        assert!(!is_full_check_due(1_000_000_000));
+    }
+
+    #[test]
+    fn integrity_check_result_clone_preserves_all_fields() {
+        let original = IntegrityCheckResult {
+            ok: false,
+            details: vec!["error1".into(), "error2".into()],
+            duration_us: 99999,
+            kind: CheckKind::Incremental,
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned.ok, false);
+        assert_eq!(cloned.details.len(), 2);
+        assert_eq!(cloned.details[0], "error1");
+        assert_eq!(cloned.duration_us, 99999);
+        assert_eq!(cloned.kind, CheckKind::Incremental);
+    }
+
     #[test]
     #[ignore = "VACUUM INTO not implemented in frankensqlite (no-op)"]
     fn vacuum_recovery_on_healthy_db() {
