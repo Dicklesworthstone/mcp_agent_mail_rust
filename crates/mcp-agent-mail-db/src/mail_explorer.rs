@@ -1050,4 +1050,342 @@ mod tests {
             ..test_entry(id, ts, Direction::Inbound)
         }
     }
+
+    // ── New tests: sorting ─────────────────────────────────────
+
+    #[test]
+    fn sort_entries_agent_alpha() {
+        let mut entries = vec![
+            {
+                let mut e = test_entry(1, 100, Direction::Inbound);
+                e.sender_name = "ZuluFox".to_string();
+                e
+            },
+            {
+                let mut e = test_entry(2, 200, Direction::Outbound);
+                e.to_agents = "AlphaWolf".to_string();
+                e
+            },
+            {
+                let mut e = test_entry(3, 300, Direction::Inbound);
+                e.sender_name = "MidLake".to_string();
+                e
+            },
+        ];
+        sort_entries(&mut entries, SortMode::AgentAlpha);
+        // AlphaWolf < MidLake < ZuluFox (case-insensitive)
+        assert_eq!(entries[0].message_id, 2); // AlphaWolf
+        assert_eq!(entries[1].message_id, 3); // MidLake
+        assert_eq!(entries[2].message_id, 1); // ZuluFox
+    }
+
+    #[test]
+    fn sort_entries_agent_alpha_tiebreak_by_date() {
+        let mut entries = vec![
+            {
+                let mut e = test_entry(1, 100, Direction::Inbound);
+                e.sender_name = "RedFox".to_string();
+                e
+            },
+            {
+                let mut e = test_entry(2, 300, Direction::Inbound);
+                e.sender_name = "RedFox".to_string();
+                e
+            },
+        ];
+        sort_entries(&mut entries, SortMode::AgentAlpha);
+        // Same agent name → tiebreak by date descending (newer first)
+        assert_eq!(entries[0].message_id, 2); // ts=300
+        assert_eq!(entries[1].message_id, 1); // ts=100
+    }
+
+    #[test]
+    fn sort_entries_importance_tiebreak_by_date() {
+        let entries_before = vec![
+            test_entry_with_importance(1, 100, "urgent"),
+            test_entry_with_importance(2, 300, "urgent"),
+            test_entry_with_importance(3, 200, "urgent"),
+        ];
+        let mut entries = entries_before;
+        sort_entries(&mut entries, SortMode::ImportanceDesc);
+        // All urgent → tiebreak by date descending
+        assert_eq!(entries[0].message_id, 2); // ts=300
+        assert_eq!(entries[1].message_id, 3); // ts=200
+        assert_eq!(entries[2].message_id, 1); // ts=100
+    }
+
+    #[test]
+    fn sort_entries_empty_slice() {
+        let mut entries: Vec<ExplorerEntry> = Vec::new();
+        sort_entries(&mut entries, SortMode::DateDesc);
+        assert!(entries.is_empty());
+    }
+
+    // ── New tests: apply_filters ────────────────────────────────
+
+    #[test]
+    fn apply_filters_ack_pending() {
+        let mut conditions = vec!["r.agent_id = ?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::BigInt(1)];
+        let query = ExplorerQuery {
+            ack_filter: AckFilter::PendingAck,
+            ..Default::default()
+        };
+        apply_filters(&mut conditions, &mut params, &query);
+        assert!(conditions.iter().any(|c| c.contains("m.ack_required = 1")));
+    }
+
+    #[test]
+    fn apply_filters_ack_acknowledged() {
+        let mut conditions = vec!["r.agent_id = ?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::BigInt(1)];
+        let query = ExplorerQuery {
+            ack_filter: AckFilter::Acknowledged,
+            ..Default::default()
+        };
+        apply_filters(&mut conditions, &mut params, &query);
+        assert!(conditions.iter().any(|c| c.contains("m.ack_required = 1")));
+    }
+
+    #[test]
+    fn apply_filters_unread_is_noop() {
+        let mut conditions = vec!["r.agent_id = ?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::BigInt(1)];
+        let query = ExplorerQuery {
+            ack_filter: AckFilter::Unread,
+            ..Default::default()
+        };
+        apply_filters(&mut conditions, &mut params, &query);
+        // Unread filter doesn't add SQL conditions (filtered post-query)
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn apply_filters_text_escapes_underscore() {
+        let mut conditions = vec!["r.agent_id = ?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::BigInt(1)];
+        let query = ExplorerQuery {
+            text_filter: "hello_world".to_string(),
+            ..Default::default()
+        };
+        apply_filters(&mut conditions, &mut params, &query);
+        if let Value::Text(ref s) = params[1] {
+            assert!(s.contains("hello\\_world"), "underscore should be escaped: {s}");
+        } else {
+            panic!("expected text param");
+        }
+    }
+
+    #[test]
+    fn apply_filters_combined_importance_and_text() {
+        let mut conditions = vec!["r.agent_id = ?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::BigInt(1)];
+        let query = ExplorerQuery {
+            importance_filter: vec!["urgent".to_string()],
+            text_filter: "auth".to_string(),
+            ..Default::default()
+        };
+        apply_filters(&mut conditions, &mut params, &query);
+        // Should have: base + importance IN + LIKE
+        assert_eq!(conditions.len(), 3);
+        assert!(conditions[1].contains("m.importance IN"));
+        assert!(conditions[2].contains("LIKE"));
+        // params: base + "urgent" + "%auth%"
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn apply_filters_empty_query_is_noop() {
+        let mut conditions = vec!["r.agent_id = ?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::BigInt(1)];
+        let query = ExplorerQuery::default();
+        apply_filters(&mut conditions, &mut params, &query);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(params.len(), 1);
+    }
+
+    // ── New tests: compute_stats ────────────────────────────────
+
+    #[test]
+    fn compute_stats_empty() {
+        let stats = compute_stats(&[]);
+        assert_eq!(stats.inbound_count, 0);
+        assert_eq!(stats.outbound_count, 0);
+        assert_eq!(stats.unread_count, 0);
+        assert_eq!(stats.pending_ack_count, 0);
+        assert_eq!(stats.unique_threads, 0);
+        assert_eq!(stats.unique_projects, 0);
+        assert_eq!(stats.unique_agents, 0);
+    }
+
+    #[test]
+    fn compute_stats_unique_counting() {
+        let mut e1 = test_entry(1, 100, Direction::Inbound);
+        e1.project_id = 10;
+        e1.sender_name = "RedFox".to_string();
+        e1.thread_id = Some("t1".to_string());
+
+        let mut e2 = test_entry(2, 200, Direction::Outbound);
+        e2.project_id = 20;
+        e2.sender_name = "BlueLake".to_string();
+        e2.thread_id = Some("t1".to_string()); // same thread
+
+        let mut e3 = test_entry(3, 300, Direction::Inbound);
+        e3.project_id = 10; // same project as e1
+        e3.sender_name = "RedFox".to_string(); // same agent as e1
+        e3.thread_id = Some("t2".to_string());
+
+        let stats = compute_stats(&[e1, e2, e3]);
+        assert_eq!(stats.unique_projects, 2); // 10, 20
+        assert_eq!(stats.unique_threads, 2); // t1, t2
+        assert_eq!(stats.unique_agents, 2); // RedFox, BlueLake
+    }
+
+    #[test]
+    fn compute_stats_outbound_not_counted_as_unread() {
+        let e = test_entry(1, 100, Direction::Outbound);
+        // Outbound message with read_ts=None should NOT count as unread
+        let stats = compute_stats(&[e]);
+        assert_eq!(stats.unread_count, 0);
+        assert_eq!(stats.outbound_count, 1);
+    }
+
+    // ── New tests: build_groups ─────────────────────────────────
+
+    #[test]
+    fn build_groups_empty() {
+        let groups = build_groups(&[], GroupMode::Project);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn build_groups_label_format() {
+        let mut e = test_entry(1, 100, Direction::Inbound);
+        e.project_slug = "my-project".to_string();
+        let groups = build_groups(&[e], GroupMode::Project);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "Project: my-project");
+        assert_eq!(groups[0].key, "my-project");
+    }
+
+    #[test]
+    fn build_groups_thread_label_format() {
+        let mut e = test_entry(1, 100, Direction::Inbound);
+        e.thread_id = Some("bd-123".to_string());
+        let groups = build_groups(&[e], GroupMode::Thread);
+        assert_eq!(groups[0].label, "Thread: bd-123");
+    }
+
+    #[test]
+    fn build_groups_agent_label_format() {
+        let mut e = test_entry(1, 100, Direction::Inbound);
+        e.sender_name = "RedFox".to_string();
+        let groups = build_groups(&[e], GroupMode::Agent);
+        assert_eq!(groups[0].label, "Agent: RedFox");
+    }
+
+    // ── New tests: serde roundtrips ─────────────────────────────
+
+    #[test]
+    fn direction_serde_roundtrip() {
+        for dir in [Direction::Inbound, Direction::Outbound, Direction::All] {
+            let json = serde_json::to_string(&dir).unwrap();
+            let parsed: Direction = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, dir);
+        }
+    }
+
+    #[test]
+    fn sort_mode_serde_roundtrip() {
+        for mode in [
+            SortMode::DateDesc,
+            SortMode::DateAsc,
+            SortMode::ImportanceDesc,
+            SortMode::AgentAlpha,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: SortMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
+        }
+    }
+
+    #[test]
+    fn group_mode_serde_roundtrip() {
+        for mode in [
+            GroupMode::None,
+            GroupMode::Project,
+            GroupMode::Thread,
+            GroupMode::Agent,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: GroupMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
+        }
+    }
+
+    #[test]
+    fn ack_filter_serde_roundtrip() {
+        for filter in [
+            AckFilter::All,
+            AckFilter::PendingAck,
+            AckFilter::Acknowledged,
+            AckFilter::Unread,
+        ] {
+            let json = serde_json::to_string(&filter).unwrap();
+            let parsed: AckFilter = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, filter);
+        }
+    }
+
+    #[test]
+    fn explorer_entry_serde_roundtrip() {
+        let entry = test_entry(42, 1_000_000, Direction::Inbound);
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: ExplorerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.message_id, 42);
+        assert_eq!(parsed.created_ts, 1_000_000);
+    }
+
+    #[test]
+    fn explorer_stats_default() {
+        let stats = ExplorerStats::default();
+        assert_eq!(stats.inbound_count, 0);
+        assert_eq!(stats.outbound_count, 0);
+        assert_eq!(stats.unread_count, 0);
+        assert_eq!(stats.pending_ack_count, 0);
+        assert_eq!(stats.unique_threads, 0);
+        assert_eq!(stats.unique_projects, 0);
+        assert_eq!(stats.unique_agents, 0);
+    }
+
+    #[test]
+    fn explorer_page_serde_roundtrip() {
+        let page = ExplorerPage {
+            entries: vec![test_entry(1, 100, Direction::Inbound)],
+            groups: vec![ExplorerGroup {
+                key: "proj-a".to_string(),
+                label: "Project: proj-a".to_string(),
+                count: 1,
+                entries: vec![test_entry(1, 100, Direction::Inbound)],
+            }],
+            total_count: 1,
+            stats: ExplorerStats::default(),
+        };
+        let json = serde_json::to_string(&page).unwrap();
+        let parsed: ExplorerPage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_count, 1);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.groups.len(), 1);
+        assert_eq!(parsed.groups[0].count, 1);
+    }
+
+    // ── New tests: importance_rank ──────────────────────────────
+
+    #[test]
+    fn importance_rank_unknown_returns_zero() {
+        assert_eq!(importance_rank(""), 0);
+        assert_eq!(importance_rank("critical"), 0);
+        assert_eq!(importance_rank("URGENT"), 0); // case-sensitive
+    }
 }

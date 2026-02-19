@@ -504,4 +504,186 @@ mod tests {
         // Remove on empty is fine
         assert_eq!(cache.remove(&"nonexistent"), None);
     }
+
+    // ── New tests ──────────────────────────────────────────────
+
+    #[test]
+    fn s3fifo_get_mut_modifies_value() {
+        let mut cache = S3FifoCache::new(10);
+        cache.insert("key", 100);
+
+        if let Some(val) = cache.get_mut(&"key") {
+            *val = 999;
+        }
+        assert_eq!(cache.get(&"key"), Some(&999));
+    }
+
+    #[test]
+    fn s3fifo_get_mut_returns_none_for_missing() {
+        let mut cache: S3FifoCache<&str, i32> = S3FifoCache::new(10);
+        assert!(cache.get_mut(&"missing").is_none());
+    }
+
+    #[test]
+    fn s3fifo_get_mut_returns_none_for_ghost() {
+        // capacity 5 -> small=1, main=4
+        let mut cache = S3FifoCache::new(5);
+        cache.insert("a", 10);
+        // Insert "b" without accessing "a" -> "a" evicts to ghost (freq=0)
+        cache.insert("b", 20);
+        assert!(cache.get_mut(&"a").is_none());
+        assert_eq!(cache.ghost_len(), 1);
+    }
+
+    #[test]
+    fn s3fifo_contains_key() {
+        let mut cache = S3FifoCache::new(10);
+        cache.insert("a", 1);
+        assert!(cache.contains_key(&"a"));
+        assert!(!cache.contains_key(&"b"));
+    }
+
+    #[test]
+    fn s3fifo_contains_key_excludes_ghost() {
+        let mut cache = S3FifoCache::new(5);
+        cache.insert("a", 1);
+        cache.insert("b", 2); // evicts "a" to ghost
+        assert!(!cache.contains_key(&"a"));
+    }
+
+    #[test]
+    fn s3fifo_keys_iterator() {
+        let mut cache = S3FifoCache::new(30);
+        cache.insert("x", 1);
+        cache.insert("y", 2);
+        cache.insert("z", 3);
+        let mut keys: Vec<&&str> = cache.keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec![&"x", &"y", &"z"]);
+    }
+
+    #[test]
+    fn s3fifo_keys_excludes_ghost() {
+        let mut cache = S3FifoCache::new(5);
+        cache.insert("a", 1);
+        cache.insert("b", 2); // evicts "a" to ghost
+        let keys: Vec<&&str> = cache.keys().collect();
+        assert!(!keys.contains(&&"a"));
+        assert!(keys.contains(&&"b"));
+    }
+
+    #[test]
+    fn s3fifo_remove_from_small() {
+        let mut cache = S3FifoCache::new(30);
+        cache.insert("a", 10);
+        assert_eq!(cache.remove(&"a"), Some(10));
+        assert!(cache.is_empty());
+        assert!(!cache.contains_key(&"a"));
+    }
+
+    #[test]
+    fn s3fifo_remove_from_main() {
+        // capacity 5 -> small=1, main=4
+        let mut cache = S3FifoCache::new(5);
+        cache.insert("a", 10);
+        cache.get(&"a"); // bump freq
+        cache.insert("b", 20); // evicts "a" to main
+        assert_eq!(cache.main_len(), 1);
+
+        assert_eq!(cache.remove(&"a"), Some(10));
+        assert_eq!(cache.main_len(), 0);
+    }
+
+    #[test]
+    fn s3fifo_remove_from_ghost_returns_none() {
+        let mut cache = S3FifoCache::new(5);
+        cache.insert("a", 10);
+        cache.insert("b", 20); // "a" to ghost (freq=0)
+        assert_eq!(cache.ghost_len(), 1);
+
+        // Removing ghost entry returns None (no value stored)
+        assert_eq!(cache.remove(&"a"), None);
+        assert_eq!(cache.ghost_len(), 0);
+    }
+
+    #[test]
+    fn s3fifo_clear() {
+        let mut cache = S3FifoCache::new(30);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("c", 3);
+        assert_eq!(cache.len(), 3);
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.ghost_len(), 0);
+        assert_eq!(cache.get(&"a"), None);
+    }
+
+    #[test]
+    fn s3fifo_capacity_returns_total() {
+        let cache: S3FifoCache<&str, i32> = S3FifoCache::new(100);
+        assert_eq!(cache.capacity(), 100);
+    }
+
+    #[test]
+    fn s3fifo_capacity_minimum_one_small() {
+        // capacity 5 -> small=1 (max of 5/10=0 and 1)
+        let cache: S3FifoCache<&str, i32> = S3FifoCache::new(5);
+        assert_eq!(cache.small_capacity, 1);
+        assert_eq!(cache.main_capacity, 4);
+        assert_eq!(cache.capacity(), 5);
+    }
+
+    #[test]
+    fn s3fifo_insert_updates_existing_in_small() {
+        let mut cache = S3FifoCache::new(30);
+        cache.insert("a", 100);
+        cache.insert("a", 200); // update in-place
+        assert_eq!(cache.get(&"a"), Some(&200));
+        assert_eq!(cache.len(), 1); // no duplicate
+    }
+
+    #[test]
+    fn s3fifo_insert_updates_existing_in_main() {
+        let mut cache = S3FifoCache::new(5);
+        cache.insert("a", 100);
+        cache.get(&"a"); // bump freq
+        cache.insert("b", 200); // "a" promoted to main
+        assert_eq!(cache.main_len(), 1);
+
+        cache.insert("a", 999); // update in-place in main
+        assert_eq!(cache.get(&"a"), Some(&999));
+    }
+
+    #[test]
+    fn s3fifo_freq_saturates_at_3() {
+        let mut cache = S3FifoCache::new(30);
+        cache.insert("a", 1);
+        // Access 10 times — freq should saturate at 3, not overflow
+        for _ in 0..10 {
+            cache.get(&"a");
+        }
+        // Still accessible, no panic from overflow
+        assert_eq!(cache.get(&"a"), Some(&1));
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be > 0")]
+    fn s3fifo_zero_capacity_panics() {
+        let _cache: S3FifoCache<&str, i32> = S3FifoCache::new(0);
+    }
+
+    #[test]
+    fn s3fifo_get_mut_in_main() {
+        let mut cache = S3FifoCache::new(5);
+        cache.insert("a", 10);
+        cache.get(&"a"); // bump freq
+        cache.insert("b", 20); // "a" promoted to main
+
+        if let Some(val) = cache.get_mut(&"a") {
+            *val = 42;
+        }
+        assert_eq!(cache.get(&"a"), Some(&42));
+    }
 }
