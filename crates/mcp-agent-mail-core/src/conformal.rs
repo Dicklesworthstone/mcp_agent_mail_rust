@@ -441,4 +441,162 @@ mod tests {
             "center should be near 5.0, got {center}"
         );
     }
+
+    // ── Additional edge case tests ───────────────────────────────────────
+
+    /// Median of an odd-count window is exact middle value.
+    #[test]
+    fn conformal_median_odd_count() {
+        let mut predictor = ConformalPredictor::new(100, 0.90);
+        // Feed 31 values: 0.0, 1.0, ..., 30.0
+        for i in 0..31 {
+            predictor.observe(f64::from(i));
+        }
+        let interval = predictor.predict().unwrap();
+        // Median of 0..30 is 15.0, interval should be symmetric around 15.
+        let center = f64::midpoint(interval.lower, interval.upper);
+        assert!(
+            (center - 15.0).abs() < 1e-10,
+            "center should be 15.0, got {center}"
+        );
+    }
+
+    /// Very high coverage (0.99) produces wider intervals.
+    #[test]
+    fn conformal_high_coverage_wider_intervals() {
+        let mut pred_90 = ConformalPredictor::new(200, 0.90);
+        let mut pred_99 = ConformalPredictor::new(200, 0.99);
+
+        for i in 0..100 {
+            let x = f64::from(i) * 0.1;
+            pred_90.observe(x);
+            pred_99.observe(x);
+        }
+
+        let int_90 = pred_90.predict().unwrap();
+        let int_99 = pred_99.predict().unwrap();
+        let width_90 = int_90.upper - int_90.lower;
+        let width_99 = int_99.upper - int_99.lower;
+        assert!(
+            width_99 >= width_90,
+            "99% interval ({width_99:.4}) should be >= 90% interval ({width_90:.4})"
+        );
+    }
+
+    /// Very low coverage (0.10) produces narrower intervals.
+    #[test]
+    fn conformal_low_coverage_narrow_intervals() {
+        let mut pred_90 = ConformalPredictor::new(200, 0.90);
+        let mut pred_10 = ConformalPredictor::new(200, 0.10);
+
+        for i in 0..100 {
+            let x = f64::from(i) * 0.1;
+            pred_90.observe(x);
+            pred_10.observe(x);
+        }
+
+        let int_90 = pred_90.predict().unwrap();
+        let int_10 = pred_10.predict().unwrap();
+        let width_90 = int_90.upper - int_90.lower;
+        let width_10 = int_10.upper - int_10.lower;
+        assert!(
+            width_10 <= width_90,
+            "10% interval ({width_10:.4}) should be <= 90% interval ({width_90:.4})"
+        );
+    }
+
+    /// Negative data points work correctly.
+    #[test]
+    fn conformal_negative_data() {
+        let mut predictor = ConformalPredictor::new(100, 0.90);
+        for i in 0..50 {
+            predictor.observe(-100.0 + f64::from(i));
+        }
+        let interval = predictor.predict().unwrap();
+        // Center should be near -75.5 (midpoint of -100..-51).
+        let center = f64::midpoint(interval.lower, interval.upper);
+        assert!(
+            center < 0.0,
+            "center should be negative for negative data, got {center}"
+        );
+        assert!(
+            interval.lower < interval.upper,
+            "interval should have positive width"
+        );
+    }
+
+    /// Exactly MIN_CALIBRATION observations: interval is available.
+    #[test]
+    fn conformal_exactly_min_calibration() {
+        let mut predictor = ConformalPredictor::new(100, 0.90);
+        for i in 0..MIN_CALIBRATION {
+            predictor.observe(f64::from(i as i32));
+        }
+        assert_eq!(predictor.calibration_size(), MIN_CALIBRATION);
+        let interval = predictor.predict().unwrap();
+        assert_eq!(interval.calibration_size, MIN_CALIBRATION);
+    }
+
+    /// Window size of exactly 1 never produces a prediction (< MIN_CALIBRATION).
+    #[test]
+    fn conformal_tiny_window() {
+        let mut predictor = ConformalPredictor::new(1, 0.90);
+        for i in 0..1000 {
+            predictor.observe(f64::from(i));
+        }
+        // Window=1 means calibration_size is always 1, far below MIN_CALIBRATION.
+        assert_eq!(predictor.calibration_size(), 1);
+        assert!(predictor.predict().is_none());
+        assert!(predictor.empirical_coverage().is_none());
+    }
+
+    /// Two identical values followed by a third: should have 100% hit rate.
+    #[test]
+    fn conformal_repeated_values_high_coverage() {
+        let mut predictor = ConformalPredictor::new(200, 0.90);
+        // Fill calibration with a constant.
+        for _ in 0..50 {
+            predictor.observe(5.0);
+        }
+        // Observe the same value again; it should fall in the zero-width interval.
+        predictor.observe(5.0);
+        let coverage = predictor.empirical_coverage().unwrap();
+        assert!(
+            (coverage - 1.0).abs() < 1e-10,
+            "constant data should have 100% coverage, got {coverage}"
+        );
+    }
+
+    /// Large window with small data set: window is not overfilled.
+    #[test]
+    fn conformal_large_window_small_data() {
+        let mut predictor = ConformalPredictor::new(10_000, 0.90);
+        for i in 0..35 {
+            predictor.observe(f64::from(i));
+        }
+        assert_eq!(predictor.calibration_size(), 35);
+        assert_eq!(predictor.total_observations(), 35);
+        assert!(predictor.predict().is_some()); // 35 > MIN_CALIBRATION
+    }
+
+    /// Empirical coverage is always in [0.0, 1.0].
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn conformal_empirical_coverage_bounds() {
+        let mut predictor = ConformalPredictor::new(50, 0.90);
+        // Calibrate, then feed outliers to drive coverage down.
+        for i in 0..40 {
+            predictor.observe(f64::from(i));
+        }
+        // Feed extreme outliers.
+        for _ in 0..20 {
+            predictor.observe(99999.0);
+        }
+        if let Some(cov) = predictor.empirical_coverage() {
+            assert!(
+                (0.0..=1.0).contains(&cov),
+                "coverage should be in [0, 1], got {cov}"
+            );
+        }
+    }
 }

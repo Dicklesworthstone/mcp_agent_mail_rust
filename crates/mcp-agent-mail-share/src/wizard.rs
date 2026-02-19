@@ -750,4 +750,451 @@ mod tests {
         assert!(!inputs.dry_run);
         assert_eq!(inputs.github_branch, Some("gh-pages".to_string()));
     }
+
+    // ── Additional alias coverage ────────────────────────────────────────
+
+    #[test]
+    fn provider_parse_remaining_aliases() {
+        // GitHub aliases not covered by existing test
+        assert_eq!(
+            HostingProvider::parse("ghpages"),
+            Some(HostingProvider::GithubPages)
+        );
+        assert_eq!(
+            HostingProvider::parse("github-pages"),
+            Some(HostingProvider::GithubPages)
+        );
+        // Cloudflare aliases
+        assert_eq!(
+            HostingProvider::parse("cfpages"),
+            Some(HostingProvider::CloudflarePages)
+        );
+        assert_eq!(
+            HostingProvider::parse("cloudflare-pages"),
+            Some(HostingProvider::CloudflarePages)
+        );
+        assert_eq!(
+            HostingProvider::parse("cloudflare_pages"),
+            Some(HostingProvider::CloudflarePages)
+        );
+        // S3 aliases
+        assert_eq!(HostingProvider::parse("aws"), Some(HostingProvider::S3));
+        assert_eq!(HostingProvider::parse("amazon"), Some(HostingProvider::S3));
+        // Custom aliases
+        assert_eq!(
+            HostingProvider::parse("manual"),
+            Some(HostingProvider::Custom)
+        );
+        assert_eq!(
+            HostingProvider::parse("other"),
+            Some(HostingProvider::Custom)
+        );
+    }
+
+    #[test]
+    fn provider_parse_trims_whitespace_and_ignores_case() {
+        assert_eq!(
+            HostingProvider::parse("  GITHUB  "),
+            Some(HostingProvider::GithubPages)
+        );
+        assert_eq!(
+            HostingProvider::parse("Netlify"),
+            Some(HostingProvider::Netlify)
+        );
+        assert_eq!(
+            HostingProvider::parse("  S3 "),
+            Some(HostingProvider::S3)
+        );
+        assert_eq!(HostingProvider::parse(""), None);
+        assert_eq!(HostingProvider::parse("   "), None);
+    }
+
+    #[test]
+    fn provider_display_matches_display_name() {
+        let providers = [
+            HostingProvider::GithubPages,
+            HostingProvider::CloudflarePages,
+            HostingProvider::Netlify,
+            HostingProvider::S3,
+            HostingProvider::Custom,
+        ];
+        for p in providers {
+            assert_eq!(p.to_string(), p.display_name());
+        }
+    }
+
+    // ── Serde roundtrips ─────────────────────────────────────────────────
+
+    #[test]
+    fn hosting_provider_serde_roundtrip_all_variants() {
+        let variants = [
+            HostingProvider::GithubPages,
+            HostingProvider::CloudflarePages,
+            HostingProvider::Netlify,
+            HostingProvider::S3,
+            HostingProvider::Custom,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: HostingProvider = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v, "roundtrip failed for {v:?}");
+        }
+        // Verify snake_case serialization
+        assert_eq!(
+            serde_json::to_string(&HostingProvider::GithubPages).unwrap(),
+            "\"github_pages\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HostingProvider::CloudflarePages).unwrap(),
+            "\"cloudflare_pages\""
+        );
+    }
+
+    #[test]
+    fn detection_confidence_serde_roundtrip() {
+        for v in [
+            DetectionConfidence::High,
+            DetectionConfidence::Medium,
+            DetectionConfidence::Low,
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: DetectionConfidence = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v);
+        }
+        assert_eq!(
+            serde_json::to_string(&DetectionConfidence::High).unwrap(),
+            "\"high\""
+        );
+    }
+
+    #[test]
+    fn wizard_mode_serde_roundtrip() {
+        for v in [WizardMode::Interactive, WizardMode::NonInteractive] {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: WizardMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v);
+        }
+        assert_eq!(
+            serde_json::to_string(&WizardMode::NonInteractive).unwrap(),
+            "\"non_interactive\""
+        );
+    }
+
+    #[test]
+    fn error_code_serde_roundtrip_all_variants() {
+        let all_codes = [
+            WizardErrorCode::BundleNotFound,
+            WizardErrorCode::BundleInvalid,
+            WizardErrorCode::ProviderUnknown,
+            WizardErrorCode::MissingRequiredOption,
+            WizardErrorCode::InvalidOption,
+            WizardErrorCode::GitNotFound,
+            WizardErrorCode::NotGitRepo,
+            WizardErrorCode::NoGitRemote,
+            WizardErrorCode::ToolNotFound,
+            WizardErrorCode::EnvVarMissing,
+            WizardErrorCode::NetworkError,
+            WizardErrorCode::CommandFailed,
+            WizardErrorCode::FileOperationFailed,
+            WizardErrorCode::VerificationFailed,
+            WizardErrorCode::UserCancelled,
+            WizardErrorCode::Timeout,
+            WizardErrorCode::InternalError,
+        ];
+        for v in all_codes {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: WizardErrorCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v, "roundtrip failed for {v:?}");
+        }
+        // SCREAMING_SNAKE_CASE
+        assert_eq!(
+            serde_json::to_string(&WizardErrorCode::BundleNotFound).unwrap(),
+            "\"BUNDLE_NOT_FOUND\""
+        );
+    }
+
+    // ── Exhaustive code() and category() ─────────────────────────────────
+
+    #[test]
+    fn error_code_all_exit_codes_exhaustive() {
+        // Validation: exit 1
+        for v in [
+            WizardErrorCode::BundleNotFound,
+            WizardErrorCode::BundleInvalid,
+            WizardErrorCode::ProviderUnknown,
+            WizardErrorCode::MissingRequiredOption,
+            WizardErrorCode::InvalidOption,
+        ] {
+            assert_eq!(v.code(), 1, "{v:?} should have code 1");
+        }
+        // Environment: exit 2
+        for v in [
+            WizardErrorCode::GitNotFound,
+            WizardErrorCode::NotGitRepo,
+            WizardErrorCode::NoGitRemote,
+            WizardErrorCode::ToolNotFound,
+            WizardErrorCode::EnvVarMissing,
+            WizardErrorCode::NetworkError,
+        ] {
+            assert_eq!(v.code(), 2, "{v:?} should have code 2");
+        }
+        // Execution: exit 3
+        for v in [
+            WizardErrorCode::CommandFailed,
+            WizardErrorCode::FileOperationFailed,
+            WizardErrorCode::VerificationFailed,
+            WizardErrorCode::Timeout,
+        ] {
+            assert_eq!(v.code(), 3, "{v:?} should have code 3");
+        }
+        assert_eq!(WizardErrorCode::UserCancelled.code(), 130);
+        assert_eq!(WizardErrorCode::InternalError.code(), 99);
+    }
+
+    #[test]
+    fn error_code_all_categories_exhaustive() {
+        for v in [
+            WizardErrorCode::BundleNotFound,
+            WizardErrorCode::BundleInvalid,
+            WizardErrorCode::ProviderUnknown,
+            WizardErrorCode::MissingRequiredOption,
+            WizardErrorCode::InvalidOption,
+        ] {
+            assert_eq!(v.category(), "validation", "{v:?}");
+        }
+        for v in [
+            WizardErrorCode::GitNotFound,
+            WizardErrorCode::NotGitRepo,
+            WizardErrorCode::NoGitRemote,
+            WizardErrorCode::ToolNotFound,
+            WizardErrorCode::EnvVarMissing,
+            WizardErrorCode::NetworkError,
+        ] {
+            assert_eq!(v.category(), "environment", "{v:?}");
+        }
+        for v in [
+            WizardErrorCode::CommandFailed,
+            WizardErrorCode::FileOperationFailed,
+            WizardErrorCode::VerificationFailed,
+            WizardErrorCode::Timeout,
+        ] {
+            assert_eq!(v.category(), "execution", "{v:?}");
+        }
+        assert_eq!(WizardErrorCode::UserCancelled.category(), "cancelled");
+        assert_eq!(WizardErrorCode::InternalError.category(), "internal");
+    }
+
+    // ── Display impls ────────────────────────────────────────────────────
+
+    #[test]
+    fn error_code_display_all_screaming_snake_case() {
+        let expected = [
+            (WizardErrorCode::BundleNotFound, "BUNDLE_NOT_FOUND"),
+            (WizardErrorCode::BundleInvalid, "BUNDLE_INVALID"),
+            (WizardErrorCode::ProviderUnknown, "PROVIDER_UNKNOWN"),
+            (
+                WizardErrorCode::MissingRequiredOption,
+                "MISSING_REQUIRED_OPTION",
+            ),
+            (WizardErrorCode::InvalidOption, "INVALID_OPTION"),
+            (WizardErrorCode::GitNotFound, "GIT_NOT_FOUND"),
+            (WizardErrorCode::NotGitRepo, "NOT_GIT_REPO"),
+            (WizardErrorCode::NoGitRemote, "NO_GIT_REMOTE"),
+            (WizardErrorCode::ToolNotFound, "TOOL_NOT_FOUND"),
+            (WizardErrorCode::EnvVarMissing, "ENV_VAR_MISSING"),
+            (WizardErrorCode::NetworkError, "NETWORK_ERROR"),
+            (WizardErrorCode::CommandFailed, "COMMAND_FAILED"),
+            (
+                WizardErrorCode::FileOperationFailed,
+                "FILE_OPERATION_FAILED",
+            ),
+            (WizardErrorCode::VerificationFailed, "VERIFICATION_FAILED"),
+            (WizardErrorCode::UserCancelled, "USER_CANCELLED"),
+            (WizardErrorCode::Timeout, "TIMEOUT"),
+            (WizardErrorCode::InternalError, "INTERNAL_ERROR"),
+        ];
+        for (code, text) in expected {
+            assert_eq!(code.to_string(), text, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn wizard_error_display_without_context() {
+        let err = WizardError::new(WizardErrorCode::NetworkError, "connection refused");
+        assert_eq!(err.to_string(), "NETWORK_ERROR: connection refused");
+    }
+
+    #[test]
+    fn wizard_error_display_with_context() {
+        let err = WizardError::new(WizardErrorCode::ToolNotFound, "wrangler not found")
+            .with_context("PATH=/usr/bin");
+        assert_eq!(
+            err.to_string(),
+            "TOOL_NOT_FOUND: wrangler not found (PATH=/usr/bin)"
+        );
+    }
+
+    #[test]
+    fn wizard_error_is_std_error() {
+        let err = WizardError::new(WizardErrorCode::Timeout, "timed out");
+        let dyn_err: &dyn std::error::Error = &err;
+        assert!(dyn_err.to_string().contains("TIMEOUT"));
+    }
+
+    #[test]
+    fn wizard_error_exit_code_matches_code() {
+        let err = WizardError::new(WizardErrorCode::UserCancelled, "ctrl-c");
+        assert_eq!(err.exit_code(), 130);
+        let err2 = WizardError::new(WizardErrorCode::InternalError, "bug");
+        assert_eq!(err2.exit_code(), 99);
+    }
+
+    // ── JSON output edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn json_output_failure_none_bundle_path() {
+        let error = WizardError::new(WizardErrorCode::BundleNotFound, "not found");
+        let output = WizardJsonOutput::failure(error, None);
+        assert_eq!(output.bundle_path, "");
+        assert!(!output.success);
+    }
+
+    // ── Exit code constants ──────────────────────────────────────────────
+
+    #[test]
+    fn exit_code_constants_match_error_categories() {
+        assert_eq!(exit_codes::SUCCESS, 0);
+        assert_eq!(
+            exit_codes::VALIDATION_ERROR,
+            i32::from(WizardErrorCode::BundleNotFound.code())
+        );
+        assert_eq!(
+            exit_codes::ENVIRONMENT_ERROR,
+            i32::from(WizardErrorCode::GitNotFound.code())
+        );
+        assert_eq!(
+            exit_codes::EXECUTION_ERROR,
+            i32::from(WizardErrorCode::CommandFailed.code())
+        );
+        assert_eq!(
+            exit_codes::INTERNAL_ERROR,
+            i32::from(WizardErrorCode::InternalError.code())
+        );
+        assert_eq!(
+            exit_codes::USER_CANCELLED,
+            i32::from(WizardErrorCode::UserCancelled.code())
+        );
+    }
+
+    // ── Misc struct serde ────────────────────────────────────────────────
+
+    #[test]
+    fn wizard_inputs_serde_roundtrip() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::Netlify),
+            bundle_path: Some(PathBuf::from("/tmp/b")),
+            output_dir: Some(PathBuf::from("/tmp/out")),
+            netlify_site: Some("my-site".to_string()),
+            skip_confirm: true,
+            dry_run: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&inputs).unwrap();
+        let back: WizardInputs = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.provider, Some(HostingProvider::Netlify));
+        assert!(back.skip_confirm);
+        assert!(back.dry_run);
+        assert_eq!(back.netlify_site, Some("my-site".to_string()));
+    }
+
+    #[test]
+    fn step_outcome_serde_roundtrip() {
+        let outcome = StepOutcome {
+            step_id: "deploy".to_string(),
+            success: true,
+            message: "OK".to_string(),
+            duration_ms: 1234,
+            files_created: vec![PathBuf::from("deploy.yml")],
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: StepOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.step_id, "deploy");
+        assert!(back.success);
+        assert_eq!(back.duration_ms, 1234);
+        assert_eq!(back.files_created.len(), 1);
+    }
+
+    #[test]
+    fn detected_signal_serde_roundtrip() {
+        let signal = DetectedSignal {
+            source: "git_remote".to_string(),
+            detail: "github.com/user/repo".to_string(),
+            confidence: DetectionConfidence::High,
+        };
+        let json = serde_json::to_string(&signal).unwrap();
+        let back: DetectedSignal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source, "git_remote");
+        assert_eq!(back.confidence, DetectionConfidence::High);
+    }
+
+    #[test]
+    fn detected_environment_default_is_empty() {
+        let env = DetectedEnvironment::default();
+        assert!(env.git_remote_url.is_none());
+        assert!(env.github_repo.is_none());
+        assert!(!env.is_git_repo);
+        assert!(env.signals.is_empty());
+        assert!(env.recommended_provider.is_none());
+        assert!(env.existing_bundle.is_none());
+        assert!(!env.github_env);
+        assert!(!env.cloudflare_env);
+        assert!(!env.netlify_env);
+        assert!(!env.aws_env);
+    }
+
+    #[test]
+    fn wizard_version_is_semver() {
+        let parts: Vec<&str> = WIZARD_VERSION.split('.').collect();
+        assert_eq!(parts.len(), 3, "version should have 3 parts");
+        for part in parts {
+            part.parse::<u32>()
+                .unwrap_or_else(|_| panic!("'{part}' should be numeric"));
+        }
+    }
+
+    // ── Provider description coverage ────────────────────────────────────
+
+    #[test]
+    fn all_providers_have_nonempty_description() {
+        let all = [
+            HostingProvider::GithubPages,
+            HostingProvider::CloudflarePages,
+            HostingProvider::Netlify,
+            HostingProvider::S3,
+            HostingProvider::Custom,
+        ];
+        for p in all {
+            assert!(!p.description().is_empty(), "{p:?} has empty description");
+            assert!(!p.id().is_empty(), "{p:?} has empty id");
+            assert!(
+                !p.display_name().is_empty(),
+                "{p:?} has empty display_name"
+            );
+        }
+    }
+
+    // ── WizardError serde ────────────────────────────────────────────────
+
+    #[test]
+    fn wizard_error_serde_roundtrip() {
+        let err = WizardError::new(WizardErrorCode::BundleInvalid, "bad manifest")
+            .with_context("manifest.json missing")
+            .with_hint("Run am share export first");
+        let json = serde_json::to_string(&err).unwrap();
+        let back: WizardError = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.code, WizardErrorCode::BundleInvalid);
+        assert_eq!(back.message, "bad manifest");
+        assert_eq!(back.context.as_deref(), Some("manifest.json missing"));
+        assert_eq!(back.hint.as_deref(), Some("Run am share export first"));
+    }
 }

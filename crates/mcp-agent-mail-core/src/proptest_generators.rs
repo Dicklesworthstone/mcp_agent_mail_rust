@@ -222,4 +222,55 @@ mod tests {
             }
         }
     }
+
+    // ── Non-proptest unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn title_case_empty_string() {
+        assert_eq!(title_case(""), "");
+    }
+
+    #[test]
+    fn title_case_single_char() {
+        assert_eq!(title_case("a"), "A");
+        assert_eq!(title_case("z"), "Z");
+    }
+
+    #[test]
+    fn title_case_already_capitalized() {
+        assert_eq!(title_case("Hello"), "Hello");
+    }
+
+    #[test]
+    fn title_case_all_uppercase() {
+        assert_eq!(title_case("HELLO"), "Hello");
+    }
+
+    #[test]
+    fn title_case_all_lowercase() {
+        assert_eq!(title_case("hello"), "Hello");
+    }
+
+    #[test]
+    fn proptest_config_values() {
+        let cfg = proptest_config();
+        assert_eq!(cfg.cases, 1000);
+        assert_eq!(cfg.max_shrink_iters, 5000);
+    }
+
+    #[test]
+    fn arb_timestamp_range() {
+        // Verify the strategy produces values in valid range.
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        let mut runner = TestRunner::default();
+        let strategy = arb_timestamp_micros();
+        for _ in 0..20 {
+            let tree = strategy.new_tree(&mut runner).unwrap();
+            let val = tree.current();
+            assert!(val >= 0, "timestamp must be non-negative, got {val}");
+            assert!(val <= i64::MAX);
+        }
+    }
 }

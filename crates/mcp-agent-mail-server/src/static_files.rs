@@ -283,4 +283,86 @@ mod tests {
         assert_eq!(ct, "application/javascript; charset=utf-8");
         assert_eq!(body, b"vendor code");
     }
+
+    // ── Additional MIME type edge cases ──────────────────────────────────
+
+    #[test]
+    fn mime_type_remaining_extensions() {
+        assert_eq!(mime_type_for_path(Path::new("page.htm")), "text/html; charset=utf-8");
+        assert_eq!(mime_type_for_path(Path::new("module.mjs")), "application/javascript; charset=utf-8");
+        assert_eq!(mime_type_for_path(Path::new("chunk.map")), "application/json");
+        assert_eq!(mime_type_for_path(Path::new("photo.jpg")), "image/jpeg");
+        assert_eq!(mime_type_for_path(Path::new("photo.jpeg")), "image/jpeg");
+        assert_eq!(mime_type_for_path(Path::new("anim.gif")), "image/gif");
+        assert_eq!(mime_type_for_path(Path::new("icon.svg")), "image/svg+xml");
+        assert_eq!(mime_type_for_path(Path::new("favicon.ico")), "image/x-icon");
+        assert_eq!(mime_type_for_path(Path::new("img.webp")), "image/webp");
+        assert_eq!(mime_type_for_path(Path::new("img.avif")), "image/avif");
+        assert_eq!(mime_type_for_path(Path::new("font.woff")), "font/woff");
+        assert_eq!(mime_type_for_path(Path::new("font.ttf")), "font/ttf");
+        assert_eq!(mime_type_for_path(Path::new("font.otf")), "font/otf");
+        assert_eq!(mime_type_for_path(Path::new("readme.txt")), "text/plain; charset=utf-8");
+        assert_eq!(mime_type_for_path(Path::new("feed.xml")), "application/xml");
+        assert_eq!(mime_type_for_path(Path::new("doc.pdf")), "application/pdf");
+    }
+
+    #[test]
+    fn mime_type_case_insensitive() {
+        assert_eq!(mime_type_for_path(Path::new("app.JS")), "application/javascript; charset=utf-8");
+        assert_eq!(mime_type_for_path(Path::new("style.CSS")), "text/css; charset=utf-8");
+        assert_eq!(mime_type_for_path(Path::new("page.HTML")), "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn mime_type_no_extension() {
+        assert_eq!(mime_type_for_path(Path::new("Makefile")), "application/octet-stream");
+        assert_eq!(mime_type_for_path(Path::new("")), "application/octet-stream");
+    }
+
+    #[test]
+    fn is_safe_path_rejects_nonexistent() {
+        let root = Path::new("/nonexistent/root");
+        let resolved = Path::new("/nonexistent/root/file.txt");
+        assert!(!is_safe_path(root, resolved));
+    }
+
+    #[test]
+    fn is_safe_path_accepts_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("file.txt");
+        std::fs::write(&child, "ok").unwrap();
+        assert!(is_safe_path(dir.path(), &child));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("web");
+        std::fs::create_dir(&inside).unwrap();
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "nope").unwrap();
+        assert!(!is_safe_path(&inside, &outside));
+    }
+
+    #[test]
+    fn web_root_empty_path_serves_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let web = dir.path().join("web");
+        std::fs::create_dir(&web).unwrap();
+        std::fs::write(web.join("index.html"), "<h1>home</h1>").unwrap();
+
+        let root = WebRoot { root: web };
+        let (ct, body) = root.serve("").unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+        assert_eq!(body, b"<h1>home</h1>");
+    }
+
+    #[test]
+    fn web_root_debug_impl() {
+        let root = WebRoot {
+            root: PathBuf::from("/tmp/web"),
+        };
+        let debug = format!("{root:?}");
+        assert!(debug.contains("/tmp/web"));
+    }
 }
