@@ -1276,7 +1276,7 @@ mod tests {
     #[test]
     fn remaining_open_secs_zero_when_closed() {
         let cb = CircuitBreaker::with_params(3, Duration::from_secs(30));
-        assert_eq!(cb.remaining_open_secs(), 0.0);
+        assert!(cb.remaining_open_secs() <= f64::EPSILON);
     }
 
     #[test]
@@ -1299,7 +1299,7 @@ mod tests {
         cb.record_failure();
         cb.record_failure();
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(cb.remaining_open_secs(), 0.0);
+        assert!(cb.remaining_open_secs() <= f64::EPSILON);
     }
 
     #[test]
@@ -1309,7 +1309,7 @@ mod tests {
         cb.record_failure();
         assert!(cb.remaining_open_secs() > 0.0);
         cb.reset();
-        assert_eq!(cb.remaining_open_secs(), 0.0);
+        assert!(cb.remaining_open_secs() <= f64::EPSILON);
     }
 
     // -- CircuitState Display tests -----------------------------------------
@@ -1325,7 +1325,7 @@ mod tests {
 
     #[test]
     fn record_success_in_open_state_closes_circuit() {
-        let cb = CircuitBreaker::with_params(2, Duration::from_secs(300));
+        let cb = CircuitBreaker::with_params(2, Duration::from_mins(5));
         cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);

@@ -1433,7 +1433,10 @@ mod tests {
     fn flake_verdict_serde_all_variants() {
         for (variant, expected_json) in [
             (FlakeVerdict::Stable, "\"stable\""),
-            (FlakeVerdict::DeterministicFailure, "\"deterministic_failure\""),
+            (
+                FlakeVerdict::DeterministicFailure,
+                "\"deterministic_failure\"",
+            ),
             (FlakeVerdict::Flaky, "\"flaky\""),
             (FlakeVerdict::Inconclusive, "\"inconclusive\""),
         ] {

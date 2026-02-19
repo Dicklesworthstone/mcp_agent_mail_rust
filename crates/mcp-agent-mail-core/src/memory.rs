@@ -317,10 +317,7 @@ mod tests {
 
     #[test]
     fn classify_pressure_zero_rss_always_ok() {
-        assert_eq!(
-            classify_pressure(0, 2048, 4096, 8192),
-            MemoryPressure::Ok
-        );
+        assert_eq!(classify_pressure(0, 2048, 4096, 8192), MemoryPressure::Ok);
     }
 
     #[test]

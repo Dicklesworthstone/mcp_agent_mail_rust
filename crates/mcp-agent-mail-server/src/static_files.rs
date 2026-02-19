@@ -288,9 +288,18 @@ mod tests {
 
     #[test]
     fn mime_type_remaining_extensions() {
-        assert_eq!(mime_type_for_path(Path::new("page.htm")), "text/html; charset=utf-8");
-        assert_eq!(mime_type_for_path(Path::new("module.mjs")), "application/javascript; charset=utf-8");
-        assert_eq!(mime_type_for_path(Path::new("chunk.map")), "application/json");
+        assert_eq!(
+            mime_type_for_path(Path::new("page.htm")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("module.mjs")),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("chunk.map")),
+            "application/json"
+        );
         assert_eq!(mime_type_for_path(Path::new("photo.jpg")), "image/jpeg");
         assert_eq!(mime_type_for_path(Path::new("photo.jpeg")), "image/jpeg");
         assert_eq!(mime_type_for_path(Path::new("anim.gif")), "image/gif");
@@ -301,22 +310,40 @@ mod tests {
         assert_eq!(mime_type_for_path(Path::new("font.woff")), "font/woff");
         assert_eq!(mime_type_for_path(Path::new("font.ttf")), "font/ttf");
         assert_eq!(mime_type_for_path(Path::new("font.otf")), "font/otf");
-        assert_eq!(mime_type_for_path(Path::new("readme.txt")), "text/plain; charset=utf-8");
+        assert_eq!(
+            mime_type_for_path(Path::new("readme.txt")),
+            "text/plain; charset=utf-8"
+        );
         assert_eq!(mime_type_for_path(Path::new("feed.xml")), "application/xml");
         assert_eq!(mime_type_for_path(Path::new("doc.pdf")), "application/pdf");
     }
 
     #[test]
     fn mime_type_case_insensitive() {
-        assert_eq!(mime_type_for_path(Path::new("app.JS")), "application/javascript; charset=utf-8");
-        assert_eq!(mime_type_for_path(Path::new("style.CSS")), "text/css; charset=utf-8");
-        assert_eq!(mime_type_for_path(Path::new("page.HTML")), "text/html; charset=utf-8");
+        assert_eq!(
+            mime_type_for_path(Path::new("app.JS")),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("style.CSS")),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("page.HTML")),
+            "text/html; charset=utf-8"
+        );
     }
 
     #[test]
     fn mime_type_no_extension() {
-        assert_eq!(mime_type_for_path(Path::new("Makefile")), "application/octet-stream");
-        assert_eq!(mime_type_for_path(Path::new("")), "application/octet-stream");
+        assert_eq!(
+            mime_type_for_path(Path::new("Makefile")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("")),
+            "application/octet-stream"
+        );
     }
 
     #[test]

@@ -1171,7 +1171,10 @@ mod tests {
         };
         apply_filters(&mut conditions, &mut params, &query);
         if let Value::Text(ref s) = params[1] {
-            assert!(s.contains("hello\\_world"), "underscore should be escaped: {s}");
+            assert!(
+                s.contains("hello\\_world"),
+                "underscore should be escaped: {s}"
+            );
         } else {
             panic!("expected text param");
         }

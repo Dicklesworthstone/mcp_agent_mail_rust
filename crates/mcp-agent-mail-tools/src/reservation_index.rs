@@ -367,11 +367,7 @@ mod tests {
     #[test]
     fn deeply_nested_exact_path() {
         let idx = ReservationIndex::build(
-            vec![(
-                "crates/db/src/schema.rs".to_string(),
-                make_ref(1),
-            )]
-            .into_iter(),
+            vec![("crates/db/src/schema.rs".to_string(), make_ref(1))].into_iter(),
         );
         let req = CompiledPattern::new("crates/db/src/schema.rs");
         let conflicts = idx.find_conflicts(&req);
@@ -381,11 +377,7 @@ mod tests {
     #[test]
     fn deeply_nested_no_conflict_different_subtree() {
         let idx = ReservationIndex::build(
-            vec![(
-                "crates/db/src/schema.rs".to_string(),
-                make_ref(1),
-            )]
-            .into_iter(),
+            vec![("crates/db/src/schema.rs".to_string(), make_ref(1))].into_iter(),
         );
         let req = CompiledPattern::new("crates/cli/src/schema.rs");
         let conflicts = idx.find_conflicts(&req);
@@ -433,8 +425,7 @@ mod tests {
             exclusive: true,
             expires_ts: 999_000,
         };
-        let idx =
-            ReservationIndex::build(vec![("src/main.rs".to_string(), rref)].into_iter());
+        let idx = ReservationIndex::build(vec![("src/main.rs".to_string(), rref)].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);

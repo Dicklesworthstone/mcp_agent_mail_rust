@@ -1459,22 +1459,67 @@ mod tests {
     #[test]
     fn agent_platform_from_slug_all_aliases() {
         // Primary slugs
-        assert_eq!(AgentPlatform::from_slug("claude"), Some(AgentPlatform::Claude));
-        assert_eq!(AgentPlatform::from_slug("codex"), Some(AgentPlatform::Codex));
-        assert_eq!(AgentPlatform::from_slug("cursor"), Some(AgentPlatform::Cursor));
-        assert_eq!(AgentPlatform::from_slug("gemini"), Some(AgentPlatform::Gemini));
-        assert_eq!(AgentPlatform::from_slug("opencode"), Some(AgentPlatform::OpenCode));
-        assert_eq!(AgentPlatform::from_slug("factory"), Some(AgentPlatform::FactoryDroid));
-        assert_eq!(AgentPlatform::from_slug("cline"), Some(AgentPlatform::Cline));
-        assert_eq!(AgentPlatform::from_slug("windsurf"), Some(AgentPlatform::Windsurf));
-        assert_eq!(AgentPlatform::from_slug("github-copilot"), Some(AgentPlatform::GithubCopilot));
+        assert_eq!(
+            AgentPlatform::from_slug("claude"),
+            Some(AgentPlatform::Claude)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("codex"),
+            Some(AgentPlatform::Codex)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("cursor"),
+            Some(AgentPlatform::Cursor)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("gemini"),
+            Some(AgentPlatform::Gemini)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("opencode"),
+            Some(AgentPlatform::OpenCode)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("factory"),
+            Some(AgentPlatform::FactoryDroid)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("cline"),
+            Some(AgentPlatform::Cline)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("windsurf"),
+            Some(AgentPlatform::Windsurf)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("github-copilot"),
+            Some(AgentPlatform::GithubCopilot)
+        );
         // Alias slugs
-        assert_eq!(AgentPlatform::from_slug("claude-code"), Some(AgentPlatform::Claude));
-        assert_eq!(AgentPlatform::from_slug("codex-cli"), Some(AgentPlatform::Codex));
-        assert_eq!(AgentPlatform::from_slug("gemini-cli"), Some(AgentPlatform::Gemini));
-        assert_eq!(AgentPlatform::from_slug("open-code"), Some(AgentPlatform::OpenCode));
-        assert_eq!(AgentPlatform::from_slug("factory-droid"), Some(AgentPlatform::FactoryDroid));
-        assert_eq!(AgentPlatform::from_slug("copilot"), Some(AgentPlatform::GithubCopilot));
+        assert_eq!(
+            AgentPlatform::from_slug("claude-code"),
+            Some(AgentPlatform::Claude)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("codex-cli"),
+            Some(AgentPlatform::Codex)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("gemini-cli"),
+            Some(AgentPlatform::Gemini)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("open-code"),
+            Some(AgentPlatform::OpenCode)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("factory-droid"),
+            Some(AgentPlatform::FactoryDroid)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("copilot"),
+            Some(AgentPlatform::GithubCopilot)
+        );
         // Unknown
         assert_eq!(AgentPlatform::from_slug("vscode"), None);
         assert_eq!(AgentPlatform::from_slug(""), None);
@@ -1494,7 +1539,10 @@ mod tests {
 
     #[test]
     fn agent_platform_display_name_all() {
-        let names: Vec<&str> = AgentPlatform::ALL.iter().map(|p| p.display_name()).collect();
+        let names: Vec<&str> = AgentPlatform::ALL
+            .iter()
+            .map(|p| p.display_name())
+            .collect();
         assert!(names.contains(&"Claude Code"));
         assert!(names.contains(&"Codex CLI"));
         assert!(names.contains(&"Cursor"));
@@ -1677,9 +1725,11 @@ mod tests {
         let actions = AgentPlatform::Claude.config_actions(&params);
         // project-local, user-level, hooks = 3 actions
         assert_eq!(actions.len(), 3);
-        assert!(actions[0]
-            .file_path
-            .ends_with(".claude/settings.local.json"));
+        assert!(
+            actions[0]
+                .file_path
+                .ends_with(".claude/settings.local.json")
+        );
         assert!(actions[1].file_path.ends_with(".claude/settings.json"));
         // Third action is hooks
         assert!(matches!(
@@ -1741,9 +1791,15 @@ mod tests {
     #[test]
     fn hook_is_ours_detects_all_markers() {
         assert!(hook_is_ours(&json!({"command": "mcp-agent-mail serve"})));
-        assert!(hook_is_ours(&json!({"command": "am file_reservations active proj"})));
-        assert!(hook_is_ours(&json!({"command": "am acks pending proj agent"})));
-        assert!(hook_is_ours(&json!({"command": "am mail inbox --project proj"})));
+        assert!(hook_is_ours(
+            &json!({"command": "am file_reservations active proj"})
+        ));
+        assert!(hook_is_ours(
+            &json!({"command": "am acks pending proj agent"})
+        ));
+        assert!(hook_is_ours(
+            &json!({"command": "am mail inbox --project proj"})
+        ));
         assert!(!hook_is_ours(&json!({"command": "echo hello"})));
         assert!(!hook_is_ours(&json!({"command": "cargo build"})));
     }
@@ -1797,9 +1853,11 @@ mod tests {
             "expected JSON object at top level or servers key"
         );
 
-        assert!(SetupError::UnknownPlatform("foo".into())
-            .to_string()
-            .contains("foo"));
+        assert!(
+            SetupError::UnknownPlatform("foo".into())
+                .to_string()
+                .contains("foo")
+        );
 
         assert_eq!(SetupError::Other("oops".into()).to_string(), "oops");
     }
@@ -1832,11 +1890,7 @@ mod tests {
     #[test]
     fn resolve_token_env_file_quoted_values() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            tmp.path(),
-            "HTTP_BEARER_TOKEN=\"double-quoted-token\"\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN=\"double-quoted-token\"\n").unwrap();
         let t = resolve_token(None, tmp.path());
         assert_eq!(t, "double-quoted-token");
     }
@@ -1844,11 +1898,7 @@ mod tests {
     #[test]
     fn resolve_token_env_file_single_quoted() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            tmp.path(),
-            "HTTP_BEARER_TOKEN='single-quoted-token'\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN='single-quoted-token'\n").unwrap();
         let t = resolve_token(None, tmp.path());
         assert_eq!(t, "single-quoted-token");
     }

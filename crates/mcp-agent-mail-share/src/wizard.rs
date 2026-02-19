@@ -801,10 +801,7 @@ mod tests {
             HostingProvider::parse("Netlify"),
             Some(HostingProvider::Netlify)
         );
-        assert_eq!(
-            HostingProvider::parse("  S3 "),
-            Some(HostingProvider::S3)
-        );
+        assert_eq!(HostingProvider::parse("  S3 "), Some(HostingProvider::S3));
         assert_eq!(HostingProvider::parse(""), None);
         assert_eq!(HostingProvider::parse("   "), None);
     }
@@ -1176,10 +1173,7 @@ mod tests {
         for p in all {
             assert!(!p.description().is_empty(), "{p:?} has empty description");
             assert!(!p.id().is_empty(), "{p:?} has empty id");
-            assert!(
-                !p.display_name().is_empty(),
-                "{p:?} has empty display_name"
-            );
+            assert!(!p.display_name().is_empty(), "{p:?} has empty display_name");
         }
     }
 

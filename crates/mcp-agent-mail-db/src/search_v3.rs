@@ -705,7 +705,9 @@ mod tests {
 
     // -- convert_results tests ---------------------------------------------
 
-    fn make_search_results(hits: Vec<mcp_agent_mail_search_core::results::SearchHit>) -> SearchResults {
+    fn make_search_results(
+        hits: Vec<mcp_agent_mail_search_core::results::SearchHit>,
+    ) -> SearchResults {
         use mcp_agent_mail_search_core::query::SearchMode;
         SearchResults {
             total_count: hits.len(),
@@ -748,7 +750,12 @@ mod tests {
         let hit = make_hit(42, 1.5, Some("snippet"), meta);
         let results = make_search_results(vec![hit]);
 
-        for kind in &[DocKind::Message, DocKind::Agent, DocKind::Project, DocKind::Thread] {
+        for kind in &[
+            DocKind::Message,
+            DocKind::Agent,
+            DocKind::Project,
+            DocKind::Thread,
+        ] {
             let converted = convert_results(&results, *kind);
             assert_eq!(converted.len(), 1);
             assert_eq!(converted[0].doc_kind, *kind);
@@ -762,7 +769,10 @@ mod tests {
         meta.insert("sender".to_string(), serde_json::json!("GoldHawk"));
         meta.insert("importance".to_string(), serde_json::json!("urgent"));
         meta.insert("thread_id".to_string(), serde_json::json!("br-500"));
-        meta.insert("created_ts".to_string(), serde_json::json!(9_876_543_210i64));
+        meta.insert(
+            "created_ts".to_string(),
+            serde_json::json!(9_876_543_210i64),
+        );
         meta.insert("project_id".to_string(), serde_json::json!(3i64));
         let hit = make_hit(99, 2.5, Some("snippet text"), meta);
         let results = make_search_results(vec![hit]);

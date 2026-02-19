@@ -392,7 +392,7 @@ mod tests {
                 // but well-distributed value.
                 let h = (i as u64).wrapping_mul(2_654_435_761).wrapping_add(13) % 10000;
                 let u = (h as f64 + 0.5) / 10001.0; // (0, 1)
-                                                    // Map through tan for heavy tails, but clamp to avoid infinity.
+                // Map through tan for heavy tails, but clamp to avoid infinity.
                 let angle = (u - 0.5) * std::f64::consts::PI * 0.95;
                 angle.tan()
             })

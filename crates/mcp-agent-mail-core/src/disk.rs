@@ -601,7 +601,10 @@ mod tests {
 
         let sample = sample_disk(&config);
         assert!(sample.storage_free_bytes.is_some());
-        assert!(sample.db_probe_path.is_none(), "memory DB has no probe path");
+        assert!(
+            sample.db_probe_path.is_none(),
+            "memory DB has no probe path"
+        );
         assert!(sample.db_free_bytes.is_none());
         // effective should be storage-only
         assert_eq!(sample.effective_free_bytes, sample.storage_free_bytes);
