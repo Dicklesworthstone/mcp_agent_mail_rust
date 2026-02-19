@@ -888,4 +888,155 @@ mod tests {
         // Should not be flagged as slow (p95 well below 500ms threshold).
         assert!(!lat.is_slow, "should not be flagged as slow");
     }
+
+    #[test]
+    fn tool_index_returns_some_for_known_tools() {
+        // Spot-check a few known tools across different clusters.
+        assert!(tool_index("health_check").is_some());
+        assert!(tool_index("send_message").is_some());
+        assert!(tool_index("search_messages").is_some());
+        assert!(tool_index("acquire_build_slot").is_some());
+        assert!(tool_index("macro_start_session").is_some());
+    }
+
+    #[test]
+    fn tool_index_returns_none_for_unknown() {
+        assert!(tool_index("nonexistent_tool").is_none());
+        assert!(tool_index("").is_none());
+        assert!(tool_index("HEALTH_CHECK").is_none()); // case-sensitive
+    }
+
+    #[test]
+    fn record_latency_by_name() {
+        let _guard = METRICS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_tool_metrics();
+
+        record_call("mark_message_read");
+        record_latency("mark_message_read", 5_000); // 5ms
+
+        let snapshot = tool_metrics_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.name == "mark_message_read")
+            .unwrap();
+        assert!(entry.latency.is_some(), "latency should be recorded by name");
+    }
+
+    #[test]
+    fn record_latency_unknown_tool_is_noop() {
+        // In release mode, record_latency for unknown tool silently does nothing.
+        // (debug_assert only fires in debug builds.)
+        record_latency("totally_fake_tool", 1_000);
+        // No panic — this is the assertion.
+    }
+
+    #[test]
+    fn slow_tools_empty_when_no_slow() {
+        let _guard = METRICS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_tool_metrics();
+
+        // Record fast calls only.
+        let idx = tool_index("acknowledge_message").unwrap();
+        for _ in 0..10 {
+            record_call_idx(idx);
+            record_latency_idx(idx, 100); // 0.1ms — well under threshold
+        }
+
+        let slow = slow_tools();
+        assert!(
+            !slow.iter().any(|e| e.name == "acknowledge_message"),
+            "fast tool should not appear in slow_tools()"
+        );
+    }
+
+    #[test]
+    fn tool_meta_map_covers_all_cluster_tools() {
+        // Every tool in TOOL_CLUSTER_MAP should have an entry in TOOL_META_MAP.
+        for (name, _cluster) in TOOL_CLUSTER_MAP {
+            assert!(
+                tool_meta(name).is_some(),
+                "TOOL_META_MAP missing entry for tool: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn us_to_ms_conversion() {
+        assert!((us_to_ms(0) - 0.0).abs() < f64::EPSILON);
+        assert!((us_to_ms(1_000) - 1.0).abs() < f64::EPSILON);
+        assert!((us_to_ms(500) - 0.5).abs() < f64::EPSILON);
+        assert!((us_to_ms(1_000_000) - 1000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn latency_snapshot_serde_roundtrip() {
+        let snap = LatencySnapshot {
+            avg_ms: 1.5,
+            min_ms: 0.1,
+            max_ms: 10.0,
+            p50_ms: 1.0,
+            p95_ms: 5.0,
+            p99_ms: 9.0,
+            is_slow: false,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let deser: LatencySnapshot = serde_json::from_str(&json).unwrap();
+        assert!((deser.avg_ms - 1.5).abs() < f64::EPSILON);
+        assert!((deser.p95_ms - 5.0).abs() < f64::EPSILON);
+        assert!(!deser.is_slow);
+    }
+
+    #[test]
+    fn metrics_snapshot_entry_serde_roundtrip() {
+        let entry = MetricsSnapshotEntry {
+            name: "health_check".to_string(),
+            calls: 42,
+            errors: 3,
+            cluster: "infrastructure".to_string(),
+            capabilities: vec!["infrastructure".to_string()],
+            complexity: "low".to_string(),
+            latency: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let deser: MetricsSnapshotEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.name, "health_check");
+        assert_eq!(deser.calls, 42);
+        assert_eq!(deser.errors, 3);
+        assert!(deser.latency.is_none());
+    }
+
+    #[test]
+    fn metrics_snapshot_entry_latency_skipped_when_none() {
+        let entry = MetricsSnapshotEntry {
+            name: "test".to_string(),
+            calls: 1,
+            errors: 0,
+            cluster: "test".to_string(),
+            capabilities: Vec::new(),
+            complexity: "low".to_string(),
+            latency: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("latency"),
+            "latency field should be skipped when None"
+        );
+    }
+
+    #[test]
+    fn tool_meta_debug_impl() {
+        let meta = tool_meta("send_message").unwrap();
+        let debug = format!("{meta:?}");
+        assert!(debug.contains("messaging"));
+        assert!(debug.contains("medium"));
+    }
+
+    #[test]
+    fn slow_tool_threshold_is_500ms() {
+        assert_eq!(SLOW_TOOL_P95_THRESHOLD_US, 500_000);
+    }
 }

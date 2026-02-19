@@ -1326,4 +1326,259 @@ mod tests {
             }
         }
     }
+
+    // ── Additional coverage tests ────────────────────────────────────
+
+    #[test]
+    fn extract_table_id_empty_string() {
+        assert_eq!(extract_table_id(""), TableId::Unknown);
+    }
+
+    #[test]
+    fn extract_table_id_short_strings() {
+        assert_eq!(extract_table_id("SEL"), TableId::Unknown);
+        assert_eq!(extract_table_id("FROM"), TableId::Unknown);
+        assert_eq!(extract_table_id("12345"), TableId::Unknown);
+    }
+
+    #[test]
+    fn extract_table_id_tab_delimiters() {
+        assert_eq!(
+            extract_table_id("SELECT *\tFROM\tmessages\tWHERE id=1"),
+            TableId::Messages
+        );
+        assert_eq!(
+            extract_table_id("INSERT\tINTO\tagents (name) VALUES ('x')"),
+            TableId::Agents
+        );
+    }
+
+    #[test]
+    fn extract_table_id_carriage_return() {
+        assert_eq!(
+            extract_table_id("SELECT *\r\nFROM projects\r\nWHERE 1"),
+            TableId::Projects
+        );
+    }
+
+    #[test]
+    fn extract_table_id_bracket_quotes() {
+        assert_eq!(
+            extract_table_id("SELECT * FROM [messages] WHERE id=1"),
+            TableId::Messages
+        );
+    }
+
+    #[test]
+    fn extract_table_empty_string() {
+        assert_eq!(extract_table(""), None);
+    }
+
+    #[test]
+    fn extract_table_whitespace_only() {
+        assert_eq!(extract_table("   \t\n  "), None);
+    }
+
+    #[test]
+    fn extract_table_schema_qualified_backticks() {
+        assert_eq!(
+            extract_table("SELECT * FROM `schema`.`agents` WHERE 1"),
+            Some("agents".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_delete() {
+        assert_eq!(
+            extract_table("DELETE FROM messages WHERE id = 1"),
+            Some("messages".to_string())
+        );
+    }
+
+    #[test]
+    fn slow_query_entry_serde_roundtrip() {
+        let entry = SlowQueryEntry {
+            table: Some("messages".to_string()),
+            duration_ms: 123.45,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: SlowQueryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table, Some("messages".to_string()));
+        assert!((back.duration_ms - 123.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn slow_query_entry_null_table() {
+        let entry = SlowQueryEntry {
+            table: None,
+            duration_ms: 0.5,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("null"));
+        let back: SlowQueryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table, None);
+    }
+
+    #[test]
+    fn snapshot_clone() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(100));
+        tracker.record("SELECT * FROM agents", 50_000);
+        let snap = tracker.snapshot();
+        let cloned = snap.clone();
+        assert_eq!(cloned.total, snap.total);
+        assert_eq!(cloned.per_table, snap.per_table);
+    }
+
+    #[test]
+    fn tracker_default_impl() {
+        let tracker = QueryTracker::default();
+        assert!(!tracker.is_enabled());
+        assert_eq!(tracker.snapshot().total, 0);
+    }
+
+    #[test]
+    fn tracker_slow_query_preserves_order() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(0)); // everything is slow
+        tracker.record("SELECT 1 FROM agents", 1000);
+        tracker.record("SELECT 2 FROM messages", 2000);
+        tracker.record("SELECT 3 FROM projects", 3000);
+        let snap = tracker.snapshot();
+        assert_eq!(snap.slow_queries.len(), 3);
+        assert_eq!(snap.slow_queries[0].table.as_deref(), Some("agents"));
+        assert_eq!(snap.slow_queries[1].table.as_deref(), Some("messages"));
+        assert_eq!(snap.slow_queries[2].table.as_deref(), Some("projects"));
+    }
+
+    #[test]
+    fn tracker_unknown_table_counted_via_regex() {
+        let tracker = QueryTracker::new();
+        tracker.enable(None);
+        tracker.record("SELECT * FROM custom_table WHERE id = 1", 100);
+        tracker.record("SELECT * FROM custom_table WHERE id = 2", 100);
+        let snap = tracker.snapshot();
+        assert_eq!(snap.total, 2);
+        assert_eq!(snap.per_table.get("custom_table"), Some(&2));
+    }
+
+    #[test]
+    fn tracker_total_time_accumulates() {
+        let tracker = QueryTracker::new();
+        tracker.enable(None);
+        tracker.record("SELECT * FROM messages", 1000); // 1ms
+        tracker.record("SELECT * FROM messages", 2000); // 2ms
+        tracker.record("SELECT * FROM messages", 3000); // 3ms
+        let snap = tracker.snapshot();
+        assert_eq!(snap.total, 3);
+        // Total should be 6000us = 6.0ms
+        assert!((snap.total_time_ms - 6.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn round_ms_one_microsecond() {
+        assert_close(round_ms(1), 0.0); // 0.001ms rounds to 0.00
+    }
+
+    #[test]
+    fn round_ms_very_large() {
+        // u64::MAX microseconds
+        let result = round_ms(u64::MAX);
+        assert!(result.is_finite(), "round_ms(u64::MAX) should be finite");
+        assert!(result > 0.0);
+    }
+
+    #[test]
+    fn table_id_as_str_all_variants() {
+        assert_eq!(TableId::Projects.as_str(), "projects");
+        assert_eq!(TableId::Products.as_str(), "products");
+        assert_eq!(TableId::ProductProjectLinks.as_str(), "product_project_links");
+        assert_eq!(TableId::Agents.as_str(), "agents");
+        assert_eq!(TableId::Messages.as_str(), "messages");
+        assert_eq!(TableId::MessageRecipients.as_str(), "message_recipients");
+        assert_eq!(TableId::FileReservations.as_str(), "file_reservations");
+        assert_eq!(TableId::AgentLinks.as_str(), "agent_links");
+        assert_eq!(TableId::ProjectSiblingSuggestions.as_str(), "project_sibling_suggestions");
+        assert_eq!(TableId::FtsMessages.as_str(), "fts_messages");
+        assert_eq!(TableId::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn table_id_debug_and_clone() {
+        let id = TableId::Messages;
+        let cloned = id;
+        assert_eq!(id, cloned);
+        let debug = format!("{id:?}");
+        assert_eq!(debug, "Messages");
+    }
+
+    #[test]
+    fn active_tracker_guard_restores_none() {
+        // Set a tracker, then drop the guard — should restore to None (or previous)
+        let tracker = Arc::new(QueryTracker::new());
+        let guard = set_active_tracker(tracker);
+        assert!(active_tracker().is_some());
+        drop(guard);
+        // After drop, previous state is restored (which may be None or a
+        // previously-set tracker from another test running on this thread)
+    }
+
+    #[test]
+    fn to_dict_includes_slow_queries_array() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(0)); // all queries are "slow"
+        tracker.record("SELECT * FROM agents", 500_000);
+        let snap = tracker.snapshot();
+        let dict = snap.to_dict();
+        let slow = dict["slow_queries"].as_array().unwrap();
+        assert_eq!(slow.len(), 1);
+        assert_eq!(slow[0]["table"].as_str(), Some("agents"));
+        assert!(slow[0]["duration_ms"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn to_dict_empty_tracker() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(250));
+        let snap = tracker.snapshot();
+        let dict = snap.to_dict();
+        assert_eq!(dict["total"], 0);
+        assert_eq!(dict["per_table"].as_object().unwrap().len(), 0);
+        assert_eq!(dict["slow_queries"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn snapshot_deserializes_from_json() {
+        let json = r#"{
+            "total": 5,
+            "total_time_ms": 12.34,
+            "per_table": {"messages": 3, "agents": 2},
+            "slow_query_ms": 100.0,
+            "slow_queries": [{"table": "messages", "duration_ms": 150.0}]
+        }"#;
+        let snap: QueryTrackerSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.total, 5);
+        assert!((snap.total_time_ms - 12.34).abs() < 0.001);
+        assert_eq!(snap.per_table.get("messages"), Some(&3));
+        assert_eq!(snap.per_table.get("agents"), Some(&2));
+        assert_eq!(snap.slow_query_ms, Some(100.0));
+        assert_eq!(snap.slow_queries.len(), 1);
+    }
+
+    #[test]
+    fn extract_table_id_insert_or_replace() {
+        assert_eq!(
+            extract_table_id("INSERT OR REPLACE INTO messages (id, body) VALUES (1, 'hi')"),
+            TableId::Messages
+        );
+    }
+
+    #[test]
+    fn extract_table_id_update_priority_over_from() {
+        // UPDATE should win over FROM in the SET clause subquery
+        assert_eq!(
+            extract_table_id("UPDATE agents SET name = (SELECT name FROM projects WHERE id=1)"),
+            TableId::Agents
+        );
+    }
 }
