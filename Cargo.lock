@@ -277,11 +277,11 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "asupersync-macros",
  "base64 0.22.1",
- "bincode",
+ "bincode-next",
  "crossbeam-queue",
  "franken-decision",
  "franken-evidence",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -476,6 +476,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bincode-next"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbe9e7e6d14aeb39557f226bff158a30e367fac279d0e69b8b42fb41999f9a86"
+dependencies = [
+ "bincode_derive-next",
+ "serde",
+ "unty-next",
+]
+
+[[package]]
+name = "bincode_derive-next"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af389a025376dbbe728c43dfa5c08f866116c0b62627787c21ca1c69e2b8dec"
+dependencies = [
+ "virtue-next",
 ]
 
 [[package]]
@@ -1942,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1951,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1959,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "serde",
 ]
@@ -1980,21 +2000,21 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "asupersync",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
- "toml 1.0.2+spec-1.1.0",
+ "toml 1.0.3+spec-1.1.0",
  "tracing",
  "unicode-normalization",
 ]
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "asupersync",
  "dirs",
@@ -2027,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crc32fast",
  "frankensearch-core",
@@ -2036,7 +2056,7 @@ dependencies = [
  "rayon",
  "serde",
  "tracing",
- "wide 0.7.33",
+ "wide",
 ]
 
 [[package]]
@@ -4664,7 +4684,7 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "tracing",
- "wide 1.1.1",
+ "wide",
 ]
 
 [[package]]
@@ -6455,15 +6475,6 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safe_arch"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
-dependencies = [
- "bytemuck",
-]
-
-[[package]]
-name = "safe_arch"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed"
@@ -7574,9 +7585,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.0.2+spec-1.1.0"
+version = "1.0.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1dfefef6a142e93f346b64c160934eb13b5594b84ab378133ac6815cb2bd57f"
+checksum = "c7614eaf19ad818347db24addfa201729cf2a9b6fdfd9eb0ab870fcacc606c0c"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -7938,6 +7949,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "unty-next"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bce2adbe4c8e63c3e7f79e9249b5409fb3c9bce989dd44337493cf1c8d7dea0"
+
+[[package]]
 name = "ureq"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8111,6 +8128,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue-next"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "507787017685ff1c8dadaab8ca717bc1145b99163bddc0cbbbd210c3d76cb8b0"
 
 [[package]]
 name = "visibility"
@@ -8357,22 +8380,12 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "wide"
-version = "0.7.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
-dependencies = [
- "bytemuck",
- "safe_arch 0.7.4",
-]
-
-[[package]]
-name = "wide"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac11b009ebeae802ed758530b6496784ebfee7a87b9abfbcaf3bbe25b814eb25"
 dependencies = [
  "bytemuck",
- "safe_arch 1.0.0",
+ "safe_arch",
 ]
 
 [[package]]
