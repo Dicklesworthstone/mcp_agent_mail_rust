@@ -2622,4 +2622,367 @@ mod tests {
         assert_ne!(header, even);
         assert_ne!(odd, even);
     }
+
+    // ── Severity filter cycle & labels ─────────────────────────────────
+
+    #[test]
+    fn severity_filter_next_cycles() {
+        assert_eq!(AnalyticsSeverityFilter::All.next(), AnalyticsSeverityFilter::HighAndUp);
+        assert_eq!(AnalyticsSeverityFilter::HighAndUp.next(), AnalyticsSeverityFilter::CriticalOnly);
+        assert_eq!(AnalyticsSeverityFilter::CriticalOnly.next(), AnalyticsSeverityFilter::All);
+    }
+
+    #[test]
+    fn severity_filter_labels() {
+        assert_eq!(AnalyticsSeverityFilter::All.label(), "filter:all");
+        assert_eq!(AnalyticsSeverityFilter::HighAndUp.label(), "filter:high+");
+        assert_eq!(AnalyticsSeverityFilter::CriticalOnly.label(), "filter:crit");
+    }
+
+    #[test]
+    fn severity_filter_includes_matrix() {
+        // All includes everything
+        assert!(AnalyticsSeverityFilter::All.includes(AnomalySeverity::Low));
+        assert!(AnalyticsSeverityFilter::All.includes(AnomalySeverity::Critical));
+
+        // HighAndUp excludes Low and Medium
+        assert!(!AnalyticsSeverityFilter::HighAndUp.includes(AnomalySeverity::Low));
+        assert!(!AnalyticsSeverityFilter::HighAndUp.includes(AnomalySeverity::Medium));
+        assert!(AnalyticsSeverityFilter::HighAndUp.includes(AnomalySeverity::High));
+        assert!(AnalyticsSeverityFilter::HighAndUp.includes(AnomalySeverity::Critical));
+
+        // CriticalOnly excludes everything but Critical
+        assert!(!AnalyticsSeverityFilter::CriticalOnly.includes(AnomalySeverity::Low));
+        assert!(!AnalyticsSeverityFilter::CriticalOnly.includes(AnomalySeverity::Medium));
+        assert!(!AnalyticsSeverityFilter::CriticalOnly.includes(AnomalySeverity::High));
+        assert!(AnalyticsSeverityFilter::CriticalOnly.includes(AnomalySeverity::Critical));
+    }
+
+    // ── Sort mode cycle & labels ───────────────────────────────────────
+
+    #[test]
+    fn sort_mode_next_cycles() {
+        assert_eq!(AnalyticsSortMode::Priority.next(), AnalyticsSortMode::Severity);
+        assert_eq!(AnalyticsSortMode::Severity.next(), AnalyticsSortMode::Confidence);
+        assert_eq!(AnalyticsSortMode::Confidence.next(), AnalyticsSortMode::Priority);
+    }
+
+    #[test]
+    fn sort_mode_labels() {
+        assert_eq!(AnalyticsSortMode::Priority.label(), "sort:priority");
+        assert_eq!(AnalyticsSortMode::Severity.label(), "sort:severity");
+        assert_eq!(AnalyticsSortMode::Confidence.label(), "sort:confidence");
+    }
+
+    // ── Focus toggle & labels ──────────────────────────────────────────
+
+    #[test]
+    fn focus_next_toggles() {
+        assert_eq!(AnalyticsFocus::List.next(), AnalyticsFocus::Detail);
+        assert_eq!(AnalyticsFocus::Detail.next(), AnalyticsFocus::List);
+    }
+
+    #[test]
+    fn focus_labels() {
+        assert_eq!(AnalyticsFocus::List.label(), "focus:list");
+        assert_eq!(AnalyticsFocus::Detail.label(), "focus:detail");
+    }
+
+    // ── severity_rank ordering ─────────────────────────────────────────
+
+    #[test]
+    fn severity_rank_descending() {
+        assert!(AnalyticsScreen::severity_rank(AnomalySeverity::Critical)
+            > AnalyticsScreen::severity_rank(AnomalySeverity::High));
+        assert!(AnalyticsScreen::severity_rank(AnomalySeverity::High)
+            > AnalyticsScreen::severity_rank(AnomalySeverity::Medium));
+        assert!(AnalyticsScreen::severity_rank(AnomalySeverity::Medium)
+            > AnalyticsScreen::severity_rank(AnomalySeverity::Low));
+    }
+
+    // ── format_error_rate_percent ──────────────────────────────────────
+
+    #[test]
+    fn format_error_rate_zero_calls() {
+        assert_eq!(format_error_rate_percent(0, 0), "0.00");
+    }
+
+    #[test]
+    fn format_error_rate_no_errors() {
+        assert_eq!(format_error_rate_percent(0, 100), "0.00");
+    }
+
+    #[test]
+    fn format_error_rate_all_errors() {
+        assert_eq!(format_error_rate_percent(100, 100), "100.00");
+    }
+
+    #[test]
+    fn format_error_rate_fractional() {
+        // 1 error in 200 calls = 0.50%
+        assert_eq!(format_error_rate_percent(1, 200), "0.50");
+    }
+
+    // ── perceived_luma ─────────────────────────────────────────────────
+
+    #[test]
+    fn perceived_luma_black_is_zero() {
+        let black = PackedRgba::rgba(0, 0, 0, 255);
+        assert_eq!(perceived_luma(black), 0);
+    }
+
+    #[test]
+    fn perceived_luma_white_is_max() {
+        let white = PackedRgba::rgba(255, 255, 255, 255);
+        // (299*255 + 587*255 + 114*255)/1000 = 255
+        assert_eq!(perceived_luma(white), 255);
+    }
+
+    #[test]
+    fn perceived_luma_green_higher_than_red() {
+        let pure_red = PackedRgba::rgba(255, 0, 0, 255);
+        let pure_green = PackedRgba::rgba(0, 255, 0, 255);
+        assert!(perceived_luma(pure_green) > perceived_luma(pure_red));
+    }
+
+    // ── scroll detail saturates ────────────────────────────────────────
+
+    #[test]
+    fn scroll_detail_up_saturates_at_zero() {
+        let mut screen = AnalyticsScreen::new();
+        screen.detail_scroll = 0;
+        screen.scroll_detail_up();
+        assert_eq!(screen.detail_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_detail_down_increments() {
+        let mut screen = AnalyticsScreen::new();
+        screen.detail_scroll = 0;
+        screen.scroll_detail_down();
+        assert_eq!(screen.detail_scroll, 1);
+        screen.scroll_detail_down();
+        assert_eq!(screen.detail_scroll, 2);
+    }
+
+    // ── copyable_content ───────────────────────────────────────────────
+
+    #[test]
+    fn copyable_content_with_card() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![sample_card("test", AnomalySeverity::High, 0.8)],
+            alerts_processed: 1,
+            cards_produced: 1,
+        };
+        let content = screen.copyable_content();
+        assert!(content.is_some());
+        let text = content.unwrap();
+        assert!(text.contains("test headline"));
+        assert!(text.contains("test rationale"));
+    }
+
+    #[test]
+    fn context_help_tip_returns_some() {
+        let screen = AnalyticsScreen::new();
+        assert!(screen.context_help_tip().is_some());
+    }
+
+    // ── sort_card_indices with severity sort ───────────────────────────
+
+    #[test]
+    fn severity_sort_orders_critical_first() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![
+                sample_card("low", AnomalySeverity::Low, 0.9),
+                sample_card("crit", AnomalySeverity::Critical, 0.3),
+                sample_card("med", AnomalySeverity::Medium, 0.5),
+            ],
+            alerts_processed: 3,
+            cards_produced: 3,
+        };
+        screen.sort_mode = AnalyticsSortMode::Severity;
+        let active = screen.active_cards();
+        assert_eq!(active[0].id, "crit");   // rank 4
+        assert_eq!(active[1].id, "med");   // rank 2
+        assert_eq!(active[2].id, "low");   // rank 1
+    }
+
+    // ── cycle_severity_filter / cycle_sort_mode ────────────────────────
+
+    #[test]
+    fn cycle_severity_filter_wraps_around() {
+        let mut screen = AnalyticsScreen::new();
+        assert_eq!(screen.severity_filter, AnalyticsSeverityFilter::All);
+        screen.cycle_severity_filter();
+        assert_eq!(screen.severity_filter, AnalyticsSeverityFilter::HighAndUp);
+        screen.cycle_severity_filter();
+        assert_eq!(screen.severity_filter, AnalyticsSeverityFilter::CriticalOnly);
+        screen.cycle_severity_filter();
+        assert_eq!(screen.severity_filter, AnalyticsSeverityFilter::All);
+    }
+
+    #[test]
+    fn cycle_sort_mode_wraps_around() {
+        let mut screen = AnalyticsScreen::new();
+        assert_eq!(screen.sort_mode, AnalyticsSortMode::Priority);
+        screen.cycle_sort_mode();
+        assert_eq!(screen.sort_mode, AnalyticsSortMode::Severity);
+        screen.cycle_sort_mode();
+        assert_eq!(screen.sort_mode, AnalyticsSortMode::Confidence);
+        screen.cycle_sort_mode();
+        assert_eq!(screen.sort_mode, AnalyticsSortMode::Priority);
+    }
+
+    // ── build_persisted_insight_feed_from_rows edge cases ──────────────
+
+    #[test]
+    fn persisted_feed_empty_rows() {
+        let feed = build_persisted_insight_feed_from_rows(&[], 0);
+        assert!(feed.cards.is_empty());
+        assert_eq!(feed.alerts_processed, 0);
+    }
+
+    #[test]
+    fn persisted_feed_low_error_tools_generate_baseline_cards() {
+        // Tools with 0 errors and normal latency should still produce low-severity fallback
+        let rows = vec![crate::tool_metrics::PersistedToolMetric {
+            tool_name: "read_inbox".to_string(),
+            calls: 500,
+            errors: 0,
+            cluster: "messaging".to_string(),
+            complexity: "low".to_string(),
+            avg_ms: 12.0,
+            p50_ms: 8.0,
+            p95_ms: 30.0,
+            p99_ms: 45.0,
+            is_slow: false,
+            collected_ts: 1_700_000_000_000_000,
+        }];
+        let feed = build_persisted_insight_feed_from_rows(&rows, 10);
+        assert!(!feed.cards.is_empty());
+    }
+
+    // ── parse_deep_link additional screen targets ──────────────────────
+
+    #[test]
+    fn parse_deep_link_all_screen_targets() {
+        let targets = [
+            ("screen:messages", MailScreenId::Messages),
+            ("screen:threads", MailScreenId::Threads),
+            ("screen:agents", MailScreenId::Agents),
+            ("screen:search", MailScreenId::Search),
+            ("screen:reservations", MailScreenId::Reservations),
+            ("screen:system_health", MailScreenId::SystemHealth),
+            ("screen:timeline", MailScreenId::Timeline),
+            ("screen:projects", MailScreenId::Projects),
+            ("screen:contacts", MailScreenId::Contacts),
+            ("screen:explorer", MailScreenId::Explorer),
+            ("screen:analytics", MailScreenId::Analytics),
+        ];
+        for (link, expected) in &targets {
+            let msg = AnalyticsScreen::parse_deep_link(link);
+            assert!(
+                matches!(msg, Some(MailScreenMsg::Navigate(ref id)) if id == expected),
+                "Failed for link: {link}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_deep_link_agent_target() {
+        let msg = AnalyticsScreen::parse_deep_link("agent:GoldHawk");
+        assert!(
+            matches!(msg, Some(MailScreenMsg::DeepLink(DeepLinkTarget::AgentByName(ref n))) if n == "GoldHawk")
+        );
+    }
+
+    #[test]
+    fn parse_deep_link_unknown_screen_returns_none() {
+        assert!(AnalyticsScreen::parse_deep_link("screen:nonexistent").is_none());
+    }
+
+    // ── AnalyticsVizSnapshot default ───────────────────────────────────
+
+    #[test]
+    fn analytics_viz_snapshot_default() {
+        let snap = AnalyticsVizSnapshot::default();
+        assert_eq!(snap.total_calls, 0);
+        assert_eq!(snap.total_errors, 0);
+        assert_eq!(snap.active_tools, 0);
+        assert_eq!(snap.avg_latency_ms, 0.0);
+        assert!(snap.top_call_tools.is_empty());
+        assert!(snap.sparkline.is_empty());
+    }
+
+    // ── Home / End keys ────────────────────────────────────────────────
+
+    #[test]
+    fn home_key_jumps_to_first_card() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![
+                sample_card("a", AnomalySeverity::Low, 0.5),
+                sample_card("b", AnomalySeverity::High, 0.8),
+                sample_card("c", AnomalySeverity::Medium, 0.6),
+            ],
+            alerts_processed: 3,
+            cards_produced: 3,
+        };
+        screen.selected = 2;
+        screen.detail_scroll = 5;
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Home)), &state);
+        assert_eq!(screen.selected, 0);
+        assert_eq!(screen.detail_scroll, 0);
+    }
+
+    #[test]
+    fn end_key_jumps_to_last_card() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![
+                sample_card("a", AnomalySeverity::Low, 0.5),
+                sample_card("b", AnomalySeverity::High, 0.8),
+                sample_card("c", AnomalySeverity::Medium, 0.6),
+            ],
+            alerts_processed: 3,
+            cards_produced: 3,
+        };
+        screen.selected = 0;
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::End)), &state);
+        assert_eq!(screen.selected, 2);
+    }
+
+    // ── fast scroll (J/K) ──────────────────────────────────────────────
+
+    #[test]
+    fn fast_scroll_detail_moves_by_five() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![sample_card("card", AnomalySeverity::High, 0.8)],
+            alerts_processed: 1,
+            cards_produced: 1,
+        };
+        screen.focus = AnalyticsFocus::Detail;
+        screen.detail_scroll = 0;
+
+        screen.update(
+            &Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))),
+            &state,
+        );
+        assert_eq!(screen.detail_scroll, 5);
+
+        screen.update(
+            &Event::Key(ftui::KeyEvent::new(KeyCode::Char('K'))),
+            &state,
+        );
+        assert_eq!(screen.detail_scroll, 0);
+    }
 }

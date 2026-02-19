@@ -1114,4 +1114,336 @@ mod tests {
         assert!(json.contains("\"schema_version\":1"));
         assert!(json.contains("\"suite\":\"test_suite\""));
     }
+
+    // ── ClockMode ──────────────────────────────────────────────────────
+
+    #[test]
+    fn clock_mode_default_is_wall() {
+        assert_eq!(ClockMode::default(), ClockMode::Wall);
+    }
+
+    #[test]
+    fn clock_mode_as_str() {
+        assert_eq!(ClockMode::Wall.as_str(), "wall");
+        assert_eq!(ClockMode::Deterministic.as_str(), "deterministic");
+    }
+
+    #[test]
+    fn clock_mode_display() {
+        assert_eq!(format!("{}", ClockMode::Wall), "wall");
+        assert_eq!(format!("{}", ClockMode::Deterministic), "deterministic");
+    }
+
+    #[test]
+    fn clock_mode_serde_roundtrip() {
+        let wall: ClockMode = serde_json::from_str("\"wall\"").unwrap();
+        assert_eq!(wall, ClockMode::Wall);
+        let det: ClockMode = serde_json::from_str("\"deterministic\"").unwrap();
+        assert_eq!(det, ClockMode::Deterministic);
+        assert_eq!(serde_json::to_string(&ClockMode::Wall).unwrap(), "\"wall\"");
+    }
+
+    // ── SeededRng ──────────────────────────────────────────────────────
+
+    #[test]
+    fn seeded_rng_different_seeds_differ() {
+        let mut r1 = SeededRng::new(1);
+        let mut r2 = SeededRng::new(2);
+        // At least one of the first 5 values should differ
+        let vals1: Vec<u32> = (0..5).map(|_| r1.next_u32()).collect();
+        let vals2: Vec<u32> = (0..5).map(|_| r2.next_u32()).collect();
+        assert_ne!(vals1, vals2);
+    }
+
+    #[test]
+    fn seeded_rng_next_id_format() {
+        let mut rng = SeededRng::new(99);
+        let id = rng.next_id("test");
+        assert!(id.starts_with("test_"));
+        assert_eq!(id.len(), 5 + 8); // "test_" + 8 hex chars
+    }
+
+    #[test]
+    fn seeded_rng_state_masked_to_31_bits() {
+        let rng = SeededRng::new(u64::MAX);
+        // state should be masked
+        assert!(rng.state <= 0x7fff_ffff);
+    }
+
+    // ── TestCounters ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_counters_default() {
+        let c = TestCounters::default();
+        let snap = c.snapshot();
+        assert_eq!(snap.total, 0);
+        assert_eq!(snap.pass, 0);
+        assert_eq!(snap.fail, 0);
+        assert_eq!(snap.skip, 0);
+    }
+
+    // ── Counts ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn counts_default() {
+        let c = Counts::default();
+        assert_eq!(c.total, 0);
+        assert_eq!(c.pass, 0);
+    }
+
+    #[test]
+    fn counts_serde_roundtrip() {
+        let c = Counts { total: 10, pass: 7, fail: 2, skip: 1 };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Counts = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total, c.total);
+        assert_eq!(back.pass, c.pass);
+        assert_eq!(back.fail, c.fail);
+        assert_eq!(back.skip, c.skip);
+    }
+
+    // ── GitInfo ────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_info_default() {
+        let g = GitInfo::default();
+        assert!(g.commit.is_empty());
+        assert!(g.branch.is_empty());
+        assert!(!g.dirty);
+    }
+
+    #[test]
+    fn git_info_serde_roundtrip() {
+        let g = GitInfo {
+            commit: "abc123".to_string(),
+            branch: "main".to_string(),
+            dirty: true,
+        };
+        let json = serde_json::to_string(&g).unwrap();
+        let back: GitInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.commit, "abc123");
+        assert!(back.dirty);
+    }
+
+    // ── Summary ────────────────────────────────────────────────────────
+
+    #[test]
+    fn summary_fields_populated() {
+        let ctx = RunContext {
+            suite: "s".to_string(),
+            timestamp: "ts".to_string(),
+            clock_mode: ClockMode::Wall,
+            seed: 0,
+            started_at: "start".to_string(),
+            start_epoch_s: 100,
+        };
+        let counts = Counts { total: 5, pass: 4, fail: 1, skip: 0 };
+        let s = Summary::new(&ctx, &counts, "end");
+        assert_eq!(s.schema_version, 1);
+        assert_eq!(s.suite, "s");
+        assert_eq!(s.ended_at, "end");
+        assert_eq!(s.total, 5);
+    }
+
+    // ── Meta ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn meta_includes_determinism_info() {
+        let ctx = RunContext {
+            suite: "suite".to_string(),
+            timestamp: "ts".to_string(),
+            clock_mode: ClockMode::Deterministic,
+            seed: 42,
+            started_at: "start".to_string(),
+            start_epoch_s: 1700000000,
+        };
+        let git = GitInfo::default();
+        let m = Meta::new(&ctx, "end", git);
+        assert_eq!(m.determinism.clock_mode, "deterministic");
+        assert_eq!(m.determinism.seed, 42);
+        assert_eq!(m.determinism.run_start_epoch_s, 1700000000);
+    }
+
+    // ── Metrics ────────────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_duration_calculation() {
+        let ctx = RunContext {
+            suite: "s".to_string(),
+            timestamp: "ts".to_string(),
+            clock_mode: ClockMode::Wall,
+            seed: 0,
+            started_at: "start".to_string(),
+            start_epoch_s: 100,
+        };
+        let counts = Counts::default();
+        let m = Metrics::new(&ctx, &counts, 150);
+        assert_eq!(m.timing.duration_s, 50);
+        assert_eq!(m.timing.start_epoch_s, 100);
+        assert_eq!(m.timing.end_epoch_s, 150);
+    }
+
+    #[test]
+    fn metrics_negative_duration_clamped_to_zero() {
+        let ctx = RunContext {
+            suite: "s".to_string(),
+            timestamp: "ts".to_string(),
+            clock_mode: ClockMode::Wall,
+            seed: 0,
+            started_at: "start".to_string(),
+            start_epoch_s: 200,
+        };
+        let counts = Counts::default();
+        let m = Metrics::new(&ctx, &counts, 100); // end < start
+        assert_eq!(m.timing.duration_s, 0);
+    }
+
+    // ── Repro ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn repro_command_contains_env_vars() {
+        let ctx = RunContext {
+            suite: "my_suite".to_string(),
+            timestamp: "20260101_000000".to_string(),
+            clock_mode: ClockMode::Deterministic,
+            seed: 777,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            start_epoch_s: 1700000000,
+        };
+        let r = Repro::new(&ctx, Path::new("/project"));
+        assert!(r.command.contains("E2E_CLOCK_MODE=deterministic"));
+        assert!(r.command.contains("E2E_SEED=777"));
+        assert!(r.command.contains("my_suite"));
+        assert!(r.command.contains("/project"));
+    }
+
+    // ── Fixtures ───────────────────────────────────────────────────────
+
+    #[test]
+    fn fixtures_schema_and_ids() {
+        let ctx = RunContext {
+            suite: "s".to_string(),
+            timestamp: "ts".to_string(),
+            clock_mode: ClockMode::Wall,
+            seed: 0,
+            started_at: "start".to_string(),
+            start_epoch_s: 0,
+        };
+        let f = Fixtures::new(&ctx, vec!["id1".to_string(), "id2".to_string()]);
+        assert_eq!(f.schema_version, 1);
+        assert_eq!(f.fixture_ids.len(), 2);
+    }
+
+    // ── TraceEvent ─────────────────────────────────────────────────────
+
+    #[test]
+    fn trace_event_to_jsonl_is_single_line() {
+        let e = TraceEvent {
+            schema_version: 1,
+            suite: "s".to_string(),
+            run_timestamp: "ts".to_string(),
+            ts: "now".to_string(),
+            kind: "pass".to_string(),
+            case: "test_case".to_string(),
+            message: "ok".to_string(),
+            counters: Counts { total: 1, pass: 1, fail: 0, skip: 0 },
+        };
+        let line = e.to_jsonl();
+        assert!(!line.contains('\n'));
+        assert!(line.contains("\"kind\":\"pass\""));
+        assert!(line.contains("\"case\":\"test_case\""));
+    }
+
+    // ── classify_artifact additional paths ─────────────────────────────
+
+    #[test]
+    fn classify_artifact_known_paths() {
+        assert_eq!(classify_artifact("meta.json").0, "metadata");
+        assert_eq!(classify_artifact("metrics.json").0, "metrics");
+        assert_eq!(classify_artifact("fixtures.json").0, "fixture");
+        assert_eq!(classify_artifact("repro.json").0, "replay");
+        assert_eq!(classify_artifact("repro.env").0, "replay");
+        assert_eq!(classify_artifact("trace/events.jsonl").0, "trace");
+        assert_eq!(classify_artifact("logs/index.json").0, "logs");
+        assert_eq!(classify_artifact("screenshots/index.json").0, "screenshots");
+    }
+
+    #[test]
+    fn classify_artifact_prefix_paths() {
+        assert_eq!(classify_artifact("diagnostics/env.txt").0, "diagnostics");
+        assert_eq!(classify_artifact("logs/extra.log").0, "logs");
+        assert_eq!(classify_artifact("screenshots/shot.png").0, "screenshots");
+        assert_eq!(classify_artifact("trace/extra.jsonl").0, "trace");
+        assert_eq!(classify_artifact("transcript/session.txt").0, "transcript");
+    }
+
+    // ── DeterminismInfo serde ──────────────────────────────────────────
+
+    #[test]
+    fn determinism_info_serde_roundtrip() {
+        let d = DeterminismInfo {
+            clock_mode: "deterministic".to_string(),
+            seed: 42,
+            run_start_epoch_s: 1700000000,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: DeterminismInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.seed, 42);
+        assert_eq!(back.clock_mode, "deterministic");
+    }
+
+    // ── BundleSchema / ArtifactRef ─────────────────────────────────────
+
+    #[test]
+    fn bundle_schema_serde() {
+        let s = BundleSchema {
+            name: "mcp-agent-mail-artifacts".to_string(),
+            major: 1,
+            minor: 0,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"major\":1"));
+        let back: BundleSchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "mcp-agent-mail-artifacts");
+    }
+
+    #[test]
+    fn artifact_ref_optional_schema() {
+        let with = ArtifactRef { path: "p".to_string(), schema: Some("v1".to_string()) };
+        let json_with = serde_json::to_string(&with).unwrap();
+        assert!(json_with.contains("\"schema\""));
+
+        let without = ArtifactRef { path: "p".to_string(), schema: None };
+        let json_without = serde_json::to_string(&without).unwrap();
+        assert!(!json_without.contains("\"schema\""));
+    }
+
+    // ── BundleFile optional schema ─────────────────────────────────────
+
+    #[test]
+    fn bundle_file_optional_schema_skip() {
+        let f = BundleFile {
+            path: "test.txt".to_string(),
+            sha256: "abc".to_string(),
+            bytes: 100,
+            kind: "opaque".to_string(),
+            schema: None,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(!json.contains("\"schema\""));
+    }
+
+    // ── TimingInfo serde ───────────────────────────────────────────────
+
+    #[test]
+    fn timing_info_serde_roundtrip() {
+        let t = TimingInfo {
+            start_epoch_s: 100,
+            end_epoch_s: 200,
+            duration_s: 100,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: TimingInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.duration_s, 100);
+    }
 }
