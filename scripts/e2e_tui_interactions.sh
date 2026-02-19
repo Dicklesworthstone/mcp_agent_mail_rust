@@ -26,6 +26,9 @@
 set -euo pipefail
 
 : "${AM_E2E_KEEP_TMP:=1}"
+# Keep readiness probes responsive so retries can run instead of hanging on one curl.
+: "${E2E_RPC_CONNECT_TIMEOUT_SECONDS:=2}"
+: "${E2E_RPC_MAX_TIME_SECONDS:=10}"
 
 E2E_SUITE="${E2E_SUITE:-tui_interactions}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -136,10 +139,9 @@ jsonrpc_call() {
     local params="$3"
     : "${params:="{}"}"
 
-    JSONRPC_CALL_SEQ="${JSONRPC_CALL_SEQ:-0}"
-    JSONRPC_CALL_SEQ=$((JSONRPC_CALL_SEQ + 1))
-
-    local case_id="jsonrpc_${JSONRPC_CALL_SEQ}_${tool}"
+    local case_stamp
+    case_stamp="$(date +%s%N)"
+    local case_id="jsonrpc_${case_stamp}_${tool}"
     local url="http://127.0.0.1:${port}/mcp/"
 
     e2e_mark_case_start "${case_id}"
@@ -154,6 +156,21 @@ jsonrpc_call() {
     fi
 
     e2e_rpc_read_response "${case_id}"
+}
+
+jsonrpc_wait_ready() {
+    local port="$1"
+    local timeout_seconds="${2:-90}"
+    local deadline=$(( $(date +%s) + timeout_seconds ))
+
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        if jsonrpc_call "${port}" "health_check" '{}' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
 }
 
 # Combine two JSON documents into a single valid JSON array payload.
@@ -520,33 +537,44 @@ sleep 2
 send "1"
 sleep 1
 
-send "q"
-expect eof
+# Keep the TUI/session alive while the parent process performs
+# JSON-RPC seeding and verification calls against this live server.
+# The parent process terminates this expect runner once seeding completes.
+sleep 120
 ' &
 EXPECT_PID=$!
 
 # Wait for the server to come up
 sleep 6
 if e2e_wait_port 127.0.0.1 "${PORT5}" 10; then
-    # Seed data via the API while TUI is running
-    EP_RESP=$(jsonrpc_call "${PORT5}" "ensure_project" '{"human_key":"/data/e2e/live_tui"}')
-    e2e_save_artifact "live_seed_project.json" "${EP_RESP}"
+    if jsonrpc_wait_ready "${PORT5}" 90; then
+        # Seed data via the API while TUI is running
+        EP_RESP=$(jsonrpc_call "${PORT5}" "ensure_project" '{"human_key":"/data/e2e/live_tui"}')
+        e2e_save_artifact "live_seed_project.json" "${EP_RESP}"
 
-    REG1=$(jsonrpc_call "${PORT5}" "register_agent" '{"project_key":"/data/e2e/live_tui","program":"e2e","model":"test","name":"RedLake","task_description":"E2E sender"}')
-    REG2=$(jsonrpc_call "${PORT5}" "register_agent" '{"project_key":"/data/e2e/live_tui","program":"e2e","model":"test","name":"BluePeak","task_description":"E2E receiver"}')
-    e2e_save_artifact "live_seed_agents.json" "$(json_array_pair "${REG1}" "${REG2}")"
+        REG1=$(jsonrpc_call "${PORT5}" "register_agent" '{"project_key":"/data/e2e/live_tui","program":"e2e","model":"test","name":"RedLake","task_description":"E2E sender"}')
+        REG2=$(jsonrpc_call "${PORT5}" "register_agent" '{"project_key":"/data/e2e/live_tui","program":"e2e","model":"test","name":"BluePeak","task_description":"E2E receiver"}')
+        e2e_save_artifact "live_seed_agents.json" "$(json_array_pair "${REG1}" "${REG2}")"
 
-    MSG=$(jsonrpc_call "${PORT5}" "send_message" '{"project_key":"/data/e2e/live_tui","sender_name":"RedLake","to":["BluePeak"],"subject":"Live TUI canary","body_md":"Seeded while TUI is running."}')
-    e2e_save_artifact "live_seed_message.json" "${MSG}"
+        MSG=$(jsonrpc_call "${PORT5}" "send_message" '{"project_key":"/data/e2e/live_tui","sender_name":"RedLake","to":["BluePeak"],"subject":"Live TUI canary","body_md":"Seeded while TUI is running."}')
+        e2e_save_artifact "live_seed_message.json" "${MSG}"
 
-    # Verify API returns valid JSON-RPC response
-    if echo "${MSG}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'result' in d or 'error' not in d" 2>/dev/null; then
-        e2e_pass "API responds during live TUI session"
+        # Verify API returns valid JSON-RPC response
+        if echo "${MSG}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'result' in d or 'error' not in d" 2>/dev/null; then
+            e2e_pass "API responds during live TUI session"
+        else
+            e2e_fail "API did not respond properly during TUI session"
+        fi
     else
-        e2e_fail "API did not respond properly during TUI session"
+        e2e_fail "Server JSON-RPC not ready during live TUI session"
     fi
 else
     e2e_fail "Server port not reachable during TUI session"
+fi
+
+# Stop the background expect runner now that seeding checks are complete.
+if kill -0 "${EXPECT_PID}" 2>/dev/null; then
+    kill "${EXPECT_PID}" 2>/dev/null || true
 fi
 
 # Wait for the expect process to finish
@@ -824,35 +852,44 @@ sleep 0.2
 send "\r"
 sleep 0.6
 
-send "q"
-expect eof
+# Keep session alive while parent seeds and validates JSON-RPC traffic.
+sleep 120
 ' &
 EXPECT8_PID=$!
 
 sleep 6
 if e2e_wait_port 127.0.0.1 "${PORT8}" 12; then
-    PRE_HEALTH=$(jsonrpc_call "${PORT8}" "health_check" '{}')
-    e2e_save_artifact "analytics_health_pre.json" "${PRE_HEALTH}"
+    if jsonrpc_wait_ready "${PORT8}" 90; then
+        PRE_HEALTH=$(jsonrpc_call "${PORT8}" "health_check" '{}')
+        e2e_save_artifact "analytics_health_pre.json" "${PRE_HEALTH}"
 
-    EP8=$(jsonrpc_call "${PORT8}" "ensure_project" '{"human_key":"/data/e2e/analytics_widgets"}')
-    REG8_A=$(jsonrpc_call "${PORT8}" "register_agent" '{"project_key":"/data/e2e/analytics_widgets","program":"e2e","model":"test","name":"AmberRidge","task_description":"analytics sender"}')
-    REG8_B=$(jsonrpc_call "${PORT8}" "register_agent" '{"project_key":"/data/e2e/analytics_widgets","program":"e2e","model":"test","name":"SlateRiver","task_description":"analytics receiver"}')
-    MSG8_1=$(jsonrpc_call "${PORT8}" "send_message" '{"project_key":"/data/e2e/analytics_widgets","sender_name":"AmberRidge","to":["SlateRiver"],"subject":"Widget latency delta","body_md":"p95 increased from 18ms to 32ms"}')
-    MSG8_2=$(jsonrpc_call "${PORT8}" "send_message" '{"project_key":"/data/e2e/analytics_widgets","sender_name":"AmberRidge","to":["SlateRiver"],"subject":"Timeline anomaly","body_md":"Ack backlog above threshold"}')
-    RES8=$(jsonrpc_call "${PORT8}" "file_reservation_paths" '{"project_key":"/data/e2e/analytics_widgets","agent_name":"AmberRidge","paths":["src/**"],"ttl_seconds":1800,"exclusive":true,"reason":"e2e-analytics"}')
-    SEARCH8=$(jsonrpc_call "${PORT8}" "search_messages" '{"project_key":"/data/e2e/analytics_widgets","query":"latency OR anomaly","limit":10}')
-    FETCH8=$(jsonrpc_call "${PORT8}" "fetch_inbox" '{"project_key":"/data/e2e/analytics_widgets","agent_name":"SlateRiver","limit":10}')
-    POST_HEALTH=$(jsonrpc_call "${PORT8}" "health_check" '{}')
+        EP8=$(jsonrpc_call "${PORT8}" "ensure_project" '{"human_key":"/data/e2e/analytics_widgets"}')
+        REG8_A=$(jsonrpc_call "${PORT8}" "register_agent" '{"project_key":"/data/e2e/analytics_widgets","program":"e2e","model":"test","name":"AmberRidge","task_description":"analytics sender"}')
+        REG8_B=$(jsonrpc_call "${PORT8}" "register_agent" '{"project_key":"/data/e2e/analytics_widgets","program":"e2e","model":"test","name":"SlateRiver","task_description":"analytics receiver"}')
+        MSG8_1=$(jsonrpc_call "${PORT8}" "send_message" '{"project_key":"/data/e2e/analytics_widgets","sender_name":"AmberRidge","to":["SlateRiver"],"subject":"Widget latency delta","body_md":"p95 increased from 18ms to 32ms"}')
+        MSG8_2=$(jsonrpc_call "${PORT8}" "send_message" '{"project_key":"/data/e2e/analytics_widgets","sender_name":"AmberRidge","to":["SlateRiver"],"subject":"Timeline anomaly","body_md":"Ack backlog above threshold"}')
+        RES8=$(jsonrpc_call "${PORT8}" "file_reservation_paths" '{"project_key":"/data/e2e/analytics_widgets","agent_name":"AmberRidge","paths":["src/**"],"ttl_seconds":1800,"exclusive":true,"reason":"e2e-analytics"}')
+        SEARCH8=$(jsonrpc_call "${PORT8}" "search_messages" '{"project_key":"/data/e2e/analytics_widgets","query":"latency OR anomaly","limit":10}')
+        FETCH8=$(jsonrpc_call "${PORT8}" "fetch_inbox" '{"project_key":"/data/e2e/analytics_widgets","agent_name":"SlateRiver","limit":10}')
+        POST_HEALTH=$(jsonrpc_call "${PORT8}" "health_check" '{}')
 
-    e2e_save_artifact "analytics_seed_project.json" "${EP8}"
-    e2e_save_artifact "analytics_seed_agents.json" "$(json_array_pair "${REG8_A}" "${REG8_B}")"
-    e2e_save_artifact "analytics_seed_messages.json" "$(json_array_pair "${MSG8_1}" "${MSG8_2}")"
-    e2e_save_artifact "analytics_seed_reservation.json" "${RES8}"
-    e2e_save_artifact "analytics_search_response.json" "${SEARCH8}"
-    e2e_save_artifact "analytics_inbox_response.json" "${FETCH8}"
-    e2e_save_artifact "analytics_health_post.json" "${POST_HEALTH}"
+        e2e_save_artifact "analytics_seed_project.json" "${EP8}"
+        e2e_save_artifact "analytics_seed_agents.json" "$(json_array_pair "${REG8_A}" "${REG8_B}")"
+        e2e_save_artifact "analytics_seed_messages.json" "$(json_array_pair "${MSG8_1}" "${MSG8_2}")"
+        e2e_save_artifact "analytics_seed_reservation.json" "${RES8}"
+        e2e_save_artifact "analytics_search_response.json" "${SEARCH8}"
+        e2e_save_artifact "analytics_inbox_response.json" "${FETCH8}"
+        e2e_save_artifact "analytics_health_post.json" "${POST_HEALTH}"
+    else
+        e2e_fail "analytics/widgets server JSON-RPC not ready"
+    fi
 else
     e2e_fail "analytics/widgets server port not reachable"
+fi
+
+# Stop the background expect runner now that analytics checks are complete.
+if kill -0 "${EXPECT8_PID}" 2>/dev/null; then
+    kill "${EXPECT8_PID}" 2>/dev/null || true
 fi
 
 wait "${EXPECT8_PID}" 2>/dev/null || true

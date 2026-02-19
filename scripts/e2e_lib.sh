@@ -1533,6 +1533,8 @@ e2e_rpc_call() {
 
     # Build JSON-RPC request payload
     local payload
+    local connect_timeout="${E2E_RPC_CONNECT_TIMEOUT_SECONDS:-}"
+    local max_time="${E2E_RPC_MAX_TIME_SECONDS:-}"
     payload="$(cat <<EOJSON
 {"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"${tool_name}","arguments":${args_json}}}
 EOJSON
@@ -1550,6 +1552,12 @@ EOJSON
         -H "content-type: application/json"
         --data "@${request_file}"
     )
+    if [ -n "${connect_timeout}" ]; then
+        curl_args+=(--connect-timeout "${connect_timeout}")
+    fi
+    if [ -n "${max_time}" ]; then
+        curl_args+=(--max-time "${max_time}")
+    fi
 
     # Add extra headers from remaining args
     for h in "$@"; do
@@ -1647,6 +1655,8 @@ e2e_rpc_call_raw() {
     shift 3 2>/dev/null || true
 
     local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local connect_timeout="${E2E_RPC_CONNECT_TIMEOUT_SECONDS:-}"
+    local max_time="${E2E_RPC_MAX_TIME_SECONDS:-}"
     mkdir -p "${case_dir}"
 
     local request_file="${case_dir}/request.json"
@@ -1669,6 +1679,12 @@ e2e_rpc_call_raw() {
         -H "content-type: application/json"
         --data "@${request_file}"
     )
+    if [ -n "${connect_timeout}" ]; then
+        curl_args+=(--connect-timeout "${connect_timeout}")
+    fi
+    if [ -n "${max_time}" ]; then
+        curl_args+=(--max-time "${max_time}")
+    fi
 
     for h in "$@"; do
         curl_args+=(-H "$h")
