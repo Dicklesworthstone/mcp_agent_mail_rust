@@ -1447,6 +1447,319 @@ mod tests {
         );
     }
 
+    /// Verify `run_startup_integrity_check` passes on a healthy file-backed DB.
+    #[test]
+    fn startup_integrity_check_healthy_db() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy_startup.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        // Trigger initial migration so the file actually exists.
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+        });
+
+        let result = pool
+            .run_startup_integrity_check()
+            .expect("startup integrity check");
+        assert!(result.ok, "healthy DB should pass startup integrity check");
+        assert!(
+            result.details.contains(&"ok".to_string()),
+            "details should contain 'ok'"
+        );
+    }
+
+    /// Verify `run_startup_integrity_check` returns Ok for :memory: databases.
+    #[test]
+    fn startup_integrity_check_memory_db() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+        let result = pool
+            .run_startup_integrity_check()
+            .expect("memory integrity check");
+        assert!(result.ok, "memory DB should always pass");
+        assert_eq!(result.duration_us, 0, "memory check should be instant");
+    }
+
+    /// Verify `run_startup_integrity_check` returns Ok for non-existent DB file.
+    #[test]
+    fn startup_integrity_check_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nonexistent.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+        let result = pool
+            .run_startup_integrity_check()
+            .expect("missing file check");
+        assert!(result.ok, "missing file is not corruption");
+    }
+
+    /// Verify `run_full_integrity_check` passes on a healthy file-backed DB.
+    #[test]
+    fn full_integrity_check_healthy_db() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy_full.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+        });
+
+        let result = pool
+            .run_full_integrity_check()
+            .expect("full integrity check");
+        assert!(result.ok, "healthy DB should pass full integrity check");
+        assert_eq!(
+            result.kind,
+            integrity::CheckKind::Full,
+            "should be a full check"
+        );
+    }
+
+    /// Verify `run_full_integrity_check` returns Ok for :memory: databases.
+    #[test]
+    fn full_integrity_check_memory_db() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+        let result = pool.run_full_integrity_check().expect("memory full check");
+        assert!(result.ok, "memory DB should always pass full check");
+        assert_eq!(
+            result.kind,
+            integrity::CheckKind::Full,
+            "should be Full kind"
+        );
+    }
+
+    /// Verify `sample_recent_message_refs` returns empty for :memory: databases.
+    #[test]
+    fn sample_recent_message_refs_memory_db() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+        let refs = pool.sample_recent_message_refs(10).expect("memory sample");
+        assert!(refs.is_empty(), "memory DB should return empty refs");
+    }
+
+    /// Verify `sample_recent_message_refs` returns empty for non-existent DB.
+    #[test]
+    fn sample_recent_message_refs_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing_refs.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+        let refs = pool
+            .sample_recent_message_refs(10)
+            .expect("missing file sample");
+        assert!(refs.is_empty(), "missing DB should return empty refs");
+    }
+
+    /// Verify `sample_recent_message_refs` returns actual messages from a seeded DB.
+    #[test]
+    fn sample_recent_message_refs_returns_seeded_messages() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("refs_seeded.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        // Seed the database with a project, agent, and messages.
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            let now = crate::now_micros();
+            conn.execute_raw(&format!(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'test-proj', '/tmp/test-proj', {now})"
+            ))
+            .expect("insert project");
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, \
+                 inception_ts, last_active_ts) \
+                 VALUES (1, 1, 'BlueLake', 'test', 'test-model', {now}, {now})"
+            ))
+            .expect("insert agent");
+            conn.execute_raw(&format!(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, \
+                 thread_id, importance, created_ts) \
+                 VALUES (1, 1, 1, 'Test Subject', 'body', 'thread-1', 'normal', {now})"
+            ))
+            .expect("insert message");
+            conn.execute_raw(&format!(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, \
+                 thread_id, importance, created_ts) \
+                 VALUES (2, 1, 1, 'Second Message', 'body2', 'thread-2', 'normal', {now})"
+            ))
+            .expect("insert message 2");
+        });
+
+        let refs = pool.sample_recent_message_refs(10).expect("sample refs");
+        assert_eq!(refs.len(), 2, "should return 2 seeded messages");
+        // Messages should be in DESC order by id.
+        assert_eq!(refs[0].message_id, 2);
+        assert_eq!(refs[1].message_id, 1);
+        assert_eq!(refs[0].project_slug, "test-proj");
+        assert_eq!(refs[0].sender_name, "BlueLake");
+        assert_eq!(refs[0].subject, "Second Message");
+        assert_eq!(refs[1].subject, "Test Subject");
+    }
+
+    /// Verify `sample_recent_message_refs` honours the limit parameter.
+    #[test]
+    fn sample_recent_message_refs_respects_limit() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("refs_limited.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            let now = crate::now_micros();
+            conn.execute_raw(&format!(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'limit-proj', '/tmp/limit', {now})"
+            ))
+            .expect("insert project");
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, \
+                 inception_ts, last_active_ts) \
+                 VALUES (1, 1, 'RedFox', 'test', 'model', {now}, {now})"
+            ))
+            .expect("insert agent");
+            for i in 1..=5 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, \
+                     thread_id, importance, created_ts) \
+                     VALUES ({i}, 1, 1, 'Msg {i}', 'body', 'thread-{i}', 'normal', {now})"
+                ))
+                .expect("insert message");
+            }
+        });
+
+        let refs = pool.sample_recent_message_refs(3).expect("limited sample");
+        assert_eq!(refs.len(), 3, "should respect limit=3");
+        // Most recent first.
+        assert_eq!(refs[0].message_id, 5);
+        assert_eq!(refs[2].message_id, 3);
+    }
+
+    /// Verify `get_or_create_pool` returns the same pool for the same URL.
+    #[test]
+    fn get_or_create_pool_caches_by_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache_test.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+
+        let pool1 = get_or_create_pool(&config).expect("first get");
+        let pool2 = get_or_create_pool(&config).expect("second get");
+
+        // Both should point to the same underlying pool (Arc identity).
+        assert!(
+            Arc::ptr_eq(&pool1.pool, &pool2.pool),
+            "get_or_create_pool should return the same Arc<Pool> for the same URL"
+        );
+    }
+
+    /// Verify `DbPool::sqlite_path()` accessor matches config.
+    #[test]
+    fn pool_sqlite_path_accessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("path_test.db");
+        let expected = db_path.display().to_string();
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+        assert_eq!(pool.sqlite_path(), expected);
+    }
+
+    /// Verify `sample_pool_stats_now` doesn't panic and updates metrics.
+    #[test]
+    fn sample_pool_stats_now_updates_metrics() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stats_test.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        // Open a connection first so the pool has something to sample.
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+        });
+
+        // This should not panic.
+        pool.sample_pool_stats_now();
+
+        // Verify global metrics were updated.
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let total = metrics.db.pool_total_connections.load();
+        assert!(
+            total >= 1,
+            "pool_total_connections should be >= 1 after acquire + sample, got {total}"
+        );
+    }
+
     #[test]
     fn pool_startup_strips_identity_fts_artifacts() {
         use asupersync::runtime::RuntimeBuilder;
@@ -1499,5 +1812,109 @@ mod tests {
             identity_fts_count, 0,
             "pool startup must remove legacy identity FTS artifacts to avoid rowid corruption regressions"
         );
+    }
+
+    /// Verify `create_pool` is an alias for `get_or_create_pool`.
+    #[test]
+    fn create_pool_is_alias_for_get_or_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alias_test.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+
+        let pool1 = create_pool(&config).expect("create_pool");
+        let pool2 = get_or_create_pool(&config).expect("get_or_create_pool");
+
+        assert!(
+            Arc::ptr_eq(&pool1.pool, &pool2.pool),
+            "create_pool should delegate to get_or_create_pool"
+        );
+    }
+
+    /// Verify corruption detection recognizes known error messages.
+    #[test]
+    fn corruption_error_message_detection() {
+        assert!(is_corruption_error_message(
+            "database disk image is malformed"
+        ));
+        assert!(is_corruption_error_message(
+            "Error: database disk image is malformed (detail)"
+        ));
+        assert!(is_corruption_error_message(
+            "malformed database schema - something"
+        ));
+        assert!(is_corruption_error_message("file is not a database"));
+        assert!(is_corruption_error_message(
+            "DATABASE DISK IMAGE IS MALFORMED"
+        ));
+        // Non-corruption errors should not be detected.
+        assert!(!is_corruption_error_message("table not found"));
+        assert!(!is_corruption_error_message("database is locked"));
+        assert!(!is_corruption_error_message(""));
+    }
+
+    /// Verify `sqlite_file_is_healthy` returns false for a corrupt file.
+    #[test]
+    fn sqlite_file_is_healthy_detects_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.db");
+        std::fs::write(&path, b"not-a-database").expect("write corrupt");
+        let healthy = sqlite_file_is_healthy(&path).expect("should not error");
+        assert!(!healthy, "corrupt file should not be healthy");
+    }
+
+    /// Verify `sqlite_file_is_healthy` returns true for non-existent file.
+    #[test]
+    fn sqlite_file_is_healthy_nonexistent_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.db");
+        let healthy = sqlite_file_is_healthy(&path).expect("should not error");
+        assert!(
+            healthy,
+            "non-existent file is considered healthy (not corrupt)"
+        );
+    }
+
+    /// Verify `sqlite_file_is_healthy` returns true for a valid DB.
+    #[test]
+    fn sqlite_file_is_healthy_valid_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("valid.db");
+        let path_str = path.to_string_lossy();
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+        let healthy = sqlite_file_is_healthy(&path).expect("should not error");
+        assert!(healthy, "valid DB should be healthy");
+    }
+
+    /// Verify `quarantine_sidecar` renames WAL/SHM files with corrupt- prefix.
+    #[test]
+    fn quarantine_sidecar_renames_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        std::fs::write(&primary, b"db").expect("write primary");
+        std::fs::write(&wal, b"wal-content").expect("write wal");
+
+        quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine");
+
+        assert!(!wal.exists(), "original WAL should be gone");
+        let quarantined = dir.path().join("test.db-wal.corrupt-20260218_120000_000");
+        assert!(quarantined.exists(), "quarantined WAL should exist");
+    }
+
+    /// Verify `quarantine_sidecar` is a no-op when the sidecar doesn't exist.
+    #[test]
+    fn quarantine_sidecar_noop_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        std::fs::write(&primary, b"db").expect("write primary");
+
+        // Should not error when WAL doesn't exist.
+        quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine noop");
     }
 }
