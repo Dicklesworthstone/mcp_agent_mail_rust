@@ -9,7 +9,7 @@
 
 > "It's like Gmail for your coding agents!"
 
-A mail-like coordination layer for AI coding agents, exposed as an MCP server with 34 tools and 20+ resources, Git-backed archive, SQLite indexing, and an interactive 11-screen TUI operations console. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
+A mail-like coordination layer for AI coding agents, exposed as an MCP server with 34 tools and 20+ resources, Git-backed archive, SQLite indexing, and an interactive 15-screen TUI operations console. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
 
 **Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
 
@@ -491,25 +491,34 @@ resource://health
 
 ## TUI Operations Console
 
-The interactive TUI has 11 screens. Number keys `1`-`9`, `0` for screen 10; `Tab` or `Ctrl+P` to reach any screen:
+The interactive TUI has 15 screens. Jump directly with `1`-`9`, `0` (screen 10), and shifted digits `!`, `@`, `#`, `$`, `%` (screens 11-15). Use `Tab`/`Shift+Tab` to cycle in order.
 
 | # | Screen | Shows |
 |---|--------|-------|
-| 1 | Dashboard | Real-time event stream with sparkline and Braille heatmap |
-| 2 | Messages | Message browser with search and filtering |
-| 3 | Threads | Thread view with correlation |
-| 4 | Agents | Registered agents with activity indicators |
-| 5 | Search | Query bar + facets + results + preview |
-| 6 | Reservations | File reservations with TTL countdowns |
-| 7 | Tool Metrics | Per-tool latency and call counts |
-| 8 | System Health | Connection probes, disk/memory, circuit breakers |
-| 9 | Timeline | Chronological event timeline with inspector |
-| 10 | Projects | Project list and routing helpers |
-| 11 | Contacts | Contact graph and policy surface |
+| 1 | Dashboard | Real-time operational overview with event stream and anomaly rail |
+| 2 | Messages | Message browser with detail pane, presets, and compose/reply flows |
+| 3 | Threads | Thread explorer and conversation drill-down |
+| 4 | Agents | Agent roster with activity, state, and quick actions |
+| 5 | Search | Unified multi-scope search with facets and preview |
+| 6 | Reservations | File reservation status, conflicts, and create/release actions |
+| 7 | Tool Metrics | Per-tool call counts, latency distributions, and failures |
+| 8 | System Health | Probe/circuit/disk/memory diagnostics |
+| 9 | Timeline | Events/Commits/Combined timeline views with inspector |
+| 10 | Projects | Project inventory and routing helpers |
+| 11 | Contacts | Contact links, policy view, and graph/mermaid modes |
+| 12 | Explorer | Unified inbox/outbox explorer with direction and ack filters |
+| 13 | Analytics | Anomaly insight feed with confidence and deep links |
+| 14 | Attachments | Attachment inventory with preview and provenance |
+| 15 | Archive Browser | Two-pane Git archive browser with tree + file preview |
 
-**Key bindings:** `?` help, `Ctrl+P` command palette, `m` toggle MCP/API, `Shift+T` cycle theme, `q` quit, vim-style visual multi-selection with batch actions.
+**Global keys:** `?` help, `Ctrl+P`/`:` command palette, `/` global search focus, `.` contextual action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast-focus mode, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API transport, `q` quit.
 
-**Themes:** Cyberpunk Aurora, Darcula, Lumen Light, Nordic Frost, High Contrast. Accessibility support with high-contrast mode and reduced motion.
+**Screen-specific highlights:** Messages uses `g` for Local/Global inbox; Threads uses `e/c` for expand/collapse-all in conversation view; Timeline uses `V` for Events/Commits/Combined and `v` for visual selection; Search uses `f` + facet rail navigation for scope/sort/field controls; Contacts uses `n` for Table/Graph mode; batch-capable screens share `Space`/`v`/`A`/`C`; preset-enabled screens use `Ctrl+S`/`Ctrl+L`.
+
+**Command palette:** Press `Ctrl+P` (or `:` outside text-entry) to open a searchable action launcher that includes screen navigation, transport/layout controls, and dynamic entities (agents/projects/threads/tools/reservations).
+
+**Themes:** Cyberpunk Aurora, Darcula, Lumen Light, Nordic Frost, High Contrast. Accessibility support includes high-contrast mode and reduced motion.
+Archive Browser note: use `Enter` to expand/preview, `Tab` to switch tree vs preview pane, `/` to filter filenames, and `Ctrl+D/U` for preview paging.
 
 ---
 
@@ -744,6 +753,18 @@ All configuration via environment variables. The server reads them at startup vi
 | `LOG_LEVEL` | `info` | Minimum log level |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
 | `TUI_HIGH_CONTRAST` | `false` | Accessibility mode |
+| `AM_TUI_TOAST_ENABLED` | `true` | Enable toast notifications |
+| `AM_TUI_TOAST_SEVERITY` | `info` | Minimum toast severity (`info`/`warning`/`error`/`off`) |
+| `AM_TUI_TOAST_POSITION` | `top-right` | Toast stack position |
+| `AM_TUI_TOAST_MAX_VISIBLE` | `3` | Max visible toasts at once |
+| `AM_TUI_TOAST_INFO_DISMISS_SECS` | `5` | Info toast auto-dismiss timeout |
+| `AM_TUI_TOAST_WARN_DISMISS_SECS` | `8` | Warning toast auto-dismiss timeout |
+| `AM_TUI_TOAST_ERROR_DISMISS_SECS` | `15` | Error toast auto-dismiss timeout |
+| `AM_TUI_THREAD_PAGE_SIZE` | `20` | Thread conversation page size |
+| `AM_TUI_THREAD_GUIDES` | `rounded` (theme default) | Thread tree guide style (`ascii`/`unicode`/`bold`/`double`/`rounded`) |
+| `AM_TUI_COACH_HINTS_ENABLED` | `true` | Enable contextual coach-hint notifications |
+| `AM_TUI_EFFECTS` | `true` | Enable text/animation effects |
+| `AM_TUI_AMBIENT` | `subtle` | Ambient mode (`off`/`subtle`/`full`) |
 | `WORKTREES_ENABLED` | `false` | Build slots feature flag |
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
@@ -787,7 +808,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
 │   ├── mcp-agent-mail-tools/               # 34 MCP tool implementations (9 clusters)
-│   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (11 screens)
+│   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (15 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode
 │   ├── mcp-agent-mail-conformance/         # Python parity tests
@@ -842,7 +863,7 @@ mcp_agent_mail_rust/
 | Audit trail | Full Git history of all communication | File timestamps | Depends | Chat logs (if saved) |
 | Cross-repo coordination | Product bus, contact system | Manual | Build yourself | Manual |
 | Search | FTS5 + optional semantic search | `grep` | Build yourself | Limited |
-| Operational visibility | 11-screen TUI, robot CLI, metrics | None | None | None |
+| Operational visibility | 15-screen TUI, robot CLI, metrics | None | None | None |
 | Token efficiency | Messages stored externally, not in context | Files in context | Varies | All in context |
 
 ---
@@ -957,7 +978,7 @@ The repair command applies safe fixes (stale locks, expired reservations) automa
 ## FAQ
 
 **Q: How is this different from the Python version?**
-A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: an 11-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite ensures output format parity with the Python reference.
+A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 15-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite ensures output format parity with the Python reference.
 
 **Q: Do I need to run a separate server for each project?**
 A: No. One server handles multiple projects. Each project is identified by its absolute filesystem path as the `project_key`.

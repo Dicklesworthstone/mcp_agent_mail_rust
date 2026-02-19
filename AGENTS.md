@@ -293,7 +293,7 @@ mcp_agent_mail_rust/
 | `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
 | `mcp-agent-mail-tools` | `src/` | 34 MCP tool implementations across 9 clusters |
 | `mcp-agent-mail-server` | `src/lib.rs` | Server dispatch, HTTP handler |
-| `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (11 screens) |
+| `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (15 screens) |
 | `mcp-agent-mail` | `src/main.rs` | Server binary entry point (dual-mode) |
 | `mcp-agent-mail-cli` | `src/main.rs` | CLI binary (`am`) entry point |
 
@@ -311,7 +311,7 @@ mcp_agent_mail_rust/
 | Product Bus | 5 | ensure_product, products_link, search_messages_product, fetch_inbox_product, summarize_thread_product |
 | Build Slots | 3 | acquire_build_slot, renew_build_slot, release_build_slot |
 
-### 11-Screen TUI
+### 15-Screen TUI
 
 | # | Screen | Shows |
 |---|--------|-------|
@@ -326,8 +326,13 @@ mcp_agent_mail_rust/
 | 9 | Timeline | Chronological event timeline with inspector |
 | 10 | Projects | Project list and routing helpers |
 | 11 | Contacts | Contact graph and policy surface |
+| 12 | Explorer | Unified inbox/outbox explorer with direction and ack filters |
+| 13 | Analytics | Anomaly insight feed with confidence scoring |
+| 14 | Attachments | Attachment browser with preview and provenance |
+| 15 | Archive Browser | Two-pane Git archive browser and file preview |
 
-Key bindings: `?` help, `Ctrl+P` command palette, `m` toggle MCP/API, `Shift+T` cycle theme, `q` quit.
+Key bindings: `?` help, `Ctrl+P`/`:` command palette, `/` global search, `.` action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast focus, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API, `q` quit.
+Webapp-parity keys: Messages `g` (Local/Global inbox), Threads `e/c` (expand/collapse all), Timeline `V` (Events/Commits/Combined), Contacts `n` (Table/Graph).
 
 ### Dual-Mode Interface
 
@@ -368,6 +373,19 @@ All configuration via environment variables. Key variables:
 | `DATABASE_URL` | `sqlite:///:memory:` | SQLite connection URL |
 | `STORAGE_ROOT` | `~/.mcp_agent_mail` | Archive root directory |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
+| `TUI_HIGH_CONTRAST` | `false` | Accessibility mode |
+| `AM_TUI_TOAST_ENABLED` | `true` | Enable toast notifications |
+| `AM_TUI_TOAST_SEVERITY` | `info` | Minimum toast level (`info`/`warning`/`error`/`off`) |
+| `AM_TUI_TOAST_POSITION` | `top-right` | Toast stack placement |
+| `AM_TUI_TOAST_MAX_VISIBLE` | `3` | Max simultaneous visible toasts |
+| `AM_TUI_TOAST_INFO_DISMISS_SECS` | `5` | Auto-dismiss for info toasts |
+| `AM_TUI_TOAST_WARN_DISMISS_SECS` | `8` | Auto-dismiss for warning toasts |
+| `AM_TUI_TOAST_ERROR_DISMISS_SECS` | `15` | Auto-dismiss for error toasts |
+| `AM_TUI_THREAD_PAGE_SIZE` | `20` | Thread conversation page size in Threads screen |
+| `AM_TUI_THREAD_GUIDES` | `rounded` (theme default) | Thread tree guide style (`ascii`/`unicode`/`bold`/`double`/`rounded`) |
+| `AM_TUI_COACH_HINTS_ENABLED` | `true` | Enable contextual coach-hint toasts |
+| `AM_TUI_EFFECTS` | `true` | Enable ambient text/render effects |
+| `AM_TUI_AMBIENT` | `subtle` | Ambient effects level (`off`/`subtle`/`full`) |
 | `WORKTREES_ENABLED` | `false` | Build slots feature flag |
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.

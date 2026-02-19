@@ -78,19 +78,24 @@ remediation hints and exits. Probes check:
 
 ### Global (always active)
 
-| Key         | Action            | Notes                                   |
-|-------------|-------------------|-----------------------------------------|
-| `1`-`9`     | Jump to screens 1-9 | Suppressed during text input          |
-| `0`         | Jump to screen 10 | Projects screen                          |
-| `Tab`       | Next screen       | Use to reach screen 11 (Contacts)        |
-| `Shift+Tab` | Previous screen   |                                         |
-| `m`         | Toggle MCP/API    | Restarts transport                       |
-| `Ctrl+P`    | Command palette   |                                         |
-| `:`         | Command palette   | Suppressed during text input             |
-| `T`         | Cycle theme       | Shift+T; 5 themes available              |
-| `?`         | Toggle help       |                                         |
-| `q`         | Quit              |                                         |
-| `Esc`       | Dismiss overlay   |                                         |
+| Key | Action | Notes |
+|-----|--------|-------|
+| `1`-`9` | Jump to screens 1-9 | Suppressed during text input |
+| `0` | Jump to screen 10 | Projects screen |
+| `! @ # $ %` | Jump to screens 11-15 | Contacts, Explorer, Analytics, Attachments, Archive Browser |
+| `Tab` / `Shift+Tab` | Next/previous screen | Cycles through all 15 screens |
+| `Ctrl+P` | Command palette | Always available outside text-entry conflicts |
+| `:` | Command palette | Suppressed during text input |
+| `/` | Global search deep link | Opens Search with query focus |
+| `.` | Contextual action menu | Uses focused row/entity actions |
+| `Ctrl+N` | Open compose overlay | Global compose panel |
+| `Ctrl+Y` | Toggle toast focus mode | Enter toast navigation/dismiss mode |
+| `Ctrl+T` / `Shift+T` | Cycle theme | Shows toast confirmation with theme name |
+| `Ctrl+E` | Export menu | Snapshot/export overlay |
+| `m` | Toggle MCP/API base path | Restarts listener on `/mcp/` or `/api/` |
+| `?` | Toggle help overlay | Includes screen and global keymaps |
+| `q` | Quit | Immediate when not blocked by overlays |
+| `Esc` | Dismiss overlay / close toast focus | Also used for quit-confirm flow |
 
 ### Screen-Specific
 
@@ -98,38 +103,112 @@ Each screen has its own keybindings shown in the bottom hint bar and
 accessible via `?`. Common patterns:
 
 - `j`/`k` or `Up`/`Down` — Navigate rows
-- `Enter` — Expand/select
-- `r` — Refresh data
-- `/` — Search/filter
-- `v` — Cycle verbosity (Dashboard, Timeline)
-- `t` — Cycle type filter (Dashboard, Timeline)
+- `Space`/`v`/`A`/`C` — Toggle/extend/select-all/clear multi-select (batch-capable screens)
+- `Ctrl+S`/`Ctrl+L` — Save/load filter presets (Messages, Reservations, Timeline)
+- `Enter` — Inspect/open selected item (screen-dependent deep links)
+- `.` — Open contextual action menu on focused row
+
+### 3.1 Command Palette Usage
+
+Use the palette (`Ctrl+P` or `:`) for fast, low-friction control:
+
+1. Open palette and type fuzzy text (screen/tool/agent/project/thread/reservation).
+2. Use arrow keys + `Enter` to execute actions.
+3. Prefer palette when direct jump keys are ambiguous (especially screens 11-15).
+4. Use palette for transport/layout/macro actions to keep workflows deterministic.
+
+### 3.2 Toast Focus Mode
+
+Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
+
+| Key | Action |
+|-----|--------|
+| `j`/`Down` | Next toast |
+| `k`/`Up` | Previous toast |
+| `Enter` | Dismiss focused toast |
+| `m` | Mute/unmute toasts (runtime) |
+| `Esc` | Exit toast focus mode |
+
+### 3.3 High-Signal Screen Keys
+
+- Messages: `g` toggles Local/Global inbox mode; `c` opens compose; `Ctrl+M` marks read; `Ctrl+V` drops to thread.
+- Threads: `e/c` expands/collapses all message cards; `Left/Right` collapses/expands selected branch.
+- Timeline: `V` cycles Events/Commits/Combined; lowercase `v` toggles visual selection mode.
+- Search: `f` focuses facet rail; use `j/k` + `Enter` to cycle scope/sort/field facets.
+- Contacts: `n` toggles Table/Graph; `g` toggles Mermaid panel.
+- Reservations: `n` opens create-reservation form.
 
 ## 4. Screens Reference
 
 | # | Screen       | Purpose                                           |
 |---|--------------|---------------------------------------------------|
-| 1 | Dashboard    | Event stream, sparkline, anomaly rail, quick triage |
-| 2 | Messages     | Browse/search message content and metadata          |
-| 3 | Threads      | Thread correlation and conversation drill-down      |
-| 4 | Agents       | Registered agents, activity, and unread state       |
-| 5 | Search       | Query/facets/results/preview explorer               |
-| 6 | Reservations | Active file reservations and TTL countdowns         |
-| 7 | Tool Metrics | Per-tool latency/error/call count observability     |
-| 8 | SystemHealth | Probes, disk/memory, and circuit breaker state      |
-| 9 | Timeline     | Chronological event timeline + inspector            |
-| 10 | Projects    | Project inventory and routing helpers               |
-| 11 | Contacts    | Contact graph and policy management                 |
+| 1 | Dashboard    | Event stream, anomaly rail, throughput and triage summary |
+| 2 | Messages     | Inbox/outbox triage, presets, compose/reply, detail pane |
+| 3 | Threads      | Thread correlation and conversation drill-down |
+| 4 | Agents       | Agent roster, activity, unread state, deep links |
+| 5 | Search       | Query/facets/results/preview explorer |
+| 6 | Reservations | Active/released file reservations, create/release workflows |
+| 7 | Tool Metrics | Per-tool latency/error/call-count observability |
+| 8 | SystemHealth | Probes, disk/memory, and circuit-breaker state |
+| 9 | Timeline     | Events/Commits/Combined chronology + inspector |
+| 10 | Projects    | Project inventory, stats, and routing helpers |
+| 11 | Contacts    | Contact graph and policy management |
+| 12 | Explorer    | Unified mailbox explorer with direction and ack filters |
+| 13 | Analytics   | Anomaly feed with confidence and remediation links |
+| 14 | Attachments | Attachment inventory, preview, and provenance |
+| 15 | Archive Browser | Two-pane Git archive tree + file content preview |
 
 ### 4.1 Representative Operator Workflows
 
 1. Incident triage from Dashboard:
    `1` → inspect anomaly rail and event log → `Enter` on high-signal event to deep-link Timeline → `9` verify sequence and timestamps.
 2. Ack backlog chase:
-   `2` Messages with filter/sort → locate `ack_required` high/urgent traffic → pivot to `3` Threads for context → use MCP/CLI action to acknowledge.
+   `2` Messages with filter/sort + presets → locate `ack_required` high/urgent traffic → pivot to `3` Threads for context → acknowledge via MCP/CLI.
 3. Reservation contention diagnosis:
    `6` Reservations to identify conflicting globs/holders → `4` Agents for ownership/activity recency → `11` Contacts if policy/linking blocks direct coordination.
 4. Tool latency regression check:
-   `7` Tool Metrics to identify slow/failing tools → `8` SystemHealth to check DB/circuit pressure → capture bundle and run troubleshooting suites from Section 7.
+   `7` Tool Metrics to identify slow/failing tools → `8` SystemHealth to check DB/circuit pressure → `13` Analytics for anomaly context → capture diagnostics bundle.
+5. Attachment and archive forensics:
+   `14` Attachments to locate suspect payloads/messages → `15` Archive Browser for canonical file history → export evidence.
+
+### 4.2 Cross-Project Inbox Usage (Messages)
+
+1. Jump to Messages (`2`) and press `g` to toggle Local vs Global inbox mode.
+2. In Global mode, triage by urgency/ack requirements first; then pivot to Threads (`3`) for context.
+3. Save high-value filter setups with `Ctrl+S`; restore with `Ctrl+L`.
+4. Use `p/P` query presets for rapid rotation between All/Urgent/Ack-focused views.
+
+### 4.3 Advanced Search With Scope Filters
+
+1. Open Search (`5`) and press `/` to focus the query bar.
+2. Press `f` to focus the facet rail.
+3. Use `j/k` to move between facets and `Enter` to cycle values.
+4. Critical facets: Scope (Global/Project/Product), Sort Order (Newest/Oldest/Relevance), Field Scope (Subject/Body/Both), Importance/Ack.
+5. Press `r` to reset all facets to defaults when search gets over-constrained.
+
+### 4.4 Archive Browsing in TUI
+
+1. Jump to Archive Browser (`%` / screen 15).
+2. Navigate tree with `j/k`; use `Enter` to expand directories or preview files.
+3. Use `Tab` to switch between tree and preview panes.
+4. Use `Ctrl+D/U` for preview paging and `/` for filename filtering.
+5. Use this view for canonical Git-backed evidence when diagnosing message/archive drift.
+
+### 4.5 Human Overseer Message Composition
+
+Use the web overseer form when humans need to redirect active agents quickly:
+
+1. Open `/mail/{project}/overseer/compose`.
+2. Select recipients and write subject/body (optionally set `thread_id`).
+3. Submit to send a high-importance message as `HumanOverseer`.
+4. Agents receive it through normal inbox resources/tools and can reply in-thread.
+
+### 4.6 Agent Network Graph Interpretation (Contacts)
+
+1. Open Contacts (`!` / screen 11) and press `n` for Graph mode.
+2. In Graph mode, inspect node centrality (high message volume) and dense edge clusters (coordination hotspots).
+3. Press `g` to toggle Mermaid panel for textual graph export/inspection.
+4. Use this before large multi-agent swarms to identify overloaded communication paths.
 
 ## 5. Transport Modes
 
@@ -207,11 +286,30 @@ is used in hot paths.
 | Variable               | Default   | Description                          |
 |------------------------|-----------|--------------------------------------|
 | `TUI_ENABLED`          | `true`    | Enable interactive TUI               |
-| `TUI_DOCK_POSITION`    | `bottom`  | Dock position (`top`, `bottom`, etc.)|
-| `TUI_DOCK_RATIO_PERCENT` | `30`   | Dock size as % of terminal           |
-| `TUI_DOCK_VISIBLE`     | `false`   | Show dock on startup                 |
+| `TUI_DOCK_POSITION`    | `right`   | Dock position (`top`, `bottom`, `left`, `right`) |
+| `TUI_DOCK_RATIO_PERCENT` | `40`   | Dock size as % of terminal           |
+| `TUI_DOCK_VISIBLE`     | `true`    | Show dock on startup                 |
 | `TUI_HIGH_CONTRAST`    | `false`   | High-contrast accessibility mode     |
 | `TUI_KEY_HINTS`        | `true`    | Show key hints in status bar         |
+| `TUI_REDUCED_MOTION`   | `false`   | Accessibility reduced-motion mode    |
+| `TUI_SCREEN_READER`    | `false`   | Screen-reader-friendly rendering hints |
+| `TUI_KEYMAP_PROFILE`   | `default` | Keymap profile (`default`/`vim`/`emacs`/`minimal`/`custom`) |
+| `TUI_ACTIVE_PRESET`    | `default` | Active keymap preset name            |
+| `AM_TUI_THEME`         | `default` | Theme override (`default`, `solarized`, `dracula`, `nord`, `gruvbox`, `frankenstein`) |
+| `AM_TUI_TREE_STYLE`    | `rounded` | Tree style (`rounded`, `plain`, `bold`, `double`, `ascii`) |
+| `AM_TUI_DEBUG`         | `false`   | Enable TUI debug behaviors           |
+| `AM_TUI_EFFECTS`       | `true`    | Enable TUI visual effects            |
+| `AM_TUI_AMBIENT`       | `subtle`  | Ambient rendering mode (`off`/`subtle`/`full`) |
+| `AM_TUI_COACH_HINTS_ENABLED` | `true` | Enable contextual coach-hint toasts |
+| `AM_TUI_TOAST_ENABLED` | `true`    | Enable toast notifications           |
+| `AM_TUI_TOAST_SEVERITY` | `info`   | Toast severity floor (`info`/`warning`/`error`/`off`) |
+| `AM_TUI_TOAST_POSITION` | `top-right` | Toast stack position              |
+| `AM_TUI_TOAST_MAX_VISIBLE` | `3`   | Max visible toasts (1-10 clamp)     |
+| `AM_TUI_TOAST_INFO_DISMISS_SECS` | `5` | Info toast timeout (seconds)   |
+| `AM_TUI_TOAST_WARN_DISMISS_SECS` | `8` | Warning toast timeout (seconds) |
+| `AM_TUI_TOAST_ERROR_DISMISS_SECS` | `15` | Error toast timeout (seconds) |
+| `AM_TUI_THREAD_PAGE_SIZE` | `20`   | Threads screen conversation page size |
+| `AM_TUI_THREAD_GUIDES` | `rounded` (theme default) | Thread tree guide style (`ascii`/`unicode`/`bold`/`double`/`rounded`) |
 
 ### Logging
 
