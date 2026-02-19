@@ -3,7 +3,7 @@
 <div align="center">
 
 [![CI](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-yellow.svg)](./LICENSE)
 
 </div>
 
@@ -1044,4 +1044,4 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-MIT
+MIT License (with OpenAI/Anthropic Rider). See `LICENSE`.

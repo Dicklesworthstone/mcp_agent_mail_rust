@@ -18,7 +18,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license-file = "LICENSE"
 rust-version = "1.95"
 repository = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust"
 authors = ["Jeff Emanuel"]
