@@ -11950,7 +11950,7 @@ mod tests {
             .unwrap();
         }
 
-        // Re-create pool after SqliteConnection is dropped.
+        // Re-create pool after sync connection is dropped.
         let pool = make_pool();
 
         // Ensure (existing) should now have deterministic created_at
@@ -14877,14 +14877,12 @@ mod tests {
     /// Helper: seed a DB with projects, agents, messages, and file_reservations for CLI tests.
     fn seed_acks_and_reservations_db(
         db_path: &Path,
-    ) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
+    ) -> mcp_agent_mail_db::DbConn {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("open sqlite db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
         let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -15511,14 +15509,12 @@ mod tests {
     fn seed_mail_status_db(
         db_path: &Path,
         project_path: &str,
-    ) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
+    ) -> mcp_agent_mail_db::DbConn {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("open sqlite db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
         let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -15705,14 +15701,12 @@ mod tests {
         db_path: &Path,
         source_human_key: &Path,
         target_human_key: &Path,
-    ) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
+    ) -> mcp_agent_mail_db::DbConn {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("open sqlite db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
         let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -17366,11 +17360,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let db_path = dir.path().join("resolve_project_test.db");
 
-        // Initialize the DB with base schema via SqliteConnection.
-        let init_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("open sqlite connection");
+        // Initialize the DB with base schema via DbConn.
+        let init_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("open sqlite connection");
         init_conn
             .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
             .expect("apply init PRAGMAs");
@@ -17752,7 +17745,7 @@ mod tests {
         );
 
         // Verify .bak is a valid SQLite DB with same data
-        let bak_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&bak_path)
+        let bak_conn = mcp_agent_mail_db::DbConn::open_file(&bak_path)
             .expect("open .bak");
         let rows = bak_conn
             .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
@@ -17812,7 +17805,7 @@ mod tests {
 
         // Verify the .bak is a valid DB that passes quick_check
         let bak_path = format!("{}.bak", db_path.display());
-        let bak_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&bak_path)
+        let bak_conn = mcp_agent_mail_db::DbConn::open_file(&bak_path)
             .expect("open .bak");
         let qc_rows = bak_conn
             .query_sync("PRAGMA quick_check", &[])
@@ -19325,7 +19318,7 @@ fn iso_from_micros(micros: i64) -> String {
 
 fn projects_included_from_snapshot(snapshot_path: &Path) -> CliResult<Vec<serde_json::Value>> {
     let path_str = snapshot_path.display().to_string();
-    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str)
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str)
         .map_err(|e| CliError::Other(format!("cannot open snapshot for metadata: {e}")))?;
     let rows = conn
         .query_sync(
@@ -22559,7 +22552,7 @@ fn search_index_has_content(index_root: &std::path::Path) -> bool {
 }
 
 fn query_existing_search_fts_triggers(
-    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
 ) -> CliResult<Vec<String>> {
     let sql = "\
         SELECT name \

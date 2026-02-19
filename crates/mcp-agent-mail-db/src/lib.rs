@@ -69,13 +69,9 @@ pub use mcp_agent_mail_search_core::{QueryAssistance, parse_query_assistance};
 pub use sqlmodel;
 pub use sqlmodel_core;
 pub use sqlmodel_frankensqlite;
-pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
 /// Runtime DB traffic uses `FrankenConnection` to enable pure-Rust `SQLite` with
 /// `BEGIN CONCURRENT` write paths.
-///
-/// C-backed `sqlmodel_sqlite::SqliteConnection` remains available for any
-/// explicitly isolated legacy/offline paths while they are being migrated.
 pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;

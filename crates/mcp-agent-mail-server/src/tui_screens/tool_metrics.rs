@@ -1316,7 +1316,10 @@ mod tests {
     fn tick_hydrates_from_persisted_metrics_when_events_are_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("tool_metrics_hydration.db");
-        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open sqlite");
 
         conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS tool_metrics_snapshots (\
