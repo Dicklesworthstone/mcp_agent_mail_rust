@@ -55,8 +55,11 @@ use crate::tui_widgets::{
     AmbientEffectRenderer, AmbientHealthInput, AmbientMode, AmbientRenderTelemetry,
 };
 
-/// How often the TUI ticks (16 ms ≈ 60 fps).
-const TICK_INTERVAL: Duration = Duration::from_millis(16);
+/// How often the TUI ticks (33 ms ≈ 30 fps).
+///
+/// 30 fps is more than adequate for a TUI and halves terminal output compared
+/// to 60 fps.  Input latency stays imperceptible (< 50 ms round-trip).
+const TICK_INTERVAL: Duration = Duration::from_millis(33);
 
 const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
@@ -69,13 +72,18 @@ const PALETTE_DYNAMIC_RESERVATION_CAP: usize = 30;
 const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
 const PALETTE_DB_CACHE_TTL_MICROS: i64 = 5 * 1_000_000;
 const PALETTE_USAGE_HALF_LIFE_MICROS: i64 = 60 * 60 * 1_000_000;
-const SCREEN_TRANSITION_TICKS: u8 = 4;
-const TOAST_ENTRANCE_TICKS: u8 = 20;
-const TOAST_EXIT_TICKS: u8 = 15;
+const SCREEN_TRANSITION_TICKS: u8 = 2;
+const TOAST_ENTRANCE_TICKS: u8 = 10;
+const TOAST_EXIT_TICKS: u8 = 7;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
 const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
+/// Ambient effects only re-render every Nth frame.  At 30 fps this means the
+/// plasma/fire/metaball animation updates at ~5 fps, which is more than enough
+/// for a subtle background effect and eliminates the per-frame full-screen diff
+/// that was causing visible flashing and high CPU usage.
+const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 6;
 
 fn command_palette_theme_style() -> PaletteStyle {
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -3778,17 +3786,31 @@ impl Model for MailAppModel {
         }
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
-        // Hard guarantee that each frame paints the full terminal surface.
+        // Paint the theme background.  The buffer is already cleared by ftui's
+        // `reset_for_frame()`, so we only need to set the bg color on cells
+        // that widgets won't paint over.  A lightweight Paragraph achieves
+        // this without resetting every cell attribute (which would inflate the
+        // per-frame diff and cause visible flashing at high tick rates).
         let tp = crate::tui_theme::TuiThemePalette::current();
-        clear_rect(frame, area, tp.bg_deep, tp.text_primary);
-        let ambient_telemetry = self.ambient_renderer.borrow_mut().render(
-            area,
-            frame,
-            self.ambient_mode_for_frame(),
-            self.ambient_health_input(now_micros()),
-            self.state.uptime().as_secs_f64(),
-        );
-        self.ambient_last_telemetry.set(ambient_telemetry);
+        Paragraph::new("")
+            .style(Style::default().bg(tp.bg_deep))
+            .render(area, frame);
+        // Throttle ambient effects to every Nth frame.  Animated effects
+        // (plasma, fire, metaballs) change every cell's bg color, defeating
+        // the diff engine and causing full-screen terminal writes on every
+        // frame.  By only re-rendering every 6th frame the ambient animation
+        // runs at ~5 fps which is imperceptibly smooth for a subtle background
+        // wash while keeping terminal output minimal on intervening frames.
+        if self.tick_count.is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES) {
+            let ambient_telemetry = self.ambient_renderer.borrow_mut().render(
+                area,
+                frame,
+                self.ambient_mode_for_frame(),
+                self.ambient_health_input(now_micros()),
+                self.state.uptime().as_secs_f64(),
+            );
+            self.ambient_last_telemetry.set(ambient_telemetry);
+        }
         let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();
         *self.last_content_area.borrow_mut() = chrome.content;
@@ -5205,6 +5227,7 @@ fn set_focus_cell(frame: &mut Frame, x: u16, y: u16, symbol: char, color: Packed
     }
 }
 
+#[allow(dead_code)]
 fn clear_rect(frame: &mut Frame, area: Rect, bg: PackedRgba, fg: PackedRgba) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -9405,34 +9428,34 @@ mod tests {
     }
 
     #[test]
-    fn toast_entrance_slide_progresses_over_four_ticks() {
-        // TOAST_ENTRANCE_TICKS=20, formula: (20 - age) * 2
-        assert_eq!(entrance_slide_columns(0), 40);
-        assert_eq!(entrance_slide_columns(1), 38);
-        assert_eq!(entrance_slide_columns(2), 36);
-        assert_eq!(entrance_slide_columns(3), 34);
-        assert_eq!(entrance_slide_columns(4), 32);
-        assert_eq!(entrance_slide_columns(9), 22);
+    fn toast_entrance_slide_progresses_over_ticks() {
+        // TOAST_ENTRANCE_TICKS=10, formula: (10 - age) * 2
+        assert_eq!(entrance_slide_columns(0), 20);
+        assert_eq!(entrance_slide_columns(1), 18);
+        assert_eq!(entrance_slide_columns(2), 16);
+        assert_eq!(entrance_slide_columns(3), 14);
+        assert_eq!(entrance_slide_columns(4), 12);
+        assert_eq!(entrance_slide_columns(9), 2);
     }
 
     #[test]
-    fn toast_exit_fade_levels_progress_over_three_ticks() {
-        // TOAST_EXIT_TICKS=15, formula: 15 - remaining + 1 (if 1..=15)
+    fn toast_exit_fade_levels_progress_over_ticks() {
+        // TOAST_EXIT_TICKS=7, formula: 7 - remaining + 1 (if 1..=7)
         assert_eq!(exit_fade_level(None), 0);
-        assert_eq!(exit_fade_level(Some(9)), 7); // 15-9+1
-        assert_eq!(exit_fade_level(Some(3)), 13); // 15-3+1
-        assert_eq!(exit_fade_level(Some(2)), 14); // 15-2+1
-        assert_eq!(exit_fade_level(Some(1)), 15); // 15-1+1
+        assert_eq!(exit_fade_level(Some(7)), 1); // 7-7+1
+        assert_eq!(exit_fade_level(Some(3)), 5); // 7-3+1
+        assert_eq!(exit_fade_level(Some(2)), 6); // 7-2+1
+        assert_eq!(exit_fade_level(Some(1)), 7); // 7-1+1
         assert_eq!(exit_fade_level(Some(0)), 0);
     }
 
     #[test]
     fn toast_remaining_ticks_rounds_up() {
-        // TICK_INTERVAL=16ms, formula: ceil(ms / 16)
+        // TICK_INTERVAL=33ms, formula: ceil(ms / 33)
         assert_eq!(remaining_ticks_from_duration(Duration::from_millis(1)), 1);
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 7); // ceil(99/16)
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 7); // ceil(100/16)
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 7); // ceil(101/16)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 3); // ceil(99/33)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 4); // ceil(100/33)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 4); // ceil(101/33)
     }
 
     #[test]
