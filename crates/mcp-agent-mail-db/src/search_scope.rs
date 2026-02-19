@@ -1082,4 +1082,188 @@ mod tests {
         assert_eq!(audit.denied_count, 2);
         assert_eq!(audit.entries.len(), 2);
     }
+
+    // ── Empty batch ──────────────────────────────────────────────
+
+    #[test]
+    fn apply_scope_empty_results() {
+        let ctx = viewer_ctx(10, 1);
+        let policy = RedactionPolicy::default();
+        let (visible, audit) = apply_scope(Vec::new(), &ctx, &policy);
+        assert!(visible.is_empty());
+        assert_eq!(audit.total_before, 0);
+        assert_eq!(audit.visible_count, 0);
+        assert_eq!(audit.denied_count, 0);
+        assert_eq!(audit.redacted_count, 0);
+        assert!(audit.entries.is_empty());
+    }
+
+    // ── ContactPolicyKind::as_str all variants ───────────────────
+
+    #[test]
+    fn contact_policy_as_str() {
+        assert_eq!(ContactPolicyKind::Open.as_str(), "open");
+        assert_eq!(ContactPolicyKind::Auto.as_str(), "auto");
+        assert_eq!(ContactPolicyKind::ContactsOnly.as_str(), "contacts_only");
+        assert_eq!(ContactPolicyKind::BlockAll.as_str(), "block_all");
+    }
+
+    // ── ScopeAuditSummary default ────────────────────────────────
+
+    #[test]
+    fn audit_summary_default_is_zeroed() {
+        let summary = ScopeAuditSummary::default();
+        assert_eq!(summary.total_before, 0);
+        assert_eq!(summary.visible_count, 0);
+        assert_eq!(summary.redacted_count, 0);
+        assert_eq!(summary.denied_count, 0);
+        assert!(summary.entries.is_empty());
+    }
+
+    // ── ScopeAuditEntry serialization ────────────────────────────
+
+    #[test]
+    fn audit_entry_serializes_to_json() {
+        let entry = ScopeAuditEntry {
+            result_id: 42,
+            doc_kind: "message".to_string(),
+            verdict: ScopeVerdict::Deny,
+            reason: ScopeReason::CrossProjectDenied,
+            explanation: "cross-project".to_string(),
+            viewer: Some(ViewerIdentity {
+                project_id: 1,
+                agent_id: 10,
+            }),
+        };
+        let json = serde_json::to_value(&entry).expect("serialize");
+        assert_eq!(json["result_id"], 42);
+        assert_eq!(json["doc_kind"], "message");
+        assert_eq!(json["verdict"], "deny");
+        assert_eq!(json["reason"], "cross_project_denied");
+        assert_eq!(json["viewer"]["agent_id"], 10);
+    }
+
+    // ── ScopedSearchResult with scope metadata ───────────────────
+
+    #[test]
+    fn scoped_result_includes_scope_decision() {
+        let result = make_message_result(1, 1, "BlueLake");
+        let ctx = operator_ctx();
+        let policy = RedactionPolicy::default();
+        let (visible, _) = apply_scope(vec![result], &ctx, &policy);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].scope.verdict, ScopeVerdict::Allow);
+        assert_eq!(visible[0].scope.reason, ScopeReason::OperatorMode);
+        assert!(visible[0].redaction_note.is_none());
+    }
+
+    // ── ScopeSqlParam variants ───────────────────────────────────
+
+    #[test]
+    fn scope_sql_param_debug() {
+        let int_param = ScopeSqlParam::Int(42);
+        let text_param = ScopeSqlParam::Text("test".to_string());
+        let ts_param = ScopeSqlParam::TimestampNow;
+        // Just ensure Debug is derived and doesn't panic.
+        let _ = format!("{int_param:?}");
+        let _ = format!("{text_param:?}");
+        let _ = format!("{ts_param:?}");
+    }
+
+    // ── ScopeContext serialization roundtrip ──────────────────────
+
+    #[test]
+    fn scope_context_serde_roundtrip() {
+        let ctx = ScopeContext {
+            viewer: Some(ViewerIdentity {
+                project_id: 1,
+                agent_id: 10,
+            }),
+            approved_contacts: vec![(1, 20), (2, 30)],
+            viewer_project_ids: vec![1, 2],
+            sender_policies: vec![SenderPolicy {
+                project_id: 1,
+                agent_id: 20,
+                policy: ContactPolicyKind::Open,
+            }],
+            recipient_map: vec![RecipientEntry {
+                message_id: 42,
+                agent_ids: vec![10, 20],
+            }],
+        };
+        let json = serde_json::to_string(&ctx).expect("serialize");
+        let ctx2: ScopeContext = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(ctx2.viewer.unwrap().agent_id, 10);
+        assert_eq!(ctx2.approved_contacts.len(), 2);
+        assert_eq!(ctx2.sender_policies.len(), 1);
+        assert_eq!(ctx2.recipient_map.len(), 1);
+    }
+
+    // ── Thread result is NonMessageEntity ────────────────────────
+
+    #[test]
+    fn thread_doc_kind_always_allowed() {
+        let result = SearchResult {
+            doc_kind: DocKind::Thread,
+            id: 1,
+            project_id: Some(99),
+            title: "Thread summary".to_string(),
+            body: String::new(),
+            score: None,
+            importance: None,
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+            redacted: false,
+            redaction_reason: None,
+        };
+        let ctx = viewer_ctx(10, 1); // different project
+        let decision = evaluate_scope(&result, &ctx);
+        assert_eq!(decision.verdict, ScopeVerdict::Allow);
+        assert_eq!(decision.reason, ScopeReason::NonMessageEntity);
+    }
+
+    // ── Auto policy allows when no other policy matches ──────────
+
+    #[test]
+    fn auto_policy_default_allows() {
+        // No sender_policies → falls back to Auto → Allow
+        let result = make_message_result(1, 1, "BlueLake");
+        let ctx = viewer_ctx(10, 1);
+        let decision = evaluate_scope(&result, &ctx);
+        assert_eq!(decision.verdict, ScopeVerdict::Allow);
+        assert_eq!(decision.reason, ScopeReason::AutoPolicy);
+    }
+
+    // ── Multiple recipients, viewer is one of them ───────────────
+
+    #[test]
+    fn viewer_among_multiple_recipients() {
+        let result = make_message_result(42, 1, "BlueLake");
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.recipient_map.push(RecipientEntry {
+            message_id: 42,
+            agent_ids: vec![5, 10, 15], // viewer is agent 10
+        });
+        let decision = evaluate_scope(&result, &ctx);
+        assert_eq!(decision.verdict, ScopeVerdict::Allow);
+        assert_eq!(decision.reason, ScopeReason::IsRecipient);
+    }
+
+    // ── SQL clause has OR structure ──────────────────────────────
+
+    #[test]
+    fn sql_clauses_have_or_structure() {
+        let ctx = viewer_ctx(10, 1);
+        let (clauses, _) = build_scope_sql_clauses(&ctx);
+        assert_eq!(clauses.len(), 1);
+        let clause = &clauses[0];
+        // Should have 4 OR conditions wrapped in parens
+        assert!(clause.starts_with('('));
+        assert!(clause.ends_with(')'));
+        assert!(clause.contains(" OR "));
+    }
 }
