@@ -179,7 +179,7 @@ struct ExplorerDisplayRow {
 }
 
 impl RenderItem for ExplorerDisplayRow {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
         use ftui::text::{Line, Span};
 
         if area.height == 0 || area.width < 10 {

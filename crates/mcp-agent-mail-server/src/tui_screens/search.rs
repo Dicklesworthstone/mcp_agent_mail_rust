@@ -598,7 +598,7 @@ struct SearchResultRow {
 
 impl RenderItem for SearchResultRow {
     #[allow(clippy::too_many_lines)]
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
         use ftui::widgets::Widget;
 
         if area.height == 0 || area.width < 10 {

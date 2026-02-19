@@ -230,7 +230,7 @@ struct MessageEntry {
 }
 
 impl RenderItem for MessageEntry {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
         self.render_row(
             area,
             frame,
@@ -489,7 +489,7 @@ struct MessageDropVisual<'a> {
 }
 
 impl RenderItem for MessageRenderRow<'_> {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
         self.entry.render_row(
             area,
             frame,
