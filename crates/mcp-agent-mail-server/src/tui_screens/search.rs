@@ -2423,8 +2423,7 @@ impl MailScreen for SearchCockpitScreen {
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 4 || area.width < 30 {
             let tp = crate::tui_theme::TuiThemePalette::current();
-            Block::default()
-                .borders(Borders::ALL)
+            Block::bordered()
                 .title("Search")
                 .border_type(BorderType::Rounded)
                 .border_style(crate::tui_theme::text_meta(&tp))
@@ -3298,8 +3297,7 @@ fn render_query_bar(
     );
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -3511,8 +3509,7 @@ fn render_facet_rail(
     focused: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title("Facets")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -3653,8 +3650,7 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
     let lab_area = Rect::new(inner.x, top, inner.width, available_h);
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title("Query Lab")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border_dim));
@@ -3889,8 +3885,7 @@ fn render_results(
         )
     };
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -4325,8 +4320,7 @@ fn render_detail(
     focused: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .title("Detail")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
@@ -4857,9 +4851,11 @@ mod tests {
         screen.query_input.set_value("\"oops");
         screen.last_error = validate_query_syntax(screen.query_input.value());
 
+        // Frame must be tall enough (>=20) so query bar gets height 6, leaving
+        // 2 inner rows after Block::bordered() padding for the hint line.
         let mut pool = ftui::GraphemePool::new();
-        let mut frame = ftui::Frame::new(80, 10, &mut pool);
-        screen.view(&mut frame, Rect::new(0, 0, 80, 10), &state);
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
         let text = buffer_to_text(&frame.buffer);
         assert!(text.contains("ERR:"), "expected ERR line, got:\n{text}");
         assert!(
@@ -4876,9 +4872,11 @@ mod tests {
         screen.query_input.set_value("form:BlueLake thread:br-123");
         screen.query_assistance = Some(parse_query_assistance(screen.query_input.value()));
 
+        // Frame must be tall enough (>=20) so query bar gets height 6, leaving
+        // 2 inner rows after Block::bordered() padding for the hint line.
         let mut pool = ftui::GraphemePool::new();
-        let mut frame = ftui::Frame::new(80, 10, &mut pool);
-        screen.view(&mut frame, Rect::new(0, 0, 80, 10), &state);
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
         let text = buffer_to_text(&frame.buffer);
         assert!(
             text.contains("Did you mean:"),
