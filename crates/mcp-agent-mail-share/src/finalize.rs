@@ -874,6 +874,307 @@ mod tests {
     }
 
     #[test]
+    fn fts_on_empty_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        // Remove all messages so the DB is empty
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+        conn.execute_raw("DELETE FROM message_recipients").unwrap();
+        conn.execute_raw("DELETE FROM messages").unwrap();
+        drop(conn);
+
+        let fts_ok = build_search_indexes(&db).unwrap();
+        assert!(fts_ok, "FTS5 should still succeed on empty table");
+
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM fts_messages", &[])
+            .unwrap();
+        let count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(
+            count, 0,
+            "FTS should have 0 entries for empty messages table"
+        );
+    }
+
+    #[test]
+    fn fts_idempotent_reruns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        // Run FTS twice - should be idempotent
+        let first = build_search_indexes(&db).unwrap();
+        assert!(first);
+
+        let second = build_search_indexes(&db).unwrap();
+        assert!(second);
+
+        // Verify same data (no duplicates)
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM fts_messages", &[])
+            .unwrap();
+        let count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(count, 2, "idempotent re-run should not duplicate entries");
+    }
+
+    #[test]
+    fn materialized_views_without_fts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        // Build views with fts_enabled=false — should skip fts_search_overview_mv
+        let views = build_materialized_views(&db, false).unwrap();
+        assert!(views.contains(&"message_overview_mv".to_string()));
+        assert!(views.contains(&"attachments_by_message_mv".to_string()));
+        assert!(
+            !views.contains(&"fts_search_overview_mv".to_string()),
+            "should not create fts_search_overview_mv when fts is disabled"
+        );
+    }
+
+    #[test]
+    fn materialized_views_on_empty_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+        conn.execute_raw("DELETE FROM message_recipients").unwrap();
+        conn.execute_raw("DELETE FROM messages").unwrap();
+        drop(conn);
+
+        let views = build_materialized_views(&db, false).unwrap();
+        assert!(views.contains(&"message_overview_mv".to_string()));
+        assert!(views.contains(&"attachments_by_message_mv".to_string()));
+
+        // Verify overview is empty
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM message_overview_mv", &[])
+            .unwrap();
+        let count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Create a test DB without sender_id column on messages.
+    fn create_test_db_no_sender_id(dir: &std::path::Path) -> std::path::PathBuf {
+        let db_path = dir.join("test_no_sender.sqlite3");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .unwrap();
+
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, \
+             thread_id TEXT, subject TEXT DEFAULT '', body_md TEXT DEFAULT '', \
+             importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, \
+             created_ts TEXT DEFAULT '', attachments TEXT DEFAULT '[]')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, \
+             kind TEXT DEFAULT 'to', read_ts TEXT, ack_ts TEXT, PRIMARY KEY(message_id, agent_id))",
+        )
+        .unwrap();
+
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'proj', '/data/proj', '2025-01-01')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO agents VALUES (1, 1, 'TestAgent')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages VALUES (1, 1, 'TKT-1', 'Test', 'Body.', 'normal', 0, '2025-01-01', '[]')",
+        ).unwrap();
+
+        db_path
+    }
+
+    #[test]
+    fn performance_indexes_without_sender_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db_no_sender_id(dir.path());
+
+        let indexes = create_performance_indexes(&db).unwrap();
+        assert!(indexes.contains(&"idx_messages_created_ts".to_string()));
+        assert!(indexes.contains(&"idx_messages_subject_lower".to_string()));
+        assert!(indexes.contains(&"idx_messages_sender_lower".to_string()));
+        // idx_messages_sender should NOT be created (no sender_id column)
+        assert!(
+            !indexes.contains(&"idx_messages_sender".to_string()),
+            "should not create sender index when sender_id is absent"
+        );
+    }
+
+    /// Create a test DB without thread_id column on messages.
+    fn create_test_db_no_thread_id(dir: &std::path::Path) -> std::path::PathBuf {
+        let db_path = dir.join("test_no_thread.sqlite3");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .unwrap();
+
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT DEFAULT '', body_md TEXT DEFAULT '', \
+             importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, \
+             created_ts TEXT DEFAULT '', attachments TEXT DEFAULT '[]')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, \
+             kind TEXT DEFAULT 'to', read_ts TEXT, ack_ts TEXT, PRIMARY KEY(message_id, agent_id))",
+        )
+        .unwrap();
+
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'proj', '/data/proj', '2025-01-01')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO agents VALUES (1, 1, 'TestAgent')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages VALUES (1, 1, 1, 'Test', 'Body.', 'normal', 0, '2025-01-01', '[]')",
+        ).unwrap();
+
+        db_path
+    }
+
+    #[test]
+    fn performance_indexes_without_thread_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db_no_thread_id(dir.path());
+
+        let indexes = create_performance_indexes(&db).unwrap();
+        assert!(indexes.contains(&"idx_messages_created_ts".to_string()));
+        // idx_messages_thread should NOT be created (no thread_id column)
+        assert!(
+            !indexes.contains(&"idx_messages_thread".to_string()),
+            "should not create thread index when thread_id is absent"
+        );
+    }
+
+    #[test]
+    fn fts_without_thread_id_uses_msg_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db_no_thread_id(dir.path());
+
+        let fts_ok = build_search_indexes(&db).unwrap();
+        assert!(fts_ok);
+
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+        let rows = conn
+            .query_sync("SELECT thread_key FROM fts_messages WHERE rowid = 1", &[])
+            .unwrap();
+        let thread_key: String = rows[0].get_named("thread_key").unwrap();
+        assert_eq!(
+            thread_key, "msg:1",
+            "should use 'msg:N' format when thread_id column absent"
+        );
+    }
+
+    #[test]
+    fn column_exists_returns_false_for_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+
+        assert!(!column_exists(&conn, "messages", "nonexistent_column").unwrap());
+    }
+
+    #[test]
+    fn column_exists_returns_true_for_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+
+        assert!(column_exists(&conn, "messages", "subject").unwrap());
+        assert!(column_exists(&conn, "messages", "sender_id").unwrap());
+        assert!(column_exists(&conn, "messages", "thread_id").unwrap());
+        assert!(column_exists(&conn, "projects", "slug").unwrap());
+    }
+
+    #[test]
+    fn finalize_export_db_on_empty_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+        conn.execute_raw("DELETE FROM message_recipients").unwrap();
+        conn.execute_raw("DELETE FROM messages").unwrap();
+        conn.execute_raw("DELETE FROM agents").unwrap();
+        conn.execute_raw("DELETE FROM projects").unwrap();
+        drop(conn);
+
+        let result = finalize_export_db(&db).unwrap();
+        // FTS should still succeed but have no data
+        assert!(result.fts_enabled);
+        assert!(!result.views_created.is_empty());
+        assert!(!result.indexes_created.is_empty());
+    }
+
+    #[test]
+    fn materialized_views_without_sender_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db_no_sender_id(dir.path());
+
+        let views = build_materialized_views(&db, false).unwrap();
+        assert!(views.contains(&"message_overview_mv".to_string()));
+
+        // Verify overview created with empty sender_name
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT sender_name FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let name: String = rows[0].get_named("sender_name").unwrap();
+        assert_eq!(name, "", "should have empty sender_name without sender_id");
+    }
+
+    #[test]
     fn conformance_views_structure() {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../mcp-agent-mail-conformance/tests/conformance/fixtures/share");

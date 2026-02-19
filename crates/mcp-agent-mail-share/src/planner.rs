@@ -808,6 +808,247 @@ mod tests {
     }
 
     #[test]
+    fn validate_inputs_bundle_is_file_not_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file_path, "contents").unwrap();
+
+        let inputs = WizardInputs {
+            bundle_path: Some(file_path),
+            ..Default::default()
+        };
+        let result = validate_inputs(&inputs);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, WizardErrorCode::BundleInvalid);
+    }
+
+    #[test]
+    fn validate_inputs_bundle_missing_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // Directory exists but has no manifest.json
+        let inputs = WizardInputs {
+            bundle_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = validate_inputs(&inputs);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, WizardErrorCode::BundleInvalid);
+    }
+
+    #[test]
+    fn validate_inputs_valid_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), "{}").unwrap();
+
+        let inputs = WizardInputs {
+            bundle_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = validate_inputs(&inputs);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn s3_plan_with_cloudfront() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::S3),
+            s3_bucket: Some("my-bucket".to_string()),
+            cloudfront_id: Some("E123ABC".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_s3_plan(&inputs, &env, bundle.path()).unwrap();
+        assert!(plan.steps.iter().any(|s| s.id == "cloudfront_invalidate"));
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn s3_plan_without_cloudfront_has_warning() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::S3),
+            s3_bucket: Some("my-bucket".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_s3_plan(&inputs, &env, bundle.path()).unwrap();
+        assert!(!plan.steps.iter().any(|s| s.id == "cloudfront_invalidate"));
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("CloudFront")),
+            "should warn about missing CloudFront"
+        );
+    }
+
+    #[test]
+    fn s3_plan_expected_url_from_base_url() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::S3),
+            s3_bucket: Some("my-bucket".to_string()),
+            base_url: Some("https://cdn.example.com".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_s3_plan(&inputs, &env, bundle.path()).unwrap();
+        assert_eq!(
+            plan.expected_url,
+            Some("https://cdn.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn netlify_plan_has_deploy_step() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::Netlify),
+            netlify_site: Some("my-site".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_netlify_plan(&inputs, &env, bundle.path()).unwrap();
+        assert!(plan.steps.iter().any(|s| s.id == "netlify_deploy"));
+        assert_eq!(
+            plan.expected_url,
+            Some("https://my-site.netlify.app".to_string())
+        );
+    }
+
+    #[test]
+    fn custom_plan_has_manual_step() {
+        let inputs = WizardInputs::default();
+        let env = DetectedEnvironment::default();
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_custom_plan(&inputs, &env, bundle.path()).unwrap();
+        assert!(plan.steps.iter().any(|s| s.id == "manual_deploy"));
+        assert!(plan.expected_url.is_none());
+    }
+
+    #[test]
+    fn github_plan_warns_when_not_git_repo() {
+        let inputs = WizardInputs::default();
+        let env = DetectedEnvironment {
+            is_git_repo: false,
+            ..Default::default()
+        };
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("Git repository")),
+            "should warn when not in a git repo"
+        );
+    }
+
+    #[test]
+    fn github_plan_expected_url_from_repo() {
+        let inputs = WizardInputs::default();
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            github_repo: Some("myuser/myrepo".to_string()),
+            ..Default::default()
+        };
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        assert_eq!(
+            plan.expected_url,
+            Some("https://myuser.github.io/myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn github_plan_uses_custom_branch() {
+        let inputs = WizardInputs {
+            github_branch: Some("main".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            ..Default::default()
+        };
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        let push_step = plan.steps.iter().find(|s| s.id == "git_push").unwrap();
+        assert!(push_step.command.as_ref().unwrap().contains("main"));
+    }
+
+    #[test]
+    fn resolve_provider_github_env_fallback() {
+        let inputs = WizardInputs::default();
+        let env = DetectedEnvironment {
+            github_env: true,
+            ..Default::default()
+        };
+        let provider = resolve_provider(&inputs, &env).unwrap();
+        assert_eq!(provider, HostingProvider::GithubPages);
+    }
+
+    #[test]
+    fn format_plan_human_with_warnings_and_files() {
+        let plan = DeploymentPlan {
+            provider: HostingProvider::S3,
+            bundle_path: PathBuf::from("/tmp/bundle"),
+            steps: vec![PlanStep {
+                index: 1,
+                id: "test".to_string(),
+                description: "Upload files".to_string(),
+                command: None,
+                optional: false,
+                requires_confirm: false,
+            }],
+            expected_url: None,
+            generated_files: vec![PathBuf::from("_headers"), PathBuf::from("_redirects")],
+            warnings: vec!["No CDN configured".to_string()],
+        };
+
+        let output = format_plan_human(&plan);
+        assert!(output.contains("S3"), "should mention S3");
+        assert!(
+            output.contains("Upload files"),
+            "should include step description"
+        );
+        assert!(
+            output.contains("No CDN configured"),
+            "should include warnings"
+        );
+        assert!(output.contains("_headers"), "should list generated files");
+        assert!(output.contains("_redirects"), "should list generated files");
+    }
+
+    #[test]
+    fn validate_s3_provider_requires_bucket_in_non_interactive() {
+        let result = validate_provider_options(
+            HostingProvider::S3,
+            &WizardInputs {
+                skip_confirm: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().code,
+            WizardErrorCode::MissingRequiredOption
+        );
+    }
+
+    #[test]
+    fn validate_s3_provider_ok_in_interactive_without_bucket() {
+        // When skip_confirm is false (interactive), S3 without bucket is ok
+        // because it will be prompted
+        let result = validate_provider_options(HostingProvider::S3, &WizardInputs::default());
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn format_plan_human_matches_snapshot() {
         let plan = DeploymentPlan {
             provider: HostingProvider::GithubPages,

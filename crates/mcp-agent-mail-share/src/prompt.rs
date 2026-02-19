@@ -804,4 +804,90 @@ mod tests {
         assert!(result.is_ok());
         assert!(!result.unwrap());
     }
+
+    #[test]
+    fn validate_bundle_path_rejects_file_not_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file_path, "data").unwrap();
+
+        let result = validate_bundle_path(&file_path);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "should reject file path");
+    }
+
+    #[test]
+    fn validate_bundle_path_rejects_dir_without_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // Directory exists but no manifest.json
+        let result = validate_bundle_path(dir.path());
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "should reject dir without manifest.json");
+    }
+
+    #[test]
+    fn validate_bundle_path_accepts_valid_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), "{}").unwrap();
+
+        let result = validate_bundle_path(dir.path());
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "should accept dir with manifest.json");
+    }
+
+    #[test]
+    fn validate_provider_requirements_cloudflare() {
+        let inputs = WizardInputs::default();
+        let result = validate_provider_requirements(HostingProvider::CloudflarePages, &inputs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("Cloudflare project"));
+    }
+
+    #[test]
+    fn validate_provider_requirements_netlify() {
+        let inputs = WizardInputs::default();
+        let result = validate_provider_requirements(HostingProvider::Netlify, &inputs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("Netlify site"));
+    }
+
+    #[test]
+    fn validate_provider_requirements_s3() {
+        let inputs = WizardInputs::default();
+        let result = validate_provider_requirements(HostingProvider::S3, &inputs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("S3 bucket"));
+    }
+
+    #[test]
+    fn validate_non_interactive_fills_defaults_from_env() {
+        let detected_bundle = tempfile::tempdir().unwrap();
+        std::fs::write(detected_bundle.path().join("manifest.json"), "{}").unwrap();
+
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::Custom),
+            bundle_path: None,
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            existing_bundle: Some(detected_bundle.path().to_path_buf()),
+            recommended_provider: Some(HostingProvider::Custom),
+            ..Default::default()
+        };
+
+        let resolved = validate_non_interactive(inputs, &env).unwrap();
+        assert_eq!(
+            resolved.bundle_path,
+            Some(detected_bundle.path().to_path_buf())
+        );
+        assert_eq!(resolved.provider, Some(HostingProvider::Custom));
+    }
+
+    #[test]
+    fn wizard_config_default() {
+        let config = WizardConfig::default();
+        assert!(!config.non_interactive);
+        assert!(!config.json_output);
+        assert!(!config.skip_detection);
+    }
 }

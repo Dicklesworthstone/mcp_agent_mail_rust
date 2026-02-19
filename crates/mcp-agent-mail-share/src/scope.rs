@@ -591,6 +591,196 @@ mod tests {
         assert!(matches!(result, Err(ShareError::Sqlite { .. })));
     }
 
+    #[test]
+    fn scope_multiple_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        // Select both projects - nothing should be removed
+        let result =
+            apply_project_scope(&db, &["proj-alpha".to_string(), "proj-beta".to_string()]).unwrap();
+        assert_eq!(result.removed_count, 0);
+        assert_eq!(result.projects.len(), 2);
+        assert_eq!(result.remaining.messages, 3);
+        assert_eq!(result.remaining.agents, 2);
+    }
+
+    #[test]
+    fn scope_duplicate_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        // Same project specified twice via slug and human_key
+        let result = apply_project_scope(
+            &db,
+            &["proj-alpha".to_string(), "/data/projects/alpha".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.removed_count, 1);
+        assert_eq!(
+            result.projects.len(),
+            1,
+            "should de-duplicate by project ID"
+        );
+        assert_eq!(result.projects[0].slug, "proj-alpha");
+    }
+
+    #[test]
+    fn scope_keeps_all_when_all_projects_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let result =
+            apply_project_scope(&db, &["proj-alpha".to_string(), "proj-beta".to_string()]).unwrap();
+        assert_eq!(result.removed_count, 0);
+        assert_eq!(result.remaining.messages, 3);
+        assert_eq!(result.remaining.agents, 2);
+        assert_eq!(result.remaining.agent_links, 1);
+        assert_eq!(result.remaining.project_sibling_suggestions, 1);
+    }
+
+    #[test]
+    fn scope_by_slug_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let result = apply_project_scope(&db, &["PROJ-ALPHA".to_string()]).unwrap();
+        assert_eq!(result.removed_count, 1);
+        assert_eq!(result.projects[0].slug, "proj-alpha");
+    }
+
+    #[test]
+    fn build_placeholders_empty() {
+        let result = build_placeholders(0);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn build_placeholders_one() {
+        let result = build_placeholders(1);
+        assert_eq!(result, "?");
+    }
+
+    #[test]
+    fn build_placeholders_many() {
+        let result = build_placeholders(5);
+        assert_eq!(result, "?,?,?,?,?");
+    }
+
+    #[test]
+    fn scope_without_optional_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no_links.sqlite3");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .unwrap();
+
+        // Create schema without agent_links and project_sibling_suggestions
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at TEXT DEFAULT '')",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT DEFAULT '', model TEXT DEFAULT '', task_description TEXT DEFAULT '', inception_ts TEXT DEFAULT '', last_active_ts TEXT DEFAULT '', attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT, subject TEXT DEFAULT '', body_md TEXT DEFAULT '', importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, created_ts TEXT DEFAULT '', attachments TEXT DEFAULT '[]')",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT DEFAULT 'to', read_ts TEXT, ack_ts TEXT, PRIMARY KEY(message_id, agent_id))",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, path_pattern TEXT, exclusive INTEGER DEFAULT 1, reason TEXT DEFAULT '', created_ts TEXT DEFAULT '', expires_ts TEXT DEFAULT '', released_ts TEXT)",
+        ).unwrap();
+
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'only', '/data/only', '2025-01-01')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (1, 1, 'Solo', '', '', '', '', '', 'auto', 'auto')",
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = apply_project_scope(&db_path, &[]).unwrap();
+        assert_eq!(result.remaining.projects, 1);
+        assert_eq!(result.remaining.agent_links, 0);
+        assert_eq!(result.remaining.project_sibling_suggestions, 0);
+    }
+
+    #[test]
+    fn project_scope_result_serialization_roundtrip() {
+        let result = ProjectScopeResult {
+            identifiers: vec!["proj-alpha".to_string()],
+            projects: vec![ProjectRecord {
+                id: 1,
+                slug: "proj-alpha".to_string(),
+                human_key: "/data/alpha".to_string(),
+            }],
+            removed_count: 1,
+            remaining: RemainingCounts {
+                projects: 1,
+                agents: 2,
+                messages: 5,
+                recipients: 10,
+                file_reservations: 3,
+                agent_links: 0,
+                project_sibling_suggestions: 0,
+            },
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: ProjectScopeResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.removed_count, 1);
+        assert_eq!(deserialized.projects.len(), 1);
+        assert_eq!(deserialized.projects[0].slug, "proj-alpha");
+        assert_eq!(deserialized.remaining.messages, 5);
+    }
+
+    #[test]
+    fn scope_select_only_beta_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let result = apply_project_scope(&db, &["proj-beta".to_string()]).unwrap();
+        assert_eq!(result.removed_count, 1);
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(result.projects[0].slug, "proj-beta");
+        assert_eq!(result.remaining.projects, 1);
+        assert_eq!(result.remaining.agents, 1);
+        assert_eq!(result.remaining.messages, 1);
+        assert_eq!(result.remaining.recipients, 1);
+        assert_eq!(result.remaining.file_reservations, 0);
+    }
+
+    #[test]
+    fn scope_empty_database_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("empty.sqlite3");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT DEFAULT '', model TEXT DEFAULT '', task_description TEXT DEFAULT '', inception_ts TEXT DEFAULT '', last_active_ts TEXT DEFAULT '', attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT, subject TEXT DEFAULT '', body_md TEXT DEFAULT '', importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, created_ts TEXT DEFAULT '', attachments TEXT DEFAULT '[]')",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT DEFAULT 'to', read_ts TEXT, ack_ts TEXT, PRIMARY KEY(message_id, agent_id))",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, path_pattern TEXT, exclusive INTEGER DEFAULT 1, reason TEXT DEFAULT '', created_ts TEXT DEFAULT '', expires_ts TEXT DEFAULT '', released_ts TEXT)",
+        ).unwrap();
+        drop(conn);
+
+        let result = apply_project_scope(&db_path, &["anything".to_string()]);
+        assert!(matches!(result, Err(ShareError::ScopeNoProjects)));
+    }
+
     /// Conformance test: scope against the fixture `needs_scrub.sqlite3` and
     /// compare with `expected_scoped.json` produced by the Python reference.
     #[test]
