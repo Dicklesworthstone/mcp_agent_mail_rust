@@ -1534,4 +1534,340 @@ mod tests {
             }
         }
     }
+
+    // ── Additional coverage tests ────────────────────────────────────
+
+    #[test]
+    fn focus_target_none_is_default() {
+        let target = FocusTarget::default();
+        assert_eq!(target, FocusTarget::None);
+        assert!(!target.accepts_text_input());
+        assert!(!target.is_list());
+        assert!(!target.is_modal());
+    }
+
+    #[test]
+    fn focus_context_traps_focus_variants() {
+        assert!(!FocusContext::Screen.traps_focus());
+        assert!(FocusContext::CommandPalette.traps_focus());
+        assert!(FocusContext::Modal.traps_focus());
+        assert!(FocusContext::ActionMenu.traps_focus());
+        assert!(FocusContext::ToastPanel.traps_focus());
+    }
+
+    #[test]
+    fn focus_context_allows_shortcuts_variants() {
+        assert!(FocusContext::Screen.allows_shortcuts());
+        assert!(!FocusContext::CommandPalette.allows_shortcuts());
+        assert!(!FocusContext::Modal.allows_shortcuts());
+        assert!(!FocusContext::ActionMenu.allows_shortcuts());
+        assert!(!FocusContext::ToastPanel.allows_shortcuts());
+    }
+
+    #[test]
+    fn focus_context_default_is_screen() {
+        assert_eq!(FocusContext::default(), FocusContext::Screen);
+    }
+
+    #[test]
+    fn focus_manager_default_trait() {
+        let fm = FocusManager::default();
+        assert_eq!(fm.context(), FocusContext::Screen);
+        assert_eq!(fm.current(), FocusTarget::None);
+    }
+
+    #[test]
+    fn focus_manager_with_empty_ring() {
+        let fm = FocusManager::with_ring(vec![]);
+        assert_eq!(fm.current(), FocusTarget::None);
+        assert!(fm.focus_ring().is_empty());
+    }
+
+    #[test]
+    fn focus_manager_focus_ring_getter() {
+        let ring = vec![FocusTarget::TextInput(0), FocusTarget::List(0)];
+        let fm = FocusManager::with_ring(ring.clone());
+        assert_eq!(fm.focus_ring(), &ring);
+    }
+
+    #[test]
+    fn set_focus_ring_empty_clears_focus() {
+        let mut fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0), FocusTarget::List(0)]);
+        assert_eq!(fm.current(), FocusTarget::TextInput(0));
+
+        fm.set_focus_ring(vec![]);
+        assert_eq!(fm.current(), FocusTarget::None);
+    }
+
+    #[test]
+    fn set_focus_ring_preserves_current_if_in_new_ring() {
+        let mut fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0), FocusTarget::List(0)]);
+        fm.focus(FocusTarget::List(0));
+
+        fm.set_focus_ring(vec![FocusTarget::List(0), FocusTarget::DetailPanel]);
+        assert_eq!(fm.current(), FocusTarget::List(0));
+    }
+
+    #[test]
+    fn pop_context_with_empty_stack_resets_to_screen() {
+        let mut fm = FocusManager::new();
+        fm.context = FocusContext::Modal; // simulate a modal without push
+        fm.pop_context();
+        assert_eq!(fm.context(), FocusContext::Screen);
+    }
+
+    #[test]
+    fn restore_with_empty_stack_is_noop() {
+        let mut fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0)]);
+        fm.focus(FocusTarget::TextInput(0));
+        fm.restore(); // no snapshot exists
+        assert_eq!(fm.current(), FocusTarget::TextInput(0));
+        assert_eq!(fm.context(), FocusContext::Screen);
+    }
+
+    #[test]
+    fn push_command_palette_focuses_text_input() {
+        let mut fm = FocusManager::new();
+        fm.push_context(FocusContext::CommandPalette);
+        assert_eq!(fm.context(), FocusContext::CommandPalette);
+        assert_eq!(fm.current(), FocusTarget::TextInput(0));
+    }
+
+    #[test]
+    fn push_action_menu_focuses_list() {
+        let mut fm = FocusManager::new();
+        fm.push_context(FocusContext::ActionMenu);
+        assert_eq!(fm.context(), FocusContext::ActionMenu);
+        assert_eq!(fm.current(), FocusTarget::List(0));
+    }
+
+    #[test]
+    fn push_toast_panel_focuses_list() {
+        let mut fm = FocusManager::new();
+        fm.push_context(FocusContext::ToastPanel);
+        assert_eq!(fm.context(), FocusContext::ToastPanel);
+        assert_eq!(fm.current(), FocusTarget::List(0));
+    }
+
+    #[test]
+    fn focus_ring_builder_button_and_custom() {
+        let ring = FocusRingBuilder::new()
+            .button(0)
+            .button(1)
+            .custom(5)
+            .build();
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring[0], FocusTarget::Button(0));
+        assert_eq!(ring[1], FocusTarget::Button(1));
+        assert_eq!(ring[2], FocusTarget::Custom(5));
+    }
+
+    #[test]
+    fn focus_ring_builder_into_manager() {
+        let fm = FocusRingBuilder::new()
+            .search_bar()
+            .result_list()
+            .into_manager();
+        assert_eq!(fm.current(), FocusTarget::TextInput(0));
+        assert_eq!(fm.focus_ring().len(), 2);
+    }
+
+    #[test]
+    fn focus_ring_builder_text_input_and_list_with_ids() {
+        let ring = FocusRingBuilder::new()
+            .text_input(0)
+            .text_input(1)
+            .list(0)
+            .list(1)
+            .build();
+        assert_eq!(ring.len(), 4);
+        assert_eq!(ring[0], FocusTarget::TextInput(0));
+        assert_eq!(ring[1], FocusTarget::TextInput(1));
+        assert_eq!(ring[2], FocusTarget::List(0));
+        assert_eq!(ring[3], FocusTarget::List(1));
+    }
+
+    #[test]
+    fn focus_indicator_chars() {
+        assert_eq!(focus_indicator_char(), '▶');
+        assert_eq!(unfocused_indicator_char(), ' ');
+    }
+
+    #[test]
+    fn focus_graph_screen_getter() {
+        let graph = FocusGraph::for_screen(MailScreenId::Messages, Rect::new(0, 0, 120, 40));
+        assert_eq!(graph.screen(), MailScreenId::Messages);
+    }
+
+    #[test]
+    fn focus_graph_node_index_missing_target() {
+        let graph = FocusGraph::for_screen(MailScreenId::Agents, Rect::new(0, 0, 120, 40));
+        // Agents screen only has List(0), not DetailPanel
+        assert!(graph.node_index(FocusTarget::DetailPanel).is_none());
+        assert!(graph.node(FocusTarget::DetailPanel).is_none());
+    }
+
+    #[test]
+    fn focus_ring_for_screen_matches_graph_targets() {
+        for &screen in ALL_SCREEN_IDS {
+            let ring = focus_ring_for_screen(screen);
+            let graph = FocusGraph::for_screen(screen, Rect::new(0, 0, 120, 40));
+            let graph_targets: Vec<FocusTarget> =
+                graph.nodes().iter().map(|n| n.target).collect();
+            assert_eq!(
+                ring, graph_targets,
+                "screen {screen:?}: focus_ring_for_screen should match graph targets"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_graph_for_screen_wrapper() {
+        let graph = focus_graph_for_screen(MailScreenId::Dashboard, Rect::new(0, 0, 120, 40));
+        assert_eq!(graph.screen(), MailScreenId::Dashboard);
+        assert!(!graph.nodes().is_empty());
+    }
+
+    #[test]
+    fn axis_overlap_no_overlap() {
+        assert_eq!(axis_overlap(0, 10, 20, 10), 0);
+        assert_eq!(axis_overlap(20, 10, 0, 10), 0);
+    }
+
+    #[test]
+    fn axis_overlap_full_overlap() {
+        assert_eq!(axis_overlap(5, 10, 5, 10), 10);
+    }
+
+    #[test]
+    fn axis_overlap_partial() {
+        assert_eq!(axis_overlap(0, 10, 5, 10), 5);
+        assert_eq!(axis_overlap(5, 10, 0, 10), 5);
+    }
+
+    #[test]
+    fn axis_overlap_contained() {
+        assert_eq!(axis_overlap(0, 20, 5, 5), 5);
+        assert_eq!(axis_overlap(5, 5, 0, 20), 5);
+    }
+
+    #[test]
+    fn scale_permille_basic() {
+        assert_eq!(scale_permille(100, 500), 50); // 50%
+        assert_eq!(scale_permille(100, 1000), 100); // 100%
+        assert_eq!(scale_permille(100, 0), 0); // 0%
+        assert_eq!(scale_permille(200, 250), 50); // 25%
+    }
+
+    #[test]
+    fn rect_center_basic() {
+        let r = Rect::new(10, 20, 30, 40);
+        let (cx, cy) = rect_center(r);
+        // center x = 10 + (30-1)/2 = 10 + 14 = 24
+        // center y = 20 + (40-1)/2 = 20 + 19 = 39
+        assert_eq!(cx, 24);
+        assert_eq!(cy, 39);
+    }
+
+    #[test]
+    fn rect_center_unit_rect() {
+        let r = Rect::new(5, 5, 1, 1);
+        let (cx, cy) = rect_center(r);
+        assert_eq!(cx, 5);
+        assert_eq!(cy, 5);
+    }
+
+    #[test]
+    fn best_neighbor_returns_none_for_single_rect() {
+        let rects = vec![Rect::new(10, 10, 20, 20)];
+        assert!(best_neighbor(&rects, 0, Direction::Up).is_none());
+        assert!(best_neighbor(&rects, 0, Direction::Down).is_none());
+        assert!(best_neighbor(&rects, 0, Direction::Left).is_none());
+        assert!(best_neighbor(&rects, 0, Direction::Right).is_none());
+    }
+
+    #[test]
+    fn best_neighbor_returns_none_for_out_of_bounds_index() {
+        let rects = vec![Rect::new(10, 10, 20, 20)];
+        assert!(best_neighbor(&rects, 5, Direction::Up).is_none());
+    }
+
+    #[test]
+    fn best_neighbor_up_down_left_right() {
+        let rects = vec![
+            Rect::new(50, 50, 20, 20), // 0: center
+            Rect::new(50, 10, 20, 20), // 1: above
+            Rect::new(50, 90, 20, 20), // 2: below
+            Rect::new(10, 50, 20, 20), // 3: left
+            Rect::new(90, 50, 20, 20), // 4: right
+        ];
+        assert_eq!(best_neighbor(&rects, 0, Direction::Up), Some(1));
+        assert_eq!(best_neighbor(&rects, 0, Direction::Down), Some(2));
+        assert_eq!(best_neighbor(&rects, 0, Direction::Left), Some(3));
+        assert_eq!(best_neighbor(&rects, 0, Direction::Right), Some(4));
+    }
+
+    #[test]
+    fn focus_target_button_properties() {
+        let b = FocusTarget::Button(0);
+        assert!(!b.accepts_text_input());
+        assert!(!b.is_list());
+        assert!(!b.is_modal());
+    }
+
+    #[test]
+    fn focus_target_tab_bar_properties() {
+        let tb = FocusTarget::TabBar;
+        assert!(!tb.accepts_text_input());
+        assert!(!tb.is_list());
+        assert!(!tb.is_modal());
+    }
+
+    #[test]
+    fn focus_target_filter_rail_properties() {
+        let fr = FocusTarget::FilterRail;
+        assert!(!fr.accepts_text_input());
+        assert!(!fr.is_list());
+        assert!(!fr.is_modal());
+    }
+
+    #[test]
+    fn focus_next_then_prev_returns_to_start() {
+        let mut fm = FocusManager::with_ring(vec![
+            FocusTarget::TextInput(0),
+            FocusTarget::List(0),
+            FocusTarget::DetailPanel,
+        ]);
+        let start = fm.current();
+        fm.focus_next();
+        fm.focus_prev();
+        assert_eq!(fm.current(), start);
+    }
+
+    #[test]
+    fn single_element_ring_tab_returns_false() {
+        let mut fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0)]);
+        // Tab should not change focus (only one element)
+        assert!(!fm.handle_tab(false));
+        assert!(!fm.handle_tab(true));
+    }
+
+    #[test]
+    fn focus_graph_search_screen_has_three_panels() {
+        let graph = FocusGraph::for_screen(MailScreenId::Search, Rect::new(0, 0, 120, 40));
+        assert_eq!(graph.nodes().len(), 3);
+        assert!(graph.node(FocusTarget::TextInput(0)).is_some());
+        assert!(graph.node(FocusTarget::FilterRail).is_some());
+        assert!(graph.node(FocusTarget::List(0)).is_some());
+    }
+
+    #[test]
+    fn focus_graph_explorer_has_four_panels() {
+        let graph = FocusGraph::for_screen(MailScreenId::Explorer, Rect::new(0, 0, 120, 40));
+        assert_eq!(graph.nodes().len(), 4);
+        assert!(graph.node(FocusTarget::TextInput(0)).is_some());
+        assert!(graph.node(FocusTarget::FilterRail).is_some());
+        assert!(graph.node(FocusTarget::List(0)).is_some());
+        assert!(graph.node(FocusTarget::DetailPanel).is_some());
+    }
 }

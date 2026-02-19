@@ -1480,4 +1480,260 @@ mod tests {
         let counts = DbStatQueryBatcher::new(&conn).fetch_counts();
         assert_eq!(counts.file_reservations, 4);
     }
+
+    // ── Additional coverage tests ────────────────────────────────────
+
+    #[test]
+    fn db_snapshot_counts_default() {
+        let counts = DbSnapshotCounts::default();
+        assert_eq!(counts.projects, 0);
+        assert_eq!(counts.agents, 0);
+        assert_eq!(counts.messages, 0);
+        assert_eq!(counts.file_reservations, 0);
+        assert_eq!(counts.contact_links, 0);
+        assert_eq!(counts.ack_pending, 0);
+    }
+
+    #[test]
+    fn snapshot_delta_identical_nondefault_no_change() {
+        let snap = DbStatSnapshot {
+            projects: 5,
+            agents: 3,
+            messages: 100,
+            file_reservations: 10,
+            contact_links: 2,
+            ack_pending: 1,
+            agents_list: vec![AgentSummary {
+                name: "GoldFox".into(),
+                program: "claude-code".into(),
+                last_active_ts: 1000,
+            }],
+            ..Default::default()
+        };
+        let d = snapshot_delta(&snap, &snap);
+        assert!(!d.any_changed());
+        assert_eq!(d.changed_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_delta_projects_list_change() {
+        let a = DbStatSnapshot::default();
+        let b = DbStatSnapshot {
+            projects_list: vec![ProjectSummary {
+                id: 1,
+                slug: "test".into(),
+                human_key: "hk".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let d = snapshot_delta(&a, &b);
+        assert!(d.projects_list_changed);
+        assert!(!d.projects_changed); // count didn't change
+        assert_eq!(d.changed_count(), 1);
+    }
+
+    #[test]
+    fn snapshot_delta_contacts_list_change() {
+        let a = DbStatSnapshot::default();
+        let b = DbStatSnapshot {
+            contacts_list: vec![ContactSummary {
+                from_agent: "A".into(),
+                to_agent: "B".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let d = snapshot_delta(&a, &b);
+        assert!(d.contacts_list_changed);
+        assert_eq!(d.changed_count(), 1);
+    }
+
+    #[test]
+    fn snapshot_delta_ack_only() {
+        let a = DbStatSnapshot {
+            ack_pending: 0,
+            ..Default::default()
+        };
+        let b = DbStatSnapshot {
+            ack_pending: 5,
+            ..Default::default()
+        };
+        let d = snapshot_delta(&a, &b);
+        assert!(d.ack_changed);
+        assert!(!d.messages_changed);
+        assert_eq!(d.changed_count(), 1);
+    }
+
+    #[test]
+    fn active_reservation_predicate_is_nonempty() {
+        assert!(!ACTIVE_RESERVATION_PREDICATE.is_empty());
+        assert!(ACTIVE_RESERVATION_PREDICATE.contains("released_ts IS NULL"));
+    }
+
+    #[test]
+    fn max_constants_are_positive() {
+        assert!(MAX_AGENTS > 0);
+        assert!(MAX_PROJECTS > 0);
+        assert!(MAX_CONTACTS > 0);
+        assert!(MAX_RESERVATIONS > 0);
+    }
+
+    #[test]
+    fn batcher_fetch_counts_fallback_on_empty_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_fallback_counts.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
+            .expect("create");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+        conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
+            .expect("create");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+        conn.execute_sync("CREATE TABLE agent_links (id INTEGER PRIMARY KEY)", &[])
+            .expect("create");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+
+        let counts = DbStatQueryBatcher::new(&conn).fetch_counts();
+        assert_eq!(counts, DbSnapshotCounts::default());
+    }
+
+    #[test]
+    fn fetch_agents_list_returns_empty_for_no_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_agents_no_table.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        // No tables created
+        let agents = fetch_agents_list(&conn);
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn fetch_projects_list_returns_empty_for_no_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_projects_no_table.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        let projects = fetch_projects_list(&conn);
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn fetch_contacts_list_returns_empty_for_no_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_contacts_no_table.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        let contacts = fetch_contacts_list(&conn);
+        assert!(contacts.is_empty());
+    }
+
+    #[test]
+    fn fetch_reservation_snapshots_returns_empty_for_no_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservations_no_table.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        let reservations = fetch_reservation_snapshots(&conn);
+        assert!(reservations.is_empty());
+    }
+
+    #[test]
+    fn fetch_agents_list_ordered_by_last_active_desc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_agents_order.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+        conn.execute_sync(
+            "INSERT INTO agents (name, program, last_active_ts) VALUES
+             ('OldAgent', 'codex', 100),
+             ('NewAgent', 'claude', 300),
+             ('MidAgent', 'gemini', 200)",
+            &[],
+        )
+        .expect("insert");
+
+        let agents = fetch_agents_list(&conn);
+        assert_eq!(agents.len(), 3);
+        assert_eq!(agents[0].name, "NewAgent");
+        assert_eq!(agents[1].name, "MidAgent");
+        assert_eq!(agents[2].name, "OldAgent");
+    }
+
+    #[test]
+    fn fetch_projects_list_includes_aggregate_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_projects_aggregates.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, released_ts INTEGER)",
+            &[],
+        )
+        .expect("create reservations");
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'proj', 'hk', 100)",
+            &[],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, last_active_ts) VALUES (1, 'A', 'x', 0), (1, 'B', 'y', 0)",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO messages (project_id) VALUES (1), (1), (1)",
+            &[],
+        )
+        .expect("insert messages");
+        conn.execute_sync(
+            "INSERT INTO file_reservations (project_id, released_ts) VALUES (1, NULL)",
+            &[],
+        )
+        .expect("insert reservation");
+
+        let projects = fetch_projects_list(&conn);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].slug, "proj");
+        assert_eq!(projects[0].agent_count, 2);
+        assert_eq!(projects[0].message_count, 3);
+        assert_eq!(projects[0].reservation_count, 1);
+    }
+
+    #[test]
+    fn health_pulse_heartbeat_interval_is_reasonable() {
+        assert!(HEALTH_PULSE_HEARTBEAT_INTERVAL.as_secs() >= 5);
+        assert!(HEALTH_PULSE_HEARTBEAT_INTERVAL.as_secs() <= 60);
+    }
 }
