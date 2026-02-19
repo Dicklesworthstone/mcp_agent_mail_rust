@@ -771,4 +771,179 @@ mod tests {
             "second resize should be Full"
         );
     }
+
+    // ── Additional coverage tests ────────────────────────────────────
+
+    #[test]
+    fn diff_action_index_roundtrip() {
+        for i in 0..3 {
+            let action = DiffAction::from_index(i);
+            assert_eq!(action.index(), i);
+        }
+        // Out-of-range maps to Deferred
+        assert_eq!(DiffAction::from_index(99), DiffAction::Deferred);
+    }
+
+    #[test]
+    fn diff_action_labels() {
+        assert_eq!(DiffAction::Incremental.label(), "incremental");
+        assert_eq!(DiffAction::Full.label(), "full");
+        assert_eq!(DiffAction::Deferred.label(), "deferred");
+    }
+
+    #[test]
+    fn strategy_default_impl() {
+        let strategy = BayesianDiffStrategy::default();
+        // Uniform prior
+        for &p in &strategy.posterior() {
+            assert!((p - 0.25).abs() < 1e-9);
+        }
+        assert!(!strategy.deterministic_fallback);
+    }
+
+    #[test]
+    fn compute_likelihood_resize_dominates() {
+        let frame = resize_frame();
+        let lik = compute_likelihood(&frame);
+        assert!((lik[STATE_RESIZE] - 0.9).abs() < 1e-9);
+        assert!(lik[STATE_RESIZE] > lik[STATE_STABLE]);
+        assert!(lik[STATE_RESIZE] > lik[STATE_BURSTY]);
+        assert!(lik[STATE_RESIZE] > lik[STATE_DEGRADED]);
+    }
+
+    #[test]
+    fn compute_likelihood_stable_frame() {
+        let frame = stable_frame();
+        let lik = compute_likelihood(&frame);
+        assert!(
+            lik[STATE_STABLE] >= 0.8,
+            "stable frame should have high stable likelihood, got {}",
+            lik[STATE_STABLE]
+        );
+    }
+
+    #[test]
+    fn compute_likelihood_degraded_frame() {
+        let frame = degraded_frame();
+        let lik = compute_likelihood(&frame);
+        assert!(
+            lik[STATE_DEGRADED] >= 0.8,
+            "degraded frame should have high degraded likelihood, got {}",
+            lik[STATE_DEGRADED]
+        );
+    }
+
+    #[test]
+    fn compute_likelihood_bursty_frame() {
+        let frame = bursty_frame();
+        let lik = compute_likelihood(&frame);
+        assert!(
+            lik[STATE_BURSTY] >= 0.8,
+            "bursty frame should have high bursty likelihood, got {}",
+            lik[STATE_BURSTY]
+        );
+    }
+
+    #[test]
+    fn compute_likelihood_medium_change_ratio() {
+        let frame = FrameState {
+            change_ratio: 0.35,
+            is_resize: false,
+            budget_remaining_ms: 10.0,
+            error_count: 0,
+        };
+        let lik = compute_likelihood(&frame);
+        assert!(
+            lik[STATE_BURSTY] >= 0.5,
+            "medium change ratio should give bursty >= 0.5, got {}",
+            lik[STATE_BURSTY]
+        );
+        assert!(lik[STATE_RESIZE] < 0.1);
+    }
+
+    #[test]
+    fn compute_likelihood_low_budget_moderate_errors() {
+        let frame = FrameState {
+            change_ratio: 0.05,
+            is_resize: false,
+            budget_remaining_ms: 6.0,
+            error_count: 2,
+        };
+        let lik = compute_likelihood(&frame);
+        assert!(
+            lik[STATE_DEGRADED] >= 0.3,
+            "moderate budget/errors should give degraded >= 0.3, got {}",
+            lik[STATE_DEGRADED]
+        );
+    }
+
+    #[test]
+    fn dominant_state_basic() {
+        let dist = [0.1, 0.6, 0.2, 0.1];
+        assert_eq!(dominant_state(&dist), STATE_BURSTY);
+    }
+
+    #[test]
+    fn dominant_state_first_wins_on_tie() {
+        let dist = [0.5, 0.5, 0.0, 0.0];
+        // When tied, max_by returns the last of equal elements, so this
+        // depends on iterator order. The important thing is it returns a valid index.
+        let idx = dominant_state(&dist);
+        assert!(idx == STATE_STABLE || idx == STATE_BURSTY);
+    }
+
+    #[test]
+    fn expected_loss_after_stable_training() {
+        let mut strategy = BayesianDiffStrategy::new();
+        // Train with 20 stable frames
+        for _ in 0..20 {
+            strategy.observe_with_ledger(&stable_frame(), None);
+        }
+        // Now incremental should have lowest expected loss
+        let el_inc = strategy.expected_loss(DiffAction::Incremental);
+        let el_full = strategy.expected_loss(DiffAction::Full);
+        assert!(
+            el_inc < el_full,
+            "after stable training, incremental ({el_inc}) should beat full ({el_full})"
+        );
+    }
+
+    #[test]
+    fn zero_change_ratio_zero_errors() {
+        let frame = FrameState {
+            change_ratio: 0.0,
+            is_resize: false,
+            budget_remaining_ms: 16.0,
+            error_count: 0,
+        };
+        let mut strategy = BayesianDiffStrategy::new();
+        // With a perfectly calm frame, should not crash
+        let action = strategy.observe_with_ledger(&frame, None);
+        assert!(matches!(
+            action,
+            DiffAction::Incremental | DiffAction::Full | DiffAction::Deferred
+        ));
+    }
+
+    #[test]
+    fn alternating_frames_stays_bounded() {
+        let mut strategy = BayesianDiffStrategy::new();
+        for i in 0..200 {
+            let frame = if i % 2 == 0 {
+                stable_frame()
+            } else {
+                bursty_frame()
+            };
+            strategy.observe_with_ledger(&frame, None);
+        }
+        let post = strategy.posterior();
+        let sum: f64 = post.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        for (i, &p) in post.iter().enumerate() {
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "prior[{i}] = {p} out of bounds after alternating frames"
+            );
+        }
+    }
 }

@@ -1107,4 +1107,250 @@ mod tests {
         assert_eq!(log[0].action_id, "screen:Messages");
         assert_eq!(log[1].action_id, "screen:Threads");
     }
+
+    // ── Additional coverage tests ────────────────────────────────────
+
+    #[test]
+    fn stable_hash64_deterministic() {
+        let step = MacroStep::new("screen:Messages", "Go to Messages");
+        let h1 = step.stable_hash64();
+        let h2 = step.stable_hash64();
+        assert_eq!(h1, h2, "stable_hash64 should be deterministic");
+    }
+
+    #[test]
+    fn stable_hash64_differs_for_different_actions() {
+        let s1 = MacroStep::new("screen:Messages", "Go to Messages");
+        let s2 = MacroStep::new("screen:Threads", "Go to Threads");
+        assert_ne!(s1.stable_hash64(), s2.stable_hash64());
+    }
+
+    #[test]
+    fn stable_hash64_ignores_delay() {
+        let s1 = MacroStep::new("screen:Messages", "Go to Messages").with_delay(0);
+        let s2 = MacroStep::new("screen:Messages", "Go to Messages").with_delay(5000);
+        assert_eq!(s1.stable_hash64(), s2.stable_hash64());
+    }
+
+    #[test]
+    fn stable_hash64_pair_not_commutative() {
+        let h1 = stable_hash64_pair("abc", "def");
+        let h2 = stable_hash64_pair("def", "abc");
+        assert_ne!(h1, h2, "hash should not be commutative");
+    }
+
+    #[test]
+    fn stable_hash64_pair_separator_prevents_concat_collision() {
+        let h1 = stable_hash64_pair("ab", "cd");
+        let h2 = stable_hash64_pair("abc", "d");
+        assert_ne!(h1, h2, "separator should prevent concatenation collisions");
+    }
+
+    #[test]
+    fn playback_state_is_active() {
+        assert!(!PlaybackState::Idle.is_active());
+        assert!(PlaybackState::Playing {
+            name: "t".into(),
+            step: 0,
+            total: 1,
+            mode: PlaybackMode::Continuous,
+        }
+        .is_active());
+        assert!(PlaybackState::Paused {
+            name: "t".into(),
+            step: 0,
+            total: 1,
+        }
+        .is_active());
+        assert!(!PlaybackState::Completed {
+            name: "t".into(),
+            steps_executed: 1,
+        }
+        .is_active());
+        assert!(!PlaybackState::Failed {
+            name: "t".into(),
+            step: 0,
+            reason: "x".into(),
+        }
+        .is_active());
+    }
+
+    #[test]
+    fn recorder_state_is_recording() {
+        assert!(!RecorderState::Idle.is_recording());
+        assert!(RecorderState::Recording { step_count: 0 }.is_recording());
+        assert!(RecorderState::Recording { step_count: 5 }.is_recording());
+    }
+
+    #[test]
+    fn macro_def_empty() {
+        let def = MacroDef::new("empty", vec![]);
+        assert!(def.is_empty());
+        assert_eq!(def.len(), 0);
+    }
+
+    #[test]
+    fn playback_empty_macro_returns_false() {
+        let mut engine = test_engine();
+        // Manually insert an empty macro
+        let def = MacroDef::new("empty", vec![]);
+        engine.macros.insert("empty".to_string(), def);
+
+        assert!(!engine.start_playback("empty", PlaybackMode::Continuous));
+    }
+
+    #[test]
+    fn mark_last_playback_error() {
+        let mut engine = test_engine();
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+        engine.stop_recording("err-test");
+
+        engine.start_playback("err-test", PlaybackMode::Continuous);
+        engine.next_step();
+        engine.mark_last_playback_error("something went wrong");
+
+        let log = engine.playback_log();
+        assert_eq!(
+            log[0].error.as_deref(),
+            Some("something went wrong")
+        );
+    }
+
+    #[test]
+    fn mark_last_playback_error_empty_log_is_noop() {
+        let mut engine = test_engine();
+        // No playback log entries
+        engine.mark_last_playback_error("should not crash");
+        assert!(engine.playback_log().is_empty());
+    }
+
+    #[test]
+    fn fail_playback_when_idle_is_noop() {
+        let mut engine = test_engine();
+        engine.fail_playback("nope");
+        assert_eq!(*engine.playback_state(), PlaybackState::Idle);
+    }
+
+    #[test]
+    fn stop_playback_when_not_active_is_noop() {
+        let mut engine = test_engine();
+        engine.stop_playback();
+        assert_eq!(*engine.playback_state(), PlaybackState::Idle);
+    }
+
+    #[test]
+    fn clear_playback_while_active_is_noop() {
+        let mut engine = test_engine();
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+        engine.stop_recording("active-test");
+
+        engine.start_playback("active-test", PlaybackMode::StepByStep);
+        assert!(engine.playback_state().is_active());
+
+        engine.clear_playback(); // should NOT clear while active
+        assert!(engine.playback_state().is_active());
+    }
+
+    #[test]
+    fn confirm_step_when_not_paused_returns_none() {
+        let mut engine = test_engine();
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+        engine.stop_recording("conf-test");
+
+        // Start in continuous mode — confirm_step should return None
+        engine.start_playback("conf-test", PlaybackMode::Continuous);
+        assert!(engine.confirm_step().is_none());
+    }
+
+    #[test]
+    fn action_ids_constants_nonempty() {
+        assert!(!action_ids::RECORD_START.is_empty());
+        assert!(!action_ids::RECORD_STOP.is_empty());
+        assert!(!action_ids::RECORD_CANCEL.is_empty());
+        assert!(!action_ids::PLAY_PREFIX.is_empty());
+        assert!(!action_ids::PLAY_STEP_PREFIX.is_empty());
+        assert!(!action_ids::DRY_RUN_PREFIX.is_empty());
+        assert!(!action_ids::DELETE_PREFIX.is_empty());
+        assert!(!action_ids::PLAYBACK_STOP.is_empty());
+    }
+
+    #[test]
+    fn sanitize_filename_unicode() {
+        // is_alphanumeric() is true for Unicode letters, so accented/CJK chars survive
+        assert_eq!(sanitize_filename("café"), "café");
+        assert_eq!(sanitize_filename("日本語"), "日本語");
+        // but non-alphanumeric Unicode gets replaced
+        assert_eq!(sanitize_filename("hello…world"), "hello_world");
+    }
+
+    #[test]
+    fn sanitize_filename_empty() {
+        assert_eq!(sanitize_filename(""), "");
+    }
+
+    #[test]
+    fn macro_step_serde_roundtrip() {
+        let step = MacroStep::new("screen:Messages", "Go to Messages").with_delay(1234);
+        let json = serde_json::to_string(&step).unwrap();
+        let back: MacroStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, step);
+    }
+
+    #[test]
+    fn macro_def_serde_roundtrip() {
+        let def = MacroDef::new(
+            "test-macro",
+            vec![
+                MacroStep::new("screen:Messages", "Messages"),
+                MacroStep::new("screen:Threads", "Threads").with_delay(500),
+            ],
+        )
+        .with_description("A test");
+
+        let json = serde_json::to_string_pretty(&def).unwrap();
+        let back: MacroDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test-macro");
+        assert_eq!(back.steps.len(), 2);
+        assert_eq!(back.description.as_deref(), Some("A test"));
+        assert_eq!(back.version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn rename_nonexistent_macro_returns_false() {
+        let mut engine = test_engine();
+        assert!(!engine.rename_macro("nope", "also-nope"));
+    }
+
+    #[test]
+    fn stop_recording_when_not_recording_returns_none() {
+        let mut engine = test_engine();
+        assert!(engine.stop_recording("test").is_none());
+    }
+
+    #[test]
+    fn status_label_playing_step_format() {
+        let state = PlaybackState::Playing {
+            name: "demo".into(),
+            step: 2,
+            total: 5,
+            mode: PlaybackMode::Continuous,
+        };
+        let label = state.status_label().unwrap();
+        assert!(label.contains("3/5"), "expected step 3/5 in '{label}'");
+    }
+
+    #[test]
+    fn status_label_failed_includes_reason() {
+        let state = PlaybackState::Failed {
+            name: "demo".into(),
+            step: 1,
+            reason: "timeout".into(),
+        };
+        let label = state.status_label().unwrap();
+        assert!(label.contains("timeout"));
+        assert!(label.contains("step 2"));
+    }
 }
