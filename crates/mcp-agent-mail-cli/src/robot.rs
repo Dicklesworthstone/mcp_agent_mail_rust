@@ -725,13 +725,13 @@ impl RobotSubcommand {
 
 // ── DB helpers ──────────────────────────────────────────────────────────────
 
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 
 /// Resolve a project by slug or human_key.
 ///
 /// Note: Uses LIKE instead of = for string comparison due to a bug in sqlmodel_sqlite
 /// where parameterized = queries don't match strings correctly.
-fn resolve_project_sync(conn: &SqliteConnection, key: &str) -> Result<(i64, String), CliError> {
+fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliError> {
     // Try slug first (using LIKE for workaround)
     let rows = conn
         .query_sync(
@@ -766,7 +766,7 @@ fn resolve_project_sync(conn: &SqliteConnection, key: &str) -> Result<(i64, Stri
 }
 
 /// Find the project for the current working directory.
-fn find_project_for_cwd(conn: &SqliteConnection) -> Result<(i64, String), CliError> {
+fn find_project_for_cwd(conn: &DbConn) -> Result<(i64, String), CliError> {
     let cwd =
         std::env::current_dir().map_err(|e| CliError::Other(format!("cannot get CWD: {e}")))?;
     let cwd_str = cwd.to_string_lossy().to_string();
@@ -774,7 +774,7 @@ fn find_project_for_cwd(conn: &SqliteConnection) -> Result<(i64, String), CliErr
 }
 
 /// Resolve project from --project flag or CWD.
-fn resolve_project(conn: &SqliteConnection, flag: Option<&str>) -> Result<(i64, String), CliError> {
+fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), CliError> {
     if let Some(key) = flag {
         resolve_project_sync(conn, key)
     } else {
@@ -787,7 +787,7 @@ fn resolve_project(conn: &SqliteConnection, flag: Option<&str>) -> Result<(i64, 
 /// Note: Uses LIKE instead of = for string comparison due to a bug in sqlmodel_sqlite
 /// where parameterized = queries don't match strings correctly.
 fn resolve_agent_id(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     flag: Option<&str>,
 ) -> Option<(i64, String)> {
@@ -826,7 +826,7 @@ fn format_age(seconds: i64) -> String {
 // ── Status command implementation ───────────────────────────────────────────
 
 fn build_status(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     project_slug: &str,
     agent: Option<(i64, String)>,
@@ -1077,7 +1077,7 @@ struct InboxResult {
 
 #[allow(clippy::too_many_arguments)]
 fn build_inbox(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     project_slug: &str,
     agent_id: i64,
@@ -1286,7 +1286,7 @@ impl MarkdownRenderable for ThreadData {
 }
 
 fn build_thread(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     thread_id: &str,
     limit: Option<usize>,
@@ -1428,7 +1428,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 }
 
 fn build_message(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     message_id: i64,
 ) -> Result<MessageContext, CliError> {
@@ -1664,7 +1664,7 @@ struct SearchData {
 }
 
 fn build_search(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     query: &str,
     importance_filter: Option<&str>,
@@ -1833,7 +1833,7 @@ fn format_remaining(seconds: i64) -> String {
 }
 
 fn build_reservations(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     project_slug: &str,
     agent: Option<(i64, String)>,
@@ -1991,7 +1991,7 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 // ── Timeline command implementation ─────────────────────────────────────────
 
 fn build_timeline(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     since: Option<&str>,
     kind_filter: Option<&str>,
@@ -2138,7 +2138,7 @@ fn build_timeline(
 
 // ── Overview command implementation ─────────────────────────────────────────
 
-fn build_overview(conn: &SqliteConnection) -> Result<Vec<OverviewProject>, CliError> {
+fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
 
     let rows = conn
@@ -2215,7 +2215,7 @@ fn build_overview(conn: &SqliteConnection) -> Result<Vec<OverviewProject>, CliEr
 // ── Analytics command implementation ────────────────────────────────────────
 
 fn build_analytics(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     agent: Option<(i64, String)>,
 ) -> Result<Vec<AnomalyCard>, CliError> {
@@ -2390,7 +2390,7 @@ fn build_analytics(
 // ── Agents command implementation ───────────────────────────────────────────
 
 fn build_agents(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     active_only: bool,
     sort_field: Option<&str>,
@@ -2454,7 +2454,7 @@ fn build_agents(
 
 // ── Contacts command implementation ─────────────────────────────────────────
 
-fn build_contacts(conn: &SqliteConnection, project_id: i64) -> Result<Vec<ContactRow>, CliError> {
+fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
 
     let rows = conn
@@ -2497,7 +2497,7 @@ fn build_contacts(conn: &SqliteConnection, project_id: i64) -> Result<Vec<Contac
 
 // ── Projects command implementation ─────────────────────────────────────────
 
-fn build_projects(conn: &SqliteConnection) -> Result<Vec<ProjectRow>, CliError> {
+fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
 
     let rows = conn
@@ -2566,7 +2566,7 @@ enum NavigateResult {
 }
 
 fn build_navigate(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     uri: &str,
     project_id: i64,
     project_slug: &str,

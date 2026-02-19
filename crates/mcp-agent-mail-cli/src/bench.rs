@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use mcp_agent_mail_db::sqlmodel::Value;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -387,7 +387,7 @@ fn db_error(context: &'static str, err: impl std::fmt::Display) -> BenchSeedErro
     }
 }
 
-fn select_project_id(conn: &SqliteConnection) -> Result<Option<i64>, BenchSeedError> {
+fn select_project_id(conn: &DbConn) -> Result<Option<i64>, BenchSeedError> {
     let rows = conn
         .query_sync(
             "SELECT id FROM projects WHERE human_key = ? ORDER BY id ASC LIMIT 1",
@@ -398,7 +398,7 @@ fn select_project_id(conn: &SqliteConnection) -> Result<Option<i64>, BenchSeedEr
 }
 
 fn select_agent_id(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     agent_name: &str,
 ) -> Result<Option<i64>, BenchSeedError> {
@@ -414,7 +414,7 @@ fn select_agent_id(
     Ok(rows.first().and_then(|row| row.get_named("id").ok()))
 }
 
-fn count_project_messages(conn: &SqliteConnection, project_id: i64) -> Result<i64, BenchSeedError> {
+fn count_project_messages(conn: &DbConn, project_id: i64) -> Result<i64, BenchSeedError> {
     let rows = conn
         .query_sync(
             "SELECT COUNT(*) AS count FROM messages WHERE project_id = ?",
@@ -427,7 +427,7 @@ fn count_project_messages(conn: &SqliteConnection, project_id: i64) -> Result<i6
         .unwrap_or(0))
 }
 
-fn ensure_project(conn: &SqliteConnection, now_us: i64) -> Result<i64, BenchSeedError> {
+fn ensure_project(conn: &DbConn, now_us: i64) -> Result<i64, BenchSeedError> {
     if let Some(project_id) = select_project_id(conn)? {
         return Ok(project_id);
     }
@@ -444,7 +444,7 @@ fn ensure_project(conn: &SqliteConnection, now_us: i64) -> Result<i64, BenchSeed
     select_project_id(conn)?.ok_or(BenchSeedError::MissingRow("project"))
 }
 
-fn purge_project_rows(conn: &SqliteConnection, project_id: i64) -> Result<(), BenchSeedError> {
+fn purge_project_rows(conn: &DbConn, project_id: i64) -> Result<(), BenchSeedError> {
     conn.execute_sync(
         "DELETE FROM message_recipients \
          WHERE message_id IN (SELECT id FROM messages WHERE project_id = ?)",
@@ -493,7 +493,7 @@ fn purge_project_rows(conn: &SqliteConnection, project_id: i64) -> Result<(), Be
 }
 
 fn insert_agent(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     agent_name: &str,
     now_us: i64,
@@ -521,7 +521,7 @@ fn insert_agent(
 }
 
 fn insert_message(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     project_id: i64,
     sender_id: i64,
     recipient_id: i64,
@@ -575,7 +575,7 @@ fn insert_message(
 /// This removes the benchmark setup bottleneck caused by repeatedly spawning
 /// CLI subprocesses for project/agent/message creation.
 pub fn seed_bench_database(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     reseed: bool,
 ) -> Result<BenchSeedReport, BenchSeedError> {
     let started = Instant::now();
@@ -1286,7 +1286,7 @@ pub fn fixture_signature(
 mod tests {
     use super::*;
 
-    fn count_with_params(conn: &SqliteConnection, sql: &str, params: &[Value]) -> i64 {
+    fn count_with_params(conn: &DbConn, sql: &str, params: &[Value]) -> i64 {
         conn.query_sync(sql, params)
             .expect("query")
             .first()
@@ -1678,7 +1678,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bench-seed.sqlite3");
         let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite db");
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
 
         let report = seed_bench_database(&conn, false).expect("seed benchmark db");
         assert!(!report.skipped);
@@ -1727,7 +1727,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bench-idempotent.sqlite3");
         let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite db");
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
 
         let first = seed_bench_database(&conn, false).expect("first seed");
         assert!(!first.skipped);
@@ -1751,7 +1751,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bench-reseed.sqlite3");
         let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite db");
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
 
         let initial = seed_bench_database(&conn, false).expect("initial seed");
         let blue_id = select_agent_id(&conn, initial.project_id, BENCH_AGENT_BLUE)
@@ -1797,7 +1797,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bench-existing-project.sqlite3");
         let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite db");
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
 

@@ -1623,6 +1623,8 @@ pub const fn theme_id_env_value(id: ThemeId) -> &'static str {
         ThemeId::LumenLight => "lumen_light",
         ThemeId::NordicFrost => "nordic_frost",
         ThemeId::HighContrast => "high_contrast",
+        ThemeId::Doom => "doom",
+        ThemeId::Quake => "quake",
     }
 }
 

@@ -16,7 +16,7 @@ use mcp_agent_mail_core::disk::{
     is_sqlite_memory_database_url, sqlite_file_path_from_database_url,
 };
 use mcp_agent_mail_db::schema;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -861,7 +861,7 @@ fn run_setup_refresh_once(project_dir: Option<PathBuf>) -> CliResult<()> {
 fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
     use asupersync::runtime::RuntimeBuilder;
 
-    let conn = SqliteConnection::open_file(path.display().to_string())
+    let conn = DbConn::open_file(path.display().to_string())
         .map_err(|e| CliError::Other(format!("cannot open sqlite DB {}: {e}", path.display())))?;
     conn.execute_raw(schema::PRAGMA_SETTINGS_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply PRAGMAs: {e}")))?;
@@ -883,7 +883,7 @@ fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
 }
 
 fn integrity_check_ok(path: &Path) -> CliResult<bool> {
-    let conn = SqliteConnection::open_file(path.display().to_string())
+    let conn = DbConn::open_file(path.display().to_string())
         .map_err(|e| CliError::Other(format!("cannot open sqlite DB {}: {e}", path.display())))?;
     let rows = conn
         .query_sync("PRAGMA integrity_check", &[])
@@ -896,7 +896,7 @@ fn integrity_check_ok(path: &Path) -> CliResult<bool> {
 }
 
 fn query_core_table_counts(path: &Path) -> CliResult<BTreeMap<String, i64>> {
-    let conn = SqliteConnection::open_file(path.display().to_string())
+    let conn = DbConn::open_file(path.display().to_string())
         .map_err(|e| CliError::Other(format!("cannot open sqlite DB {}: {e}", path.display())))?;
     let mut out = BTreeMap::new();
     for table in [
@@ -1146,7 +1146,7 @@ fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
     if !path.exists() {
         return None;
     }
-    let conn = match SqliteConnection::open_file(path.display().to_string()) {
+    let conn = match DbConn::open_file(path.display().to_string()) {
         Ok(v) => v,
         Err(_) => {
             return Some(LegacyDbSignature {
@@ -2122,7 +2122,7 @@ mod tests {
         fs::create_dir_all(&source_storage).unwrap();
         fs::write(source_storage.join(".placeholder"), "legacy-storage-root").unwrap();
 
-        let source_conn = SqliteConnection::open_file(source_db.display().to_string()).unwrap();
+        let source_conn = DbConn::open_file(source_db.display().to_string()).unwrap();
         let source_rows = source_conn
             .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
             .unwrap();
@@ -2166,7 +2166,7 @@ mod tests {
             "expected at least one legacy import receipt file"
         );
 
-        let conn = SqliteConnection::open_file(target_db.display().to_string()).unwrap();
+        let conn = DbConn::open_file(target_db.display().to_string()).unwrap();
         let migration_rows = conn
             .query_sync("SELECT COUNT(*) AS c FROM mcp_agent_mail_migrations", &[])
             .unwrap();
