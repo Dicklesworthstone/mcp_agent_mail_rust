@@ -1,5 +1,9 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
-                              → Ops • Reservations                              
+< 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics · 8♥ System Health >
+Active              Exclusive           Shared              Expired             
+0 ─                 0 ─                 0 ─                 0 ─                 
+ 0 active  0 exclusive  0 shared   Sort: TTL▲                                   
+Agent         │Path Pattern     │Excl  │TTL Remaining           │Project        
+No active reservations.                                                         
                                                                                 
                                                                                 
                                                                                 
@@ -16,9 +20,5 @@
                                                                                 
                                                                                 
                                                                                 
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
- Reservations api up:0m00s                                                    ? 
+0 active │ 0 exclusive │ 0 shared │ 0 expired                                   
+ Reservations api up:0m00s                                          LIVE [^P] ? 

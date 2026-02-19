@@ -1,5 +1,9 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │ 8:System Health ┃       
-                                                  → Ops • Reservations                                                  
+ 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics · 8♥ System Health ╎ 9◷ Timeline · 10▣ Projects 
+Active                        Exclusive                     Shared                        Expired                       
+0 ─                           0 ─                           0 ─                           0 ─                           
+ 0 active  0 exclusive  0 shared   Sort: TTL▲                                                                           
+Agent                │Path Pattern                   │Excl     │TTL Remaining                      │Project             
+No active reservations.                                                                                                 
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -32,9 +36,5 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
- Reservations api up:0m00s          req:0 ok:0 err:0 avg:0ms |  j/k  Navigate reservations           ? Cyberpunk Aurora 
+0 active │ 0 exclusive │ 0 shared │ 0 expired                                                                           
+ Reservations api up:0m00s      req:0 ok:0 err:0 avg:0ms ·  j/k  Navigate reservations     LIVEVE Cyberpunk Aurora [^P] 

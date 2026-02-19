@@ -1,5 +1,8 @@
+Active              Exclusive           Shared              Expired             
+0 ─                 0 ─                 0 ─                 0 ─                 
  0 active  0 exclusive  0 shared   Sort: TTL▲                                   
-Agent         │Path Pattern         │Excl  │TTL Remaining          │Project     
+Agent         │Path Pattern     │Excl  │TTL Remaining           │Project        
+No active reservations.                                                         
                                                                                 
                                                                                 
                                                                                 
@@ -18,7 +21,4 @@ Agent         │Path Pattern         │Excl  │TTL Remaining          │Proj
                                                                                 
                                                                                 
                                                                                 
-                                                                                
-                                                                                
-                                                                                
-                                                                                
+0 active │ 0 exclusive │ 0 shared │ 0 expired                                   
