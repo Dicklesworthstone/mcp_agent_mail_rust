@@ -166,7 +166,7 @@ pub fn patterns_overlap(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::CompiledPattern;
+    use super::*;
 
     #[test]
     fn overlaps_is_symmetric_for_equal_norms() {
@@ -187,5 +187,289 @@ mod tests {
 
         let invalid_same = CompiledPattern::new(" [abc ");
         assert!(invalid.overlaps(&invalid_same));
+    }
+
+    // ── normalize_pattern tests ──────────────────────────────────────
+
+    #[test]
+    fn normalize_strips_dot_slash_prefix() {
+        assert_eq!(normalize_pattern("./src/main.rs"), "src/main.rs");
+        assert_eq!(normalize_pattern("././src/main.rs"), "src/main.rs");
+        assert_eq!(normalize_pattern("./"), "");
+    }
+
+    #[test]
+    fn normalize_converts_backslashes() {
+        assert_eq!(normalize_pattern("src\\lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_pattern("a\\b\\c"), "a/b/c");
+    }
+
+    #[test]
+    fn normalize_strips_leading_slash() {
+        assert_eq!(normalize_pattern("/src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn normalize_trims_whitespace() {
+        assert_eq!(normalize_pattern("  src/main.rs  "), "src/main.rs");
+    }
+
+    #[test]
+    fn normalize_identity_for_clean_paths() {
+        assert_eq!(normalize_pattern("src/main.rs"), "src/main.rs");
+        assert_eq!(normalize_pattern("Cargo.toml"), "Cargo.toml");
+    }
+
+    // ── has_glob_meta tests ──────────────────────────────────────────
+
+    #[test]
+    fn has_glob_meta_detects_metacharacters() {
+        assert!(has_glob_meta("*.rs"));
+        assert!(has_glob_meta("src/**"));
+        assert!(has_glob_meta("file?.txt"));
+        assert!(has_glob_meta("[abc].rs"));
+        assert!(has_glob_meta("{a,b}.rs"));
+    }
+
+    #[test]
+    fn has_glob_meta_false_for_literals() {
+        assert!(!has_glob_meta("src/main.rs"));
+        assert!(!has_glob_meta("Cargo.toml"));
+        assert!(!has_glob_meta(""));
+    }
+
+    // ── CompiledPattern basic tests ──────────────────────────────────
+
+    #[test]
+    fn compiled_pattern_normalized_accessor() {
+        let p = CompiledPattern::new("./src/main.rs");
+        assert_eq!(p.normalized(), "src/main.rs");
+    }
+
+    #[test]
+    fn compiled_pattern_is_glob() {
+        assert!(CompiledPattern::new("src/**").is_glob());
+        assert!(CompiledPattern::new("*.rs").is_glob());
+        assert!(!CompiledPattern::new("src/main.rs").is_glob());
+        assert!(!CompiledPattern::new("Cargo.toml").is_glob());
+    }
+
+    #[test]
+    fn first_literal_segment_with_prefix() {
+        assert_eq!(
+            CompiledPattern::new("src/api/*.rs").first_literal_segment(),
+            Some("src")
+        );
+        assert_eq!(
+            CompiledPattern::new("docs/readme.md").first_literal_segment(),
+            Some("docs")
+        );
+    }
+
+    #[test]
+    fn first_literal_segment_none_for_root_globs() {
+        assert_eq!(CompiledPattern::new("*.rs").first_literal_segment(), None);
+        assert_eq!(CompiledPattern::new("**").first_literal_segment(), None);
+        assert_eq!(
+            CompiledPattern::new("**/*.rs").first_literal_segment(),
+            None
+        );
+    }
+
+    #[test]
+    fn first_literal_segment_single_file() {
+        assert_eq!(
+            CompiledPattern::new("Cargo.toml").first_literal_segment(),
+            Some("Cargo.toml")
+        );
+    }
+
+    // ── CompiledPattern::matches tests ───────────────────────────────
+
+    #[test]
+    fn matches_glob_against_path() {
+        let p = CompiledPattern::new("src/**/*.rs");
+        assert!(p.matches("src/main.rs"));
+        assert!(p.matches("src/db/schema.rs"));
+        assert!(!p.matches("docs/readme.md"));
+    }
+
+    #[test]
+    fn matches_exact_path() {
+        let p = CompiledPattern::new("src/main.rs");
+        assert!(p.matches("src/main.rs"));
+        assert!(!p.matches("src/lib.rs"));
+    }
+
+    #[test]
+    fn matches_returns_false_for_invalid_glob() {
+        let p = CompiledPattern::new("[abc");
+        assert!(!p.matches("abc"));
+    }
+
+    // ── CompiledPattern::overlaps tests ──────────────────────────────
+
+    #[test]
+    fn overlaps_exact_same_path() {
+        let a = CompiledPattern::new("src/main.rs");
+        let b = CompiledPattern::new("src/main.rs");
+        assert!(a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_exact_different_paths() {
+        let a = CompiledPattern::new("src/main.rs");
+        let b = CompiledPattern::new("src/lib.rs");
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_glob_contains_exact() {
+        let glob = CompiledPattern::new("src/**");
+        let exact = CompiledPattern::new("src/main.rs");
+        assert!(glob.overlaps(&exact));
+        assert!(exact.overlaps(&glob));
+    }
+
+    #[test]
+    fn overlaps_disjoint_globs_different_prefix() {
+        let a = CompiledPattern::new("src/*.rs");
+        let b = CompiledPattern::new("docs/*.md");
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_conservative_for_intersecting_globs() {
+        // Both globs in same directory, conservative heuristic returns true
+        let a = CompiledPattern::new("src/a*");
+        let b = CompiledPattern::new("src/*b");
+        assert!(a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_recursive_glob_always_overlaps() {
+        let a = CompiledPattern::new("src/**/*.rs");
+        let b = CompiledPattern::new("src/**/*.txt");
+        // ** triggers conservative overlap assumption
+        assert!(a.overlaps(&b));
+    }
+
+    // ── segments_overlap tests ───────────────────────────────────────
+
+    #[test]
+    fn segments_overlap_recursive_fast_path() {
+        assert!(segments_overlap("src/**", "src/main.rs"));
+        assert!(segments_overlap("**/*.rs", "src/*.rs"));
+    }
+
+    #[test]
+    fn segments_overlap_different_depth() {
+        // Different segment counts without ** → disjoint
+        assert!(!segments_overlap("src/*.rs", "src/deep/nested/*.rs"));
+    }
+
+    #[test]
+    fn segments_overlap_same_depth_disjoint_literal() {
+        // Same depth, but different literal segments
+        assert!(!segments_overlap("src/alpha/*.rs", "docs/beta/*.rs"));
+    }
+
+    #[test]
+    fn segments_overlap_same_depth_matching() {
+        // Same depth, all segments compatible
+        assert!(segments_overlap("src/*.rs", "src/*.txt"));
+    }
+
+    // ── segment_pair_overlaps tests ──────────────────────────────────
+
+    #[test]
+    fn segment_pair_both_equal() {
+        assert!(segment_pair_overlaps("src", "src"));
+    }
+
+    #[test]
+    fn segment_pair_both_globs_conservative() {
+        assert!(segment_pair_overlaps("*.rs", "*.txt"));
+    }
+
+    #[test]
+    fn segment_pair_glob_matches_literal() {
+        assert!(segment_pair_overlaps("*.rs", "main.rs"));
+        assert!(segment_pair_overlaps("main.rs", "*.rs"));
+    }
+
+    #[test]
+    fn segment_pair_glob_no_match_literal() {
+        assert!(!segment_pair_overlaps("*.rs", "readme.md"));
+        assert!(!segment_pair_overlaps("readme.md", "*.rs"));
+    }
+
+    #[test]
+    fn segment_pair_both_literal_unequal() {
+        assert!(!segment_pair_overlaps("src", "docs"));
+    }
+
+    // ── patterns_overlap convenience function ────────────────────────
+
+    #[test]
+    fn patterns_overlap_convenience_fn() {
+        assert!(patterns_overlap("src/**", "src/main.rs"));
+        assert!(!patterns_overlap("src/*.rs", "docs/*.md"));
+        assert!(patterns_overlap("./src/main.rs", "src/main.rs"));
+    }
+
+    // ── edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn empty_pattern() {
+        let p = CompiledPattern::new("");
+        assert_eq!(p.normalized(), "");
+        assert!(!p.is_glob());
+        assert_eq!(p.first_literal_segment(), None);
+    }
+
+    #[test]
+    fn overlaps_self() {
+        let p = CompiledPattern::new("src/**/*.rs");
+        assert!(p.overlaps(&p));
+    }
+
+    #[test]
+    fn star_glob_single_level() {
+        // *.rs should not match nested paths (literal_separator = true)
+        let p = CompiledPattern::new("*.rs");
+        assert!(p.matches("main.rs"));
+        assert!(!p.matches("src/main.rs"));
+    }
+
+    #[test]
+    fn question_mark_glob() {
+        let p = CompiledPattern::new("file?.txt");
+        assert!(p.matches("file1.txt"));
+        assert!(p.matches("fileA.txt"));
+        assert!(!p.matches("file12.txt"));
+    }
+
+    #[test]
+    fn brace_expansion_glob() {
+        let p = CompiledPattern::new("src/*.{rs,toml}");
+        assert!(p.matches("src/main.rs"));
+        assert!(p.matches("src/Cargo.toml"));
+        assert!(!p.matches("src/readme.md"));
+    }
+
+    #[test]
+    fn compiled_pattern_debug_impl() {
+        let p = CompiledPattern::new("src/**");
+        let debug = format!("{p:?}");
+        assert!(debug.contains("src/**"));
+    }
+
+    #[test]
+    fn compiled_pattern_clone() {
+        let p = CompiledPattern::new("src/**/*.rs");
+        let cloned = p.clone();
+        assert_eq!(cloned.normalized(), p.normalized());
+        assert_eq!(cloned.is_glob(), p.is_glob());
     }
 }

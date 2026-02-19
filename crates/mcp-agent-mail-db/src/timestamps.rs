@@ -358,6 +358,59 @@ mod tests {
     }
 
     #[test]
+    fn iso_to_micros_rfc3339_with_offset() {
+        // RFC 3339 with +00:00 offset
+        let micros = iso_to_micros("2024-01-01T00:00:00+00:00").unwrap();
+        assert_eq!(micros, 1_704_067_200_000_000);
+    }
+
+    #[test]
+    fn iso_to_micros_without_timezone() {
+        // Bare datetime without Z or offset
+        let micros = iso_to_micros("2024-01-01T00:00:00").unwrap();
+        assert_eq!(micros, 1_704_067_200_000_000);
+    }
+
+    #[test]
+    fn iso_to_micros_invalid_returns_none() {
+        assert!(iso_to_micros("not-a-date").is_none());
+        assert!(iso_to_micros("").is_none());
+        assert!(iso_to_micros("2024-13-01T00:00:00Z").is_none()); // month 13
+    }
+
+    #[test]
+    fn micros_to_iso_roundtrip_precision() {
+        let original = 1_704_067_200_123_456_i64; // 2024-01-01 + 123456 us
+        let iso = micros_to_iso(original);
+        let back = iso_to_micros(&iso).unwrap();
+        assert_eq!(
+            back, original,
+            "ISO roundtrip should preserve microsecond precision"
+        );
+    }
+
+    #[test]
+    fn clock_skew_metrics_default() {
+        let m = ClockSkewMetrics::default();
+        assert_eq!(m.backward_jumps, 0);
+        assert_eq!(m.forward_jumps, 0);
+        assert_eq!(m.last_system_time_us, 0);
+    }
+
+    #[test]
+    fn clock_skew_metrics_clone_debug() {
+        let m = ClockSkewMetrics {
+            backward_jumps: 1,
+            forward_jumps: 2,
+            last_system_time_us: 3,
+        };
+        let cloned = m.clone();
+        assert_eq!(cloned.backward_jumps, 1);
+        let debug = format!("{m:?}");
+        assert!(debug.contains("backward_jumps"));
+    }
+
+    #[test]
     fn small_backward_drift_allowed() {
         let _guard = skew_test_guard();
         clock_skew_reset();

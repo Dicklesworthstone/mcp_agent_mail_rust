@@ -311,6 +311,70 @@ mod tests {
         );
     }
 
+    /// Constant data should produce a zero-width (or near-zero) interval.
+    #[test]
+    fn conformal_constant_data_narrow_interval() {
+        let mut predictor = ConformalPredictor::new(100, 0.90);
+        for _ in 0..50 {
+            predictor.observe(42.0);
+        }
+        let interval = predictor.predict().unwrap();
+        let width = interval.upper - interval.lower;
+        assert!(
+            width < 1e-10,
+            "constant data should produce near-zero-width interval, got width={width}"
+        );
+    }
+
+    /// `empirical_coverage()` returns None before any predictions are made.
+    #[test]
+    fn conformal_empirical_coverage_none_before_predictions() {
+        let predictor = ConformalPredictor::new(100, 0.90);
+        assert!(predictor.empirical_coverage().is_none());
+    }
+
+    /// `calibration_size()` and `total_observations()` getters.
+    #[test]
+    fn conformal_getters() {
+        let mut predictor = ConformalPredictor::new(50, 0.90);
+        assert_eq!(predictor.calibration_size(), 0);
+        assert_eq!(predictor.total_observations(), 0);
+
+        for i in 0..75 {
+            predictor.observe(f64::from(i));
+        }
+        assert_eq!(predictor.calibration_size(), 50); // capped at window
+        assert_eq!(predictor.total_observations(), 75);
+    }
+
+    /// `PredictionInterval` Debug and Clone derives.
+    #[test]
+    fn prediction_interval_debug_clone() {
+        let mut predictor = ConformalPredictor::new(100, 0.95);
+        for i in 0..40 {
+            predictor.observe(f64::from(i));
+        }
+        let interval = predictor.predict().unwrap();
+        let cloned = interval.clone();
+        assert!((cloned.coverage - interval.coverage).abs() < f64::EPSILON);
+        assert_eq!(cloned.calibration_size, interval.calibration_size);
+        let debug = format!("{interval:?}");
+        assert!(debug.contains("coverage"));
+    }
+
+    /// Median with even-count window.
+    #[test]
+    fn conformal_even_calibration_count() {
+        let mut predictor = ConformalPredictor::new(100, 0.90);
+        // Feed exactly 30 values (even count)
+        for i in 0..30 {
+            predictor.observe(f64::from(i));
+        }
+        let interval = predictor.predict().unwrap();
+        assert_eq!(interval.calibration_size, 30);
+        assert!(interval.lower < interval.upper);
+    }
+
     /// Coverage holds for heavy-tailed data when presented in shuffled
     /// (approximately exchangeable) order.
     /// Conformal prediction is distribution-free for exchangeable data.
@@ -328,7 +392,7 @@ mod tests {
                 // but well-distributed value.
                 let h = (i as u64).wrapping_mul(2_654_435_761).wrapping_add(13) % 10000;
                 let u = (h as f64 + 0.5) / 10001.0; // (0, 1)
-                // Map through tan for heavy tails, but clamp to avoid infinity.
+                                                    // Map through tan for heavy tails, but clamp to avoid infinity.
                 let angle = (u - 0.5) * std::f64::consts::PI * 0.95;
                 angle.tan()
             })
