@@ -18,6 +18,9 @@
 - [x] Enable pre-push hook installation in `mcp-agent-mail-guard` and `mcp-agent-mail-tools` (restoring legacy parity).
 - [x] Fix `budget_deadline_is_relative_to_wall_now_not_absolute` test logic error in `mcp-agent-mail-server` to correctly use `saturating_duration_since`.
 - [x] Fix `handle_guard` in `mcp-agent-mail-cli` to correctly pass `prepush` flags to `install_guard`.
+- [x] Hardened `tui_ws_input` in `mcp-agent-mail-server` against DoS by truncating large key events.
+- [x] Improved `send_message` error clarity for empty broadcast results in `mcp-agent-mail-tools`.
+- [x] Hardened `force_release_file_reservation` in `mcp-agent-mail-tools` by truncating large note payloads.
 
 ## Pending
 - None identified.
@@ -27,3 +30,4 @@
 - `release_reservations` DB query now returns `Vec<FileReservationRow>` (using `RETURNING`) to enable precise artifact updates.
 - `send_message` broadcast now gracefully handles mixed contact policies by dropping restricted recipients.
 - Pre-push hooks are now installed by default via `install_precommit_guard` tool and `am guard install`.
+- TUI input and reservation notes are now capped at 4KB to prevent OOM/DB bloat vectors.
