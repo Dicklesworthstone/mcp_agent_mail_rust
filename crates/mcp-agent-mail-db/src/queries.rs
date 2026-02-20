@@ -4796,7 +4796,7 @@ pub async fn list_product_projects(
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT p.* FROM projects p \
+    let sql = "SELECT p.id, p.slug, p.human_key, p.created_at FROM projects p \
                JOIN product_project_links ppl ON ppl.project_id = p.id \
                WHERE ppl.product_id = ?";
     let params = [Value::BigInt(product_id)];

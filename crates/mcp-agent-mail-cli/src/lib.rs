@@ -5547,7 +5547,7 @@ fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
         .build()
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
 
-    let outcome = rt.block_on(async { schema::migrate_to_latest(&cx, &conn).await });
+    let outcome = rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await });
 
     match outcome {
         asupersync::Outcome::Ok(_) => {

@@ -870,7 +870,7 @@ fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
     let rt = RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
-    match rt.block_on(async { schema::migrate_to_latest(&cx, &conn).await }) {
+    match rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await }) {
         asupersync::Outcome::Ok(ids) => Ok(ids),
         asupersync::Outcome::Err(e) => Err(CliError::Other(format!("migration failed: {e}"))),
         asupersync::Outcome::Cancelled(r) => {
