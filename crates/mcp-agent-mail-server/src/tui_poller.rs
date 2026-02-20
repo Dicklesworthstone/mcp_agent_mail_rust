@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::sqlmodel_core::{Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
 
 use crate::tui_bridge::TuiSharedState;
@@ -37,13 +38,20 @@ const MAX_RESERVATIONS: usize = 1000;
 /// Maximum silent interval before a heartbeat `HealthPulse` is emitted.
 const HEALTH_PULSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// `SQLite` predicate for active reservations across legacy sentinel values.
+///
+/// NOTE: we avoid `NOT GLOB '*[^0-9.+-]*'` because FrankenConnection's parser
+/// does not support negated character classes inside GLOB patterns.  Instead we
+/// strip all valid numeric characters via nested REPLACE and check the remainder
+/// is empty, which achieves the same "string contains only [0-9.+-]" test.
 const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
     OR (typeof(released_ts) IN ('integer', 'real') AND released_ts <= 0) \
     OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none')) \
     OR (typeof(released_ts) = 'text' \
       AND length(trim(released_ts)) > 0 \
       AND trim(released_ts) GLOB '*[0-9]*' \
-      AND trim(released_ts) NOT GLOB '*[^0-9.+-]*' \
+      AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(\
+            trim(released_ts),\
+            '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' \
       AND CAST(trim(released_ts) AS REAL) <= 0)";
 
 /// Batched aggregate counters used to populate [`DbStatSnapshot`].
@@ -441,6 +449,10 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
     // Use a subquery to pre-filter active reservations so the complex
     // ACTIVE_RESERVATION_PREDICATE runs in a simple context (FrankenConnection
     // evaluates it incorrectly when combined with CASE/WHEN in the SELECT).
+    //
+    // Return raw created_ts / expires_ts and convert to micros in Rust, because
+    // FrankenConnection does not support strftime / negated GLOB character
+    // classes needed for the SQL-side timestamp conversion.
     let sql = format!(
         "SELECT \
            fr.id, \
@@ -448,43 +460,13 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
            COALESCE(a.name, '[unknown-agent]') AS agent_name, \
            fr.path_pattern, \
            fr.\"exclusive\", \
-           CASE \
-             WHEN fr.created_ts IS NULL THEN 0 \
-             WHEN typeof(fr.created_ts) IN ('integer', 'real') THEN CAST(fr.created_ts AS INTEGER) \
-             WHEN typeof(fr.created_ts) = 'text' \
-               AND length(trim(fr.created_ts)) > 0 \
-               AND trim(fr.created_ts) NOT GLOB '*[^0-9]*' THEN CAST(trim(fr.created_ts) AS INTEGER) \
-             WHEN typeof(fr.created_ts) = 'text' THEN COALESCE( \
-               CAST(strftime('%s', fr.created_ts) AS INTEGER) * 1000000 + \
-                 CASE \
-                   WHEN instr(fr.created_ts, '.') > 0 THEN CAST(substr(fr.created_ts || '000000', instr(fr.created_ts, '.') + 1, 6) AS INTEGER) \
-                   ELSE 0 \
-                 END, \
-               0 \
-             ) \
-             ELSE 0 \
-           END AS created_ts_micros, \
-           CASE \
-             WHEN fr.expires_ts IS NULL THEN 0 \
-             WHEN typeof(fr.expires_ts) IN ('integer', 'real') THEN CAST(fr.expires_ts AS INTEGER) \
-             WHEN typeof(fr.expires_ts) = 'text' \
-               AND length(trim(fr.expires_ts)) > 0 \
-               AND trim(fr.expires_ts) NOT GLOB '*[^0-9]*' THEN CAST(trim(fr.expires_ts) AS INTEGER) \
-             WHEN typeof(fr.expires_ts) = 'text' THEN COALESCE( \
-               CAST(strftime('%s', fr.expires_ts) AS INTEGER) * 1000000 + \
-                 CASE \
-                   WHEN instr(fr.expires_ts, '.') > 0 THEN CAST(substr(fr.expires_ts || '000000', instr(fr.expires_ts, '.') + 1, 6) AS INTEGER) \
-                   ELSE 0 \
-                 END, \
-               0 \
-             ) \
-             ELSE 0 \
-           END AS expires_ts_micros \
+           fr.created_ts AS raw_created_ts, \
+           fr.expires_ts AS raw_expires_ts \
          FROM file_reservations fr \
          LEFT JOIN projects p ON p.id = fr.project_id \
          LEFT JOIN agents a ON a.id = fr.agent_id \
          WHERE fr.id IN (SELECT id FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})) \
-         ORDER BY expires_ts_micros ASC \
+         ORDER BY fr.expires_ts ASC \
          LIMIT {MAX_RESERVATIONS}"
     );
 
@@ -520,8 +502,8 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
                     .get_named::<i64>("exclusive")
                     .ok()
                     .is_none_or(|value| value != 0),
-                granted_ts: row.get_named::<i64>("created_ts_micros").ok().unwrap_or(0),
-                expires_ts: row.get_named::<i64>("expires_ts_micros").ok().unwrap_or(0),
+                granted_ts: parse_raw_ts(&row, "raw_created_ts"),
+                expires_ts: parse_raw_ts(&row, "raw_expires_ts"),
                 released_ts: None,
             })
         })
