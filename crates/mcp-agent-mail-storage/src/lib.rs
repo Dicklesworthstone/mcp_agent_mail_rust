@@ -802,7 +802,12 @@ impl FileLock {
                     return Ok(());
                 }
                 Err(_) => {
-                    // Lock held by another process
+                    // Lock held by another process - check for stale owner first.
+                    if self.cleanup_if_stale()? {
+                        // Stale lock cleaned up; retry immediately without backoff.
+                        continue;
+                    }
+
                     if attempt >= self.max_retries {
                         break;
                     }
@@ -879,6 +884,90 @@ impl FileLock {
         {
             Ok(true)
         }
+    }
+
+    /// Check whether this lock artifact is stale and remove it when safe.
+    ///
+    /// Safety rules:
+    /// - Never remove a lock file unless we can first acquire an exclusive flock
+    ///   on the current inode (prevents deleting an actively-held lock).
+    /// - Consider stale when owner PID is dead, or lock age exceeds `stale_timeout`
+    ///   (when `stale_timeout > 0`).
+    /// - Return `Ok(false)` for benign races/permission issues so callers can retry.
+    fn cleanup_if_stale(&self) -> Result<bool> {
+        use fs2::FileExt;
+
+        if !self.path.exists() {
+            return Ok(false);
+        }
+
+        let file = match fs::OpenOptions::new().write(true).open(&self.path) {
+            Ok(f) => f,
+            Err(_) => return Ok(false),
+        };
+        if file.try_lock_exclusive().is_err() {
+            return Ok(false);
+        }
+
+        // Ensure we are still looking at the same file currently mounted at `self.path`.
+        if !self.verify_lock_identity(&file)? {
+            let _ = file.unlock();
+            return Ok(false);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        let meta = if self.metadata_path.exists() {
+            fs::read_to_string(&self.metadata_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<LockOwnerMeta>(&s).ok())
+        } else {
+            None
+        };
+
+        let owner_alive = meta.as_ref().map(|m| pid_alive(m.pid)).unwrap_or(false);
+        let age = meta.as_ref().map(|m| now - m.created_ts).or_else(|| {
+            fs::metadata(&self.path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| now - d.as_secs_f64())
+        });
+
+        let is_stale = if !owner_alive {
+            true
+        } else if self.stale_timeout.is_zero() {
+            false
+        } else {
+            age.is_some_and(|a| a >= self.stale_timeout.as_secs_f64())
+        };
+
+        if !is_stale {
+            let _ = file.unlock();
+            return Ok(false);
+        }
+
+        // Try removing while lock is held (best race safety).
+        let removed = match fs::remove_file(&self.path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Windows can require closing/unlocking first before unlinking.
+                let _ = file.unlock();
+                drop(file);
+                fs::remove_file(&self.path).is_ok()
+            }
+            Err(_) => false,
+        };
+
+        if removed {
+            let _ = fs::remove_file(&self.metadata_path);
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
 

@@ -137,14 +137,14 @@ fn relativize_path(project_root: &str, path: &str) -> Option<String> {
     // Check for traversal in relative path
     let mut depth = 0;
     for component in path_path.components() {
-        match std::path::Component::ParentDir {
-            _ if component == std::path::Component::ParentDir => {
+        match component {
+            std::path::Component::ParentDir => {
                 depth -= 1;
                 if depth < 0 {
                     return None; // Traversal above root
                 }
             }
-            _ if matches!(component, std::path::Component::Normal(_)) => {
+            std::path::Component::Normal(_) => {
                 depth += 1;
             }
             _ => {}

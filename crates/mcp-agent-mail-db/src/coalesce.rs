@@ -255,7 +255,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
         E: fmt::Display,
     {
         enum Role<V> {
-            Leader,
+            Leader(Arc<Slot<V>>),
             Joiner(Arc<Slot<V>>),
         }
 
@@ -278,7 +278,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                     }
                 }
                 map.insert(key.clone(), Arc::clone(&slot));
-                Role::Leader
+                Role::Leader(slot)
             }
         };
 
@@ -316,7 +316,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                     }
                 }
             }
-            Role::Leader => {
+            Role::Leader(slot) => {
                 mcp_agent_mail_core::evidence_ledger().record(
                     "coalesce.outcome",
                     serde_json::json!({ "inflight_count": inflight_count }),
@@ -326,43 +326,39 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                     "coalesce_v1",
                 );
                 self.leader_count.fetch_add(1, Ordering::Relaxed);
-                // Retrieve our slot (we just inserted it).
-                let slot = {
-                    self.shards[shard_idx]
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(&key)
-                        .cloned()
-                };
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
                 match result {
                     Ok(result) => {
                         // Broadcast result to any joiners.
-                        if let Some(slot) = slot {
-                            match &result {
-                                Ok(v) => slot.complete_ok(v),
-                                Err(e) => slot.complete_err(e.to_string()),
-                            }
+                        match &result {
+                            Ok(v) => slot.complete_ok(v),
+                            Err(e) => slot.complete_err(e.to_string()),
                         }
 
-                        // Remove from in-flight map.
-                        self.shards[shard_idx]
+                        // Remove from in-flight map only if it hasn't been replaced.
+                        let mut map = self.shards[shard_idx]
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&key);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(existing) = map.get(&key) {
+                            if Arc::ptr_eq(existing, &slot) {
+                                map.remove(&key);
+                            }
+                        }
 
                         result.map(CoalesceOutcome::Executed)
                     }
                     Err(payload) => {
-                        if let Some(slot) = slot {
-                            slot.complete_err(panic_payload_message(payload.as_ref()));
-                        }
-                        self.shards[shard_idx]
+                        slot.complete_err(panic_payload_message(payload.as_ref()));
+                        let mut map = self.shards[shard_idx]
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&key);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(existing) = map.get(&key) {
+                            if Arc::ptr_eq(existing, &slot) {
+                                map.remove(&key);
+                            }
+                        }
                         std::panic::resume_unwind(payload);
                     }
                 }
