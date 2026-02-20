@@ -729,8 +729,7 @@ use mcp_agent_mail_db::DbConn;
 
 /// Resolve a project by slug or human_key.
 ///
-/// Note: Uses LIKE instead of = for string comparison due to a bug in sqlmodel_sqlite
-/// where parameterized = queries don't match strings correctly.
+/// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
 fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliError> {
     // Try slug first (using LIKE for workaround)
     let rows = conn
@@ -784,8 +783,7 @@ fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), C
 
 /// Resolve agent ID from --agent flag or AGENT_NAME env.
 ///
-/// Note: Uses LIKE instead of = for string comparison due to a bug in sqlmodel_sqlite
-/// where parameterized = queries don't match strings correctly.
+/// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
 fn resolve_agent_id(
     conn: &DbConn,
     project_id: i64,
