@@ -1030,36 +1030,12 @@ effective_free_bytes={free}"
 
     let broadcast = broadcast.unwrap_or(false);
     if broadcast {
-        if to.iter().any(|name| !name.trim().is_empty()) {
-            return Err(legacy_tool_error(
-                "INVALID_ARGUMENT",
-                "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
-                true,
-                json!({ "argument": "broadcast" }),
-            ));
-        }
-
-        let cutoff = mcp_agent_mail_db::now_micros() - THIRTY_DAYS_MICROS;
-        let sender_lower = sender_name.trim().to_ascii_lowercase();
-        let eligible = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-        )?;
-        to = eligible
-            .into_iter()
-            .filter(|agent| {
-                !agent.name.trim().is_empty()
-                    && agent.last_active_ts > cutoff
-                    && agent.name.to_ascii_lowercase() != sender_lower
-                    && !agent.contact_policy.eq_ignore_ascii_case("block_all")
-            })
-            .map(|agent| agent.name)
-            .collect();
-
-        if to.is_empty() {
-            tracing::warn!(
-                "[warn] Broadcast: no eligible recipients found (sender is the only active agent)."
-            );
-        }
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Broadcast messaging is not supported. Please address recipients individually.",
+            true,
+            json!({ "argument": "broadcast" }),
+        ));
     }
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
@@ -1089,21 +1065,13 @@ effective_free_bytes={free}"
     let bcc_list = bcc.unwrap_or_default();
 
     if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() {
-        let msg = if broadcast {
-            format!(
-                "Broadcast found no eligible active recipients (sender excluded). Check active agents via `resource://agents/{project_key}`."
-            )
-        } else {
-            "At least one recipient is required. Provide agent names in to, cc, or bcc.".to_string()
-        };
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
-            &msg,
+            "At least one recipient is required. Provide agent names in to, cc, or bcc.",
             true,
             json!({
                 "field": "to|cc|bcc",
                 "error_detail": "empty recipient list",
-                "broadcast": broadcast,
             }),
         ));
     }

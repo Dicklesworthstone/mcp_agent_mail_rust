@@ -105,6 +105,13 @@ pub fn verify_bundle(
         });
     }
 
+    let meta = std::fs::metadata(&manifest_path)?;
+    if meta.len() > 10 * 1024 * 1024 {
+        return Err(ShareError::ManifestParse {
+            message: "manifest.json too large (>10MB)".to_string(),
+        });
+    }
+
     let manifest_bytes = std::fs::read(&manifest_path)?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&manifest_bytes).map_err(|e| ShareError::ManifestParse {

@@ -371,6 +371,11 @@ struct SuiteExecution {
 
 impl Runner {
     const NATIVE_HTTP_SUITE: &'static str = "http";
+    const NATIVE_HTTP_STREAMABLE_SUITE: &'static str = "http_streamable";
+    const NATIVE_MCP_API_PARITY_SUITE: &'static str = "mcp_api_parity";
+    const NATIVE_SHARE_SUITE: &'static str = "share";
+    const NATIVE_SHARE_VERIFY_LIVE_SUITE: &'static str = "share_verify_live";
+    const NATIVE_ARCHIVE_SUITE: &'static str = "archive";
     const NATIVE_DUAL_MODE_SUITE: &'static str = "dual_mode";
     const NATIVE_MODE_MATRIX_SUITE: &'static str = "mode_matrix";
     const NATIVE_SECURITY_PRIVACY_SUITE: &'static str = "security_privacy";
@@ -446,8 +451,16 @@ impl Runner {
     /// Runs a single suite.
     fn run_suite(&self, suite: &Suite) -> SuiteResult {
         if Self::is_native_suite(&suite.name) {
-            return if suite.name == Self::NATIVE_HTTP_SUITE {
+            return if suite.name == Self::NATIVE_HTTP_SUITE
+                || suite.name == Self::NATIVE_HTTP_STREAMABLE_SUITE
+                || suite.name == Self::NATIVE_MCP_API_PARITY_SUITE
+            {
                 self.run_native_http_suite(suite)
+            } else if suite.name == Self::NATIVE_SHARE_SUITE
+                || suite.name == Self::NATIVE_SHARE_VERIFY_LIVE_SUITE
+                || suite.name == Self::NATIVE_ARCHIVE_SUITE
+            {
+                self.run_native_share_archive_suite(suite)
             } else if suite.name == Self::NATIVE_MODE_MATRIX_SUITE {
                 self.run_native_mode_matrix_suite(suite)
             } else if suite.name == Self::NATIVE_SECURITY_PRIVACY_SUITE {
@@ -609,6 +622,11 @@ impl Runner {
 
     fn is_native_suite(name: &str) -> bool {
         name == Self::NATIVE_HTTP_SUITE
+            || name == Self::NATIVE_HTTP_STREAMABLE_SUITE
+            || name == Self::NATIVE_MCP_API_PARITY_SUITE
+            || name == Self::NATIVE_SHARE_SUITE
+            || name == Self::NATIVE_SHARE_VERIFY_LIVE_SUITE
+            || name == Self::NATIVE_ARCHIVE_SUITE
             || name == Self::NATIVE_DUAL_MODE_SUITE
             || name == Self::NATIVE_MODE_MATRIX_SUITE
             || name == Self::NATIVE_SECURITY_PRIVACY_SUITE
@@ -636,6 +654,7 @@ impl Runner {
         for (key, value) in &self.config.env {
             cmd.env(key, value);
         }
+        cmd.env("AM_HTTP_HARNESS_SUITE", &suite.name);
         cmd.env("AM_E2E_HTTP_REQUIRE_PASS", "1");
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_HTTP_ARTIFACT_DIR", artifact_root);
@@ -673,6 +692,74 @@ impl Runner {
                 duration_ms: elapsed.as_millis() as u64,
                 stdout: String::new(),
                 stderr: format!("Failed to execute native http suite: {error}"),
+                assertions_passed: 0,
+                assertions_failed: 1,
+                assertions_skipped: 0,
+                started_at: started_at.to_rfc3339(),
+                ended_at: ended_at.to_rfc3339(),
+            },
+        }
+    }
+
+    fn run_native_share_archive_suite(&self, suite: &Suite) -> SuiteResult {
+        let started_at = Utc::now();
+        let start_instant = Instant::now();
+
+        let mut cmd = Command::new("cargo");
+        cmd.args([
+            "test",
+            "-p",
+            "mcp-agent-mail-cli",
+            "--test",
+            "share_archive_harness",
+            "--",
+            "--nocapture",
+        ]);
+        cmd.current_dir(&self.config.project_root);
+        if self.config.keep_tmp {
+            cmd.env("AM_E2E_KEEP_TMP", "1");
+        }
+        for (key, value) in &self.config.env {
+            cmd.env(key, value);
+        }
+        cmd.env("AM_SHARE_ARCHIVE_HARNESS_SUITE", &suite.name);
+        cmd.env("AM_E2E_SHARE_ARCHIVE_REQUIRE_PASS", "1");
+        if let Some(artifact_root) = &self.config.artifact_dir {
+            cmd.env("AM_SHARE_ARCHIVE_ARTIFACT_DIR", artifact_root);
+        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let output = cmd.output();
+        let elapsed = start_instant.elapsed();
+        let ended_at = Utc::now();
+
+        match output {
+            Ok(output) => {
+                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
+                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
+                let passed = output.status.success();
+                SuiteResult {
+                    name: suite.name.clone(),
+                    passed,
+                    exit_code: output.status.code().unwrap_or(-1),
+                    duration_ms: elapsed.as_millis() as u64,
+                    stdout,
+                    stderr,
+                    assertions_passed: if passed { 1 } else { 0 },
+                    assertions_failed: if passed { 0 } else { 1 },
+                    assertions_skipped: 0,
+                    started_at: started_at.to_rfc3339(),
+                    ended_at: ended_at.to_rfc3339(),
+                }
+            }
+            Err(error) => SuiteResult {
+                name: suite.name.clone(),
+                passed: false,
+                exit_code: -1,
+                duration_ms: elapsed.as_millis() as u64,
+                stdout: String::new(),
+                stderr: format!("Failed to execute native share/archive suite: {error}"),
                 assertions_passed: 0,
                 assertions_failed: 1,
                 assertions_skipped: 0,
@@ -2046,6 +2133,11 @@ exit 1
     #[test]
     fn test_native_suite_detection_matches_enabled_native_suites() {
         assert!(Runner::is_native_suite("http"));
+        assert!(Runner::is_native_suite("http_streamable"));
+        assert!(Runner::is_native_suite("mcp_api_parity"));
+        assert!(Runner::is_native_suite("share"));
+        assert!(Runner::is_native_suite("share_verify_live"));
+        assert!(Runner::is_native_suite("archive"));
         assert!(Runner::is_native_suite("dual_mode"));
         assert!(Runner::is_native_suite("mode_matrix"));
         assert!(Runner::is_native_suite("security_privacy"));
@@ -2667,6 +2759,11 @@ exit 1
     #[test]
     fn native_suite_constants_match_is_native_suite() {
         assert_eq!(Runner::NATIVE_HTTP_SUITE, "http");
+        assert_eq!(Runner::NATIVE_HTTP_STREAMABLE_SUITE, "http_streamable");
+        assert_eq!(Runner::NATIVE_MCP_API_PARITY_SUITE, "mcp_api_parity");
+        assert_eq!(Runner::NATIVE_SHARE_SUITE, "share");
+        assert_eq!(Runner::NATIVE_SHARE_VERIFY_LIVE_SUITE, "share_verify_live");
+        assert_eq!(Runner::NATIVE_ARCHIVE_SUITE, "archive");
         assert_eq!(Runner::NATIVE_DUAL_MODE_SUITE, "dual_mode");
         assert_eq!(Runner::NATIVE_MODE_MATRIX_SUITE, "mode_matrix");
         assert_eq!(Runner::NATIVE_SECURITY_PRIVACY_SUITE, "security_privacy");
@@ -2677,6 +2774,9 @@ exit 1
     fn is_native_suite_prefix_not_matched() {
         // "http_extra" is NOT a native suite (exact match only)
         assert!(!Runner::is_native_suite("http_extra"));
+        assert!(!Runner::is_native_suite("mcp_api_parity_v2"));
+        assert!(!Runner::is_native_suite("share_plus"));
+        assert!(!Runner::is_native_suite("archive_legacy"));
         assert!(!Runner::is_native_suite("dual_mode_v2"));
         assert!(!Runner::is_native_suite(""));
     }

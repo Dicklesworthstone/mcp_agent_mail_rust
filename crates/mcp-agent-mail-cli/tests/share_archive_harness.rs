@@ -1,8 +1,8 @@
-//! br-dsdzo: Native HTTP transport/parity harness for HTTP-family suites.
+//! br-3ibsu: Native harness adapter for share/archive-heavy E2E suites.
 //!
 //! Current phase: managed adapter.
-//! - Native runner entrypoint is Rust (`cargo test --test http_transport_harness`).
-//! - Scenario execution delegates to shell suites (`http`, `http_streamable`, `mcp_api_parity`).
+//! - Native runner entrypoint is Rust (`cargo test --test share_archive_harness`).
+//! - Scenario execution delegates to shell suites (`share`, `share_verify_live`, `archive`).
 //! - Harness captures deterministic metadata and copies legacy artifacts.
 
 #![forbid(unsafe_code)]
@@ -32,7 +32,6 @@ struct HarnessSummary {
     runner: String,
     adapter_mode: String,
     strict_mode: bool,
-    include_focused_subsuites: bool,
     generated_at: String,
     duration_ms: u64,
     passed: bool,
@@ -43,19 +42,18 @@ struct HarnessSummary {
     adapter_stdout_path: String,
     adapter_stderr_path: String,
     legacy_artifacts_root: String,
-    new_legacy_runs: Vec<String>,
+    new_legacy_run_paths: Vec<String>,
     copied_legacy_run_path: Option<String>,
     notes: Vec<String>,
 }
 
-const DEFAULT_HARNESS_SUITE: &str = "http";
+const DEFAULT_HARNESS_SUITE: &str = "share";
 
 #[derive(Clone, Copy, Debug)]
 struct HarnessSuiteSpec {
     suite_name: &'static str,
     adapter_script: &'static str,
     legacy_artifacts_subdir: &'static str,
-    supports_focused_subsuites: bool,
 }
 
 fn bool_env(var_name: &str) -> bool {
@@ -63,31 +61,29 @@ fn bool_env(var_name: &str) -> bool {
 }
 
 fn selected_suite_name() -> String {
-    std::env::var("AM_HTTP_HARNESS_SUITE").unwrap_or_else(|_| DEFAULT_HARNESS_SUITE.to_string())
+    std::env::var("AM_SHARE_ARCHIVE_HARNESS_SUITE")
+        .unwrap_or_else(|_| DEFAULT_HARNESS_SUITE.to_string())
 }
 
 fn suite_spec_for(name: &str) -> HarnessSuiteSpec {
     match name {
-        "http" => HarnessSuiteSpec {
-            suite_name: "http",
-            adapter_script: "tests/e2e/test_http.sh",
-            legacy_artifacts_subdir: "http",
-            supports_focused_subsuites: true,
+        "share" => HarnessSuiteSpec {
+            suite_name: "share",
+            adapter_script: "tests/e2e/test_share.sh",
+            legacy_artifacts_subdir: "share",
         },
-        "http_streamable" => HarnessSuiteSpec {
-            suite_name: "http_streamable",
-            adapter_script: "tests/e2e/test_http_streamable.sh",
-            legacy_artifacts_subdir: "http_streamable",
-            supports_focused_subsuites: false,
+        "share_verify_live" => HarnessSuiteSpec {
+            suite_name: "share_verify_live",
+            adapter_script: "tests/e2e/test_share_verify_live.sh",
+            legacy_artifacts_subdir: "share_verify_live",
         },
-        "mcp_api_parity" => HarnessSuiteSpec {
-            suite_name: "mcp_api_parity",
-            adapter_script: "tests/e2e/test_mcp_api_parity.sh",
-            legacy_artifacts_subdir: "mcp_api_parity",
-            supports_focused_subsuites: false,
+        "archive" => HarnessSuiteSpec {
+            suite_name: "archive",
+            adapter_script: "tests/e2e/test_archive.sh",
+            legacy_artifacts_subdir: "archive",
         },
         _ => panic!(
-            "unsupported AM_HTTP_HARNESS_SUITE={name}; expected one of: http, http_streamable, mcp_api_parity"
+            "unsupported AM_SHARE_ARCHIVE_HARNESS_SUITE={name}; expected one of: share, share_verify_live, archive"
         ),
     }
 }
@@ -101,13 +97,13 @@ fn repo_root() -> PathBuf {
 }
 
 fn harness_artifacts_root(suite_name: &str) -> PathBuf {
-    if let Ok(override_root) = std::env::var("AM_HTTP_ARTIFACT_DIR") {
+    if let Ok(override_root) = std::env::var("AM_SHARE_ARCHIVE_ARTIFACT_DIR") {
         return PathBuf::from(override_root).join(suite_name);
     }
     repo_root().join("tests/artifacts/cli").join(suite_name)
 }
 
-fn legacy_http_artifacts_root(subdir: &str) -> PathBuf {
+fn legacy_artifacts_root(subdir: &str) -> PathBuf {
     repo_root().join("tests/artifacts").join(subdir)
 }
 
@@ -190,7 +186,7 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
 }
 
 #[test]
-fn native_http_transport_gate() {
+fn native_share_archive_transport_gate() {
     let suite_name = selected_suite_name();
     let suite_spec = suite_spec_for(&suite_name);
     let start_instant = Instant::now();
@@ -201,20 +197,13 @@ fn native_http_transport_gate() {
     ));
     fs::create_dir_all(&run_root).expect("create run root");
     eprintln!(
-        "http harness artifact root (suite={}): {}",
+        "share/archive harness artifact root (suite={}): {}",
         suite_spec.suite_name,
         run_root.display()
     );
-    let strict_mode = bool_env("AM_E2E_HTTP_REQUIRE_PASS");
-    let include_focused_subsuites = if suite_spec.supports_focused_subsuites {
-        std::env::var("AM_E2E_HTTP_INCLUDE_FOCUSED_SUBSUITES")
-            .map(|raw| raw != "0")
-            .unwrap_or(!strict_mode)
-    } else {
-        false
-    };
 
-    let legacy_root = legacy_http_artifacts_root(suite_spec.legacy_artifacts_subdir);
+    let strict_mode = bool_env("AM_E2E_SHARE_ARCHIVE_REQUIRE_PASS");
+    let legacy_root = legacy_artifacts_root(suite_spec.legacy_artifacts_subdir);
     fs::create_dir_all(&legacy_root).expect("create legacy artifact root");
     let before_runs = list_run_directories(&legacy_root);
 
@@ -227,17 +216,11 @@ fn native_http_transport_gate() {
             "AM_E2E_KEEP_TMP",
             std::env::var("AM_E2E_KEEP_TMP").unwrap_or_else(|_| "1".to_string()),
         );
-    if suite_spec.supports_focused_subsuites {
-        cmd.env(
-            "AM_E2E_HTTP_INCLUDE_FOCUSED_SUBSUITES",
-            if include_focused_subsuites { "1" } else { "0" },
-        );
-    }
 
-    let timeout_secs = std::env::var("AM_HTTP_ADAPTER_TIMEOUT_SECS")
+    let timeout_secs = std::env::var("AM_SHARE_ARCHIVE_ADAPTER_TIMEOUT_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(1200);
+        .unwrap_or(1800);
     let outcome = run_with_timeout(&mut cmd, Duration::from_secs(timeout_secs));
 
     let stdout_path = run_root.join("adapter.stdout.log");
@@ -253,7 +236,10 @@ fn native_http_transport_gate() {
 
     let copied_legacy_run_path = new_runs.last().and_then(|run_name| {
         let src = legacy_root.join(run_name);
-        let dst = run_root.join("subsuite").join("http").join(run_name);
+        let dst = run_root
+            .join("subsuite")
+            .join(suite_spec.suite_name)
+            .join(run_name);
         copy_directory_recursive(&src, &dst).ok()?;
         Some(dst.display().to_string())
     });
@@ -261,7 +247,7 @@ fn native_http_transport_gate() {
     let passed = outcome.exit_code == Some(0) && !outcome.timed_out;
     let mut notes = Vec::new();
     if new_runs.is_empty() {
-        notes.push("No new legacy HTTP artifact run was detected.".to_string());
+        notes.push("No new legacy artifact run was detected.".to_string());
     }
     if outcome.timed_out {
         notes.push("Adapter execution timed out.".to_string());
@@ -278,7 +264,6 @@ fn native_http_transport_gate() {
         runner: "native".to_string(),
         adapter_mode: "shell_managed".to_string(),
         strict_mode,
-        include_focused_subsuites,
         generated_at: Utc::now().to_rfc3339(),
         duration_ms: start_instant.elapsed().as_millis() as u64,
         passed,
@@ -289,7 +274,7 @@ fn native_http_transport_gate() {
         adapter_stdout_path: stdout_path.display().to_string(),
         adapter_stderr_path: stderr_path.display().to_string(),
         legacy_artifacts_root: legacy_root.display().to_string(),
-        new_legacy_runs: new_runs.clone(),
+        new_legacy_run_paths: new_runs,
         copied_legacy_run_path,
         notes,
     };
@@ -311,14 +296,15 @@ fn native_http_transport_gate() {
             outcome.stderr
         );
         assert!(
-            !new_runs.is_empty(),
+            summary.copied_legacy_run_path.is_some(),
             "{} adapter succeeded but did not produce a new legacy artifact run under {}",
             suite_spec.suite_name,
             legacy_root.display()
         );
     } else if !passed {
         eprintln!(
-            "SKIP(non-strict): HTTP adapter failed but strict mode is disabled; see {}",
+            "SKIP(non-strict): {} adapter failed but strict mode is disabled; see {}",
+            suite_spec.suite_name,
             summary_path.display()
         );
     }

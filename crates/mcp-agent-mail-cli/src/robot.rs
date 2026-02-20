@@ -731,10 +731,10 @@ use mcp_agent_mail_db::DbConn;
 ///
 /// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
 fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliError> {
-    // Try slug first (using LIKE for workaround)
+    // Try slug first
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE slug LIKE ?",
+            "SELECT id, slug FROM projects WHERE slug = ?",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
@@ -745,10 +745,10 @@ fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliEr
             return Ok((id, slug));
         }
     }
-    // Try human_key (using LIKE for workaround)
+    // Try human_key
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE human_key LIKE ?",
+            "SELECT id, slug FROM projects WHERE human_key = ?",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
@@ -790,7 +790,7 @@ fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Optio
         .or_else(|| std::env::var("AGENT_NAME").ok())?;
     let rows = conn
         .query_sync(
-            "SELECT id, name FROM agents WHERE project_id = ? AND name LIKE ?",
+            "SELECT id, name FROM agents WHERE project_id = ? AND name = ?",
             &[Value::BigInt(project_id), Value::Text(name)],
         )
         .ok()?;
