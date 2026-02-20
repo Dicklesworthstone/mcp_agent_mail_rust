@@ -544,11 +544,11 @@ pub struct RobotArgs {
     #[arg(long, global = true, value_parser = parse_output_format)]
     pub format: Option<OutputFormat>,
 
-    /// Project key (absolute path or slug). Auto-detected from CWD if omitted.
+    /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
     #[arg(long, global = true)]
     pub project: Option<String>,
 
-    /// Agent name. Auto-detected from AGENT_NAME env var if omitted.
+    /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
     #[arg(long, global = true)]
     pub agent: Option<String>,
 
@@ -774,20 +774,43 @@ fn find_project_for_cwd(conn: &DbConn) -> Result<(i64, String), CliError> {
 
 /// Resolve project from --project flag or CWD.
 fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), CliError> {
-    if let Some(key) = flag {
-        resolve_project_sync(conn, key)
+    if let Some(key) = flag
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::borrow::ToOwned::to_owned)
+        .or_else(|| {
+            std::env::var("AGENT_MAIL_PROJECT")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+    {
+        resolve_project_sync(conn, &key)
     } else {
         find_project_for_cwd(conn)
     }
 }
 
-/// Resolve agent ID from --agent flag or AGENT_NAME env.
+/// Resolve agent ID from --agent flag or AGENT_MAIL_AGENT/AGENT_NAME env vars.
 ///
 /// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
 fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Option<(i64, String)> {
     let name = flag
-        .map(String::from)
-        .or_else(|| std::env::var("AGENT_NAME").ok())?;
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::borrow::ToOwned::to_owned)
+        .or_else(|| {
+            std::env::var("AGENT_MAIL_AGENT")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("AGENT_NAME")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })?;
     let rows = conn
         .query_sync(
             "SELECT id, name FROM agents WHERE project_id = ? AND name = ?",
@@ -815,6 +838,11 @@ fn format_age(seconds: i64) -> String {
         return format!("{}h ago", seconds / 3600);
     }
     format!("{}d ago", seconds / 86400)
+}
+
+fn parse_since_micros(s: &str) -> Result<i64, CliError> {
+    mcp_agent_mail_db::iso_to_micros(s)
+        .ok_or_else(|| CliError::InvalidArgument(format!("invalid --since timestamp: {s}")))
 }
 
 // ── Status command implementation ───────────────────────────────────────────
@@ -1234,6 +1262,86 @@ fn build_inbox(
     })
 }
 
+fn build_outbox_entries(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    limit: usize,
+    include_bodies: bool,
+) -> Result<Vec<InboxEntry>, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let rows = conn
+        .query_sync(
+            "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md,
+                    COALESCE(SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END), 0) AS acked_count,
+                    COALESCE(COUNT(mr.id), 0) AS recipient_count,
+                    COALESCE(
+                        GROUP_CONCAT(CASE WHEN mr.kind = 'to' THEN a.name END, ', '),
+                        GROUP_CONCAT(a.name, ', '),
+                        ''
+                    ) AS recipient_names
+             FROM messages m
+             LEFT JOIN message_recipients mr ON mr.message_id = m.id
+             LEFT JOIN agents a ON a.id = mr.agent_id
+             WHERE m.sender_id = ? AND m.project_id = ?
+             GROUP BY m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md
+             ORDER BY m.created_ts DESC
+             LIMIT ?",
+            &[
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+                Value::BigInt(limit as i64),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("outbox query failed: {e}")))?;
+
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: i64 = row.get_named("id").unwrap_or(0);
+        let subject: String = row.get_named("subject").unwrap_or_default();
+        let thread_id: String = row.get_named("thread_id").unwrap_or_default();
+        let importance: String = row.get_named("importance").unwrap_or_default();
+        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+        let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
+        let acked_count: i64 = row.get_named("acked_count").unwrap_or(0);
+        let recipient_count: i64 = row.get_named("recipient_count").unwrap_or(0);
+        let recipient_names = row
+            .get_named::<String>("recipient_names")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "(no recipients)".to_string());
+
+        let ack_status = if ack_required == 0 {
+            "none".to_string()
+        } else if recipient_count > 0 && acked_count >= recipient_count {
+            "acked".to_string()
+        } else {
+            "pending".to_string()
+        };
+
+        let body_md = if include_bodies {
+            row.get_named::<String>("body_md").ok()
+        } else {
+            None
+        };
+
+        let age_seconds = (now_us - created_ts) / 1_000_000;
+        entries.push(InboxEntry {
+            id,
+            priority: "sent".to_string(),
+            from: recipient_names,
+            subject,
+            thread: thread_id,
+            age: format_age(age_seconds),
+            ack_status,
+            importance,
+            body_md,
+        });
+    }
+
+    Ok(entries)
+}
+
 // ── Thread command implementation ───────────────────────────────────────────
 
 /// Thread rendering response data.
@@ -1299,7 +1407,7 @@ fn build_thread(
     ];
 
     if let Some(since_str) = since {
-        let since_us = mcp_agent_mail_db::iso_to_micros(since_str).unwrap_or(0);
+        let since_us = parse_since_micros(since_str)?;
         conditions.push("m.created_ts > ?".to_string());
         params.push(Value::BigInt(since_us));
     }
@@ -1702,7 +1810,7 @@ fn build_search(
         params.push(Value::Text(imp.to_string()));
     }
     if let Some(since_str) = since {
-        let since_us = mcp_agent_mail_db::iso_to_micros(since_str).unwrap_or(0);
+        let since_us = parse_since_micros(since_str)?;
         extra_where.push_str(" AND m.created_ts > ?");
         params.push(Value::BigInt(since_us));
     }
@@ -1996,8 +2104,7 @@ fn build_timeline(
 
     // Default "since" to 24h ago
     let since_us = if let Some(s) = since {
-        mcp_agent_mail_db::iso_to_micros(s)
-            .ok_or_else(|| CliError::InvalidArgument(format!("invalid --since timestamp: {s}")))?
+        parse_since_micros(s)?
     } else {
         now_us - 24 * 3600 * 1_000_000
     };
@@ -2701,7 +2808,7 @@ fn build_navigate(
                 None,
             ))
         }
-        ["mailbox", agent_name] | ["outbox", agent_name] => {
+        ["mailbox", agent_name] => {
             let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
             if let Some((agent_id, name)) = agent_opt {
                 let result = build_inbox(
@@ -2723,6 +2830,15 @@ fn build_navigate(
                     },
                     None,
                 ))
+            } else {
+                Ok((NavigateResult::Inbox { entries: vec![] }, None))
+            }
+        }
+        ["outbox", agent_name] => {
+            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
+            if let Some((agent_id, _name)) = agent_opt {
+                let entries = build_outbox_entries(conn, project_id, agent_id, 50, false)?;
+                Ok((NavigateResult::Inbox { entries }, None))
             } else {
                 Ok((NavigateResult::Inbox { entries: vec![] }, None))
             }
@@ -2812,7 +2928,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let (agent_id, agent_name_str) =
                 resolve_agent_id(&conn, project_id, args.agent.as_deref()).ok_or_else(|| {
                     CliError::InvalidArgument(
-                        "agent required for inbox — use --agent or set AGENT_NAME".to_string(),
+                        "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME"
+                            .to_string(),
                     )
                 })?;
 
