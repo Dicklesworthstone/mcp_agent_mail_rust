@@ -6048,8 +6048,8 @@ mod tests {
         // Allow some tolerance for test execution time
         // Note: asupersync::time::Instant opaque type doesn't expose raw nanoseconds directly in all versions,
         // but duration_since works.
-        let remaining = deadline.saturating_duration_since(check_time);
-        let diff_secs = remaining.as_secs();
+        let remaining = deadline.duration_since(check_time);
+        let diff_secs = remaining;
 
         assert!(
             (29..=31).contains(&diff_secs),
@@ -10586,9 +10586,7 @@ mod tests {
         {
             let mut cache = state.jwks_cache.lock().unwrap();
             *cache = Some(JwksCacheEntry {
-                fetched_at: Instant::now()
-                    .checked_sub(Duration::from_secs(120))
-                    .unwrap(),
+                fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
                 jwks: Arc::clone(&jwks),
             });
         }
@@ -10627,9 +10625,7 @@ mod tests {
             {
                 let mut cache = state.jwks_cache.lock().unwrap();
                 *cache = Some(JwksCacheEntry {
-                    fetched_at: Instant::now()
-                        .checked_sub(Duration::from_secs(120))
-                        .unwrap(),
+                    fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
                     jwks: Arc::clone(&old_jwks),
                 });
             }
@@ -13638,7 +13634,8 @@ mod tests {
     fn setup_compose_dispatch_test_db(path: &std::path::Path) {
         use mcp_agent_mail_db::sqlmodel_core::Value;
 
-        let conn = mcp_agent_mail_db::DbConn::open_file(path).expect("open compose test db");
+        let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
+            .expect("open compose test db");
         conn.execute_sync(
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
@@ -13725,7 +13722,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("compose_dispatch.sqlite3");
         setup_compose_dispatch_test_db(&db_path);
-        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path).expect("open db");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
         conn.execute_sync(
             "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -13842,7 +13840,8 @@ mod tests {
         let database_url = format!("sqlite://{}", db_path.display());
         dispatch_compose_envelope(&database_url, &tui_state, &envelope);
 
-        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path).expect("open db");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
         let row = conn
             .query_sync(
                 "SELECT thread_id FROM messages WHERE subject = ?1 LIMIT 1",
@@ -13979,9 +13978,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *cache = Some(JwksCacheEntry {
             // 2 minutes in the past — well beyond the 60s TTL.
-            fetched_at: Instant::now()
-                .checked_sub(Duration::from_secs(120))
-                .unwrap(),
+            fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
             jwks: Arc::new(jwks.clone()),
         });
     }

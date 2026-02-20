@@ -2,7 +2,7 @@ use globset::{Glob, GlobBuilder, GlobMatcher};
 
 fn normalize_pattern(pattern: &str) -> String {
     let mut normalized = pattern.trim().replace('\\', "/");
-    
+
     // Collapse consecutive slashes
     while normalized.contains("//") {
         normalized = normalized.replace("//", "/");

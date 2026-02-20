@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn should_ignore_empty_pattern_skipped() {
-        let patterns = vec!["".to_string(), "   ".to_string()];
+        let patterns = vec![String::new(), "   ".to_string()];
         assert!(!should_ignore("anything", &patterns));
     }
 

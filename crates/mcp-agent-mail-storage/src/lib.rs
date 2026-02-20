@@ -667,16 +667,16 @@ fn thread_jitter_ms(range: u64) -> u64 {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            
+
             // Mix thread-id string hash with timestamp to ensure per-thread jitter.
             // Simple FNV-1a style mixer on the debug string representation of ThreadId.
             let tid_str = format!("{tid:?}");
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
             for byte in tid_str.bytes() {
-                h = h ^ u64::from(byte);
-                h = h.wrapping_mul(0x1000_0000_1b3);
+                h ^= u64::from(byte);
+                h = h.wrapping_mul(0x0100_0000_01b3);
             }
-            
+
             let mut seed = now ^ h;
             if seed == 0 { seed = 1; }
             seed
@@ -870,6 +870,7 @@ impl FileLock {
             return Ok(false);
         }
 
+        #[cfg(not(unix))]
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -887,8 +888,9 @@ impl FileLock {
         // If metadata is missing, we must assume the owner is alive (likely just acquired the lock
         // and hasn't written metadata yet) to avoid race conditions where we delete a lock
         // held by a live process. We fallback to the timeout check below.
-        let owner_alive = meta.as_ref().map_or(true, |m| pid_alive(m.pid));
+        let owner_alive = meta.as_ref().is_none_or(|m| pid_alive(m.pid));
 
+        #[cfg(not(unix))]
         let age = meta.as_ref().map(|m| now - m.created_ts).or_else(|| {
             fs::metadata(&self.path)
                 .ok()
@@ -1910,7 +1912,7 @@ fn coalescer_pool_worker(
         // Release processing lock (via guard drop) + update last_serviced timestamp
         rq.last_serviced_us
             .store(now_micros_u64(), Ordering::Relaxed);
-        
+
         // If any repo still has work, wake another worker
         let more_work = {
             let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
@@ -2575,7 +2577,9 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                     // On non-Unix, pid_alive() returns true blindly. If the lock is very old,
                     // we must assume it's stale because we can't verify the PID identity.
                     #[cfg(not(unix))]
-                    if lock_file_age_seconds(&lock_path).is_some_and(|age| age > max_age_seconds * 2.0) {
+                    if lock_file_age_seconds(&lock_path)
+                        .is_some_and(|age| age > max_age_seconds * 2.0)
+                    {
                         tracing::info!(
                             "[git-lock] non-unix stale lock force clean (age={age:.1}s)"
                         );

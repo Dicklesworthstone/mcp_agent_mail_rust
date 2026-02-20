@@ -3472,18 +3472,16 @@ fn build_golden_specs(pattern: Option<&glob::Pattern>) -> Vec<golden::GoldenComm
 
     if is_executable_file(&stub_bin) {
         let cmd = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
-            vec!["sh".to_string(), stub_bin_str.clone(), "--encode".to_string()]
+            vec![
+                "sh".to_string(),
+                stub_bin_str.clone(),
+                "--encode".to_string(),
+            ]
         } else {
             vec![stub_bin_str.clone(), "--encode".to_string()]
         };
 
-        maybe_push(
-            golden::GoldenCommandSpec::new(
-                "stub_encode.txt",
-                cmd,
-            )
-            .stdin("{\"id\":1}\n"),
-        );
+        maybe_push(golden::GoldenCommandSpec::new("stub_encode.txt", cmd).stdin("{\"id\":1}\n"));
 
         let cmd_stats = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
             vec![
@@ -8498,7 +8496,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             )?;
 
             let released = if auto_release {
-                let count = outcome_to_result(
+                let released_rows = outcome_to_result(
                     mcp_agent_mail_db::queries::release_reservations(
                         &cx,
                         &ctx.pool,
@@ -8509,10 +8507,11 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     )
                     .await,
                 )?;
-                Some(count)
+                Some(released_rows)
             } else {
                 None
             };
+            let released_count = released.as_ref().map(Vec::len);
 
             let resp = serde_json::json!({
                 "file_reservations": {
@@ -8525,7 +8524,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     })).collect::<Vec<_>>(),
                     "conflicts": [],
                 },
-                "released": released.map(|n| serde_json::json!({
+                "released": released_count.map(|n| serde_json::json!({
                     "released": n,
                     "released_at": mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::timestamps::now_micros()),
                 })),
@@ -8548,7 +8547,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                         ),
                     );
                 }
-                if let Some(n) = released {
+                if let Some(n) = released_count {
                     output::kv("Released", &n.to_string());
                 }
             });

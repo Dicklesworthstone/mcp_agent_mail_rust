@@ -1000,11 +1000,7 @@ pub async fn register_agent(
     );
 
     // Dynamic Normalize: enforce fields on matching rows, preserving if None
-    let mut normalize_sets = vec![
-        "program = ?",
-        "model = ?",
-        "last_active_ts = ?",
-    ];
+    let mut normalize_sets = vec!["program = ?", "model = ?", "last_active_ts = ?"];
     let mut normalize_params = vec![
         Value::Text(program.to_string()),
         Value::Text(model.to_string()),
@@ -1610,39 +1606,6 @@ pub struct ThreadMessageRow {
     pub from: String,
 }
 
-async fn reload_inserted_message_id(
-    cx: &Cx,
-    tracked: &TrackedConnection<'_>,
-    row: &MessageRow,
-) -> Outcome<i64, DbError> {
-    // Re-select the just-inserted row by its unique key within the transaction.
-    // This avoids `SELECT last_insert_rowid()` which returns 0 on FrankenConnection
-    // (frankensqlite does not track rowids).
-    // We include `subject` to reduce collision probability if multiple messages
-    // are inserted at the same microsecond.
-    let sql = "SELECT MAX(id) FROM messages \
-               WHERE project_id = ? AND sender_id = ? AND created_ts = ? AND subject = ?";
-    let params = [
-        Value::BigInt(row.project_id),
-        Value::BigInt(row.sender_id),
-        Value::BigInt(row.created_ts),
-        Value::Text(row.subject.clone()),
-    ];
-    match map_sql_outcome(traw_query(cx, tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).map_or_else(
-            || {
-                Outcome::Err(DbError::Internal(
-                    "message insert succeeded but re-select returned NULL".to_string(),
-                ))
-            },
-            Outcome::Ok,
-        ),
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
-}
-
 /// Atomically check for conflicts and create reservations.
 ///
 /// Executes the read-check-write cycle within a `BEGIN IMMEDIATE` transaction
@@ -1660,7 +1623,9 @@ pub async fn atomic_file_reservation_check_and_create<F>(
     checker: F,
 ) -> Outcome<Vec<FileReservationRow>, DbError>
 where
-    F: FnOnce(&[FileReservationRow]) -> std::result::Result<Vec<(i64, String, i64, bool, String)>, String>
+    F: FnOnce(
+            &[FileReservationRow],
+        ) -> std::result::Result<Vec<(i64, String, i64, bool, String)>, String>
         + Send,
 {
     let conn = match acquire_conn(cx, pool).await {
@@ -1679,8 +1644,7 @@ where
     // Fetch active reservations within the transaction snapshot.
     // We duplicate the logic of `get_active_reservations` here to use the transaction.
     let sql = format!(
-        "{} WHERE project_id = ? AND ({})",
-        FILE_RESERVATION_SELECT_COLUMNS_SQL, ACTIVE_RESERVATION_PREDICATE
+        "{FILE_RESERVATION_SELECT_COLUMNS_SQL} WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
     );
     let params = [Value::BigInt(project_id)];
     let rows = try_in_tx!(
@@ -1746,15 +1710,15 @@ where
 
             created_rows.push(FileReservationRow {
                 id: None, // populated below via reload if possible, or left None?
-                          // Ideally we reload, but batch insert makes reloading IDs hard in SQLite without RETURNING.
-                          // FrankenSQLite supports RETURNING?
-                          // Let's assume standard SQLite logic. RETURNING is supported in recent SQLite.
-                          // But to be safe and consistent with other queries, we might skip ID reload if not strictly needed?
-                          // Wait, the tool returns IDs. We need them.
+                // Ideally we reload, but batch insert makes reloading IDs hard in SQLite without RETURNING.
+                // FrankenSQLite supports RETURNING?
+                // Let's assume standard SQLite logic. RETURNING is supported in recent SQLite.
+                // But to be safe and consistent with other queries, we might skip ID reload if not strictly needed?
+                // Wait, the tool returns IDs. We need them.
                 project_id,
                 agent_id: *agent_id,
                 path_pattern: path.clone(),
-                exclusive: i32::from(*exclusive),
+                exclusive: i64::from(*exclusive),
                 reason: reason.clone(),
                 created_ts: now,
                 expires_ts: expires,
@@ -1773,10 +1737,10 @@ where
         // Assign IDs back to created_rows slice corresponding to this chunk
         let start_idx = created_rows.len() - chunk.len();
         for (j, row) in id_rows.iter().enumerate() {
-            if let Some(id) = row_first_i64(row) {
-                if let Some(cr) = created_rows.get_mut(start_idx + j) {
-                    cr.id = Some(id);
-                }
+            if let Some(id) = row_first_i64(row)
+                && let Some(cr) = created_rows.get_mut(start_idx + j)
+            {
+                cr.id = Some(id);
             }
         }
     }
@@ -1819,10 +1783,7 @@ pub async fn create_message(
     let params = [
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
-        match thread_id {
-            Some(t) => Value::Text(t.to_string()),
-            None => Value::Null,
-        },
+        thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
         Value::Text(subject.to_string()),
         Value::Text(body_md.to_string()),
         Value::Text(importance.to_string()),
@@ -1982,10 +1943,7 @@ async fn create_message_with_recipients_tx(
     let params = [
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
-        match thread_id {
-            Some(t) => Value::Text(t.to_string()),
-            None => Value::Null,
-        },
+        thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
         Value::Text(subject.to_string()),
         Value::Text(body_md.to_string()),
         Value::Text(importance.to_string()),

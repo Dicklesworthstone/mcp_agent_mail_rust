@@ -765,7 +765,7 @@ fn char_count(s: &str) -> usize {
 }
 
 fn byte_index_from_char_index(s: &str, char_idx: usize) -> usize {
-    s.chars().take(char_idx).map(|c| c.len_utf8()).sum()
+    s.chars().take(char_idx).map(char::len_utf8).sum()
 }
 
 // ──────────────────────────────────────────────────────────────────────

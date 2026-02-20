@@ -219,7 +219,7 @@ mod tests {
             monitor_interval_seconds(u64::MAX),
             Duration::from_secs(u64::MAX)
         );
-        assert_eq!(monitor_interval_seconds(3600), Duration::from_secs(3600));
+        assert_eq!(monitor_interval_seconds(3600), Duration::from_hours(1));
     }
 
     #[test]

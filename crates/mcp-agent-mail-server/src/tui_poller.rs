@@ -454,11 +454,12 @@ fn parse_raw_ts(row: &Row, col: &str) -> i64 {
 /// Convert a floating timestamp into microseconds with saturation.
 #[allow(clippy::cast_possible_truncation)]
 fn parse_float_ts(value: f64) -> i64 {
+    const I64_MAX_F64: f64 = 9_223_372_036_854_775_807.0;
+    const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+
     if !value.is_finite() {
         return 0;
     }
-    const I64_MAX_F64: f64 = 9_223_372_036_854_775_807.0;
-    const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
     let truncated = value.trunc();
     if truncated >= I64_MAX_F64 {
         i64::MAX
@@ -1654,10 +1655,12 @@ mod tests {
 
     #[test]
     fn max_constants_are_positive() {
-        assert!(MAX_AGENTS > 0);
-        assert!(MAX_PROJECTS > 0);
-        assert!(MAX_CONTACTS > 0);
-        assert!(MAX_RESERVATIONS > 0);
+        const {
+            assert!(MAX_AGENTS > 0);
+            assert!(MAX_PROJECTS > 0);
+            assert!(MAX_CONTACTS > 0);
+            assert!(MAX_RESERVATIONS > 0);
+        }
     }
 
     #[test]

@@ -350,13 +350,12 @@ impl DbPool {
                         && let Some(parent) = Path::new(&sqlite_path).parent()
                         && !parent.as_os_str().is_empty()
                         && !parent.exists()
+                        && let Err(e) = std::fs::create_dir_all(parent)
                     {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            return Outcome::Err(SqlError::Custom(format!(
-                                "failed to create db dir {}: {e}",
-                                parent.display()
-                            )));
-                        }
+                        return Outcome::Err(SqlError::Custom(format!(
+                            "failed to create db dir {}: {e}",
+                            parent.display()
+                        )));
                     }
 
                     // For file-backed DBs, run DB-wide init (journal mode, migrations) once

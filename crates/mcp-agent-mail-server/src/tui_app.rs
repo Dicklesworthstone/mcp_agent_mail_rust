@@ -109,11 +109,9 @@ enum QuitConfirmSource {
 
 /// Deferred action from a confirmed modal callback.
 ///
-/// Modal callbacks are `FnOnce + Send` closures that cannot directly send
-/// messages back into the model.  Instead, confirmed operations are written
-/// to this static slot and drained on the next tick.
-// (REMOVED: static DEFERRED_CONFIRMED_ACTION replaced by channel in MailAppModel)
-
+/// Modal callbacks are `FnOnce + Send` closures that cannot directly mutate
+/// the model, so confirmed operations are sent through `action_tx` and drained
+/// from `action_rx` on the next tick.
 /// Tracks the outcome of a dispatched action for feedback surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
@@ -1415,18 +1413,15 @@ impl MailAppModel {
                 operation,
             } => {
                 let ctx = context.to_string();
+                let action_tx = self.action_tx.clone();
                 self.modal_manager.show_confirmation(
                     title,
                     message,
                     ModalSeverity::Warning,
                     move |result| {
                         if matches!(result, DialogResult::Ok) {
-                            // Confirmed operation is stored for deferred execution.
-                            // The deferred_confirmed_action field will be checked on
-                            // the next tick and dispatched.
-                            if let Some(slot) = DEFERRED_CONFIRMED_ACTION.lock().ok().as_mut() {
-                                **slot = Some((operation, ctx));
-                            }
+                            // Confirmed operation is queued for deferred execution.
+                            let _ = action_tx.send((operation, ctx));
                         }
                     },
                 );
@@ -1802,11 +1797,15 @@ impl MailAppModel {
     /// Drain any deferred confirmed action (from modal callback) and dispatch it.
     fn drain_deferred_confirmed_action(&mut self) -> Cmd<MailMsg> {
         // Drain all pending actions from the channel
-        let mut cmd = Cmd::none();
+        let mut cmds = Vec::new();
         while let Ok((operation, context)) = self.action_rx.try_recv() {
-            cmd = cmd.merge(self.dispatch_execute_operation(&operation, &context));
+            cmds.push(self.dispatch_execute_operation(&operation, &context));
         }
-        cmd
+        match cmds.len() {
+            0 => Cmd::none(),
+            1 => cmds.into_iter().next().unwrap_or_else(Cmd::none),
+            _ => Cmd::batch(cmds),
+        }
     }
 
     /// Record an action outcome (success or failure) and show a toast.
@@ -2456,7 +2455,6 @@ impl MailAppModel {
 
     #[must_use]
     fn adjust_diff_action_for_overlays(
-        &self,
         diff_action: crate::tui_decision::DiffAction,
     ) -> crate::tui_decision::DiffAction {
         if diff_action == crate::tui_decision::DiffAction::Deferred {
@@ -3832,8 +3830,9 @@ impl Model for MailAppModel {
             budget_remaining_ms,
             error_count: 0,
         };
-        let diff_action = self
-            .adjust_diff_action_for_overlays(self.diff_strategy.borrow_mut().observe(&frame_state));
+        let diff_action = Self::adjust_diff_action_for_overlays(
+            self.diff_strategy.borrow_mut().observe(&frame_state),
+        );
         self.resize_detected.set(false);
 
         // Act on the diff decision.
@@ -6839,12 +6838,14 @@ mod tests {
 
     #[test]
     fn deferred_diff_always_promotes_to_full_to_avoid_cursor_trails() {
-        let model = test_model();
         let deferred = crate::tui_decision::DiffAction::Deferred;
         let full = crate::tui_decision::DiffAction::Full;
 
-        assert_eq!(model.adjust_diff_action_for_overlays(deferred), full);
-        assert_eq!(model.adjust_diff_action_for_overlays(full), full);
+        assert_eq!(
+            MailAppModel::adjust_diff_action_for_overlays(deferred),
+            full
+        );
+        assert_eq!(MailAppModel::adjust_diff_action_for_overlays(full), full);
     }
 
     #[test]
@@ -8428,7 +8429,9 @@ mod tests {
             .command_palette
             .result_count()
             .min(PALETTE_MAX_VISIBLE);
-        let palette_height = (result_rows as u16 + 3)
+        let palette_height = u16::try_from(result_rows)
+            .unwrap_or(u16::MAX)
+            .saturating_add(3)
             .max(5)
             .min(area.height.saturating_sub(2));
         let palette_x = area.x + (area.width.saturating_sub(palette_width)) / 2;
@@ -9055,7 +9058,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("focus target")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.notifications.tick(Duration::from_millis(16));
         assert_eq!(model.notifications.visible_count(), 1);
@@ -9088,7 +9091,7 @@ mod tests {
         // for named-theme index. Acquire named lock first to avoid deadlock.
         let _ng = crate::tui_theme::NAMED_THEME_TEST_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::tui_theme::init_named_theme("default");
         let _tg = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let mut model = test_model();
@@ -9106,7 +9109,7 @@ mod tests {
     fn shift_t_cycles_theme_when_not_in_text_mode() {
         let _ng = crate::tui_theme::NAMED_THEME_TEST_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::tui_theme::init_named_theme("default");
         let _tg = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let mut model = test_model();
@@ -9128,7 +9131,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(60)),
+                    .duration(Duration::from_mins(1)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -9444,7 +9447,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("test")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.notifications.tick(Duration::from_millis(16));
         assert_eq!(model.notifications.visible_count(), 1);
@@ -9480,7 +9483,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(60)),
+                    .duration(Duration::from_mins(1)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -9505,7 +9508,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(60)),
+                    .duration(Duration::from_mins(1)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -9525,7 +9528,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(60)),
+                    .duration(Duration::from_mins(1)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -9549,7 +9552,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("only one")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.notifications.tick(Duration::from_millis(16));
         model.toast_focus_index = Some(0);
@@ -9708,7 +9711,7 @@ mod tests {
     #[test]
     fn focus_highlight_noop_when_index_out_of_bounds() {
         let mut queue = NotificationQueue::new(QueueConfig::default());
-        queue.notify(Toast::new("test").duration(Duration::from_secs(60)));
+        queue.notify(Toast::new("test").duration(Duration::from_mins(1)));
         queue.tick(Duration::from_millis(16));
         assert_eq!(queue.visible_count(), 1);
 
@@ -9722,7 +9725,7 @@ mod tests {
     #[test]
     fn focus_highlight_renders_hint_text() {
         let mut queue = NotificationQueue::new(QueueConfig::default());
-        queue.notify(Toast::new("test toast").duration(Duration::from_secs(60)));
+        queue.notify(Toast::new("test toast").duration(Duration::from_mins(1)));
         queue.tick(Duration::from_millis(16));
         assert_eq!(queue.visible_count(), 1);
 
@@ -10487,7 +10490,7 @@ mod tests {
         model.notifications.notify(
             ftui_widgets::Toast::new("test")
                 .icon(ftui_widgets::ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.toast_focus_index = Some(0);
 
@@ -10835,61 +10838,30 @@ mod tests {
 
     #[test]
     fn drain_deferred_action_lifecycle() {
-        fn clear() {
-            match DEFERRED_CONFIRMED_ACTION.lock() {
-                Ok(mut s) => *s = None,
-                Err(e) => *e.into_inner() = None,
-            }
-        }
-        fn store(op: &str, ctx: &str) {
-            match DEFERRED_CONFIRMED_ACTION.lock() {
-                Ok(mut s) => *s = Some((op.to_string(), ctx.to_string())),
-                Err(e) => *e.into_inner() = Some((op.to_string(), ctx.to_string())),
-            }
-        }
-        fn is_empty() -> bool {
-            match DEFERRED_CONFIRMED_ACTION.lock() {
-                Ok(s) => s.is_none(),
-                Err(e) => e.into_inner().is_none(),
-            }
-        }
-
-        // Phase 1: empty static → Cmd::None.
-        clear();
+        // Phase 1: empty queue → Cmd::None.
         let mut model = test_model();
         let cmd = model.drain_deferred_confirmed_action();
         assert!(matches!(cmd, Cmd::None));
 
-        // Phase 2: store a server-dispatched action → Cmd::Msg.
-        store("acknowledge", "msg:10");
+        // Phase 2: queued server-dispatched action → Cmd::Msg.
+        model
+            .action_tx
+            .send(("acknowledge".to_string(), "msg:10".to_string()))
+            .expect("queue deferred action");
         let cmd = model.drain_deferred_confirmed_action();
-        assert!(is_empty(), "static should be drained");
         assert!(matches!(cmd, Cmd::Msg(_)));
+        let drained = model.action_rx.try_recv();
+        assert!(
+            matches!(drained, Err(std::sync::mpsc::TryRecvError::Empty)),
+            "channel should be drained",
+        );
     }
 
     // ── ConfirmThenExecute end-to-end tests ─────────────────────
-    //
-    // These tests share the global DEFERRED_CONFIRMED_ACTION static, so
-    // they are combined into a single sequential test to avoid races.
 
     #[test]
     fn confirm_then_execute_lifecycle() {
-        // Helper: recover from poisoned Mutex.
-        fn clear_deferred() {
-            match DEFERRED_CONFIRMED_ACTION.lock() {
-                Ok(mut slot) => *slot = None,
-                Err(e) => *e.into_inner() = None,
-            }
-        }
-        fn read_deferred() -> Option<(String, String)> {
-            match DEFERRED_CONFIRMED_ACTION.lock() {
-                Ok(slot) => slot.clone(),
-                Err(e) => e.into_inner().clone(),
-            }
-        }
-
         // ── Phase 1: ConfirmThenExecute shows a modal ────────────
-        clear_deferred();
         let mut model = test_model();
         let _cmd = model.dispatch_action_menu_selection(
             ActionKind::ConfirmThenExecute {
@@ -10906,7 +10878,6 @@ mod tests {
             .handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
 
         // ── Phase 2: OK stores the deferred action ───────────────
-        clear_deferred();
         model.dispatch_action_menu_selection(
             ActionKind::ConfirmThenExecute {
                 title: "Release?".to_string(),
@@ -10919,14 +10890,16 @@ mod tests {
             .modal_manager
             .handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
         assert!(!model.modal_manager.is_active());
-
-        let stored = read_deferred();
-        let (op, ctx) = stored.as_ref().expect("deferred action should be set");
-        assert_eq!(op, "release:7");
-        assert_eq!(ctx, "reservation:7");
+        let cmd = model.drain_deferred_confirmed_action();
+        match cmd {
+            Cmd::Msg(MailMsg::Screen(MailScreenMsg::ActionExecute(op, ctx))) => {
+                assert_eq!(op, "release:7");
+                assert_eq!(ctx, "reservation:7");
+            }
+            other => panic!("expected deferred ActionExecute after confirm, got: {other:?}"),
+        }
 
         // ── Phase 3: Cancel does NOT store ───────────────────────
-        clear_deferred();
         model.dispatch_action_menu_selection(
             ActionKind::ConfirmThenExecute {
                 title: "Delete?".to_string(),
@@ -10939,13 +10912,13 @@ mod tests {
             .modal_manager
             .handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
         assert!(!model.modal_manager.is_active());
+        let cmd = model.drain_deferred_confirmed_action();
         assert!(
-            read_deferred().is_none(),
-            "cancelled confirm should not store"
+            matches!(cmd, Cmd::None),
+            "cancelled confirm should not queue deferred action",
         );
 
         // ── Phase 4: Full lifecycle via tick drain ────────────────
-        clear_deferred();
         model.dispatch_action_menu_selection(
             ActionKind::ConfirmThenExecute {
                 title: "Acknowledge?".to_string(),
@@ -10959,7 +10932,11 @@ mod tests {
             .handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
         let cmd = model.drain_deferred_confirmed_action();
         assert!(matches!(cmd, Cmd::Msg(_)), "acknowledge → Cmd::Msg");
-        assert!(read_deferred().is_none(), "static should be drained");
+        let drained = model.action_rx.try_recv();
+        assert!(
+            matches!(drained, Err(std::sync::mpsc::TryRecvError::Empty)),
+            "channel should be drained",
+        );
     }
 
     // ── ActionOutcome tests ─────────────────────────────────────
@@ -11270,7 +11247,7 @@ mod tests {
         model.notifications.notify(
             ftui_widgets::Toast::new("test")
                 .icon(ftui_widgets::ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.toast_focus_index = Some(0);
         assert_eq!(model.topmost_overlay(), OverlayLayer::ToastFocus);

@@ -6291,7 +6291,7 @@ mod tests {
     #[test]
     fn format_duration_hours() {
         assert_eq!(
-            format_duration(std::time::Duration::from_secs(7380)),
+            format_duration(std::time::Duration::from_mins(123)),
             "2h 3m"
         );
     }

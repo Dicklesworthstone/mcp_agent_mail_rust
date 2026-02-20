@@ -2938,7 +2938,7 @@ mod tests {
         assert_eq!(snap.total_calls, 0);
         assert_eq!(snap.total_errors, 0);
         assert_eq!(snap.active_tools, 0);
-        assert_eq!(snap.avg_latency_ms, 0.0);
+        assert!((snap.avg_latency_ms).abs() < f64::EPSILON);
         assert!(snap.top_call_tools.is_empty());
         assert!(snap.sparkline.is_empty());
     }

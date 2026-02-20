@@ -4321,7 +4321,7 @@ mod resource_shape_tests {
                 )
                 .await
                 {
-                    Outcome::Ok(affected) => assert_eq!(affected, 1),
+                    Outcome::Ok(affected) => assert_eq!(affected.len(), 1),
                     other => panic!("release_reservations failed: {other:?}"),
                 }
 

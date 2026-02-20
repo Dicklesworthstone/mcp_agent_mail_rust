@@ -561,7 +561,6 @@ pub async fn release_file_reservations(
 
     // Update archive artifacts for the released items
     if !released_rows.is_empty() {
-        let now_iso = micros_to_iso(mcp_agent_mail_db::now_micros());
         let res_jsons: Vec<serde_json::Value> = released_rows
             .iter()
             .map(|r| {
@@ -603,7 +602,7 @@ pub async fn release_file_reservations(
 
     tracing::debug!(
         "Released {} reservations for {} in project {} (paths: {:?}, ids: {:?})",
-        released,
+        released_rows.len(),
         agent_name,
         project_key,
         paths,

@@ -2034,7 +2034,7 @@ mod tests {
 
     #[test]
     fn format_uptime_hours() {
-        assert_eq!(format_uptime(Duration::from_secs(7200 + 300)), "2h 5m");
+        assert_eq!(format_uptime(Duration::from_mins(125)), "2h 5m");
     }
 
     #[test]

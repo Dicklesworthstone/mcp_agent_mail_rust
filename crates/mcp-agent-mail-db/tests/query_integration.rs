@@ -847,7 +847,7 @@ fn reserve_and_release_roundtrip() {
             other => panic!("release failed: {other:?}"),
         }
     });
-    assert!(released > 0, "should have released at least 1");
+    assert!(!released.is_empty(), "should have released at least 1");
 }
 
 #[test]

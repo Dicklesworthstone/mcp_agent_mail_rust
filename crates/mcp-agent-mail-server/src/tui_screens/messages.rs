@@ -2683,8 +2683,6 @@ impl MailScreen for MessageBrowserScreen {
                 self.clear_message_selection();
                 Cmd::None
             }
-            // Consume single-item actions to prevent routing loops between tui_app and screen
-            "acknowledge" | "mark_read" => Cmd::None,
             _ => Cmd::None,
         }
     }

@@ -3402,7 +3402,11 @@ fn edge_case_release_reservations_idempotency() {
                 Outcome::Ok(n) => n,
                 other => panic!("first release failed: {other:?}"),
             };
-        assert_eq!(released, 2, "first release should free 2 reservations");
+        assert_eq!(
+            released.len(),
+            2,
+            "first release should free 2 reservations"
+        );
 
         // Second release (idempotent): should release 0
         let released_again =
@@ -3410,8 +3414,8 @@ fn edge_case_release_reservations_idempotency() {
                 Outcome::Ok(n) => n,
                 other => panic!("second release failed: {other:?}"),
             };
-        assert_eq!(
-            released_again, 0,
+        assert!(
+            released_again.is_empty(),
             "second release should be a no-op (0 rows, all already released)"
         );
 

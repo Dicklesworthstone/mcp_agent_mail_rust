@@ -2066,7 +2066,7 @@ mod tests {
     fn named_theme_guard() -> std::sync::MutexGuard<'static, ()> {
         super::NAMED_THEME_TEST_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn srgb_channel_to_linear(c: u8) -> f64 {

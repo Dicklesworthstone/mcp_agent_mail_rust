@@ -228,15 +228,15 @@ fn recipient_not_found_error(
                 Value::Array(suggested_tool_calls),
             );
         }
-        if let Some(map) = suggestions_map {
-            if !map.is_empty() {
-                // Flatten map to JSON object
-                let mut sug_json = serde_json::Map::new();
-                for (k, v) in map {
-                    sug_json.insert(k.clone(), Value::Array(v.clone()));
-                }
-                obj.insert("suggestions".to_string(), Value::Object(sug_json));
+        if let Some(map) = suggestions_map
+            && !map.is_empty()
+        {
+            // Flatten map to JSON object
+            let mut sug_json = serde_json::Map::new();
+            for (k, v) in map {
+                sug_json.insert(k.clone(), Value::Array(v.clone()));
             }
+            obj.insert("suggestions".to_string(), Value::Object(sug_json));
         }
     }
 
@@ -1090,13 +1090,15 @@ effective_free_bytes={free}"
 
     if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() {
         let msg = if broadcast {
-            "Broadcast found no eligible active recipients (sender excluded). Check active agents via `resource://agents/{project_key}`."
+            format!(
+                "Broadcast found no eligible active recipients (sender excluded). Check active agents via `resource://agents/{project_key}`."
+            )
         } else {
-            "At least one recipient is required. Provide agent names in to, cc, or bcc."
+            "At least one recipient is required. Provide agent names in to, cc, or bcc.".to_string()
         };
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
-            msg,
+            &msg,
             true,
             json!({
                 "field": "to|cc|bcc",
@@ -1215,17 +1217,14 @@ effective_free_bytes={free}"
                 &project.human_key,
             )
             .await
+                && let Some(data) = &e.data
+                && let Some(sug) = data
+                    .get("error")
+                    .and_then(|e| e.get("data"))
+                    .and_then(|d| d.get("suggestions"))
+                    .and_then(|s| s.as_array())
             {
-                if let Some(data) = &e.data {
-                    if let Some(sug) = data
-                        .get("error")
-                        .and_then(|e| e.get("data"))
-                        .and_then(|d| d.get("suggestions"))
-                        .and_then(|s| s.as_array())
-                    {
-                        suggestions_map.insert(name.clone(), sug.to_vec());
-                    }
-                }
+                suggestions_map.insert(name.clone(), sug.clone());
             }
         }
 
@@ -2147,17 +2146,14 @@ effective_free_bytes={free}"
                 &project.human_key,
             )
             .await
+                && let Some(data) = &e.data
+                && let Some(sug) = data
+                    .get("error")
+                    .and_then(|e| e.get("data"))
+                    .and_then(|d| d.get("suggestions"))
+                    .and_then(|s| s.as_array())
             {
-                if let Some(data) = &e.data {
-                    if let Some(sug) = data
-                        .get("error")
-                        .and_then(|e| e.get("data"))
-                        .and_then(|d| d.get("suggestions"))
-                        .and_then(|s| s.as_array())
-                    {
-                        suggestions_map.insert(name.clone(), sug.to_vec());
-                    }
-                }
+                suggestions_map.insert(name.clone(), sug.clone());
             }
         }
 
@@ -2929,6 +2925,7 @@ mod tests {
             "proj-slug",
             &sender,
             &["Zulu".to_string(), "Alpha".to_string(), "Zulu".to_string()],
+            None,
         );
 
         assert_eq!(

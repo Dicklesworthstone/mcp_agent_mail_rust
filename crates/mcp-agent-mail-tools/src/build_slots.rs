@@ -113,13 +113,13 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
 fn collect_slot_conflicts(
     active: Vec<BuildSlotLease>,
     agent_name: &str,
-    branch: &Option<String>,
+    branch: Option<&str>,
     request_exclusive: bool,
 ) -> Vec<BuildSlotLease> {
     let mut conflicts = Vec::new();
     for entry in active {
         // Renewing/reacquiring your own lease should not self-conflict.
-        if entry.agent == agent_name && entry.branch.as_deref() == branch.as_deref() {
+        if entry.agent == agent_name && entry.branch.as_deref() == branch {
             continue;
         }
         // Exclusive request conflicts with any active holder.
@@ -177,7 +177,7 @@ pub async fn acquire_build_slot(
         .map_err(|e| McpError::internal_error(format!("failed to create slot dir: {e}")))?;
 
     let active = read_active_leases(&slot_path, now);
-    let conflicts = collect_slot_conflicts(active, &agent_name, &branch, is_exclusive);
+    let conflicts = collect_slot_conflicts(active, &agent_name, branch.as_deref(), is_exclusive);
 
     let holder_id = safe_component(&format!(
         "{agent_name}__{}",
@@ -235,16 +235,13 @@ pub async fn renew_build_slot(
     let lease_path = slot_path.join(format!("{holder_id}.json"));
 
     // If lease doesn't exist, do not renew (prevent acquiring without conflict check).
-    let text = match std::fs::read_to_string(&lease_path) {
-        Ok(t) => t,
-        Err(_) => {
-            let response = RenewBuildSlotResponse {
-                renewed: false,
-                expires_ts: "".to_string(),
-            };
-            return serde_json::to_string(&response)
-                .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
-        }
+    let Ok(text) = std::fs::read_to_string(&lease_path) else {
+        let response = RenewBuildSlotResponse {
+            renewed: false,
+            expires_ts: String::new(),
+        };
+        return serde_json::to_string(&response)
+            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
     };
 
     let mut current = serde_json::from_str::<BuildSlotLease>(&text)
@@ -687,7 +684,7 @@ mod tests {
     fn collect_slot_conflicts_exclusive_request_conflicts_with_shared_holder() {
         let active = vec![make_lease("BlueLake", Some("main"), false)];
         let branch = Some("feature".to_string());
-        let conflicts = collect_slot_conflicts(active, "GreenPeak", &branch, true);
+        let conflicts = collect_slot_conflicts(active, "GreenPeak", branch.as_deref(), true);
         assert_eq!(
             conflicts.len(),
             1,
@@ -699,7 +696,7 @@ mod tests {
     fn collect_slot_conflicts_shared_request_conflicts_with_exclusive_holder() {
         let active = vec![make_lease("BlueLake", Some("main"), true)];
         let branch = Some("feature".to_string());
-        let conflicts = collect_slot_conflicts(active, "GreenPeak", &branch, false);
+        let conflicts = collect_slot_conflicts(active, "GreenPeak", branch.as_deref(), false);
         assert_eq!(
             conflicts.len(),
             1,
@@ -711,7 +708,7 @@ mod tests {
     fn collect_slot_conflicts_shared_request_ignores_shared_holder() {
         let active = vec![make_lease("BlueLake", Some("main"), false)];
         let branch = Some("feature".to_string());
-        let conflicts = collect_slot_conflicts(active, "GreenPeak", &branch, false);
+        let conflicts = collect_slot_conflicts(active, "GreenPeak", branch.as_deref(), false);
         assert!(
             conflicts.is_empty(),
             "shared requests should not conflict with other shared holders"
@@ -722,7 +719,7 @@ mod tests {
     fn collect_slot_conflicts_ignores_same_agent_branch() {
         let active = vec![make_lease("BlueLake", Some("main"), true)];
         let branch = Some("main".to_string());
-        let conflicts = collect_slot_conflicts(active, "BlueLake", &branch, true);
+        let conflicts = collect_slot_conflicts(active, "BlueLake", branch.as_deref(), true);
         assert!(
             conflicts.is_empty(),
             "agent reacquiring the same branch lease should not self-conflict"
