@@ -95,6 +95,13 @@ ci-artifacts/
 proptest-regressions/
 test_meminfo
 
+# Remote compilation helper release artifacts
+.rch-release-bin/
+.rch-release-root/
+
+# Beads backup/conflict files
+.beads/*.bak_*
+
 # Agent session ephemeral files
 SESSION_TODO.md
 SESSION_REPORT.md
