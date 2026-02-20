@@ -13,8 +13,8 @@ use sqlmodel_core::Value as SqlValue;
 
 use crate::{ScrubPreset, ShareError};
 
-/// Connection type for offline snapshot manipulation (C-backed SQLite).
-type Conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+/// Connection type for offline snapshot manipulation.
+type Conn = mcp_agent_mail_db::DbConn;
 
 /// Keys to remove from attachment metadata dicts during scrubbing.
 const ATTACHMENT_REDACT_KEYS: &[&str] = &[
@@ -146,13 +146,9 @@ pub fn scrub_snapshot(
 ) -> Result<ScrubSummary, ShareError> {
     let cfg = preset_config(preset);
     let path_str = snapshot_path.display().to_string();
-    // Use SqliteConnection (C-backed) for offline snapshot manipulation.
-    // FrankenConnection lacks sqlite_master support needed by table_exists().
-    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(
-        |e| ShareError::Sqlite {
-            message: format!("cannot open snapshot {path_str}: {e}"),
-        },
-    )?;
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot {path_str}: {e}"),
+    })?;
 
     conn.execute_raw("PRAGMA foreign_keys = ON")
         .map_err(|e| ShareError::Sqlite {
@@ -659,10 +655,7 @@ mod tests {
     fn scrub_presets_apply_distinct_redaction_levels() {
         let dir = tempfile::tempdir().unwrap();
         let source_db = create_fixture_db(dir.path());
-        let source_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            source_db.display().to_string(),
-        )
-        .unwrap();
+        let source_conn = Conn::open_file(source_db.display().to_string()).unwrap();
         source_conn
             .execute_sync(
                 "UPDATE messages SET ack_required = 1, body_md = ?, attachments = ? WHERE id = 1",
@@ -688,10 +681,7 @@ mod tests {
         scrub_snapshot(&archive_db, ScrubPreset::Archive).unwrap();
 
         fn fetch_message_state(db_path: &std::path::Path) -> (i64, String, String) {
-            let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-                db_path.display().to_string(),
-            )
-            .unwrap();
+            let conn = Conn::open_file(db_path.display().to_string()).unwrap();
             let rows = conn
                 .query_sync(
                     "SELECT ack_required, body_md, attachments FROM messages WHERE id = 1",
@@ -792,10 +782,7 @@ mod tests {
         }
 
         // Verify message content
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            snapshot.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(snapshot.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT id, subject, body_md, ack_required, attachments FROM messages ORDER BY id",
@@ -846,10 +833,7 @@ mod tests {
 
     fn create_fixture_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test.sqlite3");
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         )

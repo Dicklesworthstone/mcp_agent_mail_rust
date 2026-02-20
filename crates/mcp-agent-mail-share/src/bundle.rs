@@ -18,6 +18,7 @@ use crate::scrub::ScrubSummary;
 use crate::{ShareError, ShareResult};
 
 static BUILTIN_VIEWER_ASSETS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/viewer_assets");
+type Conn = mcp_agent_mail_db::DbConn;
 
 /// Per-attachment entry in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,11 +92,9 @@ pub fn bundle_attachments(
     use base64::Engine;
 
     let path_str = snapshot_path.display().to_string();
-    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(
-        |e| ShareError::Sqlite {
-            message: format!("cannot open snapshot: {e}"),
-        },
-    )?;
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot: {e}"),
+    })?;
 
     let _rows = conn
         .query_sync(
@@ -958,11 +957,9 @@ pub fn export_viewer_data(
     std::fs::create_dir_all(&data_dir)?;
 
     let path_str = snapshot_path.display().to_string();
-    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(
-        |e| ShareError::Sqlite {
-            message: format!("cannot open snapshot for viewer data: {e}"),
-        },
-    )?;
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot for viewer data: {e}"),
+    })?;
 
     // Count total messages
     let count_rows = conn
@@ -1251,10 +1248,7 @@ mod tests {
     /// Helper to create a DB with attachment entries pointing to storage files.
     fn create_bundle_test_db(dir: &Path, msg_attachments: &[&str]) -> PathBuf {
         let db_path = dir.join("bundle_test.sqlite3");
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         ).unwrap();
@@ -1359,10 +1353,7 @@ mod tests {
         assert_eq!(result.items[0].mode, "inline");
 
         // Verify DB was updated with data: URI
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();
@@ -1452,10 +1443,7 @@ mod tests {
         assert_eq!(result.items[3].mode, "missing");
 
         // Verify DB was updated with all 4 types
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();
@@ -1542,10 +1530,7 @@ mod tests {
         assert_eq!(result.stats.inline, 1);
 
         // Verify DB: should have 2 entries, first unchanged
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();

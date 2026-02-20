@@ -11,8 +11,8 @@ use sqlmodel_core::Value;
 
 use crate::ShareError;
 
-/// Connection type for offline snapshot manipulation (C-backed SQLite).
-type Conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+/// Connection type for offline snapshot manipulation.
+type Conn = mcp_agent_mail_db::DbConn;
 
 /// A project record from the `projects` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,13 +63,9 @@ pub fn apply_project_scope(
     identifiers: &[String],
 ) -> Result<ProjectScopeResult, ShareError> {
     let path_str = snapshot_path.display().to_string();
-    // Use SqliteConnection (C-backed) for offline snapshot manipulation.
-    // FrankenConnection lacks sqlite_master support needed by table_exists().
-    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(
-        |e| ShareError::Sqlite {
-            message: format!("cannot open snapshot {path_str}: {e}"),
-        },
-    )?;
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot {path_str}: {e}"),
+    })?;
 
     // Enable foreign keys
     conn.execute_raw("PRAGMA foreign_keys = ON")
@@ -376,10 +372,7 @@ mod tests {
 
     fn create_test_db(dir: &Path) -> PathBuf {
         let db_path = dir.join("test.sqlite3");
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -583,10 +576,7 @@ mod tests {
     fn count_table_rejects_unknown_table_name() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
         let result = count_table(&conn, "unknown_table");
         assert!(matches!(result, Err(ShareError::Sqlite { .. })));
     }
@@ -671,10 +661,7 @@ mod tests {
     fn scope_without_optional_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("no_links.sqlite3");
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db_path.display().to_string()).unwrap();
 
         // Create schema without agent_links and project_sibling_suggestions
         conn.execute_raw(
@@ -756,10 +743,7 @@ mod tests {
     fn scope_empty_database_errors() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("empty.sqlite3");
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .unwrap();
+        let conn = Conn::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
         ).unwrap();

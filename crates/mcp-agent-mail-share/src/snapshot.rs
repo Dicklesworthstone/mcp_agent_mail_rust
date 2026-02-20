@@ -1,18 +1,20 @@
-//! Step 1: SQLite snapshot creation via WAL checkpoint + online backup API.
+//! Step 1: SQLite snapshot creation via WAL checkpoint + filesystem copy.
 //!
 //! Creates an atomic, clean copy of the source database suitable for
 //! offline manipulation (scoping, scrubbing, etc.).
 
 use std::path::{Path, PathBuf};
 
+use mcp_agent_mail_db::DbConn;
+
 use crate::ShareError;
 
 /// Create a snapshot of the source SQLite database at `destination`.
 ///
 /// 1. Opens source DB.
-/// 2. If `checkpoint` is true, runs `PRAGMA wal_checkpoint(PASSIVE)` to
-///    flush as much WAL data as possible without blocking writers.
-/// 3. Uses SQLite's online backup API to copy the source into the destination.
+/// 2. If `checkpoint` is true, runs `PRAGMA wal_checkpoint(TRUNCATE)` to
+///    flush WAL frames into the main DB before copying.
+/// 3. Copies the source DB file into the destination.
 ///
 /// Returns the destination path on success.
 ///
@@ -55,36 +57,19 @@ pub fn create_sqlite_snapshot(
 
     let source_str = source.display().to_string();
 
-    // Checkpoint WAL if requested (requires a read-write connection).
+    // Checkpoint WAL if requested.
     if checkpoint {
-        let checkpoint_conn = sqlmodel_sqlite::SqliteConnection::open(
-            &sqlmodel_sqlite::SqliteConfig::file(&source_str)
-                .flags(sqlmodel_sqlite::OpenFlags::read_write()),
-        )
-        .map_err(|e| ShareError::Sqlite {
+        let checkpoint_conn = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
             message: format!("cannot open source DB {source_str}: {e}"),
         })?;
         checkpoint_conn
-            .execute_raw("PRAGMA wal_checkpoint(PASSIVE)")
+            .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|e| ShareError::Sqlite {
                 message: format!("WAL checkpoint failed: {e}"),
             })?;
     }
 
-    // Open source connection read-only for backup.
-    let conn = sqlmodel_sqlite::SqliteConnection::open(
-        &sqlmodel_sqlite::SqliteConfig::file(&source_str)
-            .flags(sqlmodel_sqlite::OpenFlags::read_only()),
-    )
-    .map_err(|e| ShareError::Sqlite {
-        message: format!("cannot open source DB {source_str}: {e}"),
-    })?;
-
-    let dest_str = dest.display().to_string();
-    conn.backup_to_path(&dest_str)
-        .map_err(|e| ShareError::Sqlite {
-            message: format!("backup failed: {e}"),
-        })?;
+    std::fs::copy(source, &dest)?;
 
     Ok(dest)
 }
@@ -147,8 +132,7 @@ mod tests {
         let dest = dir.path().join("dest.sqlite3");
 
         // Create a minimal source DB
-        let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(source.display().to_string()).unwrap();
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
         conn.execute_raw("CREATE TABLE test_data (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
         conn.execute_raw("INSERT INTO test_data VALUES (1, 'hello')")
@@ -161,8 +145,7 @@ mod tests {
         assert!(dest.exists());
 
         // Verify data in copy
-        let copy_conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(dest.display().to_string()).unwrap();
+        let copy_conn = DbConn::open_file(dest.display().to_string()).unwrap();
         let rows = copy_conn
             .query_sync("SELECT name FROM test_data WHERE id = 1", &[])
             .unwrap();
@@ -183,8 +166,7 @@ mod tests {
         let dest = dir.path().join("dest.sqlite3");
 
         // Create source and dest
-        let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(source.display().to_string()).unwrap();
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
         conn.execute_raw("CREATE TABLE t (id INTEGER)").unwrap();
         drop(conn);
         std::fs::write(&dest, b"existing").unwrap();
@@ -210,8 +192,7 @@ mod tests {
 
         // 1. Create a seeded source database
         let source = dir.path().join("source.sqlite3");
-        let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(source.display().to_string()).unwrap();
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         ).unwrap();
