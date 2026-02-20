@@ -1321,7 +1321,7 @@ mod tests {
         let orig_body = "#!/bin/sh\necho original\n";
         std::fs::write(&pre_commit, orig_body).expect("write pre-commit");
 
-        install_guard("/abs/path/backend", &repo_dir, None).expect("install_guard");
+        install_guard("/abs/path/backend", &repo_dir, None, false).expect("install_guard");
 
         let chain_body = std::fs::read_to_string(&pre_commit).expect("read chain");
         assert!(
@@ -2107,7 +2107,7 @@ mod tests {
         std::fs::create_dir_all(&repo_dir).expect("mkdir");
         run_git(&repo_dir, &["init", "-q"]);
 
-        install_guard("/test/project", &repo_dir, None).expect("install");
+        install_guard("/test/project", &repo_dir, None, false).expect("install");
 
         let status = guard_status(&repo_dir).expect("guard_status");
         assert!(
@@ -2307,7 +2307,7 @@ mod tests {
     fn install_guard_nonexistent_repo_returns_error() {
         let td = tempfile::TempDir::new().expect("tempdir");
         let nonexistent = td.path().join("nonexistent");
-        let result = install_guard("/test/project", &nonexistent, None);
+        let result = install_guard("/test/project", &nonexistent, None, false);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -2323,8 +2323,8 @@ mod tests {
         run_git(&repo_dir, &["init", "-q"]);
 
         // Install twice - should not error
-        install_guard("/test/project", &repo_dir, None).expect("first install");
-        install_guard("/test/project", &repo_dir, None).expect("second install");
+        install_guard("/test/project", &repo_dir, None, false).expect("first install");
+        install_guard("/test/project", &repo_dir, None, false).expect("second install");
 
         let status = guard_status(&repo_dir).expect("status");
         assert!(status.pre_commit_present);
