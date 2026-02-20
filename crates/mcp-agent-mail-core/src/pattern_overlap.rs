@@ -2,6 +2,12 @@ use globset::{Glob, GlobBuilder, GlobMatcher};
 
 fn normalize_pattern(pattern: &str) -> String {
     let mut normalized = pattern.trim().replace('\\', "/");
+    
+    // Collapse consecutive slashes
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+
     while normalized.starts_with("./") {
         normalized = normalized[2..].to_string();
     }
@@ -111,20 +117,20 @@ fn segments_overlap(p1: &str, p2: &str) -> bool {
         return true;
     }
 
-    let s1: Vec<&str> = p1.split('/').collect();
-    let s2: Vec<&str> = p2.split('/').collect();
+    let mut i1 = p1.split('/');
+    let mut i2 = p2.split('/');
 
-    if s1.len() != s2.len() {
-        return false;
-    }
-
-    for (seg1, seg2) in s1.iter().zip(s2.iter()) {
-        if !segment_pair_overlaps(seg1, seg2) {
-            return false;
+    loop {
+        match (i1.next(), i2.next()) {
+            (Some(seg1), Some(seg2)) => {
+                if !segment_pair_overlaps(seg1, seg2) {
+                    return false;
+                }
+            }
+            (None, None) => return true, // Both ended and matched all segments
+            _ => return false,           // Length mismatch implies disjoint
         }
     }
-
-    true
 }
 
 fn segment_pair_overlaps(s1: &str, s2: &str) -> bool {

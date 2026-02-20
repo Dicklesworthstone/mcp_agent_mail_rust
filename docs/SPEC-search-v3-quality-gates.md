@@ -300,4 +300,7 @@ scope/redaction regression) requires opening a follow-up bead with:
 - failing query samples,
 - health snapshot JSON,
 - relevant server log window,
-- artifact paths under `tests/artifacts/search_v3_*`.
+- artifact paths under `tests/artifacts/search_v3_*`,
+- scenario-level `case_id` + status from `search_v3/summaries/suite_summary.json`,
+- timings + failure reason details from `metrics.json` and diagnostics logs,
+- `repro.txt` / `repro.env` so the verification can be rerun deterministically.

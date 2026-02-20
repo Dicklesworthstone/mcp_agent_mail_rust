@@ -784,11 +784,7 @@ fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), C
 /// Resolve agent ID from --agent flag or AGENT_NAME env.
 ///
 /// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
-fn resolve_agent_id(
-    conn: &DbConn,
-    project_id: i64,
-    flag: Option<&str>,
-) -> Option<(i64, String)> {
+fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Option<(i64, String)> {
     let name = flag
         .map(String::from)
         .or_else(|| std::env::var("AGENT_NAME").ok())?;
@@ -1418,10 +1414,11 @@ fn build_thread(
 
 /// Truncate a string to `max_len` chars, appending "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.min(s.len())])
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
     }
 }
 

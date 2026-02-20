@@ -27,7 +27,6 @@ sqlmodel-query.workspace = true
 sqlmodel-schema.workspace = true
 sqlmodel-session.workspace = true
 sqlmodel-pool.workspace = true
-sqlmodel-sqlite.workspace = true
 sqlmodel-frankensqlite.workspace = true
 
 # LRU cache

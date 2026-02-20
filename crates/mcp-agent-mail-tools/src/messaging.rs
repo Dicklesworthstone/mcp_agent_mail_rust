@@ -186,6 +186,7 @@ fn recipient_not_found_error(
     project_slug: &str,
     sender: &mcp_agent_mail_db::AgentRow,
     missing_local: &[String],
+    suggestions_map: Option<&HashMap<String, Vec<Value>>>,
 ) -> McpError {
     let mut missing_sorted = missing_local.to_vec();
     missing_sorted.sort_unstable();
@@ -220,13 +221,23 @@ fn recipient_not_found_error(
         "unknown_local": missing_sorted,
         "hint": hint,
     });
-    if !suggested_tool_calls.is_empty()
-        && let Some(obj) = data.as_object_mut()
-    {
-        obj.insert(
-            "suggested_tool_calls".to_string(),
-            Value::Array(suggested_tool_calls),
-        );
+    if let Some(obj) = data.as_object_mut() {
+        if !suggested_tool_calls.is_empty() {
+            obj.insert(
+                "suggested_tool_calls".to_string(),
+                Value::Array(suggested_tool_calls),
+            );
+        }
+        if let Some(map) = suggestions_map {
+            if !map.is_empty() {
+                // Flatten map to JSON object
+                let mut sug_json = serde_json::Map::new();
+                for (k, v) in map {
+                    sug_json.insert(k.clone(), Value::Array(v.clone()));
+                }
+                obj.insert("suggestions".to_string(), Value::Object(sug_json));
+            }
+        }
     }
 
     legacy_tool_error("RECIPIENT_NOT_FOUND", message, true, data)
@@ -459,6 +470,17 @@ fn validate_message_size_limits(
                 std::fs::metadata(path)
             };
             if let Ok(meta) = metadata {
+                if !meta.is_file() {
+                    return Err(legacy_tool_error(
+                        "INVALID_ARGUMENT",
+                        format!("Attachment path is not a file: {path}"),
+                        true,
+                        json!({
+                            "field": "attachment_paths",
+                            "path": path,
+                        }),
+                    ));
+                }
                 let file_size = usize::try_from(meta.len()).unwrap_or(usize::MAX);
                 if config.max_attachment_bytes > 0 && file_size > config.max_attachment_bytes {
                     return Err(legacy_tool_error(
@@ -627,12 +649,18 @@ fn normalize_send_message_cc_bcc_argument(
             Ok(())
         }
         Value::Array(items) => {
-            if items.iter().any(|item| !item.is_string()) {
+            if let Some(invalid_item) = items.iter().find(|item| !item.is_string()) {
                 return Err(legacy_tool_error(
                     "INVALID_ARGUMENT",
-                    format!("{field} items must be strings (agent names)."),
+                    format!(
+                        "Each recipient in '{field}' must be a string (agent name). Got: {}",
+                        python_json_type_name(invalid_item)
+                    ),
                     true,
-                    json!({ "argument": field }),
+                    json!({
+                        "argument": field,
+                        "invalid_item": python_value_repr(invalid_item),
+                    }),
                 ));
             }
             Ok(())
@@ -771,7 +799,7 @@ pub struct MessagePayload {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -791,7 +819,7 @@ pub struct InboxMessage {
     pub from: String,
     pub created_ts: Option<String>,
     pub kind: String,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
 }
@@ -827,7 +855,7 @@ pub struct ReplyMessageResponse {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     pub body_md: String,
     pub from: String,
     pub to: Vec<String>,
@@ -1061,13 +1089,19 @@ effective_free_bytes={free}"
     let bcc_list = bcc.unwrap_or_default();
 
     if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() {
+        let msg = if broadcast {
+            "Broadcast found no eligible active recipients (sender excluded). Check active agents via `resource://agents/{project_key}`."
+        } else {
+            "At least one recipient is required. Provide agent names in to, cc, or bcc."
+        };
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
-            "At least one recipient is required. Provide agent names in to, cc, or bcc.",
+            msg,
             true,
             json!({
                 "field": "to|cc|bcc",
                 "error_detail": "empty recipient list",
+                "broadcast": broadcast,
             }),
         ));
     }
@@ -1169,11 +1203,38 @@ effective_free_bytes={free}"
     }
 
     if !missing_local.is_empty() {
+        let mut suggestions_map = HashMap::new();
+        for name in &missing_local {
+            // Attempt resolve to get fuzzy suggestions from the error payload
+            if let Err(e) = resolve_agent(
+                ctx,
+                &pool,
+                project_id,
+                name,
+                &project.slug,
+                &project.human_key,
+            )
+            .await
+            {
+                if let Some(data) = &e.data {
+                    if let Some(sug) = data
+                        .get("error")
+                        .and_then(|e| e.get("data"))
+                        .and_then(|d| d.get("suggestions"))
+                        .and_then(|s| s.as_array())
+                    {
+                        suggestions_map.insert(name.clone(), sug.to_vec());
+                    }
+                }
+            }
+        }
+
         return Err(recipient_not_found_error(
             &project.human_key,
             &project.slug,
             &sender,
             &missing_local,
+            Some(&suggestions_map),
         ));
     }
 
@@ -1514,6 +1575,8 @@ effective_free_bytes={free}"
         let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
         let mut blocked: Vec<String> = Vec::new();
+        let mut to_remove_names: HashSet<String> = HashSet::new();
+
         for name in resolved_to
             .iter()
             .chain(resolved_cc_recipients.iter())
@@ -1533,8 +1596,42 @@ effective_free_bytes={free}"
                 approved,
             ) {
                 ContactPolicyDecision::Allow => {}
-                ContactPolicyDecision::BlockAll => return Err(contact_blocked_error()),
-                ContactPolicyDecision::RequireApproval => blocked.push(agent.name.clone()),
+                ContactPolicyDecision::BlockAll => {
+                    if broadcast {
+                        to_remove_names.insert(name.clone());
+                    } else {
+                        return Err(contact_blocked_error());
+                    }
+                }
+                ContactPolicyDecision::RequireApproval => {
+                    if broadcast {
+                        to_remove_names.insert(name.clone());
+                    } else {
+                        blocked.push(agent.name.clone());
+                    }
+                }
+            }
+        }
+
+        if !to_remove_names.is_empty() {
+            resolved_to.retain(|n| !to_remove_names.contains(n));
+            resolved_cc_recipients.retain(|n| !to_remove_names.contains(n));
+            resolved_bcc_recipients.retain(|n| !to_remove_names.contains(n));
+
+            let remove_ids: HashSet<i64> = to_remove_names
+                .iter()
+                .filter_map(|n| recipient_map.get(&n.to_lowercase()).and_then(|a| a.id))
+                .collect();
+
+            all_recipients.retain(|(id, _)| !remove_ids.contains(id));
+
+            if all_recipients.is_empty() {
+                return Err(legacy_tool_error(
+                    "NO_RECIPIENTS",
+                    "Broadcast failed: no eligible recipients found (all potential recipients blocked the message via contact policies).",
+                    true,
+                    json!({}),
+                ));
             }
         }
 
@@ -1724,7 +1821,7 @@ effective_free_bytes={free}"
         importance: message.importance,
         ack_required: message.ack_required != 0,
         created_ts: Some(micros_to_iso(message.created_ts)),
-        attachments: attachment_paths_out.clone(),
+        attachments: all_attachment_meta,
         from: sender_name.clone(),
         to: resolved_to.into_vec(),
         cc: resolved_cc_recipients.into_vec(),
@@ -2038,11 +2135,38 @@ effective_free_bytes={free}"
     }
 
     if !missing_local.is_empty() {
+        let mut suggestions_map = HashMap::new();
+        for name in &missing_local {
+            // Attempt resolve to get fuzzy suggestions from the error payload
+            if let Err(e) = resolve_agent(
+                ctx,
+                &pool,
+                project_id,
+                name,
+                &project.slug,
+                &project.human_key,
+            )
+            .await
+            {
+                if let Some(data) = &e.data {
+                    if let Some(sug) = data
+                        .get("error")
+                        .and_then(|e| e.get("data"))
+                        .and_then(|d| d.get("suggestions"))
+                        .and_then(|s| s.as_array())
+                    {
+                        suggestions_map.insert(name.clone(), sug.to_vec());
+                    }
+                }
+            }
+        }
+
         return Err(recipient_not_found_error(
             &project.human_key,
             &project.slug,
             &sender,
             &missing_local,
+            Some(&suggestions_map),
         ));
     }
 
@@ -2457,7 +2581,7 @@ pub async fn fetch_inbox(
     let messages: Vec<InboxMessage> = inbox_rows
         .into_iter()
         .map(|row| {
-            let attachments: Vec<String> =
+            let attachments: Vec<serde_json::Value> =
                 serde_json::from_str(&row.message.attachments).unwrap_or_default();
             InboxMessage {
                 id: row.message.id.unwrap_or(0),
@@ -3310,7 +3434,7 @@ mod tests {
             from: "BlueLake".into(),
             created_ts: Some("2026-02-06T00:00:00Z".into()),
             kind: "to".into(),
-            attachments: vec!["img.webp".into()],
+            attachments: vec![json!({"path": "img.webp", "type": "file"})],
             body_md: Some("Hello world".into()),
         };
         let json: serde_json::Value =
@@ -3318,6 +3442,7 @@ mod tests {
         assert_eq!(json["body_md"], "Hello world");
         assert_eq!(json["ack_required"], true);
         assert_eq!(json["thread_id"], "thread-1");
+        assert_eq!(json["attachments"][0]["path"], "img.webp");
     }
 
     #[test]
@@ -3361,7 +3486,7 @@ mod tests {
             importance: "high".into(),
             ack_required: true,
             created_ts: Some("2026-02-06T00:00:00Z".into()),
-            attachments: vec!["file.webp".into()],
+            attachments: vec![json!({"path": "file.webp"})],
             from: "BlueLake".into(),
             to: vec!["RedFox".into()],
             cc: vec!["GoldHawk".into()],
@@ -3374,6 +3499,7 @@ mod tests {
         assert_eq!(json["cc"][0], "GoldHawk");
         assert!(json["bcc"].as_array().unwrap().is_empty());
         assert_eq!(json["importance"], "high");
+        assert_eq!(json["attachments"][0]["path"], "file.webp");
     }
 
     #[test]

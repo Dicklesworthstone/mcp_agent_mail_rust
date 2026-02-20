@@ -536,6 +536,10 @@ e2e_validate_bundle_tree tests/artifacts
 
 | Suite | Primary Diagnostics File |
 |-------|---------------------------|
+| `search_v3_stdio` | `tests/artifacts/search_v3_stdio/<timestamp>/search_v3/summaries/suite_summary.json` |
+| `search_v3_http` | `tests/artifacts/search_v3_http/<timestamp>/search_v3/summaries/suite_summary.json` |
+| `search_v3_resilience` | `tests/artifacts/search_v3_resilience/<timestamp>/search_v3/summaries/suite_summary.json` |
+| `search_v3_load_concurrency` | `tests/artifacts/search_v3_load_concurrency/<timestamp>/search_v3/summaries/suite_summary.json` |
 | `tui_wasm` | `tests/artifacts/tui_wasm/<timestamp>/diagnostics/wasm_scenarios.jsonl` |
 | `tui_interaction` | `tests/artifacts/tui_interaction/<timestamp>/diagnostics/pty_scenarios.jsonl` |
 | `tui_interactions` | `tests/artifacts/tui_interactions/<timestamp>/diagnostics/pty_scenarios.jsonl` |

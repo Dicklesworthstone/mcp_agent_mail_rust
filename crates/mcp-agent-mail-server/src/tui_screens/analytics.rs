@@ -520,7 +520,7 @@ fn analytics_table_backgrounds(
     (table_base_bg, header_bg, even_row_bg, odd_row_bg)
 }
 
-fn confidence_bar_colored(confidence: f64, severity: AnomalySeverity) -> ftui::text::Line {
+fn confidence_bar_colored(confidence: f64, severity: AnomalySeverity) -> ftui::text::Line<'static> {
     use ftui::text::{Line, Span};
 
     let confidence = confidence.clamp(0.0, 1.0);
@@ -1126,7 +1126,7 @@ fn render_card_detail(
     if let Some(ref cause) = card.likely_cause {
         lines.push(Line::from_spans(vec![
             Span::styled("Likely Cause: ", crate::tui_theme::text_warning(&tp)),
-            Span::raw(cause),
+            Span::raw(cause.clone()),
         ]));
         lines.push(Line::raw(""));
     }
@@ -1449,7 +1449,7 @@ fn render_viz_metric_tile(
         return;
     }
     fill_rect(frame, inner, tp.panel_bg);
-    Paragraph::new(value)
+    Paragraph::new(value.to_string())
         .style(crate::tui_theme::text_primary(&tp).bold())
         .render(inner, frame);
 }

@@ -1751,7 +1751,7 @@ fn render_pressure_board(
             break;
         }
         let line_area = Rect::new(inner.x, y, inner.width, 1);
-        Paragraph::new(text.as_str())
+        Paragraph::new(text.clone())
             .style(*style)
             .render(line_area, frame);
     }

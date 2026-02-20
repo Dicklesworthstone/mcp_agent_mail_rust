@@ -1,6 +1,6 @@
 //! Timestamp conversion utilities with clock skew detection.
 //!
-//! `sqlmodel_rust` uses i64 (microseconds since Unix epoch) for timestamps.
+//! `sqlmodel` uses i64 (microseconds since Unix epoch) for timestamps.
 //! This module provides conversion to/from chrono types, plus monotonic
 //! protection against wall-clock jumps (NTP corrections, VM migration, etc.).
 //!

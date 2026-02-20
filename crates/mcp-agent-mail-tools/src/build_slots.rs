@@ -91,6 +91,9 @@ fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> V
             continue;
         };
         if exp.with_timezone(&chrono::Utc) <= now {
+            // Lease expired. Clean it up to prevent unlimited file accumulation.
+            // Best-effort; ignore errors.
+            let _ = std::fs::remove_file(&path);
             continue;
         }
         results.push(lease);
@@ -105,6 +108,32 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
     let text =
         serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(path, text)
+}
+
+fn collect_slot_conflicts(
+    active: Vec<BuildSlotLease>,
+    agent_name: &str,
+    branch: &Option<String>,
+    request_exclusive: bool,
+) -> Vec<BuildSlotLease> {
+    let mut conflicts = Vec::new();
+    for entry in active {
+        // Renewing/reacquiring your own lease should not self-conflict.
+        if entry.agent == agent_name && entry.branch.as_deref() == branch.as_deref() {
+            continue;
+        }
+        // Exclusive request conflicts with any active holder.
+        // Shared request conflicts only with existing exclusive holders.
+        let conflicts_with_entry = if request_exclusive {
+            true
+        } else {
+            entry.exclusive
+        };
+        if conflicts_with_entry {
+            conflicts.push(entry);
+        }
+    }
+    conflicts
 }
 
 fn worktrees_required() -> McpError {
@@ -148,17 +177,7 @@ pub async fn acquire_build_slot(
         .map_err(|e| McpError::internal_error(format!("failed to create slot dir: {e}")))?;
 
     let active = read_active_leases(&slot_path, now);
-    let mut conflicts = Vec::new();
-    if is_exclusive {
-        for entry in active {
-            if entry.agent == agent_name && entry.branch == branch {
-                continue;
-            }
-            if entry.exclusive {
-                conflicts.push(entry);
-            }
-        }
-    }
+    let conflicts = collect_slot_conflicts(active, &agent_name, &branch, is_exclusive);
 
     let holder_id = safe_component(&format!(
         "{agent_name}__{}",
@@ -215,18 +234,21 @@ pub async fn renew_build_slot(
     ));
     let lease_path = slot_path.join(format!("{holder_id}.json"));
 
-    let mut current = std::fs::read_to_string(&lease_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<BuildSlotLease>(&t).ok())
-        .unwrap_or_else(|| BuildSlotLease {
-            slot: slot.clone(),
-            agent: agent_name.clone(),
-            branch: branch.clone(),
-            exclusive: true,
-            acquired_ts: now.to_rfc3339(),
-            expires_ts: new_exp.clone(),
-            released_ts: None,
-        });
+    // If lease doesn't exist, do not renew (prevent acquiring without conflict check).
+    let text = match std::fs::read_to_string(&lease_path) {
+        Ok(t) => t,
+        Err(_) => {
+            let response = RenewBuildSlotResponse {
+                renewed: false,
+                expires_ts: "".to_string(),
+            };
+            return serde_json::to_string(&response)
+                .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
+        }
+    };
+
+    let mut current = serde_json::from_str::<BuildSlotLease>(&text)
+        .map_err(|e| McpError::internal_error(format!("Failed to parse existing lease: {e}")))?;
 
     current.slot = slot;
     current.agent = agent_name;
@@ -645,6 +667,65 @@ mod tests {
         assert!(
             leases.is_empty(),
             "nonexistent directory should return empty vec"
+        );
+    }
+
+    fn make_lease(agent: &str, branch: Option<&str>, exclusive: bool) -> BuildSlotLease {
+        let now = chrono::Utc::now();
+        BuildSlotLease {
+            slot: "slot-a".to_string(),
+            agent: agent.to_string(),
+            branch: branch.map(str::to_string),
+            exclusive,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: (now + chrono::Duration::minutes(30)).to_rfc3339(),
+            released_ts: None,
+        }
+    }
+
+    #[test]
+    fn collect_slot_conflicts_exclusive_request_conflicts_with_shared_holder() {
+        let active = vec![make_lease("BlueLake", Some("main"), false)];
+        let branch = Some("feature".to_string());
+        let conflicts = collect_slot_conflicts(active, "GreenPeak", &branch, true);
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "exclusive requests should conflict with active shared holders"
+        );
+    }
+
+    #[test]
+    fn collect_slot_conflicts_shared_request_conflicts_with_exclusive_holder() {
+        let active = vec![make_lease("BlueLake", Some("main"), true)];
+        let branch = Some("feature".to_string());
+        let conflicts = collect_slot_conflicts(active, "GreenPeak", &branch, false);
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "shared requests should conflict with existing exclusive holders"
+        );
+    }
+
+    #[test]
+    fn collect_slot_conflicts_shared_request_ignores_shared_holder() {
+        let active = vec![make_lease("BlueLake", Some("main"), false)];
+        let branch = Some("feature".to_string());
+        let conflicts = collect_slot_conflicts(active, "GreenPeak", &branch, false);
+        assert!(
+            conflicts.is_empty(),
+            "shared requests should not conflict with other shared holders"
+        );
+    }
+
+    #[test]
+    fn collect_slot_conflicts_ignores_same_agent_branch() {
+        let active = vec![make_lease("BlueLake", Some("main"), true)];
+        let branch = Some("main".to_string());
+        let conflicts = collect_slot_conflicts(active, "BlueLake", &branch, true);
+        assert!(
+            conflicts.is_empty(),
+            "agent reacquiring the same branch lease should not self-conflict"
         );
     }
 }

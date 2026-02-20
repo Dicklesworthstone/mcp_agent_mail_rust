@@ -318,6 +318,21 @@ impl<'a> HeatmapGrid<'a> {
     }
 }
 
+pub(crate) fn truncate_width(s: &str, max_width: u16) -> String {
+    let mut w = 0;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let mut b = [0; 4];
+        let cw = display_width(ch.encode_utf8(&mut b)) as u16;
+        if w + cw > max_width {
+            break;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out
+}
+
 impl Widget for HeatmapGrid<'_> {
     #[allow(clippy::too_many_lines)]
     fn render(&self, area: Rect, frame: &mut Frame) {
@@ -353,7 +368,7 @@ impl Widget for HeatmapGrid<'_> {
                 let label_width: u16 = self.row_labels.map_or(0, |labels| {
                     labels
                         .iter()
-                        .map(|l| l.len())
+                        .map(|l| display_width(l))
                         .max()
                         .unwrap_or(0)
                         .saturating_add(1)
@@ -411,15 +426,18 @@ impl Widget for HeatmapGrid<'_> {
                     break;
                 }
                 let max_w = cell_w.min(inner.right().saturating_sub(x));
-                let truncated: String = label.chars().take(max_w as usize).collect();
-                for (i, ch) in truncated.chars().enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let cx = x + i as u16;
+                let truncated = truncate_width(label, max_w);
+                let mut dx = 0;
+                for ch in truncated.chars() {
+                    let mut b = [0; 4];
+                    let cw = display_width(ch.encode_utf8(&mut b)) as u16;
+                    let cx = x + dx;
                     if cx < inner.right() {
                         let mut cell = Cell::from_char(ch);
                         cell.fg = PackedRgba::rgb(180, 180, 180);
                         frame.buffer.set_fast(cx, y, cell);
                     }
+                    dx += cw;
                 }
             }
         }
@@ -439,18 +457,19 @@ impl Widget for HeatmapGrid<'_> {
                 && let Some(labels) = self.row_labels
                 && let Some(label) = labels.get(r)
             {
-                let lbl: String = label
-                    .chars()
-                    .take((effective_label_width.saturating_sub(1)) as usize)
-                    .collect();
-                for (i, ch) in lbl.chars().enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let cx = inner.x + i as u16;
+                let max_w = effective_label_width.saturating_sub(1);
+                let lbl = truncate_width(label, max_w);
+                let mut dx = 0;
+                for ch in lbl.chars() {
+                    let mut b = [0; 4];
+                    let cw = display_width(ch.encode_utf8(&mut b)) as u16;
+                    let cx = inner.x + dx;
                     if cx < grid_left {
                         let mut cell = Cell::from_char(ch);
                         cell.fg = PackedRgba::rgb(180, 180, 180);
                         frame.buffer.set_fast(cx, y, cell);
                     }
+                    dx += cw;
                 }
             }
 
@@ -888,8 +907,8 @@ impl Widget for Leaderboard<'_> {
             }
 
             // Right-align value: pad between name and value.
-            let used: usize = spans.iter().map(|s| s.content.len()).sum();
-            let value_len = value_str.len();
+            let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+            let value_len = display_width(&value_str);
             let padding = (inner.width as usize).saturating_sub(used + value_len + 1);
             if padding > 0 {
                 spans.push(Span::raw(" ".repeat(padding)));
@@ -1088,7 +1107,7 @@ impl Widget for AnomalyCard<'_> {
             };
 
             let headline_max = (inner.width as usize).saturating_sub(sev_label.len() + 4);
-            let truncated_headline: String = self.headline.chars().take(headline_max).collect();
+            let truncated_headline = truncate_width(self.headline, headline_max as u16);
 
             let line = Line::from_spans([
                 badge_span,
@@ -1178,8 +1197,7 @@ impl Widget for AnomalyCard<'_> {
 
         // Line 3: rationale (if present).
         if let Some(rationale) = self.rationale {
-            let max_chars = inner.width as usize;
-            let truncated: String = rationale.chars().take(max_chars).collect();
+            let truncated = truncate_width(rationale, inner.width);
             let line = Line::styled(truncated, Style::new().fg(tp.text_secondary).bg(card_bg));
             Paragraph::new(line).render(
                 Rect {
@@ -1200,7 +1218,7 @@ impl Widget for AnomalyCard<'_> {
                     break;
                 }
                 let bullet = format!("\u{2022} {step}");
-                let truncated: String = bullet.chars().take(inner.width as usize).collect();
+                let truncated = truncate_width(&bullet, inner.width);
                 let line = Line::styled(
                     truncated,
                     Style::new()
@@ -1388,7 +1406,7 @@ impl Widget for MetricTile<'_> {
             .render(inner, frame);
 
         // Line 1: label.
-        let label_truncated: String = self.label.chars().take(inner.width as usize).collect();
+        let label_truncated = truncate_width(self.label, inner.width);
         let label_line = Line::styled(
             label_truncated,
             Style::new()
@@ -1593,7 +1611,7 @@ impl Widget for ReservationGauge<'_> {
             .ttl_display
             .map_or(String::new(), |t| format!(" ({t})"));
         let header = format!("{} {count_str}{ttl_suffix}", self.label);
-        let header_truncated: String = header.chars().take(inner.width as usize).collect();
+        let header_truncated = truncate_width(&header, inner.width);
 
         let label_line = Line::styled(
             header_truncated,
@@ -3402,7 +3420,7 @@ impl ThreadTreeItem {
     }
 
     #[must_use]
-    pub fn render_line(&self, is_selected: bool, is_expanded: bool) -> Line {
+    pub fn render_line(&self, is_selected: bool, is_expanded: bool) -> Line<'static> {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let selection_prefix = if is_selected { "> " } else { "  " };
         let mut spans: Vec<Span<'static>> = vec![Span::raw(selection_prefix.to_string())];

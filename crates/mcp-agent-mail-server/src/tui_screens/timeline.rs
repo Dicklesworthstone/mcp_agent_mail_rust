@@ -2358,7 +2358,7 @@ fn render_virtualized_rows<T: RenderItem>(
         let summary_area = Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
         let summary_style = crate::tui_theme::text_meta(&tp);
         Paragraph::new(Text::from_line(Line::from(Span::styled(
-            summary,
+            summary.to_string(),
             summary_style,
         ))))
         .render(summary_area, frame);

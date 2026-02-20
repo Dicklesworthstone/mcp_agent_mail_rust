@@ -51,7 +51,7 @@ impl Widget for StatusBadge<'_> {
             return;
         }
         let text = format!("{} {}", self.icon, self.label);
-        let truncated: String = text.chars().take(area.width as usize).collect();
+        let truncated = super::truncate_width(&text, area.width);
         let line = Line::styled(truncated, self.style);
         Paragraph::new(line).render(area, frame);
     }

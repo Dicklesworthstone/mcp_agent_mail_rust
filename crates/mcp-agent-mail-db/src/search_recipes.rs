@@ -294,6 +294,69 @@ pub fn recipe_migrations() -> Vec<Migration> {
 
 use crate::sqlmodel::Value;
 
+/// Whether sync write helpers should use `BEGIN CONCURRENT`.
+///
+/// Controlled by `FSQLITE_CONCURRENT_MODE` (default: enabled).
+static SYNC_CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("FSQLITE_CONCURRENT_MODE")
+        .ok()
+        .is_none_or(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+});
+
+fn begin_sync_write_tx(conn: &DbConn) -> Result<(), String> {
+    if !*SYNC_CONCURRENT_MODE_ENABLED {
+        return conn
+            .execute_sync("BEGIN IMMEDIATE", &[])
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
+
+    match conn.execute_sync("BEGIN CONCURRENT", &[]) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.to_ascii_lowercase().contains("near \"concurrent\"") {
+                conn.execute_sync("BEGIN IMMEDIATE", &[])
+                    .map(|_| ())
+                    .map_err(|fallback| fallback.to_string())
+            } else {
+                Err(msg)
+            }
+        }
+    }
+}
+
+fn commit_sync_write_tx(conn: &DbConn) -> Result<(), String> {
+    conn.execute_sync("COMMIT", &[])
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn rollback_sync_write_tx(conn: &DbConn) {
+    let _ = conn.execute_sync("ROLLBACK", &[]);
+}
+
+fn with_sync_write_tx<T>(
+    conn: &DbConn,
+    body: impl FnOnce(&DbConn) -> Result<T, String>,
+) -> Result<T, String> {
+    begin_sync_write_tx(conn)?;
+    let out = body(conn);
+    match out {
+        Ok(value) => match commit_sync_write_tx(conn) {
+            Ok(()) => Ok(value),
+            Err(e) => {
+                rollback_sync_write_tx(conn);
+                Err(e)
+            }
+        },
+        Err(e) => {
+            rollback_sync_write_tx(conn);
+            Err(e)
+        }
+    }
+}
+
 fn row_named_i64(row: &Row, col: &str) -> Option<i64> {
     row.get_named::<i64>(col)
         .ok()
@@ -304,24 +367,26 @@ fn row_named_i64(row: &Row, col: &str) -> Option<i64> {
 
 /// Insert a new search recipe. Returns the row ID.
 pub fn insert_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<i64, String> {
-    let sql = "INSERT INTO search_recipes \
-        (name, description, query_text, doc_kind, scope_mode, scope_id, \
-         importance_filter, ack_filter, sort_mode, thread_filter, \
-         created_ts, updated_ts, pinned, use_count) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    with_sync_write_tx(conn, |conn| {
+        let sql = "INSERT INTO search_recipes \
+            (name, description, query_text, doc_kind, scope_mode, scope_id, \
+             importance_filter, ack_filter, sort_mode, thread_filter, \
+             created_ts, updated_ts, pinned, use_count) \
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-    let params = recipe_to_params(recipe);
-    conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
+        let params = recipe_to_params(recipe);
+        conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
 
-    // frankensqlite workaround: parameter comparison doesn't work reliably.
-    // Use MAX(id) to get the most recently inserted recipe id.
-    let lookup_sql = "SELECT MAX(id) as id FROM search_recipes";
-    let rows = conn
-        .query_sync(lookup_sql, &[])
-        .map_err(|e| e.to_string())?;
-    rows.first()
-        .and_then(|r| row_named_i64(r, "id").or_else(|| row_first_i64(r)))
-        .ok_or_else(|| "failed to resolve inserted search_recipes id".to_string())
+        // frankensqlite workaround: parameter comparison doesn't work reliably.
+        // Use MAX(id) to get the most recently inserted recipe id.
+        let lookup_sql = "SELECT MAX(id) as id FROM search_recipes";
+        let rows = conn
+            .query_sync(lookup_sql, &[])
+            .map_err(|e| e.to_string())?;
+        rows.first()
+            .and_then(|r| row_named_i64(r, "id").or_else(|| row_first_i64(r)))
+            .ok_or_else(|| "failed to resolve inserted search_recipes id".to_string())
+    })
 }
 
 /// Update an existing recipe by ID.
@@ -358,18 +423,22 @@ pub fn update_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<(), String>
         Value::BigInt(id),
     ];
 
-    conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
-    Ok(())
+    with_sync_write_tx(conn, |conn| {
+        conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
+        Ok(())
+    })
 }
 
 /// Delete a recipe by ID.
 pub fn delete_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
-    conn.execute_sync(
-        "DELETE FROM search_recipes WHERE id = ?",
-        &[Value::BigInt(recipe_id)],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    with_sync_write_tx(conn, |conn| {
+        conn.execute_sync(
+            "DELETE FROM search_recipes WHERE id = ?",
+            &[Value::BigInt(recipe_id)],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
 }
 
 /// List recipes, ordered by pinned (desc) then name (asc).
@@ -406,12 +475,14 @@ pub fn get_recipe(conn: &DbConn, recipe_id: i64) -> Result<Option<SearchRecipe>,
 /// Increment the use count for a recipe and update its timestamp.
 pub fn touch_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
     let now = now_micros();
-    conn.execute_sync(
-        "UPDATE search_recipes SET use_count = use_count + 1, updated_ts = ? WHERE id = ?",
-        &[Value::BigInt(now), Value::BigInt(recipe_id)],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    with_sync_write_tx(conn, |conn| {
+        conn.execute_sync(
+            "UPDATE search_recipes SET use_count = use_count + 1, updated_ts = ? WHERE id = ?",
+            &[Value::BigInt(now), Value::BigInt(recipe_id)],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
 }
 
 /// Prune old recipes, keeping pinned recipes plus the most recently updated
@@ -424,8 +495,10 @@ pub fn prune_recipes(conn: &DbConn, keep: usize) -> Result<u64, String> {
         SELECT id FROM search_recipes WHERE pinned = 0 \
         ORDER BY updated_ts DESC LIMIT ? \
     )";
-    conn.execute_sync(sql, &[Value::BigInt(keep_val)])
-        .map_err(|e| e.to_string())
+    with_sync_write_tx(conn, |conn| {
+        conn.execute_sync(sql, &[Value::BigInt(keep_val)])
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// Count total recipes.
@@ -440,30 +513,32 @@ pub fn count_recipes(conn: &DbConn) -> Result<i64, String> {
 
 /// Record a query execution in history.
 pub fn insert_history(conn: &DbConn, entry: &QueryHistoryEntry) -> Result<i64, String> {
-    let sql = "INSERT INTO query_history \
-        (query_text, doc_kind, scope_mode, scope_id, result_count, executed_ts) \
-        VALUES (?, ?, ?, ?, ?, ?)";
+    with_sync_write_tx(conn, |conn| {
+        let sql = "INSERT INTO query_history \
+            (query_text, doc_kind, scope_mode, scope_id, result_count, executed_ts) \
+            VALUES (?, ?, ?, ?, ?, ?)";
 
-    let params = vec![
-        Value::Text(entry.query_text.clone()),
-        Value::Text(entry.doc_kind.clone()),
-        Value::Text(entry.scope_mode.as_str().to_string()),
-        entry.scope_id.map_or(Value::Null, Value::BigInt),
-        Value::BigInt(entry.result_count),
-        Value::BigInt(entry.executed_ts),
-    ];
+        let params = vec![
+            Value::Text(entry.query_text.clone()),
+            Value::Text(entry.doc_kind.clone()),
+            Value::Text(entry.scope_mode.as_str().to_string()),
+            entry.scope_id.map_or(Value::Null, Value::BigInt),
+            Value::BigInt(entry.result_count),
+            Value::BigInt(entry.executed_ts),
+        ];
 
-    conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
+        conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
 
-    // frankensqlite workaround: parameter comparison doesn't work reliably.
-    // Use MAX(id) to get the most recently inserted history entry id.
-    let lookup_sql = "SELECT MAX(id) as id FROM query_history";
-    let rows = conn
-        .query_sync(lookup_sql, &[])
-        .map_err(|e| e.to_string())?;
-    rows.first()
-        .and_then(|r| row_named_i64(r, "id").or_else(|| row_first_i64(r)))
-        .ok_or_else(|| "failed to resolve inserted query_history id".to_string())
+        // frankensqlite workaround: parameter comparison doesn't work reliably.
+        // Use MAX(id) to get the most recently inserted history entry id.
+        let lookup_sql = "SELECT MAX(id) as id FROM query_history";
+        let rows = conn
+            .query_sync(lookup_sql, &[])
+            .map_err(|e| e.to_string())?;
+        rows.first()
+            .and_then(|r| row_named_i64(r, "id").or_else(|| row_first_i64(r)))
+            .ok_or_else(|| "failed to resolve inserted query_history id".to_string())
+    })
 }
 
 /// List recent query history, newest first.
@@ -487,8 +562,10 @@ pub fn prune_history(conn: &DbConn, keep: usize) -> Result<u64, String> {
     let sql = "DELETE FROM query_history WHERE id NOT IN ( \
         SELECT id FROM query_history ORDER BY executed_ts DESC LIMIT ? \
     )";
-    conn.execute_sync(sql, &[Value::BigInt(keep_val)])
-        .map_err(|e| e.to_string())
+    with_sync_write_tx(conn, |conn| {
+        conn.execute_sync(sql, &[Value::BigInt(keep_val)])
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// Count total history entries.

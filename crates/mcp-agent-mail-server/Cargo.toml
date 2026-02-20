@@ -44,7 +44,6 @@ criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 ftui-harness.workspace = true
-sqlmodel-sqlite.workspace = true
 
 [[bench]]
 name = "widget_bench"

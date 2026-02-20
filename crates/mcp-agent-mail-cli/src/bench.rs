@@ -12,8 +12,8 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use chrono::Utc;
-use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::sqlmodel::Value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -575,12 +575,11 @@ fn insert_message(
 ///
 /// This removes the benchmark setup bottleneck caused by repeatedly spawning
 /// CLI subprocesses for project/agent/message creation.
-pub fn seed_bench_database(
-    conn: &DbConn,
-    reseed: bool,
-) -> Result<BenchSeedReport, BenchSeedError> {
+pub fn seed_bench_database(conn: &DbConn, reseed: bool) -> Result<BenchSeedReport, BenchSeedError> {
     let started = Instant::now();
-    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+    // Use base schema (no FTS5) since FrankenConnection cannot create
+    // virtual tables.
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .map_err(|e| db_error("initializing schema for benchmark seed", e))?;
     conn.execute_raw("BEGIN IMMEDIATE")
         .map_err(|e| db_error("starting benchmark seed transaction", e))?;
@@ -1678,8 +1677,7 @@ mod tests {
     fn seed_bench_database_populates_expected_fixture() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bench-seed.sqlite3");
-        let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
 
         let report = seed_bench_database(&conn, false).expect("seed benchmark db");
         assert!(!report.skipped);
@@ -1725,8 +1723,7 @@ mod tests {
     fn seed_bench_database_is_idempotent_without_reseed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bench-idempotent.sqlite3");
-        let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
 
         let first = seed_bench_database(&conn, false).expect("first seed");
         assert!(!first.skipped);
@@ -1749,8 +1746,7 @@ mod tests {
     fn seed_bench_database_reseed_rebuilds_fixture() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bench-reseed.sqlite3");
-        let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
 
         let initial = seed_bench_database(&conn, false).expect("initial seed");
         let blue_id = select_agent_id(&conn, initial.project_id, BENCH_AGENT_BLUE)
@@ -1795,9 +1791,8 @@ mod tests {
     fn seed_bench_database_reuses_existing_human_key_project() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bench-existing-project.sqlite3");
-        let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
         let now_us = mcp_agent_mail_db::timestamps::now_micros();

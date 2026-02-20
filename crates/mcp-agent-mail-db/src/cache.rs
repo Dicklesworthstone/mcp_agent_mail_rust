@@ -191,8 +191,8 @@ pub fn cache_metrics() -> &'static CacheMetrics {
 pub struct ReadCache {
     projects_by_slug: OrderedRwLock<S3FifoCache<String, CacheEntry<ProjectRow>>>,
     projects_by_human_key: OrderedRwLock<S3FifoCache<String, CacheEntry<ProjectRow>>>,
-    agents_by_key: OrderedRwLock<S3FifoCache<(i64, InternedStr), CacheEntry<AgentRow>>>,
-    agents_by_id: OrderedRwLock<S3FifoCache<i64, CacheEntry<AgentRow>>>,
+    agents_by_key: OrderedRwLock<S3FifoCache<(u64, i64, InternedStr), CacheEntry<AgentRow>>>,
+    agents_by_id: OrderedRwLock<S3FifoCache<(u64, i64), CacheEntry<AgentRow>>>,
     /// Cached inbox aggregate counters keyed by `(db_scope, agent_id)` (30s TTL).
     inbox_stats: OrderedRwLock<S3FifoCache<(u64, i64), CacheEntry<InboxStatsRow>>>,
     /// Sharded deferred touch queue (16 shards, keyed by `agent_id % 16`).
@@ -325,7 +325,13 @@ impl ReadCache {
     /// Look up an agent by (`project_id`, name). Returns `None` if not cached or expired.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_agent(&self, project_id: i64, name: &str) -> Option<AgentRow> {
-        let key = (project_id, InternedStr::new(name));
+        self.get_agent_scoped("", project_id, name)
+    }
+
+    /// Look up an agent by (`project_id`, name) in a specific DB scope.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn get_agent_scoped(&self, scope: &str, project_id: i64, name: &str) -> Option<AgentRow> {
+        let key = (scope_fingerprint(scope), project_id, InternedStr::new(name));
         let mut cache = self.agents_by_key.write();
         match cache.get(&key) {
             Some(entry) if entry.is_expired(AGENT_TTL) => {
@@ -349,10 +355,17 @@ impl ReadCache {
     /// Look up an agent by id.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_agent_by_id(&self, agent_id: i64) -> Option<AgentRow> {
+        self.get_agent_by_id_scoped("", agent_id)
+    }
+
+    /// Look up an agent by id in a specific DB scope.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn get_agent_by_id_scoped(&self, scope: &str, agent_id: i64) -> Option<AgentRow> {
+        let key = (scope_fingerprint(scope), agent_id);
         let mut cache = self.agents_by_id.write();
-        match cache.get(&agent_id) {
+        match cache.get(&key) {
             Some(entry) if entry.is_expired(AGENT_TTL) => {
-                cache.remove(&agent_id);
+                cache.remove(&key);
                 CACHE_METRICS.record_agent_miss();
                 return None;
             }
@@ -362,7 +375,7 @@ impl ReadCache {
                 return None;
             }
         }
-        let entry = cache.get_mut(&agent_id)?;
+        let entry = cache.get_mut(&key)?;
         entry.touch();
         let value = entry.value.clone();
         CACHE_METRICS.record_agent_hit();
@@ -372,16 +385,22 @@ impl ReadCache {
     /// Cache an agent (write-through after DB mutation).
     /// Indexes by both (`project_id`, `name`) and `id`.
     pub fn put_agent(&self, agent: &AgentRow) {
+        self.put_agent_scoped("", agent);
+    }
+
+    /// Cache an agent (write-through after DB mutation) in a specific DB scope.
+    pub fn put_agent_scoped(&self, scope: &str, agent: &AgentRow) {
+        let scope_fp = scope_fingerprint(scope);
         {
             let mut cache = self.agents_by_key.write();
             cache.insert(
-                (agent.project_id, InternedStr::new(&agent.name)),
+                (scope_fp, agent.project_id, InternedStr::new(&agent.name)),
                 CacheEntry::new(agent.clone()),
             );
         }
         if let Some(id) = agent.id {
             let mut cache = self.agents_by_id.write();
-            cache.insert(id, CacheEntry::new(agent.clone()));
+            cache.insert((scope_fp, id), CacheEntry::new(agent.clone()));
         }
     }
 
@@ -389,11 +408,17 @@ impl ReadCache {
     /// Useful for pre-loading all agents for active projects to avoid cold-start
     /// DB round-trips.
     pub fn warm_agents(&self, agents: &[AgentRow]) {
+        self.warm_agents_scoped("", agents);
+    }
+
+    /// Bulk-insert agents into the cache (cache warming on startup) in a DB scope.
+    pub fn warm_agents_scoped(&self, scope: &str, agents: &[AgentRow]) {
+        let scope_fp = scope_fingerprint(scope);
         {
             let mut cache = self.agents_by_key.write();
             for agent in agents {
                 cache.insert(
-                    (agent.project_id, InternedStr::new(&agent.name)),
+                    (scope_fp, agent.project_id, InternedStr::new(&agent.name)),
                     CacheEntry::new(agent.clone()),
                 );
             }
@@ -402,7 +427,7 @@ impl ReadCache {
             let mut cache = self.agents_by_id.write();
             for agent in agents {
                 if let Some(id) = agent.id {
-                    cache.insert(id, CacheEntry::new(agent.clone()));
+                    cache.insert((scope_fp, id), CacheEntry::new(agent.clone()));
                 }
             }
         }
@@ -426,14 +451,20 @@ impl ReadCache {
 
     /// Invalidate a specific agent entry (call after `register_agent` update).
     pub fn invalidate_agent(&self, project_id: i64, name: &str) {
-        let key = (project_id, InternedStr::new(name));
+        self.invalidate_agent_scoped("", project_id, name);
+    }
+
+    /// Invalidate a specific agent entry in a DB scope.
+    pub fn invalidate_agent_scoped(&self, scope: &str, project_id: i64, name: &str) {
+        let scope_fp = scope_fingerprint(scope);
+        let key = (scope_fp, project_id, InternedStr::new(name));
         let mut cache = self.agents_by_key.write();
         if let Some(agent) = cache.remove(&key)
             && let Some(id) = agent.value.id
         {
             drop(cache); // release key map lock first
             let mut id_cache = self.agents_by_id.write();
-            id_cache.remove(&id);
+            id_cache.remove(&(scope_fp, id));
         }
     }
 
@@ -1267,6 +1298,50 @@ mod tests {
         cache.invalidate_inbox_stats_scoped("/tmp/a.sqlite3", 2);
         assert!(cache.get_inbox_stats_scoped("/tmp/a.sqlite3", 2).is_none());
         assert!(cache.get_inbox_stats_scoped("/tmp/b.sqlite3", 2).is_some());
+    }
+
+    #[test]
+    fn agent_scope_isolation_prevents_cross_db_collisions() {
+        let cache = ReadCache::new();
+        let mut a = make_agent_with_id("BlueLake", 1, 42);
+        a.program = "codex-cli".to_string();
+        let mut b = make_agent_with_id("BlueLake", 1, 42);
+        b.program = "e2e-test".to_string();
+
+        cache.put_agent_scoped("/tmp/a.sqlite3", &a);
+        cache.put_agent_scoped("/tmp/b.sqlite3", &b);
+
+        let a_by_key = cache
+            .get_agent_scoped("/tmp/a.sqlite3", 1, "BlueLake")
+            .expect("agent in scope a");
+        let b_by_key = cache
+            .get_agent_scoped("/tmp/b.sqlite3", 1, "BlueLake")
+            .expect("agent in scope b");
+        assert_eq!(a_by_key.program, "codex-cli");
+        assert_eq!(b_by_key.program, "e2e-test");
+
+        let a_by_id = cache
+            .get_agent_by_id_scoped("/tmp/a.sqlite3", 42)
+            .expect("agent id in scope a");
+        let b_by_id = cache
+            .get_agent_by_id_scoped("/tmp/b.sqlite3", 42)
+            .expect("agent id in scope b");
+        assert_eq!(a_by_id.program, "codex-cli");
+        assert_eq!(b_by_id.program, "e2e-test");
+
+        cache.invalidate_agent_scoped("/tmp/a.sqlite3", 1, "BlueLake");
+        assert!(
+            cache
+                .get_agent_scoped("/tmp/a.sqlite3", 1, "BlueLake")
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_agent_scoped("/tmp/b.sqlite3", 1, "BlueLake")
+                .is_some()
+        );
+        assert!(cache.get_agent_by_id_scoped("/tmp/a.sqlite3", 42).is_none());
+        assert!(cache.get_agent_by_id_scoped("/tmp/b.sqlite3", 42).is_some());
     }
 
     // =========================================================================

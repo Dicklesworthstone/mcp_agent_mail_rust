@@ -1582,7 +1582,7 @@ impl MailScreen for ReservationsScreen {
                         .time(animation_time)
                         .render(alert_area, frame);
                 } else {
-                    Paragraph::new(critical_alert.trim_start())
+                    Paragraph::new(critical_alert.trim_start().to_string())
                         .style(crate::tui_theme::text_critical(&tp))
                         .render(alert_area, frame);
                 }
@@ -1995,7 +1995,7 @@ fn render_create_form_label(
     } else {
         crate::tui_theme::text_meta(tp)
     };
-    Paragraph::new(label)
+    Paragraph::new(label.to_string())
         .style(style)
         .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
     *cursor_y = (*cursor_y).saturating_add(1);
@@ -2012,7 +2012,7 @@ fn render_create_form_error(
     if let Some(error) = error
         && *cursor_y < bottom
     {
-        Paragraph::new(error)
+        Paragraph::new(error.to_string())
             .style(crate::tui_theme::text_warning(tp))
             .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
         *cursor_y = (*cursor_y).saturating_add(1);

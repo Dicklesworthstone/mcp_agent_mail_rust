@@ -667,8 +667,17 @@ fn thread_jitter_ms(range: u64) -> u64 {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            // Mix thread-id hash with timestamp; ensure non-zero.
-            let mut seed = now ^ (format!("{tid:?}").len() as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+            
+            // Mix thread-id string hash with timestamp to ensure per-thread jitter.
+            // Simple FNV-1a style mixer on the debug string representation of ThreadId.
+            let tid_str = format!("{tid:?}");
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in tid_str.bytes() {
+                h = h ^ u64::from(byte);
+                h = h.wrapping_mul(0x1000_0000_1b3);
+            }
+            
+            let mut seed = now ^ h;
             if seed == 0 { seed = 1; }
             seed
         });
@@ -875,7 +884,10 @@ impl FileLock {
             None
         };
 
-        let owner_alive = meta.as_ref().map(|m| pid_alive(m.pid)).unwrap_or(false);
+        // If metadata is missing, we must assume the owner is alive (likely just acquired the lock
+        // and hasn't written metadata yet) to avoid race conditions where we delete a lock
+        // held by a live process. We fallback to the timeout check below.
+        let owner_alive = meta.as_ref().map_or(true, |m| pid_alive(m.pid));
 
         let age = meta.as_ref().map(|m| now - m.created_ts).or_else(|| {
             fs::metadata(&self.path)
@@ -888,7 +900,16 @@ impl FileLock {
         let is_stale = if !owner_alive {
             true
         } else if !self.stale_timeout.is_zero() {
-            age.is_some_and(|a| a >= self.stale_timeout.as_secs_f64())
+            // On Unix, if the PID is alive, we trust it (it might be a long-running operation).
+            // On Windows, pid_alive is always true, so we must rely on the timeout to clear crashes.
+            #[cfg(unix)]
+            {
+                false
+            }
+            #[cfg(not(unix))]
+            {
+                age.is_some_and(|a| a >= self.stale_timeout.as_secs_f64())
+            }
         } else {
             false
         };
@@ -1769,6 +1790,17 @@ fn coalescer_pool_worker(
             continue;
         }
 
+        // RAII guard to ensure processing flag is cleared even on panic
+        struct ProcessingGuard<'a> {
+            rq: &'a Arc<RepoQueue>,
+        }
+        impl<'a> Drop for ProcessingGuard<'a> {
+            fn drop(&mut self) {
+                self.rq.processing.store(false, Ordering::Release);
+            }
+        }
+        let _guard = ProcessingGuard { rq: &rq };
+
         // Phase 3: Drain queue + spill for this repo
         let mut batch: Vec<CoalescerCommitFields> = Vec::new();
         {
@@ -1794,12 +1826,20 @@ fn coalescer_pool_worker(
 
         let drained_count =
             batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
-        // Single atomic fetch_sub avoids TOCTOU race of load-then-sub.
-        // If drained_count > prev (shouldn't happen, but guards against wrapping),
-        // clamp back to 0.
-        let prev = rq.depth.fetch_sub(drained_count, Ordering::Relaxed);
-        if drained_count > prev {
+
+        if drained_count == 0 {
+            // We found nothing, but we were invoked. If depth > 0, it's a desync.
+            // Reset to 0 to prevent busy loop.
             rq.depth.store(0, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(1));
+        } else {
+            // Single atomic fetch_sub avoids TOCTOU race of load-then-sub.
+            // If drained_count > prev (shouldn't happen, but guards against wrapping),
+            // clamp back to 0.
+            let prev = rq.depth.fetch_sub(drained_count, Ordering::Relaxed);
+            if drained_count > prev {
+                rq.depth.store(0, Ordering::Relaxed);
+            }
         }
 
         // Phase 4: Commit
@@ -1867,11 +1907,10 @@ fn coalescer_pool_worker(
             coalescer_update_pending(&pending_requests, work.pending_requests);
         }
 
-        // Release processing lock + update last_serviced timestamp
+        // Release processing lock (via guard drop) + update last_serviced timestamp
         rq.last_serviced_us
             .store(now_micros_u64(), Ordering::Relaxed);
-        rq.processing.store(false, Ordering::Release);
-
+        
         // If any repo still has work, wake another worker
         let more_work = {
             let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
@@ -2533,6 +2572,18 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                 // New-format owner files may carry "unknown" start ticks (e.g., non-Linux).
                 // Be conservative: never remove an alive-PID lock in that case.
                 if has_start_ticks_field {
+                    // On non-Unix, pid_alive() returns true blindly. If the lock is very old,
+                    // we must assume it's stale because we can't verify the PID identity.
+                    #[cfg(not(unix))]
+                    if lock_file_age_seconds(&lock_path).is_some_and(|age| age > max_age_seconds * 2.0) {
+                        tracing::info!(
+                            "[git-lock] non-unix stale lock force clean (age={age:.1}s)"
+                        );
+                        let _ = fs::remove_file(&lock_path);
+                        let _ = fs::remove_file(&owner_path);
+                        return true;
+                    }
+
                     tracing::debug!(
                         "[git-lock] index.lock held by alive PID {pid} (start ticks unavailable), not removing"
                     );
@@ -3311,17 +3362,15 @@ fn validate_repo_relative_path<'a>(kind: &str, raw: &'a str) -> Result<&'a str> 
     }
 
     let p = Path::new(s);
-    if let Some(Component::Normal(first)) = p.components().next()
-        && first == ".git"
-    {
-        return Err(StorageError::InvalidPath(format!(
-            "{kind} must not reference .git internals"
-        )));
-    }
-
     for c in p.components() {
         match c {
-            Component::Normal(_) => {}
+            Component::Normal(part) => {
+                if part == ".git" {
+                    return Err(StorageError::InvalidPath(format!(
+                        "{kind} must not reference .git internals"
+                    )));
+                }
+            }
             Component::CurDir
             | Component::ParentDir
             | Component::RootDir
@@ -6021,6 +6070,16 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
     }
 
     let safe_rel = normalized.trim_start_matches('/');
+    if safe_rel.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "path must not be empty or root".to_string(),
+        ));
+    }
+    if safe_rel.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "path must not be empty or root".to_string(),
+        ));
+    }
     // Use pre-canonicalized root to avoid repeated readlink syscalls.
     let root = &archive.canonical_root;
 

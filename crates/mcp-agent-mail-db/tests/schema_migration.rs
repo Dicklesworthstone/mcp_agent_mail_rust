@@ -17,11 +17,11 @@
 
 use asupersync::cx::Cx;
 use asupersync::runtime::RuntimeBuilder;
+use mcp_agent_mail_db::DbConn as SqliteConnection;
 use mcp_agent_mail_db::schema::{
     self, MIGRATIONS_TABLE_NAME, PRAGMA_SETTINGS_SQL, enforce_runtime_fts_cleanup,
     migrate_to_latest, migration_status,
 };
-use mcp_agent_mail_db::DbConn as SqliteConnection;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use sqlmodel_core::Value;
 use std::sync::atomic::{AtomicU64, Ordering};

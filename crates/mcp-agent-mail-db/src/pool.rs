@@ -18,7 +18,7 @@ use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Instant, SystemTime};
 
 /// Default pool configuration values — sized for 1000+ concurrent agents.
@@ -283,6 +283,20 @@ pub struct DbPool {
 }
 
 impl DbPool {
+    fn from_shared_pool(config: &DbPoolConfig, pool: Arc<Pool<DbConn>>) -> DbResult<Self> {
+        let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
+        let init_sql = Arc::new(schema::build_conn_pragmas(config.max_connections));
+        let stats_sampler = Arc::new(DbPoolStatsSampler::new());
+
+        Ok(Self {
+            pool,
+            sqlite_path,
+            init_sql,
+            run_migrations: config.run_migrations,
+            stats_sampler,
+        })
+    }
+
     /// Create a new pool (does not open connections until first acquire).
     pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
@@ -335,12 +349,14 @@ impl DbPool {
                     if sqlite_path != ":memory:"
                         && let Some(parent) = Path::new(&sqlite_path).parent()
                         && !parent.as_os_str().is_empty()
-                        && let Err(e) = std::fs::create_dir_all(parent)
+                        && !parent.exists()
                     {
-                        return Outcome::Err(SqlError::Custom(format!(
-                            "failed to create db dir {}: {e}",
-                            parent.display()
-                        )));
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            return Outcome::Err(SqlError::Custom(format!(
+                                "failed to create db dir {}: {e}",
+                                parent.display()
+                            )));
+                        }
                     }
 
                     // For file-backed DBs, run DB-wide init (journal mode, migrations) once
@@ -520,12 +536,11 @@ impl DbPool {
                 }
 
                 // Re-open and re-verify
-                let conn = DbConn::open_file(&self.sqlite_path)
-                    .map_err(|e| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check (post-recovery): open failed: {e}"
-                        ))
-                    })?;
+                let conn = DbConn::open_file(&self.sqlite_path).map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "startup integrity check (post-recovery): open failed: {e}"
+                    ))
+                })?;
                 integrity::quick_check(&conn)
             }
             Err(e) => Err(e),
@@ -669,7 +684,7 @@ impl DbPool {
 
 static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<OnceCell<()>>>>> =
     OnceLock::new();
-static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<String, DbPool>>> = OnceLock::new();
+static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<String, Weak<Pool<DbConn>>>>> = OnceLock::new();
 
 fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
     let gates = SQLITE_INIT_GATES
@@ -954,23 +969,29 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     let cache =
         POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
 
-    // Fast path: shared read lock for existing pool (concurrent readers).
+    // Fast path: shared read lock for existing live pool (concurrent readers).
     {
         let guard = cache.read();
-        if let Some(pool) = guard.get(&config.database_url) {
-            return Ok(pool.clone());
+        if let Some(pool) = guard.get(&config.database_url)
+            && let Some(shared_pool) = pool.upgrade()
+        {
+            return DbPool::from_shared_pool(config, shared_pool);
         }
     }
 
-    // Slow path: exclusive write lock to create a new pool (rare).
+    // Slow path: exclusive write lock to create a new pool (rare), or to
+    // evict dead weak entries left after all callers dropped a pool.
     let mut guard = cache.write();
     // Double-check after acquiring write lock — another thread may have won the race.
     if let Some(pool) = guard.get(&config.database_url) {
-        return Ok(pool.clone());
+        if let Some(shared_pool) = pool.upgrade() {
+            return DbPool::from_shared_pool(config, shared_pool);
+        }
+        guard.remove(&config.database_url);
     }
 
     let pool = DbPool::new(config)?;
-    guard.insert(config.database_url.clone(), pool.clone());
+    guard.insert(config.database_url.clone(), Arc::downgrade(&pool.pool));
     drop(guard);
     Ok(pool)
 }

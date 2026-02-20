@@ -12,8 +12,8 @@
 #![forbid(unsafe_code)]
 
 use mcp_agent_mail_core::{Config, kpi_record_sample};
-use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::now_micros;
 use mcp_agent_mail_tools::{
@@ -774,7 +774,10 @@ mod tests {
             .next()
             .and_then(|row| row.get_named::<i64>("c").ok())
             .unwrap_or(0);
-        assert!(after < before, "old rows should have been pruned: before={before}, after={after}");
+        assert!(
+            after < before,
+            "old rows should have been pruned: before={before}, after={after}"
+        );
     }
 
     #[test]

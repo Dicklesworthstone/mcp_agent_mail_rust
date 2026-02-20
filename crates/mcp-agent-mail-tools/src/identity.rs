@@ -678,7 +678,23 @@ pub async fn create_agent_identity(
     // Generate or validate agent name
     let agent_name = match name_hint {
         Some(hint) => {
+            // Strict validation: name_hint MUST be a valid agent name format.
             if !is_valid_agent_name(&hint) {
+                // Check for specific mistake types before generic error
+                if let Some((mistake_type, message)) =
+                    mcp_agent_mail_core::models::detect_agent_name_mistake(&hint)
+                {
+                    return Err(legacy_tool_error(
+                        mistake_type,
+                        &message,
+                        true,
+                        json!({
+                            "field": "name_hint",
+                            "error_detail": hint,
+                            "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
+                        }),
+                    ));
+                }
                 return Err(legacy_tool_error(
                     "INVALID_ARGUMENT",
                     format!(

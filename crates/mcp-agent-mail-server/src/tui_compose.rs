@@ -571,7 +571,7 @@ impl ComposeState {
                 *cursor = cursor.saturating_sub(1);
             }
             KeyCode::Right => {
-                if *cursor < text.len() {
+                if *cursor < char_count(text) {
                     *cursor += 1;
                 }
             }
@@ -579,18 +579,20 @@ impl ComposeState {
                 *cursor = 0;
             }
             KeyCode::End => {
-                *cursor = text.len();
+                *cursor = char_count(text);
             }
             KeyCode::Backspace => {
                 if *cursor > 0 {
-                    text.remove(*cursor - 1);
+                    let byte_idx = byte_index_from_char_index(text, *cursor - 1);
+                    text.remove(byte_idx);
                     *cursor -= 1;
                     self.dirty = true;
                 }
             }
             KeyCode::Delete => {
-                if *cursor < text.len() {
-                    text.remove(*cursor);
+                if *cursor < char_count(text) {
+                    let byte_idx = byte_index_from_char_index(text, *cursor);
+                    text.remove(byte_idx);
                     self.dirty = true;
                 }
             }
@@ -599,8 +601,9 @@ impl ComposeState {
                     TextTarget::Subject => MAX_SUBJECT_LEN,
                     TextTarget::ThreadId => 200,
                 };
-                if text.len() < max {
-                    text.insert(*cursor, c);
+                if char_count(text) < max {
+                    let byte_idx = byte_index_from_char_index(text, *cursor);
+                    text.insert(byte_idx, c);
                     *cursor += 1;
                     self.dirty = true;
                 }
@@ -625,19 +628,32 @@ impl ComposeState {
                 let offset = self.body_offset();
                 if offset > 0 {
                     if self.body_cursor_col > 0 {
-                        self.body.remove(offset - 1);
-                        self.body_cursor_col -= 1;
+                        // Remove char before cursor on current line
+                        // body_offset points to char *at* cursor, so we need char *before*
+                        // But finding byte index of char before is hard from global offset without scanning back.
+                        // Easier: use line-local logic.
+                        let lines: Vec<&str> = self.body.split('\n').collect();
+                        if let Some(line) = lines.get(self.body_cursor_line) {
+                            let byte_in_line =
+                                byte_index_from_char_index(line, self.body_cursor_col - 1);
+                            // Global offset of that char
+                            let line_start = self.body_offset()
+                                - byte_index_from_char_index(line, self.body_cursor_col);
+                            self.body.remove(line_start + byte_in_line);
+                            self.body_cursor_col -= 1;
+                        }
                     } else if self.body_cursor_line > 0 {
                         // Joining lines: capture prev line length *before* removal.
                         let prev_line_len = self
                             .body
                             .split('\n')
                             .nth(self.body_cursor_line - 1)
-                            .map_or(0, str::len);
+                            .map_or(0, char_count);
                         self.body.remove(offset - 1);
                         self.body_cursor_line -= 1;
                         self.body_cursor_col = prev_line_len;
                     } else {
+                        // Start of body, nothing before it (offset > 0 check handles empty body)
                         self.body.remove(offset - 1);
                     }
                     self.dirty = true;
@@ -649,12 +665,16 @@ impl ComposeState {
                 } else if self.body_cursor_line > 0 {
                     self.body_cursor_line -= 1;
                     let lines = self.body_lines();
-                    self.body_cursor_col = lines.get(self.body_cursor_line).map_or(0, |l| l.len());
+                    self.body_cursor_col = lines
+                        .get(self.body_cursor_line)
+                        .map_or(0, |l| char_count(l));
                 }
             }
             KeyCode::Right => {
                 let lines = self.body_lines();
-                let line_len = lines.get(self.body_cursor_line).map_or(0, |l| l.len());
+                let line_len = lines
+                    .get(self.body_cursor_line)
+                    .map_or(0, |l| char_count(l));
                 if self.body_cursor_col < line_len {
                     self.body_cursor_col += 1;
                 } else if self.body_cursor_line + 1 < lines.len() {
@@ -666,7 +686,9 @@ impl ComposeState {
                 if self.body_cursor_line > 0 {
                     self.body_cursor_line -= 1;
                     let lines = self.body_lines();
-                    let line_len = lines.get(self.body_cursor_line).map_or(0, |l| l.len());
+                    let line_len = lines
+                        .get(self.body_cursor_line)
+                        .map_or(0, |l| char_count(l));
                     self.body_cursor_col = self.body_cursor_col.min(line_len);
                 }
             }
@@ -678,7 +700,7 @@ impl ComposeState {
                         .body
                         .split('\n')
                         .nth(self.body_cursor_line)
-                        .map_or(0, str::len);
+                        .map_or(0, char_count);
                     self.body_cursor_col = self.body_cursor_col.min(line_len);
                 }
             }
@@ -711,7 +733,9 @@ impl ComposeState {
         let mut offset = 0;
         for (i, line) in self.body.split('\n').enumerate() {
             if i == self.body_cursor_line {
-                return offset + self.body_cursor_col.min(line.len());
+                // Convert char col to byte col for this line
+                let byte_col = byte_index_from_char_index(line, self.body_cursor_col);
+                return offset + byte_col;
             }
             offset += line.len() + 1; // +1 for the '\n'
         }
@@ -734,6 +758,14 @@ impl Default for ComposeState {
 enum TextTarget {
     Subject,
     ThreadId,
+}
+
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn byte_index_from_char_index(s: &str, char_idx: usize) -> usize {
+    s.chars().take(char_idx).map(|c| c.len_utf8()).sum()
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -984,7 +1016,7 @@ impl<'a> ComposePanel<'a> {
             };
             let counter = format!(
                 "Subject ({}/{}):",
-                self.state.subject.len(),
+                char_count(&self.state.subject),
                 MAX_SUBJECT_LEN
             );
             self.draw_text(
@@ -1040,7 +1072,7 @@ impl<'a> ComposePanel<'a> {
             } else {
                 cp.label_fg
             };
-            let body_label = format!("Body ({} chars):", self.state.body.len());
+            let body_label = format!("Body ({} bytes):", self.state.body.len());
             self.draw_text(
                 inner.x,
                 y,

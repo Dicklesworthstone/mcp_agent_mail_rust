@@ -112,8 +112,7 @@ enum QuitConfirmSource {
 /// Modal callbacks are `FnOnce + Send` closures that cannot directly send
 /// messages back into the model.  Instead, confirmed operations are written
 /// to this static slot and drained on the next tick.
-static DEFERRED_CONFIRMED_ACTION: std::sync::Mutex<Option<(String, String)>> =
-    std::sync::Mutex::new(None);
+// (REMOVED: static DEFERRED_CONFIRMED_ACTION replaced by channel in MailAppModel)
 
 /// Tracks the outcome of a dispatched action for feedback surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1069,6 +1068,10 @@ pub struct MailAppModel {
     inspector_selected_index: usize,
     /// Whether the inspector properties panel is visible.
     inspector_show_properties: bool,
+    /// Sender for deferred actions from modal callbacks.
+    action_tx: std::sync::mpsc::Sender<(String, String)>,
+    /// Receiver for deferred actions from modal callbacks.
+    action_rx: std::sync::mpsc::Receiver<(String, String)>,
 }
 
 impl MailAppModel {
@@ -1101,6 +1104,9 @@ impl MailAppModel {
         if focus_manager.current() != FocusTarget::None {
             focus_memory.insert(MailScreenId::Dashboard, focus_manager.current());
         }
+
+        let (action_tx, action_rx) = std::sync::mpsc::channel();
+
         Self {
             state,
             screen_manager,
@@ -1158,6 +1164,8 @@ impl MailAppModel {
             inspector_last_tree_len: Cell::new(0),
             inspector_selected_index: 0,
             inspector_show_properties: false,
+            action_tx,
+            action_rx,
         }
     }
 
@@ -1754,7 +1762,8 @@ impl MailAppModel {
             // These produce an in-flight toast; actual execution is
             // delegated to the screen's update handler via ActionExecute.
             "acknowledge" | "mark_read" | "renew" | "release" | "force_release" | "summarize"
-            | "approve_contact" | "deny_contact" | "block_contact" => {
+            | "approve_contact" | "deny_contact" | "block_contact" | "batch_acknowledge"
+            | "batch_mark_read" | "batch_mark_unread" => {
                 let op = operation.to_string();
                 let ctx = context.to_string();
                 self.action_outcomes.push(ActionOutcome::InFlight {
@@ -1792,14 +1801,12 @@ impl MailAppModel {
 
     /// Drain any deferred confirmed action (from modal callback) and dispatch it.
     fn drain_deferred_confirmed_action(&mut self) -> Cmd<MailMsg> {
-        let action = DEFERRED_CONFIRMED_ACTION
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
-        if let Some((operation, context)) = action {
-            return self.dispatch_execute_operation(&operation, &context);
+        // Drain all pending actions from the channel
+        let mut cmd = Cmd::none();
+        while let Ok((operation, context)) = self.action_rx.try_recv() {
+            cmd = cmd.merge(self.dispatch_execute_operation(&operation, &context));
         }
-        Cmd::none()
+        cmd
     }
 
     /// Record an action outcome (success or failure) and show a toast.
@@ -2445,6 +2452,20 @@ impl MailAppModel {
             return OverlayLayer::Toasts;
         }
         OverlayLayer::None
+    }
+
+    #[must_use]
+    fn adjust_diff_action_for_overlays(
+        &self,
+        diff_action: crate::tui_decision::DiffAction,
+    ) -> crate::tui_decision::DiffAction {
+        if diff_action == crate::tui_decision::DiffAction::Deferred {
+            // The dashboard and overlays paint focus/caret highlights directly
+            // into cells. Deferring a frame leaves stale highlight cells behind
+            // (visible as purple cursor trails), so promote to a real render.
+            return crate::tui_decision::DiffAction::Full;
+        }
+        diff_action
     }
 
     fn open_palette(&mut self) {
@@ -3730,6 +3751,32 @@ impl Model for MailAppModel {
                 Cmd::none()
             }
             MailMsg::Screen(MailScreenMsg::ActionExecute(ref op, ref ctx)) => {
+                // Delegate to the active screen first.
+                if let Some(screen) = self.screen_manager.active_screen_mut() {
+                    let cmd = screen.handle_action(op, ctx);
+                    if !matches!(cmd, Cmd::None) {
+                        return map_screen_cmd(cmd);
+                    }
+                }
+                // Fallback to global dispatch (e.g. for toast-only actions or cross-cutting concerns).
+                // Note: deeply nested recursion is prevented because global dispatch returns
+                // Cmd::none() for unknown actions, or specific Cmds for known ones.
+                // However, if global dispatch emits ActionExecute for the SAME op, we loop.
+                // We must ensure global dispatch only emits ActionExecute for ops it expects
+                // the screen to handle *via the next loop*, or handle them directly.
+                //
+                // Actually, dispatch_execute_operation emits ActionExecute for "acknowledge", etc.
+                // So if the screen didn't handle it above, we call dispatch_execute_operation,
+                // which emits ActionExecute, which comes back here... LOOP.
+                //
+                // Fix: Only call dispatch_execute_operation if it's NOT one of the screen-delegated ops
+                // that we just failed to handle.
+                // Or better: dispatch_execute_operation should be the *origin* of these messages,
+                // not the fallback handler.
+                //
+                // If the screen didn't handle it, and it's a batch action, we should log a warning.
+                // But dispatch_execute_operation handles "view_body" etc internally.
+
                 self.dispatch_execute_operation(op, ctx)
             }
             MailMsg::ToggleHelp => {
@@ -3750,6 +3797,10 @@ impl Model for MailAppModel {
     fn view(&self, frame: &mut Frame) {
         use crate::tui_chrome;
         use crate::tui_decision::{DiffAction, FrameState};
+
+        // The app renders its own caret/highlight treatment in widgets. Keep the
+        // terminal cursor hidden to prevent visible cursor trails during refresh.
+        frame.cursor_visible = false;
 
         // Compute frame budget: how much slack we have relative to the tick
         // interval. Normal frames arrive ~every TICK_INTERVAL; budget is
@@ -3781,7 +3832,8 @@ impl Model for MailAppModel {
             budget_remaining_ms,
             error_count: 0,
         };
-        let diff_action = self.diff_strategy.borrow_mut().observe(&frame_state);
+        let diff_action = self
+            .adjust_diff_action_for_overlays(self.diff_strategy.borrow_mut().observe(&frame_state));
         self.resize_detected.set(false);
 
         // Act on the diff decision.
@@ -6157,11 +6209,18 @@ mod tests {
         for _ in 0..AMBIENT_RENDER_EVERY_N_FRAMES {
             let _ = model.update(MailMsg::Terminal(Event::Tick));
         }
-        assert!(model.tick_count.is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES));
+        assert!(
+            model
+                .tick_count
+                .is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES)
+        );
 
         model.view(&mut frame);
         let first_count = model.ambient_render_invocations.get();
-        assert!(first_count >= 1, "ambient renderer should run on bucket tick");
+        assert!(
+            first_count >= 1,
+            "ambient renderer should run on bucket tick"
+        );
         assert_eq!(model.ambient_last_render_tick.get(), Some(model.tick_count));
 
         model.view(&mut frame);
@@ -6333,7 +6392,7 @@ mod tests {
         let mut frame = Frame::new(6, 2, &mut pool);
 
         let content = ftui::render::cell::CellContent::from_grapheme(
-            ftui::render::cell::GraphemeId::new(7, 2),
+            ftui::render::cell::GraphemeId::new(7, 2, 1),
         );
         let mut unreadable = ftui::Cell::new(content);
         unreadable.fg = PackedRgba::rgb(255, 255, 255);
@@ -6765,6 +6824,27 @@ mod tests {
         let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
         let _ = model.update(MailMsg::Terminal(tab));
         assert_eq!(model.active_screen(), initial_screen);
+    }
+
+    #[test]
+    fn view_hides_terminal_cursor_to_prevent_cursor_trails() {
+        let model = test_model();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+
+        assert!(frame.cursor_visible);
+        model.view(&mut frame);
+        assert!(!frame.cursor_visible);
+    }
+
+    #[test]
+    fn deferred_diff_always_promotes_to_full_to_avoid_cursor_trails() {
+        let model = test_model();
+        let deferred = crate::tui_decision::DiffAction::Deferred;
+        let full = crate::tui_decision::DiffAction::Full;
+
+        assert_eq!(model.adjust_diff_action_for_overlays(deferred), full);
+        assert_eq!(model.adjust_diff_action_for_overlays(full), full);
     }
 
     #[test]

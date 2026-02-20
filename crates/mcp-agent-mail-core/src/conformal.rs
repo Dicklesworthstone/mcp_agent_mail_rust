@@ -530,7 +530,8 @@ mod tests {
     fn conformal_exactly_min_calibration() {
         let mut predictor = ConformalPredictor::new(100, 0.90);
         for i in 0..MIN_CALIBRATION {
-            #[allow(clippy::cast_precision_loss)] // MIN_CALIBRATION is 30, well within f64 mantissa
+            #[allow(clippy::cast_precision_loss)]
+            // MIN_CALIBRATION is 30, well within f64 mantissa
             predictor.observe(i as f64);
         }
         assert_eq!(predictor.calibration_size(), MIN_CALIBRATION);

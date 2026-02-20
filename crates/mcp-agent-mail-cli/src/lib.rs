@@ -2800,7 +2800,13 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
 
 fn handle_guard(action: GuardCommand) -> CliResult<()> {
     match action {
-        GuardCommand::Install { project, repo, .. } => {
+        GuardCommand::Install {
+            project,
+            repo,
+            prepush,
+            no_prepush,
+        } => {
+            let install_prepush = if prepush { true } else { !no_prepush };
             let config = Config::from_env();
             let db_cfg = mcp_agent_mail_db::DbPoolConfig {
                 database_url: config.database_url.clone(),
@@ -2823,7 +2829,12 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
                 })
                 .map(|p| p.to_string_lossy().to_string());
 
-            mcp_agent_mail_guard::install_guard(&project, repo.as_path(), abs_db_path.as_deref())?;
+            mcp_agent_mail_guard::install_guard(
+                &project,
+                repo.as_path(),
+                abs_db_path.as_deref(),
+                install_prepush,
+            )?;
             ftui_runtime::ftui_println!("Guard installed successfully.");
             Ok(())
         }
@@ -3022,9 +3033,7 @@ fn handle_list_projects_with_database_url(
 }
 
 /// Open a synchronous SQLite connection for CLI commands.
-fn open_db_sync_with_database_url(
-    database_url: &str,
-) -> CliResult<mcp_agent_mail_db::DbConn> {
+fn open_db_sync_with_database_url(database_url: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -3462,44 +3471,65 @@ fn build_golden_specs(pattern: Option<&glob::Pattern>) -> Vec<golden::GoldenComm
     }
 
     if is_executable_file(&stub_bin) {
+        let cmd = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
+            vec!["sh".to_string(), stub_bin_str.clone(), "--encode".to_string()]
+        } else {
+            vec![stub_bin_str.clone(), "--encode".to_string()]
+        };
+
         maybe_push(
             golden::GoldenCommandSpec::new(
                 "stub_encode.txt",
-                vec![stub_bin_str.clone(), "--encode".to_string()],
+                cmd,
             )
             .stdin("{\"id\":1}\n"),
         );
+
+        let cmd_stats = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
+            vec![
+                "sh".to_string(),
+                stub_bin_str.clone(),
+                "--encode".to_string(),
+                "--stats".to_string(),
+            ]
+        } else {
+            vec![
+                stub_bin_str.clone(),
+                "--encode".to_string(),
+                "--stats".to_string(),
+            ]
+        };
+
         maybe_push(
-            golden::GoldenCommandSpec::new(
-                "stub_encode_stats_stdout.txt",
-                vec![
-                    stub_bin_str.clone(),
-                    "--encode".to_string(),
-                    "--stats".to_string(),
-                ],
-            )
-            .stdin("{\"id\":1}\n")
-            .stream(golden::GoldenStream::Stdout),
+            golden::GoldenCommandSpec::new("stub_encode_stats_stdout.txt", cmd_stats.clone())
+                .stdin("{\"id\":1}\n")
+                .stream(golden::GoldenStream::Stdout),
         );
         maybe_push(
-            golden::GoldenCommandSpec::new(
-                "stub_encode_stats_stderr.txt",
-                vec![
-                    stub_bin_str.clone(),
-                    "--encode".to_string(),
-                    "--stats".to_string(),
-                ],
-            )
-            .stdin("{\"id\":1}\n")
-            .stream(golden::GoldenStream::Stderr),
+            golden::GoldenCommandSpec::new("stub_encode_stats_stderr.txt", cmd_stats)
+                .stdin("{\"id\":1}\n")
+                .stream(golden::GoldenStream::Stderr),
         );
-        maybe_push(golden::GoldenCommandSpec::new(
-            "stub_help.txt",
-            vec![stub_bin_str.clone(), "--help".to_string()],
-        ));
+
+        let cmd_help = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
+            vec!["sh".to_string(), stub_bin_str.clone(), "--help".to_string()]
+        } else {
+            vec![stub_bin_str.clone(), "--help".to_string()]
+        };
+        maybe_push(golden::GoldenCommandSpec::new("stub_help.txt", cmd_help));
+
+        let cmd_version = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
+            vec![
+                "sh".to_string(),
+                stub_bin_str.clone(),
+                "--version".to_string(),
+            ]
+        } else {
+            vec![stub_bin_str, "--version".to_string()]
+        };
         maybe_push(golden::GoldenCommandSpec::new(
             "stub_version.txt",
-            vec![stub_bin_str, "--version".to_string()],
+            cmd_version,
         ));
     }
 
@@ -4640,10 +4670,7 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
     handle_acks_with_conn(&conn, action)
 }
 
-fn handle_acks_with_conn(
-    conn: &mcp_agent_mail_db::DbConn,
-    action: AcksCommand,
-) -> CliResult<()> {
+fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
 
     match action {
@@ -5538,8 +5565,8 @@ fn handle_list_acks_with_conn(
 
 fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
     use asupersync::runtime::RuntimeBuilder;
-    use mcp_agent_mail_db::schema;
     use mcp_agent_mail_db::DbConn;
+    use mcp_agent_mail_db::schema;
 
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
@@ -7064,9 +7091,7 @@ fn handle_doctor_check_with(
                         "status": "fail",
                         "detail": "Database file is 0 bytes (empty/corrupt)",
                     }));
-                } else if let Ok(conn) =
-                    mcp_agent_mail_db::DbConn::open_file(&db_path)
-                {
+                } else if let Ok(conn) = mcp_agent_mail_db::DbConn::open_file(&db_path) {
                     let qc_ok = conn
                         .query_sync("PRAGMA quick_check", &[])
                         .ok()
@@ -7298,10 +7323,7 @@ fn handle_mail(action: MailCommand) -> CliResult<()> {
     }
 }
 
-fn handle_mail_status_sync(
-    conn: &mcp_agent_mail_db::DbConn,
-    action: MailCommand,
-) -> CliResult<()> {
+fn handle_mail_status_sync(conn: &mcp_agent_mail_db::DbConn, action: MailCommand) -> CliResult<()> {
     let MailCommand::Status { project_path } = action else {
         unreachable!()
     };
@@ -11019,10 +11041,8 @@ mod tests {
         // FrankenConnection does not support sqlite_master and cross-connection
         // visibility is limited. Re-apply the schema on a fresh connection and
         // probe each table directly with a SELECT.
-        let conn = mcp_agent_mail_db::DbConn::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("reopen");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema on verification connection");
 
@@ -11066,10 +11086,8 @@ mod tests {
 
         handle_migrate_with_database_url(&url).unwrap();
 
-        let conn = mcp_agent_mail_db::DbConn::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("reopen");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen");
         let tables = conn
             .query_sync(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%' ORDER BY name",
@@ -11200,10 +11218,8 @@ mod tests {
     }
 
     fn seed_mailbox_db(db_path: &Path) {
-        let conn = mcp_agent_mail_db::DbConn::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("open test sqlite db");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open test sqlite db");
         conn.execute_raw(
             "CREATE TABLE projects (\
                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -11487,10 +11503,8 @@ mod tests {
         );
 
         // Restored DB should contain only the scoped project.
-        let restored_conn = mcp_agent_mail_db::DbConn::open_file(
-            restore_db.display().to_string(),
-        )
-        .unwrap();
+        let restored_conn =
+            mcp_agent_mail_db::DbConn::open_file(restore_db.display().to_string()).unwrap();
         let rows = restored_conn
             .query_sync("SELECT slug FROM projects ORDER BY id", &[])
             .unwrap();
@@ -11683,10 +11697,8 @@ mod tests {
         let proj_beta_key = proj_beta_dir.canonicalize().unwrap().display().to_string();
 
         let db_path = root.path().join("mailbox.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("open products test sqlite db");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open products test sqlite db");
         // Use base schema (no FTS5/triggers) because this DB will be opened
         // by FrankenConnection via the pool. FrankenConnection cannot read
         // database files containing FTS5 shadow table pages.
@@ -11944,10 +11956,7 @@ mod tests {
         // Drop pool before opening a standalone connection on the same file.
         drop(pool);
         {
-            let conn = mcp_agent_mail_db::DbConn::open_file(
-                db_path.display().to_string(),
-            )
-            .unwrap();
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
             conn.execute_sync(
                 "UPDATE products SET created_at = ? WHERE product_uid = ?",
                 &[
@@ -14883,9 +14892,7 @@ mod tests {
     }
 
     /// Helper: seed a DB with projects, agents, messages, and file_reservations for CLI tests.
-    fn seed_acks_and_reservations_db(
-        db_path: &Path,
-    ) -> mcp_agent_mail_db::DbConn {
+    fn seed_acks_and_reservations_db(db_path: &Path) -> mcp_agent_mail_db::DbConn {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
@@ -15514,10 +15521,7 @@ mod tests {
 
     /// Seed a DB with a project whose slug matches what `resolve_project_identity`
     /// computes for the given `project_path`.
-    fn seed_mail_status_db(
-        db_path: &Path,
-        project_path: &str,
-    ) -> mcp_agent_mail_db::DbConn {
+    fn seed_mail_status_db(db_path: &Path, project_path: &str) -> mcp_agent_mail_db::DbConn {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
@@ -17369,9 +17373,8 @@ mod tests {
         let db_path = dir.path().join("resolve_project_test.db");
 
         // Initialize the DB with base schema via DbConn.
-        let init_conn =
-            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-                .expect("open sqlite connection");
+        let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
         init_conn
             .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
             .expect("apply init PRAGMAs");
@@ -17753,8 +17756,7 @@ mod tests {
         );
 
         // Verify .bak is a valid SQLite DB with same data
-        let bak_conn = mcp_agent_mail_db::DbConn::open_file(&bak_path)
-            .expect("open .bak");
+        let bak_conn = mcp_agent_mail_db::DbConn::open_file(&bak_path).expect("open .bak");
         let rows = bak_conn
             .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
             .expect("query projects in .bak");
@@ -17813,8 +17815,7 @@ mod tests {
 
         // Verify the .bak is a valid DB that passes quick_check
         let bak_path = format!("{}.bak", db_path.display());
-        let bak_conn = mcp_agent_mail_db::DbConn::open_file(&bak_path)
-            .expect("open .bak");
+        let bak_conn = mcp_agent_mail_db::DbConn::open_file(&bak_path).expect("open .bak");
         let qc_rows = bak_conn
             .query_sync("PRAGMA quick_check", &[])
             .expect("quick_check");
@@ -20445,7 +20446,7 @@ fn render_table_text(title: Option<&str>, headers: &[&str], rows: Vec<Vec<String
         .collect::<Vec<_>>();
 
     let row_count = rows.len();
-    let header = Row::new(headers.to_vec());
+    let header = Row::new(headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
     let ftui_rows = rows.into_iter().map(Row::new).collect::<Vec<_>>();
 
     let mut table = Table::new(ftui_rows, widths)
@@ -22559,9 +22560,7 @@ fn search_index_has_content(index_root: &std::path::Path) -> bool {
         .any(|entry| entry.file_type().is_file())
 }
 
-fn query_existing_search_fts_triggers(
-    conn: &mcp_agent_mail_db::DbConn,
-) -> CliResult<Vec<String>> {
+fn query_existing_search_fts_triggers(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<String>> {
     let sql = "\
         SELECT name \
           FROM sqlite_master \

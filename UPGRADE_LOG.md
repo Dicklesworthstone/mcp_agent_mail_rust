@@ -1,9 +1,37 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-02-17  |  **Project:** mcp-agent-mail-rust  |  **Language:** Rust
+**Date:** 2026-02-19  |  **Project:** mcp-agent-mail-rust  |  **Language:** Rust
 
 ## Summary
-- **Updated:** 8  |  **Skipped:** 0  |  **Failed:** 0  |  **Needs attention:** 2 (pre-existing)
+- **Updated:** 15 (8 from 2026-02-17 + 7 from 2026-02-19)  |  **Skipped:** 0  |  **Failed:** 0  |  **Needs attention:** 2 (pre-existing)
+
+---
+
+## 2026-02-19 Update
+
+### fastembed: 5.9.0 → 5.11.0
+- **Manifest:** Updated pinned version in workspace `Cargo.toml` from `"5.9.0"` to `"5.11.0"`
+- **Breaking:** None (minor version bump)
+- **Tests:** 722 passed across compilable crates
+
+### clap: 4.5.59 → 4.5.60
+- **Manifest:** Spec `"4"` — no change needed, picked up via `cargo update`
+- **Breaking:** None (patch bump)
+- **Tests:** Passed
+
+### Transitive updates (via `cargo update`)
+- bumpalo: 3.19.1 → 3.20.2
+- native-tls: 0.2.16 → 0.2.18
+- security-framework: 3.6.0 → 3.7.0
+- security-framework-sys: 2.16.0 → 2.17.0
+
+### Pre-existing issues (not from this update)
+- **ftui-text compile error:** `E0515` in `frankentui/crates/ftui-text/src/markup.rs:143` — nightly lifetime checking tightened. Blocks server/CLI crates. Needs fix in frankentui.
+- **FrankenSQLite:** 10 db tests fail due to unimplemented `sum()` aggregate in `GROUP BY+JOIN`
+
+---
+
+## 2026-02-17 Update
 
 ## Toolchain
 - **rust-toolchain.toml:** pinned to `nightly-2026-02-13` (was `nightly`)

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE;
 use mcp_agent_mail_db::sqlmodel_core::{Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
 
@@ -37,22 +38,6 @@ const MAX_CONTACTS: usize = 200;
 const MAX_RESERVATIONS: usize = 1000;
 /// Maximum silent interval before a heartbeat `HealthPulse` is emitted.
 const HEALTH_PULSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-/// `SQLite` predicate for active reservations across legacy sentinel values.
-///
-/// NOTE: we avoid `NOT GLOB '*[^0-9.+-]*'` because FrankenConnection's parser
-/// does not support negated character classes inside GLOB patterns.  Instead we
-/// strip all valid numeric characters via nested REPLACE and check the remainder
-/// is empty, which achieves the same "string contains only [0-9.+-]" test.
-const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
-    OR (typeof(released_ts) IN ('integer', 'real') AND released_ts <= 0) \
-    OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none')) \
-    OR (typeof(released_ts) = 'text' \
-      AND length(trim(released_ts)) > 0 \
-      AND trim(released_ts) GLOB '*[0-9]*' \
-      AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(\
-            trim(released_ts),\
-            '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' \
-      AND CAST(trim(released_ts) AS REAL) <= 0)";
 
 /// Batched aggregate counters used to populate [`DbStatSnapshot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,12 +79,13 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn fetch_counts(&self) -> DbSnapshotCounts {
+        let now = now_micros();
         let reservation_count_sql = format!(
             "SELECT \
              (SELECT COUNT(*) FROM projects) AS projects_count, \
              (SELECT COUNT(*) FROM agents) AS agents_count, \
              (SELECT COUNT(*) FROM messages) AS messages_count, \
-             (SELECT COUNT(*) FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})) \
+             (SELECT COUNT(*) FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?) \
                AS reservations_count, \
              (SELECT COUNT(*) FROM agent_links) AS contacts_count, \
              (SELECT COUNT(*) FROM message_recipients \
@@ -108,7 +94,7 @@ impl<'a> DbStatQueryBatcher<'a> {
         );
         let batched = self
             .conn
-            .query_sync(&reservation_count_sql, &[])
+            .query_sync(&reservation_count_sql, &[Value::BigInt(now)])
             .ok()
             .and_then(|rows| rows.into_iter().next())
             .map(|row| {
@@ -136,36 +122,42 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn fetch_counts_fallback(&self) -> DbSnapshotCounts {
+        let now = now_micros();
         DbSnapshotCounts {
             projects: self
-                .run_count_query("SELECT COUNT(*) AS c FROM projects")
+                .run_count_query("SELECT COUNT(*) AS c FROM projects", &[])
                 .unwrap_or(0),
             agents: self
-                .run_count_query("SELECT COUNT(*) AS c FROM agents")
+                .run_count_query("SELECT COUNT(*) AS c FROM agents", &[])
                 .unwrap_or(0),
             messages: self
-                .run_count_query("SELECT COUNT(*) AS c FROM messages")
+                .run_count_query("SELECT COUNT(*) AS c FROM messages", &[])
                 .unwrap_or(0),
-            file_reservations: self.run_count_query(&format!(
-                "SELECT COUNT(*) AS c FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})"
-            ))
-            .unwrap_or(0),
+            file_reservations: self
+                .run_count_query(
+                    &format!(
+                        "SELECT COUNT(*) AS c FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
+                    ),
+                    &[Value::BigInt(now)],
+                )
+                .unwrap_or(0),
             contact_links: self
-                .run_count_query("SELECT COUNT(*) AS c FROM agent_links")
+                .run_count_query("SELECT COUNT(*) AS c FROM agent_links", &[])
                 .unwrap_or(0),
             ack_pending: self
                 .run_count_query(
                     "SELECT COUNT(*) AS c FROM message_recipients \
                      WHERE ack_ts IS NULL \
                        AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)",
+                    &[],
                 )
                 .unwrap_or(0),
         }
     }
 
-    fn run_count_query(&self, sql: &str) -> Option<u64> {
+    fn run_count_query(&self, sql: &str, params: &[Value]) -> Option<u64> {
         self.conn
-            .query_sync(sql, &[])
+            .query_sync(sql, params)
             .ok()?
             .into_iter()
             .next()
@@ -354,6 +346,7 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
 
 /// Fetch the project list with per-project agent/message/reservation counts.
 fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
+    let now = now_micros();
     let sql = format!(
         "SELECT p.id, p.slug, p.human_key, p.created_at, \
          COALESCE(ac.cnt, 0) AS agent_count, \
@@ -365,12 +358,12 @@ fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
          LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM messages GROUP BY project_id) mc \
            ON mc.project_id = p.id \
          LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM file_reservations \
-           WHERE ({ACTIVE_RESERVATION_PREDICATE}) GROUP BY project_id) rc \
+           WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? GROUP BY project_id) rc \
            ON rc.project_id = p.id \
          ORDER BY p.created_at DESC \
          LIMIT {MAX_PROJECTS}"
     );
-    conn.query_sync(&sql, &[])
+    conn.query_sync(&sql, &[Value::BigInt(now)])
         .ok()
         .map(|rows| {
             rows.into_iter()
@@ -451,10 +444,28 @@ fn parse_raw_ts(row: &Row, col: &str) -> i64 {
     match row.get_by_name(col) {
         Some(Value::BigInt(v)) => *v,
         Some(Value::Int(v)) => i64::from(*v),
-        Some(Value::Double(v)) => *v as i64,
-        Some(Value::Float(v)) => *v as i64,
+        Some(Value::Double(v)) => parse_float_ts(*v),
+        Some(Value::Float(v)) => parse_float_ts(f64::from(*v)),
         Some(Value::Text(s)) => parse_text_timestamp(s),
         _ => 0,
+    }
+}
+
+/// Convert a floating timestamp into microseconds with saturation.
+#[allow(clippy::cast_possible_truncation)]
+fn parse_float_ts(value: f64) -> i64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    const I64_MAX_F64: f64 = 9_223_372_036_854_775_807.0;
+    const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+    let truncated = value.trunc();
+    if truncated >= I64_MAX_F64 {
+        i64::MAX
+    } else if truncated <= I64_MIN_F64 {
+        i64::MIN
+    } else {
+        truncated as i64
     }
 }
 
@@ -473,9 +484,8 @@ fn parse_text_timestamp(s: &str) -> i64 {
     }
     // Try YYYY-MM-DD HH:MM:SS[.ffffff] format
     // Split on space → date part + time part
-    let (date_part, time_part) = match s.split_once(' ') {
-        Some((d, t)) => (d, t),
-        None => return 0,
+    let Some((date_part, time_part)) = s.split_once(' ') else {
+        return 0;
     };
     let date_parts: Vec<&str> = date_part.split('-').collect();
     if date_parts.len() != 3 {
@@ -515,14 +525,14 @@ fn parse_text_timestamp(s: &str) -> i64 {
 
 /// Days from civil date (year, month 1-12, day 1-31) to Unix epoch.
 /// Adapted from Howard Hinnant's `days_from_civil` algorithm.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
     let m = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * m + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    era * 146_097 + doe - 719_468
 }
 
 /// Fetch active file reservations with project and agent names.
@@ -538,6 +548,7 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
     // Return raw created_ts / expires_ts and convert to micros in Rust, because
     // FrankenConnection does not support strftime / negated GLOB character
     // classes needed for the SQL-side timestamp conversion.
+    let now = now_micros();
     let sql = format!(
         "SELECT \
            fr.id, \
@@ -550,12 +561,12 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
          FROM file_reservations fr \
          LEFT JOIN projects p ON p.id = fr.project_id \
          LEFT JOIN agents a ON a.id = fr.agent_id \
-         WHERE fr.id IN (SELECT id FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})) \
+         WHERE fr.id IN (SELECT id FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?) \
          ORDER BY fr.expires_ts ASC \
          LIMIT {MAX_RESERVATIONS}"
     );
 
-    let rows = match conn.query_sync(&sql, &[]) {
+    let rows = match conn.query_sync(&sql, &[Value::BigInt(now)]) {
         Ok(rows) => rows,
         Err(err) => {
             tracing::debug!(

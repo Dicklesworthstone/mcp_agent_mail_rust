@@ -41,7 +41,7 @@ fn sanitize_body(body: &str) -> String {
 /// markdown pipeline with syntax highlighting. Otherwise it is returned
 /// as plain unstyled text.
 #[must_use]
-pub fn render_body(body: &str, theme: &MarkdownTheme) -> Text {
+pub fn render_body(body: &str, theme: &MarkdownTheme) -> Text<'static> {
     let renderer = MarkdownRenderer::new(theme.clone());
     let sanitized = sanitize_body(body);
     renderer.auto_render(&sanitized)
@@ -52,7 +52,7 @@ pub fn render_body(body: &str, theme: &MarkdownTheme) -> Text {
 /// Same as [`render_body`] but closes unclosed fences, bold markers,
 /// etc. before parsing so partial content renders gracefully.
 #[must_use]
-pub fn render_body_streaming(body: &str, theme: &MarkdownTheme) -> Text {
+pub fn render_body_streaming(body: &str, theme: &MarkdownTheme) -> Text<'static> {
     let renderer = MarkdownRenderer::new(theme.clone());
     let sanitized = sanitize_body(body);
     renderer.auto_render_streaming(&sanitized)

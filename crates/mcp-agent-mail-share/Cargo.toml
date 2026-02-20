@@ -23,7 +23,6 @@ include_dir.workspace = true
 atty.workspace = true
 mcp-agent-mail-core = { workspace = true }
 mcp-agent-mail-db = { workspace = true }
-sqlmodel-sqlite.workspace = true
 sqlmodel-core.workspace = true
 
 [dev-dependencies]

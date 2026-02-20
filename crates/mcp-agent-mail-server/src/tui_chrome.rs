@@ -374,7 +374,7 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
 
         let mut spans = vec![
             Span::styled(" ", Style::default().fg(fg).bg(bg)),
-            Span::styled(key_str.as_str(), key_style),
+            Span::styled(key_str.clone(), key_style),
         ];
         if has_label {
             if show_icon {
@@ -894,7 +894,7 @@ pub fn render_status_line(
         acc.saturating_add(segment_text_width(&s.text))
     });
 
-    let mut spans: Vec<Span<'_>> = Vec::with_capacity(16);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(16);
     let mut effect_overlays: Vec<(u16, u16, StatusEffect, PackedRgba, String)> = Vec::new();
     let mut cursor_x = area.x;
     let effects_enabled = state.config_snapshot().tui_effects && !accessibility.reduced_motion;
@@ -903,7 +903,7 @@ pub fn render_status_line(
     // Left segments
     for seg in &left {
         let style = status_segment_style(seg, &tp, effects_enabled);
-        spans.push(Span::styled(seg.text.as_str(), style));
+        spans.push(Span::styled(seg.text.clone(), style));
         cursor_x = cursor_x.saturating_add(segment_text_width(&seg.text));
     }
 
@@ -941,7 +941,7 @@ pub fn render_status_line(
             push_keycap_chip_spans(&mut spans, &seg.text, &tp, chip_bg);
         } else {
             let style = status_segment_style(seg, &tp, effects_enabled);
-            spans.push(Span::styled(seg.text.as_str(), style));
+            spans.push(Span::styled(seg.text.clone(), style));
         }
         cursor_x = cursor_x.saturating_add(segment_text_width(&seg.text));
     }
@@ -963,7 +963,7 @@ pub fn render_status_line(
         if effects_enabled && seg.effect != StatusEffect::None && seg_width > 0 {
             effect_overlays.push((cursor_x, seg_width, seg.effect, seg.fg, seg.text.clone()));
         }
-        spans.push(Span::styled(seg.text.as_str(), style));
+        spans.push(Span::styled(seg.text.clone(), style));
         cursor_x = cursor_x.saturating_add(seg_width);
     }
 
@@ -1033,7 +1033,7 @@ pub fn render_help_overlay_sections(
     let title = format!(" Keyboard Shortcuts{scroll_hint}(Esc to close) ");
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(title.as_str())
+        .title(&title)
         .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
 
     let inner = block.inner(overlay_area);
@@ -1084,7 +1084,7 @@ pub fn render_help_overlay_sections(
         // Optional context description.
         if let Some(ref desc) = section.description {
             if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
-                let desc_para = Paragraph::new(desc.as_str()).style(
+                let desc_para = Paragraph::new(desc.clone()).style(
                     Style::default()
                         .fg(tp.text_secondary)
                         .bg(tp.help_bg)
@@ -1313,7 +1313,7 @@ fn render_keybinding_line_themed(
         Span::styled("  ", Style::default().fg(tp.help_fg).bg(row_bg)),
         Span::styled(keycap, keycap_style),
         Span::styled(padding, Style::default().fg(tp.help_fg).bg(row_bg)),
-        Span::styled(action, action_style),
+        Span::styled(action.to_string(), action_style),
     ];
 
     let line = Line::from_spans(spans);
@@ -1446,9 +1446,9 @@ pub fn build_key_hints(
 ///
 /// Keycap regions are delimited by `\x01..\x02` and rendered in reverse-video;
 /// action text is rendered in dim/normal style; separators (`·`) in dim.
-fn push_keycap_chip_spans<'a>(
-    spans: &mut Vec<ftui::text::Span<'a>>,
-    hints: &'a str,
+fn push_keycap_chip_spans(
+    spans: &mut Vec<ftui::text::Span<'static>>,
+    hints: &str,
     tp: &crate::tui_theme::TuiThemePalette,
     bg: PackedRgba,
 ) {
@@ -1463,7 +1463,7 @@ fn push_keycap_chip_spans<'a>(
         if let Some(start) = rest.find('\x01') {
             // Text before keycap (separator or leading space)
             if start > 0 {
-                spans.push(Span::styled(&rest[..start], sep_style));
+                spans.push(Span::styled(rest[..start].to_string(), sep_style));
             }
             rest = &rest[start + 1..]; // skip SOH
             if let Some(end) = rest.find('\x02') {
@@ -1473,12 +1473,12 @@ fn push_keycap_chip_spans<'a>(
                 rest = &rest[end + 1..]; // skip STX
             } else {
                 // Malformed — dump remaining
-                spans.push(Span::styled(rest, action_style));
+                spans.push(Span::styled(rest.to_string(), action_style));
                 break;
             }
         } else {
             // No more keycaps — remaining is action text / separators
-            spans.push(Span::styled(rest, action_style));
+            spans.push(Span::styled(rest.to_string(), action_style));
             break;
         }
     }

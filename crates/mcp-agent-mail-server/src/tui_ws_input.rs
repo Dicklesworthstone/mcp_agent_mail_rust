@@ -70,7 +70,14 @@ pub fn parse_remote_terminal_events(body: &[u8]) -> Result<ParsedRemoteEvents, S
     let mut ignored = 0_usize;
     for message in messages {
         match message {
-            IngressMessage::Input(IngressInputEvent::Key { key, modifiers }) => {
+            IngressMessage::Input(IngressInputEvent::Key { mut key, modifiers }) => {
+                if key.len() > 4096 {
+                    let mut idx = 4096;
+                    while idx > 0 && !key.is_char_boundary(idx) {
+                        idx -= 1;
+                    }
+                    key.truncate(idx);
+                }
                 events.push(RemoteTerminalEvent::Key { key, modifiers });
             }
             IngressMessage::Resize { cols, rows } => {

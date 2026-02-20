@@ -379,6 +379,13 @@ pub trait MailScreen {
         None
     }
 
+    /// Handle an action dispatched from the action menu or macro engine.
+    ///
+    /// The default implementation returns `Cmd::None`.
+    fn handle_action(&mut self, _operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
+        Cmd::None
+    }
+
     /// Title shown in the help overlay header.
     fn title(&self) -> &'static str;
 

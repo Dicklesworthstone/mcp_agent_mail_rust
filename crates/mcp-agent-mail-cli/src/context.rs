@@ -105,10 +105,7 @@ pub struct ResolvedProject {
 /// Look up a project by slug or `human_key`.
 ///
 /// Tries slug match first, then `human_key` match.
-pub fn resolve_project(
-    conn: &mcp_agent_mail_db::DbConn,
-    key: &str,
-) -> CliResult<ResolvedProject> {
+pub fn resolve_project(conn: &mcp_agent_mail_db::DbConn, key: &str) -> CliResult<ResolvedProject> {
     // Try slug first
     let rows = conn
         .query_sync(
@@ -254,9 +251,7 @@ pub fn resolve_bool(primary: bool, negated: bool, default: bool) -> bool {
 
 // ── Internal helpers ────────────────────────────────────────────────────
 
-fn open_conn(
-    cfg: &DbPoolConfig,
-) -> CliResult<mcp_agent_mail_db::DbConn> {
+fn open_conn(cfg: &DbPoolConfig) -> CliResult<mcp_agent_mail_db::DbConn> {
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;

@@ -15,8 +15,8 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::disk::{
     is_sqlite_memory_database_url, sqlite_file_path_from_database_url,
 };
-use mcp_agent_mail_db::schema;
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::schema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;

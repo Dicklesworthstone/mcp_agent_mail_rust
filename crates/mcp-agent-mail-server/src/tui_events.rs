@@ -1630,11 +1630,11 @@ impl RenderItem for TimelineRow {
         let line = Line::from_spans([
             Span::styled(seq_str, base_style.fg(tp.text_muted)),
             Span::raw(" "),
-            Span::styled(&self.timestamp, base_style.fg(tp.text_secondary)),
+            Span::styled(self.timestamp.clone(), base_style.fg(tp.text_secondary)),
             Span::raw(" "),
             Span::styled(self.icon.to_string(), severity_style),
             Span::raw(" "),
-            Span::styled(&self.summary, base_style),
+            Span::styled(self.summary.clone(), base_style),
         ]);
 
         let paragraph = ftui::widgets::paragraph::Paragraph::new(line);
@@ -1818,15 +1818,15 @@ impl RenderItem for MessageRow {
         let line = Line::from_spans([
             Span::styled(ack_indicator, Style::default().fg(tp.severity_warn)),
             Span::raw(" "),
-            Span::styled(&self.timestamp, base_style.fg(tp.text_secondary)),
+            Span::styled(self.timestamp.clone(), base_style.fg(tp.text_secondary)),
             Span::raw(" "),
-            Span::styled(&self.from_agent, base_style.fg(tp.status_accent)),
+            Span::styled(self.from_agent.clone(), base_style.fg(tp.status_accent)),
             Span::raw(" → "),
-            Span::styled(&self.to_agents, base_style.fg(tp.status_good)),
+            Span::styled(self.to_agents.clone(), base_style.fg(tp.status_good)),
             Span::raw(" "),
-            Span::styled(&self.importance, importance_style),
+            Span::styled(self.importance.clone(), importance_style),
             Span::raw(" "),
-            Span::styled(&self.subject, base_style),
+            Span::styled(self.subject.clone(), base_style),
         ]);
 
         let paragraph = ftui::widgets::paragraph::Paragraph::new(line);
@@ -1877,13 +1877,13 @@ impl RenderItem for SearchHitRow {
         let score_str = format!("{:.1}", self.score);
 
         let line = Line::from_spans([
-            Span::styled(&score_str, base_style.fg(tp.status_accent)),
+            Span::styled(score_str, base_style.fg(tp.status_accent)),
             Span::raw(" "),
-            Span::styled(&self.from, base_style.fg(tp.text_secondary)),
+            Span::styled(self.from.clone(), base_style.fg(tp.text_secondary)),
             Span::raw(": "),
-            Span::styled(&self.subject, base_style.bold()),
+            Span::styled(self.subject.clone(), base_style.bold()),
             Span::raw(" — "),
-            Span::styled(&self.snippet, base_style.fg(tp.text_muted)),
+            Span::styled(self.snippet.clone(), base_style.fg(tp.text_muted)),
         ]);
 
         let paragraph = ftui::widgets::paragraph::Paragraph::new(line);
@@ -1942,13 +1942,13 @@ impl RenderItem for ExplorerRow {
         let line = Line::from_spans([
             Span::styled(self.direction.to_string(), direction_style),
             Span::raw(" "),
-            Span::styled(&self.date, base_style.fg(tp.text_secondary)),
+            Span::styled(self.date.clone(), base_style.fg(tp.text_secondary)),
             Span::raw(" "),
-            Span::styled(&self.primary_agent, base_style.fg(tp.status_accent)),
+            Span::styled(self.primary_agent.clone(), base_style.fg(tp.status_accent)),
             Span::raw(" → "),
-            Span::styled(&self.secondary_agent, base_style.fg(tp.status_good)),
+            Span::styled(self.secondary_agent.clone(), base_style.fg(tp.status_good)),
             Span::raw(" "),
-            Span::styled(&self.subject, base_style),
+            Span::styled(self.subject.clone(), base_style),
         ]);
 
         let paragraph = ftui::widgets::paragraph::Paragraph::new(line);

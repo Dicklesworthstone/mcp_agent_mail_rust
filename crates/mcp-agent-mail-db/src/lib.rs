@@ -1,7 +1,7 @@
 //! Database layer for MCP Agent Mail
 //!
 //! This crate provides:
-//! - `SQLite` database operations via `sqlmodel_rust`
+//! - `SQLite` database operations via `sqlmodel` on frankensqlite
 //! - Connection pooling
 //! - Schema migrations
 //! - FTS5 full-text search
@@ -9,7 +9,7 @@
 //! # Timestamp Convention
 //!
 //! All timestamps are stored as `i64` (microseconds since Unix epoch) internally.
-//! This matches `sqlmodel_rust`'s convention. Helper functions are provided to convert
+//! This matches `sqlmodel`'s convention. Helper functions are provided to convert
 //! to/from `chrono::NaiveDateTime` for API compatibility.
 
 #![forbid(unsafe_code)]

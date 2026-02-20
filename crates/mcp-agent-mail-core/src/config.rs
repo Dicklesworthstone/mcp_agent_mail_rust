@@ -627,7 +627,7 @@ impl Default for Config {
             inline_image_max_bytes: 65536,
             convert_images: true,
             keep_original_images: false,
-            allow_absolute_attachment_paths: true,
+            allow_absolute_attachment_paths: false,
 
             // Disk space monitoring
             disk_space_monitor_enabled: true,
@@ -897,7 +897,6 @@ impl Config {
     fn apply_environment_defaults(&mut self) {
         let is_dev = self.app_environment == AppEnvironment::Development;
         self.http_cors_enabled = is_dev;
-        self.allow_absolute_attachment_paths = is_dev;
     }
 
     /// Load configuration from environment variables
@@ -1931,9 +1930,11 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
 
         let comment = extract_inline_comment(line);
 
-        // Calculate the index of '=' to preserve everything before it
-
-        let equals_idx = line.len() - content.len() + key_str.len();
+        // Calculate the index of '=' to preserve everything before it.
+        // We find the first '=' after the key to handle potential whitespace/quoting.
+        let key_start_in_line = line.find(key).unwrap_or(0);
+        let equals_relative_to_key = line[key_start_in_line..].find('=').unwrap_or(0);
+        let equals_idx = key_start_in_line + equals_relative_to_key;
 
         let prefix = &line[..=equals_idx];
 
@@ -2047,10 +2048,36 @@ fn strip_inline_comment(value: &str) -> &str {
 }
 
 fn extract_inline_comment(line: &str) -> Option<&str> {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
     let bytes = line.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
-            return Some(&line[i..]);
+    for (i, &b) in bytes.iter().enumerate() {
+        // Single quotes: no escapes allowed, they end only at the next single quote
+        if in_single_quote {
+            if b == b'\'' {
+                in_single_quote = false;
+            }
+            continue;
+        }
+
+        // Handle escapes (only relevant outside single quotes)
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match b {
+            b'\\' => escaped = true,
+            b'\'' if !in_double_quote => in_single_quote = true,
+            b'"' => in_double_quote = !in_double_quote,
+            b'#' if !in_double_quote => {
+                if i == 0 || bytes[i - 1].is_ascii_whitespace() {
+                    return Some(&line[i..]);
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -2367,7 +2394,38 @@ mod tests {
     }
 
     #[test]
-    fn test_update_envfile_preserves_unrelated_and_is_idempotent() {
+    fn test_update_envfile_handles_quoted_hash_correctly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_path = tmp.path().join("config.env");
+        // Initial value is quoted and contains a hash
+        std::fs::write(
+            &env_path,
+            "SECRET=\"password # with hash\"\nOTHER=1\n",
+        )
+        .expect("write envfile");
+
+        let mut updates: HashMap<&str, String> = HashMap::new();
+        updates.insert("SECRET", "\"new_value\"".to_string());
+
+        update_envfile(&env_path, &updates).expect("update envfile");
+        let content = std::fs::read_to_string(&env_path).expect("read envfile");
+        
+        // If extract_inline_comment is broken, it will strip " # with hash" and append it as a comment
+        // Resulting in: SECRET="new_value" # with hash
+        // But the original intention was likely that " # with hash" was PART of the value.
+        // However, update_envfile replaces the value entirely.
+        // The issue is whether " # with hash" is considered a comment on the line or part of the value.
+        // In .env syntax, comments start with #. But inside quotes, they are literal.
+        // The current implementation treats it as a comment even inside quotes.
+        
+        // Let's assert what we expect. Correct behavior is that " # with hash" was part of the value,
+        // so it should NOT be preserved as a comment on the new line.
+        assert!(!content.contains("# with hash"), "Inline comment extractor incorrectly identified quoted hash as comment");
+        assert!(content.contains("SECRET=\"new_value\""));
+    }
+
+    #[test]
+    fn test_update_envfile_preserves_real_inline_comments() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let env_path = tmp.path().join("config.env");
         std::fs::write(

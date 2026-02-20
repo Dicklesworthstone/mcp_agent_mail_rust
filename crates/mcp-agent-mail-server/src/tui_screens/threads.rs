@@ -3217,7 +3217,7 @@ fn truncate_display_width(s: &str, max_width: usize) -> String {
 }
 
 /// Clip a styled line to `max_width` display cells while preserving style/link metadata.
-fn clip_line_to_display_width(line: Line, max_width: usize) -> Line {
+fn clip_line_to_display_width(line: Line<'static>, max_width: usize) -> Line<'static> {
     if max_width == 0 {
         return Line::raw(String::new());
     }

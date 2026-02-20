@@ -341,7 +341,7 @@ impl RecentMessagePreview {
 
     fn to_markdown(&self) -> String {
         let subject = if self.subject.trim().is_empty() {
-            "(no subject)"
+            "(no subject)".to_string()
         } else {
             truncate(&self.subject, 160)
         };
@@ -908,6 +908,14 @@ const fn should_enable_mega_dashboard_density(main_area: Rect) -> bool {
     main_area.width >= DASHBOARD_6K_MIN_WIDTH && main_area.height >= DASHBOARD_6K_MIN_HEIGHT
 }
 
+const fn should_render_console_log_panel(
+    manual_enabled: bool,
+    mega_dense_surface: bool,
+    console_log_lines: usize,
+) -> bool {
+    manual_enabled || (mega_dense_surface && console_log_lines > 0)
+}
+
 impl Default for DashboardScreen {
     fn default() -> Self {
         Self::new()
@@ -1065,16 +1073,15 @@ impl MailScreen for DashboardScreen {
         // stale offsets after trims/filter changes.
         self.clamp_scroll_offset();
 
-        // Ingest console log entries when panel is visible
-        if self.show_log_panel {
-            let new_entries = state.console_log_since(self.console_log_last_seq);
-            if !new_entries.is_empty() {
-                let mut pane = self.console_log.borrow_mut();
-                for (seq, line) in &new_entries {
-                    self.console_log_last_seq = *seq;
-                    for l in line.split('\n') {
-                        pane.push(crate::console::ansi_to_line(l));
-                    }
+        // Keep the local console log cache warm even when the panel is hidden so
+        // auto-dense layouts can render meaningful content immediately.
+        let new_entries = state.console_log_since(self.console_log_last_seq);
+        if !new_entries.is_empty() {
+            let mut pane = self.console_log.borrow_mut();
+            for (seq, line) in &new_entries {
+                self.console_log_last_seq = *seq;
+                for l in line.split('\n') {
+                    pane.push(crate::console::ansi_to_line(l));
                 }
             }
         }
@@ -1212,7 +1219,11 @@ impl MailScreen for DashboardScreen {
         let show_trend_panel = self.should_render_trend_panel() || force_dense_surface;
         let show_footer_panel =
             Self::should_render_bottom_rail(quick_query, preview, force_dense_surface);
-        let show_log_panel = self.show_log_panel || mega_dense_surface;
+        let show_log_panel = should_render_console_log_panel(
+            self.show_log_panel,
+            mega_dense_surface,
+            console_log_lines,
+        );
         let layout = Self::main_content_layout(
             show_trend_panel,
             show_log_panel,
@@ -1377,16 +1388,16 @@ fn format_ctx(project: Option<&str>, agent: Option<&str>) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> &str {
+fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        return s;
+        return s.to_string();
     }
     // Find a valid UTF-8 char boundary at or before `max`.
     let mut end = max;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    &s[..end]
+    s[..end].to_string()
 }
 
 fn summarize_recipients(recipients: &[String]) -> String {
@@ -1801,7 +1812,7 @@ fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
 fn render_lines_with_columns(
     frame: &mut Frame<'_>,
     area: Rect,
-    lines: &[Line],
+    lines: &[Line<'static>],
     min_col_width: u16,
     max_cols: usize,
 ) {
@@ -5289,11 +5300,12 @@ fn render_event_log(
                 entry.kind.compact_label(),
                 entry.summary
             );
-            let line = truncate(&raw_line, line_width_budget).to_string();
-            shimmer_progresses.get(idx).and_then(|p| *p).map_or_else(
-                || line.clone(),
-                |progress| shimmerize_plain_text(&line, progress, SHIMMER_HIGHLIGHT_WIDTH),
-            )
+            let line = truncate(&raw_line, line_width_budget);
+            if let Some(progress) = shimmer_progresses.get(idx).and_then(|p| *p) {
+                shimmerize_plain_text(&line, progress, SHIMMER_HIGHLIGHT_WIDTH)
+            } else {
+                line
+            }
         })
         .collect();
 
@@ -6239,6 +6251,18 @@ mod tests {
             DashboardScreen::main_content_layout(true, false, false, false, 0, false, false)
                 .compute(Rect::new(0, 0, 200, 50));
         assert!(composition.rect(PanelSlot::Footer).is_none());
+    }
+
+    #[test]
+    fn console_log_panel_auto_mode_requires_content() {
+        assert!(!should_render_console_log_panel(false, true, 0));
+        assert!(should_render_console_log_panel(false, true, 1));
+    }
+
+    #[test]
+    fn console_log_panel_manual_toggle_forces_visibility() {
+        assert!(should_render_console_log_panel(true, false, 0));
+        assert!(should_render_console_log_panel(true, true, 0));
     }
 
     #[test]

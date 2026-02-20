@@ -6,9 +6,9 @@
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::{DbPool, DbPoolConfig};
 use mcp_agent_mail_db::schema;
-use mcp_agent_mail_db::DbConn;
 use tempfile::tempdir;
 
 fn count_fts_artifacts(conn: &DbConn) -> i64 {

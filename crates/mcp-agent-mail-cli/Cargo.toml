@@ -21,7 +21,6 @@ ftui-runtime = { workspace = true, features = ["stdio-capture"] }
 thiserror.workspace = true
 chrono.workspace = true
 sqlmodel-core.workspace = true
-sqlmodel-sqlite.workspace = true
 mcp-agent-mail-core = { workspace = true, features = ["agent-detect"] }
 mcp-agent-mail-db = { workspace = true }
 mcp-agent-mail-share = { workspace = true }

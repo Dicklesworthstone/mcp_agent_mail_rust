@@ -76,7 +76,7 @@ fn level_styled_line(
     tp: &crate::tui_theme::TuiThemePalette,
     description: String,
     detail: String,
-) -> Line {
+) -> Line<'static> {
     let badge_style = level.style(tp);
     let desc_style = crate::tui_theme::text_primary(tp);
     let detail_style = crate::tui_theme::text_meta(tp);
@@ -276,7 +276,7 @@ impl SystemHealthScreen {
         let accent_style = crate::tui_theme::text_accent(&tp);
         let action_key_style = crate::tui_theme::text_action_key(&tp);
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'static>> = Vec::new();
 
         // ── Configuration Section ──
         lines.push(Line::from_spans([Span::styled(
@@ -444,7 +444,7 @@ impl SystemHealthScreen {
             let tp = crate::tui_theme::TuiThemePalette::current();
             let alert_text = format!("CRITICAL: {critical_alerts} failing health checks");
             let alert_style = crate::tui_theme::text_critical(&tp);
-            Paragraph::new(alert_text.as_str())
+            Paragraph::new(alert_text.clone())
                 .style(alert_style)
                 .render(Rect::new(area.x, area.y, area.width, 1), frame);
             if effects_enabled {
@@ -711,7 +711,7 @@ impl SystemHealthScreen {
         // fall back to compact text lines showing severity + title.
         if area.width < 30 {
             let tp = crate::tui_theme::TuiThemePalette::current();
-            let mut compact_lines: Vec<Line> = Vec::new();
+            let mut compact_lines: Vec<Line<'static>> = Vec::new();
             for f in &findings {
                 let (badge, badge_style) = match f.severity {
                     AnomalySeverity::Critical => ("[CRIT]", crate::tui_theme::text_critical(&tp)),
@@ -726,7 +726,7 @@ impl SystemHealthScreen {
                 ]));
             }
             let visible = usize::from(area.height);
-            let truncated: Vec<Line> = compact_lines.into_iter().take(visible).collect();
+            let truncated: Vec<Line<'static>> = compact_lines.into_iter().take(visible).collect();
             Paragraph::new(Text::from_lines(truncated)).render(area, frame);
             return;
         }

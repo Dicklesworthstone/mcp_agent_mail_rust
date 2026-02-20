@@ -182,7 +182,14 @@ pub fn bundle_attachments(
                         ));
                     };
 
-                    let file_size = source.metadata()?.len() as usize;
+                    let metadata = source.metadata()?;
+                    if !metadata.is_file() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "source is not a regular file",
+                        ));
+                    }
+                    let file_size = metadata.len() as usize;
 
                     if file_size <= inline_threshold {
                         let content = std::fs::read(source)?;

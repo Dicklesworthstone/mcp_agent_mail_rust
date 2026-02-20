@@ -105,7 +105,7 @@ pub fn normalize_contact_policy(raw: &str) -> String {
 
 /// Resolve the sender agent, optionally auto-registering if missing.
 #[allow(clippy::too_many_arguments)]
-async fn resolve_or_register_sender(
+pub(crate) async fn resolve_or_register_sender(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
     project_id: i64,

@@ -321,7 +321,18 @@ pub async fn file_reservation_paths(
     let index = ReservationIndex::build(
         active
             .iter()
-            .filter(|res| res.agent_id != agent_id && res.exclusive != 0)
+            .filter(|res| {
+                if res.agent_id == agent_id {
+                    return false;
+                }
+                // If request is exclusive, we conflict with ANY existing reservation (shared or exclusive).
+                // If request is shared, we only conflict with existing EXCLUSIVE reservations.
+                if is_exclusive {
+                    true
+                } else {
+                    res.exclusive != 0
+                }
+            })
             .map(|res| {
                 (
                     res.path_pattern.clone(),
@@ -535,7 +546,8 @@ pub async fn release_file_reservations(
         .as_ref()
         .map(|p| p.iter().map(String::as_str).collect());
 
-    let released = db_outcome_to_mcp_result(
+    // Perform the DB release (returns the actual updated rows)
+    let released_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::release_reservations(
             ctx.cx(),
             &pool,
@@ -547,8 +559,45 @@ pub async fn release_file_reservations(
         .await,
     )?;
 
+    // Update archive artifacts for the released items
+    if !released_rows.is_empty() {
+        let now_iso = micros_to_iso(mcp_agent_mail_db::now_micros());
+        let res_jsons: Vec<serde_json::Value> = released_rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id.unwrap_or(0),
+                    "agent": &agent_name,
+                    "path_pattern": &r.path_pattern,
+                    "exclusive": r.exclusive != 0,
+                    "reason": &r.reason,
+                    "created_ts": micros_to_iso(r.created_ts),
+                    "expires_ts": micros_to_iso(r.expires_ts),
+                    "released_ts": micros_to_iso(r.released_ts.unwrap_or(0)),
+                })
+            })
+            .collect();
+
+        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+            project_slug: project.slug.clone(),
+            config: Config::get(),
+            reservations: res_jsons,
+        };
+        // Use match to ignore result (consistent with create path)
+        match mcp_agent_mail_storage::wbq_enqueue(op) {
+            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+            | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
+            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                tracing::warn!(
+                    "WBQ enqueue failed; skipping reservation release artifacts archive write project={}",
+                    project.slug
+                );
+            }
+        }
+    }
+
     let response = ReleaseResult {
-        released: i32::try_from(released).unwrap_or(i32::MAX),
+        released: i32::try_from(released_rows.len()).unwrap_or(i32::MAX),
         released_at: micros_to_iso(mcp_agent_mail_db::now_micros()),
     };
 
@@ -814,9 +863,41 @@ pub async fn force_release_file_reservation(
             .await,
     )?;
 
+    if released_count > 0 {
+        let now_iso = micros_to_iso(mcp_agent_mail_db::now_micros());
+        let res_json = serde_json::json!({
+            "id": reservation.id.unwrap_or(0),
+            "agent": &holder_agent.name,
+            "path_pattern": &reservation.path_pattern,
+            "exclusive": reservation.exclusive != 0,
+            "reason": &reservation.reason,
+            "created_ts": micros_to_iso(reservation.created_ts),
+            "expires_ts": micros_to_iso(reservation.expires_ts),
+            "released_ts": now_iso,
+        });
+
+        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+            project_slug: project.slug.clone(),
+            config: Config::get(),
+            reservations: vec![res_json],
+        };
+        mcp_agent_mail_storage::wbq_enqueue(op);
+    }
+
     // Optionally send notification to previous holder
     let notified = if should_notify && released_count > 0 && holder_agent.name != agent_name {
-        let note_text = note.as_deref().unwrap_or("");
+        let raw_note = note.as_deref().unwrap_or("");
+        // Truncate note to prevent bypassing message size limits (4KB cap)
+        let note_text = if raw_note.len() > 4096 {
+            let mut idx = 4096;
+            while idx > 0 && !raw_note.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            &raw_note[..idx]
+        } else {
+            raw_note
+        };
+
         let signals_md = stale_reasons
             .iter()
             .map(|r| format!("- {r}"))
@@ -1037,14 +1118,14 @@ pub fn install_precommit_guard(
         })
         .map(|p| p.to_string_lossy().to_string());
 
-    mcp_agent_mail_guard::install_guard(&project_key, &repo_path, abs_db_path.as_deref()).map_err(
-        |e| {
+    // Enable pre-push hook installation by default to match legacy behavior
+    mcp_agent_mail_guard::install_guard(&project_key, &repo_path, abs_db_path.as_deref(), true)
+        .map_err(|e| {
             McpError::new(
                 McpErrorCode::InternalError,
                 format!("Failed to install guard: {e}"),
             )
-        },
-    )?;
+        })?;
 
     // Resolve the actual hook path (honors core.hooksPath, worktrees, etc.)
     let hooks_dir = mcp_agent_mail_guard::resolve_hooks_dir(&repo_path).map_err(|e| {

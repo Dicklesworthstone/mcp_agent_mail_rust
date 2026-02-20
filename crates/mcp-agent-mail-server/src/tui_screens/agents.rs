@@ -31,8 +31,8 @@ const SORT_LABELS: &[&str] = &["Name", "Program", "Model", "Active", "Msgs"];
 const STATUS_FADE_TICKS: u8 = 5;
 const MESSAGE_FLASH_TICKS: u8 = 3;
 const STAGGER_MAX_TICKS: u8 = 10;
-const ACTIVE_WINDOW_MICROS: i64 = 2 * 60 * 1_000_000;
-const IDLE_WINDOW_MICROS: i64 = 15 * 60 * 1_000_000;
+const ACTIVE_WINDOW_MICROS: i64 = 60 * 1_000_000;
+const IDLE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
 /// Max sparkline history samples.
 const SPARKLINE_CAP: usize = 30;
 

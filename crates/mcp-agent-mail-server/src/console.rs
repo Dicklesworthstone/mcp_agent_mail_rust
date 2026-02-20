@@ -71,10 +71,10 @@ pub fn sanitize_known_value(key: &str, value: &str) -> Option<String> {
     sanitize_url_userinfo(value)
 }
 
-/// Walk a `serde_json::Value` tree and replace values whose keys match
-/// sensitive patterns with redaction placeholders. Also sanitizes select known keys.
-#[must_use]
-pub fn mask_json(value: &Value) -> Value {
+fn mask_json_depth(value: &Value, depth: usize) -> Value {
+    if depth > 20 {
+        return value.clone();
+    }
     match value {
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
@@ -86,14 +86,23 @@ pub fn mask_json(value: &Value) -> Value {
                 {
                     out.insert(k.clone(), Value::String(sanitized));
                 } else {
-                    out.insert(k.clone(), mask_json(v));
+                    out.insert(k.clone(), mask_json_depth(v, depth + 1));
                 }
             }
             Value::Object(out)
         }
-        Value::Array(arr) => Value::Array(arr.iter().map(mask_json).collect()),
+        Value::Array(arr) => {
+            Value::Array(arr.iter().map(|v| mask_json_depth(v, depth + 1)).collect())
+        }
         other => other.clone(),
     }
+}
+
+/// Walk a `serde_json::Value` tree and replace values whose keys match
+/// sensitive patterns with redaction placeholders. Also sanitizes select known keys.
+#[must_use]
+pub fn mask_json(value: &Value) -> Value {
+    mask_json_depth(value, 0)
 }
 
 /// Back-compat name used by existing panel renderers/tests.
@@ -1020,10 +1029,10 @@ fn apply_sgr_to_style(style: &mut ftui::Style, code: u8, params: &[u8], param_id
 /// `Span` objects, preserving colors, bold, italic, etc. Non-SGR escape
 /// sequences are silently ignored.
 #[must_use]
-pub fn ansi_to_line(input: &str) -> ftui::text::Line {
+pub fn ansi_to_line(input: &str) -> ftui::text::Line<'static> {
     use ftui::text::{Line, Span};
 
-    let mut spans: Vec<Span> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let mut current_style = ftui::Style::default();
     let mut buf = String::new();
 
@@ -1085,7 +1094,7 @@ pub fn ansi_to_line(input: &str) -> ftui::text::Line {
 }
 
 /// Parse an ANSI-escaped multi-line string into a styled `ftui::text::Text`.
-pub fn ansi_to_text(input: &str) -> ftui::text::Text {
+pub fn ansi_to_text(input: &str) -> ftui::text::Text<'static> {
     let lines: Vec<ftui::text::Line> = input.split('\n').map(ansi_to_line).collect();
     ftui::text::Text::from_lines(lines)
 }
@@ -1367,12 +1376,15 @@ impl LogPane {
     }
 
     /// Append a log line (plain text or ANSI-stripped).
-    pub fn push(&mut self, line: impl Into<ftui::text::Text>) {
+    pub fn push(&mut self, line: impl Into<ftui::text::Text<'static>>) {
         self.viewer.push(line);
     }
 
     /// Append multiple lines efficiently.
-    pub fn push_many(&mut self, lines: impl IntoIterator<Item = impl Into<ftui::text::Text>>) {
+    pub fn push_many(
+        &mut self,
+        lines: impl IntoIterator<Item = impl Into<ftui::text::Text<'static>>>,
+    ) {
         self.viewer.push_many(lines);
     }
 
@@ -1615,7 +1627,7 @@ pub fn render_split_frame(
             if !log_pane.caps_addendum.is_empty() {
                 full_help.push_str(&log_pane.caps_addendum);
             }
-            let help = Paragraph::new(full_help.as_str());
+            let help = Paragraph::new(full_help.clone());
             let help_block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .title(" Log Pane Help ");

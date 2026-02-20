@@ -233,7 +233,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
         "def _run_child(path: Path, * , stdin_bytes=None):".to_string(),
         "    # On Windows, prefer 'python' for .py plugins to avoid PATHEXT reliance.".to_string(),
         "    if os.name != 'posix' and path.suffix.lower() == '.py':".to_string(),
-        "        return subprocess.run(['python', str(path)], input=stdin_bytes, check=False).returncode"
+        "        return subprocess.run([sys.executable, str(path)], input=stdin_bytes, check=False).returncode"
             .to_string(),
         "    return subprocess.run([str(path)], input=stdin_bytes, check=False).returncode"
             .to_string(),
@@ -374,7 +374,7 @@ def get_active_reservations():
             "FROM file_reservations fr "
             "JOIN agents a ON a.id = fr.agent_id "
             "JOIN projects p ON p.id = fr.project_id "
-            "WHERE fr.exclusive = 1 AND fr.released_ts IS NULL "
+            "WHERE fr.exclusive = 1 AND (fr.released_ts IS NULL OR fr.released_ts <= 0) "
             "AND fr.expires_ts > ? AND p.human_key = ?",
             (now_micros, PROJECT),
         ).fetchall()
@@ -462,6 +462,7 @@ pub fn install_guard(
     _project: &str,
     repo: &Path,
     default_db_path: Option<&str>,
+    install_prepush: bool,
 ) -> GuardResult<()> {
     if !repo.exists() {
         return Err(GuardError::InvalidRepo {
@@ -472,46 +473,66 @@ pub fn install_guard(
     let hooks_dir = resolve_hooks_dir(repo)?;
     std::fs::create_dir_all(&hooks_dir)?;
 
-    // Ensure hooks.d/pre-commit exists.
-    let run_dir = hooks_dir.join("hooks.d").join("pre-commit");
-    std::fs::create_dir_all(&run_dir)?;
+    // Helper to install a single hook type
+    let install_hook = |name: &str| -> GuardResult<()> {
+        // Ensure hooks.d/<name> exists
+        let run_dir = hooks_dir.join("hooks.d").join(name);
+        std::fs::create_dir_all(&run_dir)?;
 
-    let chain_path = hooks_dir.join("pre-commit");
-    if chain_path.exists() {
-        let content = std::fs::read_to_string(&chain_path).unwrap_or_default();
-        let content = content.trim();
-        if !content.contains("mcp-agent-mail chain-runner (pre-commit)") {
-            let orig = hooks_dir.join("pre-commit.orig");
-            if !orig.exists() {
-                std::fs::rename(&chain_path, &orig)?;
+        let chain_path = hooks_dir.join(name);
+        if chain_path.exists() {
+            let content = std::fs::read_to_string(&chain_path).unwrap_or_default();
+            let content = content.trim();
+            // Idempotent: backup if not ours
+            if !content.contains(&format!("mcp-agent-mail chain-runner ({name})")) {
+                let orig = hooks_dir.join(format!("{name}.orig"));
+                if !orig.exists() {
+                    std::fs::rename(&chain_path, &orig)?;
+                }
             }
         }
-    }
 
-    // Write/overwrite chain-runner.
-    let chain_script = render_chain_runner_script("pre-commit");
-    std::fs::write(&chain_path, chain_script)?;
-    chmod_exec(&chain_path)?;
+        // Write chain-runner
+        let chain_script = render_chain_runner_script(name);
+        std::fs::write(&chain_path, chain_script)?;
+        chmod_exec(&chain_path)?;
 
-    // Windows shims (.cmd/.ps1) to invoke the Python chain-runner.
-    let cmd_path = hooks_dir.join("pre-commit.cmd");
-    if !cmd_path.exists() {
-        let body = "@echo off\r\nsetlocal\r\nset \"DIR=%~dp0\"\r\npython \"%DIR%pre-commit\" %*\r\nexit /b %ERRORLEVEL%\r\n";
-        std::fs::write(&cmd_path, body)?;
-    }
-    let ps1_path = hooks_dir.join("pre-commit.ps1");
-    if !ps1_path.exists() {
-        let body = "$ErrorActionPreference = 'Stop'\n$hook = Join-Path $PSScriptRoot 'pre-commit'\npython $hook @args\nexit $LASTEXITCODE\n";
-        std::fs::write(&ps1_path, body)?;
-    }
+        // Windows shims
+        let cmd_path = hooks_dir.join(format!("{name}.cmd"));
+        if !cmd_path.exists() {
+            let body = format!(
+                "@echo off\r\nsetlocal\r\nset \"DIR=%~dp0\"\r\npython \"%DIR%{name}\" %*\r\nexit /b %ERRORLEVEL%\r\n"
+            );
+            std::fs::write(&cmd_path, body)?;
+        }
+        let ps1_path = hooks_dir.join(format!("{name}.ps1"));
+        if !ps1_path.exists() {
+            let body = format!(
+                "$ErrorActionPreference = 'Stop'\n$hook = Join-Path $PSScriptRoot '{name}'\npython $hook @args\nexit $LASTEXITCODE\n"
+            );
+            std::fs::write(&ps1_path, body)?;
+        }
 
-    // Write our guard plugin (currently stubbed).
-    let plugin_path = run_dir.join(PLUGIN_FILE_NAME);
-    std::fs::write(
-        &plugin_path,
-        render_guard_plugin_script(_project, "pre-commit", default_db_path),
-    )?;
-    chmod_exec(&plugin_path)?;
+        // Write guard plugin
+        // Note: Currently the Python plugin only implements 'pre-commit' logic (checking staged files).
+        // If we install it for pre-push, it will check staged files during push, which is better than nothing
+        // but not strictly correct (should check pushed commits).
+        // TODO: Upgrade render_guard_plugin_script to handle pre-push stdin.
+        let plugin_path = run_dir.join(PLUGIN_FILE_NAME);
+        std::fs::write(
+            &plugin_path,
+            render_guard_plugin_script(_project, name, default_db_path),
+        )?;
+        chmod_exec(&plugin_path)?;
+
+        Ok(())
+    };
+
+    install_hook("pre-commit")?;
+
+    if install_prepush {
+        install_hook("pre-push")?;
+    }
 
     Ok(())
 }
@@ -1020,6 +1041,7 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                         "--no-ext-diff",
                         "--diff-filter=ACMRDTU",
                         "-z",
+                        "-m",
                         sha,
                     ])
                     .output()?;

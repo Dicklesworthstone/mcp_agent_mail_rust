@@ -541,11 +541,15 @@ pub async fn macro_contact_handshake(
         let project = resolve_project(ctx, &pool, &project_key).await?;
         let project_id = project.id.unwrap_or(0);
 
-        let from_row = crate::tool_util::resolve_agent(
+        let from_row = crate::contacts::resolve_or_register_sender(
             ctx,
             &pool,
             project_id,
             &from_agent,
+            register_if_missing.unwrap_or(true),
+            program.clone(),
+            model.clone(),
+            task_description.as_deref(),
             &project.slug,
             &project.human_key,
         )

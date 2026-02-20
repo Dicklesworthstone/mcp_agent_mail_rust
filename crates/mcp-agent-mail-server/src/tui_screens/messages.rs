@@ -344,16 +344,16 @@ impl MessageEntry {
         };
 
         // Compact timestamp (HH:MM:SS from ISO string)
-        let time_short = if self.timestamp_iso.len() >= 19 {
-            &self.timestamp_iso[11..19]
+        let time_short: String = if self.timestamp_iso.len() >= 19 {
+            self.timestamp_iso[11..19].to_string()
         } else {
-            &self.timestamp_iso
+            self.timestamp_iso.clone()
         };
         let time_style = crate::tui_theme::text_meta(&tp).bg(row_bg);
 
         // Sender (truncated to 12 chars, Unicode-safe).
         let sender_end = char_index_to_byte_offset(&self.from_agent, 12);
-        let sender = &self.from_agent[..sender_end];
+        let sender = self.from_agent[..sender_end].to_string();
         let sender_style = Style::default().fg(tp.text_secondary).bg(row_bg);
 
         // Project badge (only in Global mode)
@@ -2653,6 +2653,42 @@ impl MailScreen for MessageBrowserScreen {
         self.sync_focused_event();
     }
 
+    fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
+        match operation {
+            "batch_acknowledge" => {
+                let ids = self.selected_message_ids_sorted();
+                self.clear_message_selection();
+                let mut batch = Vec::new();
+                for id in ids {
+                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
+                        "acknowledge".to_string(),
+                        format!("msg:{id}"),
+                    )));
+                }
+                Cmd::batch(batch)
+            }
+            "batch_mark_read" => {
+                let ids = self.selected_message_ids_sorted();
+                self.clear_message_selection();
+                let mut batch = Vec::new();
+                for id in ids {
+                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
+                        "mark_read".to_string(),
+                        format!("msg:{id}"),
+                    )));
+                }
+                Cmd::batch(batch)
+            }
+            "batch_mark_unread" => {
+                self.clear_message_selection();
+                Cmd::None
+            }
+            // Consume single-item actions to prevent routing loops between tui_app and screen
+            "acknowledge" | "mark_read" => Cmd::None,
+            _ => Cmd::None,
+        }
+    }
+
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
         self.focused_synthetic.as_ref()
     }
@@ -3517,7 +3553,7 @@ fn looks_like_json(body: &str) -> bool {
 /// immediately followed (ignoring whitespace) by a `Punctuation` token whose
 /// text is `:` is classified as a key.
 #[allow(dead_code)] // kept for tests and fallback experiments; main path uses markdown rendering.
-fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Text {
+fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Text<'static> {
     let tokenizer = JsonTokenizer;
     let key_style = crate::tui_theme::style_json_key(tp);
     let string_style = crate::tui_theme::style_json_string(tp);
@@ -3535,7 +3571,7 @@ fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Tex
         state = new_state;
 
         if tokens.is_empty() {
-            lines.push(Line::raw(line));
+            lines.push(Line::raw(line.to_string()));
             continue;
         }
 
@@ -4012,7 +4048,7 @@ fn render_compose_label(
     } else {
         crate::tui_theme::text_meta(tp)
     };
-    Paragraph::new(label)
+    Paragraph::new(label.to_string())
         .style(style)
         .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
     *cursor_y = (*cursor_y).saturating_add(1);

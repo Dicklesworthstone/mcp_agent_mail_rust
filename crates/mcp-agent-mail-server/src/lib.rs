@@ -370,7 +370,7 @@ fn result_preview_from_contents(contents: &[Content]) -> Option<String> {
     // Mask if it looks like JSON
     Some(
         serde_json::from_str::<serde_json::Value>(preview).map_or_else(
-            |_| preview.to_string(),
+            |_| preview.replace('\n', "\\n").replace('\r', "\\r"),
             |v| console::mask_json(&v).to_string(),
         ),
     )
@@ -1270,27 +1270,29 @@ fn dispatch_compose_envelope(
         return;
     }
 
-    // 3. Insert the message.
-    let thread_id = envelope.thread_id.as_deref().unwrap_or("").to_string();
+    // 3. Insert the message and get its id atomically.
+    // NOTE: Do not reference a `topic` column here: current schema does not
+    // include it, and compose should succeed against the runtime DB shape.
     let importance = &envelope.importance;
-    let _ = conn.execute_sync(
-        "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, topic, created_ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?7)",
-        &[
-            Value::BigInt(project_id),
-            Value::BigInt(sender_id),
-            Value::Text(envelope.subject.clone()),
-            Value::Text(envelope.body_md.clone()),
-            Value::Text(importance.clone()),
-            Value::Text(thread_id),
-            Value::BigInt(now),
-        ],
-    );
-
-    // 4. Get the inserted message ID (MAX(id) since FrankenConnection
-    // does not support last_insert_rowid).
+    let thread_id_value = envelope
+        .thread_id
+        .as_ref()
+        .map_or(Value::Null, |tid| Value::Text(tid.clone()));
     let msg_id: i64 = conn
-        .query_sync("SELECT MAX(id) AS id FROM messages", &[])
+        .query_sync(
+            "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, created_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7) \
+             RETURNING id",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(sender_id),
+                Value::Text(envelope.subject.clone()),
+                Value::Text(envelope.body_md.clone()),
+                Value::Text(importance.clone()),
+                thread_id_value,
+                Value::BigInt(now),
+            ],
+        )
         .ok()
         .and_then(|rows| rows.into_iter().next())
         .and_then(|row| row.get_named::<i64>("id").ok())
@@ -5805,7 +5807,11 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 fn py_repr_str(s: &str) -> String {
     // Cheap approximation of Python's `repr(str)` used by structlog's KeyValueRenderer.
     // Good enough for stable snapshots and human scanning.
-    let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     format!("'{escaped}'")
 }
 
@@ -6040,9 +6046,11 @@ mod tests {
 
         // The deadline should be approximately 30 seconds from now
         // Allow some tolerance for test execution time
-        let deadline_nanos = deadline.as_nanos();
-        let now_nanos = check_time.as_nanos();
-        let diff_secs = (deadline_nanos.saturating_sub(now_nanos)) / 1_000_000_000;
+        // Note: asupersync::time::Instant opaque type doesn't expose raw nanoseconds directly in all versions,
+        // but duration_since works.
+        let remaining = deadline.saturating_duration_since(check_time);
+        let diff_secs = remaining.as_secs();
+
         assert!(
             (29..=31).contains(&diff_secs),
             "Deadline should be ~30 seconds in the future, got {diff_secs}s",
@@ -13625,6 +13633,234 @@ mod tests {
         set_tui_state_handle(None);
         // Should not panic
         emit_tui_event(tui_events::MailEvent::server_shutdown());
+    }
+
+    fn setup_compose_dispatch_test_db(path: &std::path::Path) {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(path).expect("open compose test db");
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                task_description TEXT NOT NULL,
+                inception_ts INTEGER NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                thread_id TEXT,
+                subject TEXT NOT NULL,
+                body_md TEXT NOT NULL,
+                importance TEXT NOT NULL DEFAULT 'normal',
+                ack_required INTEGER NOT NULL DEFAULT 0,
+                created_ts INTEGER NOT NULL,
+                attachments TEXT NOT NULL DEFAULT '[]'
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                ack_ts INTEGER,
+                read_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create message_recipients");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                Value::BigInt(1),
+                Value::Text("proj-test".to_string()),
+                Value::Text("/tmp/proj-test".to_string()),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                Value::BigInt(2),
+                Value::BigInt(1),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("recipient".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert recipient");
+    }
+
+    #[test]
+    fn dispatch_compose_envelope_inserts_new_message_and_uses_returning_id() {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("compose_dispatch.sqlite3");
+        setup_compose_dispatch_test_db(&db_path);
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path).expect("open db");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::BigInt(2),
+                Value::Text("legacy-1".to_string()),
+                Value::Text("legacy-subject".to_string()),
+                Value::Text("legacy-body".to_string()),
+                Value::Text("normal".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(1),
+                Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert legacy message");
+
+        let config = mcp_agent_mail_core::Config::default();
+        let tui_state = tui_bridge::TuiSharedState::new(&config);
+        let envelope = tui_compose::ComposeEnvelope {
+            sender_name: tui_compose::OVERSEER_AGENT_NAME.to_string(),
+            to: vec!["BlueLake".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "compose subject".to_string(),
+            body_md: "compose body".to_string(),
+            importance: "high".to_string(),
+            thread_id: Some("br-123".to_string()),
+        };
+        let database_url = format!("sqlite://{}", db_path.display());
+        dispatch_compose_envelope(&database_url, &tui_state, &envelope);
+
+        let message_count = conn
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("count messages")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(message_count, 2, "compose should create a new message row");
+
+        let newest = conn
+            .query_sync(
+                "SELECT id, subject, thread_id FROM messages ORDER BY id DESC LIMIT 1",
+                &[],
+            )
+            .expect("query newest message")
+            .into_iter()
+            .next()
+            .expect("new message row");
+        let new_id = newest
+            .get_named::<i64>("id")
+            .expect("new message id should be present");
+        let new_subject = newest
+            .get_named::<String>("subject")
+            .expect("new message subject");
+        let new_thread = newest
+            .get_named::<Option<String>>("thread_id")
+            .expect("new message thread");
+        assert!(
+            new_id > 1,
+            "new message id should be greater than legacy id"
+        );
+        assert_eq!(new_subject, "compose subject");
+        assert_eq!(new_thread.as_deref(), Some("br-123"));
+
+        let legacy_recips = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM message_recipients WHERE message_id = 1",
+                &[],
+            )
+            .expect("legacy recipient count")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            legacy_recips, 0,
+            "compose recipients must not be attached to pre-existing message ids"
+        );
+
+        let new_recips = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM message_recipients WHERE message_id = ?1",
+                &[Value::BigInt(new_id)],
+            )
+            .expect("new recipient count")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(new_recips, 1, "compose should add exactly one recipient");
+    }
+
+    #[test]
+    fn dispatch_compose_envelope_stores_null_thread_id_when_unset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("compose_dispatch_null_thread.sqlite3");
+        setup_compose_dispatch_test_db(&db_path);
+
+        let config = mcp_agent_mail_core::Config::default();
+        let tui_state = tui_bridge::TuiSharedState::new(&config);
+        let envelope = tui_compose::ComposeEnvelope {
+            sender_name: tui_compose::OVERSEER_AGENT_NAME.to_string(),
+            to: vec!["BlueLake".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "compose no thread".to_string(),
+            body_md: "body".to_string(),
+            importance: "normal".to_string(),
+            thread_id: None,
+        };
+        let database_url = format!("sqlite://{}", db_path.display());
+        dispatch_compose_envelope(&database_url, &tui_state, &envelope);
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path).expect("open db");
+        let row = conn
+            .query_sync(
+                "SELECT thread_id FROM messages WHERE subject = ?1 LIMIT 1",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                    "compose no thread".to_string(),
+                )],
+            )
+            .expect("query message")
+            .into_iter()
+            .next()
+            .expect("message row");
+        let thread_id = row
+            .get_named::<Option<String>>("thread_id")
+            .expect("thread_id decode");
+        assert!(
+            thread_id.is_none(),
+            "thread_id should be NULL when compose envelope omits it"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -453,6 +453,22 @@ When creating the bead, attach:
 - command transcript used for reproduction,
 - artifact paths under `tests/artifacts/search_v3_*`.
 
+### Structured Diagnostics Contract (Required Evidence)
+
+Every weekly verification run and incident-triggered follow-up must include these
+machine-readable artifacts so another operator can replay without prior context:
+
+| Evidence Field | Required Location / Source |
+|----------------|----------------------------|
+| Scenario IDs + pass/fail status | `${SEARCH_V3_RUN_DIR}/summaries/suite_summary.json` (`cases[].case_id`, `status`) |
+| Timing breakdowns (latency/elapsed) | `${SEARCH_V3_RUN_DIR}/summaries/suite_summary.json` + `tests/artifacts/search_v3_*/<timestamp>/metrics.json` |
+| Error/reason codes and failing assertions | `${SEARCH_V3_RUN_DIR}/logs/summary.log` and suite `diagnostics/*.txt` files |
+| Artifact directory + bundle manifest | `tests/artifacts/search_v3_*/<timestamp>/bundle.json` |
+| Reproduction command + environment | `tests/artifacts/search_v3_*/<timestamp>/repro.txt` and `repro.env` |
+
+If any field is missing, treat the run as non-actionable and re-run the suite before
+closing the incident or marking a verification window complete.
+
 ---
 
 ## Checklist Summary
@@ -466,6 +482,35 @@ When creating the bead, attach:
 - [ ] Weekly verification and drift review completed
 - [ ] Post-cutover checks complete at T+24h, T+7d, and T+30d
 - [ ] Incident triage + repair procedures validated by operator dry run
+
+## Post-Cutover Audit Summary (`br-2tnl.8.6`)
+
+Audit date: `2026-02-20`
+
+### Consolidated Evidence Matrix
+
+| Area | Evidence Source | Audit Result |
+|------|-----------------|--------------|
+| Parity | `br-2tnl.7.10`, `br-2tnl.7.16`; `tests/e2e/test_search_v3_shadow_parity.sh` | Satisfied |
+| Relevance + Diversity | `br-2tnl.7.4`, `br-2tnl.7.20`; benchmark + regression artifacts under `tests/artifacts/search_v3_*` | Satisfied |
+| Performance | `br-2tnl.7.5`, `br-2tnl.7.15`; load/concurrency suite + gate checks | Satisfied |
+| Resilience | `br-2tnl.7.6`, `br-2tnl.7.21`; resilience/timeout/backpressure suites | Satisfied |
+| Security + Scope/Redaction | `br-2tnl.7.14`; security matrix artifacts | Satisfied |
+| Logging + Compliance | `br-2tnl.7.19`; diagnostics contract + redaction checks | Satisfied |
+| Unit Tests (required by audit) | `br-2tnl.7.1` | Satisfied |
+| Integration Tests (required by audit) | `br-2tnl.7.2` | Satisfied |
+| Decommission completion | `br-2tnl.8.4` (SQLite FTS execution path removed) | Satisfied |
+| Steady-state runbook readiness | `br-2tnl.8.5` + this runbook section | Satisfied |
+
+### Residual Risks and Follow-Up Beads
+
+- `br-2tnl.8.7` (P2): automate weekly Search V3 steady-state bundle execution so evidence freshness is not manual-only.
+- `br-2tnl.8.8` (P2): enforce stale-artifact detection and evidence freshness alerts with explicit remediation output.
+
+### Sign-Off
+
+Search V3 rollout objectives are met with no critical regressions identified in current evidence.  
+Open follow-ups are operational hardening tasks, not blockers for Search V3 steady-state operation.
 
 ---
 
