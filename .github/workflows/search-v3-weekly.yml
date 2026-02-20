@@ -1,0 +1,46 @@
+name: Search V3 Weekly Bundle
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  search-v3-weekly:
+    name: Search V3 Weekly Steady-State Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries
+        run: |
+          cargo build -p mcp-agent-mail-cli
+          cargo build -p mcp-agent-mail
+
+      - name: Run weekly Search V3 bundle
+        run: |
+          set -euo pipefail
+          scripts/e2e_search_v3_weekly_bundle.sh --strict-freshness
+
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
+
+      - name: Upload weekly Search V3 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-v3-weekly-artifacts
+          path: |
+            tests/artifacts/search_v3_*/
+            tests/artifacts/search_v3/
+            tests/artifacts/search_v3_freshness/
+            tests/artifacts/search_v3_weekly/
+          retention-days: 30
+          if-no-files-found: error

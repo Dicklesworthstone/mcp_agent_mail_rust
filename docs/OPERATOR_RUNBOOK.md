@@ -524,6 +524,7 @@ Search V3-specific steady-state procedures live in:
 | Artifact bundle schema/manifest failures | `tests/e2e/test_artifacts_schema.sh` | `tests/artifacts/artifacts_schema/<timestamp>/` |
 | Static export routing/search/hash parity | `tests/e2e/test_share.sh` | `tests/artifacts/share/<timestamp>/` |
 | Verify-live exit-code/severity/compatibility regressions | `tests/e2e/test_share_verify_live.sh` | `tests/artifacts/share_verify_live/<timestamp>/` |
+| Search V3 stale/missing evidence detection | `scripts/search_v3_evidence_freshness_check.sh --strict --output tests/artifacts/search_v3_freshness/latest.json` | `tests/artifacts/search_v3_freshness/latest.json` |
 
 For any failing suite, validate forensic bundle structure:
 
@@ -540,6 +541,7 @@ e2e_validate_bundle_tree tests/artifacts
 | `search_v3_http` | `tests/artifacts/search_v3_http/<timestamp>/search_v3/summaries/suite_summary.json` |
 | `search_v3_resilience` | `tests/artifacts/search_v3_resilience/<timestamp>/search_v3/summaries/suite_summary.json` |
 | `search_v3_load_concurrency` | `tests/artifacts/search_v3_load_concurrency/<timestamp>/search_v3/summaries/suite_summary.json` |
+| `search_v3_freshness_check` | `tests/artifacts/search_v3_freshness/latest.json` |
 | `tui_wasm` | `tests/artifacts/tui_wasm/<timestamp>/diagnostics/wasm_scenarios.jsonl` |
 | `tui_interaction` | `tests/artifacts/tui_interaction/<timestamp>/diagnostics/pty_scenarios.jsonl` |
 | `tui_interactions` | `tests/artifacts/tui_interactions/<timestamp>/diagnostics/pty_scenarios.jsonl` |

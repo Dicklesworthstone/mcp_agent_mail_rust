@@ -381,17 +381,29 @@ The minimum steady-state guardrails to enforce operationally:
    ```bash
    am ci --quick --json --report tests/artifacts/ci/search_v3_weekly.json
    ```
-2. Run the Search V3 steady-state suite bundle:
+2. Run the native Search V3 weekly bundle runner:
+   ```bash
+   scripts/e2e_search_v3_weekly_bundle.sh --strict-freshness
+   ```
+   This executes:
    - `tests/e2e/test_search_v3_stdio.sh`
    - `tests/e2e/test_search_v3_http.sh`
    - `tests/e2e/test_search_v3_resilience.sh`
    - `tests/e2e/test_search_v3_load_concurrency.sh`
-3. Validate artifact bundle integrity:
+3. Inspect machine-readable rollup output:
+   - `tests/artifacts/search_v3_weekly/<timestamp>/rollup.json`
+   - `tests/artifacts/search_v3_weekly/<timestamp>/rollup.txt`
+4. Validate artifact bundle integrity:
    ```bash
    source scripts/e2e_lib.sh
    e2e_validate_bundle_tree tests/artifacts
    ```
-4. Compare this week’s latency/relevance artifacts against prior weekly baseline artifacts; open a follow-up bead if any guardrail regresses.
+5. Compare this week’s latency/relevance artifacts against prior weekly baseline artifacts; open a follow-up bead if any guardrail regresses.
+
+CI schedule:
+- GitHub Actions workflow: `.github/workflows/search-v3-weekly.yml`
+- Trigger: weekly cron + `workflow_dispatch`
+- Artifacts: `search-v3-weekly-artifacts`
 
 ### Post-Cutover Verification Windows
 
@@ -465,9 +477,34 @@ machine-readable artifacts so another operator can replay without prior context:
 | Error/reason codes and failing assertions | `${SEARCH_V3_RUN_DIR}/logs/summary.log` and suite `diagnostics/*.txt` files |
 | Artifact directory + bundle manifest | `tests/artifacts/search_v3_*/<timestamp>/bundle.json` |
 | Reproduction command + environment | `tests/artifacts/search_v3_*/<timestamp>/repro.txt` and `repro.env` |
+| Evidence freshness status (stale/missing paths + remediation) | `tests/artifacts/search_v3_freshness/latest.json` from `scripts/search_v3_evidence_freshness_check.sh` |
 
 If any field is missing, treat the run as non-actionable and re-run the suite before
 closing the incident or marking a verification window complete.
+
+### Evidence Freshness SLOs and Escalation
+
+`scripts/search_v3_evidence_freshness_check.sh` enforces freshness expectations for required
+Search V3 evidence files (`suite_summary.json`, `metrics.json`, `bundle.json`, `repro.txt`,
+`repro.env`) across the latest run in each `tests/artifacts/search_v3_*` suite root.
+
+| SLO Category | Suites / Artifact Roots | Max Age |
+|--------------|--------------------------|---------|
+| Daily snapshots | `search_v3_stdio`, `search_v3_http`, `search_v3_resilience` | 24h (`86400s`) |
+| Weekly suite bundle | `search_v3_load_concurrency` | 7d (`604800s`) |
+| Post-cutover checkpoints | `search_v3_shadow_parity` | 30d (`2592000s`) |
+
+Run checker (strict mode fails CI/automation when stale or missing evidence is detected):
+
+```bash
+scripts/search_v3_evidence_freshness_check.sh --strict \
+  --output tests/artifacts/search_v3_freshness/latest.json
+```
+
+Escalation policy when checker reports `alert`:
+1. Re-run the remediation command listed for each stale/missing suite.
+2. If the rerun still reports missing/stale evidence, page the Search V3 owner/on-call and open a bead with the failing paths and ages from `latest.json`.
+3. Do not mark weekly verification or incident follow-up as complete until the checker returns `summary.status = "pass"`.
 
 ---
 
@@ -504,13 +541,13 @@ Audit date: `2026-02-20`
 
 ### Residual Risks and Follow-Up Beads
 
-- `br-2tnl.8.7` (P2): automate weekly Search V3 steady-state bundle execution so evidence freshness is not manual-only.
-- `br-2tnl.8.8` (P2): enforce stale-artifact detection and evidence freshness alerts with explicit remediation output.
+- `br-2tnl.8.7` (P2) closed: weekly Search V3 bundle automation now runs via `scripts/e2e_search_v3_weekly_bundle.sh` and scheduled CI (`.github/workflows/search-v3-weekly.yml`).
+- `br-2tnl.8.8` (P2) closed: stale-artifact detection and evidence freshness alerts enforced via `scripts/search_v3_evidence_freshness_check.sh`.
 
 ### Sign-Off
 
 Search V3 rollout objectives are met with no critical regressions identified in current evidence.  
-Open follow-ups are operational hardening tasks, not blockers for Search V3 steady-state operation.
+Remaining risks are now execution hygiene (running the weekly workflow reliably and triaging freshness alerts quickly), not architecture or parity gaps.
 
 ---
 
