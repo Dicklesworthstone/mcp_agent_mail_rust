@@ -330,7 +330,7 @@ fn decode_agent_link_row(row: &SqlRow) -> std::result::Result<AgentLinkRow, DbEr
 
 const PROJECT_SELECT_ALL_SQL: &str =
     "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
-const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
+const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
      FROM file_reservations";
 const AGENT_LINK_SELECT_COLUMNS_SQL: &str = "SELECT id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts \
      FROM agent_links";
@@ -342,7 +342,9 @@ pub const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
     OR (typeof(released_ts) = 'text' \
       AND length(trim(released_ts)) > 0 \
       AND trim(released_ts) GLOB '*[0-9]*' \
-      AND trim(released_ts) NOT GLOB '*[^0-9.+-]*' \
+      AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(\
+            trim(released_ts),\
+            '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' \
       AND CAST(trim(released_ts) AS REAL) <= 0)";
 
 /// Decode `ProductRow` from raw SQL query result using positional (indexed) column access.
@@ -3521,7 +3523,7 @@ pub async fn create_file_reservations(
         "SELECT path_pattern FROM file_reservations \
          WHERE project_id = ? AND agent_id != ? \
            AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
-           AND exclusive = 1"
+           AND \"exclusive\" = 1"
     );
     let conflict_params = [
         Value::BigInt(project_id),
@@ -3743,7 +3745,7 @@ pub async fn renew_reservations(
 
     // Fetch candidate reservations first (so tools can report old/new expiry).
     let mut sql = format!(
-        "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
+        "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
          FROM file_reservations \
          WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
     );
@@ -3849,7 +3851,7 @@ pub async fn list_file_reservations(
         let now = now_micros();
         (
             format!(
-                "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? ORDER BY id"
+                "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? ORDER BY id"
             ),
             vec![Value::BigInt(project_id), Value::BigInt(now)],
         )
@@ -3858,7 +3860,7 @@ pub async fn list_file_reservations(
             // Legacy Python schema stored released_ts as TEXT (e.g. "2026-02-05 02:21:37.212634").
             // Coerce it to INTEGER microseconds so listing historical reservations can't crash.
             "SELECT \
-                 id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, \
+                 id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, \
                  CASE \
                      WHEN released_ts IS NULL THEN NULL \
                      WHEN typeof(released_ts) = 'text' THEN CAST(strftime('%s', released_ts) AS INTEGER) * 1000000 + \
@@ -3956,7 +3958,7 @@ pub async fn list_unreleased_file_reservations(
     let tracked = tracked(&*conn);
 
     let sql = format!(
-        "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id"
+        "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id"
     );
     let params = vec![Value::BigInt(project_id)];
 
@@ -4942,7 +4944,7 @@ pub async fn get_reservations_by_ids(
 
     let placeholders = placeholders(ids.len());
     let sql = format!(
-        "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, \
+        "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
                 created_ts, expires_ts, released_ts \
          FROM file_reservations \
          WHERE id IN ({placeholders})"

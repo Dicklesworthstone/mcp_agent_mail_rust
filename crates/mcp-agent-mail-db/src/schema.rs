@@ -227,7 +227,7 @@ PRAGMA journal_mode = WAL;
 /// and malformed-image scenarios when the server process is terminated abruptly.
 pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
-PRAGMA journal_mode = DELETE;
+PRAGMA journal_mode = 'DELETE';
 ";
 
 /// Per-connection PRAGMAs (safe to run on every new connection).

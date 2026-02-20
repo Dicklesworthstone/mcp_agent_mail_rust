@@ -4091,7 +4091,7 @@ fn handle_file_reservations_with_conn(
             all,
         } => {
             let sql = if active_only {
-                "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                         fr.expires_ts, fr.released_ts, a.name AS agent_name \
                  FROM file_reservations fr \
                  JOIN agents a ON a.id = fr.agent_id \
@@ -4099,7 +4099,7 @@ fn handle_file_reservations_with_conn(
                  WHERE p.slug = ? AND fr.released_ts IS NULL AND fr.expires_ts > ? \
                  ORDER BY fr.id"
             } else if all {
-                "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                         fr.expires_ts, fr.released_ts, a.name AS agent_name \
                  FROM file_reservations fr \
                  JOIN agents a ON a.id = fr.agent_id \
@@ -4108,7 +4108,7 @@ fn handle_file_reservations_with_conn(
                  ORDER BY fr.id"
             } else {
                 // Default: active (not released, not expired)
-                "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                         fr.expires_ts, fr.released_ts, a.name AS agent_name \
                  FROM file_reservations fr \
                  JOIN agents a ON a.id = fr.agent_id \
@@ -4157,7 +4157,7 @@ fn handle_file_reservations_with_conn(
             let limit = limit.unwrap_or(50);
             let rows = conn
                 .query_sync(
-                    "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                    "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                             fr.expires_ts, a.name AS agent_name \
                      FROM file_reservations fr \
                      JOIN agents a ON a.id = fr.agent_id \
@@ -4270,13 +4270,13 @@ fn handle_file_reservations_with_conn(
             for path in &paths {
                 let overlap_rows = conn
                     .query_sync(
-                        "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                        "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                                 fr.expires_ts, a.name AS agent_name \
                          FROM file_reservations fr \
                          JOIN agents a ON a.id = fr.agent_id \
                          WHERE fr.project_id = ? AND fr.released_ts IS NULL \
                            AND fr.expires_ts > ? AND fr.agent_id != ? \
-                           AND (fr.exclusive = 1 OR ? = 1) \
+                           AND (fr.\"exclusive\" = 1 OR ? = 1) \
                            AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
                                 OR ? GLOB fr.path_pattern)",
                         &[
@@ -4309,7 +4309,7 @@ fn handle_file_reservations_with_conn(
             for path in &paths {
                 conn.query_sync(
                     "INSERT INTO file_reservations \
-                     (project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts) \
+                     (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
                      VALUES (?, ?, ?, ?, ?, ?, ?)",
                     &[
                         sqlmodel_core::Value::BigInt(project_id),
@@ -4577,12 +4577,12 @@ fn handle_file_reservations_with_conn(
             for path in &paths {
                 let overlap_rows = conn
                     .query_sync(
-                        "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                        "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                                 fr.expires_ts, a.name AS agent_name \
                          FROM file_reservations fr \
                          JOIN agents a ON a.id = fr.agent_id \
                          WHERE fr.project_id = ? AND fr.released_ts IS NULL \
-                           AND fr.expires_ts > ? AND fr.exclusive = 1 \
+                           AND fr.expires_ts > ? AND fr.\"exclusive\" = 1 \
                            AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
                                 OR ? LIKE fr.path_pattern)",
                         &[
@@ -15002,7 +15002,7 @@ mod tests {
         let future_ts = now_us + 3_600_000_000; // 1 hour from now
         conn.execute_sync(
             "INSERT INTO file_reservations (\
-                id, project_id, agent_id, path_pattern, exclusive, reason, \
+                id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
                 created_ts, expires_ts, released_ts\
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
@@ -15791,7 +15791,7 @@ mod tests {
 
         conn.execute_sync(
             "INSERT INTO file_reservations (\
-                id, project_id, agent_id, path_pattern, exclusive, reason, \
+                id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
                 created_ts, expires_ts, released_ts\
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[

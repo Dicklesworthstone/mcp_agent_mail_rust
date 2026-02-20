@@ -595,7 +595,7 @@ impl MailExplorerScreen {
         conn: &DbConn,
         now: i64,
     ) -> Result<Vec<ReservationPressureCard>, String> {
-        let sql = "SELECT fr.path_pattern, fr.exclusive, fr.expires_ts, \
+        let sql = "SELECT fr.path_pattern, fr.\"exclusive\", fr.expires_ts, \
                    a.name AS agent_name, p.slug AS project_slug \
                    FROM file_reservations fr \
                    JOIN agents a ON a.id = fr.agent_id \

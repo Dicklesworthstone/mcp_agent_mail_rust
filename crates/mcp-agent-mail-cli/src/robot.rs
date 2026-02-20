@@ -924,7 +924,7 @@ fn build_status(
     // 5. My reservations (agent-specific)
     let my_reservations = if let Some((agent_id, _)) = &agent {
         conn.query_sync(
-            "SELECT path_pattern, exclusive, expires_ts FROM file_reservations
+            "SELECT path_pattern, \"exclusive\", expires_ts FROM file_reservations
              WHERE project_id = ? AND agent_id = ? AND released_ts IS NULL AND expires_ts > ?
              ORDER BY expires_ts ASC",
             &[
@@ -1845,7 +1845,7 @@ fn build_reservations(
     // Fetch all active reservations
     let all_rows = conn
         .query_sync(
-            "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.created_ts, fr.expires_ts,
+            "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.created_ts, fr.expires_ts,
                     a.name AS agent_name, a.id AS agent_id
              FROM file_reservations fr
              JOIN agents a ON a.id = fr.agent_id
@@ -2259,7 +2259,7 @@ fn build_analytics(
                AND fr1.agent_id != fr2.agent_id
              JOIN agents a1 ON a1.id = fr1.agent_id
              JOIN agents a2 ON a2.id = fr2.agent_id
-             WHERE fr1.project_id = ? AND fr1.exclusive = 1 AND fr2.exclusive = 1
+             WHERE fr1.project_id = ? AND fr1.\"exclusive\" = 1 AND fr2.\"exclusive\" = 1
                AND fr1.released_ts IS NULL AND fr2.released_ts IS NULL
                AND fr1.expires_ts > ? AND fr2.expires_ts > ?",
             &[
@@ -2674,7 +2674,7 @@ fn build_navigate(
 
             let rows = conn
                 .query_sync(
-                    "SELECT fr.path_pattern, a.name, fr.exclusive, fr.expires_ts, fr.released_ts
+                    "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, fr.released_ts
                      FROM file_reservations fr
                      JOIN agents a ON a.id = fr.agent_id
                      WHERE fr.project_id = ?

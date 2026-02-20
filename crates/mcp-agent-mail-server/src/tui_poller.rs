@@ -440,6 +440,91 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
     .unwrap_or_default()
 }
 
+/// Parse a raw timestamp value (integer or text) into microseconds.
+///
+/// Handles:
+/// - Integer/real → returned as-is (assumed microseconds)
+/// - Text containing only digits → parsed as integer microseconds
+/// - Text in `YYYY-MM-DD HH:MM:SS.ffffff` format → parsed via chrono-free manual conversion
+/// - Anything else → 0
+fn parse_raw_ts(row: &Row, col: &str) -> i64 {
+    match row.get_by_name(col) {
+        Some(Value::BigInt(v)) => *v,
+        Some(Value::Int(v)) => i64::from(*v),
+        Some(Value::Double(v)) => *v as i64,
+        Some(Value::Float(v)) => *v as i64,
+        Some(Value::Text(s)) => parse_text_timestamp(s),
+        _ => 0,
+    }
+}
+
+/// Convert a text timestamp to microseconds.
+///
+/// Recognises pure-numeric strings (microsecond integers stored as text) and
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]` datetime strings.
+fn parse_text_timestamp(s: &str) -> i64 {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0;
+    }
+    // Pure numeric string → microseconds
+    if let Ok(v) = s.parse::<i64>() {
+        return v;
+    }
+    // Try YYYY-MM-DD HH:MM:SS[.ffffff] format
+    // Split on space → date part + time part
+    let (date_part, time_part) = match s.split_once(' ') {
+        Some((d, t)) => (d, t),
+        None => return 0,
+    };
+    let date_parts: Vec<&str> = date_part.split('-').collect();
+    if date_parts.len() != 3 {
+        return 0;
+    }
+    let year: i64 = date_parts[0].parse().unwrap_or(0);
+    let month: i64 = date_parts[1].parse().unwrap_or(0);
+    let day: i64 = date_parts[2].parse().unwrap_or(0);
+    if year == 0 || month == 0 || day == 0 {
+        return 0;
+    }
+    // Parse time part: HH:MM:SS[.ffffff]
+    let (time_hms, frac_str) = match time_part.split_once('.') {
+        Some((hms, frac)) => (hms, frac),
+        None => (time_part, ""),
+    };
+    let time_parts: Vec<&str> = time_hms.split(':').collect();
+    if time_parts.len() != 3 {
+        return 0;
+    }
+    let hour: i64 = time_parts[0].parse().unwrap_or(0);
+    let min: i64 = time_parts[1].parse().unwrap_or(0);
+    let sec: i64 = time_parts[2].parse().unwrap_or(0);
+    // Fractional seconds → microseconds (pad/truncate to 6 digits)
+    let frac_micros: i64 = if frac_str.is_empty() {
+        0
+    } else {
+        let padded = format!("{:0<6}", &frac_str[..frac_str.len().min(6)]);
+        padded.parse().unwrap_or(0)
+    };
+    // Convert to unix timestamp using a simplified calculation
+    // (good enough for display timestamps, not a precise calendar)
+    let epoch_days = days_from_civil(year, month, day);
+    let unix_seconds = epoch_days * 86400 + hour * 3600 + min * 60 + sec;
+    unix_seconds * 1_000_000 + frac_micros
+}
+
+/// Days from civil date (year, month 1-12, day 1-31) to Unix epoch.
+/// Adapted from Howard Hinnant's `days_from_civil` algorithm.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
 /// Fetch active file reservations with project and agent names.
 ///
 /// This is reused by the reservations screen as a direct fallback when the
@@ -471,16 +556,12 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
     );
 
     let rows = match conn.query_sync(&sql, &[]) {
-        Ok(rows) => {
-            eprintln!("[DEBUG] fetch_reservation_snapshots OK: {} raw rows", rows.len());
-            rows
-        }
+        Ok(rows) => rows,
         Err(err) => {
             tracing::debug!(
                 error = ?err,
                 "tui_poller.fetch_reservation_snapshots query failed"
             );
-            eprintln!("[DEBUG] fetch_reservation_snapshots query error: {err:?}");
             return Vec::new();
         }
     };
