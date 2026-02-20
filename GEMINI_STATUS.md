@@ -19,7 +19,7 @@
 - [x] Fix `budget_deadline_is_relative_to_wall_now_not_absolute` test logic error in `mcp-agent-mail-server` to correctly use `saturating_duration_since`.
 - [x] Fix `handle_guard` in `mcp-agent-mail-cli` to correctly pass `prepush` flags to `install_guard`.
 - [x] Hardened `tui_ws_input` in `mcp-agent-mail-server` against DoS by truncating large key events.
-- [x] Improved `send_message` error clarity for empty broadcast results in `mcp-agent-mail-tools`.
+- [x] Disabled unsupported `broadcast` messaging in `mcp-agent-mail-tools` (returns error if used).
 - [x] Hardened `force_release_file_reservation` in `mcp-agent-mail-tools` by truncating large note payloads.
 
 ## Pending
