@@ -1287,9 +1287,10 @@ fn dispatch_compose_envelope(
         ],
     );
 
-    // 4. Get the inserted message ID.
+    // 4. Get the inserted message ID (MAX(id) since FrankenConnection
+    // does not support last_insert_rowid).
     let msg_id: i64 = conn
-        .query_sync("SELECT last_insert_rowid() AS id", &[])
+        .query_sync("SELECT MAX(id) AS id FROM messages", &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())
         .and_then(|row| row.get_named::<i64>("id").ok())

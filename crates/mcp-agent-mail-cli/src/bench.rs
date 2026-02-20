@@ -548,8 +548,9 @@ fn insert_message(
     )
     .map_err(|e| db_error("inserting benchmark message", e))?;
 
-    let message_id = conn
-        .query_sync("SELECT last_insert_rowid() AS id", &[])
+    // FrankenConnection does not support last_insert_rowid(); use MAX(id).
+    let message_id: i64 = conn
+        .query_sync("SELECT MAX(id) AS id FROM messages", &[])
         .map_err(|e| db_error("reading inserted benchmark message id", e))?
         .first()
         .and_then(|row| row.get_named("id").ok())
@@ -1686,12 +1687,12 @@ mod tests {
         assert_eq!(report.inserted_messages, BENCH_SEED_TOTAL_MESSAGES);
         assert!(report.elapsed_us >= 0);
 
+        // FrankenConnection: JOIN + COUNT(*) returns NULL; use IN subqueries.
         let blue_messages = count_with_params(
             &conn,
             "SELECT COUNT(*) AS count \
-             FROM messages m \
-             JOIN agents a ON a.id = m.sender_id \
-             WHERE m.project_id = ? AND a.name = ?",
+             FROM messages \
+             WHERE project_id = ? AND sender_id IN (SELECT id FROM agents WHERE name = ?)",
             &[
                 Value::BigInt(report.project_id),
                 Value::Text(BENCH_AGENT_BLUE.to_string()),
@@ -1700,9 +1701,8 @@ mod tests {
         let red_messages = count_with_params(
             &conn,
             "SELECT COUNT(*) AS count \
-             FROM messages m \
-             JOIN agents a ON a.id = m.sender_id \
-             WHERE m.project_id = ? AND a.name = ?",
+             FROM messages \
+             WHERE project_id = ? AND sender_id IN (SELECT id FROM agents WHERE name = ?)",
             &[
                 Value::BigInt(report.project_id),
                 Value::Text(BENCH_AGENT_RED.to_string()),
@@ -1711,9 +1711,8 @@ mod tests {
         let recipient_rows = count_with_params(
             &conn,
             "SELECT COUNT(*) AS count \
-             FROM message_recipients mr \
-             JOIN messages m ON m.id = mr.message_id \
-             WHERE m.project_id = ?",
+             FROM message_recipients \
+             WHERE message_id IN (SELECT id FROM messages WHERE project_id = ?)",
             &[Value::BigInt(report.project_id)],
         );
 

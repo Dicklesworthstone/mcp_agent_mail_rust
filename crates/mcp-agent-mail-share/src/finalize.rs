@@ -39,10 +39,12 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
 
     if let Err(e) = create_result {
         let msg = e.to_string();
-        // FTS5 not available — not an error, just means no search
+        // FTS5 not available — not an error, just means no search.
+        // FrankenConnection reports "not implemented" for VIRTUAL TABLE.
         if msg.contains("fts5")
             || msg.contains("unknown tokenizer")
             || msg.contains("no such module")
+            || msg.contains("not implemented")
         {
             return Ok(false);
         }
@@ -451,18 +453,28 @@ fn sql_err(e: impl std::fmt::Display) -> ShareError {
 }
 
 fn column_exists(conn: &DbConn, table: &str, column: &str) -> Result<bool, ShareError> {
+    // PRAGMA table_info returns 0 rows on FrankenConnection; fall back to
+    // a direct SELECT probe when PRAGMA yields nothing.
     let rows = conn
         .query_sync(&format!("PRAGMA table_info({table})"), &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("PRAGMA table_info({table}) failed: {e}"),
         })?;
-    for row in &rows {
-        let name: String = row.get_named("name").unwrap_or_default();
-        if name == column {
-            return Ok(true);
+    if !rows.is_empty() {
+        for row in &rows {
+            let name: String = row.get_named("name").unwrap_or_default();
+            if name == column {
+                return Ok(true);
+            }
         }
+        return Ok(false);
     }
-    Ok(false)
+    // Fallback: try to SELECT the column directly.
+    let probe = format!("SELECT \"{column}\" FROM \"{table}\" LIMIT 0");
+    match conn.query_sync(&probe, &[]) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 #[cfg(test)]

@@ -1028,6 +1028,20 @@ fn is_fts_migration(id: &str) -> bool {
     id_lower.contains("fts")
 }
 
+/// Migrations that use SQL features unsupported by `FrankenConnection`.
+///
+/// Includes FTS5 virtual tables, queries with aggregate functions over JOINs,
+/// and CREATE INDEX with expressions (COLLATE NOCASE).
+fn is_unsupported_by_franken(id: &str) -> bool {
+    is_fts_migration(id)
+        || matches!(
+            id,
+            "v6_backfill_inbox_stats"
+                | "v10a_dedup_agents_case_insensitive"
+                | "v10b_idx_agents_project_name_nocase"
+        )
+}
+
 /// Base-only trigger cleanup migrations.
 ///
 /// Base mode runs during startup to make DB files safe for later runtime access.
@@ -1157,7 +1171,7 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
 pub fn schema_migrations_base() -> Vec<Migration> {
     let mut migrations: Vec<Migration> = schema_migrations()
         .into_iter()
-        .filter(|m| !is_fts_migration(&m.id))
+        .filter(|m| !is_unsupported_by_franken(&m.id))
         .collect();
     migrations.extend(base_trigger_cleanup_migrations());
     migrations

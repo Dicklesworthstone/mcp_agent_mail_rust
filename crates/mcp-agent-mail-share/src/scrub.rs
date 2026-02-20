@@ -478,16 +478,14 @@ fn exec_count(conn: &Conn, sql: &str, params: &[SqlValue]) -> Result<i64, ShareE
     Ok(i64::try_from(n).unwrap_or(0))
 }
 
+/// Check if a table exists. Uses a direct SELECT probe because
+/// FrankenConnection does not support sqlite_master queries.
 fn table_exists(conn: &Conn, name: &str) -> Result<bool, ShareError> {
-    let rows = conn
-        .query_sync(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            &[SqlValue::Text(name.to_string())],
-        )
-        .map_err(|e| ShareError::Sqlite {
-            message: format!("table_exists check failed: {e}"),
-        })?;
-    Ok(!rows.is_empty())
+    let probe = format!("SELECT 1 FROM \"{name}\" LIMIT 0");
+    match conn.query_sync(&probe, &[]) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 #[cfg(test)]

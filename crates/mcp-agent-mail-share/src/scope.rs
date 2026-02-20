@@ -298,16 +298,14 @@ fn build_placeholders(n: usize) -> String {
 }
 
 /// Check if a table exists in the database.
+/// Uses a direct SELECT probe because FrankenConnection does not
+/// support sqlite_master queries.
 fn table_exists(conn: &Conn, name: &str) -> Result<bool, ShareError> {
-    let rows = conn
-        .query_sync(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            &[Value::Text(name.to_string())],
-        )
-        .map_err(|e| ShareError::Sqlite {
-            message: format!("table_exists check failed: {e}"),
-        })?;
-    Ok(!rows.is_empty())
+    let probe = format!("SELECT 1 FROM \"{name}\" LIMIT 0");
+    match conn.query_sync(&probe, &[]) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Execute a statement with parameters, mapping errors to [`ShareError`].

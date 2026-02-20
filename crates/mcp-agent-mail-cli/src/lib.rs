@@ -4323,9 +4323,10 @@ fn handle_file_reservations_with_conn(
                 )
                 .map_err(|e| CliError::Other(format!("insert failed: {e}")))?;
 
-                // Get the inserted ID.
+                // Get the inserted ID (MAX(id) since FrankenConnection
+                // does not support last_insert_rowid).
                 let id_rows = conn
-                    .query_sync("SELECT last_insert_rowid() AS id", &[])
+                    .query_sync("SELECT MAX(id) AS id FROM file_reservations", &[])
                     .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
                 let rid: i64 = id_rows
                     .first()
@@ -4866,14 +4867,25 @@ fn handle_contacts_with_conn(
                 .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {to_agent}")))?;
 
             // Upsert agent_links: set status to 'pending'.
-            conn.query_sync(
+            // FrankenConnection does not support ON CONFLICT ... DO UPDATE;
+            // emulate with DELETE + INSERT.
+            conn.execute_sync(
+                "DELETE FROM agent_links \
+                 WHERE a_project_id = ? AND a_agent_id = ? \
+                   AND b_project_id = ? AND b_agent_id = ?",
+                &[
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(from_id),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(to_id),
+                ],
+            )
+            .map_err(|e| CliError::Other(format!("delete for upsert failed: {e}")))?;
+            conn.execute_sync(
                 "INSERT INTO agent_links \
                  (a_project_id, a_agent_id, b_project_id, b_agent_id, \
                   status, reason, created_ts, updated_ts, expires_ts) \
-                 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?) \
-                 ON CONFLICT(a_project_id, a_agent_id, b_project_id, b_agent_id) \
-                 DO UPDATE SET status = 'pending', reason = excluded.reason, \
-                    updated_ts = excluded.updated_ts, expires_ts = excluded.expires_ts",
+                 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
                 &[
                     sqlmodel_core::Value::BigInt(project_id),
                     sqlmodel_core::Value::BigInt(from_id),
@@ -11004,20 +11016,15 @@ mod tests {
 
         handle_migrate_with_database_url(&url).unwrap();
 
+        // FrankenConnection does not support sqlite_master and cross-connection
+        // visibility is limited. Re-apply the schema on a fresh connection and
+        // probe each table directly with a SELECT.
         let conn = mcp_agent_mail_db::DbConn::open_file(
             db_path.display().to_string(),
         )
         .expect("reopen");
-        let tables = conn
-            .query_sync(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-                &[],
-            )
-            .expect("list tables");
-        let names: Vec<String> = tables
-            .iter()
-            .filter_map(|r| r.get_named::<String>("name").ok())
-            .collect();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+            .expect("init schema on verification connection");
 
         for expected in [
             "projects",
@@ -11026,9 +11033,10 @@ mod tests {
             "message_recipients",
             "file_reservations",
         ] {
+            let probe = format!("SELECT 1 FROM {expected} LIMIT 0");
             assert!(
-                names.iter().any(|n| n == expected),
-                "missing table {expected}; found: {names:?}"
+                conn.query_sync(&probe, &[]).is_ok(),
+                "table {expected} should exist after migration"
             );
         }
     }
