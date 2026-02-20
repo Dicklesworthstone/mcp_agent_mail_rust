@@ -2398,18 +2398,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let env_path = tmp.path().join("config.env");
         // Initial value is quoted and contains a hash
-        std::fs::write(
-            &env_path,
-            "SECRET=\"password # with hash\"\nOTHER=1\n",
-        )
-        .expect("write envfile");
+        std::fs::write(&env_path, "SECRET=\"password # with hash\"\nOTHER=1\n")
+            .expect("write envfile");
 
         let mut updates: HashMap<&str, String> = HashMap::new();
         updates.insert("SECRET", "\"new_value\"".to_string());
 
         update_envfile(&env_path, &updates).expect("update envfile");
         let content = std::fs::read_to_string(&env_path).expect("read envfile");
-        
+
         // If extract_inline_comment is broken, it will strip " # with hash" and append it as a comment
         // Resulting in: SECRET="new_value" # with hash
         // But the original intention was likely that " # with hash" was PART of the value.
@@ -2417,10 +2414,13 @@ mod tests {
         // The issue is whether " # with hash" is considered a comment on the line or part of the value.
         // In .env syntax, comments start with #. But inside quotes, they are literal.
         // The current implementation treats it as a comment even inside quotes.
-        
+
         // Let's assert what we expect. Correct behavior is that " # with hash" was part of the value,
         // so it should NOT be preserved as a comment on the new line.
-        assert!(!content.contains("# with hash"), "Inline comment extractor incorrectly identified quoted hash as comment");
+        assert!(
+            !content.contains("# with hash"),
+            "Inline comment extractor incorrectly identified quoted hash as comment"
+        );
         assert!(content.contains("SECRET=\"new_value\""));
     }
 
