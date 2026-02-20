@@ -513,7 +513,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
                 name: "integrity",
                 problem: format!("SQLite corruption detected: {message}"),
                 fix: format!(
-                    "Back up the database, then try VACUUM INTO to recover. Details: {detail_str}"
+                    "Back up the database, run PRAGMA wal_checkpoint(TRUNCATE) + VACUUM, then copy and re-check integrity. Details: {detail_str}"
                 ),
             })
         }

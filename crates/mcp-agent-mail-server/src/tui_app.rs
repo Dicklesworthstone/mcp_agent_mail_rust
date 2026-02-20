@@ -986,6 +986,10 @@ pub struct MailAppModel {
     ambient_renderer: RefCell<AmbientEffectRenderer>,
     ambient_mode: AmbientMode,
     ambient_last_telemetry: Cell<AmbientRenderTelemetry>,
+    /// Tick index of the most recent ambient render in `view()`.
+    ambient_last_render_tick: Cell<Option<u64>>,
+    /// Total ambient render invocations for regression diagnostics.
+    ambient_render_invocations: Cell<u64>,
     hint_ranker: HintRanker,
     palette_hint_ids: HashMap<String, usize>,
     palette_usage_path: Option<PathBuf>,
@@ -1107,6 +1111,8 @@ impl MailAppModel {
             ambient_renderer: RefCell::new(AmbientEffectRenderer::new()),
             ambient_mode: AmbientMode::Subtle,
             ambient_last_telemetry: Cell::new(AmbientRenderTelemetry::default()),
+            ambient_last_render_tick: Cell::new(None),
+            ambient_render_invocations: Cell::new(0),
             hint_ranker,
             palette_hint_ids,
             palette_usage_path: None,
@@ -2078,13 +2084,11 @@ impl MailAppModel {
 
     const fn named_config_for_theme_id(theme_id: ThemeId) -> &'static str {
         match theme_id {
-            ThemeId::CyberpunkAurora => "default",
+            ThemeId::CyberpunkAurora | ThemeId::Doom | ThemeId::Quake => "default",
             ThemeId::Darcula => "dracula",
             ThemeId::LumenLight => "solarized",
             ThemeId::NordicFrost => "nord",
             ThemeId::HighContrast => "gruvbox",
-            ThemeId::Doom => "default",
-            ThemeId::Quake => "default",
         }
     }
 
@@ -3752,7 +3756,8 @@ impl Model for MailAppModel {
         // positive when on schedule and drops toward 0 only when frames are
         // arriving significantly late (2× the expected interval or more).
         //
-        // Note: TICK_INTERVAL is set to 16ms (60fps) to ensure smooth animations
+        // Note: TICK_INTERVAL is set to 33ms (~30fps) to reduce terminal write
+        // pressure while keeping interactions smooth.
         // and responsive input handling. The Bayesian diff strategy uses this
         // budget to decide whether to skip frames under load.
         let tick_budget_ms = TICK_INTERVAL.as_secs_f64() * 1000.0;
@@ -3807,10 +3812,11 @@ impl Model for MailAppModel {
         // frame.  By only re-rendering every 6th frame the ambient animation
         // runs at ~5 fps which is imperceptibly smooth for a subtle background
         // wash while keeping terminal output minimal on intervening frames.
-        if self
+        let should_render_ambient = self
             .tick_count
             .is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES)
-        {
+            && self.ambient_last_render_tick.get() != Some(self.tick_count);
+        if should_render_ambient {
             let ambient_telemetry = self.ambient_renderer.borrow_mut().render(
                 area,
                 frame,
@@ -3819,6 +3825,9 @@ impl Model for MailAppModel {
                 self.state.uptime().as_secs_f64(),
             );
             self.ambient_last_telemetry.set(ambient_telemetry);
+            self.ambient_last_render_tick.set(Some(self.tick_count));
+            self.ambient_render_invocations
+                .set(self.ambient_render_invocations.get().saturating_add(1));
         }
         let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();
@@ -6136,6 +6145,48 @@ mod tests {
         assert_eq!(
             telemetry.effect,
             crate::tui_widgets::AmbientEffectKind::None
+        );
+    }
+
+    #[test]
+    fn ambient_render_throttles_to_once_per_tick_bucket() {
+        let mut model = test_model();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+
+        for _ in 0..AMBIENT_RENDER_EVERY_N_FRAMES {
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+        }
+        assert!(model.tick_count.is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES));
+
+        model.view(&mut frame);
+        let first_count = model.ambient_render_invocations.get();
+        assert!(first_count >= 1, "ambient renderer should run on bucket tick");
+        assert_eq!(model.ambient_last_render_tick.get(), Some(model.tick_count));
+
+        model.view(&mut frame);
+        assert_eq!(
+            model.ambient_render_invocations.get(),
+            first_count,
+            "ambient renderer must not run multiple times in one tick bucket"
+        );
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        model.view(&mut frame);
+        assert_eq!(
+            model.ambient_render_invocations.get(),
+            first_count,
+            "non-bucket tick should skip ambient rendering"
+        );
+
+        for _ in 1..AMBIENT_RENDER_EVERY_N_FRAMES {
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+        }
+        model.view(&mut frame);
+        assert_eq!(
+            model.ambient_render_invocations.get(),
+            first_count + 1,
+            "next bucket tick should render ambient exactly once"
         );
     }
 

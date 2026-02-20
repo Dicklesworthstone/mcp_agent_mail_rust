@@ -13,7 +13,7 @@
 
 use mcp_agent_mail_core::{Config, kpi_record_sample};
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::now_micros;
 use mcp_agent_mail_tools::{
@@ -177,7 +177,7 @@ fn metrics_loop(config: &Config) {
     }
 }
 
-fn open_metrics_connection(database_url: &str) -> Option<SqliteConnection> {
+fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return None;
     }
@@ -186,12 +186,12 @@ fn open_metrics_connection(database_url: &str) -> Option<SqliteConnection> {
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
-    let conn = SqliteConnection::open_file(&path).ok()?;
+    let conn = DbConn::open_file(&path).ok()?;
     let _ = conn.execute_raw("PRAGMA busy_timeout = 60000;");
     Some(conn)
 }
 
-fn ensure_metrics_schema(conn: &SqliteConnection) {
+fn ensure_metrics_schema(conn: &DbConn) {
     let _ = conn.execute_sync(
         "CREATE TABLE IF NOT EXISTS tool_metrics_snapshots (\
              id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -234,7 +234,7 @@ const fn i64_from_u64_saturating(value: u64) -> i64 {
 }
 
 fn persist_snapshot_rows(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     collected_ts: i64,
     snapshot: &[MetricsSnapshotEntry],
 ) -> Result<(), String> {
@@ -279,7 +279,7 @@ fn persist_snapshot_rows(
     Ok(())
 }
 
-fn prune_old_snapshot_rows(conn: &SqliteConnection, collected_ts: i64) {
+fn prune_old_snapshot_rows(conn: &DbConn, collected_ts: i64) {
     let cutoff = collected_ts.saturating_sub(METRICS_RETENTION_DAYS * 86_400_000_000);
     let _ = conn.execute_sync(
         "DELETE FROM tool_metrics_snapshots WHERE collected_ts < ?",
@@ -658,6 +658,7 @@ mod tests {
 
         let snapshot = tool_metrics_snapshot();
         persist_snapshot_rows(&conn, now_micros(), &snapshot).expect("persist snapshot");
+        drop(conn);
 
         let rows = load_latest_persisted_metrics(&database_url, 50);
         let row = rows
@@ -753,14 +754,27 @@ mod tests {
         let old_ts = now_micros() - 86_400_000_000 * (METRICS_RETENTION_DAYS + 1);
         persist_snapshot_rows(&conn, old_ts, &snapshot).expect("persist old");
 
-        let before = persisted_metric_store_size(&database_url);
-        assert!(before >= 1);
+        // Verify via the same connection to avoid cross-connection visibility issues.
+        let before = conn
+            .query_sync("SELECT COUNT(*) AS c FROM tool_metrics_snapshots", &[])
+            .expect("count query")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or(0);
+        assert!(before >= 1, "expected at least 1 row, got {before}");
 
         // Prune with current timestamp
         prune_old_snapshot_rows(&conn, now_micros());
 
-        let after = persisted_metric_store_size(&database_url);
-        assert!(after < before, "old rows should have been pruned");
+        let after = conn
+            .query_sync("SELECT COUNT(*) AS c FROM tool_metrics_snapshots", &[])
+            .expect("count query")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or(0);
+        assert!(after < before, "old rows should have been pruned: before={before}, after={after}");
     }
 
     #[test]
@@ -798,6 +812,7 @@ mod tests {
         }
         let snapshot = tool_metrics_snapshot();
         persist_snapshot_rows(&conn, now_micros(), &snapshot).expect("persist");
+        drop(conn);
 
         let limited = load_latest_persisted_metrics(&database_url, 2);
         assert!(
@@ -822,6 +837,10 @@ mod tests {
         record_latency("health_check", 10_000);
         let snapshot = tool_metrics_snapshot();
         persist_snapshot_rows(&conn, now_micros(), &snapshot).expect("persist snapshot");
+
+        // Drop the writer connection so FrankenConnection flushes data to disk
+        // before a second connection reads it.
+        drop(conn);
 
         let count = persisted_metric_store_size(&database_url);
         assert!(count >= 1);

@@ -333,14 +333,8 @@ mod tests {
     }
 
     fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
-        // NOTE: These tests are currently blocked by a FrankenSQLite limitation.
-        // FrankenConnection cannot properly read schemas created by SqliteConnection,
-        // and it doesn't support querying sqlite_master. This is being tracked and
-        // fixed in the sqlmodel_rust/frankensqlite projects.
-        //
-        // The pool with run_migrations: true works in production because the pool
-        // init gate uses SqliteConnection for migrations, but FrankenConnection
-        // still cannot read the resulting schema reliably in test contexts.
+        // Use the standard pool setup to mirror production initialization
+        // semantics under FrankenSQLite.
         let db_path = tmp.path().join("db.sqlite3");
         let db_url = format!(
             "sqlite:////{}",

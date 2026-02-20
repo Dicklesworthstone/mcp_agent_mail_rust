@@ -94,9 +94,9 @@ impl<'a> DbStatQueryBatcher<'a> {
              (SELECT COUNT(*) FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})) \
                AS reservations_count, \
              (SELECT COUNT(*) FROM agent_links) AS contacts_count, \
-             (SELECT COUNT(*) FROM message_recipients mr \
-                JOIN messages m ON m.id = mr.message_id \
-               WHERE m.ack_required = 1 AND mr.ack_ts IS NULL) AS ack_pending_count"
+             (SELECT COUNT(*) FROM message_recipients \
+               WHERE ack_ts IS NULL \
+                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)) AS ack_pending_count"
         );
         let batched = self
             .conn
@@ -147,9 +147,9 @@ impl<'a> DbStatQueryBatcher<'a> {
                 .unwrap_or(0),
             ack_pending: self
                 .run_count_query(
-                    "SELECT COUNT(*) AS c FROM message_recipients mr \
-                     JOIN messages m ON m.id = mr.message_id \
-                     WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
+                    "SELECT COUNT(*) AS c FROM message_recipients \
+                     WHERE ack_ts IS NULL \
+                       AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)",
                 )
                 .unwrap_or(0),
         }
@@ -438,13 +438,16 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 /// background poller snapshot is unavailable or stale.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
+    // Use a subquery to pre-filter active reservations so the complex
+    // ACTIVE_RESERVATION_PREDICATE runs in a simple context (FrankenConnection
+    // evaluates it incorrectly when combined with CASE/WHEN in the SELECT).
     let sql = format!(
         "SELECT \
            fr.id, \
            COALESCE(p.slug, '[unknown-project]') AS project_slug, \
            COALESCE(a.name, '[unknown-agent]') AS agent_name, \
            fr.path_pattern, \
-           fr.exclusive, \
+           fr.\"exclusive\", \
            CASE \
              WHEN fr.created_ts IS NULL THEN 0 \
              WHEN typeof(fr.created_ts) IN ('integer', 'real') THEN CAST(fr.created_ts AS INTEGER) \
@@ -480,18 +483,22 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
          FROM file_reservations fr \
          LEFT JOIN projects p ON p.id = fr.project_id \
          LEFT JOIN agents a ON a.id = fr.agent_id \
-         WHERE ({ACTIVE_RESERVATION_PREDICATE}) \
+         WHERE fr.id IN (SELECT id FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})) \
          ORDER BY expires_ts_micros ASC \
          LIMIT {MAX_RESERVATIONS}"
     );
 
     let rows = match conn.query_sync(&sql, &[]) {
-        Ok(rows) => rows,
+        Ok(rows) => {
+            eprintln!("[DEBUG] fetch_reservation_snapshots OK: {} raw rows", rows.len());
+            rows
+        }
         Err(err) => {
             tracing::debug!(
                 error = ?err,
                 "tui_poller.fetch_reservation_snapshots query failed"
             );
+            eprintln!("[DEBUG] fetch_reservation_snapshots query error: {err:?}");
             return Vec::new();
         }
     };

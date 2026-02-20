@@ -1609,7 +1609,7 @@ impl TimelineRow {
 }
 
 impl RenderItem for TimelineRow {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
         use ftui::widgets::Widget;
 
         if area.height == 0 || area.width < 10 {
@@ -1792,7 +1792,7 @@ pub struct MessageRow {
 }
 
 impl RenderItem for MessageRow {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
         use ftui::widgets::Widget;
 
         if area.height == 0 || area.width < 20 {
@@ -1860,7 +1860,7 @@ pub struct SearchHitRow {
 }
 
 impl RenderItem for SearchHitRow {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
         use ftui::widgets::Widget;
 
         if area.height == 0 || area.width < 20 {
@@ -1919,7 +1919,7 @@ pub struct ExplorerRow {
 }
 
 impl RenderItem for ExplorerRow {
-    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
         use ftui::widgets::Widget;
 
         if area.height == 0 || area.width < 20 {
