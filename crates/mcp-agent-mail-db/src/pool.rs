@@ -343,8 +343,8 @@ impl DbPool {
                         )));
                     }
 
-                    // For file-backed DBs, run DB-wide init (journal mode, migrations) with
-                    // C-backed SqliteConnection BEFORE opening FrankenConnection.
+                    // For file-backed DBs, run DB-wide init (journal mode, migrations) once
+                    // before opening pooled connections.
                     // Run one-time DB initialization (schema + migrations) via a separate
                     // connection to ensure atomic setup before pool connections open.
                     if sqlite_path != ":memory:" {
@@ -356,19 +356,14 @@ impl DbPool {
                                 let cx2 = cx2.clone();
                                 let sqlite_path = sqlite_path.clone();
                                 async move {
-                                    // Use C-backed SqliteConnection for DB-wide init.
-                                    //
-                                    // DbConn = FrankenConnection, but schema migrations and
-                                    // integrity PRAGMAs require C SQLite for trigger execution
-                                    // and PRAGMA support.
+                                    // Use DbConn for DB-wide init.
                                     if let Err(e) =
                                         ensure_sqlite_file_healthy(Path::new(&sqlite_path))
                                     {
                                         return Err(Outcome::Err(e));
                                     }
-                                    let mig_conn =
-                                        sqlmodel_sqlite::SqliteConnection::open_file(&sqlite_path)
-                                            .map_err(Outcome::<(), SqlError>::Err)?;
+                                    let mig_conn = DbConn::open_file(&sqlite_path)
+                                        .map_err(Outcome::<(), SqlError>::Err)?;
 
                                     if let Err(e) =
                                         mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
@@ -376,7 +371,8 @@ impl DbPool {
                                         return Err(Outcome::Err(e));
                                     }
                                     if run_migrations {
-                                        match schema::migrate_to_latest(&cx2, &mig_conn).await {
+                                        match schema::migrate_to_latest_base(&cx2, &mig_conn).await
+                                        {
                                             Outcome::Ok(_) => {}
                                             Outcome::Err(e) => return Err(Outcome::Err(e)),
                                             Outcome::Cancelled(r) => {
@@ -506,9 +502,7 @@ impl DbPool {
             });
         }
 
-        // Use C-backed SqliteConnection for integrity PRAGMAs (FrankenConnection
-        // does not implement PRAGMA quick_check / integrity_check).
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
+        let conn = DbConn::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("startup integrity check: open failed: {e}")))?;
 
         match integrity::quick_check(&conn) {
@@ -526,7 +520,7 @@ impl DbPool {
                 }
 
                 // Re-open and re-verify
-                let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
+                let conn = DbConn::open_file(&self.sqlite_path)
                     .map_err(|e| {
                         DbError::Sqlite(format!(
                             "startup integrity check (post-recovery): open failed: {e}"
@@ -561,8 +555,7 @@ impl DbPool {
             });
         }
 
-        // Use C-backed SqliteConnection for integrity PRAGMAs.
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
+        let conn = DbConn::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("full integrity check: open failed: {e}")))?;
 
         integrity::full_check(&conn)
@@ -649,8 +642,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
         }
-        // Use C-backed SqliteConnection for WAL checkpoint PRAGMAs.
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
+        let conn = DbConn::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
 
         // Apply busy_timeout so the checkpoint waits for active readers/writers.
@@ -710,7 +702,7 @@ fn is_corruption_error_message(message: &str) -> bool {
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_quick_check_is_ok(conn: &sqlmodel_sqlite::SqliteConnection) -> Result<bool, SqlError> {
+fn sqlite_quick_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
     let rows = conn.query_sync("PRAGMA quick_check", &[])?;
     let mut details: Vec<String> = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -735,7 +727,7 @@ fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
         return Ok(true);
     }
     let path_str = path.to_string_lossy();
-    let conn = match sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref()) {
+    let conn = match DbConn::open_file(path_str.as_ref()) {
         Ok(conn) => conn,
         Err(e) => {
             if is_corruption_error_message(&e.to_string()) {
@@ -1361,7 +1353,7 @@ mod tests {
 
     fn sqlite_marker_value(path: &Path) -> Option<String> {
         let path_str = path.to_string_lossy();
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref()).ok()?;
+        let conn = DbConn::open_file(path_str.as_ref()).ok()?;
         conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT NOT NULL)")
             .ok()?;
         let rows = conn
@@ -1394,8 +1386,7 @@ mod tests {
         let primary = dir.path().join("storage.sqlite3");
         let backup = dir.path().join("storage.sqlite3.bak");
         let primary_str = primary.to_string_lossy();
-        let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(primary_str.as_ref()).expect("open db");
+        let conn = DbConn::open_file(primary_str.as_ref()).expect("open db");
         conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
             .expect("create marker table");
         conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
@@ -1466,8 +1457,7 @@ mod tests {
         drop(pool);
 
         // Verify FTS tables are dropped after pool startup (Tantivy handles search)
-        let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(db_path_str).expect("reopen sqlite db");
+        let conn = DbConn::open_file(db_path_str).expect("reopen sqlite db");
         let fts_rows = conn
             .query_sync(
                 "SELECT COUNT(*) AS n FROM sqlite_master \
@@ -1830,7 +1820,7 @@ mod tests {
         drop(pool);
 
         // Verify identity FTS artifacts are removed after pool startup.
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(parsed_path).expect("reopen db");
+        let conn = DbConn::open_file(parsed_path).expect("reopen db");
         let identity_fts_rows = conn
             .query_sync(
                 "SELECT COUNT(*) AS n FROM sqlite_master \
@@ -1921,7 +1911,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("valid.db");
         let path_str = path.to_string_lossy();
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref()).expect("open");
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
         conn.execute_raw("CREATE TABLE t (x INTEGER)")
             .expect("create");
         drop(conn);
@@ -1934,7 +1924,7 @@ mod tests {
         let absolute_dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = absolute_dir.path().join("storage.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&absolute_db_str).expect("open");
+        let conn = DbConn::open_file(&absolute_db_str).expect("open");
         conn.execute_raw("CREATE TABLE t (x INTEGER)")
             .expect("create");
         drop(conn);
@@ -1960,7 +1950,7 @@ mod tests {
         let absolute_dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = absolute_dir.path().join("storage.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&absolute_db_str).expect("open");
+        let conn = DbConn::open_file(&absolute_db_str).expect("open");
         conn.execute_raw("CREATE TABLE t (x INTEGER)")
             .expect("create");
         drop(conn);

@@ -8,10 +8,10 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_db::pool::{DbPool, DbPoolConfig};
 use mcp_agent_mail_db::schema;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use tempfile::tempdir;
 
-fn count_fts_artifacts(conn: &SqliteConnection) -> i64 {
+fn count_fts_artifacts(conn: &DbConn) -> i64 {
     let rows = conn
         .query_sync(
             "SELECT COUNT(*) AS n FROM sqlite_master \
@@ -33,7 +33,7 @@ fn count_fts_artifacts(conn: &SqliteConnection) -> i64 {
 fn v11_migration_drops_all_fts_artifacts() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("v11_fts_cleanup.db");
-    let conn = SqliteConnection::open_file(db_path.display().to_string()).expect("open fixture db");
+    let conn = DbConn::open_file(db_path.display().to_string()).expect("open fixture db");
     conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
         .expect("apply init pragmas");
 
@@ -59,7 +59,7 @@ fn v11_migration_drops_all_fts_artifacts() {
 fn base_mode_cleanup_is_safe_on_clean_db() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("base_mode_clean.db");
-    let conn = SqliteConnection::open_file(db_path.display().to_string()).expect("open fixture db");
+    let conn = DbConn::open_file(db_path.display().to_string()).expect("open fixture db");
     conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
         .expect("apply init pragmas");
 
@@ -103,7 +103,7 @@ fn pool_startup_produces_clean_fts_state() {
     let parsed_path = config
         .sqlite_path()
         .expect("parse sqlite path from database_url");
-    let conn = SqliteConnection::open_file(parsed_path).expect("reopen db");
+    let conn = DbConn::open_file(parsed_path).expect("reopen db");
     assert_eq!(
         count_fts_artifacts(&conn),
         0,

@@ -5324,7 +5324,7 @@ mod tests {
         let db_path = dir.path().join(db_name);
 
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -5724,7 +5724,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("register_then_get_agent.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -5792,7 +5792,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("register_agent_preserve_task_desc.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -5874,7 +5874,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("create_agent_duplicate_error.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -5955,7 +5955,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("ensure_project_and_lookups.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -6013,7 +6013,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("set_policy_by_name_lookup.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -6658,7 +6658,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("like_fallback_100_terms.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -6755,7 +6755,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("like_fallback_union.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -6845,7 +6845,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("empty_corpus_search.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -6894,7 +6894,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("empty_corpus_product_search.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -6957,7 +6957,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("product_search_across_projects.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -7174,7 +7174,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("global_inbox_empty.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -7224,7 +7224,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("global_unread_empty.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -7273,7 +7273,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("global_search_empty.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -7322,7 +7322,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("global_search_empty_q.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open base schema connection");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -7367,7 +7367,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("no_reindex_regression.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
@@ -7481,7 +7481,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("no_reindex_ops.db");
         let init_conn =
-            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            crate::DbConn::open_file(db_path.display().to_string())
                 .expect("open");
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)

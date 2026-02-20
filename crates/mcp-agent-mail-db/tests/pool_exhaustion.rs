@@ -61,7 +61,7 @@ fn make_pool(min: usize, max: usize) -> (DbPool, tempfile::TempDir) {
 }
 
 /// Helper to unwrap a pool acquire Outcome, panicking on non-Ok variants.
-/// Needed because `PooledConnection<SqliteConnection>` does not implement Debug.
+/// Needed because `PooledConnection<DbConn>` does not implement Debug.
 macro_rules! unwrap_acquire {
     ($outcome:expr, $msg:expr) => {
         match $outcome {

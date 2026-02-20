@@ -3,9 +3,9 @@
 //! Creates all tables, indexes, and FTS5 virtual tables.
 
 use asupersync::{Cx, Outcome};
+use crate::DbConn;
 use sqlmodel_core::{Connection, Error as SqlError};
 use sqlmodel_schema::{Migration, MigrationRunner, MigrationStatus};
-use sqlmodel_sqlite::SqliteConnection;
 
 // Schema creation SQL - no runtime dependencies needed
 
@@ -285,9 +285,8 @@ PRAGMA journal_size_limit = 67108864;
 
 /// Initialize the full database schema (tables, FTS5 virtual tables, triggers).
 ///
-/// Use this only with `SqliteConnection` (C-backed `SQLite`). `FrankenConnection`
-/// cannot execute `CREATE VIRTUAL TABLE` or `CREATE TRIGGER` and cannot open
-/// database files that contain FTS5 shadow table pages.
+/// Prefer [`init_schema_sql_base`] for runtime DBs. The full schema keeps
+/// legacy FTS objects for explicit export/compatibility paths only.
 #[must_use]
 pub fn init_schema_sql() -> String {
     format!("{PRAGMA_SETTINGS_SQL}\n{CREATE_TABLES_SQL}\n{CREATE_FTS_TRIGGERS_SQL}")
@@ -297,10 +296,9 @@ pub fn init_schema_sql() -> String {
 ///
 /// Safe for databases that will be opened by `FrankenConnection` (pure-Rust `SQLite`).
 /// PRAGMAs are intentionally excluded because:
-/// - `PRAGMA journal_mode = WAL` creates WAL files that `FrankenConnection` cannot handle
 /// - The pool applies per-connection PRAGMAs separately via [`build_conn_pragmas`]
 /// - The pool's init gate applies base-safe DB init pragmas via
-///   [`PRAGMA_DB_INIT_BASE_SQL`] through `SqliteConnection`
+///   [`PRAGMA_DB_INIT_BASE_SQL`] before pooled connections open
 ///
 /// Search queries automatically fall back to LIKE-based search when FTS5 tables are absent.
 #[must_use]
@@ -941,7 +939,7 @@ pub fn schema_migrations() -> Vec<Migration> {
     //
     // Tantivy now handles all text search. Drop every FTS5 virtual table
     // and synchronization trigger. Each statement is its own migration
-    // because sqlmodel_sqlite's execute only processes one statement.
+    // because the migration runner executes one statement per migration.
     //
     // Message FTS (created v1, rebuilt v5 with porter stemmer):
     migrations.push(Migration::new(
@@ -1021,18 +1019,20 @@ pub fn schema_migrations() -> Vec<Migration> {
     migrations
 }
 
-/// Returns `true` if a migration creates or manipulates FTS5 virtual tables or
-/// triggers. These DDL statements are unsupported by `FrankenConnection`.
-fn is_fts_or_trigger_migration(id: &str) -> bool {
+/// Returns `true` if a migration creates or manipulates FTS5 virtual tables.
+///
+/// Trigger DDL is supported by `FrankenConnection`; base mode only excludes
+/// FTS virtual table migrations.
+fn is_fts_migration(id: &str) -> bool {
     let id_lower = id.to_ascii_lowercase();
-    id_lower.contains("fts") || id_lower.contains("trigger") || id_lower.contains("trg")
+    id_lower.contains("fts")
 }
 
 /// Base-only trigger cleanup migrations.
 ///
-/// Base mode runs under `SqliteConnection` during startup to make DB files safe
-/// for later `FrankenConnection` access. Any pre-existing message->FTS triggers
-/// can break message inserts in that mode, so base startup drops both legacy
+/// Base mode runs during startup to make DB files safe for later runtime access.
+/// Any pre-existing message->FTS triggers can break message inserts in that mode,
+/// so base startup drops both legacy
 /// Python trigger names and current Rust trigger names.
 fn base_trigger_cleanup_migrations() -> Vec<Migration> {
     let cleanup_steps = vec![
@@ -1127,7 +1127,7 @@ fn base_trigger_cleanup_migrations() -> Vec<Migration> {
 /// from DB files that were later touched by full/CLI migrations and reintroduced
 /// incompatible FTS identity objects.
 #[allow(clippy::result_large_err)]
-pub fn enforce_base_mode_cleanup(conn: &SqliteConnection) -> std::result::Result<(), SqlError> {
+pub fn enforce_base_mode_cleanup(conn: &DbConn) -> std::result::Result<(), SqlError> {
     for migration in base_trigger_cleanup_migrations() {
         conn.execute_raw(&migration.up)?;
     }
@@ -1139,7 +1139,7 @@ pub fn enforce_base_mode_cleanup(conn: &SqliteConnection) -> std::result::Result
 /// Since Search V3 decommission (br-2tnl.8.4), Tantivy handles all text search.
 /// This drops `fts_messages`, `fts_agents`, `fts_projects` and all their triggers.
 #[allow(clippy::result_large_err)]
-pub fn enforce_runtime_fts_cleanup(conn: &SqliteConnection) -> std::result::Result<(), SqlError> {
+pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), SqlError> {
     // Drop all FTS artifacts — same as base mode cleanup
     for migration in base_trigger_cleanup_migrations() {
         conn.execute_raw(&migration.up)?;
@@ -1149,17 +1149,15 @@ pub fn enforce_runtime_fts_cleanup(conn: &SqliteConnection) -> std::result::Resu
     Ok(())
 }
 
-/// Migrations excluding FTS5 virtual tables, triggers, and FTS backfill inserts.
+/// Migrations excluding FTS5 virtual tables and FTS backfill inserts.
 ///
 /// Safe for databases that will be opened by `FrankenConnection`. The migration
-/// runner will still record these IDs in the migrations table so that a later
-/// `SqliteConnection` run recognizes them as "already applied (base)" and
-/// doesn't re-run them.
+/// runner will still record these IDs in the migrations table.
 #[must_use]
 pub fn schema_migrations_base() -> Vec<Migration> {
     let mut migrations: Vec<Migration> = schema_migrations()
         .into_iter()
-        .filter(|m| !is_fts_or_trigger_migration(&m.id))
+        .filter(|m| !is_fts_migration(&m.id))
         .collect();
     migrations.extend(base_trigger_cleanup_migrations());
     migrations
@@ -1170,7 +1168,7 @@ pub fn migration_runner() -> MigrationRunner {
     MigrationRunner::new(schema_migrations()).table_name(MIGRATIONS_TABLE_NAME)
 }
 
-/// Migration runner that skips FTS5/trigger migrations (safe for `FrankenConnection` DBs).
+/// Migration runner that skips FTS5 migrations (safe for `FrankenConnection` DBs).
 #[must_use]
 pub fn migration_runner_base() -> MigrationRunner {
     MigrationRunner::new(schema_migrations_base()).table_name(MIGRATIONS_TABLE_NAME)
@@ -1213,11 +1211,11 @@ pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<
     migration_runner().migrate(cx, conn).await
 }
 
-/// Run only base migrations (no FTS5 / triggers).
+/// Run only base migrations (no FTS5 virtual tables).
 ///
 /// Use this when the database will be opened by `FrankenConnection`. FTS5
 /// shadow table pages in the file would cause `FrankenConnection::open_file`
-/// to fail with "cell has no rowid".
+/// to fail with unsupported virtual-table behavior.
 pub async fn migrate_to_latest_base<C: Connection>(
     cx: &Cx,
     conn: &C,
@@ -1235,9 +1233,7 @@ pub async fn migrate_to_latest_base<C: Connection>(
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
-    // Migrations use DDL that FrankenConnection doesn't support (CREATE VIRTUAL TABLE,
-    // CREATE TRIGGER), so tests use SqliteConnection directly.
-    use sqlmodel_sqlite::SqliteConnection;
+    use crate::DbConn;
 
     fn block_on<F, Fut, T>(f: F) -> T
     where
@@ -1255,7 +1251,7 @@ mod tests {
     fn migrations_apply_and_are_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_apply.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // First run applies all schema migrations.
@@ -1285,7 +1281,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_preserve.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // Simulate an older DB with only `projects` table.
@@ -1352,7 +1348,7 @@ mod tests {
     fn base_migrations_drop_existing_message_fts_triggers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("base_drop_fts_triggers.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1462,7 +1458,7 @@ mod tests {
     fn enforce_base_mode_cleanup_drops_identity_fts_objects() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("base_cleanup_identity_fts.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1592,7 +1588,7 @@ mod tests {
     fn enforce_runtime_fts_cleanup_drops_all_fts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime_cleanup_all_fts.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_DB_INIT_SQL).expect("apply PRAGMAs");
@@ -1655,7 +1651,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v3_text_ts.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1833,7 +1829,7 @@ mod tests {
     fn v4_migration_creates_composite_indexes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_indexes.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // Apply all migrations.
@@ -1884,7 +1880,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_existing.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -2000,7 +1996,7 @@ mod tests {
     fn corrupted_migrations_table_yields_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_corrupt.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // Create a tracking table with the right name but wrong schema.

@@ -14,7 +14,7 @@
 //! When corruption is detected, the system:
 //! - Logs a CRITICAL error with the raw check output.
 //! - Returns an `IntegrityCorruption` error so callers can set health to Red.
-//! - Optionally attempts recovery via `VACUUM INTO` to create a clean copy.
+//! - Optionally attempts recovery via checkpoint + `VACUUM` + validated file copy.
 
 use crate::error::{DbError, DbResult};
 use crate::DbConn;
