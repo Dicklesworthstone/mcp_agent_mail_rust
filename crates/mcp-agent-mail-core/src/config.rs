@@ -1349,6 +1349,7 @@ impl Config {
             env::var(key)
                 .ok()
                 .or_else(|| persisted_console.get(key).cloned())
+                .or_else(|| user_env_value(key))
         };
         let console_bool = |key: &str, default: bool| -> bool {
             console_value(key).map_or(default, |v| parse_bool(&v, default))
@@ -1947,7 +1948,10 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
         seen.insert(key);
     }
 
-    for (key, value) in updates {
+    let mut sorted_updates: Vec<_> = updates.iter().collect();
+    sorted_updates.sort_by_key(|(k, _)| *k);
+
+    for (key, value) in sorted_updates {
         if !seen.contains(key) {
             out_lines.push(format!("{key}={value}"));
         }

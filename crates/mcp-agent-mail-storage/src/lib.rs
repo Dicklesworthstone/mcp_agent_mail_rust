@@ -789,6 +789,12 @@ impl FileLock {
 
             match file.try_lock_exclusive() {
                 Ok(()) => {
+                    // Verify lock identity to prevent race with cleanup_if_stale
+                    if !self.verify_lock_identity(&file)? {
+                        let _ = file.unlock();
+                        continue;
+                    }
+
                     // Lock acquired - retain file handle to hold the OS-level flock
                     self.write_metadata()?;
                     self.lock_file = Some(file);
@@ -796,12 +802,7 @@ impl FileLock {
                     return Ok(());
                 }
                 Err(_) => {
-                    // Lock held by another process - check for stale
-                    if self.cleanup_if_stale()? {
-                        // Stale lock cleaned up, retry immediately
-                        continue;
-                    }
-
+                    // Lock held by another process
                     if attempt >= self.max_retries {
                         break;
                     }
@@ -860,85 +861,27 @@ impl FileLock {
         Ok(())
     }
 
-    /// Check if the lock is stale and clean it up if so.
-    ///
-    /// A lock is stale if:
-    /// 1. The owning PID is no longer alive, OR
-    /// 2. The lock age exceeds `stale_timeout`
-    fn cleanup_if_stale(&self) -> Result<bool> {
-        if !self.path.exists() {
-            return Ok(false);
-        }
+    /// Verify that the locked file handle corresponds to the file currently at `self.path`.
+    fn verify_lock_identity(&self, file: &fs::File) -> Result<bool> {
+        let file_meta = file.metadata()?;
+        let path_meta = match fs::metadata(&self.path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(file_meta.ino() == path_meta.ino())
+        }
         #[cfg(not(unix))]
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        // Read owner metadata
-        let meta = if self.metadata_path.exists() {
-            fs::read_to_string(&self.metadata_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<LockOwnerMeta>(&s).ok())
-        } else {
-            None
-        };
-
-        // If metadata is missing, we must assume the owner is alive (likely just acquired the lock
-        // and hasn't written metadata yet) to avoid race conditions where we delete a lock
-        // held by a live process. We fallback to the timeout check below.
-        let owner_alive = meta.as_ref().is_none_or(|m| pid_alive(m.pid));
-
-        #[cfg(not(unix))]
-        let age = meta.as_ref().map(|m| now - m.created_ts).or_else(|| {
-            fs::metadata(&self.path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| now - d.as_secs_f64())
-        });
-
-        let is_stale = if !owner_alive {
-            true
-        } else if !self.stale_timeout.is_zero() {
-            // On Unix, if the PID is alive, we trust it (it might be a long-running operation).
-            // On Windows, pid_alive is always true, so we must rely on the timeout to clear crashes.
-            #[cfg(unix)]
-            {
-                false
-            }
-            #[cfg(not(unix))]
-            {
-                age.is_some_and(|a| a >= self.stale_timeout.as_secs_f64())
-            }
-        } else {
-            false
-        };
-
-        if !is_stale {
-            return Ok(false);
+        {
+            Ok(true)
         }
-
-        let removed_lock = match fs::remove_file(&self.path) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => {
-                tracing::debug!(
-                    "[file-lock] stale lock removal failed for {:?}: {e}",
-                    self.path
-                );
-                false
-            }
-        };
-
-        // Only the thread/process that actually removed the lock performs metadata cleanup.
-        if removed_lock {
-            let _ = fs::remove_file(&self.metadata_path);
-        }
-
-        Ok(removed_lock)
     }
+
+
 }
 
 impl Drop for FileLock {
@@ -1835,13 +1778,11 @@ fn coalescer_pool_worker(
             rq.depth.store(0, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(1));
         } else {
-            // Single atomic fetch_sub avoids TOCTOU race of load-then-sub.
-            // If drained_count > prev (shouldn't happen, but guards against wrapping),
-            // clamp back to 0.
-            let prev = rq.depth.fetch_sub(drained_count, Ordering::Relaxed);
-            if drained_count > prev {
-                rq.depth.store(0, Ordering::Relaxed);
-            }
+            // Use fetch_update to atomically saturate-subtract, preventing wrap-around race
+            // where a concurrent enqueue (add) could be overwritten by a blind store(0).
+            let _ = rq.depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                Some(val.saturating_sub(drained_count))
+            });
         }
 
         // Phase 4: Commit
@@ -2906,10 +2847,20 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             } else if file_type.is_file() && path.extension().is_some_and(|e| e == "lock") {
                 result.locks_scanned += 1;
 
-                // Check if stale using zero-timeout lock
-                let lock = FileLock::new(path.clone()).with_stale_timeout(Duration::ZERO);
-                if lock.cleanup_if_stale().unwrap_or(false) {
-                    result.locks_removed.push(path.display().to_string());
+                // Try to acquire exclusive lock. If successful, it means no one else
+                // is holding it, so we can treat it as a stale artifact from a previous run.
+                if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                    use fs2::FileExt;
+                    if f.try_lock_exclusive().is_ok() {
+                        // We got the lock. Delete the file.
+                        if std::fs::remove_file(&path).is_ok() {
+                            result.locks_removed.push(path.display().to_string());
+                            // Try to remove corresponding metadata file
+                            let name = path.file_name().unwrap_or_default().to_string_lossy();
+                            let meta_path = path.with_file_name(format!("{name}.owner.json"));
+                            let _ = std::fs::remove_file(meta_path);
+                        }
+                    }
                 }
             }
         }
@@ -3858,6 +3809,16 @@ pub fn store_attachment(
     use base64::Engine;
     use image::GenericImageView;
 
+    // Check size before reading entire file to prevent OOM
+    let meta = fs::metadata(file_path)?;
+    if meta.len() > MAX_ATTACHMENT_BYTES as u64 {
+        return Err(StorageError::InvalidPath(format!(
+            "Attachment too large ({} bytes, max {})",
+            meta.len(),
+            MAX_ATTACHMENT_BYTES,
+        )));
+    }
+
     // Read original file
     let original_bytes = fs::read(file_path)?;
     if original_bytes.is_empty() {
@@ -4025,6 +3986,26 @@ pub fn store_raw_attachment(
     archive: &ProjectArchive,
     file_path: &Path,
 ) -> Result<StoredAttachment> {
+    // Check size before reading entire file to prevent OOM
+    let meta = fs::metadata(file_path)?;
+    if meta.len() > MAX_ATTACHMENT_BYTES as u64 {
+        return Err(StorageError::InvalidPath(format!(
+            "Attachment too large ({} bytes, max {})",
+            meta.len(),
+            MAX_ATTACHMENT_BYTES,
+        )));
+    }
+
+    // Check size before reading entire file to prevent OOM
+    let meta = fs::metadata(file_path)?;
+    if meta.len() > MAX_ATTACHMENT_BYTES as u64 {
+        return Err(StorageError::InvalidPath(format!(
+            "Attachment too large ({} bytes, max {})",
+            meta.len(),
+            MAX_ATTACHMENT_BYTES,
+        )));
+    }
+
     // Read file
     let bytes = fs::read(file_path)?;
     if bytes.is_empty() {

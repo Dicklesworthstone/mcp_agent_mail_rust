@@ -379,6 +379,10 @@ impl Runner {
     const NATIVE_DUAL_MODE_SUITE: &'static str = "dual_mode";
     const NATIVE_MODE_MATRIX_SUITE: &'static str = "mode_matrix";
     const NATIVE_SECURITY_PRIVACY_SUITE: &'static str = "security_privacy";
+    const NATIVE_TUI_INTERACTION_SUITE: &'static str = "tui_interaction";
+    const NATIVE_TUI_INTERACTIONS_SUITE: &'static str = "tui_interactions";
+    const NATIVE_TUI_COMPAT_MATRIX_SUITE: &'static str = "tui_compat_matrix";
+    const NATIVE_TUI_STARTUP_SUITE: &'static str = "tui_startup";
     const NATIVE_TUI_A11Y_SUITE: &'static str = "tui_a11y";
 
     /// Creates a new runner.
@@ -465,6 +469,12 @@ impl Runner {
                 self.run_native_mode_matrix_suite(suite)
             } else if suite.name == Self::NATIVE_SECURITY_PRIVACY_SUITE {
                 self.run_native_security_privacy_suite(suite)
+            } else if suite.name == Self::NATIVE_TUI_INTERACTION_SUITE
+                || suite.name == Self::NATIVE_TUI_INTERACTIONS_SUITE
+                || suite.name == Self::NATIVE_TUI_COMPAT_MATRIX_SUITE
+                || suite.name == Self::NATIVE_TUI_STARTUP_SUITE
+            {
+                self.run_native_tui_transport_suite(suite)
             } else if suite.name == Self::NATIVE_TUI_A11Y_SUITE {
                 self.run_native_tui_a11y_suite(suite)
             } else {
@@ -630,6 +640,10 @@ impl Runner {
             || name == Self::NATIVE_DUAL_MODE_SUITE
             || name == Self::NATIVE_MODE_MATRIX_SUITE
             || name == Self::NATIVE_SECURITY_PRIVACY_SUITE
+            || name == Self::NATIVE_TUI_INTERACTION_SUITE
+            || name == Self::NATIVE_TUI_INTERACTIONS_SUITE
+            || name == Self::NATIVE_TUI_COMPAT_MATRIX_SUITE
+            || name == Self::NATIVE_TUI_STARTUP_SUITE
             || name == Self::NATIVE_TUI_A11Y_SUITE
     }
 
@@ -960,6 +974,74 @@ impl Runner {
                 duration_ms: elapsed.as_millis() as u64,
                 stdout: String::new(),
                 stderr: format!("Failed to execute native tui_a11y suite: {error}"),
+                assertions_passed: 0,
+                assertions_failed: 1,
+                assertions_skipped: 0,
+                started_at: started_at.to_rfc3339(),
+                ended_at: ended_at.to_rfc3339(),
+            },
+        }
+    }
+
+    fn run_native_tui_transport_suite(&self, suite: &Suite) -> SuiteResult {
+        let started_at = Utc::now();
+        let start_instant = Instant::now();
+
+        let mut cmd = Command::new("cargo");
+        cmd.args([
+            "test",
+            "-p",
+            "mcp-agent-mail-cli",
+            "--test",
+            "tui_transport_harness",
+            "--",
+            "--nocapture",
+        ]);
+        cmd.current_dir(&self.config.project_root);
+        if self.config.keep_tmp {
+            cmd.env("AM_E2E_KEEP_TMP", "1");
+        }
+        for (key, value) in &self.config.env {
+            cmd.env(key, value);
+        }
+        cmd.env("AM_TUI_HARNESS_SUITE", &suite.name);
+        cmd.env("AM_E2E_TUI_REQUIRE_PASS", "1");
+        if let Some(artifact_root) = &self.config.artifact_dir {
+            cmd.env("AM_TUI_ARTIFACT_DIR", artifact_root);
+        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let output = cmd.output();
+        let elapsed = start_instant.elapsed();
+        let ended_at = Utc::now();
+
+        match output {
+            Ok(output) => {
+                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
+                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
+                let passed = output.status.success();
+                SuiteResult {
+                    name: suite.name.clone(),
+                    passed,
+                    exit_code: output.status.code().unwrap_or(-1),
+                    duration_ms: elapsed.as_millis() as u64,
+                    stdout,
+                    stderr,
+                    assertions_passed: if passed { 1 } else { 0 },
+                    assertions_failed: if passed { 0 } else { 1 },
+                    assertions_skipped: 0,
+                    started_at: started_at.to_rfc3339(),
+                    ended_at: ended_at.to_rfc3339(),
+                }
+            }
+            Err(error) => SuiteResult {
+                name: suite.name.clone(),
+                passed: false,
+                exit_code: -1,
+                duration_ms: elapsed.as_millis() as u64,
+                stdout: String::new(),
+                stderr: format!("Failed to execute native tui transport suite: {error}"),
                 assertions_passed: 0,
                 assertions_failed: 1,
                 assertions_skipped: 0,
@@ -2141,6 +2223,10 @@ exit 1
         assert!(Runner::is_native_suite("dual_mode"));
         assert!(Runner::is_native_suite("mode_matrix"));
         assert!(Runner::is_native_suite("security_privacy"));
+        assert!(Runner::is_native_suite("tui_interaction"));
+        assert!(Runner::is_native_suite("tui_interactions"));
+        assert!(Runner::is_native_suite("tui_compat_matrix"));
+        assert!(Runner::is_native_suite("tui_startup"));
         assert!(Runner::is_native_suite("tui_a11y"));
         assert!(!Runner::is_native_suite("guard"));
         assert!(!Runner::is_native_suite("dual_mode_extra"));
@@ -2767,6 +2853,10 @@ exit 1
         assert_eq!(Runner::NATIVE_DUAL_MODE_SUITE, "dual_mode");
         assert_eq!(Runner::NATIVE_MODE_MATRIX_SUITE, "mode_matrix");
         assert_eq!(Runner::NATIVE_SECURITY_PRIVACY_SUITE, "security_privacy");
+        assert_eq!(Runner::NATIVE_TUI_INTERACTION_SUITE, "tui_interaction");
+        assert_eq!(Runner::NATIVE_TUI_INTERACTIONS_SUITE, "tui_interactions");
+        assert_eq!(Runner::NATIVE_TUI_COMPAT_MATRIX_SUITE, "tui_compat_matrix");
+        assert_eq!(Runner::NATIVE_TUI_STARTUP_SUITE, "tui_startup");
         assert_eq!(Runner::NATIVE_TUI_A11Y_SUITE, "tui_a11y");
     }
 
@@ -2778,6 +2868,7 @@ exit 1
         assert!(!Runner::is_native_suite("share_plus"));
         assert!(!Runner::is_native_suite("archive_legacy"));
         assert!(!Runner::is_native_suite("dual_mode_v2"));
+        assert!(!Runner::is_native_suite("tui_interaction_extra"));
         assert!(!Runner::is_native_suite(""));
     }
 }

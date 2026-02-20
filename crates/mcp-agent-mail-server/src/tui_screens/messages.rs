@@ -368,7 +368,7 @@ impl MessageEntry {
 
         // Calculate how much space remains for subject
         // Format: marker + badge(2) + ack(1) + space + id(6) + space + time(8) + space + sender(<=12) + space + project + subject
-        let fixed_len = marker.len()
+        let fixed_len = ftui::text::display_width(marker)
             + batch_marker.chars().count()
             + 1 // spacer
             + 2  // badge
@@ -4909,17 +4909,20 @@ fn viewport_range(total: usize, height: usize, cursor: usize) -> (usize, usize) 
     (start, end)
 }
 
-/// Truncate a string to at most `max_len` characters, adding "..." if truncated.
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else if max_len <= 3 {
-        s.chars().take(max_len).collect()
-    } else {
-        let mut result: String = s.chars().take(max_len - 3).collect();
-        result.push_str("...");
-        result
+/// Truncate a string to at most `max_width` columns, adding "..." if truncated.
+fn truncate_str(s: &str, max_width: usize) -> String {
+    let s_width = ftui::text::display_width(s);
+    if s_width <= max_width {
+        return s.to_string();
     }
+    let mw_u16 = u16::try_from(max_width).unwrap_or(u16::MAX);
+    if max_width <= 3 {
+        return crate::tui_widgets::truncate_width(s, mw_u16);
+    }
+    let target = mw_u16.saturating_sub(3);
+    let mut result = crate::tui_widgets::truncate_width(s, target);
+    result.push_str("...");
+    result
 }
 
 // ──────────────────────────────────────────────────────────────────────

@@ -551,8 +551,6 @@ const fn has_any_recipients(to: &[String], cc: &[String], bcc: &[String]) -> boo
     !(to.is_empty() && cc.is_empty() && bcc.is_empty())
 }
 
-const THIRTY_DAYS_MICROS: i64 = 30_i64 * 24 * 60 * 60 * 1_000_000;
-
 fn python_json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "NoneType",
@@ -894,7 +892,7 @@ pub async fn send_message(
     ctx: &McpContext,
     project_key: String,
     sender_name: String,
-    mut to: Vec<String>,
+    to: Vec<String>,
     subject: String,
     body_md: String,
     cc: Option<Vec<String>>,
@@ -1029,10 +1027,10 @@ effective_free_bytes={free}"
     let sender_id = sender.id.unwrap_or(0);
 
     let broadcast = broadcast.unwrap_or(false);
-    if broadcast {
+    if broadcast && !to.is_empty() {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
-            "Broadcast messaging is not supported. Please address recipients individually.",
+            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
             true,
             json!({ "argument": "broadcast" }),
         ));
@@ -1064,7 +1062,7 @@ effective_free_bytes={free}"
     let cc_list = cc.unwrap_or_default();
     let bcc_list = bcc.unwrap_or_default();
 
-    if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() {
+    if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() && !broadcast {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             "At least one recipient is required. Provide agent names in to, cc, or bcc.",
@@ -1086,6 +1084,44 @@ effective_free_bytes={free}"
     let mut recipient_map: HashMap<String, mcp_agent_mail_db::AgentRow> =
         HashMap::with_capacity(total_recip);
     let mut missing_local: Vec<String> = Vec::new();
+
+    if broadcast {
+        let agents = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+        )?;
+        for agent in agents {
+            if agent.id == Some(sender_id) {
+                continue;
+            }
+            recipient_map.insert(agent.name.to_lowercase(), agent.clone());
+            if let Err(err) = push_recipient(
+                ctx,
+                &pool,
+                project_id,
+                &agent.name,
+                "to",
+                &sender,
+                config,
+                &project.human_key,
+                &project.slug,
+                &mut recipient_map,
+                &mut all_recipients,
+                &mut resolved_to,
+            )
+            .await
+            {
+                return Err(err);
+            }
+        }
+        if resolved_to.is_empty() {
+            return Err(legacy_tool_error(
+                "NO_RECIPIENTS",
+                "Broadcast found no other agents in the project.",
+                true,
+                json!({}),
+            ));
+        }
+    }
 
     for name in &to {
         if let Err(err) = push_recipient(
@@ -1416,13 +1452,13 @@ effective_free_bytes={free}"
         if let Some(thread) = thread_id.as_deref() {
             let thread = thread.trim();
             if !thread.is_empty() {
-                let thread_rows = db_outcome_to_mcp_result(
+                let mut thread_rows = db_outcome_to_mcp_result(
                     mcp_agent_mail_db::queries::list_thread_messages(
                         ctx.cx(),
                         &pool,
                         project_id,
                         thread,
-                        Some(500),
+                        None,
                     )
                     .await,
                 )
@@ -1436,6 +1472,10 @@ effective_free_bytes={free}"
                         .inc();
                     Vec::new()
                 });
+                if thread_rows.len() > 500 {
+                    let keep_from = thread_rows.len().saturating_sub(500);
+                    thread_rows.drain(..keep_from);
+                }
                 let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
                 for row in &thread_rows {
                     auto_ok_names.insert(row.from.clone());
@@ -3103,7 +3143,10 @@ mod tests {
         let err = normalize_send_message_arguments(&mut args)
             .expect_err("non-string cc item should fail");
         assert_eq!(err.code, McpErrorCode::ToolExecutionError);
-        assert_eq!(err.message, "cc items must be strings (agent names).");
+        assert_eq!(
+            err.message,
+            "Each recipient in 'cc' must be a string (agent name). Got: int"
+        );
         let data = err.data.expect("error payload");
         assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
         assert_eq!(data["error"]["data"]["argument"], "cc");
@@ -3118,7 +3161,10 @@ mod tests {
         let err = normalize_send_message_arguments(&mut args)
             .expect_err("non-string bcc item should fail");
         assert_eq!(err.code, McpErrorCode::ToolExecutionError);
-        assert_eq!(err.message, "bcc items must be strings (agent names).");
+        assert_eq!(
+            err.message,
+            "Each recipient in 'bcc' must be a string (agent name). Got: bool"
+        );
         let data = err.data.expect("error payload");
         assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
         assert_eq!(data["error"]["data"]["argument"], "bcc");

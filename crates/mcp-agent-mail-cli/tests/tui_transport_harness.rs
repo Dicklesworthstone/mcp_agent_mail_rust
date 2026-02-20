@@ -1,8 +1,9 @@
-//! br-3ibsu: Native harness adapter for share/archive-heavy E2E suites.
+//! br-3c7vp: Native harness adapter for TUI interaction-heavy E2E suites.
 //!
 //! Current phase: managed adapter.
-//! - Native runner entrypoint is Rust (`cargo test --test share_archive_harness`).
-//! - Scenario execution delegates to shell suites (`share`, `share_verify_live`, `archive`).
+//! - Native runner entrypoint is Rust (`cargo test --test tui_transport_harness`).
+//! - Scenario execution delegates to shell suites (`tui_interaction`, `tui_interactions`,
+//!   `tui_compat_matrix`, `tui_startup`).
 //! - Harness captures deterministic metadata and copies legacy artifacts.
 
 #![forbid(unsafe_code)]
@@ -47,7 +48,7 @@ struct HarnessSummary {
     notes: Vec<String>,
 }
 
-const DEFAULT_HARNESS_SUITE: &str = "share";
+const DEFAULT_HARNESS_SUITE: &str = "tui_interaction";
 
 #[derive(Clone, Copy, Debug)]
 struct HarnessSuiteSpec {
@@ -61,29 +62,33 @@ fn bool_env(var_name: &str) -> bool {
 }
 
 fn selected_suite_name() -> String {
-    std::env::var("AM_SHARE_ARCHIVE_HARNESS_SUITE")
-        .unwrap_or_else(|_| DEFAULT_HARNESS_SUITE.to_string())
+    std::env::var("AM_TUI_HARNESS_SUITE").unwrap_or_else(|_| DEFAULT_HARNESS_SUITE.to_string())
 }
 
 fn suite_spec_for(name: &str) -> HarnessSuiteSpec {
     match name {
-        "share" => HarnessSuiteSpec {
-            suite_name: "share",
-            adapter_script: "tests/e2e/test_share.sh",
-            legacy_artifacts_subdir: "share",
+        "tui_interaction" => HarnessSuiteSpec {
+            suite_name: "tui_interaction",
+            adapter_script: "tests/e2e/test_tui_interaction.sh",
+            legacy_artifacts_subdir: "tui_interaction",
         },
-        "share_verify_live" => HarnessSuiteSpec {
-            suite_name: "share_verify_live",
-            adapter_script: "tests/e2e/test_share_verify_live.sh",
-            legacy_artifacts_subdir: "share_verify_live",
+        "tui_interactions" => HarnessSuiteSpec {
+            suite_name: "tui_interactions",
+            adapter_script: "tests/e2e/test_tui_interactions.sh",
+            legacy_artifacts_subdir: "tui_interactions",
         },
-        "archive" => HarnessSuiteSpec {
-            suite_name: "archive",
-            adapter_script: "tests/e2e/test_archive.sh",
-            legacy_artifacts_subdir: "archive",
+        "tui_compat_matrix" => HarnessSuiteSpec {
+            suite_name: "tui_compat_matrix",
+            adapter_script: "tests/e2e/test_tui_compat_matrix.sh",
+            legacy_artifacts_subdir: "tui_compat_matrix",
+        },
+        "tui_startup" => HarnessSuiteSpec {
+            suite_name: "tui_startup",
+            adapter_script: "tests/e2e/test_tui_startup.sh",
+            legacy_artifacts_subdir: "tui_startup",
         },
         _ => panic!(
-            "unsupported AM_SHARE_ARCHIVE_HARNESS_SUITE={name}; expected one of: share, share_verify_live, archive"
+            "unsupported AM_TUI_HARNESS_SUITE={name}; expected one of: tui_interaction, tui_interactions, tui_compat_matrix, tui_startup"
         ),
     }
 }
@@ -97,7 +102,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn harness_artifacts_root(suite_name: &str) -> PathBuf {
-    if let Ok(override_root) = std::env::var("AM_SHARE_ARCHIVE_ARTIFACT_DIR") {
+    if let Ok(override_root) = std::env::var("AM_TUI_ARTIFACT_DIR") {
         return PathBuf::from(override_root).join(suite_name);
     }
     repo_root().join("tests/artifacts/cli").join(suite_name)
@@ -186,7 +191,7 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
 }
 
 #[test]
-fn native_share_archive_transport_gate() {
+fn native_tui_transport_gate() {
     let suite_name = selected_suite_name();
     let suite_spec = suite_spec_for(&suite_name);
     let start_instant = Instant::now();
@@ -197,12 +202,12 @@ fn native_share_archive_transport_gate() {
     ));
     fs::create_dir_all(&run_root).expect("create run root");
     eprintln!(
-        "share/archive harness artifact root (suite={}): {}",
+        "tui transport harness artifact root (suite={}): {}",
         suite_spec.suite_name,
         run_root.display()
     );
 
-    let strict_mode = bool_env("AM_E2E_SHARE_ARCHIVE_REQUIRE_PASS");
+    let strict_mode = bool_env("AM_E2E_TUI_REQUIRE_PASS");
     let legacy_root = legacy_artifacts_root(suite_spec.legacy_artifacts_subdir);
     fs::create_dir_all(&legacy_root).expect("create legacy artifact root");
     let before_runs = list_run_directories(&legacy_root);
@@ -221,10 +226,10 @@ fn native_share_archive_transport_gate() {
             std::env::var("AM_E2E_KEEP_TMP").unwrap_or_else(|_| "1".to_string()),
         );
 
-    let timeout_secs = std::env::var("AM_SHARE_ARCHIVE_ADAPTER_TIMEOUT_SECS")
+    let timeout_secs = std::env::var("AM_TUI_ADAPTER_TIMEOUT_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(1800);
+        .unwrap_or(3600);
     let outcome = run_with_timeout(&mut cmd, Duration::from_secs(timeout_secs));
 
     let stdout_path = run_root.join("adapter.stdout.log");

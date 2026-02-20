@@ -32,10 +32,12 @@ if [ -z "${TMPDIR:-}" ]; then
     fi
 fi
 
-# Cargo target dir: avoid multi-agent contention
+# Cargo target dir: avoid multi-agent contention.
+# Keep this colocated with TMPDIR so workers without /data/tmp still resolve to a valid path.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-    export CARGO_TARGET_DIR="/data/tmp/cargo-target"
+    export CARGO_TARGET_DIR="${TMPDIR%/}/cargo-target"
 fi
+mkdir -p "${CARGO_TARGET_DIR}" 2>/dev/null || true
 
 # Root of the project
 E2E_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -1898,7 +1900,8 @@ e2e_git_commit() {
 e2e_ensure_binary() {
     local bin_name="${1:-mcp-agent-mail}"
     local bin_path="${CARGO_TARGET_DIR}/debug/${bin_name}"
-    if [ ! -f "$bin_path" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
+    local workspace_fallback="${E2E_PROJECT_ROOT}/target/debug/${bin_name}"
+    if [ ! -x "$bin_path" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
         e2e_log "Building ${bin_name}..."
         case "$bin_name" in
             am)
@@ -1914,8 +1917,19 @@ e2e_ensure_binary() {
         esac
     fi
 
+    # Some environments (including remote runners) may ignore/override CARGO_TARGET_DIR.
+    if [ ! -x "$bin_path" ] && [ -x "$workspace_fallback" ]; then
+        bin_path="$workspace_fallback"
+    fi
+    if [ ! -x "$bin_path" ]; then
+        e2e_log "ERROR ${bin_name} binary not found after build"
+        e2e_log "  tried: ${CARGO_TARGET_DIR}/debug/${bin_name}"
+        e2e_log "  tried: ${workspace_fallback}"
+        return 1
+    fi
+
     # Ensure built binaries are callable by name in E2E scripts.
-    export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
+    export PATH="${CARGO_TARGET_DIR}/debug:$(dirname "$bin_path"):${PATH}"
     echo "$bin_path"
 }
 
@@ -1990,6 +2004,8 @@ e2e_start_server_with_logs() {
         export HTTP_PORT="${port}"
         export LOG_LEVEL="debug"
         export RUST_LOG="debug"
+        # Ensure server-mode invocations are not accidentally forced into CLI mode by parent env.
+        export AM_INTERFACE_MODE="${AM_INTERFACE_MODE:-mcp}"
 
         # Apply extra env vars
         while [ $# -gt 0 ]; do
@@ -2001,10 +2017,16 @@ e2e_start_server_with_logs() {
     ) >"$_E2E_SERVER_LOG" 2>&1 &
     _E2E_SERVER_PID=$!
 
-    # Wait for server to be ready
-    if ! e2e_wait_port "127.0.0.1" "${port}" 15; then
-        e2e_log "Server failed to start within 15s"
+    # Wait for server to be ready.
+    # Override with E2E_SERVER_START_TIMEOUT_SECONDS for slower CI/remote workers.
+    local start_timeout_s="${E2E_SERVER_START_TIMEOUT_SECONDS:-15}"
+    if ! e2e_wait_port "127.0.0.1" "${port}" "${start_timeout_s}"; then
+        e2e_log "Server failed to start within ${start_timeout_s}s"
         _e2e_server_startup_diagnostics
+        if [ -f "${_E2E_SERVER_LOG}" ]; then
+            e2e_log "Server log tail (${_E2E_SERVER_LOG}):"
+            tail -n 80 "${_E2E_SERVER_LOG}" >&2 || true
+        fi
         return 1
     fi
 

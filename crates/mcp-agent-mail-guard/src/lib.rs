@@ -278,11 +278,12 @@ fn render_guard_plugin_script(
     hook_name: &str,
     default_db_path: Option<&str>,
 ) -> String {
-    // Real guard plugin: checks active file reservations against staged changes.
-    // Uses the `am` CLI binary to query reservations and compare against `git diff --cached`.
+    // Real guard plugin: checks active file reservations against staged changes (pre-commit)
+    // or pushed commits (pre-push).
     let db_fallback_json =
         serde_json::to_string(default_db_path.unwrap_or("")).unwrap_or_else(|_| "\"\"".to_string());
     let project_json = serde_json::to_string(project).unwrap_or_else(|_| "\"\"".to_string());
+    let hook_name_json = serde_json::to_string(hook_name).unwrap_or_else(|_| "\"\"".to_string());
 
     format!(
         r#"#!/usr/bin/env python3
@@ -297,12 +298,13 @@ import subprocess
 import sys
 
 PROJECT = {project_json}
+HOOK_NAME = {hook_name_json}
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
 GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
 DEFAULT_DB_PATH = {db_fallback_json}
 
 def get_staged_files():
-    """Get list of staged files from git."""
+    """Get list of staged files from git (for pre-commit)."""
     try:
         result = subprocess.run(
             ["git", "diff", "--cached", "--name-status", "-M", "-z", "--diff-filter=ACMRDTU"],
@@ -351,6 +353,78 @@ def get_staged_files():
     except Exception:
         return []
 
+def get_push_files():
+    """Get list of files modified in the push (for pre-push)."""
+    files = set()
+    try:
+        # Read stdin for ref updates (local_ref local_sha remote_ref remote_sha)
+        # sys.stdin.read() works because chain-runner pipes input as text/bytes depending on OS,
+        # but in Python 3 sys.stdin is a text wrapper. The chain-runner sends raw bytes,
+        # but standard python environment usually handles this.
+        # Safe fallback is sys.stdin.read().
+        stdin_data = sys.stdin.read()
+        if not stdin_data:
+            return []
+
+        for line in stdin_data.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            local_sha = parts[1]
+            remote_sha = parts[3]
+
+            # Skip deletes
+            if set(local_sha) == {{'0'}}:
+                continue
+
+            if set(remote_sha) == {{'0'}}:
+                # New branch push
+                range_spec = local_sha
+            else:
+                range_spec = f"{{remote_sha}}..{{local_sha}}"
+
+            # Get commits in range
+            res = subprocess.run(
+                ["git", "rev-list", "--topo-order", range_spec],
+                capture_output=True, text=True
+            )
+            if res.returncode != 0:
+                continue
+
+            commits = [c.strip() for c in res.stdout.splitlines() if c.strip()]
+
+            for sha in commits:
+                diff_res = subprocess.run(
+                    ["git", "diff-tree", "-r", "--no-commit-id", "--name-status",
+                     "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "-m", sha],
+                    capture_output=True
+                )
+                if diff_res.returncode == 0:
+                    data = diff_res.stdout
+                    parts = data.split(b'\0')
+                    i = 0
+                    while i < len(parts):
+                        status = parts[i].decode('utf-8', 'ignore').strip()
+                        if not status:
+                            i += 1
+                            continue
+                        i += 1
+                        if status.startswith(('R', 'C')):
+                            if i + 1 < len(parts):
+                                oldp = parts[i].decode('utf-8', 'ignore')
+                                newp = parts[i+1].decode('utf-8', 'ignore')
+                                if oldp: files.add(oldp)
+                                if newp: files.add(newp)
+                                i += 2
+                        else:
+                            if i < len(parts):
+                                p = parts[i].decode('utf-8', 'ignore')
+                                if p: files.add(p)
+                                i += 1
+    except Exception:
+        pass
+    return sorted(list(files))
+
 def get_active_reservations():
     """Query active exclusive file reservations from the database."""
     db_path = os.environ.get("AGENT_MAIL_DB", "")
@@ -375,8 +449,8 @@ def get_active_reservations():
             "JOIN agents a ON a.id = fr.agent_id "
             "JOIN projects p ON p.id = fr.project_id "
             "WHERE fr.exclusive = 1 AND (fr.released_ts IS NULL OR fr.released_ts <= 0) "
-            "AND fr.expires_ts > ? AND p.human_key = ?",
-            (now_micros, PROJECT),
+            "AND fr.expires_ts > ? AND (p.human_key = ? OR p.slug = ?)",
+            (now_micros, PROJECT, PROJECT),
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -395,10 +469,10 @@ def glob_match(path, pattern):
     regex = regex.replace(r'\?', '.')
     return re.fullmatch(regex, path) is not None
 
-def check_conflicts(staged, reservations):
-    """Check if any staged files conflict with active reservations."""
+def check_conflicts(paths, reservations):
+    """Check if any paths conflict with active reservations."""
     conflicts = []
-    for f in staged:
+    for f in paths:
         for res in reservations:
             pattern = res["path_pattern"]
             holder = res.get("agent_name", "unknown")
@@ -428,15 +502,19 @@ def main():
         # No agent context; skip guard check
         sys.exit(0)
 
-    staged = get_staged_files()
-    if not staged:
+    if HOOK_NAME == "pre-push":
+        files_to_check = get_push_files()
+    else:
+        files_to_check = get_staged_files()
+
+    if not files_to_check:
         sys.exit(0)
 
     reservations = get_active_reservations()
     if not reservations:
         sys.exit(0)
 
-    conflicts = check_conflicts(staged, reservations)
+    conflicts = check_conflicts(files_to_check, reservations)
     if not conflicts:
         sys.exit(0)
 

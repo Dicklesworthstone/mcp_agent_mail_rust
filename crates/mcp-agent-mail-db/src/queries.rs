@@ -1017,7 +1017,7 @@ pub async fn register_agent(
     }
 
     let normalize_sql = format!(
-        "UPDATE agents SET {} WHERE project_id = ? AND lower(name) = lower(?)",
+        "UPDATE agents SET {} WHERE project_id = ? AND name = ?",
         normalize_sets.join(", ")
     );
     normalize_params.push(Value::BigInt(project_id));
@@ -1032,7 +1032,7 @@ pub async fn register_agent(
     let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                      inception_ts, last_active_ts, attachments_policy, contact_policy \
                      FROM agents \
-                     WHERE project_id = ? AND lower(name) = lower(?) \
+                     WHERE project_id = ? AND name = ? \
                      ORDER BY last_active_ts DESC, id DESC \
                      LIMIT 1";
     let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -1489,9 +1489,25 @@ pub async fn set_agent_contact_policy(
     let tracked = tracked(&*conn);
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
+    // Read current row first so we can preserve attachments_policy explicitly.
+    // Some engines can clobber this field on partial UPDATE statements.
+    let current_sql = "SELECT id, project_id, name, program, model, task_description, \
+                       inception_ts, last_active_ts, attachments_policy, contact_policy \
+                       FROM agents WHERE id = ? LIMIT 1";
+    let current_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_query(cx, &tracked, current_sql, &[Value::BigInt(agent_id)]).await)
+    );
+    let Some(current_agent) = current_rows.first().map(decode_agent_row_indexed) else {
+        rollback_tx(cx, &tracked).await;
+        return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+    };
+
     let now = now_micros();
-    let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
+    let sql = "UPDATE agents SET attachments_policy = ?, contact_policy = ?, last_active_ts = ? WHERE id = ?";
     let params = [
+        Value::Text(current_agent.attachments_policy.clone()),
         Value::Text(policy.to_string()),
         Value::BigInt(now),
         Value::BigInt(agent_id),
@@ -1549,12 +1565,40 @@ pub async fn set_agent_contact_policy_by_name(
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
     let now = now_micros();
 
-    let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE project_id = ? AND name = ?";
-    let params = [
-        Value::Text(policy.to_string()),
-        Value::BigInt(now),
+    // Resolve row first so we can preserve attachments_policy explicitly.
+    let current_sql = "SELECT id, project_id, name, program, model, task_description, \
+                       inception_ts, last_active_ts, attachments_policy, contact_policy \
+                       FROM agents WHERE project_id = ? AND name = ? \
+                       ORDER BY last_active_ts DESC, id DESC LIMIT 1";
+    let current_params = [
         Value::BigInt(project_id),
         Value::Text(normalized_name.to_string()),
+    ];
+    let current_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_query(cx, &tracked, current_sql, &current_params).await)
+    );
+    let Some(current_agent) = current_rows.first().map(decode_agent_row_indexed) else {
+        rollback_tx(cx, &tracked).await;
+        return Outcome::Err(DbError::not_found(
+            "Agent",
+            format!("{project_id}:{normalized_name}"),
+        ));
+    };
+    let Some(current_id) = current_agent.id else {
+        rollback_tx(cx, &tracked).await;
+        return Outcome::Err(DbError::Internal(format!(
+            "policy update lookup returned agent without id for {project_id}:{normalized_name}"
+        )));
+    };
+
+    let sql = "UPDATE agents SET attachments_policy = ?, contact_policy = ?, last_active_ts = ? WHERE id = ?";
+    let params = [
+        Value::Text(current_agent.attachments_policy.clone()),
+        Value::Text(policy.to_string()),
+        Value::BigInt(now),
+        Value::BigInt(current_id),
     ];
 
     try_in_tx!(
@@ -1565,11 +1609,8 @@ pub async fn set_agent_contact_policy_by_name(
 
     let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                      inception_ts, last_active_ts, attachments_policy, contact_policy \
-                     FROM agents WHERE project_id = ? AND name = ? LIMIT 1";
-    let fetch_params = [
-        Value::BigInt(project_id),
-        Value::Text(normalized_name.to_string()),
-    ];
+                     FROM agents WHERE id = ? LIMIT 1";
+    let fetch_params = [Value::BigInt(current_id)];
     let rows = try_in_tx!(
         cx,
         &tracked,
@@ -1983,29 +2024,20 @@ async fn create_message_with_recipients_tx(
         attachments: attachments.to_string(),
     };
 
-    // Batch insert recipients within the same transaction.
-    // SQLite parameter limit is 999; 5 params per row (message_id, agent_id, kind, read_ts, ack_ts).
-    // 50 rows * 5 params = 250 params, well within limits.
-    for chunk in recipients.chunks(50) {
-        let mut query = String::from(
-            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES ",
-        );
-        let mut params = Vec::with_capacity(chunk.len() * 5);
-
-        for (i, (agent_id, kind)) in chunk.iter().enumerate() {
-            if i > 0 {
-                query.push_str(", ");
-            }
-            query.push_str("(?, ?, ?, NULL, NULL)");
-            params.push(Value::BigInt(message_id));
-            params.push(Value::BigInt(*agent_id));
-            params.push(Value::Text((*kind).to_string()));
-        }
-
+    // Insert recipients one row at a time inside the same transaction.
+    // This avoids a known multi-row INSERT + trigger path that can surface
+    // spurious PRIMARY KEY conflicts in the franken sqlite engine.
+    let insert_recipient_sql = "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, NULL, NULL)";
+    for (agent_id, kind) in recipients {
+        let params = [
+            Value::BigInt(message_id),
+            Value::BigInt(*agent_id),
+            Value::Text((*kind).to_string()),
+        ];
         try_in_tx!(
             cx,
             tracked,
-            map_sql_outcome(traw_execute(cx, tracked, &query, &params).await)
+            map_sql_outcome(traw_execute(cx, tracked, insert_recipient_sql, &params).await)
         );
     }
 
@@ -2311,14 +2343,73 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
 
     let tracked = tracked(&*conn);
 
-    match map_sql_outcome(
-        select!(MessageRow)
-            .filter(Expr::col("id").eq(message_id))
-            .first(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
-        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Message", message_id.to_string())),
+    let sql = "SELECT id, project_id, sender_id, thread_id, subject, body_md, importance, \
+                      ack_required, created_ts, attachments \
+               FROM messages \
+               WHERE id = ? \
+               LIMIT 1";
+    let params = [Value::BigInt(message_id)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let Some(row) = rows.first() else {
+                return Outcome::Err(DbError::not_found("Message", message_id.to_string()));
+            };
+
+            let id: i64 = match row.get_named("id") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let project_id: i64 = match row.get_named("project_id") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let sender_id: i64 = match row.get_named("sender_id") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let thread_id: Option<String> = match row.get_named("thread_id") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let subject: String = match row.get_named("subject") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let body_md: String = match row.get_named("body_md") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let importance: String = match row.get_named("importance") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let ack_required: i64 = match row.get_named("ack_required") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let created_ts: i64 = match row.get_named("created_ts") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            let attachments: String = match row.get_named("attachments") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+
+            Outcome::Ok(MessageRow {
+                id: Some(id),
+                project_id,
+                sender_id,
+                thread_id,
+                subject,
+                body_md,
+                importance,
+                ack_required,
+                created_ts,
+                attachments,
+            })
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -3707,22 +3798,33 @@ pub async fn create_file_reservations(
             map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
         );
 
-        // frankensqlite workaround: parameter comparison doesn't work reliably
-        // in concurrent transactions. Use MAX(id) to get the most recently
-        // inserted reservation id. This is safe because we're inside a
-        // transaction and just did the INSERT.
-        let lookup_sql = "SELECT MAX(id) FROM file_reservations";
+        // Use connection-local rowid state to retrieve the ID for this exact insert.
+        // This avoids cross-transaction races that can happen with MAX(id).
+        let lookup_sql = "SELECT last_insert_rowid() AS id";
         let rows = try_in_tx!(
             cx,
             &tracked,
             map_sql_outcome(traw_query(cx, &tracked, lookup_sql, &[]).await)
         );
-        let Some(id) = rows.first().and_then(row_first_i64) else {
+        let Some(id_row) = rows.first() else {
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::Internal(format!(
-                "file reservation insert succeeded but MAX(id) returned NULL for project_id={project_id} agent_id={agent_id} path={path}"
+                "file reservation insert succeeded but last_insert_rowid() returned no row for project_id={project_id} agent_id={agent_id} path={path}"
             )));
         };
+        let id: i64 = match id_row.get_named("id") {
+            Ok(v) => v,
+            Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(map_sql_error(&e));
+            }
+        };
+        if id <= 0 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "file reservation insert succeeded but last_insert_rowid() returned invalid id={id} for project_id={project_id} agent_id={agent_id} path={path}"
+            )));
+        }
         row.id = Some(id);
         out.push(row);
     }
@@ -4443,34 +4545,36 @@ pub async fn list_approved_contact_ids(
 
     let tracked = tracked(&*conn);
 
-    let capped_ids = &candidate_ids[..candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let sql = approved_contact_sql(capped_ids.len());
-
-    let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
-    params.push(Value::BigInt(project_id));
-    params.push(Value::BigInt(sender_id));
-    params.push(Value::BigInt(project_id));
-    for id in capped_ids {
-        params.push(Value::BigInt(*id));
-    }
-
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    match rows_out {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: i64 = match row.get_named("b_agent_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                out.push(id);
-            }
-            Outcome::Ok(out)
+    let mut out: Vec<i64> = Vec::with_capacity(candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS));
+    for chunk in candidate_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = approved_contact_sql(chunk.len());
+        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() + 3);
+        params.push(Value::BigInt(project_id));
+        params.push(Value::BigInt(sender_id));
+        params.push(Value::BigInt(project_id));
+        for id in chunk {
+            params.push(Value::BigInt(*id));
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+
+        let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+        match rows_out {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let id: i64 = match row.get_named("b_agent_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.push(id);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
     }
+    out.sort_unstable();
+    out.dedup();
+    Outcome::Ok(out)
 }
 
 /// List recent contact counterpart IDs for a sender within a project.
@@ -4495,41 +4599,42 @@ pub async fn list_recent_contact_agent_ids(
 
     let tracked = tracked(&*conn);
 
-    let capped_ids = &candidate_ids[..candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let sql = recent_contact_union_sql(capped_ids.len());
-    let mut params: Vec<Value> = Vec::with_capacity((capped_ids.len() * 2) + 6);
-    params.push(Value::BigInt(project_id));
-    params.push(Value::BigInt(sender_id));
-    params.push(Value::BigInt(since_ts));
-    for id in capped_ids {
-        params.push(Value::BigInt(*id));
-    }
-    params.push(Value::BigInt(project_id));
-    params.push(Value::BigInt(sender_id));
-    params.push(Value::BigInt(since_ts));
-    for id in capped_ids {
-        params.push(Value::BigInt(*id));
-    }
-
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    match rows_out {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: i64 = match row.get_named("agent_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                out.push(id);
-            }
-            out.sort_unstable();
-            out.dedup();
-            Outcome::Ok(out)
+    let mut out: Vec<i64> = Vec::with_capacity(candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS));
+    for chunk in candidate_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = recent_contact_union_sql(chunk.len());
+        let mut params: Vec<Value> = Vec::with_capacity((chunk.len() * 2) + 6);
+        params.push(Value::BigInt(project_id));
+        params.push(Value::BigInt(sender_id));
+        params.push(Value::BigInt(since_ts));
+        for id in chunk {
+            params.push(Value::BigInt(*id));
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+        params.push(Value::BigInt(project_id));
+        params.push(Value::BigInt(sender_id));
+        params.push(Value::BigInt(since_ts));
+        for id in chunk {
+            params.push(Value::BigInt(*id));
+        }
+
+        let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+        match rows_out {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let id: i64 = match row.get_named("agent_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.push(id);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
     }
+    out.sort_unstable();
+    out.dedup();
+    Outcome::Ok(out)
 }
 
 /// Check if contact is allowed between two agents.
@@ -6183,12 +6288,13 @@ mod tests {
                 "codex-cli",
                 "gpt-5",
                 Some("policy update test"),
-                Some("auto"),
+                Some("inline"),
             )
             .await
             .into_result()
             .expect("register agent");
             assert_eq!(registered.contact_policy, "auto");
+            assert_eq!(registered.attachments_policy, "inline");
 
             let updated =
                 set_agent_contact_policy_by_name(&cx, &pool, project_id, "BlueLake", "open")
@@ -6199,6 +6305,7 @@ mod tests {
             assert_eq!(updated.name, "BlueLake");
             assert_eq!(updated.program, "codex-cli");
             assert_eq!(updated.contact_policy, "open");
+            assert_eq!(updated.attachments_policy, "inline");
 
             // Whitespace around input name should not break lookup/update.
             let updated2 = set_agent_contact_policy_by_name(
@@ -6212,17 +6319,78 @@ mod tests {
             .into_result()
             .expect("set policy by trimmed name");
             assert_eq!(updated2.contact_policy, "contacts_only");
+            assert_eq!(updated2.attachments_policy, "inline");
 
             let fetched = get_agent(&cx, &pool, project_id, "BlueLake")
                 .await
                 .into_result()
                 .expect("get_agent should work after policy updates");
             assert_eq!(fetched.contact_policy, "contacts_only");
+            assert_eq!(fetched.attachments_policy, "inline");
 
             let cached = crate::read_cache()
                 .get_agent_scoped(pool.sqlite_path(), project_id, "BlueLake")
                 .expect("cache entry should be refreshed");
             assert_eq!(cached.contact_policy, "contacts_only");
+            assert_eq!(cached.attachments_policy, "inline");
+        });
+    }
+
+    #[test]
+    fn register_agent_preserves_existing_attachment_policy_on_other_agent_upserts() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("register_agent_attachment_preservation.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-register-preserve-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let red = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("inline"),
+            )
+            .await
+            .into_result()
+            .expect("register red");
+            assert_eq!(red.attachments_policy, "inline");
+
+            let blue = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueBear",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register blue");
+            assert_eq!(blue.attachments_policy, "auto");
+
+            let red_after = get_agent(&cx, &pool, project_id, "RedFox")
+                .await
+                .into_result()
+                .expect("fetch red after blue registration");
+            assert_eq!(
+                red_after.attachments_policy, "inline",
+                "registering another agent must not clobber existing attachment policy"
+            );
         });
     }
 
@@ -6678,7 +6846,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_possible_wrap)]
-    fn list_recent_contact_agent_ids_caps_candidate_list_at_max_items() {
+    fn list_recent_contact_agent_ids_queries_across_all_candidate_chunks() {
         use asupersync::runtime::RuntimeBuilder;
 
         let rt = RuntimeBuilder::current_thread()
@@ -6746,7 +6914,7 @@ mod tests {
             let mut candidate_ids: Vec<i64> = (0..MAX_IN_CLAUSE_ITEMS as i64)
                 .map(|idx| 10_000 + idx)
                 .collect();
-            // This valid target is beyond the cap, so it must not participate.
+            // Place this valid target beyond the first chunk.
             candidate_ids.push(target_id);
 
             let union_ids = list_recent_contact_agent_ids(
@@ -6772,8 +6940,15 @@ mod tests {
             .into_result()
             .expect("run legacy baseline");
 
-            assert!(union_ids.is_empty(), "target beyond cap should not match");
-            assert_eq!(union_ids, legacy_ids);
+            assert_eq!(
+                union_ids,
+                vec![target_id],
+                "target in a later chunk should still match"
+            );
+            assert!(
+                legacy_ids.is_empty(),
+                "legacy baseline demonstrates the former capped behavior"
+            );
         });
     }
 

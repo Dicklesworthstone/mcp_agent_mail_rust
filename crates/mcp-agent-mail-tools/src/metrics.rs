@@ -13,6 +13,7 @@
 use mcp_agent_mail_core::Log2Histogram;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::TOOL_CLUSTER_MAP;
@@ -26,8 +27,8 @@ static TOOL_CALLS: LazyLock<[AtomicU64; TOOL_COUNT]> =
     LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 static TOOL_ERRORS: LazyLock<[AtomicU64; TOOL_COUNT]> =
     LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
-static TOOL_LATENCIES: LazyLock<[Log2Histogram; TOOL_COUNT]> =
-    LazyLock::new(|| std::array::from_fn(|_| Log2Histogram::new()));
+static TOOL_LATENCIES: LazyLock<[RwLock<Log2Histogram>; TOOL_COUNT]> =
+    LazyLock::new(|| std::array::from_fn(|_| RwLock::new(Log2Histogram::new())));
 
 /// Convert tool name -> stable index into the pre-allocated counter arrays.
 ///
@@ -79,7 +80,9 @@ pub fn record_error(tool_name: &str) {
 #[inline]
 pub fn record_latency_idx(tool_index: usize, latency_us: u64) {
     debug_assert!(tool_index < TOOL_COUNT);
-    TOOL_LATENCIES[tool_index].record(latency_us);
+    if let Ok(h) = TOOL_LATENCIES[tool_index].read() {
+        h.record(latency_us);
+    }
 }
 
 /// Record per-tool latency by name (convenience wrapper).
@@ -100,7 +103,9 @@ pub fn reset_tool_metrics() {
         e.store(0, Ordering::Relaxed);
     }
     for h in TOOL_LATENCIES.iter() {
-        h.reset();
+        if let Ok(guard) = h.write() {
+            guard.reset();
+        }
     }
 }
 
@@ -110,7 +115,9 @@ pub fn reset_tool_metrics() {
 /// window view of latency rather than cumulative all-time stats.
 pub fn reset_tool_latencies() {
     for h in TOOL_LATENCIES.iter() {
-        h.reset();
+        if let Ok(guard) = h.write() {
+            guard.reset();
+        }
     }
 }
 
@@ -430,7 +437,7 @@ fn us_to_ms(us: u64) -> f64 {
 
 /// Build a `LatencySnapshot` from a tool's histogram, or `None` if no data.
 fn latency_snapshot_for(idx: usize) -> Option<LatencySnapshot> {
-    let hs = TOOL_LATENCIES[idx].snapshot();
+    let hs = TOOL_LATENCIES[idx].read().ok()?.snapshot();
     if hs.count == 0 {
         return None;
     }

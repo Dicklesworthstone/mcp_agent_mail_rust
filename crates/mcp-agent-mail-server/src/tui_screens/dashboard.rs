@@ -1389,15 +1389,8 @@ fn format_ctx(project: Option<&str>, agent: Option<&str>) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    // Find a valid UTF-8 char boundary at or before `max`.
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
+    let max_u16 = u16::try_from(max).unwrap_or(u16::MAX);
+    crate::tui_widgets::truncate_width(s, max_u16)
 }
 
 fn summarize_recipients(recipients: &[String]) -> String {

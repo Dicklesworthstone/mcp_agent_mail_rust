@@ -1508,52 +1508,34 @@ impl MailAppModel {
             return;
         };
 
-        let lookup_sql = "SELECT thread_id FROM messages WHERE id = ? LIMIT 1";
-        let current_thread_id = match conn.query_sync(lookup_sql, &[Value::BigInt(message_id)]) {
-            Ok(rows) => rows
-                .into_iter()
-                .next()
-                .and_then(|row| row.get_named::<String>("thread_id").ok()),
+        match mcp_agent_mail_db::sync::update_message_thread_id(
+            &conn,
+            message_id,
+            target_thread_id,
+        ) {
+            Ok(true) => {
+                self.record_action_outcome(ActionOutcome::Success {
+                    operation: "rethread_message".to_string(),
+                    summary: format!("Moved #{message_id} to thread {target_thread_id}"),
+                });
+            }
+            Ok(false) => {
+                // No-op (already in thread)
+            }
+            Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+                self.notifications.notify(
+                    Toast::new(format!("Message {message_id} not found"))
+                        .icon(ToastIcon::Warning)
+                        .duration(Duration::from_secs(3)),
+                );
+            }
             Err(e) => {
                 self.record_action_outcome(ActionOutcome::Failure {
                     operation: "rethread_message".to_string(),
-                    error: format!("query failed: {e}"),
+                    error: format!("update failed: {e}"),
                 });
-                return;
             }
-        };
-
-        let Some(current_thread_id) = current_thread_id else {
-            self.notifications.notify(
-                Toast::new(format!("Message {message_id} not found"))
-                    .icon(ToastIcon::Warning)
-                    .duration(Duration::from_secs(3)),
-            );
-            return;
-        };
-        if current_thread_id == target_thread_id {
-            return;
         }
-
-        let update_sql = "UPDATE messages SET thread_id = ? WHERE id = ?";
-        if let Err(e) = conn.execute_sync(
-            update_sql,
-            &[
-                Value::Text(target_thread_id.to_string()),
-                Value::BigInt(message_id),
-            ],
-        ) {
-            self.record_action_outcome(ActionOutcome::Failure {
-                operation: "rethread_message".to_string(),
-                error: format!("update failed: {e}"),
-            });
-            return;
-        }
-
-        self.record_action_outcome(ActionOutcome::Success {
-            operation: "rethread_message".to_string(),
-            summary: format!("Moved #{message_id} to thread {target_thread_id}"),
-        });
     }
 
     /// Copy text to the terminal clipboard via OSC 52, with system and

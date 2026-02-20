@@ -17,10 +17,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SUITES_DIR="${PROJECT_ROOT}/tests/e2e"
 
+# Prefer a large temp root when available; keep target dir colocated with TMPDIR.
+if [ -z "${TMPDIR:-}" ]; then
+    if [ -d "/data/tmp" ]; then
+        export TMPDIR="/data/tmp"
+    else
+        export TMPDIR="/tmp"
+    fi
+fi
+
 # Set CARGO_TARGET_DIR if not already set (prevent multi-agent contention)
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-    export CARGO_TARGET_DIR="/data/tmp/cargo-target"
+    export CARGO_TARGET_DIR="${TMPDIR%/}/cargo-target"
 fi
+mkdir -p "${CARGO_TARGET_DIR}" 2>/dev/null || true
 
 # Colors
 _c_reset='\033[0m'

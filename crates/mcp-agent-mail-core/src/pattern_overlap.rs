@@ -112,17 +112,15 @@ impl CompiledPattern {
 ///    - If one is glob and one literal, check match.
 ///    - If both literal, check equality.
 fn segments_overlap(p1: &str, p2: &str) -> bool {
-    // fast path for recursive globs
-    if p1.contains("**") || p2.contains("**") {
-        return true;
-    }
-
     let mut i1 = p1.split('/');
     let mut i2 = p2.split('/');
 
     loop {
         match (i1.next(), i2.next()) {
             (Some(seg1), Some(seg2)) => {
+                if seg1 == "**" || seg2 == "**" {
+                    return true; // We reached a recursive glob, assume overlap from here on
+                }
                 if !segment_pair_overlaps(seg1, seg2) {
                     return false;
                 }
@@ -150,12 +148,18 @@ fn segment_pair_overlaps(s1: &str, s2: &str) -> bool {
 
     if g1 {
         // s1 glob, s2 literal
-        return Glob::new(s1).is_ok_and(|g| g.compile_matcher().is_match(s2));
+        return GlobBuilder::new(s1)
+            .literal_separator(true)
+            .build()
+            .is_ok_and(|g| g.compile_matcher().is_match(s2));
     }
 
     if g2 {
         // s2 glob, s1 literal
-        return Glob::new(s2).is_ok_and(|g| g.compile_matcher().is_match(s1));
+        return GlobBuilder::new(s2)
+            .literal_separator(true)
+            .build()
+            .is_ok_and(|g| g.compile_matcher().is_match(s1));
     }
 
     // Both literal, unequal

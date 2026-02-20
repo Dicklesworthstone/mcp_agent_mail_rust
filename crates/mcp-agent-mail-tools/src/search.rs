@@ -656,6 +656,7 @@ pub async fn search_messages(
     let max_results_raw = limit.unwrap_or(20).clamp(1, 1000);
     let max_results = max_results_raw.unsigned_abs() as usize;
     let offset_val = offset.unwrap_or(0).max(0).unsigned_abs() as usize;
+    let planner_limit = max_results.saturating_add(offset_val).min(1000);
     let want_explain = explain.unwrap_or(false);
 
     // Legacy parity: empty query returns an empty result set (no DB call).
@@ -716,7 +717,7 @@ pub async fn search_messages(
         ack_required: None,
         time_range,
         ranking: ranking_mode,
-        limit: Some(max_results),
+        limit: Some(planner_limit),
         cursor: None,
         // Always collect explain internally so degraded diagnostics remain deterministic
         // even when `explain=false` for the caller.
@@ -745,6 +746,7 @@ pub async fn search_messages(
         .results
         .into_iter()
         .skip(offset_val)
+        .take(max_results)
         .map(|scoped| {
             let r = scoped.result;
             SearchResult {
@@ -772,6 +774,11 @@ pub async fn search_messages(
     );
 
     let diagnostics = derive_search_diagnostics(planner_response.explain.as_ref());
+    let next_cursor = if offset_val == 0 {
+        planner_response.next_cursor
+    } else {
+        None
+    };
     let response = SearchResponse {
         result: results,
         assistance: planner_response.assistance,
@@ -781,7 +788,7 @@ pub async fn search_messages(
         } else {
             None
         },
-        next_cursor: planner_response.next_cursor,
+        next_cursor,
         diagnostics,
     };
     serde_json::to_string(&response)

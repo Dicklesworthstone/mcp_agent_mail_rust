@@ -1016,6 +1016,53 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v12: Rebuild inbox_stats INSERT trigger without UPSERT ─────────
+    //
+    // Some engines can surface PRIMARY KEY violations when running the prior
+    // UPSERT form inside a trigger. Recreate trigger with an update-first
+    // path plus insert-if-missing to keep behavior identical while avoiding
+    // conflict-handling syntax in trigger bodies.
+    migrations.push(Migration::new(
+        "v12_drop_trg_inbox_stats_insert".to_string(),
+        "drop inbox_stats insert trigger before compatibility recreation".to_string(),
+        "DROP TRIGGER IF EXISTS trg_inbox_stats_insert".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v12_recreate_trg_inbox_stats_insert_compat".to_string(),
+        "recreate inbox_stats insert trigger with update-then-insert-if-missing".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_inbox_stats_insert \
+         AFTER INSERT ON message_recipients \
+         BEGIN \
+             UPDATE inbox_stats SET \
+                 total_count = total_count + 1, \
+                 unread_count = unread_count + 1, \
+                 ack_pending_count = ack_pending_count + \
+                     (SELECT CASE WHEN m.ack_required = 1 THEN 1 ELSE 0 END FROM messages m WHERE m.id = NEW.message_id), \
+                 last_message_ts = CASE \
+                     WHEN last_message_ts IS NULL THEN \
+                         (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) \
+                     WHEN (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) IS NULL THEN \
+                         last_message_ts \
+                     WHEN last_message_ts < (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) THEN \
+                         (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) \
+                     ELSE \
+                         last_message_ts \
+                 END \
+             WHERE agent_id = NEW.agent_id; \
+             INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+             SELECT \
+                 NEW.agent_id, \
+                 1, \
+                 1, \
+                 (SELECT CASE WHEN m.ack_required = 1 THEN 1 ELSE 0 END FROM messages m WHERE m.id = NEW.message_id), \
+                 (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) \
+             WHERE NOT EXISTS (SELECT 1 FROM inbox_stats WHERE agent_id = NEW.agent_id); \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -1248,6 +1295,7 @@ mod tests {
     use super::*;
     use crate::DbConn;
     use asupersync::runtime::RuntimeBuilder;
+    use sqlmodel_core::Value;
 
     fn block_on<F, Fut, T>(f: F) -> T
     where
@@ -1259,6 +1307,67 @@ mod tests {
             .build()
             .expect("build runtime");
         rt.block_on(f(cx))
+    }
+
+    fn insert_inbox_stats_test_project(conn: &DbConn) {
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("inbox-stats-proj".to_string()),
+                Value::Text("/tmp/inbox-stats-proj".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert project");
+    }
+
+    fn insert_inbox_stats_test_agent(conn: &DbConn, name: &str) {
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text(name.to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert agent");
+    }
+
+    fn insert_inbox_stats_test_message(conn: &DbConn, message_id: i64, created_ts: i64) {
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(message_id),
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Null,
+                Value::Text("subject".to_string()),
+                Value::Text("body".to_string()),
+                Value::Text("normal".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(created_ts),
+                Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert message");
+
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, NULL, NULL)",
+            &[
+                Value::BigInt(message_id),
+                Value::BigInt(2),
+                Value::Text("to".to_string()),
+            ],
+        )
+        .expect("insert message recipient");
     }
 
     #[test]
@@ -1291,8 +1400,6 @@ mod tests {
 
     #[test]
     fn migrations_preserve_existing_data() {
-        use sqlmodel_core::Value;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_preserve.db");
         let conn =
@@ -1329,6 +1436,57 @@ mod tests {
         assert_eq!(
             rows[0].get_named::<String>("slug").unwrap_or_default(),
             "proj"
+        );
+    }
+
+    #[test]
+    fn inbox_stats_trigger_handles_repeated_recipient_deliveries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("inbox_stats_trigger_repeated_recipient.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+        });
+
+        insert_inbox_stats_test_project(&conn);
+        insert_inbox_stats_test_agent(&conn, "Sender");
+        insert_inbox_stats_test_agent(&conn, "Recipient");
+
+        for (message_id, created_ts) in [(1_i64, 100_i64), (2_i64, 200_i64)] {
+            insert_inbox_stats_test_message(&conn, message_id, created_ts);
+        }
+
+        let rows = conn
+            .query_sync(
+                "SELECT total_count, unread_count, ack_pending_count, last_message_ts \
+                 FROM inbox_stats WHERE agent_id = ?",
+                &[Value::BigInt(2)],
+            )
+            .expect("query inbox stats");
+        assert_eq!(rows.len(), 1, "expected inbox_stats row for recipient");
+        let row = &rows[0];
+        assert_eq!(
+            row.get_named::<i64>("total_count")
+                .expect("total_count value"),
+            2
+        );
+        assert_eq!(
+            row.get_named::<i64>("unread_count")
+                .expect("unread_count value"),
+            2
+        );
+        assert_eq!(
+            row.get_named::<i64>("ack_pending_count")
+                .expect("ack_pending_count value"),
+            0
+        );
+        assert_eq!(
+            row.get_named::<i64>("last_message_ts")
+                .expect("last_message_ts value"),
+            200
         );
     }
 

@@ -21,6 +21,8 @@
 - [x] Hardened `tui_ws_input` in `mcp-agent-mail-server` against DoS by truncating large key events.
 - [x] Disabled unsupported `broadcast` messaging in `mcp-agent-mail-tools` (returns error if used).
 - [x] Hardened `force_release_file_reservation` in `mcp-agent-mail-tools` by truncating large note payloads.
+- [x] Fix visual width/truncation bugs in TUI `MessageEntry` and `Dashboard` rendering (Unicode-safe).
+- [x] Fix critical OOM DoS vector in `store_attachment` and `store_raw_attachment` by validating file metadata size before reading to memory.
 
 ## Pending
 - None identified.

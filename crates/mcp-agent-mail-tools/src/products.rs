@@ -269,6 +269,8 @@ pub struct ProductSearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistance: Option<mcp_agent_mail_db::QueryAssistance>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<crate::search::SearchDiagnostics>,
 }
 
@@ -310,6 +312,7 @@ pub async fn search_messages_product(
         let response = ProductSearchResponse {
             result: Vec::new(),
             assistance: None,
+            next_cursor: None,
             diagnostics: None,
         };
         return serde_json::to_string(&response)
@@ -408,6 +411,7 @@ pub async fn search_messages_product(
     let response = ProductSearchResponse {
         result,
         assistance: planner_response.assistance,
+        next_cursor: planner_response.next_cursor,
         diagnostics,
     };
     serde_json::to_string(&response)
@@ -947,6 +951,7 @@ mod tests {
         let resp = ProductSearchResponse {
             result: Vec::new(),
             assistance: None,
+            next_cursor: None,
             diagnostics: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -980,6 +985,7 @@ mod tests {
                 },
             ],
             assistance: None,
+            next_cursor: None,
             diagnostics: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -987,6 +993,20 @@ mod tests {
         assert_eq!(parsed.result.len(), 2);
         assert_eq!(parsed.result[0].subject, "First");
         assert_eq!(parsed.result[1].subject, "Second");
+    }
+
+    #[test]
+    fn product_search_response_serializes_cursor_when_present() {
+        let resp = ProductSearchResponse {
+            result: Vec::new(),
+            assistance: None,
+            next_cursor: Some("cursor-1".to_string()),
+            diagnostics: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"next_cursor\":\"cursor-1\""));
+        let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.next_cursor.as_deref(), Some("cursor-1"));
     }
 
     // -----------------------------------------------------------------------
