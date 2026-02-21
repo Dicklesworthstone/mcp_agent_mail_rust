@@ -7939,8 +7939,6 @@ dependencies = [
 [[package]]
 name = "uring-fs"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad72d8ff71ab07acacaa3317286c41fd065d291b6631f49942f9051ff0009369"
 dependencies = [
  "io-uring",
  "libc",

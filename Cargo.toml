@@ -151,3 +151,5 @@ inherits = "release"     # Benchmarks use same optimizations as release
 # type-identity mismatches (Cx/Outcome/etc).
 # Uses /dp/ canonical path to match frankensearch's Cargo.toml.
 asupersync = { path = "/dp/asupersync" }
+# Local hotfix: avoid panic-on-read in uring-fs (1.4.0) under release panic=abort.
+uring-fs = { path = "vendor/uring-fs" }
