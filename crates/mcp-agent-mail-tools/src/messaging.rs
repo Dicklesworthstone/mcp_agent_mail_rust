@@ -334,10 +334,10 @@ async fn resolve_or_register_agent(
                 pool,
                 project_id,
                 agent_name,
-                &sender.program,
-                &sender.model,
-                Some(sender.task_description.as_str()),
-                Some(sender.attachments_policy.as_str()),
+                "unknown",
+                "unknown",
+                None,
+                None,
             )
             .await
             {

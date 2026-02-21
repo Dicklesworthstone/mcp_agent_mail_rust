@@ -567,15 +567,13 @@ pub async fn macro_contact_handshake(
         if to_row.is_err() {
             let should_register = register_if_missing.unwrap_or(true);
             if should_register {
-                let program = program.unwrap_or_else(|| "unknown".to_string());
-                let model = model.unwrap_or_else(|| "unknown".to_string());
                 let _ = crate::identity::register_agent(
                     ctx,
                     project.human_key.clone(),
-                    program,
-                    model,
+                    "unknown".to_string(),
+                    "unknown".to_string(),
                     Some(target_agent.clone()),
-                    task_description,
+                    None,
                     None,
                 )
                 .await?;
