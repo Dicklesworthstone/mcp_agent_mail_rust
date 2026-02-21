@@ -1534,16 +1534,16 @@ const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS_ENV: &str =
     "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS";
 const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS_ENV: &str =
     "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS";
-const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS_ENV: &str =
-    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS";
-const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS_ENV: &str =
-    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS";
+const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT_ENV: &str =
+    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT";
+const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT_ENV: &str =
+    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT";
 const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR_ENV: &str =
     "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR";
 const DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_MS: u64 = 250;
 const DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS: u64 = 120;
-const DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS: u32 = 70;
-const DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS: u32 = 40;
+const DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT: u32 = 70;
+const DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT: u32 = 40;
 const DEFAULT_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1570,8 +1570,8 @@ struct HybridBudgetGovernorConfig {
     enabled: bool,
     tight_ms: u64,
     critical_ms: u64,
-    tight_scale_bps: u32,
-    critical_scale_bps: u32,
+    tight_scale_pct: u32,
+    critical_scale_pct: u32,
     result_floor: usize,
 }
 
@@ -1581,8 +1581,8 @@ impl Default for HybridBudgetGovernorConfig {
             enabled: true,
             tight_ms: DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_MS,
             critical_ms: DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS,
-            tight_scale_bps: DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS,
-            critical_scale_bps: DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS,
+            tight_scale_pct: DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT,
+            critical_scale_pct: DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT,
             result_floor: DEFAULT_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR,
         }
     }
@@ -1773,15 +1773,15 @@ fn hybrid_budget_governor_config_from_env() -> HybridBudgetGovernorConfig {
         ),
         tight_ms,
         critical_ms,
-        tight_scale_bps: env_u32(
-            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_BPS_ENV,
-            defaults.tight_scale_bps,
+        tight_scale_pct: env_u32(
+            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT_ENV,
+            defaults.tight_scale_pct,
             1,
             100,
         ),
-        critical_scale_bps: env_u32(
-            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_BPS_ENV,
-            defaults.critical_scale_bps,
+        critical_scale_pct: env_u32(
+            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT_ENV,
+            defaults.critical_scale_pct,
             1,
             100,
         ),
@@ -1806,9 +1806,9 @@ const fn classify_hybrid_budget_tier(
     }
 }
 
-fn scale_limit_by_bps(limit: usize, scale_bps: u32) -> usize {
+fn scale_limit_by_pct(limit: usize, scale_pct: u32) -> usize {
     let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
-    let scaled = limit_u64.saturating_mul(u64::from(scale_bps)).div_ceil(100);
+    let scaled = limit_u64.saturating_mul(u64::from(scale_pct)).div_ceil(100);
     usize::try_from(scaled).unwrap_or(usize::MAX).max(1)
 }
 
@@ -1837,12 +1837,12 @@ fn apply_hybrid_budget_governor(
         }
         HybridBudgetGovernorTier::Tight => {
             let lexical_limit =
-                scale_limit_by_bps(base_budget.lexical_limit, config.tight_scale_bps)
+                scale_limit_by_pct(base_budget.lexical_limit, config.tight_scale_pct)
                     .max(result_floor);
             let semantic_limit = if base_budget.semantic_limit == 0 {
                 0
             } else {
-                scale_limit_by_bps(base_budget.semantic_limit, config.tight_scale_bps).max(1)
+                scale_limit_by_pct(base_budget.semantic_limit, config.tight_scale_pct).max(1)
             };
             let combined_limit = base_budget
                 .combined_limit
@@ -1859,7 +1859,7 @@ fn apply_hybrid_budget_governor(
         }
         HybridBudgetGovernorTier::Critical => {
             let lexical_limit =
-                scale_limit_by_bps(base_budget.lexical_limit, config.critical_scale_bps)
+                scale_limit_by_pct(base_budget.lexical_limit, config.critical_scale_pct)
                     .max(result_floor);
             let combined_limit = lexical_limit.max(result_floor);
             (

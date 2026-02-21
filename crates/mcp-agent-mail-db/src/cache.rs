@@ -251,10 +251,10 @@ impl ReadCache {
     /// Look up a project by slug. Returns `None` if not cached or expired.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_project(&self, slug: &str) -> Option<ProjectRow> {
-        let slug_owned = slug.to_owned();
         let mut cache = self.projects_by_slug.write();
-        match cache.get(&slug_owned) {
+        match cache.get(slug) {
             Some(entry) if entry.is_expired(PROJECT_TTL) => {
+                let slug_owned = slug.to_owned();
                 mcp_agent_mail_core::evidence_ledger().record(
                     "cache.eviction",
                     serde_json::json!({ "key": slug_owned, "reason": "ttl_expired", "category": "project" }),
@@ -263,7 +263,7 @@ impl ReadCache {
                     0.9,
                     "s3fifo_v1",
                 );
-                cache.remove(&slug_owned);
+                cache.remove(slug);
                 CACHE_METRICS.record_project_miss();
                 return None;
             }
@@ -274,7 +274,7 @@ impl ReadCache {
                 return None;
             }
         }
-        let entry = cache.get_mut(&slug_owned)?;
+        let entry = cache.get_mut(slug)?;
         entry.touch();
         let value = entry.value.clone();
         CACHE_METRICS.record_project_hit();
@@ -284,11 +284,10 @@ impl ReadCache {
     /// Look up a project by `human_key`.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_project_by_human_key(&self, human_key: &str) -> Option<ProjectRow> {
-        let key_owned = human_key.to_owned();
         let mut cache = self.projects_by_human_key.write();
-        match cache.get(&key_owned) {
+        match cache.get(human_key) {
             Some(entry) if entry.is_expired(PROJECT_TTL) => {
-                cache.remove(&key_owned);
+                cache.remove(human_key);
                 CACHE_METRICS.record_project_miss();
                 return None;
             }
@@ -298,7 +297,7 @@ impl ReadCache {
                 return None;
             }
         }
-        let entry = cache.get_mut(&key_owned)?;
+        let entry = cache.get_mut(human_key)?;
         entry.touch();
         let value = entry.value.clone();
         CACHE_METRICS.record_project_hit();

@@ -94,18 +94,22 @@ where
     ///
     /// Returns `None` if the key is not present (ghost entries are not
     /// visible to callers).
-    pub fn get(&mut self, key: &K) -> Option<&V> {
+    pub fn get<Q>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         let loc = self.index.get(key)?;
         match loc {
             Location::Small => {
-                if let Some(entry) = self.small.iter_mut().find(|e| &e.key == key) {
+                if let Some(entry) = self.small.iter_mut().find(|e| e.key.borrow() == key) {
                     entry.freq = (entry.freq + 1).min(3);
                     return Some(&entry.value);
                 }
                 None
             }
             Location::Main => {
-                if let Some(entry) = self.main.iter_mut().find(|e| &e.key == key) {
+                if let Some(entry) = self.main.iter_mut().find(|e| e.key.borrow() == key) {
                     entry.freq = (entry.freq + 1).min(3);
                     return Some(&entry.value);
                 }
@@ -119,18 +123,22 @@ where
     ///
     /// Increments the frequency counter on hit. Returns `None` if the key
     /// is not present or is a ghost entry.
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         let loc = self.index.get(key)?;
         match loc {
             Location::Small => {
-                if let Some(entry) = self.small.iter_mut().find(|e| &e.key == key) {
+                if let Some(entry) = self.small.iter_mut().find(|e| e.key.borrow() == key) {
                     entry.freq = (entry.freq + 1).min(3);
                     return Some(&mut entry.value);
                 }
                 None
             }
             Location::Main => {
-                if let Some(entry) = self.main.iter_mut().find(|e| &e.key == key) {
+                if let Some(entry) = self.main.iter_mut().find(|e| e.key.borrow() == key) {
                     entry.freq = (entry.freq + 1).min(3);
                     return Some(&mut entry.value);
                 }
@@ -142,7 +150,11 @@ where
 
     /// Check whether a key is present (Small or Main, not Ghost).
     #[must_use]
-    pub fn contains_key(&self, key: &K) -> bool {
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         matches!(self.index.get(key), Some(Location::Small | Location::Main))
     }
 
@@ -214,23 +226,27 @@ where
     }
 
     /// Remove a key from the cache entirely (including Ghost).
-    pub fn remove(&mut self, key: &K) -> Option<V> {
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         let loc = self.index.remove(key)?;
         match loc {
             Location::Small => {
-                if let Some(pos) = self.small.iter().position(|e| &e.key == key) {
+                if let Some(pos) = self.small.iter().position(|e| e.key.borrow() == key) {
                     return Some(self.small.remove(pos).unwrap().value);
                 }
                 None
             }
             Location::Main => {
-                if let Some(pos) = self.main.iter().position(|e| &e.key == key) {
+                if let Some(pos) = self.main.iter().position(|e| e.key.borrow() == key) {
                     return Some(self.main.remove(pos).unwrap().value);
                 }
                 None
             }
             Location::Ghost => {
-                self.ghost.retain(|k| k != key);
+                self.ghost.retain(|k| k.borrow() != key);
                 None
             }
         }

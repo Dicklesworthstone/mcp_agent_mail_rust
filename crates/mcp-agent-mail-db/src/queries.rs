@@ -1321,32 +1321,33 @@ pub async fn get_agents_by_ids(
 
     let tracked = tracked(&*conn);
 
-    let placeholders = placeholders(missing_ids.len());
-    let sql = format!(
-        "SELECT id, project_id, name, program, model, task_description, \
-         inception_ts, last_active_ts, attachments_policy, contact_policy \
-         FROM agents WHERE id IN ({placeholders})"
-    );
+    for chunk in missing_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT id, project_id, name, program, model, task_description, \
+             inception_ts, last_active_ts, attachments_policy, contact_policy \
+             FROM agents WHERE id IN ({placeholders})"
+        );
 
-    let capped_ids = &missing_ids[..missing_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len());
-    for id in capped_ids {
-        params.push(Value::BigInt(*id));
-    }
-
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            for row in rows {
-                let agent = decode_agent_row_indexed(&row);
-                crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &agent);
-                out.push(agent);
-            }
-            Outcome::Ok(out)
+        let mut params: Vec<Value> = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            params.push(Value::BigInt(*id));
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let agent = decode_agent_row_indexed(&row);
+                    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &agent);
+                    out.push(agent);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
     }
+    Outcome::Ok(out)
 }
 
 /// Touch agent (deferred).
@@ -2069,87 +2070,88 @@ pub async fn get_messages_details_by_ids(
 
     let tracked = tracked(&*conn);
 
-    let placeholders = placeholders(message_ids.len());
-    let sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                m.importance, m.ack_required, m.created_ts, m.attachments, a.name as from_name \
-         FROM messages m \
-         JOIN agents a ON a.id = m.sender_id \
-         WHERE m.id IN ({placeholders})"
-    );
+    let mut out = Vec::with_capacity(message_ids.len());
 
-    let capped_ids = &message_ids[..message_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let params: Vec<Value> = capped_ids.iter().map(|&id| Value::BigInt(id)).collect();
+    for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+                    m.importance, m.ack_required, m.created_ts, m.attachments, a.name as from_name \
+             FROM messages m \
+             JOIN agents a ON a.id = m.sender_id \
+             WHERE m.id IN ({placeholders})"
+        );
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    match rows_out {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: i64 = match row.get_named("id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let project_id: i64 = match row.get_named("project_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let sender_id: i64 = match row.get_named("sender_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let thread_id: Option<String> = match row.get_named("thread_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let subject: String = match row.get_named("subject") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let body_md: String = match row.get_named("body_md") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let importance: String = match row.get_named("importance") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let ack_required: i64 = match row.get_named("ack_required") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let created_ts: i64 = match row.get_named("created_ts") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let attachments: String = match row.get_named("attachments") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let from: String = match row.get_named("from_name") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                out.push(ThreadMessageRow {
-                    id,
-                    project_id,
-                    sender_id,
-                    thread_id,
-                    subject,
-                    body_md,
-                    importance,
-                    ack_required,
-                    created_ts,
-                    attachments,
-                    from,
-                });
+        let params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
+
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let id: i64 = match row.get_named("id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let project_id: i64 = match row.get_named("project_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let sender_id: i64 = match row.get_named("sender_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let thread_id: Option<String> = match row.get_named("thread_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let subject: String = match row.get_named("subject") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let body_md: String = match row.get_named("body_md") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let importance: String = match row.get_named("importance") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let ack_required: i64 = match row.get_named("ack_required") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let created_ts: i64 = match row.get_named("created_ts") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let attachments: String = match row.get_named("attachments") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let from: String = match row.get_named("from_name") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.push(ThreadMessageRow {
+                        id,
+                        project_id,
+                        sender_id,
+                        thread_id,
+                        subject,
+                        body_md,
+                        importance,
+                        ack_required,
+                        created_ts,
+                        attachments,
+                        from,
+                    });
+                }
             }
-            Outcome::Ok(out)
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
     }
+    Outcome::Ok(out)
 }
 
 /// List messages for a thread.
@@ -2297,39 +2299,43 @@ pub async fn list_message_recipient_names_for_messages(
 
     let tracked = tracked(&*conn);
 
-    let placeholders = placeholders(message_ids.len());
-    let sql = format!(
-        "SELECT DISTINCT a.name \
-         FROM message_recipients r \
-         JOIN agents a ON a.id = r.agent_id \
-         JOIN messages m ON m.id = r.message_id \
-         WHERE m.project_id = ? AND r.message_id IN ({placeholders})"
-    );
+    let mut out = Vec::new();
 
-    let capped_ids = &message_ids[..message_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len() + 1);
-    params.push(Value::BigInt(project_id));
-    for id in capped_ids {
-        params.push(Value::BigInt(*id));
-    }
+    for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT DISTINCT a.name \
+             FROM message_recipients r \
+             JOIN agents a ON a.id = r.agent_id \
+             JOIN messages m ON m.id = r.message_id \
+             WHERE m.project_id = ? AND r.message_id IN ({placeholders})"
+        );
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    match rows_out {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let name: String = match row.get_named("name") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                out.push(name);
-            }
-            Outcome::Ok(out)
+        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
+        params.push(Value::BigInt(project_id));
+        for id in chunk {
+            params.push(Value::BigInt(*id));
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let name: String = match row.get_named("name") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.push(name);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
     }
+
+    out.sort();
+    out.dedup();
+    Outcome::Ok(out)
 }
 
 /// Get message by ID
@@ -5193,36 +5199,37 @@ pub async fn get_reservations_by_ids(
 
     let tracked = tracked(&*conn);
 
-    let placeholders = placeholders(ids.len());
-    let sql = format!(
-        "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
-                created_ts, expires_ts, released_ts \
-         FROM file_reservations \
-         WHERE id IN ({placeholders})"
-    );
+    let mut out = Vec::with_capacity(ids.len());
 
-    let capped_ids = &ids[..ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let mut params = Vec::with_capacity(capped_ids.len());
-    for id in capped_ids {
-        params.push(Value::BigInt(*id));
-    }
+    for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
+                    created_ts, expires_ts, released_ts \
+             FROM file_reservations \
+             WHERE id IN ({placeholders})"
+        );
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    match rows_out {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for r in &rows {
-                match decode_file_reservation_row(r) {
-                    Ok(row) => out.push(row),
-                    Err(e) => return Outcome::Err(e),
+        let mut params = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            params.push(Value::BigInt(*id));
+        }
+
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for r in &rows {
+                    match decode_file_reservation_row(r) {
+                        Ok(row) => out.push(row),
+                        Err(e) => return Outcome::Err(e),
+                    }
                 }
             }
-            Outcome::Ok(out)
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
     }
+    Outcome::Ok(out)
 }
 
 /// Release specific file reservations by their IDs.
@@ -5250,34 +5257,32 @@ pub async fn release_reservations_by_ids(
     let tracked = tracked(&*conn);
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Build parameterized IN clause.
-    let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
-    let sql = format!(
-        "UPDATE file_reservations SET released_ts = ? WHERE id IN ({}) AND released_ts IS NULL",
-        placeholders.join(",")
-    );
+    let mut total_affected = 0usize;
 
-    let mut params = Vec::with_capacity(1 + ids.len());
-    params.push(Value::BigInt(now));
-    for &id in ids {
-        params.push(Value::BigInt(id));
+    for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        // Build parameterized IN clause.
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+        let sql = format!(
+            "UPDATE file_reservations SET released_ts = ? WHERE id IN ({}) AND released_ts IS NULL",
+            placeholders.join(",")
+        );
+
+        let mut params = Vec::with_capacity(1 + chunk.len());
+        params.push(Value::BigInt(now));
+        for &id in chunk {
+            params.push(Value::BigInt(id));
+        }
+
+        let n = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+        );
+        total_affected = total_affected.saturating_add(usize::try_from(n).unwrap_or(0));
     }
 
-    let n = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
-    );
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    usize::try_from(n).map_or_else(
-        |_| {
-            Outcome::Err(DbError::invalid(
-                "row_count",
-                "row count exceeds usize::MAX",
-            ))
-        },
-        Outcome::Ok,
-    )
+    Outcome::Ok(total_affected)
 }
 
 // =============================================================================
