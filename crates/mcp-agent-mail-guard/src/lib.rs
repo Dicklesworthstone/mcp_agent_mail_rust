@@ -484,7 +484,7 @@ def check_conflicts(paths, reservations):
                 break
             
             # Directory prefix matching for non-glob patterns
-            has_glob = any(c in pattern for c in "*?[{")
+            has_glob = any(c in pattern for c in "*?[{{")
             if not has_glob:
                 # Normal prefix check: file is inside reserved dir
                 if f.startswith(pattern + "/"):
