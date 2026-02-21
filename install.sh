@@ -63,7 +63,7 @@ log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 info() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 39 "-> $*"
+    gum style --foreground 39 -- "-> $*"
   else
     echo -e "\033[0;34m->\033[0m $*"
   fi
