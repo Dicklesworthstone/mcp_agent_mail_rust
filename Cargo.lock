@@ -451,8 +451,22 @@ dependencies = [
  "crossterm 0.29.0",
  "dunce",
  "fsqlite",
+ "fsqlite-ast",
+ "fsqlite-btree",
+ "fsqlite-core",
  "fsqlite-error",
+ "fsqlite-ext-fts5",
+ "fsqlite-ext-json",
+ "fsqlite-func",
+ "fsqlite-mvcc",
+ "fsqlite-observability",
+ "fsqlite-pager",
+ "fsqlite-parser",
+ "fsqlite-planner",
  "fsqlite-types",
+ "fsqlite-vdbe",
+ "fsqlite-vfs",
+ "fsqlite-wal",
  "indicatif 0.18.4",
  "once_cell",
  "regex",
@@ -2011,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "asupersync",
  "dirs",
