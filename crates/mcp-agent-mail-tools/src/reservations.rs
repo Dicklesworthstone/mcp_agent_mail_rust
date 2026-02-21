@@ -274,7 +274,17 @@ pub async fn file_reservation_paths(
     let mut normalized_paths = Vec::with_capacity(paths.len());
     for p in &paths {
         match relativize_path(&project.human_key, p) {
-            Some(rel) => normalized_paths.push(rel),
+            Some(rel) => {
+                if rel.is_empty() {
+                    return Err(legacy_tool_error(
+                        "INVALID_PATH",
+                        "Cannot reserve the project root directory itself. Please use more specific patterns.",
+                        true,
+                        json!({ "path": p }),
+                    ));
+                }
+                normalized_paths.push(rel);
+            }
             None => {
                 return Err(legacy_tool_error(
                     "INVALID_PATH",
@@ -359,13 +369,10 @@ pub async fn file_reservation_paths(
         // Check conflicts with existing reservations
         let conflict_refs = index.find_conflicts(path_pat);
 
-        // Check conflicts with previously granted paths in this same request (self-conflict/dedup)
-        let self_conflict = granted_patterns.contains(path)
-            || granted_patterns
-                .iter()
-                .any(|granted| crate::patterns_overlap(granted, path));
+        // Deduplicate exact same patterns in the request
+        let exact_duplicate = granted_patterns.contains(path);
 
-        if conflict_refs.is_empty() && !self_conflict {
+        if conflict_refs.is_empty() && !exact_duplicate {
             paths_to_grant.push(path);
             granted_patterns.insert(path.clone());
         } else if !conflict_refs.is_empty() {

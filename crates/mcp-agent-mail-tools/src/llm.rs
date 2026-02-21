@@ -400,23 +400,42 @@ async fn complete_single(
     let temp = temperature.unwrap_or(0.2);
     let max_tok = max_tokens.unwrap_or(512);
 
-    let payload = serde_json::json!({
-        "model": api_model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        "temperature": temp,
-        "max_tokens": max_tok
-    });
+    let is_anthropic = url.contains("api.anthropic.com");
+
+    let payload = if is_anthropic {
+        serde_json::json!({
+            "model": api_model,
+            "system": system,
+            "messages": [
+                {"role": "user", "content": user}
+            ],
+            "temperature": temp,
+            "max_tokens": max_tok
+        })
+    } else {
+        serde_json::json!({
+            "model": api_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}
+            ],
+            "temperature": temp,
+            "max_tokens": max_tok
+        })
+    };
 
     let body_bytes =
         serde_json::to_vec(&payload).map_err(|e| LlmError::ParseError(e.to_string()))?;
 
-    let headers = vec![
+    let mut headers = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
-        ("Authorization".to_string(), auth),
     ];
+    if is_anthropic {
+        headers.push(("x-api-key".to_string(), auth.replace("Bearer ", "")));
+        headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
+    } else {
+        headers.push(("Authorization".to_string(), auth));
+    }
 
     let client = get_http_client();
     let response = client
@@ -440,15 +459,24 @@ async fn complete_single(
     let resp_json: Value = serde_json::from_slice(&response.body)
         .map_err(|e| LlmError::ParseError(format!("response JSON: {e}")))?;
 
-    // Extract content from choices[0].message.content
-    let content = resp_json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let content = if is_anthropic {
+        resp_json
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    } else {
+        resp_json
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
 
     let resp_model = resp_json
         .get("model")

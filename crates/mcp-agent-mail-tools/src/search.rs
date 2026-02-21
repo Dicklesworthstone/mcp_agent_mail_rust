@@ -297,8 +297,9 @@ pub(crate) fn summarize_messages(
 
             // Mentions
             for token in stripped.split_whitespace() {
-                if let Some(rest) = token.strip_prefix('@') {
-                    let name = rest.trim_matches(MENTION_TRIM);
+                let cleaned_start = token.trim_start_matches(|c: char| MENTION_TRIM.contains(&c) || c == '"' || c == '\'');
+                if let Some(rest) = cleaned_start.strip_prefix('@') {
+                    let name = rest.trim_matches(|c: char| MENTION_TRIM.contains(&c) || c == '"' || c == '\'');
                     if !name.is_empty() {
                         *mentions.entry(name.to_string()).or_insert(0) += 1;
                     }
