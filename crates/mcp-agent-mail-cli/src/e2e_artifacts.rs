@@ -407,12 +407,13 @@ impl Repro {
     #[must_use]
     pub fn new(ctx: &RunContext, project_root: &Path) -> Self {
         let command = format!(
-            "cd {} && AM_E2E_KEEP_TMP=1 E2E_CLOCK_MODE={} E2E_SEED={} E2E_RUN_STARTED_AT='{}' E2E_RUN_START_EPOCH_S={} ./scripts/e2e_test.sh {}",
+            "cd {} && AM_E2E_KEEP_TMP=1 E2E_CLOCK_MODE={} E2E_SEED={} E2E_RUN_STARTED_AT='{}' E2E_RUN_START_EPOCH_S={} am e2e run --project {} {}",
             project_root.display(),
             ctx.clock_mode,
             ctx.seed,
             ctx.started_at,
             ctx.start_epoch_s,
+            project_root.display(),
             ctx.suite
         );
 
@@ -444,7 +445,7 @@ impl Repro {
     /// Writes sourceable repro.env.
     pub fn write_env(&self, path: &Path) -> std::io::Result<()> {
         let content = format!(
-            "export E2E_CLOCK_MODE='{}'\nexport E2E_SEED='{}'\nexport E2E_RUN_STARTED_AT='{}'\nexport E2E_RUN_START_EPOCH_S='{}'\nexport E2E_SUITE='{}'\n",
+            "# Native replay command is recorded in repro.txt/repro.json.\n# Compatibility fallback remains: AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh <suite>\nexport E2E_CLOCK_MODE='{}'\nexport E2E_SEED='{}'\nexport E2E_RUN_STARTED_AT='{}'\nexport E2E_RUN_START_EPOCH_S='{}'\nexport E2E_SUITE='{}'\n",
             self.clock_mode, self.seed, self.run_started_at, self.run_start_epoch_s, self.suite
         );
         fs::write(path, content)?;

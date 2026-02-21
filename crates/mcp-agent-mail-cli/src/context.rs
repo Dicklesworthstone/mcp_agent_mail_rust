@@ -252,15 +252,7 @@ pub fn resolve_bool(primary: bool, negated: bool, default: bool) -> bool {
 // ── Internal helpers ────────────────────────────────────────────────────
 
 fn open_conn(cfg: &DbPoolConfig) -> CliResult<mcp_agent_mail_db::DbConn> {
-    let path = cfg
-        .sqlite_path()
-        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let conn = mcp_agent_mail_db::DbConn::open_file(&path)
-        .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
-    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
-    conn.execute_raw(&init_sql)
-        .map_err(|e| CliError::Other(format!("schema init failed: {e}")))?;
-    Ok(conn)
+    crate::open_db_sync_with_database_url(&cfg.database_url)
 }
 
 // ── Async runtime helper ────────────────────────────────────────────────

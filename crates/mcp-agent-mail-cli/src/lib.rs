@@ -2894,7 +2894,12 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
                     .collect()
             };
 
-            let conflicts = mcp_agent_mail_guard::guard_check(&repo_path, &paths, advisory)?;
+            let human_key = repo_path.to_string_lossy().to_string();
+            let identity = mcp_agent_mail_core::identity::resolve_project_identity(&human_key);
+            let config = mcp_agent_mail_core::Config::get();
+            let archive_root = config.storage_root.join("projects").join(&identity.slug);
+
+            let conflicts = mcp_agent_mail_guard::guard_check(&archive_root, &repo_path, &paths, advisory)?;
             if conflicts.is_empty() {
                 ftui_runtime::ftui_println!("No file reservation conflicts detected.");
             } else {
@@ -3032,8 +3037,55 @@ fn handle_list_projects_with_database_url(
     Ok(())
 }
 
+fn is_sqlite_corruption_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("database disk image is malformed")
+        || lower.contains("malformed database schema")
+        || lower.contains("file is not a database")
+        || lower.contains("no healthy backup was found")
+}
+
+fn sqlite_absolute_fallback_path(path: &str, open_error: &str) -> Option<String> {
+    if path == ":memory:"
+        || Path::new(path).is_absolute()
+        || path.starts_with("./")
+        || path.starts_with("../")
+        || !is_sqlite_corruption_error_message(open_error)
+    {
+        return None;
+    }
+    let absolute_candidate = Path::new("/").join(path);
+    if !absolute_candidate.exists() {
+        return None;
+    }
+    Some(absolute_candidate.to_string_lossy().into_owned())
+}
+
+fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    match mcp_agent_mail_db::DbConn::open_file(path) {
+        Ok(conn) => Ok((conn, path.to_string())),
+        Err(primary_err) => {
+            let primary_err_text = primary_err.to_string();
+            if let Some(fallback_path) = sqlite_absolute_fallback_path(path, &primary_err_text) {
+                let fallback_conn =
+                    mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|fallback_err| {
+                        CliError::Other(format!(
+                            "cannot open DB at {path}: {primary_err}; fallback {fallback_path} failed: {fallback_err}"
+                        ))
+                    })?;
+                return Ok((fallback_conn, fallback_path));
+            }
+            Err(CliError::Other(format!(
+                "cannot open DB at {path}: {primary_err}"
+            )))
+        }
+    }
+}
+
 /// Open a synchronous SQLite connection for CLI commands.
-fn open_db_sync_with_database_url(database_url: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
+pub(crate) fn open_db_sync_with_database_url(
+    database_url: &str,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -3041,12 +3093,11 @@ fn open_db_sync_with_database_url(database_url: &str) -> CliResult<mcp_agent_mai
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let conn = mcp_agent_mail_db::DbConn::open_file(&path)
-        .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
+    let (conn, opened_path) = open_sqlite_with_fallback(&path)?;
     // Run schema init so tables exist even if first use
     let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
     conn.execute_raw(&init_sql)
-        .map_err(|e| CliError::Other(format!("schema init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("schema init failed for {opened_path}: {e}")))?;
     Ok(conn)
 }
 
@@ -17710,6 +17761,52 @@ mod tests {
             "fail",
             "pool_init should fail on corrupt DB"
         );
+    }
+
+    #[test]
+    fn open_db_sync_with_database_url_recovers_malformed_relative_with_absolute_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("storage.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+
+        let absolute_conn =
+            mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("open absolute db");
+        absolute_conn
+            .execute_raw("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .expect("create seed");
+        drop(absolute_conn);
+
+        let relative_path = PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        if let Some(parent) = relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create relative parent");
+        }
+        std::fs::write(&relative_path, b"not-a-database").expect("write malformed relative db");
+
+        let db_url = format!("sqlite:///{}", relative_path.display());
+        let conn = open_db_sync_with_database_url(&db_url).expect("open with fallback");
+        let rows = conn
+            .query_sync("SELECT 1 AS one", &[])
+            .expect("query fallback connection");
+        let one: i64 = rows.first().expect("row").get_named("one").unwrap_or(0);
+        assert_eq!(one, 1, "fallback connection should execute queries");
+
+        let relative_bytes = std::fs::read(&relative_path).expect("read relative bytes");
+        assert_eq!(
+            relative_bytes, b"not-a-database",
+            "malformed relative file should remain untouched"
+        );
+
+        let _ = std::fs::remove_file(&relative_path);
+        if let Some(parent) = relative_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn sqlite_corruption_error_message_detection_includes_no_backup_marker() {
+        assert!(is_sqlite_corruption_error_message(
+            "database file tmp/storage.sqlite3 is malformed and no healthy backup was found"
+        ));
     }
 
     // ── Doctor repair .bak sibling tests (br-3h13.16.4) ────────────────────

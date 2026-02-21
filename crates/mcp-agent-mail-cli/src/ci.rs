@@ -758,6 +758,23 @@ impl GateLogicInfo {
                 .map(|r| r.status.as_str().to_string())
                 .unwrap_or_else(|| "missing".to_string())
         };
+        let status_of_many = |names: &[&str]| -> String {
+            if names.is_empty() {
+                return "missing".to_string();
+            }
+            let statuses = names.iter().map(|name| status_of(name)).collect::<Vec<_>>();
+            if statuses.iter().any(|status| status == "fail") {
+                "fail".to_string()
+            } else if statuses.iter().all(|status| status == "pass") {
+                "pass".to_string()
+            } else if statuses.iter().all(|status| status == "skip") {
+                "skip".to_string()
+            } else if statuses.iter().any(|status| status == "missing") {
+                "missing".to_string()
+            } else {
+                "partial".to_string()
+            }
+        };
 
         Self {
             security_privacy_gate: GateLogicEntry {
@@ -771,9 +788,12 @@ impl GateLogicInfo {
                 threshold: "must pass (non-quick runs)".to_string(),
             },
             performance_gate: GateLogicEntry {
-                gate: "Perf + security regressions".to_string(),
-                status: status_of("Perf + security regressions"),
-                threshold: "must pass".to_string(),
+                gate: "Perf + security regressions + Perf migration guardrails".to_string(),
+                status: status_of_many(&[
+                    "Perf + security regressions",
+                    "Perf migration guardrails",
+                ]),
+                threshold: "both must pass".to_string(),
             },
             go_condition: "all non-skipped gates pass".to_string(),
         }
@@ -1090,7 +1110,7 @@ impl GateReport {
 // Default Gates
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Returns the default set of 15 CI gates.
+/// Returns the default set of 16 CI gates.
 #[must_use]
 pub fn default_gates() -> Vec<GateConfig> {
     vec![
@@ -1141,7 +1161,7 @@ pub fn default_gates() -> Vec<GateConfig> {
         GateConfig::new(
             "E2E full matrix",
             GateCategory::Quality,
-            ["bash", "scripts/e2e_test.sh"],
+            ["am", "e2e", "run", "--project", "."],
         )
         .expected_artifact("tests/artifacts_native")
         .skip_in_quick(),
@@ -1201,7 +1221,7 @@ pub fn default_gates() -> Vec<GateConfig> {
         )
         .expected_artifact("tests/artifacts/mode_matrix/*")
         .skip_in_quick(),
-        // Performance gate (1)
+        // Performance gates (2)
         GateConfig::new(
             "Perf + security regressions",
             GateCategory::Performance,
@@ -1212,6 +1232,20 @@ pub fn default_gates() -> Vec<GateConfig> {
                 "mcp-agent-mail-cli",
                 "--test",
                 "perf_security_regressions",
+                "--",
+                "--nocapture",
+            ],
+        ),
+        GateConfig::new(
+            "Perf migration guardrails",
+            GateCategory::Performance,
+            [
+                "cargo",
+                "test",
+                "-p",
+                "mcp-agent-mail-cli",
+                "--test",
+                "perf_guardrails",
                 "--",
                 "--nocapture",
             ],
@@ -1852,7 +1886,7 @@ mod tests {
     #[test]
     fn test_default_gates_count() {
         let gates = default_gates();
-        assert_eq!(gates.len(), 15, "Expected 15 default gates");
+        assert_eq!(gates.len(), 16, "Expected 16 default gates");
     }
 
     #[test]
