@@ -1,4 +1,4 @@
-use globset::{Glob, GlobBuilder, GlobMatcher};
+use globset::{GlobBuilder, GlobMatcher};
 
 fn normalize_pattern(pattern: &str) -> String {
     let mut normalized = pattern.trim().replace('\\', "/");
@@ -89,14 +89,10 @@ impl CompiledPattern {
             _ => return false,
         }
 
-        // 2. Heuristic check for intersecting globs (e.g. `src/a*` vs `src/*b`)
-        // If both are globs and neither strictly matches the other as a string,
-        // they might still intersect.
-        if self.is_glob() && other.is_glob() {
-            return segments_overlap(&self.norm, &other.norm);
-        }
-
-        false
+        // 2. Heuristic check for intersecting paths/globs
+        // If they don't strictly match as strings, they might still intersect
+        // (e.g., intersecting globs, or directory prefix containing a file).
+        segments_overlap(&self.norm, &other.norm)
     }
 }
 
@@ -126,7 +122,7 @@ fn segments_overlap(p1: &str, p2: &str) -> bool {
                 }
             }
             (None, None) => return true, // Both ended and matched all segments
-            _ => return false,           // Length mismatch implies disjoint
+            _ => return true,            // Length mismatch: one is a directory prefix of the other, assume overlap
         }
     }
 }

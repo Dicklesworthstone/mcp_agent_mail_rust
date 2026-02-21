@@ -378,14 +378,13 @@ def get_push_files():
                 continue
 
             if set(remote_sha) == {{'0'}}:
-                # New branch push
-                range_spec = local_sha
+                rev_list_args = ["git", "rev-list", "--topo-order", local_sha, "--not", "--remotes"]
             else:
-                range_spec = f"{{remote_sha}}..{{local_sha}}"
+                rev_list_args = ["git", "rev-list", "--topo-order", f"{{remote_sha}}..{{local_sha}}"]
 
             # Get commits in range
             res = subprocess.run(
-                ["git", "rev-list", "--topo-order", range_spec],
+                rev_list_args,
                 capture_output=True, text=True
             )
             if res.returncode != 0:
@@ -592,10 +591,6 @@ pub fn install_guard(
         }
 
         // Write guard plugin
-        // Note: Currently the Python plugin only implements 'pre-commit' logic (checking staged files).
-        // If we install it for pre-push, it will check staged files during push, which is better than nothing
-        // but not strictly correct (should check pushed commits).
-        // TODO: Upgrade render_guard_plugin_script to handle pre-push stdin.
         let plugin_path = run_dir.join(PLUGIN_FILE_NAME);
         std::fs::write(
             &plugin_path,
@@ -767,9 +762,13 @@ pub fn is_bypass_active() -> bool {
 /// `paths` are the file paths to check (relative to repo root).
 ///
 /// Returns a `GuardCheckResult` with conflicts and mode info.
-pub fn guard_check_full(archive_root: &Path, paths: &[String]) -> GuardResult<GuardCheckResult> {
+pub fn guard_check_full(
+    archive_root: &Path,
+    repo_root: &Path,
+    paths: &[String],
+) -> GuardResult<GuardCheckResult> {
     let mode = GuardMode::from_env();
-    let ignorecase = detect_core_ignorecase(archive_root);
+    let ignorecase = detect_core_ignorecase(repo_root);
 
     // Check bypass
     if is_bypass_active() {
@@ -816,10 +815,11 @@ pub fn guard_check_full(archive_root: &Path, paths: &[String]) -> GuardResult<Gu
 /// Lower-level API: reads from archive, no gate/bypass handling.
 pub fn guard_check(
     archive_root: &Path,
+    repo_root: &Path,
     paths: &[String],
     _advisory: bool,
 ) -> GuardResult<Vec<GuardConflict>> {
-    let ignorecase = detect_core_ignorecase(archive_root);
+    let ignorecase = detect_core_ignorecase(repo_root);
     // Get current agent name from env
     let agent_name = std::env::var("AGENT_NAME").unwrap_or_default();
     if agent_name.is_empty() {
@@ -894,14 +894,16 @@ fn check_path_conflicts(
         // reservation pattern's base, the path still conflicts. For example,
         // modifying `modules/submod` conflicts with reservation `modules/submod/**`
         // because the directory itself is within the reserved scope.
-        for (idx, res) in active_indices.iter().enumerate() {
+        for res in &active_indices {
             let pat_norm = normalize_path(&res.path_pattern, ignorecase);
+            
             // Check if the path is a prefix of the pattern's base directory
+            // (e.g. path "src", pattern "src/main.rs" or "src/**")
             if pat_norm.starts_with(&normalized)
-                && pat_norm
+                && (normalized.is_empty() || pat_norm
                     .as_bytes()
                     .get(normalized.len())
-                    .is_some_and(|&c| c == b'/')
+                    .is_some_and(|&c| c == b'/'))
             {
                 conflicts.push(GuardConflict {
                     path: path.clone(),
@@ -911,9 +913,24 @@ fn check_path_conflicts(
                 });
                 break;
             }
+            
             // Also check the reverse: pattern's literal base is a prefix of the path
-            // (already handled by globset above, but needed for non-glob patterns)
-            let _ = idx; // suppress unused warning
+            // (needed for non-glob patterns like "src/utils" matching "src/utils/file.rs")
+            let has_glob = res.path_pattern.contains('*') || res.path_pattern.contains('?') || res.path_pattern.contains('[') || res.path_pattern.contains('{');
+            if !has_glob && normalized.starts_with(&pat_norm) 
+                && (pat_norm.is_empty() || normalized
+                    .as_bytes()
+                    .get(pat_norm.len())
+                    .is_some_and(|&c| c == b'/')) 
+            {
+                conflicts.push(GuardConflict {
+                    path: path.clone(),
+                    pattern: res.path_pattern.clone(),
+                    holder: res.agent_name.clone(),
+                    expires_ts: res.expires_ts.clone(),
+                });
+                break;
+            }
         }
     }
 
@@ -1089,18 +1106,20 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
             continue;
         }
 
-        let range = if remote_sha.chars().all(|c| c == '0') {
-            local_sha.to_string()
+        let mut rev_list_cmd = Command::new("git");
+        rev_list_cmd.current_dir(repo_root).args(["rev-list", "--topo-order"]);
+        let diff_range = if remote_sha.chars().all(|c| c == '0') {
+            rev_list_cmd.args([local_sha, "--not", "--remotes"]);
+            None
         } else {
-            format!("{remote_sha}..{local_sha}")
+            let r = format!("{remote_sha}..{local_sha}");
+            rev_list_cmd.arg(&r);
+            Some(r)
         };
 
         // Prefer per-commit path enumeration (legacy guard.py parity): this catches paths
         // that were touched in any pushed commit, even if the net diff ends up empty.
-        let rev_list = Command::new("git")
-            .current_dir(repo_root)
-            .args(["rev-list", "--topo-order", &range])
-            .output()?;
+        let rev_list = rev_list_cmd.output()?;
 
         if rev_list.status.success() {
             for sha in String::from_utf8_lossy(&rev_list.stdout)
@@ -1129,7 +1148,7 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                     all_paths.extend(paths);
                 }
             }
-        } else {
+        } else if let Some(range) = diff_range {
             // Fallback: net diff across the range (less precise, but better than nothing).
             let output = Command::new("git")
                 .current_dir(repo_root)
@@ -1744,6 +1763,16 @@ mod tests {
     fn check_path_conflicts_submodule_pointer_path_matches_recursive_pattern() {
         let paths = vec!["modules/submod".to_string()];
         let reservations = vec![reservation("modules/submod/**", "OtherAgent", true)];
+        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].holder, "OtherAgent");
+    }
+
+    #[test]
+    fn check_path_conflicts_non_glob_directory_prefix_matches_contained_file() {
+        let paths = vec!["src/utils/file.rs".to_string()];
+        // Reservation is a literal directory without glob metacharacters
+        let reservations = vec![reservation("src/utils", "OtherAgent", true)];
         let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].holder, "OtherAgent");

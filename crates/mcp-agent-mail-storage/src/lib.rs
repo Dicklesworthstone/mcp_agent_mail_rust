@@ -969,8 +969,6 @@ impl FileLock {
 
         Ok(false)
     }
-
-
 }
 
 impl Drop for FileLock {
@@ -1869,9 +1867,11 @@ fn coalescer_pool_worker(
         } else {
             // Use fetch_update to atomically saturate-subtract, preventing wrap-around race
             // where a concurrent enqueue (add) could be overwritten by a blind store(0).
-            let _ = rq.depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                Some(val.saturating_sub(drained_count))
-            });
+            let _ = rq
+                .depth
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                    Some(val.saturating_sub(drained_count))
+                });
         }
 
         // Phase 4: Commit
@@ -4075,16 +4075,6 @@ pub fn store_raw_attachment(
     archive: &ProjectArchive,
     file_path: &Path,
 ) -> Result<StoredAttachment> {
-    // Check size before reading entire file to prevent OOM
-    let meta = fs::metadata(file_path)?;
-    if meta.len() > MAX_ATTACHMENT_BYTES as u64 {
-        return Err(StorageError::InvalidPath(format!(
-            "Attachment too large ({} bytes, max {})",
-            meta.len(),
-            MAX_ATTACHMENT_BYTES,
-        )));
-    }
-
     // Check size before reading entire file to prevent OOM
     let meta = fs::metadata(file_path)?;
     if meta.len() > MAX_ATTACHMENT_BYTES as u64 {

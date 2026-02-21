@@ -2098,7 +2098,10 @@ fn unescape_double_quotes(input: &str) -> String {
                 Some('t') => out.push('\t'),
                 Some('\\') | None => out.push('\\'),
                 Some('"') => out.push('"'),
-                Some(other) => out.push(other),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
             }
         } else {
             out.push(ch);

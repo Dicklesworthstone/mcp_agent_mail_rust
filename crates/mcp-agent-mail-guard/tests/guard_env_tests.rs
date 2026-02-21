@@ -130,7 +130,7 @@ fn guard_check_full_bypass_returns_empty_conflicts() {
 
     unsafe { std::env::set_var("AGENT_MAIL_BYPASS", "1") };
     let result =
-        guard_check_full(&archive, &["app/api/users.py".to_string()]).expect("guard_check_full");
+        guard_check_full(&archive, &archive, &["app/api/users.py".to_string()]).expect("guard_check_full");
     assert!(result.bypassed);
     assert!(result.conflicts.is_empty());
 }
@@ -154,7 +154,7 @@ fn guard_check_full_gated_when_neither_flag_set() {
     }
 
     let result =
-        guard_check_full(&archive, &["app/api/users.py".to_string()]).expect("guard_check_full");
+        guard_check_full(&archive, &archive, &["app/api/users.py".to_string()]).expect("guard_check_full");
     assert!(result.gated, "guard should be gated when no flags are set");
     assert!(
         result.conflicts.is_empty(),
@@ -176,7 +176,7 @@ fn guard_check_full_missing_agent_name_returns_error() {
         std::env::remove_var("AGENT_MAIL_BYPASS");
     }
 
-    let result = guard_check_full(&archive, &["app/api/users.py".to_string()]);
+    let result = guard_check_full(&archive, &archive, &["app/api/users.py".to_string()]);
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), GuardError::MissingAgentName),
@@ -199,7 +199,7 @@ fn guard_check_full_detects_conflict_when_enabled() {
     }
 
     let result =
-        guard_check_full(&archive, &["app/api/users.py".to_string()]).expect("guard_check_full");
+        guard_check_full(&archive, &archive, &["app/api/users.py".to_string()]).expect("guard_check_full");
     assert!(!result.gated);
     assert!(!result.bypassed);
     assert_eq!(result.conflicts.len(), 1);
@@ -221,7 +221,7 @@ fn guard_check_full_no_conflict_for_own_reservations() {
     }
 
     let result =
-        guard_check_full(&archive, &["my/stuff/file.txt".to_string()]).expect("guard_check_full");
+        guard_check_full(&archive, &archive, &["my/stuff/file.txt".to_string()]).expect("guard_check_full");
     assert!(
         result.conflicts.is_empty(),
         "own reservations should not conflict"
@@ -244,7 +244,7 @@ fn guard_check_full_empty_archive_no_conflicts() {
     }
 
     let result =
-        guard_check_full(&archive, &["any/file.py".to_string()]).expect("guard_check_full");
+        guard_check_full(&archive, &archive, &["any/file.py".to_string()]).expect("guard_check_full");
     assert!(result.conflicts.is_empty());
 }
 
@@ -262,7 +262,7 @@ fn guard_check_missing_agent_name_returns_error() {
 
     unsafe { std::env::remove_var("AGENT_NAME") };
 
-    let result = guard_check(&archive, &["app/api/users.py".to_string()], false);
+    let result = guard_check(&archive, &archive, &["app/api/users.py".to_string()], false);
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), GuardError::MissingAgentName));
 }
@@ -278,7 +278,7 @@ fn guard_check_detects_conflicts() {
     unsafe { std::env::set_var("AGENT_NAME", "DifferentAgent") };
 
     let conflicts =
-        guard_check(&archive, &["app/api/users.py".to_string()], false).expect("guard_check");
+        guard_check(&archive, &archive, &["app/api/users.py".to_string()], false).expect("guard_check");
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].holder, "OtherAgent");
 }
@@ -294,7 +294,7 @@ fn guard_check_no_conflicts_for_unrelated_paths() {
     unsafe { std::env::set_var("AGENT_NAME", "SomeAgent") };
 
     let conflicts =
-        guard_check(&archive, &["totally/unrelated.txt".to_string()], false).expect("guard_check");
+        guard_check(&archive, &archive, &["totally/unrelated.txt".to_string()], false).expect("guard_check");
     assert!(conflicts.is_empty());
 }
 
@@ -308,7 +308,7 @@ fn guard_check_empty_paths_no_conflicts() {
 
     unsafe { std::env::set_var("AGENT_NAME", "SomeAgent") };
 
-    let conflicts = guard_check(&archive, &[], false).expect("guard_check");
+    let conflicts = guard_check(&archive, &archive, &[], false).expect("guard_check");
     assert!(conflicts.is_empty());
 }
 
