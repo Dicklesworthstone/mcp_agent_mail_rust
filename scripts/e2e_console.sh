@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_console.sh - PTY/TTY-focused E2E suite for rich console output.
 #
-# Run via:
-#   ./scripts/e2e_test.sh console
+# Run via (authoritative):
+#   am e2e run --project . console
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh console
 #
 # This suite validates that rich console output is enabled by default in real
 # terminals, and that envfile-persisted `CONSOLE_*` settings are loaded.

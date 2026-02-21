@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_tui_v2.sh - E2E test suite for TUI V2 features (br-2bbt.11.2)
 #
-# Run via:
-#   ./scripts/e2e_test.sh tui_v2
+# Run via (authoritative):
+#   am e2e run --project . tui_v2
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_v2
 #   bash scripts/e2e_tui_v2.sh
 #
 # Tests TUI V2 features through HTTP/MCP transport:

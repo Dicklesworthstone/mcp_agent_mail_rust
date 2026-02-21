@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_tui_search_v3.sh - PTY E2E suite for TUI Search V3 cockpit screen.
 #
-# Run via:
-#   ./scripts/e2e_test.sh tui_search_v3
+# Run via (authoritative):
+#   am e2e run --project . tui_search_v3
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_search_v3
 #
 # Validates:
 #   - Search screen layout (query bar, facets, results, detail)

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_tui_startup.sh - PTY E2E suite for zero-friction TUI startup contract.
 #
-# Run via:
-#   ./scripts/e2e_test.sh tui_startup
+# Run via (authoritative):
+#   am e2e run --project . tui_startup
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_startup
 #   bash scripts/e2e_tui_startup.sh --showcase
 #
 # Validates:
@@ -297,6 +299,8 @@ start_server_pty() {
     local started_ms="$(_e2e_now_ms)"
     local -a cmd_parts=(
         env
+        -u
+        HTTP_BEARER_TOKEN
         "DATABASE_URL=sqlite:////${db_path}"
         "STORAGE_ROOT=${storage_root}"
         "HTTP_HOST=127.0.0.1"
@@ -317,6 +321,7 @@ start_server_pty() {
         printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
     done
     server_cmd="${server_cmd# }"
+    printf -v server_cmd 'cd %q && %s' "${storage_root}" "${server_cmd}"
 
     (
         script -q -f -c "${server_cmd}" \
@@ -343,6 +348,8 @@ start_server_headless() {
     local started_ms="$(_e2e_now_ms)"
     local -a cmd_parts=(
         env
+        -u
+        HTTP_BEARER_TOKEN
         "DATABASE_URL=sqlite:////${db_path}"
         "STORAGE_ROOT=${storage_root}"
         "HTTP_HOST=127.0.0.1"
@@ -363,8 +370,11 @@ start_server_headless() {
         printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
     done
     server_cmd="${server_cmd# }"
+    printf -v server_cmd 'cd %q && %s' "${storage_root}" "${server_cmd}"
 
     (
+        cd "${storage_root}" || exit 1
+        unset HTTP_BEARER_TOKEN
         export DATABASE_URL="sqlite:////${db_path}"
         export STORAGE_ROOT="${storage_root}"
         export HTTP_HOST="127.0.0.1"
@@ -920,8 +930,9 @@ PORT6="$(pick_port)"
 LOG6="${E2E_ARTIFACT_DIR}/server_clean_shell.log"
 START6_TIMEOUT_S="${AM_E2E_SERVER_TIMEOUT_S:-15}"
 START6_STARTED_MS="$(_e2e_now_ms)"
-START6_CMD="env -i PATH=${PATH} HOME=${WORK6} DATABASE_URL=sqlite:////${DB6} STORAGE_ROOT=${STORAGE6} HTTP_HOST=127.0.0.1 HTTP_PORT=${PORT6} HTTP_RBAC_ENABLED=0 HTTP_RATE_LIMIT_ENABLED=0 HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 timeout ${START6_TIMEOUT_S}s ${BIN} serve --host 127.0.0.1 --port ${PORT6} --no-tui"
+START6_CMD="cd ${WORK6} && env -i PATH=${PATH} HOME=${WORK6} DATABASE_URL=sqlite:////${DB6} STORAGE_ROOT=${STORAGE6} HTTP_HOST=127.0.0.1 HTTP_PORT=${PORT6} HTTP_RBAC_ENABLED=0 HTTP_RATE_LIMIT_ENABLED=0 HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 timeout ${START6_TIMEOUT_S}s ${BIN} serve --host 127.0.0.1 --port ${PORT6} --no-tui"
 (
+    cd "${WORK6}" || exit 1
     env -i \
         PATH="${PATH}" \
         HOME="${WORK6}" \

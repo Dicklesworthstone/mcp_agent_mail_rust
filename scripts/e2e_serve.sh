@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_serve.sh - E2E suite for native serve/start ergonomics (br-17c93)
 #
-# Run via:
-#   ./scripts/e2e_test.sh serve
+# Run via (authoritative):
+#   am e2e run --project . serve
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh serve
 #
 # Coverage:
 #   - cold start with path normalization

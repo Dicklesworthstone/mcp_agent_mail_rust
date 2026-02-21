@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # test_mcp_api_parity.sh - E2E test suite wrapper for MCP/API mode switching parity.
 #
-# Runs the implementation in scripts/e2e_mcp_api_parity.sh so the suite can be invoked via:
-#   ./scripts/e2e_test.sh mcp_api_parity
+# Runs the implementation in scripts/e2e_mcp_api_parity.sh.
+# Authoritative invocation:
+#   am e2e run --project . mcp_api_parity
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh mcp_api_parity
 
 set -euo pipefail
 

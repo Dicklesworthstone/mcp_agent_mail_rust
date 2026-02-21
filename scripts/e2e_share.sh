@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_share.sh - E2E test suite for share/export bundle pipeline
 #
-# Run via:
-#   ./scripts/e2e_test.sh share
+# Run via (authoritative):
+#   am e2e run --project . share
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh share
 #
 # This suite verifies:
 # - Export creates a bundle with manifest.json, mailbox.sqlite3, viewer/

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_tui_compat_matrix.sh - Cross-terminal compatibility matrix (br-3vwi.10.16, br-3vwi.10.21)
 #
-# Run via:
-#   ./scripts/e2e_test.sh tui_compat_matrix
+# Run via (authoritative):
+#   am e2e run --project . tui_compat_matrix
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_compat_matrix
 #
 # Validates (best-effort in CI):
 # - TUI starts and responds to key navigation under multiple TERM settings

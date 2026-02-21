@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_tui_interaction.sh - PTY E2E suite for TUI interaction flows.
 #
-# Run via:
-#   ./scripts/e2e_test.sh tui_interaction
+# Run via (authoritative):
+#   am e2e run --project . tui_interaction
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_interaction
 #
 # Validates:
 #   - Tab/number key navigation switches screens
@@ -356,10 +358,10 @@ run_pty_interaction "help" "${TRANSCRIPT3}" "${KEYS3}" \
     HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
     "${BIN}" serve --host 127.0.0.1 --port "${PORT3}" || true
 
-# Help overlay should have rendered keyboard shortcuts text
+# Help overlay should render title plus visible screen-local bindings
+# (global bindings are below the fold at 80x24 and require scrolling).
 assert_transcript_contains "help: shows Keyboard Shortcuts" "${TRANSCRIPT3}" "Keyboard Shortcuts"
-assert_transcript_contains "help: shows Quit binding" "${TRANSCRIPT3}" "Quit"
-assert_transcript_contains "help: shows Tab binding" "${TRANSCRIPT3}" "Next screen"
+assert_transcript_contains "help: shows dashboard binding" "${TRANSCRIPT3}" "Scroll event log"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -506,10 +508,10 @@ run_pty_interaction "backtab" "${TRANSCRIPT7}" "${KEYS7}" \
     HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
     "${BIN}" serve --host 127.0.0.1 --port "${PORT7}" || true
 
-# Shift-Tab from Dashboard wraps to System Health, then Tool Metrics
-# Note: "System Health" may render partially in 80-col PTY, so check for "Health"
-assert_transcript_contains "backtab: Health screen visited" "${TRANSCRIPT7}" "Health"
-assert_transcript_contains "backtab: Tool Metrics visited" "${TRANSCRIPT7}" "Tool Metrics"
+# Shift-Tab from Dashboard wraps to the end of the 15-screen ring:
+# Archive Browser, then Attachments.
+assert_transcript_contains "backtab: Archive Browser visited" "${TRANSCRIPT7}" "Archive Browser"
+assert_transcript_contains "backtab: Attachments visited" "${TRANSCRIPT7}" "Attachments"
 
 
 # ────────────────────────────────────────────────────────────────────

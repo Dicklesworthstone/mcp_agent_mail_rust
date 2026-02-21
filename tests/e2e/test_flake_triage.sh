@@ -5,7 +5,8 @@
 # Uses realistic artifact sets and validates JSON output schemas.
 #
 # Run: ./tests/e2e/test_flake_triage.sh
-# Or:  E2E_SUITE=flake_triage scripts/e2e_test.sh flake_triage
+# Native path: am e2e run --project . flake_triage
+# Compatibility fallback: AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh flake_triage
 
 E2E_SUITE="flake_triage"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

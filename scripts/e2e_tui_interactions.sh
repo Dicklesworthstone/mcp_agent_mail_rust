@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_tui_interactions.sh - PTY E2E suite for TUI interaction flows.
 #
-# Run via:
-#   ./scripts/e2e_test.sh tui_interactions
+# Run via (authoritative):
+#   am e2e run --project . tui_interactions
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_interactions
 #   # or directly:
 #   bash scripts/e2e_tui_interactions.sh
 #

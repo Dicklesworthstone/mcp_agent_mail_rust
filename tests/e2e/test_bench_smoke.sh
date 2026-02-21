@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # test_bench_smoke.sh - Bench smoke test: validates golden outputs + basic budgets.
 #
-# Runs as part of `scripts/e2e_test.sh bench_smoke` (no network required).
+# Runs as part of `am e2e run --project . bench_smoke` (no network required).
+# Compatibility fallback: `AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh bench_smoke`.
 #
 # Tests:
 # 1. Golden output validation (all checksums match)

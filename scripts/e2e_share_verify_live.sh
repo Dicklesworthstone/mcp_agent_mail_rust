@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_share_verify_live.sh - Dedicated E2E matrix for `am share deploy verify-live`
 #
-# Run via:
-#   ./scripts/e2e_test.sh share_verify_live
+# Run via (authoritative):
+#   am e2e run --project . share_verify_live
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh share_verify_live
 #
 # Coverage:
 # - Success path with local+remote+security checks

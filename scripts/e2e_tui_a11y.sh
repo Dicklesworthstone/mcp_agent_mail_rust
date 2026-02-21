@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_tui_a11y.sh - Accessibility + keyboard-only E2E suite (br-3vwi.10.13)
 #
-# Run via:
-#   ./scripts/e2e_test.sh tui_a11y
+# Run via (authoritative):
+#   am e2e run --project . tui_a11y
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_a11y
 #
 # Validates:
 # - Keyboard-only navigation across key TUI surfaces

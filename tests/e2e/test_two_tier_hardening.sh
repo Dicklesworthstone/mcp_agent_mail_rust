@@ -7,8 +7,10 @@
 # 3. Timeout handling with post-timeout recovery
 # 4. Observability surface verification (health + server logs + per-case diagnostics)
 #
-# Deterministic CI replay:
-#   E2E_CLOCK_MODE=deterministic E2E_SEED=123 ./scripts/e2e_test.sh two_tier_hardening
+# Deterministic CI replay (authoritative):
+#   E2E_CLOCK_MODE=deterministic E2E_SEED=123 am e2e run --project . two_tier_hardening
+# Compatibility fallback:
+#   E2E_CLOCK_MODE=deterministic E2E_SEED=123 AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh two_tier_hardening
 
 set -euo pipefail
 

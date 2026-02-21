@@ -174,12 +174,13 @@ e2e_repro_command() {
     # Copy/paste friendly one-liner for deterministic replay.
     # Note: We intentionally do NOT pin E2E_TIMESTAMP so each replay writes to a fresh artifact dir.
     local suite="${E2E_SUITE}"
-    printf 'cd %q && AM_E2E_KEEP_TMP=1 E2E_CLOCK_MODE=%q E2E_SEED=%q E2E_RUN_STARTED_AT=%q E2E_RUN_START_EPOCH_S=%q ./scripts/e2e_test.sh %q\n' \
+    printf 'cd %q && AM_E2E_KEEP_TMP=1 E2E_CLOCK_MODE=%q E2E_SEED=%q E2E_RUN_STARTED_AT=%q E2E_RUN_START_EPOCH_S=%q am e2e run --project %q %q\n' \
         "$E2E_PROJECT_ROOT" \
         "${E2E_CLOCK_MODE}" \
         "${E2E_SEED}" \
         "${E2E_RUN_STARTED_AT}" \
         "${E2E_RUN_START_EPOCH_S}" \
+        "$E2E_PROJECT_ROOT" \
         "${suite}"
 }
 
@@ -473,7 +474,9 @@ EOF
 
     cat > "${artifact_dir}/repro.env" <<EOF
 # Source this file, then run:
-#   ./scripts/e2e_test.sh ${E2E_SUITE}
+#   am e2e run --project "${E2E_PROJECT_ROOT}" ${E2E_SUITE}
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh ${E2E_SUITE}
 # Original artifact timestamp (for reference): ${E2E_TIMESTAMP}
 AM_E2E_KEEP_TMP=1
 E2E_CLOCK_MODE=${E2E_CLOCK_MODE}

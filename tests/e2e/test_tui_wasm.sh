@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # test_tui_wasm.sh - E2E test suite wrapper for TUI WASM/browser-mode contract.
 #
-# Runs implementation in scripts/e2e_tui_wasm.sh so the suite can be invoked via:
-#   ./scripts/e2e_test.sh tui_wasm
+# Runs implementation in scripts/e2e_tui_wasm.sh.
+# Authoritative invocation:
+#   am e2e run --project . tui_wasm
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_wasm
 
 set -euo pipefail
 

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# e2e_test.sh - Top-level E2E test runner for mcp-agent-mail Rust port
+# e2e_test.sh - Compatibility shim for E2E test execution.
 #
 # Usage:
-#   ./scripts/e2e_test.sh              # Run all suites
-#   ./scripts/e2e_test.sh guard        # Run a specific suite
-#   ./scripts/e2e_test.sh --list       # List available suites
+#   ./scripts/e2e_test.sh              # (Compat) delegates to: am e2e run --project <repo>
+#   ./scripts/e2e_test.sh guard        # (Compat) delegates to: am e2e run --project <repo> guard
+#   ./scripts/e2e_test.sh --list       # delegates to: am e2e list
 #
 # Environment:
 #   AM_E2E_KEEP_TMP=1     Keep temp directories after run
 #   E2E_FORCE_BUILD=1     Force rebuild before running
 #   CARGO_TARGET_DIR=...  Override cargo target directory
+#   AM_E2E_FORCE_LEGACY=1 Use legacy in-script runner (rollback path)
 
 set -euo pipefail
 
@@ -37,6 +38,95 @@ _c_reset='\033[0m'
 _c_green='\033[0;32m'
 _c_red='\033[0;31m'
 _c_blue='\033[0;34m'
+_c_yellow='\033[0;33m'
+
+show_deprecation_notice() {
+    cat >&2 <<'EOF'
+[DEPRECATED] scripts/e2e_test.sh is now a compatibility shim.
+Authoritative path: `am e2e run --project <repo> [suite...]`
+Rollback path: set AM_E2E_FORCE_LEGACY=1 to use legacy in-script execution.
+EOF
+}
+
+resolve_am_binary() {
+    if [ -n "${AM_E2E_AM_BIN:-}" ] && [ -x "${AM_E2E_AM_BIN}" ]; then
+        echo "${AM_E2E_AM_BIN}"
+        return 0
+    fi
+    if [ -x "${CARGO_TARGET_DIR}/debug/am" ]; then
+        echo "${CARGO_TARGET_DIR}/debug/am"
+        return 0
+    fi
+    if [ -x "${PROJECT_ROOT}/target/debug/am" ]; then
+        echo "${PROJECT_ROOT}/target/debug/am"
+        return 0
+    fi
+    if command -v am >/dev/null 2>&1; then
+        command -v am
+        return 0
+    fi
+    return 1
+}
+
+maybe_delegate_native() {
+    if [ "${AM_E2E_FORCE_LEGACY:-0}" = "1" ]; then
+        return 0
+    fi
+
+    local am_bin
+    if ! am_bin="$(resolve_am_binary)"; then
+        return 0
+    fi
+
+    if [ "${AM_E2E_SILENCE_DEPRECATION:-0}" != "1" ]; then
+        show_deprecation_notice
+    fi
+
+    local arg1="${1:-}"
+    if [ "$arg1" = "--help" ] || [ "$arg1" = "-h" ]; then
+        cat <<EOF
+Usage: $0 [suite_name] [--list]
+
+This script is deprecated as a primary entrypoint and now acts as a compatibility shim.
+
+Primary (native) commands:
+  ${am_bin} e2e list
+  ${am_bin} e2e run --project ${PROJECT_ROOT} [suite_name]
+
+Compatibility rollback:
+  AM_E2E_FORCE_LEGACY=1 $0 [suite_name]
+EOF
+        exit 0
+    fi
+
+    if [ "$arg1" = "--list" ] || [ "$arg1" = "-l" ]; then
+        (cd "${PROJECT_ROOT}" && "${am_bin}" e2e list)
+        exit $?
+    fi
+
+    local cmd=("${am_bin}" "e2e" "run" "--project" "${PROJECT_ROOT}")
+    if [ "${AM_E2E_KEEP_TMP:-0}" = "1" ]; then
+        cmd+=("--keep-tmp")
+    fi
+    if [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
+        cmd+=("--force-build")
+    fi
+    if [ -n "${E2E_TIMEOUT_SECS:-}" ]; then
+        cmd+=("--timeout" "${E2E_TIMEOUT_SECS}")
+    fi
+    if [ -n "${AM_E2E_ARTIFACT_DIR:-}" ]; then
+        cmd+=("--artifacts" "${AM_E2E_ARTIFACT_DIR}")
+    fi
+    if [ -n "$arg1" ]; then
+        cmd+=("$arg1")
+    fi
+
+    echo -e "${_c_yellow}[compat-shim] delegating to native runner:${_c_reset} ${cmd[*]}" >&2
+    (cd "${PROJECT_ROOT}" && "${cmd[@]}")
+    exit $?
+}
+
+maybe_delegate_native "$@"
 
 # ---------------------------------------------------------------------------
 # Suite discovery
@@ -70,7 +160,14 @@ fi
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "Usage: $0 [suite_name] [--list]"
     echo ""
-    echo "Run E2E test suites for mcp-agent-mail."
+    echo "Run E2E test suites for mcp-agent-mail (compatibility mode)."
+    echo ""
+    echo "Primary native path (recommended):"
+    echo "  am e2e run --project ${PROJECT_ROOT} [suite_name]"
+    echo "  am e2e list"
+    echo ""
+    echo "Rollback (legacy in-script execution):"
+    echo "  AM_E2E_FORCE_LEGACY=1 $0 [suite_name]"
     echo ""
     echo "Options:"
     echo "  --list, -l    List available suites"
@@ -85,7 +182,7 @@ fi
 
 echo ""
 echo -e "${_c_blue}╔══════════════════════════════════════════════════════════╗${_c_reset}"
-echo -e "${_c_blue}║  mcp-agent-mail E2E Test Runner                        ║${_c_reset}"
+echo -e "${_c_blue}║  mcp-agent-mail E2E Test Runner (Legacy Compat)        ║${_c_reset}"
 echo -e "${_c_blue}╚══════════════════════════════════════════════════════════╝${_c_reset}"
 echo ""
 echo "  Project:     ${PROJECT_ROOT}"

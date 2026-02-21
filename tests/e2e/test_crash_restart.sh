@@ -14,8 +14,10 @@
 #
 # Run via:
 #   ./tests/e2e/test_crash_restart.sh
-#   # or via the unified runner:
-#   ./scripts/e2e_test.sh crash_restart
+#   # or via the authoritative native runner:
+#   am e2e run --project . crash_restart
+#   # compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh crash_restart
 
 set -euo pipefail
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_spill_determinism.sh - Spill-path determinism E2E suite (br-1i11.1.6)
 #
-# Usage:
-#   ./scripts/e2e_test.sh spill_determinism
+# Usage (authoritative):
+#   am e2e run --project . spill_determinism
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh spill_determinism
 #   bash scripts/e2e_spill_determinism.sh
 #
 # Artifacts:

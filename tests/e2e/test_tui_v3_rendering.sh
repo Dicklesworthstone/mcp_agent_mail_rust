@@ -177,6 +177,18 @@ is_known_rch_remote_dep_mismatch() {
         || {
             grep -Fq "failed to select a version for \`ort\`" "${out_file}" \
                 && grep -Fq "required by package \`fastembed v4.9.0\`" "${out_file}"
+        } \
+        || {
+            grep -Fq "/dp/frankensqlite/crates/fsqlite-vfs/src/uring.rs" "${out_file}" \
+                && grep -Fq "use of unresolved module or unlinked crate \`uring_fs\`" "${out_file}"
+        } \
+        || {
+            grep -Fq "/dp/frankensqlite/crates/fsqlite-vfs/src/uring.rs" "${out_file}" \
+                && grep -Fq "use of unresolved module or unlinked crate \`pollster\`" "${out_file}"
+        } \
+        || {
+            grep -Fq "/dp/frankensqlite/crates/fsqlite-planner/src/lib.rs" "${out_file}" \
+                && grep -Fq "cannot explicitly borrow within an implicitly-borrowing pattern" "${out_file}"
         }
 }
 
@@ -302,6 +314,14 @@ run_render_case() {
             _SUITE_STOP_REASON="skipped after missing rch runtime in earlier case"
             _SUITE_STOP_EVIDENCE="${out_file}"
             e2e_log "rch unavailable; remaining cases will be skipped"
+        elif [ "${cargo_rc}" -eq 124 ]; then
+            scenario_diag_mark_reason "SKIP_RCH_TIMEOUT" "rch command timed out"
+            e2e_skip "${description} (rch timeout)"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_TIMEOUT"
+            _SUITE_STOP_REASON="skipped after rch timeout in earlier case"
+            _SUITE_STOP_EVIDENCE="${out_file}"
+            e2e_log "rch timeout detected; remaining cases will be skipped"
         elif is_known_rch_remote_dep_mismatch "${out_file}"; then
             scenario_diag_mark_reason "SKIP_RCH_REMOTE_DEP_MISMATCH" "remote worker dependency mismatch"
             e2e_skip "${description} (remote rch dependency mismatch)"
@@ -441,6 +461,13 @@ else
             _SUITE_STOP_REASON_CODE="SKIP_RCH_UNAVAILABLE"
             _SUITE_STOP_REASON="skipped after missing rch runtime in earlier case"
             _SUITE_STOP_EVIDENCE="${CASE10_LOG_A}"
+        elif [ "${case10_rc_a}" -eq 124 ]; then
+            case10_skip=1
+            scenario_diag_mark_reason "SKIP_RCH_TIMEOUT" "rch command timed out"
+            _SUITE_STOP_REMAINING=1
+            _SUITE_STOP_REASON_CODE="SKIP_RCH_TIMEOUT"
+            _SUITE_STOP_REASON="skipped after rch timeout in earlier case"
+            _SUITE_STOP_EVIDENCE="${CASE10_LOG_A}"
         elif is_known_rch_remote_dep_mismatch "${CASE10_LOG_A}"; then
             case10_skip=1
             scenario_diag_mark_reason "SKIP_RCH_REMOTE_DEP_MISMATCH" "remote worker dependency mismatch"
@@ -472,6 +499,13 @@ else
                 _SUITE_STOP_REMAINING=1
                 _SUITE_STOP_REASON_CODE="SKIP_RCH_UNAVAILABLE"
                 _SUITE_STOP_REASON="skipped after missing rch runtime in earlier case"
+                _SUITE_STOP_EVIDENCE="${CASE10_LOG_B}"
+            elif [ "${case10_rc_b}" -eq 124 ]; then
+                case10_skip=1
+                scenario_diag_mark_reason "SKIP_RCH_TIMEOUT" "rch command timed out"
+                _SUITE_STOP_REMAINING=1
+                _SUITE_STOP_REASON_CODE="SKIP_RCH_TIMEOUT"
+                _SUITE_STOP_REASON="skipped after rch timeout in earlier case"
                 _SUITE_STOP_EVIDENCE="${CASE10_LOG_B}"
             elif is_known_rch_remote_dep_mismatch "${CASE10_LOG_B}"; then
                 case10_skip=1

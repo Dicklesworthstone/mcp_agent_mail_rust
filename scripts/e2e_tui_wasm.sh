@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_tui_wasm.sh - WASM/browser-mode E2E suite for TUI state-sync contract.
 #
-# Run via:
-#   ./scripts/e2e_test.sh tui_wasm
+# Run via (authoritative):
+#   am e2e run --project . tui_wasm
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh tui_wasm
 #
 # Coverage:
 # - WASM crate native unit-test execution via rch

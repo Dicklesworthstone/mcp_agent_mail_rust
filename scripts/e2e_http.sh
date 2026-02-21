@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_http.sh - Unified HTTP-focused E2E parity suite
 #
-# Run via:
-#   ./scripts/e2e_test.sh http
+# Run via (authoritative):
+#   am e2e run --project . http
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh http
 #
 # This suite aims to cover the end-user visible HTTP server surface in one run,
 # while reusing existing focused E2E suites where appropriate.

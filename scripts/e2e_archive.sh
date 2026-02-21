@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_archive.sh - E2E test suite for git-archive side effects + notification signals
 #
-# Run via:
-#   ./scripts/e2e_test.sh archive
+# Run via (authoritative):
+#   am e2e run --project . archive
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh archive
 #
 # This suite verifies:
 # - Message archive writes (canonical + inbox/outbox copies) are byte-identical

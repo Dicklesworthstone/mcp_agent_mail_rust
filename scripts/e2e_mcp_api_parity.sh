@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # e2e_mcp_api_parity.sh - PTY E2E suite for MCP/API mode switching and parity.
 #
-# Run via:
-#   ./scripts/e2e_test.sh mcp_api_parity
+# Run via (authoritative):
+#   am e2e run --project . mcp_api_parity
+# Compatibility fallback:
+#   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh mcp_api_parity
 #   # or directly:
 #   bash scripts/e2e_mcp_api_parity.sh
 #

@@ -8,6 +8,8 @@
 #   4. Database with wrong schema (missing tables)
 #   5. Read-only database file
 #   6. Database in nonexistent directory
+#   7. Malformed relative sqlite URL with healthy absolute sibling fallback
+#   8. CLI mail/list-acks flow under malformed relative sqlite URL fallback
 
 E2E_SUITE="db_corruption"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +28,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 
 # Helper: run a single session and capture output + exit status
 try_session() {
-    local db_path="$1"
+    local db_input="$1"
     shift
     local requests=("$@")
     local output_file="${WORK}/session_response_$$.txt"
@@ -35,7 +37,14 @@ try_session() {
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
+    local database_url
+    if [[ "$db_input" == sqlite://* ]]; then
+        database_url="$db_input"
+    else
+        database_url="sqlite:////${db_input}"
+    fi
+
+    DATABASE_URL="${database_url}" RUST_LOG=error \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.5
@@ -85,6 +94,37 @@ for line in sys.stdin:
                 print('YES')
                 sys.exit(0)
     except Exception: pass
+print('NO')
+" 2>/dev/null
+}
+
+# Helper: check if a specific tool call id returned a non-error result payload
+tool_call_succeeded() {
+    local resp="$1"
+    local id="$2"
+    echo "$resp" | python3 -c "
+import sys, json
+target = int(${id})
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if d.get('id') != target:
+        continue
+    if 'error' in d:
+        print('NO')
+        sys.exit(0)
+    result = d.get('result')
+    if isinstance(result, dict) and result.get('isError') is True:
+        print('NO')
+        sys.exit(0)
+    if result is not None:
+        print('YES')
+        sys.exit(0)
 print('NO')
 " 2>/dev/null
 }
@@ -267,6 +307,131 @@ if [ "$P_CHECK" = "YES" ] && [ "$A_CHECK" = "YES" ] && [ "$M_CHECK" = "YES" ]; t
 else
     e2e_fail "fresh DB workflow incomplete: project=$P_CHECK agent=$A_CHECK msg=$M_CHECK"
 fi
+
+# ===========================================================================
+# Case 8: sqlite:///relative malformed path falls back to healthy absolute path
+# ===========================================================================
+e2e_case_banner "Malformed relative URL fallback to healthy absolute sibling"
+
+ABS_DB_DIR="/tmp/e2e_db_url_fallback_${RANDOM}_$$"
+ABS_DB="${ABS_DB_DIR}/storage.sqlite3"
+REL_DB="${ABS_DB#/}"
+FALLBACK_URL="sqlite:///${REL_DB}"
+PROJECT_KEY_FALLBACK="/tmp/e2e_relative_url_fallback"
+
+mkdir -p "$(dirname "$ABS_DB")"
+sqlite3 "$ABS_DB" "CREATE TABLE seed (id INTEGER PRIMARY KEY);" 2>/dev/null
+
+mkdir -p "$(dirname "$REL_DB")"
+printf "not-a-database" > "$REL_DB"
+
+RESP="$(try_session "$FALLBACK_URL" \
+    "$INIT_REQ" \
+    "{\"jsonrpc\":\"2.0\",\"id\":800,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_KEY_FALLBACK}\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":801,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_KEY_FALLBACK}\",\"program\":\"test\",\"model\":\"test\",\"name\":\"BlueOtter\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":802,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_KEY_FALLBACK}\",\"sender_name\":\"BlueOtter\",\"to\":[\"BlueOtter\"],\"subject\":\"fallback-db-url-check\",\"body_md\":\"ok\"}}}" \
+)" || true
+e2e_save_artifact "case_08_relative_url_fallback.txt" "$RESP"
+
+CHECK_800="$(tool_call_succeeded "$RESP" 800)"
+CHECK_801="$(tool_call_succeeded "$RESP" 801)"
+CHECK_802="$(tool_call_succeeded "$RESP" 802)"
+if [ "$CHECK_800" = "YES" ] && [ "$CHECK_801" = "YES" ] && [ "$CHECK_802" = "YES" ]; then
+    e2e_pass "sqlite:///relative malformed path recovered via fallback for project/register/send flow"
+else
+    e2e_fail "sqlite:///relative malformed path flow failed: ensure_project=${CHECK_800} register_agent=${CHECK_801} send_message=${CHECK_802}"
+fi
+
+if sqlite3 "$REL_DB" "PRAGMA quick_check;" >/dev/null 2>&1; then
+    e2e_fail "malformed relative file unexpectedly became healthy"
+else
+    e2e_pass "malformed relative file remained untouched"
+fi
+
+rm -f "$REL_DB" 2>/dev/null || true
+rmdir -p "$(dirname "$REL_DB")" 2>/dev/null || true
+rm -f "$ABS_DB" 2>/dev/null || true
+rmdir "${ABS_DB_DIR}" 2>/dev/null || true
+
+# ===========================================================================
+# Case 9: CLI flow succeeds with malformed relative sqlite URL fallback
+# ===========================================================================
+e2e_case_banner "CLI fallback for malformed relative sqlite URL (send/list-acks)"
+
+CLI_ABS_DB_DIR="/tmp/e2e_cli_db_url_fallback_${RANDOM}_$$"
+CLI_ABS_DB="${CLI_ABS_DB_DIR}/storage.sqlite3"
+CLI_REL_DB="${CLI_ABS_DB#/}"
+CLI_DB_URL="sqlite:///${CLI_REL_DB}"
+CLI_PROJECT="/tmp/e2e_cli_relative_url_fallback"
+CLI_AGENT="BlueFalcon"
+
+mkdir -p "$(dirname "$CLI_ABS_DB")"
+sqlite3 "$CLI_ABS_DB" "CREATE TABLE seed (id INTEGER PRIMARY KEY);" 2>/dev/null
+
+mkdir -p "$(dirname "$CLI_REL_DB")"
+printf "not-a-database" > "$CLI_REL_DB"
+
+if CLI_START_OUT="$(
+    DATABASE_URL="$CLI_DB_URL" AM_INTERFACE_MODE=cli \
+        am macros start-session \
+        --project "$CLI_PROJECT" \
+        --program "test" \
+        --model "test" \
+        --agent-name "$CLI_AGENT" \
+        --json 2>&1
+)"; then
+    e2e_save_artifact "case_09_cli_start_session.txt" "$CLI_START_OUT"
+    if echo "$CLI_START_OUT" | jq -e ".agent.name == \"${CLI_AGENT}\"" >/dev/null 2>&1; then
+        e2e_pass "CLI start-session succeeded with malformed relative sqlite URL fallback"
+    else
+        e2e_fail "CLI start-session output missing expected agent identity"
+    fi
+else
+    e2e_save_artifact "case_09_cli_start_session.txt" "$CLI_START_OUT"
+    e2e_fail "CLI start-session failed under malformed relative sqlite URL fallback"
+fi
+
+if CLI_SEND_OUT="$(
+    DATABASE_URL="$CLI_DB_URL" AM_INTERFACE_MODE=cli \
+        am mail send \
+        --project "$CLI_PROJECT" \
+        --from "$CLI_AGENT" \
+        --to "$CLI_AGENT" \
+        --subject "fallback-cli-check" \
+        --body "ok" \
+        --json 2>&1
+)"; then
+    e2e_save_artifact "case_09_cli_send.txt" "$CLI_SEND_OUT"
+    e2e_pass "CLI mail send succeeded with fallback URL"
+else
+    e2e_save_artifact "case_09_cli_send.txt" "$CLI_SEND_OUT"
+    e2e_fail "CLI mail send failed with fallback URL"
+fi
+
+if CLI_ACKS_OUT="$(
+    DATABASE_URL="$CLI_DB_URL" AM_INTERFACE_MODE=cli \
+        am list-acks \
+        --project "$CLI_PROJECT" \
+        --agent "$CLI_AGENT" \
+        --limit 5 2>&1
+)"; then
+    e2e_save_artifact "case_09_cli_list_acks.txt" "$CLI_ACKS_OUT"
+    e2e_pass "CLI list-acks succeeded with fallback URL"
+else
+    e2e_save_artifact "case_09_cli_list_acks.txt" "$CLI_ACKS_OUT"
+    e2e_fail "CLI list-acks failed with fallback URL"
+fi
+
+if sqlite3 "$CLI_REL_DB" "PRAGMA quick_check;" >/dev/null 2>&1; then
+    e2e_fail "CLI case: malformed relative file unexpectedly became healthy"
+else
+    e2e_pass "CLI case: malformed relative file remained untouched"
+fi
+
+rm -f "$CLI_REL_DB" 2>/dev/null || true
+rmdir -p "$(dirname "$CLI_REL_DB")" 2>/dev/null || true
+rm -f "$CLI_ABS_DB" 2>/dev/null || true
+rmdir "${CLI_ABS_DB_DIR}" 2>/dev/null || true
 
 # ===========================================================================
 # Summary
