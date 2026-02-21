@@ -3745,12 +3745,18 @@ pub async fn create_file_reservations(
     // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
     try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
-    // Check for conflicting active exclusive reservations held by others to prevent TOCTOU races.
+    let exclusive_filter = if exclusive {
+        ""
+    } else {
+        "AND \"exclusive\" = 1"
+    };
+
+    // Check for conflicting active reservations held by others to prevent TOCTOU races.
     let conflict_sql = format!(
         "SELECT path_pattern FROM file_reservations \
          WHERE project_id = ? AND agent_id != ? \
            AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
-           AND \"exclusive\" = 1"
+           {exclusive_filter}"
     );
     let conflict_params = [
         Value::BigInt(project_id),
