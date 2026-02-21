@@ -522,7 +522,8 @@ fn parse_text_timestamp(s: &str) -> i64 {
     let frac_micros: i64 = if frac_str.is_empty() {
         0
     } else {
-        let padded = format!("{:0<6}", &frac_str[..frac_str.len().min(6)]);
+        let safe_frac: String = frac_str.chars().take(6).collect();
+        let padded = format!("{:0<6}", safe_frac);
         padded.parse().unwrap_or(0)
     };
     // Convert to unix timestamp using a simplified calculation

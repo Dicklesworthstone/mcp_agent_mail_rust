@@ -1097,8 +1097,6 @@ impl MailScreen for DashboardScreen {
                     self.prev_db_stats = stats;
                 } else if stats.timestamp_micros > self.current_db_stats.timestamp_micros {
                     self.prev_db_stats = std::mem::replace(&mut self.current_db_stats, stats);
-                } else {
-                    self.current_db_stats = stats;
                 }
             }
 
