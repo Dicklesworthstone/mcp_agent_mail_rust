@@ -455,8 +455,6 @@ dependencies = [
  "fsqlite-btree",
  "fsqlite-core",
  "fsqlite-error",
- "fsqlite-ext-fts5",
- "fsqlite-ext-json",
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-observability",
