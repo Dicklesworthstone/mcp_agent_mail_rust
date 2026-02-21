@@ -100,7 +100,7 @@ pub struct RenewedReservation {
 fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
     let p = pattern.trim();
     // 1. Too-broad patterns
-    if matches!(p, "*" | "**" | "**/*" | "**/**" | ".") {
+    if matches!(p, "" | "*" | "**" | "**/*" | "**/**" | ".") {
         return Some(format!(
             "Pattern '{p}' is too broad and would reserve the entire project. \
              Use more specific patterns like 'src/api/*.py' or 'lib/auth/**'."
@@ -125,34 +125,37 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
 }
 
 fn relativize_path(project_root: &str, path: &str) -> Option<String> {
-    let path_path = std::path::Path::new(path);
-    if path_path.is_absolute() {
+    let normalized_slash = path.replace('\\', "/");
+    let path_path = std::path::Path::new(&normalized_slash);
+    
+    let rel_path = if path_path.is_absolute() {
         if let Ok(rel) = path_path.strip_prefix(project_root) {
-            return Some(rel.to_string_lossy().to_string());
+            rel
+        } else {
+            // Absolute path outside project root
+            return None;
         }
-        // Absolute path outside project root
-        return None;
-    }
+    } else {
+        path_path
+    };
 
-    // Check for traversal in relative path
-    let mut depth = 0;
-    for component in path_path.components() {
+    let mut parts = Vec::new();
+    for component in rel_path.components() {
         match component {
             std::path::Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
+                if parts.pop().is_none() {
                     return None; // Traversal above root
                 }
             }
-            std::path::Component::Normal(_) => {
-                depth += 1;
+            std::path::Component::Normal(c) => {
+                parts.push(c.to_string_lossy().into_owned());
             }
             _ => {}
         }
     }
 
-    // Already relative and safe
-    Some(path.to_string())
+    // Return the relativized and safe path
+    Some(parts.join("/"))
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
@@ -467,6 +470,7 @@ pub async fn file_reservation_paths(
                     "path_pattern": &r.path_pattern,
                     "exclusive": r.exclusive != 0,
                     "reason": &r.reason,
+                    "created_ts": micros_to_iso(r.created_ts),
                     "expires_ts": micros_to_iso(r.expires_ts),
                 })
             })
@@ -678,6 +682,38 @@ pub async fn renew_file_reservations(
         )
         .await,
     )?;
+
+    if !renewed_rows.is_empty() {
+        let res_jsons: Vec<serde_json::Value> = renewed_rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id.unwrap_or(0),
+                    "agent": &agent_name,
+                    "path_pattern": &r.path_pattern,
+                    "exclusive": r.exclusive != 0,
+                    "reason": &r.reason,
+                    "created_ts": micros_to_iso(r.created_ts),
+                    "expires_ts": micros_to_iso(r.expires_ts),
+                })
+            })
+            .collect();
+        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+            project_slug: project.slug.clone(),
+            config: Config::get(),
+            reservations: res_jsons,
+        };
+        match mcp_agent_mail_storage::wbq_enqueue(op) {
+            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+            | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
+            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                tracing::warn!(
+                    "WBQ enqueue failed; skipping reservation renewal artifacts archive write project={}",
+                    project.slug
+                );
+            }
+        }
+    }
 
     let extend_micros = extend.saturating_mul(1_000_000);
     let file_reservations: Vec<RenewedReservation> = renewed_rows
@@ -1498,7 +1534,13 @@ mod tests {
         assert_eq!(relativize_path(root, "src/../../outside"), None);
         assert_eq!(
             relativize_path(root, "src/../internal"),
-            Some("src/../internal".to_string())
+            Some("internal".to_string())
+        );
+        // Absolute path traversal check
+        assert_eq!(relativize_path(root, "/project/../outside"), None);
+        assert_eq!(
+            relativize_path(root, "/project/src/../internal"),
+            Some("internal".to_string())
         );
     }
 

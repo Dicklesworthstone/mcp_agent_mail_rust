@@ -120,12 +120,13 @@ impl ReservationIndex {
         req_prefix: Option<&str>,
         conflicts: &mut Vec<&'a ReservationRef>,
     ) {
-        // Check exact reservations: only same-prefix group, string equality.
+        // Check exact reservations: only same-prefix group.
+        // We use patterns_overlap to handle directory prefix overlaps (e.g. `src` vs `src/main.rs`).
         if let Some(prefix) = req_prefix
             && let Some(entries) = self.exact_by_prefix.get(prefix)
         {
             for (norm, rref) in entries {
-                if norm == req_norm {
+                if norm == req_norm || mcp_agent_mail_core::pattern_overlap::patterns_overlap(norm, req_norm) {
                     conflicts.push(rref);
                 }
             }
@@ -133,7 +134,7 @@ impl ReservationIndex {
         // Also check exact entries with empty prefix (root-level exact paths).
         if let Some(entries) = self.exact_by_prefix.get("") {
             for (norm, rref) in entries {
-                if norm == req_norm {
+                if norm == req_norm || mcp_agent_mail_core::pattern_overlap::patterns_overlap(norm, req_norm) {
                     conflicts.push(rref);
                 }
             }
@@ -164,11 +165,19 @@ impl ReservationIndex {
         if let Some(prefix) = req_prefix {
             // Scoped scan: only check entries sharing this prefix.
 
-            // Check exact entries: request glob might match exact paths.
+            // Check exact entries: request glob might match exact paths or overlap with exact directory prefixes.
             if let Some(entries) = self.exact_by_prefix.get(prefix) {
                 for (exact_norm, rref) in entries {
-                    // One-directional: does our glob match the exact path?
-                    if request_pat.matches(exact_norm) {
+                    // One-directional match, or fallback to patterns_overlap for directory prefix cases
+                    if request_pat.matches(exact_norm) || mcp_agent_mail_core::pattern_overlap::patterns_overlap(exact_norm, request_pat.normalized()) {
+                        conflicts.push(rref);
+                    }
+                }
+            }
+            // Also check exact entries with empty prefix (root-level exact paths or root directory itself).
+            if let Some(entries) = self.exact_by_prefix.get("") {
+                for (exact_norm, rref) in entries {
+                    if request_pat.matches(exact_norm) || mcp_agent_mail_core::pattern_overlap::patterns_overlap(exact_norm, request_pat.normalized()) {
                         conflicts.push(rref);
                     }
                 }
@@ -186,7 +195,7 @@ impl ReservationIndex {
             // Root glob request (no prefix): must check ALL groups.
             for entries in self.exact_by_prefix.values() {
                 for (exact_norm, rref) in entries {
-                    if request_pat.matches(exact_norm) {
+                    if request_pat.matches(exact_norm) || mcp_agent_mail_core::pattern_overlap::patterns_overlap(exact_norm, request_pat.normalized()) {
                         conflicts.push(rref);
                     }
                 }

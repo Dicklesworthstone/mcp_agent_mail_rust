@@ -311,7 +311,8 @@ pub(crate) fn summarize_messages(
                 if (snippet.contains('/')
                     || snippet.contains(".py")
                     || snippet.contains(".ts")
-                    || snippet.contains(".md"))
+                    || snippet.contains(".md")
+                    || snippet.contains(".rs"))
                     && (1..=120).contains(&snippet.len())
                 {
                     code_references.insert(snippet.to_string());
@@ -325,9 +326,13 @@ pub(crate) fn summarize_messages(
                 || is_ordered_prefix(stripped)
             {
                 let mut normalized = stripped.to_string();
-                if (normalized.starts_with("- [ ]")
-                    || normalized.starts_with("- [x]")
-                    || normalized.starts_with("- [X]"))
+                let upper_norm = normalized.to_ascii_uppercase();
+                if (upper_norm.starts_with("- [ ]")
+                    || upper_norm.starts_with("- [X]")
+                    || upper_norm.starts_with("* [ ]")
+                    || upper_norm.starts_with("* [X]")
+                    || upper_norm.starts_with("+ [ ]")
+                    || upper_norm.starts_with("+ [X]"))
                     && let Some((_, rest)) = normalized.split_once(']')
                 {
                     normalized = rest.trim().to_string();
@@ -637,6 +642,7 @@ pub async fn search_messages(
     query: String,
     limit: Option<i32>,
     offset: Option<i32>,
+    cursor: Option<String>,
     ranking: Option<String>,
     sender: Option<String>,
     from_agent: Option<String>,
@@ -655,7 +661,7 @@ pub async fn search_messages(
 ) -> McpResult<String> {
     let max_results_raw = limit.unwrap_or(20).clamp(1, 1000);
     let max_results = max_results_raw.unsigned_abs() as usize;
-    let offset_val = offset.unwrap_or(0).max(0).unsigned_abs() as usize;
+    let offset_val = if cursor.is_some() { 0 } else { offset.unwrap_or(0).max(0).unsigned_abs() as usize };
     let planner_limit = max_results.saturating_add(offset_val).min(1000);
     let want_explain = explain.unwrap_or(false);
 
@@ -718,7 +724,7 @@ pub async fn search_messages(
         time_range,
         ranking: ranking_mode,
         limit: Some(planner_limit),
-        cursor: None,
+        cursor,
         // Always collect explain internally so degraded diagnostics remain deterministic
         // even when `explain=false` for the caller.
         explain: true,

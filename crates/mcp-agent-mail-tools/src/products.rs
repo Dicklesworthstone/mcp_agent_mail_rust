@@ -47,16 +47,15 @@ fn generate_product_uid(now_micros: i64) -> String {
     use std::fmt::Write;
     let seq = PRODUCT_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = u64::from(std::process::id());
-    let mut out = String::with_capacity(20);
+    let mut out = String::with_capacity(32);
     // Format directly into the output buffer
-    let _ = write!(out, "{now_micros:x}{pid:x}{seq:x}");
+    let _ = write!(out, "{now_micros:016x}{pid:08x}{seq:08x}");
 
-    if out.len() > 20 {
-        out.truncate(20);
-    } else {
-        while out.len() < 20 {
-            out.push('0');
-        }
+    if out.len() > 32 {
+        // If it somehow exceeds 32 chars, we keep the rightmost 32 chars
+        // to ensure we keep the sequence number and least significant bits of time/pid.
+        let start = out.len() - 32;
+        out.drain(0..start);
     }
     out
 }
@@ -277,13 +276,14 @@ pub struct ProductSearchResponse {
 /// Full-text search across all projects linked to a product.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
-    description = "Full-text search across all projects linked to a product.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id }], assistance?, diagnostics? }"
+    description = "Full-text search across all projects linked to a product.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\ncursor : str\n    Stable pagination cursor for large result sets.\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id }], assistance?, next_cursor?, diagnostics? }"
 )]
 pub async fn search_messages_product(
     ctx: &McpContext,
     product_key: String,
     query: String,
     limit: Option<i32>,
+    cursor: Option<String>,
     project: Option<String>,
     project_key_filter: Option<String>,
     project_slug: Option<String>,
@@ -380,7 +380,7 @@ pub async fn search_messages_product(
         time_range,
         ranking: mcp_agent_mail_db::search_planner::RankingMode::default(),
         limit: Some(max_results),
-        cursor: None,
+        cursor,
         // Collect explain internally to derive deterministic degraded diagnostics.
         explain: true,
         ..Default::default()
@@ -507,7 +507,7 @@ pub async fn fetch_inbox_product(
         }
     }
 
-    items.sort_by(|(a_ts, a_id, _), (b_ts, b_id, _)| b_ts.cmp(a_ts).then_with(|| a_id.cmp(b_id)));
+    items.sort_by(|(a_ts, a_id, _), (b_ts, b_id, _)| b_ts.cmp(a_ts).then_with(|| b_id.cmp(a_id)));
     let out: Vec<InboxMessage> = items
         .into_iter()
         .take(max_messages)
@@ -571,7 +571,7 @@ pub async fn summarize_thread_product(
         rows.extend(msgs);
     }
 
-    rows.sort_by_key(|a| a.created_ts);
+    rows.sort_by(|a, b| a.created_ts.cmp(&b.created_ts).then_with(|| a.id.cmp(&b.id)));
     let use_llm = llm_mode.unwrap_or(true);
     let mut summary = crate::search::summarize_messages(&rows);
 
@@ -730,9 +730,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn product_uid_is_20_chars() {
+    fn product_uid_is_32_chars() {
         let uid = generate_product_uid(1_000_000);
-        assert_eq!(uid.len(), 20);
+        assert_eq!(uid.len(), 32);
     }
 
     #[test]
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn product_uid_zero_timestamp() {
         let uid = generate_product_uid(0);
-        assert_eq!(uid.len(), 20);
+        assert_eq!(uid.len(), 32);
         assert!(uid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -1025,17 +1025,17 @@ mod tests {
     }
 
     #[test]
-    fn product_uid_pads_to_20_chars() {
-        // Even with a very small input, should pad to 20 chars
+    fn product_uid_pads_to_32_chars() {
+        // Even with a very small input, should pad to 32 chars
         let uid = generate_product_uid(1);
-        assert_eq!(uid.len(), 20);
+        assert_eq!(uid.len(), 32);
     }
 
     #[test]
     fn product_uid_large_timestamp() {
         let large_ts = 9_999_999_999_999_i64;
         let uid = generate_product_uid(large_ts);
-        assert_eq!(uid.len(), 20);
+        assert_eq!(uid.len(), 32);
         assert!(uid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 

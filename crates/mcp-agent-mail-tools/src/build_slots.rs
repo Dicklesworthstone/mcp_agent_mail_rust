@@ -118,6 +118,9 @@ fn collect_slot_conflicts(
 ) -> Vec<BuildSlotLease> {
     let mut conflicts = Vec::new();
     for entry in active {
+        if entry.released_ts.is_some() {
+            continue;
+        }
         // Renewing/reacquiring your own lease should not self-conflict.
         if entry.agent == agent_name && entry.branch.as_deref() == branch {
             continue;
@@ -166,7 +169,7 @@ pub async fn acquire_build_slot(
     let project = resolve_project(ctx, &pool, &project_key).await?;
 
     let now = chrono::Utc::now();
-    let ttl = std::cmp::max(ttl_seconds.unwrap_or(3600), 60);
+    let ttl = std::cmp::max(ttl_seconds.unwrap_or(3600), 60).min(31_536_000);
     let expires_ts = (now + chrono::Duration::seconds(ttl)).to_rfc3339();
     let branch = compute_branch(&project.human_key);
     let is_exclusive = exclusive.unwrap_or(true);
@@ -221,7 +224,7 @@ pub async fn renew_build_slot(
     let project = resolve_project(ctx, &pool, &project_key).await?;
 
     let now = chrono::Utc::now();
-    let extend = std::cmp::max(extend_seconds.unwrap_or(1800), 60);
+    let extend = std::cmp::max(extend_seconds.unwrap_or(1800), 60).min(31_536_000);
     let new_exp = (now + chrono::Duration::seconds(extend)).to_rfc3339();
 
     let project_root = project_archive_root(config, &project.slug);

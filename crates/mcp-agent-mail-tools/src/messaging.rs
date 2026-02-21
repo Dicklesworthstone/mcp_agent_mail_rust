@@ -397,9 +397,10 @@ fn sanitize_thread_id(raw: &str, fallback: &str) -> String {
     let sanitized: String = raw
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .skip_while(|c| !c.is_ascii_alphanumeric())
         .take(128)
         .collect();
-    if sanitized.is_empty() || !sanitized.as_bytes()[0].is_ascii_alphanumeric() {
+    if sanitized.is_empty() {
         return fallback.to_string();
     }
     sanitized
@@ -1035,6 +1036,14 @@ effective_free_bytes={free}"
             json!({ "argument": "broadcast" }),
         ));
     }
+    if broadcast {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Broadcast messaging is not supported. Please address recipients individually.",
+            true,
+            json!({ "argument": "broadcast" }),
+        ));
+    }
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
     {
@@ -1062,7 +1071,7 @@ effective_free_bytes={free}"
     let cc_list = cc.unwrap_or_default();
     let bcc_list = bcc.unwrap_or_default();
 
-    if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() && !broadcast {
+    if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             "At least one recipient is required. Provide agent names in to, cc, or bcc.",
@@ -1084,44 +1093,6 @@ effective_free_bytes={free}"
     let mut recipient_map: HashMap<String, mcp_agent_mail_db::AgentRow> =
         HashMap::with_capacity(total_recip);
     let mut missing_local: Vec<String> = Vec::new();
-
-    if broadcast {
-        let agents = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-        )?;
-        for agent in agents {
-            if agent.id == Some(sender_id) {
-                continue;
-            }
-            recipient_map.insert(agent.name.to_lowercase(), agent.clone());
-            if let Err(err) = push_recipient(
-                ctx,
-                &pool,
-                project_id,
-                &agent.name,
-                "to",
-                &sender,
-                config,
-                &project.human_key,
-                &project.slug,
-                &mut recipient_map,
-                &mut all_recipients,
-                &mut resolved_to,
-            )
-            .await
-            {
-                return Err(err);
-            }
-        }
-        if resolved_to.is_empty() {
-            return Err(legacy_tool_error(
-                "NO_RECIPIENTS",
-                "Broadcast found no other agents in the project.",
-                true,
-                json!({}),
-            ));
-        }
-    }
 
     for name in &to {
         if let Err(err) = push_recipient(
