@@ -45,7 +45,15 @@ pub fn start(config: &Config) {
         SHUTDOWN.store(false, Ordering::Release);
         std::thread::Builder::new()
             .name("file-res-cleanup".into())
-            .spawn(move || cleanup_loop(&config))
+            .spawn(move || {
+                let rt = asupersync::runtime::RuntimeBuilder::new()
+                    .worker_threads(1)
+                    .build()
+                    .expect("build cleanup runtime");
+                rt.block_on(async move {
+                    cleanup_loop(&config)
+                });
+            })
             .expect("failed to spawn file reservation cleanup worker")
     });
 }
@@ -164,9 +172,9 @@ fn detect_and_release_stale(
     project_id: i64,
 ) -> Result<Vec<i64>, String> {
     let inactivity_us =
-        i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(1800) * 1_000_000;
+        i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(1800).saturating_mul(1_000_000);
     let grace_us =
-        i64::try_from(config.file_reservation_activity_grace_seconds).unwrap_or(900) * 1_000_000;
+        i64::try_from(config.file_reservation_activity_grace_seconds).unwrap_or(900).saturating_mul(1_000_000);
     let now = now_micros();
 
     // Get all unreleased reservations for this project.
@@ -289,39 +297,29 @@ fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_u
         return false;
     }
 
-    let matches = collect_matching_paths(workspace, path_pattern);
-    if matches.is_empty() {
+    // Use git log with the path pattern directly (git handles pathspecs including globs).
+    // This is vastly more efficient than spawning a git process per matched file.
+    let Ok(output) = std::process::Command::new("git")
+        .args([
+            "-C",
+            &workspace.to_string_lossy(),
+            "log",
+            "-1",
+            "--format=%ct",
+            "--",
+            path_pattern,
+        ])
+        .output()
+    else {
         return false;
-    }
+    };
 
-    // Use git log to find most recent commit touching these paths.
-    for path in &matches {
-        let Ok(rel_path) = path.strip_prefix(workspace) else {
-            continue;
-        };
-
-        let Ok(output) = std::process::Command::new("git")
-            .args([
-                "-C",
-                &workspace.to_string_lossy(),
-                "log",
-                "-1",
-                "--format=%ct",
-                "--",
-                &rel_path.to_string_lossy(),
-            ])
-            .output()
-        else {
-            continue;
-        };
-
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Ok(commit_epoch) = stdout.trim().parse::<i64>() {
-                let commit_us = commit_epoch * 1_000_000;
-                if (now_us - commit_us) <= grace_us {
-                    return true;
-                }
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Ok(commit_epoch) = stdout.trim().parse::<i64>() {
+            let commit_us = commit_epoch * 1_000_000;
+            if (now_us - commit_us) <= grace_us {
+                return true;
             }
         }
     }

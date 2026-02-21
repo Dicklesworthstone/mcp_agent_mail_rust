@@ -71,6 +71,18 @@ fn monitor_loop(config: &Config) {
     }
 
     loop {
+        // Sleep in small increments to allow quick shutdown.
+        let mut remaining = interval;
+        while !remaining.is_zero() {
+            if SHUTDOWN.load(Ordering::Acquire) {
+                tracing::info!("disk monitor worker shutting down");
+                return;
+            }
+            let chunk = remaining.min(Duration::from_secs(1));
+            std::thread::sleep(chunk);
+            remaining = remaining.saturating_sub(chunk);
+        }
+
         if SHUTDOWN.load(Ordering::Acquire) {
             tracing::info!("disk monitor worker shutting down");
             return;
@@ -89,17 +101,6 @@ fn monitor_loop(config: &Config) {
                 "disk pressure level changed"
             );
             last_pressure = pressure;
-        }
-
-        // Sleep in small increments to allow quick shutdown.
-        let mut remaining = interval;
-        while !remaining.is_zero() {
-            if SHUTDOWN.load(Ordering::Acquire) {
-                return;
-            }
-            let chunk = remaining.min(Duration::from_secs(1));
-            std::thread::sleep(chunk);
-            remaining = remaining.saturating_sub(chunk);
         }
     }
 }

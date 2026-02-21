@@ -2193,6 +2193,27 @@ impl AmbientEffectRenderer {
         )
     }
 
+    /// Composite the already-rendered background effect onto the frame
+    /// without re-running the expensive simulation.
+    pub fn render_cached(
+        &self,
+        area: Rect,
+        frame: &mut Frame,
+        mode: AmbientMode,
+    ) {
+        if area.is_empty() || !mode.is_enabled() {
+            return;
+        }
+        let opacity = mode.effect_opacity();
+        self.composite_halfblock(
+            area,
+            frame,
+            opacity,
+            self.last_telemetry.subpixel_width,
+            self.last_telemetry.subpixel_height,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_plasma(
         &mut self,

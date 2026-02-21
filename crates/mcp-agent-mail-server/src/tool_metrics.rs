@@ -61,7 +61,15 @@ pub fn start(config: &Config) {
         SHUTDOWN.store(false, Ordering::Release);
         std::thread::Builder::new()
             .name("tool-metrics-emit".into())
-            .spawn(move || metrics_loop(&config))
+            .spawn(move || {
+                let rt = asupersync::runtime::RuntimeBuilder::new()
+                    .worker_threads(1)
+                    .build()
+                    .expect("build tool-metrics runtime");
+                rt.block_on(async move {
+                    metrics_loop(&config)
+                });
+            })
             .expect("failed to spawn tool metrics emit worker")
     });
 }

@@ -33,7 +33,6 @@ use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
-use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
@@ -1508,11 +1507,8 @@ impl MailAppModel {
             return;
         };
 
-        match mcp_agent_mail_db::sync::update_message_thread_id(
-            &conn,
-            message_id,
-            target_thread_id,
-        ) {
+        match mcp_agent_mail_db::sync::update_message_thread_id(&conn, message_id, target_thread_id)
+        {
             Ok(true) => {
                 self.record_action_outcome(ActionOutcome::Success {
                     operation: "rethread_message".to_string(),
@@ -3861,6 +3857,12 @@ impl Model for MailAppModel {
             self.ambient_last_render_tick.set(Some(self.tick_count));
             self.ambient_render_invocations
                 .set(self.ambient_render_invocations.get().saturating_add(1));
+        } else {
+            self.ambient_renderer.borrow().render_cached(
+                area,
+                frame,
+                self.ambient_mode_for_frame(),
+            );
         }
         let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();

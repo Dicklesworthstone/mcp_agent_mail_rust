@@ -910,7 +910,12 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     let supervisor_thread = std::thread::Builder::new()
         .name("mcp-http-supervisor".into())
         .spawn(move || {
-            run_http_server_supervisor_thread(server_config, &supervisor_state, &server_ctl_rx)
+            let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build supervisor runtime");
+            rt.block_on(async move {
+                run_http_server_supervisor_thread(server_config, &supervisor_state, &server_ctl_rx)
+            })
         })
         .expect("spawn HTTP supervisor thread");
 
@@ -1218,13 +1223,13 @@ fn dispatch_compose_envelope(
     // 5. Insert recipients (To, Cc, Bcc).
     let mut all_recipients = Vec::new();
     for name in &envelope.to {
-        all_recipients.push((name.to_string(), "to".to_string()));
+        all_recipients.push((name.clone(), "to".to_string()));
     }
     for name in &envelope.cc {
-        all_recipients.push((name.to_string(), "cc".to_string()));
+        all_recipients.push((name.clone(), "cc".to_string()));
     }
     for name in &envelope.bcc {
-        all_recipients.push((name.to_string(), "bcc".to_string()));
+        all_recipients.push((name.clone(), "bcc".to_string()));
     }
 
     match mcp_agent_mail_db::sync::dispatch_root_message(
@@ -3464,7 +3469,7 @@ impl HttpState {
             return Some(self.json_response(req, 200, &payload));
         }
 
-        if path == "/mail/api/locks" {
+        if path == "/mail/api/locks" || path == "/mail/api/locks/" {
             if !matches!(req.method, Http1Method::Get) {
                 return Some(self.error_response(req, 405, "Method Not Allowed"));
             }
@@ -4021,7 +4026,7 @@ impl HttpState {
             "tools/call" => {
                 let mut params: fastmcp_protocol::CallToolParams = parse_params(request.params)?;
                 let tool_name = params.name.clone();
-                if tool_name == "send_message"
+                if (tool_name == "send_message" || tool_name == "reply_message")
                     && let Some(arguments) = params.arguments.as_mut()
                 {
                     mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
@@ -6516,6 +6521,28 @@ mod tests {
         };
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/mail/api/locks", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("locks response json");
+        assert!(
+            payload.get("locks").and_then(|v| v.as_array()).is_some(),
+            "locks missing or not array: {payload}"
+        );
+    }
+
+    #[test]
+    fn mail_api_locks_trailing_slash_returns_json() {
+        let storage_root = std::env::temp_dir().join(format!(
+            "mcp-agent-mail-mail-locks-test-trailing-{}",
+            std::process::id()
+        ));
+        let config = mcp_agent_mail_core::Config {
+            storage_root,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/mail/api/locks/", &[]);
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 200);
         let payload: serde_json::Value =

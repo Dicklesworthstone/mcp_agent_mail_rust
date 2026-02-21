@@ -212,7 +212,15 @@ impl DbPoller {
         let stop = Arc::clone(&self.stop);
         let join = thread::Builder::new()
             .name("tui-db-poller".into())
-            .spawn(move || self.run())
+            .spawn(move || {
+                let rt = asupersync::runtime::RuntimeBuilder::new()
+                    .worker_threads(1)
+                    .build()
+                    .expect("build db poller runtime");
+                rt.block_on(async move {
+                    self.run()
+                });
+            })
             .expect("spawn tui-db-poller thread");
         DbPollerHandle {
             join: Some(join),

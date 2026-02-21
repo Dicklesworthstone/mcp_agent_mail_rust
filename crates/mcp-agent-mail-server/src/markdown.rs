@@ -106,7 +106,7 @@ static HTML_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
 
     // Allowed URL schemes.
     b.url_schemes(
-        ["http", "https", "mailto", "data"]
+        ["http", "https", "mailto", "data", "resource"]
             .into_iter()
             .collect::<HashSet<_>>(),
     );
