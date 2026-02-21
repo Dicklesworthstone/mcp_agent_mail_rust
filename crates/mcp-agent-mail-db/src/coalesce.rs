@@ -266,8 +266,9 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             #[allow(clippy::option_if_let_else)] // map_or_else can't work: else branch mutates map
-            if let Some(slot) = map.get(&key) {
-                Role::Joiner(Arc::clone(slot))
+            if let Some(slot) = map.get(&key).map(Arc::clone) {
+                drop(map);
+                Role::Joiner(slot)
             } else {
                 // We are the leader. Insert our slot.
                 let slot = Arc::new(Slot::new());
@@ -278,6 +279,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                     }
                 }
                 map.insert(key.clone(), Arc::clone(&slot));
+                drop(map);
                 Role::Leader(slot)
             }
         };
@@ -341,11 +343,12 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                         let mut map = self.shards[shard_idx]
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some(existing) = map.get(&key) {
-                            if Arc::ptr_eq(existing, &slot) {
-                                map.remove(&key);
-                            }
+                        if let Some(existing) = map.get(&key)
+                            && Arc::ptr_eq(existing, &slot)
+                        {
+                            map.remove(&key);
                         }
+                        drop(map);
 
                         result.map(CoalesceOutcome::Executed)
                     }
@@ -354,11 +357,12 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                         let mut map = self.shards[shard_idx]
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some(existing) = map.get(&key) {
-                            if Arc::ptr_eq(existing, &slot) {
-                                map.remove(&key);
-                            }
+                        if let Some(existing) = map.get(&key)
+                            && Arc::ptr_eq(existing, &slot)
+                        {
+                            map.remove(&key);
                         }
+                        drop(map);
                         std::panic::resume_unwind(payload);
                     }
                 }

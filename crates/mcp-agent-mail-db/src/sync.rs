@@ -8,6 +8,7 @@ use crate::error::DbError;
 use sqlmodel_core::Value;
 
 /// Synchronously update the thread ID of a message.
+///
 /// Returns `Ok(true)` if the thread ID was updated, `Ok(false)` if it was already the target ID.
 /// Returns `Err` if the message was not found or if a database error occurred.
 pub fn update_message_thread_id(
@@ -32,7 +33,7 @@ pub fn update_message_thread_id(
 
     let Some(current_thread_id) = current_thread_id else {
         return Err(DbError::NotFound {
-            entity: "Message".into(),
+            entity: "Message",
             identifier: message_id.to_string(),
         });
     };
@@ -79,7 +80,7 @@ pub fn dispatch_root_message(
     let project_id = project_row
         .and_then(|r| r.get_named::<i64>("id").ok())
         .ok_or_else(|| DbError::NotFound {
-            entity: "Project".into(),
+            entity: "Project",
             identifier: "any".into(),
         })?;
 
@@ -89,7 +90,10 @@ pub fn dispatch_root_message(
     let sender_rows = conn
         .query_sync(
             "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-            &[Value::BigInt(project_id), Value::Text(sender_name.to_string())],
+            &[
+                Value::BigInt(project_id),
+                Value::Text(sender_name.to_string()),
+            ],
         )
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
@@ -109,12 +113,18 @@ pub fn dispatch_root_message(
         ).map_err(|e| DbError::Sqlite(e.to_string()))?;
 
         // Re-query ID
-        let rows = conn.query_sync(
-            "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-            &[Value::BigInt(project_id), Value::Text(sender_name.to_string())],
-        ).map_err(|e| DbError::Sqlite(e.to_string()))?;
-        
-        rows.into_iter().next()
+        let rows = conn
+            .query_sync(
+                "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                &[
+                    Value::BigInt(project_id),
+                    Value::Text(sender_name.to_string()),
+                ],
+            )
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+
+        rows.into_iter()
+            .next()
             .and_then(|r| r.get_named::<i64>("id").ok())
             .unwrap_or(0)
     };
@@ -125,7 +135,7 @@ pub fn dispatch_root_message(
 
     // 3. Insert Message
     let thread_id_val = thread_id.map_or(Value::Null, |t| Value::Text(t.to_string()));
-    
+
     let msg_rows = conn.query_sync(
         "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, created_ts) \
          VALUES (?, ?, ?, ?, ?, 0, ?, ?) \
@@ -141,29 +151,33 @@ pub fn dispatch_root_message(
         ],
     ).map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-    let msg_id = msg_rows.into_iter().next()
+    let msg_id = msg_rows
+        .into_iter()
+        .next()
         .and_then(|r| r.get_named::<i64>("id").ok())
         .ok_or_else(|| DbError::Internal("Message insert returned no ID".into()))?;
 
     // 4. Insert Recipients
     for (name, kind) in recipients {
         // Resolve recipient ID
-        let rec_rows = conn.query_sync(
-            "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-            &[Value::BigInt(project_id), Value::Text(name.to_string())],
-        ).map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let rec_rows = conn
+            .query_sync(
+                "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                &[Value::BigInt(project_id), Value::Text(name.clone())],
+            )
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-        if let Some(row) = rec_rows.into_iter().next() {
-            if let Ok(aid) = row.get_named::<i64>("id") {
-                let _ = conn.execute_sync(
-                    "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
-                    &[
-                        Value::BigInt(msg_id),
-                        Value::BigInt(aid),
-                        Value::Text(kind.to_string()),
-                    ],
-                );
-            }
+        if let Some(row) = rec_rows.into_iter().next()
+            && let Ok(aid) = row.get_named::<i64>("id")
+        {
+            let _ = conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
+                &[
+                    Value::BigInt(msg_id),
+                    Value::BigInt(aid),
+                    Value::Text(kind.clone()),
+                ],
+            );
         }
     }
 

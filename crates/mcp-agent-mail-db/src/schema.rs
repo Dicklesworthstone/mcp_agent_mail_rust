@@ -389,6 +389,29 @@ fn extract_trigger_statements(sql: &str) -> Vec<&str> {
     out
 }
 
+const TRG_INBOX_STATS_INSERT_COMPAT_SQL: &str = "CREATE TRIGGER IF NOT EXISTS trg_inbox_stats_insert \
+         AFTER INSERT ON message_recipients \
+         BEGIN \
+             INSERT OR IGNORE INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+             VALUES ( \
+                 NEW.agent_id, \
+                 0, \
+                 0, \
+                 0, \
+                 (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) \
+             ); \
+             UPDATE inbox_stats SET \
+                 total_count = total_count + 1, \
+                 unread_count = unread_count + 1, \
+                 ack_pending_count = ack_pending_count + \
+                     COALESCE((SELECT m.ack_required FROM messages m WHERE m.id = NEW.message_id), 0), \
+                 last_message_ts = COALESCE( \
+                     (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id), \
+                     last_message_ts \
+                 ) \
+             WHERE agent_id = NEW.agent_id; \
+         END";
+
 /// Return the complete list of schema migrations.
 ///
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
@@ -1016,50 +1039,15 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
-    // ── v12: Rebuild inbox_stats INSERT trigger without UPSERT ─────────
+    // ── v12: Drop legacy inbox_stats INSERT trigger shape ───────────────
     //
     // Some engines can surface PRIMARY KEY violations when running the prior
-    // UPSERT form inside a trigger. Recreate trigger with an update-first
-    // path plus insert-if-missing to keep behavior identical while avoiding
-    // conflict-handling syntax in trigger bodies.
+    // UPSERT form inside a trigger. We record only the DROP migration here,
+    // then recreate a compatibility trigger idempotently after migrations run.
     migrations.push(Migration::new(
         "v12_drop_trg_inbox_stats_insert".to_string(),
         "drop inbox_stats insert trigger before compatibility recreation".to_string(),
         "DROP TRIGGER IF EXISTS trg_inbox_stats_insert".to_string(),
-        String::new(),
-    ));
-    migrations.push(Migration::new(
-        "v12_recreate_trg_inbox_stats_insert_compat".to_string(),
-        "recreate inbox_stats insert trigger with update-then-insert-if-missing".to_string(),
-        "CREATE TRIGGER IF NOT EXISTS trg_inbox_stats_insert \
-         AFTER INSERT ON message_recipients \
-         BEGIN \
-             UPDATE inbox_stats SET \
-                 total_count = total_count + 1, \
-                 unread_count = unread_count + 1, \
-                 ack_pending_count = ack_pending_count + \
-                     (SELECT CASE WHEN m.ack_required = 1 THEN 1 ELSE 0 END FROM messages m WHERE m.id = NEW.message_id), \
-                 last_message_ts = CASE \
-                     WHEN last_message_ts IS NULL THEN \
-                         (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) \
-                     WHEN (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) IS NULL THEN \
-                         last_message_ts \
-                     WHEN last_message_ts < (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) THEN \
-                         (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) \
-                     ELSE \
-                         last_message_ts \
-                 END \
-             WHERE agent_id = NEW.agent_id; \
-             INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-             SELECT \
-                 NEW.agent_id, \
-                 1, \
-                 1, \
-                 (SELECT CASE WHEN m.ack_required = 1 THEN 1 ELSE 0 END FROM messages m WHERE m.id = NEW.message_id), \
-                 (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) \
-             WHERE NOT EXISTS (SELECT 1 FROM inbox_stats WHERE agent_id = NEW.agent_id); \
-         END"
-        .to_string(),
         String::new(),
     ));
 
@@ -1213,14 +1201,16 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
 /// Migrations excluding FTS5 virtual tables and FTS backfill inserts.
 ///
 /// Safe for databases that will be opened by `FrankenConnection`. The migration
-/// runner will still record these IDs in the migrations table.
+/// runner records only core schema migrations in the migrations table.
+///
+/// Base cleanup statements are applied idempotently at runtime without creating
+/// additional migration rows.
 #[must_use]
 pub fn schema_migrations_base() -> Vec<Migration> {
-    let mut migrations: Vec<Migration> = schema_migrations()
+    let migrations: Vec<Migration> = schema_migrations()
         .into_iter()
         .filter(|m| !is_unsupported_by_franken(&m.id))
         .collect();
-    migrations.extend(base_trigger_cleanup_migrations());
     migrations
 }
 
@@ -1233,6 +1223,27 @@ pub fn migration_runner() -> MigrationRunner {
 #[must_use]
 pub fn migration_runner_base() -> MigrationRunner {
     MigrationRunner::new(schema_migrations_base()).table_name(MIGRATIONS_TABLE_NAME)
+}
+
+async fn ensure_inbox_stats_insert_trigger_compat<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    conn.execute(cx, TRG_INBOX_STATS_INSERT_COMPAT_SQL, &[])
+        .await
+        .map(|_| ())
+}
+
+async fn enforce_base_mode_cleanup_async<C: Connection>(cx: &Cx, conn: &C) -> Outcome<(), SqlError> {
+    for migration in base_trigger_cleanup_migrations() {
+        match conn.execute(cx, &migration.up, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+    Outcome::Ok(())
 }
 
 pub async fn init_migrations_table<C: Connection>(cx: &Cx, conn: &C) -> Outcome<(), SqlError> {
@@ -1269,7 +1280,18 @@ pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
-    migration_runner().migrate(cx, conn).await
+    let applied = match migration_runner().migrate(cx, conn).await {
+        Outcome::Ok(applied) => applied,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    match ensure_inbox_stats_insert_trigger_compat(cx, conn).await {
+        Outcome::Ok(()) => Outcome::Ok(applied),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// Run only base migrations (no FTS5 virtual tables).
@@ -1287,7 +1309,24 @@ pub async fn migrate_to_latest_base<C: Connection>(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
-    migration_runner_base().migrate(cx, conn).await
+    let applied = match migration_runner_base().migrate(cx, conn).await {
+        Outcome::Ok(applied) => applied,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    match enforce_base_mode_cleanup_async(cx, conn).await {
+        Outcome::Ok(()) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+    match ensure_inbox_stats_insert_trigger_compat(cx, conn).await {
+        Outcome::Ok(()) => Outcome::Ok(applied),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 #[cfg(test)]

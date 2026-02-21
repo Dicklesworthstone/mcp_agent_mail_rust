@@ -556,13 +556,18 @@ impl ReadCache {
     /// Drain all pending touch entries from all shards and reset the flush clock.
     /// Returns the merged map of `agent_id` → latest timestamp.
     pub fn drain_touches(&self) -> HashMap<i64, i64> {
+        // Clear the pending flag BEFORE draining all shards.
+        // If a concurrent enqueue happens after we clear the flag but before we lock
+        // its shard, we will drain the new item.
+        // If it happens after we drain its shard, it will set the flag to true,
+        // which is correct because we missed it in this drain pass.
+        self.has_pending.store(false, Ordering::Release);
+
         let mut merged = HashMap::new();
         for shard in &self.deferred_touch_shards {
             let mut s = shard.lock();
             merged.extend(s.drain());
         }
-        // Clear the pending flag after draining all shards.
-        self.has_pending.store(false, Ordering::Release);
 
         let mut last = self.last_touch_flush.lock();
         *last = Instant::now();

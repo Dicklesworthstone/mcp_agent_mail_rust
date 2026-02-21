@@ -1740,7 +1740,7 @@ where
                 query.push_str(", ");
             }
             query.push_str("(?, ?, ?, ?, ?, ?, ?)");
-            let expires = now + (ttl.saturating_mul(1_000_000));
+            let expires = now.saturating_add(ttl.saturating_mul(1_000_000));
             params.push(Value::BigInt(project_id));
             params.push(Value::BigInt(*agent_id));
             params.push(Value::Text(path.clone()));
@@ -2836,7 +2836,7 @@ async fn run_like_fallback(
         "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md \
          FROM messages m \
          JOIN agents a ON a.id = m.sender_id \
-         WHERE m.project_id = ? AND {where_clause} \
+         WHERE m.project_id = ? AND ({where_clause}) \
          ORDER BY m.id ASC \
          LIMIT ?"
     );
@@ -2871,7 +2871,7 @@ async fn run_like_fallback_product(
          FROM messages m \
          JOIN agents a ON a.id = m.sender_id \
          JOIN product_project_links ppl ON ppl.project_id = m.project_id \
-         WHERE ppl.product_id = ? AND {where_clause} \
+         WHERE ppl.product_id = ? AND ({where_clause}) \
          ORDER BY m.id ASC \
          LIMIT ?"
     );
@@ -3736,7 +3736,8 @@ pub async fn create_file_reservations(
     let tracked = tracked(&*conn);
 
     // Batch all reservation inserts in a single transaction (1 fsync instead of N).
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
     // Check for conflicting active exclusive reservations held by others to prevent TOCTOU races.
     let conflict_sql = format!(

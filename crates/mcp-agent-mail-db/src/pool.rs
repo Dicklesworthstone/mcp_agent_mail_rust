@@ -713,6 +713,7 @@ fn is_corruption_error_message(message: &str) -> bool {
     lower.contains("database disk image is malformed")
         || lower.contains("malformed database schema")
         || lower.contains("file is not a database")
+        || lower.contains("no healthy backup was found")
 }
 
 #[allow(clippy::result_large_err)]
@@ -1894,6 +1895,9 @@ mod tests {
             "malformed database schema - something"
         ));
         assert!(is_corruption_error_message("file is not a database"));
+        assert!(is_corruption_error_message(
+            "database file tmp/storage.sqlite3 is malformed and no healthy backup was found"
+        ));
         assert!(is_corruption_error_message(
             "DATABASE DISK IMAGE IS MALFORMED"
         ));
