@@ -447,7 +447,7 @@ def get_active_reservations():
             "FROM file_reservations fr "
             "JOIN agents a ON a.id = fr.agent_id "
             "JOIN projects p ON p.id = fr.project_id "
-            "WHERE fr.exclusive = 1 AND (fr.released_ts IS NULL OR fr.released_ts <= 0) "
+            "WHERE fr.exclusive = 1 AND (fr.released_ts IS NULL OR fr.released_ts = 0 OR fr.released_ts = '0' OR fr.released_ts = '0.0' OR fr.released_ts = 'null') "
             "AND fr.expires_ts > ? AND (p.human_key = ? OR p.slug = ?)",
             (now_micros, PROJECT, PROJECT),
         ).fetchall()
@@ -484,7 +484,7 @@ def check_conflicts(paths, reservations):
                 break
             
             # Directory prefix matching for non-glob patterns
-            has_glob = any(c in pattern for c in "*?[")
+            has_glob = any(c in pattern for c in "*?[{")
             if not has_glob:
                 # Normal prefix check: file is inside reserved dir
                 if f.startswith(pattern + "/"):

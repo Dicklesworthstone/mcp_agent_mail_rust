@@ -734,7 +734,7 @@ fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliEr
     // Try slug first
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE slug = ?",
+            "SELECT id, slug FROM projects WHERE slug LIKE ?",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
@@ -748,7 +748,7 @@ fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliEr
     // Try human_key
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE human_key = ?",
+            "SELECT id, slug FROM projects WHERE human_key LIKE ?",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
@@ -813,7 +813,7 @@ fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Optio
         })?;
     let rows = conn
         .query_sync(
-            "SELECT id, name FROM agents WHERE project_id = ? AND name = ?",
+            "SELECT id, name FROM agents WHERE project_id = ? AND name LIKE ?",
             &[Value::BigInt(project_id), Value::Text(name)],
         )
         .ok()?;
