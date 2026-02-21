@@ -894,12 +894,33 @@ tests/e2e/test_share.sh          # Share/export
 tests/e2e/test_dual_mode.sh      # Mode switching
 scripts/e2e_cli.sh               # CLI integration (99 assertions)
 
+# Native E2E runner (authoritative path)
+am e2e list
+am e2e run --project .                 # all suites
+am e2e run --project . stdio http      # selected suites
+am e2e run --project . --include tui_  # pattern include
+
+# Legacy compatibility shim (deprecated primary path)
+./scripts/e2e_test.sh stdio
+# rollback guard: AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh stdio
+
 # Benchmarks
 cargo bench -p mcp-agent-mail
 
 # Multi-agent builds: isolate target dir to avoid lock contention
 export CARGO_TARGET_DIR="/tmp/target-$(whoami)-am"
 ```
+
+### E2E Entrypoint Policy (T9.9)
+
+- Native `am e2e` is authoritative for operator and CI invocation.
+- `scripts/e2e_test.sh` remains compatibility-only and emits deprecation guidance.
+- Rollback condition: set `AM_E2E_FORCE_LEGACY=1` only if native runner regression is confirmed.
+
+Verification checklist:
+- `am e2e list` and `am e2e run --project . <suite>` succeed for targeted suites.
+- Artifact repro commands reference `am e2e run` (not script-first commands).
+- CI/release docs and runbooks do not present `scripts/e2e_test.sh` as the primary command.
 
 ### Key Dependencies
 

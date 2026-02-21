@@ -18,6 +18,12 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE NUMBER 2: NEVER ENABLE BROADCAST MESSAGING
+
+**YOU MUST NEVER IMPLEMENT OR ENABLE BROADCAST MESSAGING IN `send_message`.** The `broadcast` parameter exists in the schema but is INTENTIONALLY NOT SUPPORTED in the code to prevent agents from spamming each other. If you see a hardcoded block returning an error when `broadcast` is true, **DO NOT REMOVE OR "FIX" IT**. It is not a bug; it is a critical safety mechanism.
+
+---
+
 ## Irreversible Git & Filesystem Actions — DO NOT EVER BREAK GLASS
 
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
@@ -190,6 +196,16 @@ cargo test --workspace --all-features
 ### End-to-End Tests
 
 ```bash
+# Authoritative native entrypoint:
+am e2e list
+am e2e run --project /abs/path
+am e2e run --project /abs/path stdio http
+
+# Compatibility-only shim (deprecated as primary entrypoint):
+# AM_E2E_FORCE_LEGACY=1 enables rollback to legacy in-script execution.
+./scripts/e2e_test.sh stdio
+
+# Direct suite scripts (still supported):
 tests/e2e/test_stdio.sh       # MCP stdio transport (17 assertions)
 tests/e2e/test_http.sh        # HTTP transport (47 assertions)
 tests/e2e/test_guard.sh       # Pre-commit guard (32 assertions)

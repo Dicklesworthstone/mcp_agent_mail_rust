@@ -82,7 +82,7 @@ cargo test -p mcp-agent-mail-conformance
 ### 2.4 Dual-Mode E2E Suite
 
 ```bash
-bash scripts/e2e_dual_mode.sh
+am e2e run --project . dual_mode
 # Expected: 84 assertions, 0 failures across 7 sections
 # Artifacts: tests/artifacts/dual_mode/<timestamp>/
 ```
@@ -93,24 +93,29 @@ cat tests/artifacts/dual_mode/*/run_summary.json
 # e2e_fail must be 0
 ```
 
+Compatibility fallback (only when a native regression is confirmed):
+```bash
+AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh dual_mode
+```
+
 ### 2.5 Mode Matrix E2E Suite
 
 ```bash
-bash scripts/e2e_mode_matrix.sh
+am e2e run --project . mode_matrix
 # Expected: all CLI-allow and MCP-deny assertions pass
 ```
 
 ### 2.6 Golden Snapshot Validation
 
 ```bash
-am golden validate
+am golden verify
 # Expected: all golden outputs match stored checksums
 ```
 
 ### 2.7 CLI Functional E2E
 
 ```bash
-bash scripts/e2e_cli.sh
+am e2e run --project . cli
 # Expected: 99 assertions, 0 failures
 ```
 
@@ -136,7 +141,7 @@ jq '.decision, .release_eligible, .summary.fail' tests/artifacts/ci/gate_report.
 ### 2.10 Security and Privacy Gates
 
 ```bash
-bash tests/e2e/test_security_privacy.sh
+am e2e run --project . security_privacy
 # Expected: 0 failures
 ```
 
@@ -147,15 +152,15 @@ Required evidence:
 ### 2.11 Accessibility and Keyboard-Only Gates
 
 ```bash
-bash tests/e2e/test_tui_a11y.sh
+am e2e run --project . tui_a11y
 # Expected: 0 failures
 ```
 
 ### 2.12 Static Export Conformance Gates
 
 ```bash
-bash tests/e2e/test_share.sh
-bash tests/e2e/test_share_verify_live.sh
+am e2e run --project . share
+am e2e run --project . share_verify_live
 # Expected: 0 failures (or deterministic SKIP with explicit reason when verify-live command is unavailable in current binary)
 ```
 
@@ -169,8 +174,9 @@ am share deploy verify-live https://example.github.io/agent-mail \
 ### 2.13 Performance and Determinism Gates
 
 ```bash
-bash tests/e2e/test_soak_harness.sh --quick
+am e2e run --project . soak_harness
 cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture
+cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture
 # Expected: no regressions, no budget failures
 ```
 
@@ -183,7 +189,7 @@ Promotion from each phase requires all of:
 - Security/privacy pass rate = `100%` (`fail=0` in `E2E security/privacy`).
 - Accessibility pass rate = `100%` (`fail=0` in `E2E TUI accessibility`).
 - Static export/verify-live pass rate = `100%` (`fail=0` in `test_share.sh`; `test_share_verify_live.sh` either passes or emits deterministic skip reason in environments without the command surface).
-- Performance gate status = pass (`perf_security_regressions` green, no p95 regression above `2.0x` baseline).
+- Performance gate status = pass (`perf_security_regressions` + `perf_guardrails` both green, no p95 regression above configured budgets/deltas).
 - CI gate report indicates `decision="go"` and `release_eligible=true`.
 - Release checklist sign-off ledger completed for the phase (owner + UTC timestamp + rationale + evidence paths).
 
@@ -202,7 +208,7 @@ Promotion from each phase requires all of:
 | All unit tests pass | `cargo test` output |
 | Dual-mode E2E passes | `tests/artifacts/dual_mode/*/run_summary.json` |
 | Machine-readable gate decision is promotable | `tests/artifacts/ci/gate_report.json` (`decision="go"`, `release_eligible=true`) |
-| Golden snapshots stable | `am golden validate` |
+| Golden snapshots stable | `am golden verify` |
 | Denial messages match contract | `tests/fixtures/golden_snapshots/mcp_deny_*.txt` |
 
 **Exit criteria:** All 2.1-2.9 gates green. Proceed to Phase 1.
@@ -337,7 +343,7 @@ After rollback, before re-attempting rollout:
 
 1. Reproduce the failure locally using the dual-mode E2E suite:
    ```bash
-   bash scripts/e2e_dual_mode.sh
+   am e2e run --project . dual_mode
    ```
 
 2. Check the structured step logs for the failing scenario:
@@ -443,7 +449,7 @@ sleep 3
 am doctor check --json | jq .status
 
 # Run dual-mode E2E
-bash scripts/e2e_dual_mode.sh
+am e2e run --project . dual_mode
 ```
 
 ### 6.2 Simulate Failure and Rollback
@@ -473,7 +479,7 @@ echo "Exit code: $?"
 # Save dry-run evidence
 mkdir -p tests/artifacts/dry_run
 date -u +%Y-%m-%dT%H:%M:%SZ > tests/artifacts/dry_run/timestamp.txt
-bash scripts/e2e_dual_mode.sh
+am e2e run --project . dual_mode
 cp tests/artifacts/dual_mode/*/run_summary.json tests/artifacts/dry_run/
 ```
 

@@ -44,6 +44,35 @@ Targets based on initial baseline (2026-02-05). Budgets are 2x the measured base
 | `am lint` | < 50ms | Static analysis |
 | `am typecheck` | < 50ms | Type checking |
 
+## Migration Command-Surface Guardrails (T10.9)
+
+Guardrails for migrated command surfaces are enforced by:
+
+```bash
+cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture
+```
+
+Artifacts are emitted under:
+- `tests/artifacts/cli/perf_guardrails/<run_id>/perf_guardrails.json`
+- `tests/artifacts/cli/perf_guardrails/trends/perf_guardrails_timeseries.jsonl`
+
+| Surface | Native workload | Native p95 budget | Legacy comparator | Max native-vs-legacy delta p95 |
+|---------|-----------------|-------------------|-------------------|---------------------------------|
+| `ci_help` | `am ci --help` | < 400ms | `scripts/ci.sh --help` when present (else unavailable rationale) | 120ms |
+| `bench_help` | `am bench --help` | < 400ms | `scripts/bench_cli.sh --help` when present (else unavailable rationale) | 120ms |
+| `golden_verify_help` | `am golden verify --help` | < 400ms | `scripts/bench_golden.sh --help` when present (else unavailable rationale) | 120ms |
+| `flake_triage_help` | `am flake-triage --help` | < 450ms | `scripts/flake_triage.sh --help` when present (else unavailable rationale) | 140ms |
+| `check_inbox_help` | `am check-inbox --help` | < 450ms | `legacy/hooks/check_inbox.sh --help` | 180ms |
+| `serve_http_help` | `am serve-http --help` | < 500ms | `scripts/am --help` | 220ms |
+| `e2e_run_help` | `am e2e run --help` | < 500ms | `scripts/e2e_test.sh --help` | 240ms |
+| `share_wizard_help` | `am share wizard --help` | < 500ms | N/A (legacy was E2E harness, not parity wrapper) | N/A |
+| `share_deploy_verify_live_help` | `am share deploy verify-live --help` | < 500ms | N/A (legacy was E2E harness, not parity wrapper) | N/A |
+
+Per-surface overrides:
+- `PERF_GUARDRAIL_NATIVE_BUDGET_P95_US_<SURFACE>=<micros>`
+- `PERF_GUARDRAIL_MAX_DELTA_P95_US_<SURFACE>=<micros>`
+- `PERF_GUARDRAIL_ITERATIONS=<count>`
+
 ## CLI Operational Budgets
 
 Baseline captured via `am bench --quick` (2026-02-09). Seeded with 60 messages (50 BlueLake→RedFox + 10 RedFox→BlueLake).
@@ -245,7 +274,7 @@ Collected via `strace -c -f` on `mcp_agent_mail_tools/health_check` benchmark (r
 
 ## Golden Outputs
 
-Stable surfaces validated via `am golden validate`:
+Stable surfaces validated via `am golden verify`:
 
 - `am --help` text
 - `am <subcommand> --help` text (7 subcommands)

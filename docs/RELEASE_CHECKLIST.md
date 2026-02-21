@@ -22,11 +22,11 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 | Gate family | Hard threshold (promotion blocker) | Machine-check source | Artifact evidence |
 |-------------|------------------------------------|----------------------|-------------------|
 | Unit + integration correctness | Pass rate = `100%` (`fail=0`) | `cargo test --workspace` and CI gate entry `Unit + integration tests=status:pass` | CI logs + gate report JSON |
-| Dual-mode E2E correctness | Pass rate = `100%` (`fail=0`) for `E2E dual-mode` and `E2E mode matrix` | `bash scripts/e2e_dual_mode.sh`, `bash scripts/e2e_mode_matrix.sh`, and CI gate report | `tests/artifacts/dual_mode/*/run_summary.json` |
-| Security/privacy | Pass rate = `100%` (`fail=0`) for `E2E security/privacy` | `bash tests/e2e/test_security_privacy.sh` and CI gate report | `tests/artifacts/security_privacy/*/*` |
-| Accessibility | Pass rate = `100%` (`fail=0`) for `E2E TUI accessibility` | `bash scripts/e2e_tui_a11y.sh` and CI gate report | `tests/artifacts/tui_a11y/*/*` |
-| Performance budgets | `perf_security_regressions=status:pass` and no p95 regression > `2.0x` baseline | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture` and CI gate report | perf/security test logs + benchmark artifacts |
-| Determinism | Golden/export checks report zero mismatches | `am golden validate` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
+| Dual-mode E2E correctness | Pass rate = `100%` (`fail=0`) for `E2E dual-mode` and `E2E mode matrix` | `am e2e run --project . dual_mode`, `am e2e run --project . mode_matrix`, and CI gate report | `tests/artifacts/dual_mode/*/run_summary.json` |
+| Security/privacy | Pass rate = `100%` (`fail=0`) for `E2E security/privacy` | `am e2e run --project . security_privacy` and CI gate report | `tests/artifacts/security_privacy/*/*` |
+| Accessibility | Pass rate = `100%` (`fail=0`) for `E2E TUI accessibility` | `am e2e run --project . tui_a11y` and CI gate report | `tests/artifacts/tui_a11y/*/*` |
+| Performance budgets | `perf_security_regressions=status:pass` + `perf_guardrails=status:pass` with no budget/delta violations | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture`, `cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture`, and CI gate report | `tests/artifacts/cli/perf_security/*`, `tests/artifacts/cli/perf_guardrails/*`, benchmark artifacts |
+| Determinism | Golden/export checks report zero mismatches | `am golden verify` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
 | Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, and sign-off row completed | `am ci --report tests/artifacts/ci/gate_report.json` | `tests/artifacts/ci/gate_report.json`, sign-off ledger row |
 
 ### Gate-to-Bead Evidence Map
@@ -107,17 +107,21 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
   ```bash
   cargo test -p mcp-agent-mail-cli --test perf_security_regressions
   ```
+- [x] Perf migration guardrails: native-vs-legacy budgets + unavailable rationale capture
+  ```bash
+  cargo test -p mcp-agent-mail-cli --test perf_guardrails
+  ```
 - [x] Help snapshots match golden fixtures
   ```bash
   cargo test -p mcp-agent-mail-cli --test help_snapshots
   ```
 - [x] E2E dual-mode: 84+ assertions (7 sections)
   ```bash
-  bash scripts/e2e_dual_mode.sh
+  am e2e run --project . dual_mode
   ```
 - [x] E2E mode matrix: 42+ assertions
   ```bash
-  bash scripts/e2e_mode_matrix.sh
+  am e2e run --project . mode_matrix
   ```
 
 ## Performance
@@ -160,15 +164,16 @@ ls tests/artifacts/dual_mode/*/steps/step_*.json | wc -l
 # Should be >= 42 (one per test step)
 
 # 4. Golden snapshot checksums are current
-am golden validate
+am golden verify
 # All checksums must match
 
-# 4b. Legacy shim emits deprecation and forwards to native command
-PATH="/data/tmp/cargo-target/release:$PATH" legacy/hooks/check_inbox.sh --help
-# Must print deprecation guidance, then native `am check-inbox` help output
+# 4b. Native check-inbox command is available
+am check-inbox --help
+# Compatibility shim fallback (only for native regressions):
+# PATH="/data/tmp/cargo-target/release:$PATH" legacy/hooks/check_inbox.sh --help
 
 # 5. Verify-live E2E artifacts exist (native path authoritative)
-bash tests/e2e/test_share_verify_live.sh
+am e2e run --project . share_verify_live
 ls tests/artifacts/share_verify_live/*/case_*/command.txt
 ls tests/artifacts/share_verify_live/*/case_*/check_trace.jsonl
 # If command unavailable in current binary, suite emits deterministic SKIP with reason
@@ -205,11 +210,12 @@ jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifact
    cargo test -p mcp-agent-mail-cli --test mode_matrix_harness
    cargo test -p mcp-agent-mail-cli --test semantic_conformance
    cargo test -p mcp-agent-mail-cli --test perf_security_regressions
+   cargo test -p mcp-agent-mail-cli --test perf_guardrails
    cargo test -p mcp-agent-mail-cli --test help_snapshots
-   bash scripts/e2e_dual_mode.sh
-   bash scripts/e2e_mode_matrix.sh
-   bash tests/e2e/test_security_privacy.sh
-   bash scripts/e2e_tui_a11y.sh
+   am e2e run --project . dual_mode
+   am e2e run --project . mode_matrix
+   am e2e run --project . security_privacy
+   am e2e run --project . tui_a11y
    ```
 
 3. Manual smoke test:

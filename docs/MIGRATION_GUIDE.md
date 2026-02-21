@@ -145,11 +145,11 @@ Legacy script paths are transitional shims only; native `am` paths are authorita
 Example mapping:
 
 ```bash
-# Legacy compatibility shim (deprecated):
-legacy/hooks/check_inbox.sh --agent "$AGENT_NAME" --rate-limit 120
-
 # Native authoritative path:
 am check-inbox --agent "$AGENT_NAME" --rate-limit 120
+
+# Legacy compatibility shim (deprecated fallback only):
+legacy/hooks/check_inbox.sh --agent "$AGENT_NAME" --rate-limit 120
 ```
 
 Deprecation flow:
@@ -283,7 +283,7 @@ am ci --quick
 cargo test -p mcp-agent-mail-cli --test mode_matrix_harness
 cargo test -p mcp-agent-mail-cli --test semantic_conformance
 cargo test -p mcp-agent-mail-cli --test perf_security_regressions
-bash scripts/e2e_dual_mode.sh
+am e2e run --project . dual_mode
 ```
 
 ### Check artifacts

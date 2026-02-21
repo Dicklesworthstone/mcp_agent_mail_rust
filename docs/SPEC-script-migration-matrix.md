@@ -28,15 +28,15 @@ workflows to native Rust commands.
 
 | Script | Native Equivalent | Status | Notes |
 |--------|-------------------|--------|-------|
-| `am` | `am serve-http` | **Migrated** | All functionality is now in the native `am serve-http` command. The `scripts/am` wrapper has been removed. |
+| `am` | `am serve-http` | **Migrated** | Native `am serve-http` is authoritative; `scripts/am` remains as optional local-dev compatibility glue. |
 
 ### CI & Quality Gates
 
 | Script | Native Equivalent | Status | Notes |
 |--------|-------------------|--------|-------|
 | `ci.sh` | `am ci` | **Migrated** | Native `am ci` command with `--quick`, `--report` flags |
-| `bench_cli.sh` | `am bench` | **Migrated** | Native bench command is authoritative; script retained as compatibility shim with deprecation warning |
-| `bench_golden.sh` | `am golden validate` | **Migrated** | Native `am golden validate` command |
+| `bench_cli.sh` | `am bench` | **Migrated** | Native bench command is authoritative; legacy script removed after cutover |
+| `bench_golden.sh` | `am golden verify` | **Migrated** | Native `am golden verify` command; legacy script removed after cutover |
 
 ### Flake Triage
 
@@ -57,7 +57,7 @@ workflows to native Rust commands.
 | `e2e_mode_matrix.sh` | -- | **Retained** | Mode matrix verification tests |
 | `e2e_mcp_api_parity.sh` | -- | **Retained** | MCP/API parity tests |
 | `e2e_share.sh` | -- | **Retained** | Share/export tests |
-| `e2e_test.sh` | -- | **Retained** | Generic E2E entry point |
+| `e2e_test.sh` | `am e2e run --project .` | **Retained** | Compatibility shim only; delegates to native runner by default |
 | `e2e_depth_counter.sh` | -- | **Retained** | Test infrastructure |
 | `e2e_histogram_snapshot.sh` | -- | **Retained** | Test infrastructure |
 | `e2e_spill_determinism.sh` | -- | **Retained** | Test infrastructure |
@@ -187,7 +187,7 @@ are now available:
 | Former Gap | Native Command | Status |
 |------------|----------------|--------|
 | CI runner | `am ci --quick --report <path>` | **Migrated** |
-| Golden benchmarks | `am golden validate` | **Migrated** |
+| Golden benchmarks | `am golden verify` | **Migrated** |
 
 ### Native Command Reference
 
@@ -198,8 +198,33 @@ are now available:
 
 **`am bench` cluster:**
 - `am bench` — CLI operation latency benchmarks (`--quick`, `--json`, `--baseline`, `--save-baseline`)
-- `am golden validate` — Regression tests against golden outputs
+- `am golden verify` — Regression tests against golden outputs
 - `am bench stress` — Load testing (future)
+
+---
+
+## Performance Guardrails Matrix (T10.9)
+
+Canonical workload/budget matrix for migrated command surfaces. This is the
+authoritative mapping consumed by `perf_guardrails.rs` and release audit checks.
+
+| Surface | Native workload (guarded) | Legacy baseline source | Guardrail decision path | Artifact path |
+|--------|----------------------------|------------------------|-------------------------|---------------|
+| `ci_help` | `am ci --help` | `scripts/ci.sh --help` (usually unavailable: script removed) | Native p95 budget + optional native-vs-legacy delta when script exists | `tests/artifacts/cli/perf_guardrails/` |
+| `bench_help` | `am bench --help` | `scripts/bench_cli.sh --help` (usually unavailable: script removed) | Native p95 budget + optional native-vs-legacy delta when script exists | `tests/artifacts/cli/perf_guardrails/` |
+| `golden_verify_help` | `am golden verify --help` | `scripts/bench_golden.sh --help` (usually unavailable: script removed) | Native p95 budget + optional native-vs-legacy delta when script exists | `tests/artifacts/cli/perf_guardrails/` |
+| `flake_triage_help` | `am flake-triage --help` | `scripts/flake_triage.sh --help` (usually unavailable: script removed) | Native p95 budget + optional native-vs-legacy delta when script exists | `tests/artifacts/cli/perf_guardrails/` |
+| `check_inbox_help` | `am check-inbox --help` | `legacy/hooks/check_inbox.sh --help` | Native p95 budget + native-vs-legacy delta budget | `tests/artifacts/cli/perf_guardrails/` |
+| `serve_http_help` | `am serve-http --help` | `scripts/am --help` | Native p95 budget + native-vs-legacy delta budget | `tests/artifacts/cli/perf_guardrails/` |
+| `e2e_run_help` | `am e2e run --help` | `scripts/e2e_test.sh --help` | Native p95 budget + native-vs-legacy delta budget | `tests/artifacts/cli/perf_guardrails/` |
+| `share_wizard_help` | `am share wizard --help` | N/A (legacy E2E harness, no direct CLI wrapper) | Native p95 budget only + explicit unavailable rationale | `tests/artifacts/cli/perf_guardrails/` |
+| `share_deploy_verify_live_help` | `am share deploy verify-live --help` | N/A (legacy E2E harness, no direct CLI wrapper) | Native p95 budget only + explicit unavailable rationale | `tests/artifacts/cli/perf_guardrails/` |
+
+Notes:
+- Per-surface overrides are supported via `PERF_GUARDRAIL_NATIVE_BUDGET_P95_US_<SURFACE>`
+  and `PERF_GUARDRAIL_MAX_DELTA_P95_US_<SURFACE>`.
+- When a legacy script is no longer present, the suite records deterministic
+  `legacy unavailable` rationale in the artifact instead of failing for missing files.
 
 ---
 
@@ -208,7 +233,9 @@ are now available:
 To prevent migration regressions in operator-facing UX, run:
 
 ```bash
-./scripts/e2e_test.sh migration_ux_smoke
+am e2e run --project . migration_ux_smoke
+# compatibility fallback:
+# AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh migration_ux_smoke
 ```
 
 Suite file:
@@ -302,13 +329,12 @@ If rollback is triggered:
 1. **Most scripts are intentionally retained** as test harnesses — they exercise the
    native commands and should remain as bash scripts.
 
-2. **The `scripts/am` wrapper has been removed.** All functionality is now in the
-   native `am serve-http` command, which handles auth token discovery, port reuse,
-   and all server startup options.
+2. **The native `am serve-http` command is authoritative.** The `scripts/am`
+   wrapper remains optional compatibility glue for local development.
 
 3. **All gaps are now closed:**
    - `ci.sh` is migrated to `am ci`
-   - `bench_golden.sh` is migrated to `am golden validate`
+   - `bench_golden.sh` is migrated to `am golden verify`
 
 4. **`flake_triage.sh` is fully migrated** to `am flake-triage` with subcommands
    `scan`, `reproduce`, and `detect`.

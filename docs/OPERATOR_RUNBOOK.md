@@ -513,17 +513,17 @@ Search V3-specific steady-state procedures live in:
 
 | Symptom / Concern | Run This Suite | Expected Artifact Root |
 |-------------------|----------------|------------------------|
-| MCP/API mode drift or deny behavior mismatch | `tests/e2e/test_dual_mode.sh` | `tests/artifacts/dual_mode/<timestamp>/` |
-| TUI startup/bootstrap/token-redaction regressions | `tests/e2e/test_tui_startup.sh` | `tests/artifacts/tui_startup/<timestamp>/` |
-| Search V3 relevance/latency/resilience drift | `tests/e2e/test_search_v3_stdio.sh`, `tests/e2e/test_search_v3_http.sh`, `tests/e2e/test_search_v3_resilience.sh`, `tests/e2e/test_search_v3_load_concurrency.sh` | `tests/artifacts/search_v3_*/<timestamp>/` |
-| Browser/WASM state-sync poll+ingress contract regressions | `tests/e2e/test_tui_wasm.sh` | `tests/artifacts/tui_wasm/<timestamp>/` |
-| Accessibility keyboard/contrast/reduced-motion regressions | `tests/e2e/test_tui_a11y.sh` | `tests/artifacts/tui_a11y/<timestamp>/` |
-| TUI resize/reflow/screen rendering regressions | `tests/e2e/test_tui_compat_matrix.sh` | `tests/artifacts/tui_compat_matrix/<timestamp>/` |
-| Explorer/analytics/widgets interaction regressions | `tests/e2e/test_tui_interactions.sh` | `tests/artifacts/tui_interactions/<timestamp>/` |
-| Web UI route/action parity issues | `tests/e2e/test_mail_ui.sh` | `tests/artifacts/mail_ui/<timestamp>/` |
-| Artifact bundle schema/manifest failures | `tests/e2e/test_artifacts_schema.sh` | `tests/artifacts/artifacts_schema/<timestamp>/` |
-| Static export routing/search/hash parity | `tests/e2e/test_share.sh` | `tests/artifacts/share/<timestamp>/` |
-| Verify-live exit-code/severity/compatibility regressions | `tests/e2e/test_share_verify_live.sh` | `tests/artifacts/share_verify_live/<timestamp>/` |
+| MCP/API mode drift or deny behavior mismatch | `am e2e run --project . dual_mode` | `tests/artifacts/dual_mode/<timestamp>/` |
+| TUI startup/bootstrap/token-redaction regressions | `am e2e run --project . tui_startup` | `tests/artifacts/tui_startup/<timestamp>/` |
+| Search V3 relevance/latency/resilience drift | `am e2e run --project . search_v3_stdio search_v3_http search_v3_resilience search_v3_load_concurrency` | `tests/artifacts/search_v3_*/<timestamp>/` |
+| Browser/WASM state-sync poll+ingress contract regressions | `am e2e run --project . tui_wasm` | `tests/artifacts/tui_wasm/<timestamp>/` |
+| Accessibility keyboard/contrast/reduced-motion regressions | `am e2e run --project . tui_a11y` | `tests/artifacts/tui_a11y/<timestamp>/` |
+| TUI resize/reflow/screen rendering regressions | `am e2e run --project . tui_compat_matrix` | `tests/artifacts/tui_compat_matrix/<timestamp>/` |
+| Explorer/analytics/widgets interaction regressions | `am e2e run --project . tui_interactions` | `tests/artifacts/tui_interactions/<timestamp>/` |
+| Web UI route/action parity issues | `am e2e run --project . mail_ui` | `tests/artifacts/mail_ui/<timestamp>/` |
+| Artifact bundle schema/manifest failures | `am e2e run --project . artifacts_schema` | `tests/artifacts/artifacts_schema/<timestamp>/` |
+| Static export routing/search/hash parity | `am e2e run --project . share` | `tests/artifacts/share/<timestamp>/` |
+| Verify-live exit-code/severity/compatibility regressions | `am e2e run --project . share_verify_live` | `tests/artifacts/share_verify_live/<timestamp>/` |
 | Search V3 stale/missing evidence detection | `scripts/search_v3_evidence_freshness_check.sh --strict --output tests/artifacts/search_v3_freshness/latest.json` | `tests/artifacts/search_v3_freshness/latest.json` |
 
 For any failing suite, validate forensic bundle structure:
@@ -532,6 +532,9 @@ For any failing suite, validate forensic bundle structure:
 source scripts/e2e_lib.sh
 e2e_validate_bundle_tree tests/artifacts
 ```
+
+Compatibility fallback for native-regression emergencies:
+`AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh <suite>`
 
 ### Structured Diagnostics Pointers (Phase 5)
 
@@ -651,6 +654,10 @@ and cross-terminal compatibility in one run.
 ### Run
 
 ```bash
+# Native standard suite path:
+am e2e run --project . tui_startup
+
+# Showcase compatibility path (includes --showcase staging extras):
 bash scripts/e2e_tui_startup.sh --showcase
 ```
 
@@ -692,7 +699,7 @@ bash scripts/e2e_tui_startup.sh --showcase
 | Missing shell tools (`expect`, `tmux`, `script`) | Install required packages, then re-run showcase command. |
 | A specific suite fails and you need focused rerun | `AM_TUI_SHOWCASE_SUITES=tui_interactions bash scripts/e2e_tui_startup.sh --showcase` |
 | Macro playback forensic step fails | `rch exec -- cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture` |
-| `tui_wasm` records `RCH_REMOTE_DEP_MISMATCH` skips | `rch workers probe --all && rch status && rch queue` then rerun `tests/e2e/test_tui_wasm.sh` |
+| `tui_wasm` records `RCH_REMOTE_DEP_MISMATCH` skips | `rch workers probe --all && rch status && rch queue` then rerun `am e2e run --project . tui_wasm` |
 | Artifact path mismatch (wrong timestamp) | `ls -1 tests/artifacts/tui_showcase/ | tail -n 5` then open matching `showcase/index.tsv` |
 
 ## 12. Graceful Shutdown
