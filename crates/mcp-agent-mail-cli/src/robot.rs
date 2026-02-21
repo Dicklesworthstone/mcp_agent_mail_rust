@@ -1801,22 +1801,21 @@ fn build_search(
         });
     }
 
-    // Build additional WHERE conditions
+    // Build additional WHERE conditions shared by FTS and LIKE fallback.
     let mut extra_where = String::new();
-    let mut params: Vec<Value> = vec![Value::Text(sanitized.clone()), Value::BigInt(project_id)];
+    let mut filter_params: Vec<Value> = Vec::new();
 
     if let Some(imp) = importance_filter {
         extra_where.push_str(" AND m.importance = ?");
-        params.push(Value::Text(imp.to_string()));
+        filter_params.push(Value::Text(imp.to_string()));
     }
     if let Some(since_str) = since {
         let since_us = parse_since_micros(since_str)?;
         extra_where.push_str(" AND m.created_ts > ?");
-        params.push(Value::BigInt(since_us));
+        filter_params.push(Value::BigInt(since_us));
     }
-    params.push(Value::BigInt(limit as i64));
 
-    let sql = format!(
+    let fts_sql = format!(
         "SELECT m.id, m.subject, m.thread_id, m.importance, m.created_ts,
                 a.name AS sender_name,
                 snippet(fts_messages, 1, '»', '«', '…', 20) AS snippet
@@ -1829,9 +1828,58 @@ fn build_search(
          LIMIT ?"
     );
 
-    let rows = conn
-        .query_sync(&sql, &params)
-        .map_err(|e| CliError::Other(format!("search query failed: {e}")))?;
+    let mut fts_params: Vec<Value> = Vec::with_capacity(filter_params.len() + 3);
+    fts_params.push(Value::Text(sanitized.clone()));
+    fts_params.push(Value::BigInt(project_id));
+    fts_params.extend(filter_params.iter().cloned());
+    fts_params.push(Value::BigInt(limit as i64));
+
+    let rows = match conn.query_sync(&fts_sql, &fts_params) {
+        Ok(rows) => rows,
+        Err(fts_err) => {
+            // Runtime DBs intentionally use base schema (no FTS tables). Degrade to LIKE automatically.
+            let terms = mcp_agent_mail_db::queries::extract_like_terms(query, 5);
+            if terms.is_empty() {
+                Vec::new()
+            } else {
+                let mut like_params: Vec<Value> =
+                    Vec::with_capacity(filter_params.len() + terms.len() * 2 + 2);
+                like_params.push(Value::BigInt(project_id));
+                like_params.extend(filter_params.iter().cloned());
+
+                let mut like_parts: Vec<String> = Vec::with_capacity(terms.len());
+                for term in terms {
+                    let escaped = format!("%{}%", mcp_agent_mail_db::queries::like_escape(&term));
+                    like_parts
+                        .push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')".to_string());
+                    like_params.push(Value::Text(escaped.clone()));
+                    like_params.push(Value::Text(escaped));
+                }
+                like_params.push(Value::BigInt(limit as i64));
+                let like_clause = like_parts.join(" OR ");
+
+                let like_sql = format!(
+                    "SELECT m.id, m.subject, m.thread_id, m.importance, m.created_ts,
+                            a.name AS sender_name,
+                            CASE
+                                WHEN length(trim(COALESCE(m.body_md, ''))) > 0 THEN substr(m.body_md, 1, 220)
+                                ELSE substr(m.subject, 1, 220)
+                            END AS snippet
+                     FROM messages m
+                     JOIN agents a ON a.id = m.sender_id
+                     WHERE m.project_id = ? {extra_where}
+                     AND ({like_clause})
+                     ORDER BY m.created_ts DESC, m.id DESC
+                     LIMIT ?"
+                );
+                conn.query_sync(&like_sql, &like_params).map_err(|like_err| {
+                    CliError::Other(format!(
+                        "search query failed: fts_error={fts_err}; like_error={like_err}"
+                    ))
+                })?
+            }
+        }
+    };
 
     // Build results and facets
     let mut results = Vec::new();
@@ -5219,4 +5267,5 @@ mod tests {
             other => panic!("unexpected navigate result: {other:?}"),
         }
     }
+
 }
