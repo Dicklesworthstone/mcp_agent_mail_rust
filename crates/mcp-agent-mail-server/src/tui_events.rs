@@ -199,18 +199,12 @@ pub(crate) const fn event_log_icon(kind: MailEventKind) -> char {
 /// Format microsecond timestamps as `HH:MM:SS.mmm`.
 #[must_use]
 pub fn format_event_timestamp(micros: i64) -> String {
-    let secs = micros / 1_000_000;
-    let millis = (micros % 1_000_000).unsigned_abs() / 1000;
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    format!(
-        "{:02}:{:02}:{:02}.{:03}",
-        h.unsigned_abs(),
-        m.unsigned_abs(),
-        s.unsigned_abs(),
-        millis,
-    )
+    let secs = micros.div_euclid(1_000_000);
+    let millis = micros.rem_euclid(1_000_000) as u64 / 1000;
+    let h = secs.rem_euclid(86400) as u64 / 3600;
+    let m = secs.rem_euclid(3600) as u64 / 60;
+    let s = secs.rem_euclid(60) as u64;
+    format!("{h:02}:{m:02}:{s:02}.{millis:03}")
 }
 
 fn format_event_context(project: Option<&str>, agent: Option<&str>) -> String {
@@ -1455,7 +1449,7 @@ impl FenwickViewportIndex {
             consumed = next;
             count += 1;
         }
-        count.max(1)
+        count
     }
 
     fn range_for_offset(&self, offset: u32, viewport_height: u16) -> Range<usize> {

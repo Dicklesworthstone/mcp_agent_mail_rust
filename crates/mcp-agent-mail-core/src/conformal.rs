@@ -138,7 +138,7 @@ impl ConformalPredictor {
         // The conformal quantile: ceil((n+1) * coverage) / n.
         // This ensures finite-sample coverage >= nominal coverage.
         let quantile_idx = ((n as f64 + 1.0) * self.coverage).ceil() as usize;
-        let quantile_idx = quantile_idx.min(n) - 1; // 0-indexed, capped at n-1
+        let quantile_idx = quantile_idx.min(n).saturating_sub(1); // 0-indexed, capped at n-1
 
         let (_, q, _) = scores.select_nth_unstable_by(quantile_idx, |a, b| {
             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)

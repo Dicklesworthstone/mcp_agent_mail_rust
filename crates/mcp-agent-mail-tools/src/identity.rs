@@ -552,20 +552,21 @@ Omit the 'name' parameter to auto-generate a valid name."
         None => generate_agent_name(),
     };
 
-    // Validate attachments_policy if provided
-    let policy = attachments_policy.unwrap_or_else(|| "auto".to_string());
+    // Validate and normalize attachments_policy (case-insensitive, trimmed)
+    let raw_policy = attachments_policy.unwrap_or_else(|| "auto".to_string());
+    let policy = raw_policy.trim().to_ascii_lowercase();
     if !is_valid_attachments_policy(&policy) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             format!(
-                "Invalid argument value: Invalid attachments_policy '{policy}'. \
+                "Invalid argument value: Invalid attachments_policy '{raw_policy}'. \
 Must be: auto, inline, file, or none. \
 Check that all parameters have valid values."
             ),
             true,
             json!({
                 "field": "attachments_policy",
-                "error_detail": policy,
+                "error_detail": raw_policy,
             }),
         ));
     }
@@ -714,20 +715,21 @@ Check that all parameters have valid values."
         None => generate_agent_name(),
     };
 
-    // Validate attachments_policy if provided
-    let policy = attachments_policy.unwrap_or_else(|| "auto".to_string());
+    // Validate and normalize attachments_policy (case-insensitive, trimmed)
+    let raw_policy = attachments_policy.unwrap_or_else(|| "auto".to_string());
+    let policy = raw_policy.trim().to_ascii_lowercase();
     if !is_valid_attachments_policy(&policy) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             format!(
-                "Invalid argument value: Invalid attachments_policy '{policy}'. \
+                "Invalid argument value: Invalid attachments_policy '{raw_policy}'. \
 Must be: auto, inline, file, or none. \
 Check that all parameters have valid values."
             ),
             true,
             json!({
                 "field": "attachments_policy",
-                "error_detail": policy,
+                "error_detail": raw_policy,
             }),
         ));
     }
@@ -812,8 +814,7 @@ Choose a different name (or omit the name to auto-generate one)."
 /// Returns `true` if the policy is one of the valid values: auto, inline, file, none.
 #[must_use]
 pub fn is_valid_attachments_policy(policy: &str) -> bool {
-    let norm = policy.trim().to_ascii_lowercase();
-    ["auto", "inline", "file", "none"].contains(&norm.as_str())
+    ["auto", "inline", "file", "none"].contains(&policy)
 }
 
 /// Look up agent profile with optional recent commits.
