@@ -2053,27 +2053,11 @@ impl MailAppModel {
     }
 
     fn theme_id_for_named_config(cfg: &str) -> ThemeId {
-        match cfg {
-            "solarized" | "lumen_light" | "lumen" | "light" => ThemeId::LumenLight,
-            "dracula" | "darcula" => ThemeId::Darcula,
-            "nord" | "nordic_frost" | "nordic" => ThemeId::NordicFrost,
-            "gruvbox" | "high_contrast" | "high-contrast" | "contrast" | "hc" => {
-                ThemeId::HighContrast
-            }
-            "doom" => ThemeId::Doom,
-            "quake" => ThemeId::Quake,
-            _ => ThemeId::CyberpunkAurora,
-        }
+        crate::tui_theme::theme_id_for_config_name(cfg)
     }
 
-    const fn named_config_for_theme_id(theme_id: ThemeId) -> &'static str {
-        match theme_id {
-            ThemeId::CyberpunkAurora | ThemeId::Doom | ThemeId::Quake => "default",
-            ThemeId::Darcula => "dracula",
-            ThemeId::LumenLight => "solarized",
-            ThemeId::NordicFrost => "nord",
-            ThemeId::HighContrast => "gruvbox",
-        }
+    fn named_config_for_theme_id(theme_id: ThemeId) -> &'static str {
+        crate::tui_theme::theme_id_env_value(theme_id)
     }
 
     fn apply_theme(&mut self, theme_id: ThemeId) -> &'static str {

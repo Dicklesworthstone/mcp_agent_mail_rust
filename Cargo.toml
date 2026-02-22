@@ -32,15 +32,15 @@ fastmcp-server = "0.2.0"
 fastmcp-transport = "0.2.0"
 fastmcp-protocol = "0.2.0"
 
-asupersync = { version = "0.2.5", path = "/dp/asupersync", features = ["tls-webpki-roots"] }
+asupersync = { version = "0.2.5", features = ["tls-webpki-roots"] }
 
-sqlmodel = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel" }
-sqlmodel-core = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-query = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
-sqlmodel-schema = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
-sqlmodel-session = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
-sqlmodel-pool = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
-sqlmodel-frankensqlite = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
+sqlmodel = "0.2.0"
+sqlmodel-core = "0.2.0"
+sqlmodel-query = "0.2.0"
+sqlmodel-schema = "0.2.0"
+sqlmodel-session = "0.2.0"
+sqlmodel-pool = "0.2.0"
+sqlmodel-frankensqlite = "0.2.0"
 
 ftui = "0.2.1"
 ftui-runtime = { version = "0.2.1", features = ["native-backend"] }
@@ -49,8 +49,8 @@ ftui-widgets = { version = "0.2.1", features = ["debug-overlay", "regex-search"]
 ftui-tty = "0.2.1"
 ftui-harness = "0.2.1"
 ftui-render = "0.2.1"
-beads_rust = { path = "/dp/beads_rust" }
-toon = { version = "0.2.0", package = "tru", path = "/dp/toon_rust" }
+beads_rust = "0.1.14"
+toon = { version = "0.2.0", package = "tru" }
 
 # Internal workspace crates
 mcp-agent-mail-core = { path = "crates/mcp-agent-mail-core" }
@@ -99,11 +99,11 @@ tantivy = "0.25"
 indexmap = "2"
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank
-frankensearch = { path = "/dp/frankensearch/frankensearch", features = ["hybrid", "rerank"] }
-frankensearch-core = { path = "/dp/frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { path = "/dp/frankensearch/crates/frankensearch-embed" }
-frankensearch-index = { path = "/dp/frankensearch/crates/frankensearch-index" }
-frankensearch-fusion = { path = "/dp/frankensearch/crates/frankensearch-fusion" }
+frankensearch = { version = "0.1.0", path = "/dp/frankensearch/frankensearch", features = ["hybrid", "rerank"] }
+frankensearch-core = { version = "0.1.1", path = "/dp/frankensearch/crates/frankensearch-core" }
+frankensearch-embed = { version = "0.1.2", path = "/dp/frankensearch/crates/frankensearch-embed" }
+frankensearch-index = { version = "0.1.1", path = "/dp/frankensearch/crates/frankensearch-index" }
+frankensearch-fusion = { version = "0.1.0", path = "/dp/frankensearch/crates/frankensearch-fusion" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
@@ -148,15 +148,17 @@ inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
 uring-fs = { path = "vendor/uring-fs" }
-asupersync = { path = "/dp/asupersync" }
-asupersync-macros = { path = "/dp/asupersync/asupersync-macros" }
-franken-kernel = { path = "/dp/asupersync/franken_kernel" }
-franken-evidence = { path = "/dp/asupersync/franken_evidence" }
-franken-decision = { path = "/dp/asupersync/franken_decision" }
-sqlmodel = { path = "/dp/sqlmodel_rust/crates/sqlmodel" }
-sqlmodel-core = { path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-query = { path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
-sqlmodel-schema = { path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
-sqlmodel-session = { path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
-sqlmodel-pool = { path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
-sqlmodel-frankensqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
+# ftui patches needed until ftui v0.2.2 is published (local code uses newer APIs)
+ftui = { path = "/dp/frankentui/crates/ftui" }
+ftui-core = { path = "/dp/frankentui/crates/ftui-core" }
+ftui-runtime = { path = "/dp/frankentui/crates/ftui-runtime" }
+ftui-extras = { path = "/dp/frankentui/crates/ftui-extras" }
+ftui-widgets = { path = "/dp/frankentui/crates/ftui-widgets" }
+ftui-tty = { path = "/dp/frankentui/crates/ftui-tty" }
+ftui-harness = { path = "/dp/frankentui/crates/ftui-harness" }
+ftui-render = { path = "/dp/frankentui/crates/ftui-render" }
+ftui-layout = { path = "/dp/frankentui/crates/ftui-layout" }
+ftui-style = { path = "/dp/frankentui/crates/ftui-style" }
+ftui-text = { path = "/dp/frankentui/crates/ftui-text" }
+ftui-backend = { path = "/dp/frankentui/crates/ftui-backend" }
+ftui-i18n = { path = "/dp/frankentui/crates/ftui-i18n" }
