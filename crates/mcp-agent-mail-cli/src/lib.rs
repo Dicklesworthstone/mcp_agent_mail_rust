@@ -3045,6 +3045,203 @@ fn is_sqlite_corruption_error_message(message: &str) -> bool {
         || lower.contains("no healthy backup was found")
 }
 
+fn is_sqlite_recovery_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    is_sqlite_corruption_error_message(message)
+        || lower.contains("out of memory")
+        || lower.contains("cursor stack is empty")
+        || lower.contains("called `option::unwrap()` on a `none` value")
+        || lower.contains("internal error")
+}
+
+fn sqlite_conn_quick_check_ok(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+    let rows = conn
+        .query_sync("PRAGMA quick_check", &[])
+        .map_err(|e| CliError::Other(format!("PRAGMA quick_check failed: {e}")))?;
+    let mut checks: Vec<String> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(v) = row.get_named::<String>("quick_check") {
+            checks.push(v);
+            continue;
+        }
+        if let Ok(v) = row.get_named::<String>("integrity_check") {
+            checks.push(v);
+        }
+    }
+
+    if checks.is_empty() {
+        return Ok(rows.is_empty());
+    }
+
+    Ok(checks.len() == 1 && checks[0] == "ok")
+}
+
+fn sqlite_conn_is_healthy(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+    match sqlite_conn_quick_check_ok(conn) {
+        Ok(ok) => Ok(ok),
+        Err(e) => {
+            if is_sqlite_recovery_error_message(&e.to_string()) {
+                return Ok(false);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+
+    let path_string = path.to_string_lossy().into_owned();
+    let conn = match mcp_agent_mail_db::DbConn::open_file(&path_string) {
+        Ok(conn) => conn,
+        Err(e) => {
+            if is_sqlite_recovery_error_message(&e.to_string()) {
+                return Ok(false);
+            }
+            return Err(CliError::Other(format!(
+                "cannot open sqlite file {} for health check: {e}",
+                path.display()
+            )));
+        }
+    };
+
+    sqlite_conn_is_healthy(&conn)
+}
+
+fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut candidates: Vec<(u8, std::time::SystemTime, PathBuf)> = Vec::new();
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+
+    let bak = path.with_file_name(format!("{file_name}.bak"));
+    if bak.is_file() {
+        let modified = bak
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((0, modified, bak));
+    }
+
+    let backup_prefix = format!("{file_name}.backup-");
+    let recovery_prefix = format!("{file_name}.recovery");
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if !candidate.is_file() {
+                continue;
+            }
+            let Some(name) = candidate.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            let priority = if name.starts_with(&backup_prefix) {
+                1
+            } else if name.starts_with(&recovery_prefix) {
+                2
+            } else {
+                continue;
+            };
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            candidates.push((priority, modified, candidate));
+        }
+    }
+
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    candidates.into_iter().map(|(_, _, path)| path).collect()
+}
+
+fn find_healthy_sqlite_backup(path: &Path) -> Option<PathBuf> {
+    for candidate in sqlite_backup_candidates(path) {
+        if let Ok(true) = sqlite_file_is_healthy(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn sqlite_quarantine_path(primary_path: &Path, suffix: &str, timestamp: &str) -> CliResult<()> {
+    let source = if suffix.is_empty() {
+        primary_path.to_path_buf()
+    } else {
+        let mut source_os = primary_path.as_os_str().to_os_string();
+        source_os.push(suffix);
+        PathBuf::from(source_os)
+    };
+    if !source.exists() {
+        return Ok(());
+    }
+
+    let base_name = primary_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("storage.sqlite3");
+    let target_name = if suffix.is_empty() {
+        format!("{base_name}.corrupt-{timestamp}")
+    } else {
+        format!("{base_name}{suffix}.corrupt-{timestamp}")
+    };
+    let target = primary_path.with_file_name(target_name);
+    std::fs::rename(&source, &target).map_err(|e| {
+        CliError::Other(format!(
+            "failed to quarantine sqlite artifact {}: {e}",
+            source.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn recover_sqlite_file(path: &Path) -> CliResult<()> {
+    if !path.exists() || sqlite_file_is_healthy(path)? {
+        return Ok(());
+    }
+
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let backup = find_healthy_sqlite_backup(path);
+    sqlite_quarantine_path(path, "", &timestamp)?;
+    sqlite_quarantine_path(path, "-wal", &timestamp)?;
+    sqlite_quarantine_path(path, "-shm", &timestamp)?;
+
+    if let Some(backup_path) = backup {
+        std::fs::copy(&backup_path, path).map_err(|e| {
+            CliError::Other(format!(
+                "failed to restore sqlite backup {} into {}: {e}",
+                backup_path.display(),
+                path.display()
+            ))
+        })?;
+        if !sqlite_file_is_healthy(path)? {
+            return Err(CliError::Other(format!(
+                "sqlite restore from {} completed, but quick_check still failed for {}",
+                backup_path.display(),
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_sqlite_parent_dir(path: &Path) -> CliResult<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CliError::Other(format!("failed to create db dir {}: {e}", parent.display()))
+        })?;
+    }
+    Ok(())
+}
+
 fn sqlite_absolute_fallback_path(path: &str, open_error: &str) -> Option<String> {
     if path == ":memory:"
         || Path::new(path).is_absolute()
@@ -3075,6 +3272,20 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
                     })?;
                 return Ok((fallback_conn, fallback_path));
             }
+            if path != ":memory:" && is_sqlite_recovery_error_message(&primary_err_text) {
+                let primary_path = Path::new(path);
+                recover_sqlite_file(primary_path).map_err(|recovery_err| {
+                    CliError::Other(format!(
+                        "cannot open DB at {path}: {primary_err}; auto-recovery failed: {recovery_err}"
+                    ))
+                })?;
+                let recovered_conn = mcp_agent_mail_db::DbConn::open_file(path).map_err(|e| {
+                    CliError::Other(format!(
+                        "cannot open DB at {path}: {primary_err}; auto-recovery reopen failed: {e}"
+                    ))
+                })?;
+                return Ok((recovered_conn, path.to_string()));
+            }
             Err(CliError::Other(format!(
                 "cannot open DB at {path}: {primary_err}"
             )))
@@ -3093,11 +3304,36 @@ pub(crate) fn open_db_sync_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let (conn, opened_path) = open_sqlite_with_fallback(&path)?;
+    if path != ":memory:" {
+        ensure_sqlite_parent_dir(Path::new(&path))?;
+    }
+    let (mut conn, opened_path) = open_sqlite_with_fallback(&path)?;
+    if opened_path != ":memory:" && !sqlite_conn_is_healthy(&conn)? {
+        drop(conn);
+        recover_sqlite_file(Path::new(&opened_path))?;
+        conn = mcp_agent_mail_db::DbConn::open_file(&opened_path)
+            .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
+    }
     // Run schema init so tables exist even if first use
     let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
-    conn.execute_raw(&init_sql)
-        .map_err(|e| CliError::Other(format!("schema init failed for {opened_path}: {e}")))?;
+    if let Err(init_error) = conn.execute_raw(&init_sql) {
+        let init_error_text = init_error.to_string();
+        if opened_path != ":memory:" && is_sqlite_recovery_error_message(&init_error_text) {
+            drop(conn);
+            recover_sqlite_file(Path::new(&opened_path))?;
+            let recovered_conn = mcp_agent_mail_db::DbConn::open_file(&opened_path)
+                .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
+            recovered_conn.execute_raw(&init_sql).map_err(|e| {
+                CliError::Other(format!(
+                    "schema init failed for {opened_path} after auto-recovery: {e}"
+                ))
+            })?;
+            return Ok(recovered_conn);
+        }
+        return Err(CliError::Other(format!(
+            "schema init failed for {opened_path}: {init_error}"
+        )));
+    }
     Ok(conn)
 }
 
@@ -17807,6 +18043,79 @@ mod tests {
         assert!(is_sqlite_corruption_error_message(
             "database file tmp/storage.sqlite3 is malformed and no healthy backup was found"
         ));
+    }
+
+    #[test]
+    fn sqlite_recovery_error_message_detection_includes_internal_oom_signals() {
+        assert!(is_sqlite_recovery_error_message(
+            "Query error: out of memory"
+        ));
+        assert!(is_sqlite_recovery_error_message(
+            "Query error: cursor stack is empty"
+        ));
+    }
+
+    #[test]
+    fn open_db_sync_with_database_url_auto_restores_from_bak_on_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let conn = open_db_sync_with_database_url(&db_url).expect("open");
+        conn.execute_raw("CREATE TABLE marker(value TEXT)")
+            .expect("create marker table");
+        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
+            .expect("seed marker");
+        drop(conn);
+
+        let bak_path = PathBuf::from(format!("{}.bak", db_path.display()));
+        std::fs::copy(&db_path, &bak_path).expect("create .bak backup");
+        std::fs::write(&db_path, b"THIS FILE IS CORRUPT").expect("corrupt primary");
+
+        let reopened = open_db_sync_with_database_url(&db_url).expect("auto-recover");
+        let rows = reopened
+            .query_sync("SELECT value FROM marker", &[])
+            .expect("query marker");
+        let marker: String = rows.first().unwrap().get_named("value").unwrap();
+        assert_eq!(marker, "from-backup", "should restore from .bak backup");
+    }
+
+    #[test]
+    fn open_db_sync_with_database_url_auto_quarantines_corrupt_db_without_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
+        let conn = open_db_sync_with_database_url(&db_url).expect("open after quarantine");
+        let rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='projects'",
+                &[],
+            )
+            .expect("query sqlite_master");
+        assert!(
+            !rows.is_empty(),
+            "schema init should recreate core tables after quarantine"
+        );
+        drop(conn);
+
+        let quarantine_count = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.starts_with("storage.sqlite3.corrupt-"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            quarantine_count >= 1,
+            "corrupt DB should be preserved as quarantined artifact"
+        );
     }
 
     // ── Doctor repair .bak sibling tests (br-3h13.16.4) ────────────────────

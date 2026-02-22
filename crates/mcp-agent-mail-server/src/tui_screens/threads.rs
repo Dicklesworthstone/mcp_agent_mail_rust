@@ -2914,12 +2914,12 @@ fn render_thread_detail(
         }
     } else {
         let rendered = crate::tui_markdown::render_body(&selected_message.body_md, &md_theme);
-        let lines = rendered
+        let lines: Vec<Line<'static>> = rendered
             .lines()
             .iter()
             .filter(|line| !line.to_plain_text().trim().is_empty())
             .cloned()
-            .collect::<Vec<_>>();
+            .collect();
         if lines.is_empty() {
             preview_lines.push(Line::raw("(empty)"));
         } else {
@@ -3217,7 +3217,7 @@ fn truncate_display_width(s: &str, max_width: usize) -> String {
 }
 
 /// Clip a styled line to `max_width` display cells while preserving style/link metadata.
-fn clip_line_to_display_width(line: Line<'static>, max_width: usize) -> Line<'static> {
+fn clip_line_to_display_width<'a>(line: Line<'a>, max_width: usize) -> Line<'a> {
     if max_width == 0 {
         return Line::raw(String::new());
     }
@@ -3226,7 +3226,7 @@ fn clip_line_to_display_width(line: Line<'static>, max_width: usize) -> Line<'st
     }
 
     let mut remaining = max_width;
-    let mut clipped: Vec<Span<'static>> = Vec::new();
+    let mut clipped: Vec<Span<'a>> = Vec::new();
     for span in line.spans() {
         if remaining == 0 {
             break;

@@ -1072,6 +1072,9 @@ fn is_unsupported_by_franken(id: &str) -> bool {
         || matches!(
             id,
             "v6_backfill_inbox_stats"
+                | "v6_trg_inbox_stats_insert"
+                | "v6_trg_inbox_stats_mark_read"
+                | "v6_trg_inbox_stats_ack"
                 | "v10a_dedup_agents_case_insensitive"
                 | "v10b_idx_agents_project_name_nocase"
         )
@@ -1229,12 +1232,39 @@ async fn ensure_inbox_stats_insert_trigger_compat<C: Connection>(
     cx: &Cx,
     conn: &C,
 ) -> Outcome<(), SqlError> {
-    conn.execute(cx, TRG_INBOX_STATS_INSERT_COMPAT_SQL, &[])
+    match conn
+        .execute(cx, TRG_INBOX_STATS_INSERT_COMPAT_SQL, &[])
         .await
-        .map(|_| ())
+    {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(e) => {
+            if is_known_trigger_engine_instability_message(&e.to_string()) {
+                tracing::warn!(
+                    error = %e,
+                    "backend failed to create inbox_stats compatibility trigger; continuing without trigger"
+                );
+                Outcome::Ok(())
+            } else {
+                Outcome::Err(e)
+            }
+        }
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
-async fn enforce_base_mode_cleanup_async<C: Connection>(cx: &Cx, conn: &C) -> Outcome<(), SqlError> {
+fn is_known_trigger_engine_instability_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("out of memory")
+        || lower.contains("cursor stack is empty")
+        || lower.contains("called `option::unwrap()` on a `none` value")
+        || lower.contains("internal error")
+}
+
+async fn enforce_base_mode_cleanup_async<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
     for migration in base_trigger_cleanup_migrations() {
         match conn.execute(cx, &migration.up, &[]).await {
             Outcome::Ok(_) => {}
@@ -1553,6 +1583,29 @@ mod tests {
         assert!(!ids.contains("v5_create_fts_with_porter"));
         assert!(!ids.contains("v7_create_fts_agents"));
         assert!(!ids.contains("v7_create_fts_projects"));
+        // Inbox trigger DDL is skipped in base mode (runtime tries best-effort compat creation).
+        assert!(!ids.contains("v6_trg_inbox_stats_insert"));
+        assert!(!ids.contains("v6_trg_inbox_stats_mark_read"));
+        assert!(!ids.contains("v6_trg_inbox_stats_ack"));
+    }
+
+    #[test]
+    fn trigger_instability_classifier_catches_known_backend_failures() {
+        assert!(is_known_trigger_engine_instability_message(
+            "Query error: out of memory"
+        ));
+        assert!(is_known_trigger_engine_instability_message(
+            "internal error: cursor stack is empty"
+        ));
+        assert!(is_known_trigger_engine_instability_message(
+            "called `Option::unwrap()` on a `None` value"
+        ));
+        assert!(is_known_trigger_engine_instability_message(
+            "internal error while compiling trigger"
+        ));
+        assert!(!is_known_trigger_engine_instability_message(
+            "near \"TRIGGER\": syntax error"
+        ));
     }
 
     #[test]

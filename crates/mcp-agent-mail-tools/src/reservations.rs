@@ -143,9 +143,8 @@ fn relativize_path(project_root: &str, path: &str) -> Option<String> {
     for component in rel_path.components() {
         match component {
             std::path::Component::ParentDir => {
-                if parts.pop().is_none() {
-                    return None; // Traversal above root
-                }
+                // Traversal above root: reject path.
+                parts.pop()?;
             }
             std::path::Component::Normal(c) => {
                 parts.push(c.to_string_lossy().into_owned());
@@ -635,6 +634,7 @@ pub async fn release_file_reservations(
 #[tool(
     description = "Extend expiry for active file reservations held by an agent without reissuing them.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nagent_name : str\n    Agent identity who owns the reservations.\nextend_seconds : int\n    Seconds to extend from the later of now or current expiry (min 60s).\npaths : Optional[list[str]]\n    Restrict renewals to matching path patterns.\nfile_reservation_ids : Optional[list[int]]\n    Restrict renewals to matching reservation ids.\n\nReturns\n-------\ndict\n    { renewed: int, file_reservations: [{id, path_pattern, old_expires_ts, new_expires_ts}] }"
 )]
+#[allow(clippy::too_many_lines)]
 pub async fn renew_file_reservations(
     ctx: &McpContext,
     project_key: String,

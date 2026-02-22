@@ -148,6 +148,24 @@ inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
 uring-fs = { path = "vendor/uring-fs" }
+asupersync = { path = "/dp/asupersync" }
+asupersync-macros = { path = "/dp/asupersync/asupersync-macros" }
+franken-kernel = { path = "/dp/asupersync/franken_kernel" }
+franken-evidence = { path = "/dp/asupersync/franken_evidence" }
+franken-decision = { path = "/dp/asupersync/franken_decision" }
+# sqlmodel/frankensqlite stack: force latest local /dp checkouts to avoid stale registry builds.
+sqlmodel = { path = "/dp/sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-core = { path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-macros = { path = "/dp/sqlmodel_rust/crates/sqlmodel-macros" }
+sqlmodel-query = { path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-pool = { path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-frankensqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
+fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
+fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }
+fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
+fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
 # ftui patches needed until ftui v0.2.2 is published (local code uses newer APIs)
 ftui = { path = "/dp/frankentui/crates/ftui" }
 ftui-core = { path = "/dp/frankentui/crates/ftui-core" }

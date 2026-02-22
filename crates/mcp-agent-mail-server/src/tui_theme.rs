@@ -24,10 +24,46 @@ static ACTIVE_NAMED_THEME_INDEX: std::sync::atomic::AtomicUsize =
 /// The `display_name` is shown in the status line and command palette.
 pub const NAMED_THEMES: &[(&str, &str)] = &[
     ("default", "Cyberpunk Aurora"),
-    ("solarized", "Lumen Light"),
-    ("dracula", "Darcula"),
-    ("nord", "Nordic Frost"),
-    ("gruvbox", "High Contrast"),
+    ("darcula", "Darcula"),
+    ("lumen_light", "Lumen Light"),
+    ("nordic_frost", "Nordic Frost"),
+    ("doom", "Doom"),
+    ("quake", "Quake"),
+    ("monokai", "Monokai"),
+    ("solarized_dark", "Solarized Dark"),
+    ("solarized_light", "Solarized Light"),
+    ("gruvbox_dark", "Gruvbox Dark"),
+    ("gruvbox_light", "Gruvbox Light"),
+    ("one_dark", "One Dark"),
+    ("tokyo_night", "Tokyo Night"),
+    ("catppuccin_mocha", "Catppuccin Mocha"),
+    ("rose_pine", "Rose Pine"),
+    ("night_owl", "Night Owl"),
+    ("dracula", "Dracula"),
+    ("material_ocean", "Material Ocean"),
+    ("ayu_dark", "Ayu Dark"),
+    ("ayu_light", "Ayu Light"),
+    ("kanagawa_wave", "Kanagawa Wave"),
+    ("everforest_dark", "Everforest Dark"),
+    ("everforest_light", "Everforest Light"),
+    ("github_dark", "GitHub Dark"),
+    ("github_light", "GitHub Light"),
+    ("synthwave_84", "Synthwave '84"),
+    ("palenight", "Palenight"),
+    ("horizon_dark", "Horizon Dark"),
+    ("nord_dark", "Nord"),
+    ("one_light", "One Light"),
+    ("catppuccin_latte", "Catppuccin Latte"),
+    ("catppuccin_frappe", "Catppuccin Frappe"),
+    ("catppuccin_macchiato", "Catppuccin Macchiato"),
+    ("kanagawa_lotus", "Kanagawa Lotus"),
+    ("nightfox", "Nightfox"),
+    ("dayfox", "Dayfox"),
+    ("oceanic_next", "Oceanic Next"),
+    ("cobalt2", "Cobalt2"),
+    ("papercolor_dark", "PaperColor Dark"),
+    ("papercolor_light", "PaperColor Light"),
+    ("high_contrast", "High Contrast"),
     ("frankenstein", "Frankenstein"),
 ];
 
@@ -101,6 +137,84 @@ pub fn set_named_theme(index: usize) -> (&'static str, &'static str, TuiThemePal
     ACTIVE_NAMED_THEME_INDEX.store(idx, std::sync::atomic::Ordering::Relaxed);
     let (cfg, display) = NAMED_THEMES[idx];
     (cfg, display, TuiThemePalette::from_config_name(cfg))
+}
+
+/// Resolve a config name into the corresponding [`ThemeId`].
+///
+/// This normalizes legacy aliases to preserve compatibility with older envfiles.
+/// For non-`ThemeId` palettes (currently `frankenstein`) this returns
+/// `ThemeId::CyberpunkAurora` as the nearest base theme.
+#[must_use]
+pub fn theme_id_for_config_name(name: &str) -> ThemeId {
+    let canonical_cfg = canonical_theme_config_name(name);
+    if matches!(canonical_cfg, "default" | "frankenstein") {
+        return ThemeId::CyberpunkAurora;
+    }
+    theme_id_for_canonical_name(canonical_cfg).unwrap_or(ThemeId::CyberpunkAurora)
+}
+
+#[must_use]
+fn canonical_theme_config_name(name: &str) -> &'static str {
+    let lowered = name.trim().to_ascii_lowercase();
+    let normalized = lowered.as_str();
+    if matches!(
+        normalized,
+        "cyberpunk_aurora" | "cyberpunk-aurora" | "cyberpunk" | "aurora"
+    ) {
+        return "default";
+    }
+    match normalized {
+        "darcula" => "darcula",
+        "dracula" => "dracula",
+        "lumen_light" | "lumen-light" | "lumen" | "light" => "lumen_light",
+        "nordic_frost" | "nordic-frost" | "nordic" | "nord" => "nordic_frost",
+        "doom" => "doom",
+        "quake" => "quake",
+        "monokai" => "monokai",
+        "solarized" | "solarized_dark" | "solarized-dark" => "solarized_dark",
+        "solarized_light" | "solarized-light" => "solarized_light",
+        "gruvbox" | "gruvbox_dark" | "gruvbox-dark" => "gruvbox_dark",
+        "gruvbox_light" | "gruvbox-light" => "gruvbox_light",
+        "one_dark" | "one-dark" | "onedark" => "one_dark",
+        "tokyo_night" | "tokyo-night" | "tokyonight" => "tokyo_night",
+        "catppuccin_mocha" | "catppuccin-mocha" | "catppuccin" => "catppuccin_mocha",
+        "rose_pine" | "rose-pine" | "rosepine" => "rose_pine",
+        "night_owl" | "night-owl" | "nightowl" => "night_owl",
+        "material_ocean" | "material-ocean" | "material" | "oceanic" => "material_ocean",
+        "ayu_dark" | "ayu-dark" | "ayu" => "ayu_dark",
+        "ayu_light" | "ayu-light" => "ayu_light",
+        "kanagawa_wave" | "kanagawa-wave" | "kanagawa" => "kanagawa_wave",
+        "everforest_dark" | "everforest-dark" | "everforest" => "everforest_dark",
+        "everforest_light" | "everforest-light" => "everforest_light",
+        "github_dark" | "github-dark" | "github" => "github_dark",
+        "github_light" | "github-light" => "github_light",
+        "synthwave_84" | "synthwave-84" | "synthwave84" | "synthwave" => "synthwave_84",
+        "palenight" => "palenight",
+        "horizon_dark" | "horizon-dark" | "horizon" => "horizon_dark",
+        "nord_dark" | "nord-dark" => "nord_dark",
+        "one_light" | "one-light" | "onelight" => "one_light",
+        "catppuccin_latte" | "catppuccin-latte" | "latte" => "catppuccin_latte",
+        "catppuccin_frappe" | "catppuccin-frappe" | "frappe" => "catppuccin_frappe",
+        "catppuccin_macchiato" | "catppuccin-macchiato" | "macchiato" => "catppuccin_macchiato",
+        "kanagawa_lotus" | "kanagawa-lotus" | "lotus" => "kanagawa_lotus",
+        "nightfox" => "nightfox",
+        "dayfox" => "dayfox",
+        "oceanic_next" | "oceanic-next" | "ocean" => "oceanic_next",
+        "cobalt2" | "cobalt_2" | "cobalt" => "cobalt2",
+        "papercolor_dark" | "papercolor-dark" => "papercolor_dark",
+        "papercolor_light" | "papercolor-light" | "papercolor" => "papercolor_light",
+        "high_contrast" | "high-contrast" | "highcontrast" | "contrast" | "hc" => "high_contrast",
+        "frankenstein" => "frankenstein",
+        _ => "default",
+    }
+}
+
+#[must_use]
+fn theme_id_for_canonical_name(name: &str) -> Option<ThemeId> {
+    ThemeId::ALL
+        .iter()
+        .copied()
+        .find(|candidate| theme_id_env_value(*candidate) == name)
 }
 
 /// Mutex to serialize tests that mutate `ACTIVE_NAMED_THEME_INDEX`.
@@ -878,22 +992,14 @@ impl TuiThemePalette {
 
     /// Resolve a named theme from the `AM_TUI_THEME` config value.
     ///
-    /// Accepted values: `"default"`, `"solarized"`, `"dracula"`, `"nord"`, `"gruvbox"`, `"frankenstein"`.
+    /// Accepted values include canonical names from [`NAMED_THEMES`] plus
+    /// legacy aliases (for example `solarized`, `dracula`, `nord`, `gruvbox`).
     /// Unknown values fall back to the default theme.
     #[must_use]
     pub fn from_config_name(name: &str) -> Self {
         let palette = match name {
-            "default" | "cyberpunk_aurora" | "cyberpunk" | "aurora" => {
-                Self::for_theme(ThemeId::CyberpunkAurora)
-            }
-            "solarized" | "lumen_light" | "lumen" | "light" => Self::for_theme(ThemeId::LumenLight),
-            "dracula" | "darcula" => Self::for_theme(ThemeId::Darcula),
-            "nord" | "nordic_frost" | "nordic" => Self::for_theme(ThemeId::NordicFrost),
-            "gruvbox" | "high_contrast" | "high-contrast" | "contrast" | "hc" => {
-                Self::for_theme(ThemeId::HighContrast)
-            }
             "frankenstein" => Self::frankenstein(),
-            _ => Self::for_theme(ThemeId::CyberpunkAurora),
+            _ => Self::for_theme(theme_id_for_config_name(name)),
         };
         palette.normalized_for_contrast()
     }
@@ -911,14 +1017,11 @@ impl TuiThemePalette {
     /// Returns `0` (default) for unrecognized names.
     #[must_use]
     pub fn config_name_to_index(name: &str) -> usize {
-        match name {
-            "solarized" | "lumen_light" | "lumen" | "light" => 1,
-            "dracula" | "darcula" => 2,
-            "nord" | "nordic_frost" | "nordic" => 3,
-            "gruvbox" | "high_contrast" | "high-contrast" | "contrast" | "hc" => 4,
-            "frankenstein" => 5,
-            _ => 0,
-        }
+        let canonical = canonical_theme_config_name(name);
+        NAMED_THEMES
+            .iter()
+            .position(|(config_name, _)| *config_name == canonical)
+            .unwrap_or(0)
     }
 
     /// Resolve a palette from a specific theme ID.
@@ -1054,7 +1157,7 @@ impl TuiThemePalette {
     fn normalized_for_contrast(mut self) -> Self {
         const MIN_TEXT_RATIO: f64 = 4.5;
         const MIN_ACCENT_RATIO: f64 = 3.2;
-        const MIN_MUTED_RATIO: f64 = 2.6;
+        const MIN_MUTED_RATIO: f64 = 3.0;
         const MIN_BORDER_RATIO: f64 = 1.24;
         const MAX_BORDER_RATIO: f64 = 2.35;
         const MIN_BORDER_DIM_RATIO: f64 = 1.10;
@@ -1497,6 +1600,43 @@ impl TuiThemePalette {
             self.panel_border_focused =
                 lerp_color(self.panel_border_focused, self.panel_border, 0.34);
         }
+        // Preserve semantic differentiation even after contrast normalization.
+        if self.status_good == self.status_warn {
+            self.status_warn = ensure_min_contrast(
+                lerp_color(self.status_warn, self.status_accent, 0.55),
+                self.status_bg,
+                dark_fallback,
+                light_fallback,
+                MIN_ACCENT_RATIO,
+            );
+            if self.status_warn == self.status_good {
+                self.status_warn = ensure_min_contrast(
+                    self.severity_error,
+                    self.status_bg,
+                    dark_fallback,
+                    light_fallback,
+                    MIN_ACCENT_RATIO,
+                );
+            }
+        }
+        if self.sparkline_lo == self.sparkline_hi {
+            self.sparkline_lo = ensure_min_contrast(
+                lerp_color(self.sparkline_hi, self.panel_bg, 0.45),
+                self.panel_bg,
+                dark_fallback,
+                light_fallback,
+                MIN_ACCENT_RATIO,
+            );
+            if self.sparkline_lo == self.sparkline_hi {
+                self.sparkline_lo = ensure_min_contrast(
+                    self.status_accent,
+                    self.panel_bg,
+                    dark_fallback,
+                    light_fallback,
+                    MIN_ACCENT_RATIO,
+                );
+            }
+        }
         self
     }
 
@@ -1615,17 +1755,19 @@ pub fn current_theme_name() -> &'static str {
 }
 
 /// Return the canonical env value for a [`ThemeId`].
+///
+/// Uses display-name lookup so this remains compatible across `ftui_extras`
+/// snapshots where the enum variant set may differ.
 #[must_use]
-pub const fn theme_id_env_value(id: ThemeId) -> &'static str {
-    match id {
-        ThemeId::CyberpunkAurora => "cyberpunk_aurora",
-        ThemeId::Darcula => "darcula",
-        ThemeId::LumenLight => "lumen_light",
-        ThemeId::NordicFrost => "nordic_frost",
-        ThemeId::HighContrast => "high_contrast",
-        ThemeId::Doom => "doom",
-        ThemeId::Quake => "quake",
+pub fn theme_id_env_value(id: ThemeId) -> &'static str {
+    let display = id.name();
+    if let Some((config_name, _)) = NAMED_THEMES
+        .iter()
+        .find(|(_, named_display)| named_display.eq_ignore_ascii_case(display))
+    {
+        return config_name;
     }
+    canonical_theme_config_name(display)
 }
 
 /// Get the currently active theme ID.
@@ -2319,6 +2461,14 @@ mod tests {
         let _guard = ScopedThemeLock::new(ThemeId::NordicFrost);
         assert_eq!(current_theme_env_value(), "nordic_frost");
         assert_eq!(theme_id_env_value(ThemeId::HighContrast), "high_contrast");
+        for &theme_id in &ThemeId::ALL {
+            let env_name = theme_id_env_value(theme_id);
+            assert!(
+                NAMED_THEMES.iter().any(|(cfg, _)| *cfg == env_name),
+                "theme {:?} resolved to unknown env name: {env_name}",
+                theme_id
+            );
+        }
     }
 
     #[test]
@@ -2750,28 +2900,59 @@ mod tests {
     /// `from_config_name` maps config strings to the correct palettes.
     #[test]
     fn from_config_name_resolves_correctly() {
-        let default = TuiThemePalette::from_config_name("default");
-        let cyber = TuiThemePalette::for_theme(ThemeId::CyberpunkAurora);
-        assert_eq!(
-            default.tab_key_fg, cyber.tab_key_fg,
-            "default should map to cyberpunk aurora"
-        );
-
-        let solar = TuiThemePalette::from_config_name("solarized");
-        let solar_direct = TuiThemePalette::for_theme(ThemeId::LumenLight);
-        assert_eq!(solar.tab_key_fg, solar_direct.tab_key_fg);
-
-        let drac = TuiThemePalette::from_config_name("dracula");
-        let drac_direct = TuiThemePalette::for_theme(ThemeId::Darcula);
-        assert_eq!(drac.tab_key_fg, drac_direct.tab_key_fg);
-
-        let nord = TuiThemePalette::from_config_name("nord");
-        let nord_direct = TuiThemePalette::for_theme(ThemeId::NordicFrost);
-        assert_eq!(nord.tab_key_fg, nord_direct.tab_key_fg);
-
-        let gruv = TuiThemePalette::from_config_name("gruvbox");
-        let gruv_direct = TuiThemePalette::for_theme(ThemeId::HighContrast);
-        assert_eq!(gruv.tab_key_fg, gruv_direct.tab_key_fg);
+        let config_names = [
+            "default",
+            "cyberpunk_aurora",
+            "solarized",
+            "dracula",
+            "darcula",
+            "nord_dark",
+            "gruvbox",
+            "doom",
+            "quake",
+            "monokai",
+            "solarized_dark",
+            "solarized_light",
+            "gruvbox_dark",
+            "gruvbox_light",
+            "one_dark",
+            "tokyo_night",
+            "catppuccin_mocha",
+            "rose_pine",
+            "night_owl",
+            "material_ocean",
+            "ayu_dark",
+            "ayu_light",
+            "kanagawa_wave",
+            "everforest_dark",
+            "everforest_light",
+            "github_dark",
+            "github_light",
+            "synthwave_84",
+            "palenight",
+            "horizon_dark",
+            "nord",
+            "one_light",
+            "catppuccin_latte",
+            "catppuccin_frappe",
+            "catppuccin_macchiato",
+            "kanagawa_lotus",
+            "nightfox",
+            "dayfox",
+            "oceanic_next",
+            "cobalt2",
+            "papercolor_dark",
+            "papercolor_light",
+            "high_contrast",
+        ];
+        for name in config_names {
+            let resolved = TuiThemePalette::from_config_name(name);
+            let direct = TuiThemePalette::for_theme(theme_id_for_config_name(name));
+            assert_eq!(
+                resolved.tab_key_fg, direct.tab_key_fg,
+                "from_config_name('{name}') mapped to the wrong theme"
+            );
+        }
 
         let frank = TuiThemePalette::from_config_name("frankenstein");
         let frank_direct = TuiThemePalette::frankenstein();
@@ -2872,6 +3053,25 @@ mod tests {
                 "config_name_to_index('{cfg_name}') should return {i}"
             );
         }
+        assert_eq!(TuiThemePalette::config_name_to_index("cyberpunk_aurora"), 0);
+        assert_eq!(TuiThemePalette::config_name_to_index("dracula"), 16);
+        assert_eq!(TuiThemePalette::config_name_to_index("material"), 17);
+        assert_eq!(TuiThemePalette::config_name_to_index("ayu"), 18);
+        assert_eq!(TuiThemePalette::config_name_to_index("everforest"), 21);
+        assert_eq!(TuiThemePalette::config_name_to_index("github"), 23);
+        assert_eq!(TuiThemePalette::config_name_to_index("synthwave84"), 25);
+        assert_eq!(TuiThemePalette::config_name_to_index("nord"), 3);
+        assert_eq!(TuiThemePalette::config_name_to_index("nord_dark"), 28);
+        assert_eq!(TuiThemePalette::config_name_to_index("one-light"), 29);
+        assert_eq!(TuiThemePalette::config_name_to_index("latte"), 30);
+        assert_eq!(TuiThemePalette::config_name_to_index("frappe"), 31);
+        assert_eq!(TuiThemePalette::config_name_to_index("macchiato"), 32);
+        assert_eq!(TuiThemePalette::config_name_to_index("lotus"), 33);
+        assert_eq!(TuiThemePalette::config_name_to_index("dayfox"), 35);
+        assert_eq!(TuiThemePalette::config_name_to_index("oceanic"), 17);
+        assert_eq!(TuiThemePalette::config_name_to_index("ocean"), 36);
+        assert_eq!(TuiThemePalette::config_name_to_index("cobalt"), 37);
+        assert_eq!(TuiThemePalette::config_name_to_index("papercolor"), 39);
         assert_eq!(TuiThemePalette::config_name_to_index("matrix"), 0);
     }
 
@@ -2897,20 +3097,17 @@ mod tests {
 
     #[test]
     fn named_theme_display_name_by_index() {
-        assert_eq!(named_theme_display_name(0), "Cyberpunk Aurora");
-        assert_eq!(named_theme_display_name(1), "Lumen Light");
-        assert_eq!(named_theme_display_name(2), "Darcula");
-        assert_eq!(named_theme_display_name(3), "Nordic Frost");
-        assert_eq!(named_theme_display_name(4), "High Contrast");
-        assert_eq!(named_theme_display_name(5), "Frankenstein");
+        for (i, (_, display)) in NAMED_THEMES.iter().enumerate() {
+            assert_eq!(named_theme_display_name(i), *display);
+        }
     }
 
     #[test]
     fn init_named_theme_sets_index() {
         let _g = named_theme_guard();
-        init_named_theme("dracula");
-        assert_eq!(active_named_theme_index(), 2);
-        assert_eq!(active_named_theme_config_name(), "dracula");
+        init_named_theme("darcula");
+        assert_eq!(active_named_theme_index(), 1);
+        assert_eq!(active_named_theme_config_name(), "darcula");
         assert_eq!(active_named_theme_display(), "Darcula");
         init_named_theme("default");
     }
@@ -2921,22 +3118,15 @@ mod tests {
         init_named_theme("default");
         assert_eq!(active_named_theme_index(), 0);
 
-        let (cfg, display, _) = cycle_named_theme();
-        assert_eq!(cfg, "solarized");
-        assert_eq!(display, "Lumen Light");
-
-        let (cfg, _, _) = cycle_named_theme();
-        assert_eq!(cfg, "dracula");
-        let (cfg, _, _) = cycle_named_theme();
-        assert_eq!(cfg, "nord");
-        let (cfg, _, _) = cycle_named_theme();
-        assert_eq!(cfg, "gruvbox");
-        let (cfg, _, _) = cycle_named_theme();
-        assert_eq!(cfg, "frankenstein");
+        for (expected_idx, _) in NAMED_THEMES.iter().enumerate().skip(1) {
+            let (cfg, display, _) = cycle_named_theme();
+            assert_eq!(cfg, NAMED_THEMES[expected_idx].0);
+            assert_eq!(display, NAMED_THEMES[expected_idx].1);
+        }
 
         let (cfg, display, _) = cycle_named_theme();
-        assert_eq!(cfg, "default");
-        assert_eq!(display, "Cyberpunk Aurora");
+        assert_eq!(cfg, NAMED_THEMES[0].0);
+        assert_eq!(display, NAMED_THEMES[0].1);
 
         init_named_theme("default");
     }
@@ -2945,7 +3135,7 @@ mod tests {
     fn set_named_theme_by_index() {
         let _g = named_theme_guard();
         let (cfg, display, palette) = set_named_theme(3);
-        assert_eq!(cfg, "nord");
+        assert_eq!(cfg, "nordic_frost");
         assert_eq!(display, "Nordic Frost");
         let direct = TuiThemePalette::for_theme(ThemeId::NordicFrost);
         assert_eq!(palette.tab_key_fg, direct.tab_key_fg);
@@ -2957,7 +3147,7 @@ mod tests {
         let _g = named_theme_guard();
         init_named_theme("gruvbox");
         let palette = active_named_palette();
-        let direct = TuiThemePalette::for_theme(ThemeId::HighContrast);
+        let direct = TuiThemePalette::for_theme(theme_id_for_config_name("gruvbox"));
         assert_eq!(palette.tab_key_fg, direct.tab_key_fg);
         assert_eq!(palette.panel_bg, direct.panel_bg);
         init_named_theme("default");

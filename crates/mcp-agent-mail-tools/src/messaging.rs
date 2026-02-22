@@ -321,7 +321,7 @@ async fn resolve_or_register_agent(
     pool: &mcp_agent_mail_db::DbPool,
     project_id: i64,
     agent_name: &str,
-    sender: &mcp_agent_mail_db::AgentRow,
+    _sender: &mcp_agent_mail_db::AgentRow,
     config: &Config,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
     let agent = match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name)

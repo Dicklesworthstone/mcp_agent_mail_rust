@@ -95,9 +95,15 @@ ci-artifacts/
 proptest-regressions/
 test_meminfo
 
-# Remote compilation helper release artifacts
+# Remote compilation helper artifacts
+rch-artifacts/
+target-rch-release/
+target-rch*/
 .rch-release-bin/
 .rch-release-root/
+
+# Vendored dependencies (local overrides)
+vendor/
 
 # Beads backup/conflict files
 .beads/*.bak_*

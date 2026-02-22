@@ -1536,7 +1536,7 @@ fn render_detail(
         return;
     };
 
-    let mut lines = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let dir = match entry.direction {
         Direction::Inbound => "Inbound",
         Direction::Outbound => "Outbound",

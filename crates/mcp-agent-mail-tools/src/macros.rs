@@ -532,7 +532,7 @@ pub async fn macro_contact_handshake(
     let target_project_key = to_project.clone().unwrap_or_else(|| project_key.clone());
 
     // Fast path: auto-accept same-project without welcome message.
-    let is_same_project = to_project.as_ref().map_or(true, |p| p == &project_key);
+    let is_same_project = to_project.as_ref().is_none_or(|p| p == &project_key);
     if should_auto_accept
         && is_same_project
         && welcome_subject.is_none()

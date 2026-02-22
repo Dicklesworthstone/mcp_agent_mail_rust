@@ -3914,7 +3914,7 @@ fn render_detail_panel(
     lines.push("--- Body ---".to_string());
 
     // Combine header and body into one Text for unified scrolling
-    let mut combined_lines = Vec::new();
+    let mut combined_lines: Vec<Line<'static>> = Vec::new();
     for line in lines {
         combined_lines.push(Line::raw(line));
     }
@@ -4541,13 +4541,13 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
             let md_theme = crate::tui_theme::markdown_theme();
             let rendered =
                 crate::tui_markdown::render_body(&form.context.original_body_md, &md_theme);
-            let preview_lines = rendered
+            let preview_lines: Vec<Line<'static>> = rendered
                 .lines()
                 .iter()
                 .filter(|line| !line.to_plain_text().trim().is_empty())
                 .take(usize::from(preview_rows))
                 .cloned()
-                .collect::<Vec<_>>();
+                .collect();
             if preview_lines.is_empty() {
                 Paragraph::new("(empty body)")
                     .style(crate::tui_theme::text_hint(&tp))
