@@ -6,18 +6,18 @@
 //! snapshot, refreshes shared stats every cycle, and emits health pulses
 //! on data changes plus periodic heartbeat intervals.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use std::{collections::HashMap};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::sqlmodel_core::{Row, Value};
-use mcp_agent_mail_db::timestamps::now_micros;
 #[cfg(test)]
 use mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE;
+use mcp_agent_mail_db::sqlmodel_core::{Row, Value};
+use mcp_agent_mail_db::timestamps::now_micros;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{
@@ -81,8 +81,7 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn fetch_counts(&self) -> DbSnapshotCounts {
-        let reservation_count_sql =
-            "SELECT \
+        let reservation_count_sql = "SELECT \
              (SELECT COUNT(*) FROM projects) AS projects_count, \
              (SELECT COUNT(*) FROM agents) AS agents_count, \
              (SELECT COUNT(*) FROM messages) AS messages_count, \
@@ -159,12 +158,11 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn count_active_reservations(&self, now: i64) -> u64 {
-        let rows = match self.conn.query_sync(
+        let Ok(rows) = self.conn.query_sync(
             "SELECT expires_ts AS raw_expires_ts, released_ts AS raw_released_ts FROM file_reservations",
             &[],
-        ) {
-            Ok(rows) => rows,
-            Err(_) => return 0,
+        ) else {
+            return 0;
         };
         #[cfg(test)]
         if let Some(first) = rows.first() {
@@ -232,9 +230,7 @@ impl DbPoller {
                     .worker_threads(1)
                     .build()
                     .expect("build db poller runtime");
-                rt.block_on(async move {
-                    self.run()
-                });
+                rt.block_on(async move { self.run() });
             })
             .expect("spawn tui-db-poller thread");
         DbPollerHandle {
@@ -254,25 +250,24 @@ impl DbPoller {
 
         while !self.stop.load(Ordering::Relaxed) {
             // Fetch fresh snapshot
-            let snapshot = match catch_optional_panic(|| fetch_db_stats(&self.database_url)) {
-                Ok(snapshot) => {
-                    if panic_recovery_active {
-                        tracing::info!(
-                            "tui-db-poller recovered after a panic; resuming normal polling"
-                        );
-                        panic_recovery_active = false;
-                    }
-                    snapshot
+            let snapshot = if let Ok(snapshot) =
+                catch_optional_panic(|| fetch_db_stats(&self.database_url))
+            {
+                if panic_recovery_active {
+                    tracing::info!(
+                        "tui-db-poller recovered after a panic; resuming normal polling"
+                    );
+                    panic_recovery_active = false;
                 }
-                Err(_) => {
-                    if !panic_recovery_active {
-                        tracing::warn!(
-                            "tui-db-poller recovered from a panic while polling DB; keeping UI alive"
-                        );
-                        panic_recovery_active = true;
-                    }
-                    None
+                snapshot
+            } else {
+                if !panic_recovery_active {
+                    tracing::warn!(
+                        "tui-db-poller recovered from a panic while polling DB; keeping UI alive"
+                    );
+                    panic_recovery_active = true;
                 }
+                None
             };
             if let Some(snapshot) = snapshot {
                 let changed = snapshot_delta(&prev, &snapshot).any_changed();
@@ -435,7 +430,10 @@ fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
                             .ok()
                             .and_then(|v| u64::try_from(v).ok())
                             .unwrap_or(0),
-                        reservation_count: reservation_counts.get(&project_id).copied().unwrap_or(0),
+                        reservation_count: reservation_counts
+                            .get(&project_id)
+                            .copied()
+                            .unwrap_or(0),
                         created_at: row.get_named::<i64>("created_at").ok().unwrap_or(0),
                     })
                 })
@@ -445,12 +443,11 @@ fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
 }
 
 fn fetch_active_reservation_counts_by_project(conn: &DbConn, now: i64) -> HashMap<i64, u64> {
-    let rows = match conn.query_sync(
+    let Ok(rows) = conn.query_sync(
         "SELECT project_id, expires_ts AS raw_expires_ts, released_ts AS raw_released_ts FROM file_reservations",
         &[],
-    ) {
-        Ok(rows) => rows,
-        Err(_) => return HashMap::new(),
+    ) else {
+        return HashMap::new();
     };
     #[cfg(test)]
     if let Some(first) = rows.first() {
@@ -516,38 +513,30 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 /// - Anything else → 0
 fn parse_raw_ts(row: &Row, col: &str) -> i64 {
     match row.get_by_name(col) {
-        Some(Value::Timestamp(v)) => *v,
-        Some(Value::TimestampTz(v)) => *v,
-        Some(Value::Time(v)) => *v,
-        Some(Value::Date(v)) => i64::from(*v),
-        Some(Value::BigInt(v)) => *v,
-        Some(Value::Int(v)) => i64::from(*v),
+        Some(Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) | Value::BigInt(v)) => *v,
+        Some(Value::Date(v) | Value::Int(v)) => i64::from(*v),
         Some(Value::SmallInt(v)) => i64::from(*v),
         Some(Value::TinyInt(v)) => i64::from(*v),
         Some(Value::Bool(v)) => i64::from(*v),
         Some(Value::Double(v)) => parse_float_ts(*v),
         Some(Value::Float(v)) => parse_float_ts(f64::from(*v)),
-        Some(Value::Decimal(s)) => parse_text_timestamp(s),
-        Some(Value::Text(s)) => parse_text_timestamp(s),
+        Some(Value::Decimal(s) | Value::Text(s)) => parse_text_timestamp(s),
         _ => 0,
     }
 }
 
 fn parse_raw_i64(row: &Row, col: &str) -> Option<i64> {
     match row.get_by_name(col) {
-        Some(Value::Timestamp(v)) => Some(*v),
-        Some(Value::TimestampTz(v)) => Some(*v),
-        Some(Value::Time(v)) => Some(*v),
-        Some(Value::Date(v)) => Some(i64::from(*v)),
-        Some(Value::BigInt(v)) => Some(*v),
-        Some(Value::Int(v)) => Some(i64::from(*v)),
+        Some(Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) | Value::BigInt(v)) => {
+            Some(*v)
+        }
+        Some(Value::Date(v) | Value::Int(v)) => Some(i64::from(*v)),
         Some(Value::SmallInt(v)) => Some(i64::from(*v)),
         Some(Value::TinyInt(v)) => Some(i64::from(*v)),
         Some(Value::Bool(v)) => Some(i64::from(*v)),
         Some(Value::Double(v)) => Some(parse_float_ts(*v)),
         Some(Value::Float(v)) => Some(parse_float_ts(f64::from(*v))),
-        Some(Value::Decimal(s)) => s.trim().parse::<i64>().ok(),
-        Some(Value::Text(s)) => s.trim().parse::<i64>().ok(),
+        Some(Value::Decimal(s) | Value::Text(s)) => s.trim().parse::<i64>().ok(),
         _ => None,
     }
 }
@@ -620,7 +609,7 @@ fn parse_text_timestamp(s: &str) -> i64 {
         0
     } else {
         let safe_frac: String = frac_str.chars().take(6).collect();
-        let padded = format!("{:0<6}", safe_frac);
+        let padded = format!("{safe_frac:0<6}");
         padded.parse().unwrap_or(0)
     };
     // Convert to unix timestamp using a simplified calculation
@@ -637,19 +626,16 @@ fn is_active_reservation_row(row: &Row, now: i64, expires_col: &str, released_co
 fn released_ts_is_active(raw: Option<&Value>) -> bool {
     match raw {
         None | Some(Value::Null) => true,
-        Some(Value::Timestamp(v)) => *v <= 0,
-        Some(Value::TimestampTz(v)) => *v <= 0,
-        Some(Value::Time(v)) => *v <= 0,
-        Some(Value::Date(v)) => *v <= 0,
-        Some(Value::BigInt(v)) => *v <= 0,
-        Some(Value::Int(v)) => *v <= 0,
+        Some(Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) | Value::BigInt(v)) => {
+            *v <= 0
+        }
+        Some(Value::Date(v) | Value::Int(v)) => *v <= 0,
         Some(Value::SmallInt(v)) => *v <= 0,
         Some(Value::TinyInt(v)) => *v <= 0,
         Some(Value::Bool(v)) => !*v,
         Some(Value::Double(v)) => *v <= 0.0,
         Some(Value::Float(v)) => *v <= 0.0,
-        Some(Value::Decimal(s)) => released_text_is_active(s),
-        Some(Value::Text(s)) => released_text_is_active(s),
+        Some(Value::Decimal(s) | Value::Text(s)) => released_text_is_active(s),
         _ => false,
     }
 }
@@ -695,23 +681,21 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
     let now = now_micros();
-    let sql = format!(
-        "SELECT \
-           fr.id, \
-           COALESCE(p.slug, '[unknown-project]') AS project_slug, \
-           COALESCE(a.name, '[unknown-agent]') AS agent_name, \
-           fr.path_pattern, \
-           fr.\"exclusive\", \
-           fr.created_ts AS raw_created_ts, \
-           fr.expires_ts AS raw_expires_ts, \
-           fr.released_ts AS raw_released_ts \
-         FROM file_reservations fr \
-         LEFT JOIN projects p ON p.id = fr.project_id \
-         LEFT JOIN agents a ON a.id = fr.agent_id \
-         ORDER BY fr.id ASC"
-    );
+    let sql = "SELECT \
+       fr.id, \
+       COALESCE(p.slug, '[unknown-project]') AS project_slug, \
+       COALESCE(a.name, '[unknown-agent]') AS agent_name, \
+       fr.path_pattern, \
+       fr.\"exclusive\", \
+       fr.created_ts AS raw_created_ts, \
+       fr.expires_ts AS raw_expires_ts, \
+       fr.released_ts AS raw_released_ts \
+     FROM file_reservations fr \
+     LEFT JOIN projects p ON p.id = fr.project_id \
+     LEFT JOIN agents a ON a.id = fr.agent_id \
+     ORDER BY fr.id ASC";
 
-    let rows = match conn.query_sync(&sql, &[]) {
+    let rows = match conn.query_sync(sql, &[]) {
         Ok(rows) => rows,
         Err(err) => {
             tracing::debug!(

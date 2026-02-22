@@ -498,7 +498,7 @@ pub async fn fetch_inbox_product(
                     importance: msg.importance,
                     ack_required: msg.ack_required != 0,
                     from: row.sender_name,
-                    created_ts: None,
+                    created_ts: Some(micros_to_iso(created_ts)),
                     kind: row.kind,
                     attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
                     body_md: if with_bodies { Some(msg.body_md) } else { None },

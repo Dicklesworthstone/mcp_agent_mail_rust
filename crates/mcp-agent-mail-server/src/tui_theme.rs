@@ -2360,7 +2360,7 @@ mod tests {
         let _g = named_theme_guard();
         init_named_theme("nord");
         let current = TuiThemePalette::current();
-        let explicit = TuiThemePalette::nord();
+        let explicit = TuiThemePalette::from_config_name("nord");
         assert_eq!(current.tab_key_fg, explicit.tab_key_fg);
         assert_eq!(current.status_good, explicit.status_good);
         init_named_theme("default");
@@ -2465,8 +2465,7 @@ mod tests {
             let env_name = theme_id_env_value(theme_id);
             assert!(
                 NAMED_THEMES.iter().any(|(cfg, _)| *cfg == env_name),
-                "theme {:?} resolved to unknown env name: {env_name}",
-                theme_id
+                "theme {theme_id:?} resolved to unknown env name: {env_name}",
             );
         }
     }

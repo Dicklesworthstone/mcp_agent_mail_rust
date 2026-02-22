@@ -41,9 +41,7 @@ pub fn start(config: &Config) {
                     .worker_threads(1)
                     .build()
                     .expect("build retention runtime");
-                rt.block_on(async move {
-                    retention_loop(&config)
-                });
+                rt.block_on(async move { retention_loop(&config) });
             })
             .expect("failed to spawn retention/quota worker")
     });
@@ -314,7 +312,9 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> u64 {
     }
 
     let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(max_age_days.saturating_mul(86400)))
+        .checked_sub(std::time::Duration::from_secs(
+            max_age_days.saturating_mul(86400),
+        ))
         .unwrap_or(std::time::UNIX_EPOCH);
 
     let mut count = 0u64;

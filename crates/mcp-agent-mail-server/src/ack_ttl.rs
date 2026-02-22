@@ -45,9 +45,7 @@ pub fn start(config: &Config) {
                     .worker_threads(1)
                     .build()
                     .expect("build ack-ttl runtime");
-                rt.block_on(async move {
-                    ack_ttl_loop(&config)
-                });
+                rt.block_on(async move { ack_ttl_loop(&config) });
             })
             .expect("failed to spawn ACK TTL scan worker")
     });
@@ -117,7 +115,9 @@ fn ack_ttl_loop(config: &Config) {
 fn run_ack_ttl_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), String> {
     let cx = Cx::for_testing();
     let now = now_micros();
-    let ttl_us = i64::try_from(config.ack_ttl_seconds).unwrap_or(1800).saturating_mul(1_000_000);
+    let ttl_us = i64::try_from(config.ack_ttl_seconds)
+        .unwrap_or(1800)
+        .saturating_mul(1_000_000);
 
     // Get all unacknowledged messages.
     let rows = match block_on(async { list_unacknowledged_messages(&cx, pool).await }) {

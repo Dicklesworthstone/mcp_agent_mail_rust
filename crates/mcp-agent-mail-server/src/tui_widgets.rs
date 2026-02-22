@@ -2195,12 +2195,7 @@ impl AmbientEffectRenderer {
 
     /// Composite the already-rendered background effect onto the frame
     /// without re-running the expensive simulation.
-    pub fn render_cached(
-        &self,
-        area: Rect,
-        frame: &mut Frame,
-        mode: AmbientMode,
-    ) {
+    pub fn render_cached(&self, area: Rect, frame: &mut Frame, mode: AmbientMode) {
         if area.is_empty() || !mode.is_enabled() {
             return;
         }

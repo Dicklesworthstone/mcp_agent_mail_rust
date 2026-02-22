@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
@@ -51,6 +51,8 @@ const SHIMMER_WINDOW_MICROS: i64 = 500_000;
 const SHIMMER_MAX_ROWS: usize = 5;
 const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
 const COMMIT_REFRESH_EVERY_TICKS: u64 = 20;
+const COMMIT_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(15);
+const COMMIT_REFRESH_ACTIVE_GRACE: Duration = Duration::from_secs(2);
 const COMMIT_LIMIT_PER_PROJECT: usize = 200;
 const TIMELINE_PRESET_SCREEN_ID: &str = "timeline";
 const TIMELINE_SPLIT_GAP_THRESHOLD: u16 = 60;
@@ -692,8 +694,12 @@ pub struct TimelineScreen {
     commit_stats: CommitTimelineStats,
     /// Last tick when commit rows were refreshed from storage.
     last_commit_refresh_tick: u64,
+    /// Wall-clock start time of the most recent commit refresh launch.
+    last_commit_refresh_at: Option<Instant>,
     /// Receiver for background commit refresh results (non-blocking).
     commit_refresh_rx: Option<std::sync::mpsc::Receiver<CommitRefreshResult>>,
+    /// Last wall-clock instant this screen was visibly rendered.
+    last_visible_at: Cell<Option<Instant>>,
     /// Log viewer pane used when `view_mode == LogViewer`.
     log_viewer: RefCell<crate::console::LogPane>,
     /// Debounced preference persister (auto-saves dock layout to envfile).
@@ -736,7 +742,9 @@ impl TimelineScreen {
             commit_entries: Vec::new(),
             commit_stats: CommitTimelineStats::default(),
             last_commit_refresh_tick: 0,
+            last_commit_refresh_at: None,
             commit_refresh_rx: None,
+            last_visible_at: Cell::new(None),
             log_viewer: RefCell::new(crate::console::LogPane::new()),
             persister,
             filter_presets_path,
@@ -914,7 +922,22 @@ impl TimelineScreen {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn refresh_commit_entries(&mut self, tick_count: u64, state: &TuiSharedState) {
+        if !matches!(
+            self.view_mode,
+            TimelineViewMode::Commits | TimelineViewMode::Combined
+        ) {
+            return;
+        }
+        if self
+            .last_visible_at
+            .get()
+            .is_none_or(|last_seen| last_seen.elapsed() > COMMIT_REFRESH_ACTIVE_GRACE)
+        {
+            return;
+        }
+
         // Check for completed background refresh first.
         if let Some(ref rx) = self.commit_refresh_rx {
             match rx.try_recv() {
@@ -945,6 +968,12 @@ impl TimelineScreen {
         {
             return;
         }
+        if self
+            .last_commit_refresh_at
+            .is_some_and(|last_refresh| last_refresh.elapsed() < COMMIT_REFRESH_MIN_INTERVAL)
+        {
+            return;
+        }
         self.last_commit_refresh_tick = tick_count;
 
         let cfg = state.config_snapshot();
@@ -969,6 +998,7 @@ impl TimelineScreen {
         // Spawn the heavy git work on a background thread.
         let (tx, rx) = std::sync::mpsc::channel();
         let storage_root = cfg.storage_root;
+        self.last_commit_refresh_at = Some(Instant::now());
         std::thread::Builder::new()
             .name("timeline-commit-refresh".to_string())
             .spawn(move || {
@@ -1510,6 +1540,7 @@ impl MailScreen for TimelineScreen {
 
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        self.last_visible_at.set(Some(Instant::now()));
         self.last_area.set(area);
         let split = self.dock.split(area);
         let mut primary_area = split.primary;

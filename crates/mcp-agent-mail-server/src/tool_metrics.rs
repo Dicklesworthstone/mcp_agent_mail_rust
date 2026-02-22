@@ -66,9 +66,7 @@ pub fn start(config: &Config) {
                     .worker_threads(1)
                     .build()
                     .expect("build tool-metrics runtime");
-                rt.block_on(async move {
-                    metrics_loop(&config)
-                });
+                rt.block_on(async move { metrics_loop(&config) });
             })
             .expect("failed to spawn tool metrics emit worker")
     });

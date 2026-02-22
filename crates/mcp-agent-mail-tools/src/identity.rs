@@ -812,7 +812,8 @@ Choose a different name (or omit the name to auto-generate one)."
 /// Returns `true` if the policy is one of the valid values: auto, inline, file, none.
 #[must_use]
 pub fn is_valid_attachments_policy(policy: &str) -> bool {
-    ["auto", "inline", "file", "none"].contains(&policy)
+    let norm = policy.trim().to_ascii_lowercase();
+    ["auto", "inline", "file", "none"].contains(&norm.as_str())
 }
 
 /// Look up agent profile with optional recent commits.

@@ -1061,8 +1061,9 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 fn normalize_timestamp(ts: &str) -> String {
     // If it looks like a microsecond integer, convert to ISO-8601
     if let Ok(micros) = ts.parse::<i64>() {
-        let secs = micros / 1_000_000;
-        let nanos = ((micros % 1_000_000) * 1000) as u32;
+        let secs = micros.div_euclid(1_000_000);
+        let sub_micros = micros.rem_euclid(1_000_000);
+        let nanos = (sub_micros * 1000) as u32;
         if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
             return dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         }

@@ -1043,8 +1043,8 @@ pub enum FileReservationsCommand {
         /// TTL in seconds (default: 3600).
         #[arg(long, default_value_t = 3600)]
         ttl: i64,
-        /// Request exclusive lock (default: true).
-        #[arg(long, default_value_t = true)]
+        /// Request exclusive lock.
+        #[arg(long, default_value_t = false)]
         exclusive: bool,
         /// Request shared (non-exclusive) lock.
         #[arg(long, conflicts_with = "exclusive")]
@@ -1161,7 +1161,7 @@ pub enum ProjectsCommand {
     #[command(name = "mark-identity")]
     MarkIdentity {
         project_path: PathBuf,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = false)]
         commit: bool,
         #[arg(long = "no-commit", default_value_t = false)]
         no_commit: bool,
@@ -1175,7 +1175,7 @@ pub enum ProjectsCommand {
     Adopt {
         source: PathBuf,
         target: PathBuf,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = false)]
         dry_run: bool,
         #[arg(long, default_value_t = false)]
         apply: bool,
@@ -1633,13 +1633,13 @@ pub enum MacroCommand {
         #[arg(long, short = 't')]
         task: Option<String>,
         /// Register agent if not already exists.
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = false)]
         register: bool,
         /// Do not register agent if missing.
         #[arg(long = "no-register", conflicts_with = "register")]
         no_register: bool,
         /// Include example messages in thread summary.
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = false)]
         examples: bool,
         /// Exclude example messages.
         #[arg(long = "no-examples", conflicts_with = "examples")]
@@ -1673,7 +1673,7 @@ pub enum MacroCommand {
         #[arg(long, default_value_t = 3600)]
         ttl: i64,
         /// Request exclusive reservations.
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = false)]
         exclusive: bool,
         /// Request shared (non-exclusive) reservations.
         #[arg(long = "no-exclusive", conflicts_with = "exclusive")]

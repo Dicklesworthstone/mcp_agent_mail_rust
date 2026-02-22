@@ -92,13 +92,18 @@ pub const VALID_CONTACT_POLICIES: &[&str] = &["open", "auto", "contacts_only", "
 /// Normalize a contact policy string.
 ///
 /// Trims whitespace, lowercases, and returns the value if it matches a known
-/// policy. Unknown values silently default to `"auto"`.
+/// policy. Unknown values log a warning and default to `"auto"`.
 #[must_use]
 pub fn normalize_contact_policy(raw: &str) -> String {
     let norm = raw.trim().to_ascii_lowercase();
     if VALID_CONTACT_POLICIES.contains(&norm.as_str()) {
         norm
     } else {
+        tracing::warn!(
+            raw = raw,
+            "unknown contact policy {raw:?}, defaulting to \"auto\"; \
+             valid policies: {VALID_CONTACT_POLICIES:?}"
+        );
         "auto".to_string()
     }
 }
@@ -466,8 +471,7 @@ pub async fn list_contacts(
         }
     }
 
-    // Return simple array format matching Python
-    // Note: Python fixture expects null for updated_ts and expires_ts
+    // Return simple array format with actual timestamps from the database.
     let contacts: Vec<SimpleContactEntry> = outgoing_rows
         .into_iter()
         .map(|r| SimpleContactEntry {
@@ -477,8 +481,8 @@ pub async fn list_contacts(
                 .unwrap_or_else(|| format!("agent_{}", r.b_agent_id)),
             status: r.status,
             reason: r.reason,
-            updated_ts: None,
-            expires_ts: None,
+            updated_ts: Some(micros_to_iso(r.updated_ts)),
+            expires_ts: r.expires_ts.map(micros_to_iso),
         })
         .collect();
 

@@ -50,9 +50,7 @@ pub fn start(config: &Config) {
                     .worker_threads(1)
                     .build()
                     .expect("build cleanup runtime");
-                rt.block_on(async move {
-                    cleanup_loop(&config)
-                });
+                rt.block_on(async move { cleanup_loop(&config) });
             })
             .expect("failed to spawn file reservation cleanup worker")
     });
@@ -171,10 +169,12 @@ fn detect_and_release_stale(
     cx: &Cx,
     project_id: i64,
 ) -> Result<Vec<i64>, String> {
-    let inactivity_us =
-        i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(1800).saturating_mul(1_000_000);
-    let grace_us =
-        i64::try_from(config.file_reservation_activity_grace_seconds).unwrap_or(900).saturating_mul(1_000_000);
+    let inactivity_us = i64::try_from(config.file_reservation_inactivity_seconds)
+        .unwrap_or(1800)
+        .saturating_mul(1_000_000);
+    let grace_us = i64::try_from(config.file_reservation_activity_grace_seconds)
+        .unwrap_or(900)
+        .saturating_mul(1_000_000);
     let now = now_micros();
 
     // Get all unreleased reservations for this project.
