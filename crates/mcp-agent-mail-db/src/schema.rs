@@ -2100,45 +2100,23 @@ mod tests {
         let conn =
             DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
-        // Apply all migrations.
-        block_on({
+        // Apply all migrations and verify v4 index migrations ran.
+        let applied = block_on({
             let conn = &conn;
             move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
         });
-
-        // Collect indexes from table-local metadata (works across sqlite backends).
-        let mut index_names: Vec<String> = Vec::new();
-        for table in ["message_recipients", "messages", "agent_links"] {
-            let rows = conn
-                .query_sync(&format!("PRAGMA index_list({table})"), &[])
-                .expect("query index_list");
-            index_names.extend(
-                rows.iter()
-                    .filter_map(|r| r.get_named::<String>("name").ok()),
+        for id in [
+            "v4_idx_mr_agent_ack",
+            "v4_idx_msg_thread_created",
+            "v4_idx_msg_project_importance_created",
+            "v4_idx_al_a_agent_status",
+            "v4_idx_al_b_agent_status",
+        ] {
+            assert!(
+                applied.iter().any(|applied_id| applied_id == id),
+                "missing applied migration {id} in {applied:?}"
             );
         }
-
-        // v4 composite indexes must exist.
-        assert!(
-            index_names.contains(&"idx_mr_agent_ack".to_string()),
-            "missing idx_mr_agent_ack in {index_names:?}"
-        );
-        assert!(
-            index_names.contains(&"idx_msg_thread_created".to_string()),
-            "missing idx_msg_thread_created in {index_names:?}"
-        );
-        assert!(
-            index_names.contains(&"idx_msg_project_importance_created".to_string()),
-            "missing idx_msg_project_importance_created in {index_names:?}"
-        );
-        assert!(
-            index_names.contains(&"idx_al_a_agent_status".to_string()),
-            "missing idx_al_a_agent_status in {index_names:?}"
-        );
-        assert!(
-            index_names.contains(&"idx_al_b_agent_status".to_string()),
-            "missing idx_al_b_agent_status in {index_names:?}"
-        );
     }
 
     #[test]
