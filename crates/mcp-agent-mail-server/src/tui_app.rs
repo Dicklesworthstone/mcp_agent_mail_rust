@@ -3400,10 +3400,19 @@ impl Model for MailAppModel {
                         KeyCode::Enter => {
                             // Dismiss the focused toast.
                             if let Some(idx) = self.toast_focus_index {
-                                let vis = self.notifications.visible();
-                                if let Some(toast) = vis.get(idx) {
-                                    let id = toast.id;
+                                let dismissed_id = {
+                                    let visible = self.notifications.visible_mut();
+                                    visible.get_mut(idx).map(|toast| {
+                                        let id = toast.id;
+                                        // In focus mode, Enter should dismiss immediately so
+                                        // navigation/index clamping stays deterministic.
+                                        toast.dismiss_immediately();
+                                        id
+                                    })
+                                };
+                                if let Some(id) = dismissed_id {
                                     self.notifications.dismiss(id);
+                                    let _ = self.notifications.tick(Duration::ZERO);
                                 }
                                 // Clamp index after dismissal.
                                 let count = self.notifications.visible_count();
@@ -9502,10 +9511,10 @@ mod tests {
         model.notifications.tick(Duration::from_millis(16));
         model.toast_focus_index = Some(2);
 
-        // Dismiss the focused toast (index 2 = last one).
-        let vis = model.notifications.visible();
-        let id = vis[2].id;
-        model.notifications.dismiss(id);
+        // Dismiss the focused toast immediately (focus-mode Enter behavior).
+        if let Some(toast) = model.notifications.visible_mut().get_mut(2) {
+            toast.dismiss_immediately();
+        }
         model.notifications.tick(Duration::from_millis(16));
 
         let count = model.notifications.visible_count();
@@ -9525,10 +9534,10 @@ mod tests {
         model.notifications.tick(Duration::from_millis(16));
         model.toast_focus_index = Some(0);
 
-        // Dismiss the only toast.
-        let vis = model.notifications.visible();
-        let id = vis[0].id;
-        model.notifications.dismiss(id);
+        // Dismiss the only toast immediately (focus-mode Enter behavior).
+        if let Some(toast) = model.notifications.visible_mut().get_mut(0) {
+            toast.dismiss_immediately();
+        }
         model.notifications.tick(Duration::from_millis(16));
 
         let count = model.notifications.visible_count();

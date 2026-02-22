@@ -515,7 +515,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         Ok(_) => {
             // Integrity check passed — create a proactive backup so future
             // corruption has something to restore from.
-            if let Err(e) = pool.create_proactive_backup(Duration::from_secs(3600)) {
+            if let Err(e) = pool.create_proactive_backup(Duration::from_hours(1)) {
                 tracing::warn!(error = %e, "proactive backup failed (non-fatal)");
             }
             ProbeResult::Ok { name: "integrity" }
@@ -538,15 +538,12 @@ fn probe_integrity(config: &Config) -> ProbeResult {
 /// 2. Reconstruct from the Git archive (recovers messages + agents)
 /// 3. Reinitialize an empty database (last resort)
 fn attempt_probe_recovery(config: &Config) -> ProbeResult {
-    let db_path = match sqlite_file_path_from_database_url(&config.database_url) {
-        Some(p) => p,
-        None => {
-            return ProbeResult::Fail(ProbeFailure {
-                name: "integrity",
-                problem: "Cannot determine database file path for recovery".into(),
-                fix: "Check DATABASE_URL format".into(),
-            });
-        }
+    let Some(db_path) = sqlite_file_path_from_database_url(&config.database_url) else {
+        return ProbeResult::Fail(ProbeFailure {
+            name: "integrity",
+            problem: "Cannot determine database file path for recovery".into(),
+            fix: "Check DATABASE_URL format".into(),
+        });
     };
 
     let storage_root = std::path::Path::new(&config.storage_root);
@@ -567,9 +564,7 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
         }
         Err(e) => ProbeResult::Fail(ProbeFailure {
             name: "integrity",
-            problem: format!(
-                "SQLite corruption detected and automatic recovery failed: {e}"
-            ),
+            problem: format!("SQLite corruption detected and automatic recovery failed: {e}"),
             fix: format!(
                 "Run `am doctor repair` to attempt manual recovery, or \
                  `am doctor reconstruct` to rebuild the database from the Git archive. \
@@ -1060,20 +1055,28 @@ mod tests {
 
     #[test]
     fn probe_port_passes_when_free() {
-        // Find an available port
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
-        let port = listener.local_addr().expect("get local addr").port();
-        drop(listener);
-
         let mut config = default_config();
         config.http_host = "127.0.0.1".into();
-        config.http_port = port;
+        let mut last_failure: Option<(u16, ProbeResult)> = None;
 
-        let result = probe_port(&config);
-        assert!(
-            matches!(result, ProbeResult::Ok { .. }),
-            "expected Ok, got {result:?}"
-        );
+        // Retry a handful of ephemeral ports to avoid rare race collisions where
+        // another process binds the released port between probe setup and check.
+        for _ in 0..16 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+            let port = listener.local_addr().expect("get local addr").port();
+            drop(listener);
+
+            config.http_port = port;
+            let result = probe_port(&config);
+            if matches!(result, ProbeResult::Ok { .. }) {
+                return;
+            }
+            last_failure = Some((port, result));
+        }
+
+        if let Some((port, result)) = last_failure {
+            panic!("expected Ok after retries, last port={port}, got {result:?}");
+        }
     }
 
     #[test]
@@ -1139,5 +1142,96 @@ mod tests {
         );
 
         server_thread.join().expect("join test server");
+    }
+
+    // -----------------------------------------------------------------------
+    // probe_integrity tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_integrity_skipped_when_disabled() {
+        let mut config = default_config();
+        config.integrity_check_on_startup = false;
+        let result = probe_integrity(&config);
+        assert!(matches!(result, ProbeResult::Ok { .. }));
+    }
+
+    #[test]
+    fn probe_integrity_passes_for_memory_db() {
+        let mut config = default_config();
+        config.database_url = "sqlite:///:memory:".into();
+        let result = probe_integrity(&config);
+        assert!(matches!(result, ProbeResult::Ok { .. }));
+    }
+
+    #[test]
+    fn probe_integrity_recovers_corrupt_db_with_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt.db");
+        let storage_root = dir.path().join("storage");
+
+        // Write corrupt data.
+        std::fs::write(&db_path, b"not-a-sqlite-db").unwrap();
+
+        // Create archive with a project.
+        let proj = storage_root.join("projects").join("test");
+        let agent_dir = proj.join("agents").join("RedFox");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"RedFox","role":"Tester","model":"test","registered_ts":"2026-01-01T00:00:00"}"#,
+        )
+        .unwrap();
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { .. }),
+            "probe_integrity should auto-recover corrupt DB; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_integrity_recovers_corrupt_db_without_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt_no_archive.db");
+
+        // Write corrupt data.
+        std::fs::write(&db_path, b"not-a-sqlite-db").unwrap();
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        // storage_root is default (nonexistent) so no archive is available.
+        config.storage_root = dir.path().join("no-storage");
+
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { .. }),
+            "probe_integrity should reinit from scratch when no archive; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_integrity_passes_healthy_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.db");
+
+        // Create a valid SQLite DB.
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw("CREATE TABLE t(x TEXT)").unwrap();
+        drop(conn);
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { .. }),
+            "healthy DB should pass probe_integrity; got: {result:?}"
+        );
     }
 }

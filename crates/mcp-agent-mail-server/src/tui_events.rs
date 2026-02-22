@@ -1500,12 +1500,12 @@ impl TimelineRow {
         let source = event.source();
         let ts_micros = event.timestamp_micros();
 
-        // Format timestamp as HH:MM:SS.mmm
-        let secs = ts_micros / 1_000_000;
-        let millis = (ts_micros % 1_000_000) / 1000;
-        let hours = (secs / 3600) % 24;
-        let mins = (secs / 60) % 60;
-        let s = secs % 60;
+        // Format timestamp as HH:MM:SS.mmm (Euclidean for negative safety)
+        let secs = ts_micros.div_euclid(1_000_000);
+        let millis = ts_micros.rem_euclid(1_000_000) / 1000;
+        let hours = secs.rem_euclid(86400) / 3600;
+        let mins = secs.rem_euclid(3600) / 60;
+        let s = secs.rem_euclid(60);
         let timestamp = format!("{hours:02}:{mins:02}:{s:02}.{millis:03}");
 
         // Icon based on event kind

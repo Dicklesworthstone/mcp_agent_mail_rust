@@ -6021,12 +6021,12 @@ mod tests {
         // Allow some tolerance for test execution time
         // Note: asupersync::time::Instant opaque type doesn't expose raw nanoseconds directly in all versions,
         // but duration_since works.
-        let remaining = deadline.duration_since(check_time);
-        let diff_secs = remaining;
+        let remaining_nanos = deadline.duration_since(check_time);
+        let remaining_secs = remaining_nanos / 1_000_000_000;
 
         assert!(
-            (29..=31).contains(&diff_secs),
-            "Deadline should be ~30 seconds in the future, got {diff_secs}s",
+            (29..=31).contains(&remaining_secs),
+            "Deadline should be ~30 seconds in the future, got {remaining_nanos}ns (~{remaining_secs}s)",
         );
     }
 

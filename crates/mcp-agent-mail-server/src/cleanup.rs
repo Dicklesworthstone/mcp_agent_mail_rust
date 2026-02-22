@@ -356,7 +356,7 @@ fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf>
 
 /// Record cleanup releases to logs (best-effort).
 fn write_cleanup_artifacts(
-    _config: &Config,
+    config: &Config,
     pool: &DbPool,
     cx: &Cx,
     project_id: i64,
@@ -368,10 +368,50 @@ fn write_cleanup_artifacts(
         return Err("project lookup failed".into());
     };
 
+    let Outcome::Ok(all_reservations) =
+        block_on(async { queries::list_file_reservations(cx, pool, project_id, false).await })
+    else {
+        return Err("failed to list reservations for artifact generation".into());
+    };
+
+    let mut res_jsons = Vec::new();
+    for row in all_reservations {
+        if let Some(id) = row.id {
+            if released_ids.contains(&id) {
+                // We need the agent name, which isn't in FileReservationRow, so we look it up
+                let agent_name = match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {
+                    Outcome::Ok(agent) => agent.name,
+                    _ => format!("agent_{}", row.agent_id),
+                };
+                
+                res_jsons.push(serde_json::json!({
+                    "id": id,
+                    "agent": agent_name,
+                    "path_pattern": row.path_pattern,
+                    "exclusive": row.exclusive != 0,
+                    "reason": row.reason,
+                    "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
+                    "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
+                    "released_ts": mcp_agent_mail_db::micros_to_iso(row.released_ts.unwrap_or(mcp_agent_mail_db::now_micros())),
+                }));
+            }
+        }
+    }
+
+    if !res_jsons.is_empty() {
+        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+            project_slug: project.slug.clone(),
+            config: config.clone(),
+            reservations: res_jsons,
+        };
+        // Best effort
+        let _ = mcp_agent_mail_storage::wbq_enqueue(op);
+    }
+
     info!(
         project = %project.slug,
         released_count = released_ids.len(),
-        "cleanup: released expired/stale reservations"
+        "cleanup: released expired/stale reservations and enqueued archive updates"
     );
 
     Ok(())

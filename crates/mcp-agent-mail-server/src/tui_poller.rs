@@ -7,6 +7,7 @@
 //! on data changes plus periodic heartbeat intervals.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -158,6 +159,14 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn count_active_reservations(&self, now: i64) -> u64 {
+        // Keep count semantics in lock-step with `is_active_reservation_row`.
+        // Legacy databases may store active sentinels in `released_ts` as text
+        // (`"0"`, `"0.0"`, `"null"`, etc.), which SQL-only `IS NULL` checks miss.
+        // The Rust row scanner is authoritative and already used for snapshots.
+        self.count_active_reservations_fallback_scan(now)
+    }
+
+    fn count_active_reservations_fallback_scan(&self, now: i64) -> u64 {
         let Ok(rows) = self.conn.query_sync(
             "SELECT expires_ts AS raw_expires_ts, released_ts AS raw_released_ts FROM file_reservations",
             &[],
@@ -166,7 +175,7 @@ impl<'a> DbStatQueryBatcher<'a> {
         };
         #[cfg(test)]
         if let Some(first) = rows.first() {
-            debug_row_shape("count_active_reservations", first);
+            debug_row_shape("count_active_reservations_fallback_scan", first);
         }
         u64::try_from(
             rows.into_iter()
@@ -366,7 +375,19 @@ fn open_sync_connection(database_url: &str) -> Option<DbConn> {
         database_url: database_url.to_string(),
         ..Default::default()
     };
-    let path = cfg.sqlite_path().ok()?;
+    let mut path = cfg.sqlite_path().ok()?;
+    let parsed = Path::new(&path);
+    if !parsed.is_absolute() && !path.starts_with("./") && !path.starts_with("../") {
+        let absolute_candidate = Path::new("/").join(parsed);
+        if !parsed.exists() && absolute_candidate.exists() {
+            tracing::warn!(
+                relative_path = %parsed.display(),
+                absolute_candidate = %absolute_candidate.display(),
+                "detected malformed sqlite URL path; using absolute fallback"
+            );
+            path = absolute_candidate.to_string_lossy().into_owned();
+        }
+    }
     DbConn::open_file(&path).ok()
 }
 

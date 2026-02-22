@@ -2315,19 +2315,37 @@ impl AmbientEffectRenderer {
             return;
         }
 
+        let cols_per_cell = usize::from(self.resolution_mode.cols_per_cell().max(1));
+        let rows_per_cell = usize::from(self.resolution_mode.rows_per_cell().max(1));
+        let max_cells_w = usize::from(subpixel_width) / cols_per_cell;
+        let max_cells_h = usize::from(subpixel_height).div_ceil(rows_per_cell);
+        let draw_width = area
+            .width
+            .min(u16::try_from(max_cells_w).unwrap_or(u16::MAX));
+        let draw_height = area
+            .height
+            .min(u16::try_from(max_cells_h).unwrap_or(u16::MAX));
+        if draw_width == 0 || draw_height == 0 {
+            return;
+        }
+
         let stride = usize::from(subpixel_width);
         let max_sub_y = usize::from(subpixel_height.saturating_sub(1));
 
-        for dy in 0..area.height {
-            let top_sub_y = usize::from(dy) * usize::from(self.resolution_mode.rows_per_cell());
-            let bottom_sub_y = (top_sub_y + 1).min(max_sub_y);
+        for dy in 0..draw_height {
+            let top_sub_y = usize::from(dy) * rows_per_cell;
+            let bottom_sub_y = (top_sub_y + rows_per_cell.saturating_sub(1)).min(max_sub_y);
             let top_row = top_sub_y * stride;
             let bottom_row = bottom_sub_y * stride;
 
-            for dx in 0..area.width {
-                let sub_x = usize::from(dx);
-                let top = self.effect_buffer[top_row + sub_x];
-                let bottom = self.effect_buffer[bottom_row + sub_x];
+            for dx in 0..draw_width {
+                let sub_x = usize::from(dx) * cols_per_cell;
+                let Some(top) = self.effect_buffer.get(top_row + sub_x).copied() else {
+                    continue;
+                };
+                let Some(bottom) = self.effect_buffer.get(bottom_row + sub_x).copied() else {
+                    continue;
+                };
                 let merged = average_rgb(top, bottom);
                 let overlay = merged.with_opacity(opacity);
                 if overlay.a() == 0 {

@@ -342,7 +342,7 @@ fn count_old_files_recursive(dir: &Path, cutoff: std::time::SystemTime) -> u64 {
             }
 
             let p = entry.path();
-            if ft.is_file() {
+            if ft.is_file() && p.extension().is_some_and(|e| e == "md") {
                 if let Ok(metadata) = p.metadata()
                     && let Ok(modified) = metadata.modified()
                     && modified < cutoff

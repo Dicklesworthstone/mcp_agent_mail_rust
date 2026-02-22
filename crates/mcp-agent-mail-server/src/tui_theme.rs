@@ -1972,6 +1972,83 @@ pub fn lerp_color(a: PackedRgba, b: PackedRgba, t: f32) -> PackedRgba {
     PackedRgba::rgb(r, g, bl)
 }
 
+/// Minimum contrast ratio for body/status/help text in theme gating.
+pub const MIN_THEME_TEXT_CONTRAST: f64 = 3.0;
+/// Minimum contrast ratio for accent/key-hint text in theme gating.
+pub const MIN_THEME_ACCENT_CONTRAST: f64 = 2.2;
+
+/// Per-theme contrast metrics used by tests and harnesses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemeContrastMetric {
+    pub theme: ThemeId,
+    pub tab_active: f64,
+    pub tab_inactive: f64,
+    pub status: f64,
+    pub help: f64,
+    pub key_hint: f64,
+}
+
+impl ThemeContrastMetric {
+    /// Format a stable metrics line for diagnostics.
+    #[must_use]
+    pub fn log_line(self) -> String {
+        format!(
+            "theme={:?} tab_active={:.2} tab_inactive={:.2} status={:.2} help={:.2} key_hint={:.2}",
+            self.theme, self.tab_active, self.tab_inactive, self.status, self.help, self.key_hint
+        )
+    }
+
+    /// Return failing contrast dimensions with observed + minimum values.
+    #[must_use]
+    pub fn failing_dimensions(
+        self,
+        min_text: f64,
+        min_accent: f64,
+    ) -> Vec<(&'static str, f64, f64)> {
+        let mut failing = Vec::new();
+        if self.tab_active < min_text {
+            failing.push(("tab_active", self.tab_active, min_text));
+        }
+        if self.tab_inactive < min_text {
+            failing.push(("tab_inactive", self.tab_inactive, min_text));
+        }
+        if self.status < min_text {
+            failing.push(("status", self.status, min_text));
+        }
+        if self.help < min_text {
+            failing.push(("help", self.help, min_text));
+        }
+        if self.key_hint < min_accent {
+            failing.push(("key_hint", self.key_hint, min_accent));
+        }
+        failing
+    }
+}
+
+/// Compute contrast metrics for a single named theme.
+#[must_use]
+pub fn theme_contrast_metric(theme: ThemeId) -> ThemeContrastMetric {
+    let p = TuiThemePalette::for_theme(theme);
+    ThemeContrastMetric {
+        theme,
+        tab_active: contrast_ratio(p.tab_active_fg, p.tab_active_bg),
+        tab_inactive: contrast_ratio(p.tab_inactive_fg, p.tab_inactive_bg),
+        status: contrast_ratio(p.status_fg, p.status_bg),
+        help: contrast_ratio(p.help_fg, p.help_bg),
+        key_hint: contrast_ratio(p.tab_key_fg, p.status_bg),
+    }
+}
+
+/// Compute contrast metrics for every named theme.
+#[must_use]
+pub fn collect_theme_contrast_metrics() -> Vec<ThemeContrastMetric> {
+    ThemeId::ALL
+        .iter()
+        .copied()
+        .map(theme_contrast_metric)
+        .collect()
+}
+
 #[allow(clippy::suboptimal_flops)]
 fn relative_luminance(color: PackedRgba) -> f64 {
     fn to_linear(component: u8) -> f64 {
@@ -2278,45 +2355,46 @@ mod tests {
 
     #[test]
     fn theme_palettes_meet_min_contrast_thresholds() {
-        // Terminal UIs can tolerate slightly lower contrast than strict WCAG AA in practice,
-        // but we still enforce a floor to avoid unreadable themes.
-        const MIN_TEXT: f64 = 3.0;
-        const MIN_ACCENT: f64 = 2.2;
-
         for &id in &ThemeId::ALL {
             let _guard = ScopedThemeLock::new(id);
-            let p = TuiThemePalette::for_theme(id);
-
-            let tab_active = contrast_ratio(p.tab_active_fg, p.tab_active_bg);
-            let tab_inactive = contrast_ratio(p.tab_inactive_fg, p.tab_inactive_bg);
-            let status = contrast_ratio(p.status_fg, p.status_bg);
-            let help = contrast_ratio(p.help_fg, p.help_bg);
-            let key_hint = contrast_ratio(p.tab_key_fg, p.status_bg);
-
+            let metric = theme_contrast_metric(id);
             // These show up in E2E runs via `cargo test ... -- --nocapture`.
-            eprintln!(
-                "theme={id:?} tab_active={tab_active:.2} tab_inactive={tab_inactive:.2} status={status:.2} help={help:.2} key_hint={key_hint:.2}"
-            );
+            eprintln!("{}", metric.log_line());
 
             assert!(
-                tab_active >= MIN_TEXT,
-                "theme {id:?}: tab_active contrast {tab_active:.2} < {MIN_TEXT:.1}"
+                metric.tab_active >= MIN_THEME_TEXT_CONTRAST,
+                "theme {:?}: tab_active contrast {:.2} < {:.1}",
+                metric.theme,
+                metric.tab_active,
+                MIN_THEME_TEXT_CONTRAST
             );
             assert!(
-                tab_inactive >= MIN_TEXT,
-                "theme {id:?}: tab_inactive contrast {tab_inactive:.2} < {MIN_TEXT:.1}"
+                metric.tab_inactive >= MIN_THEME_TEXT_CONTRAST,
+                "theme {:?}: tab_inactive contrast {:.2} < {:.1}",
+                metric.theme,
+                metric.tab_inactive,
+                MIN_THEME_TEXT_CONTRAST
             );
             assert!(
-                status >= MIN_TEXT,
-                "theme {id:?}: status contrast {status:.2} < {MIN_TEXT:.1}"
+                metric.status >= MIN_THEME_TEXT_CONTRAST,
+                "theme {:?}: status contrast {:.2} < {:.1}",
+                metric.theme,
+                metric.status,
+                MIN_THEME_TEXT_CONTRAST
             );
             assert!(
-                help >= MIN_TEXT,
-                "theme {id:?}: help contrast {help:.2} < {MIN_TEXT:.1}"
+                metric.help >= MIN_THEME_TEXT_CONTRAST,
+                "theme {:?}: help contrast {:.2} < {:.1}",
+                metric.theme,
+                metric.help,
+                MIN_THEME_TEXT_CONTRAST
             );
             assert!(
-                key_hint >= MIN_ACCENT,
-                "theme {id:?}: key_hint contrast {key_hint:.2} < {MIN_ACCENT:.1}"
+                metric.key_hint >= MIN_THEME_ACCENT_CONTRAST,
+                "theme {:?}: key_hint contrast {:.2} < {:.1}",
+                metric.theme,
+                metric.key_hint,
+                MIN_THEME_ACCENT_CONTRAST
             );
         }
     }

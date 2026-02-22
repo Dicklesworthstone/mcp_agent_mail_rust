@@ -5770,12 +5770,13 @@ mod tests {
 
     #[test]
     fn truncate_multibyte_utf8() {
-        // "café" — 'é' is 2 bytes (0xC3 0xA9); byte offsets: c=0, a=1, f=2, é=3..4
-        assert_eq!(truncate("café", 4), "caf"); // byte 4 is mid-'é', backs up to 3
-        assert_eq!(truncate("café", 5), "café"); // all 5 bytes fit
-        // Emoji: '🎉' is 4 bytes; "hi🎉bye" = h(0) i(1) 🎉(2..5) b(6) y(7) e(8)
-        assert_eq!(truncate("hi🎉bye", 3), "hi"); // byte 3 mid-emoji, backs up to 2
-        assert_eq!(truncate("hi🎉bye", 6), "hi🎉"); // byte 6 = start of 'b'
+        // Dashboard truncation is display-width based and must stay UTF-8 safe.
+        assert_eq!(truncate("café", 3), "caf");
+        assert_eq!(truncate("café", 4), "café");
+        // "🎉" is double-width in terminals.
+        assert_eq!(truncate("hi🎉bye", 3), "hi");
+        assert_eq!(truncate("hi🎉bye", 4), "hi🎉");
+        assert_eq!(truncate("hi🎉bye", 6), "hi🎉by");
     }
 
     #[test]
