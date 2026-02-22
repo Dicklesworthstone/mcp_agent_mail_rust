@@ -1471,6 +1471,22 @@ pub enum DoctorCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Reconstruct the database from the Git archive.
+    ///
+    /// Walks all project archives under STORAGE_ROOT and rebuilds the SQLite
+    /// database from the archived messages and agent profiles. Use this when
+    /// the database is corrupt and no healthy backup exists.
+    Reconstruct {
+        /// Preview what would be recovered without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Auto-confirm (skip interactive prompt).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Output JSON (shorthand for machine-readable output).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2351,7 +2367,7 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 "Static export complete: {} files, {} bytes, hash: {}",
                 manifest.file_count,
                 manifest.total_bytes,
-                &manifest.content_hash[..12]
+                &manifest.content_hash[..12.min(manifest.content_hash.len())]
             );
             ftui_runtime::ftui_println!("Output: {output_display}");
             Ok(())
@@ -2795,6 +2811,11 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             dry_run,
             yes,
         } => handle_doctor_restore(backup_path, dry_run, yes),
+        DoctorCommand::Reconstruct {
+            dry_run,
+            yes,
+            json,
+        } => handle_doctor_reconstruct(dry_run, yes, json),
     }
 }
 
@@ -4532,7 +4553,7 @@ fn handle_file_reservations_with_conn(
         }
         FileReservationsCommand::Soon { project, minutes } => {
             let minutes = minutes.unwrap_or(30);
-            let threshold_us = now_us + minutes * 60 * 1_000_000;
+            let threshold_us = now_us.saturating_add(minutes.saturating_mul(60_000_000));
             let rows = conn
                 .query_sync(
                     "SELECT fr.id, fr.path_pattern, fr.expires_ts, a.name AS agent_name \
@@ -20788,6 +20809,209 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, _yes: bool) -> Cli
     std::fs::copy(&backup_path, &dest_path)?;
     ftui_runtime::ftui_println!("Database restored from backup.");
     Ok(())
+}
+
+fn handle_doctor_reconstruct(dry_run: bool, _yes: bool, json: bool) -> CliResult<()> {
+    handle_doctor_reconstruct_with(None, None, dry_run, json)
+}
+
+fn handle_doctor_reconstruct_with(
+    db_path_override: Option<&Path>,
+    storage_root_override: Option<&Path>,
+    dry_run: bool,
+    json: bool,
+) -> CliResult<()> {
+    let config = Config::from_env();
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+
+    let storage_root = storage_root_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.storage_root.clone());
+    let db_path = match db_path_override {
+        Some(p) => p.to_path_buf(),
+        None => cfg
+            .sqlite_path()
+            .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?,
+    };
+
+    if !storage_root.is_dir() {
+        return Err(CliError::InvalidArgument(format!(
+            "storage root does not exist: {}",
+            storage_root.display()
+        )));
+    }
+
+    let projects_dir = storage_root.join("projects");
+    if !projects_dir.is_dir() {
+        if json {
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::json!({
+                    "status": "skip",
+                    "reason": "no projects directory found",
+                    "storage_root": storage_root.display().to_string()
+                })
+            );
+        } else {
+            ftui_runtime::ftui_println!(
+                "No projects directory found at {}. Nothing to reconstruct.",
+                projects_dir.display()
+            );
+        }
+        return Ok(());
+    }
+
+    if dry_run {
+        // Walk the archive to report what would be recovered, without writing.
+        ftui_runtime::ftui_println!("Dry run — scanning archive at {}", storage_root.display());
+        let stats = scan_archive_stats(&storage_root);
+        if json {
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::json!({
+                    "status": "dry_run",
+                    "db_path": db_path.display().to_string(),
+                    "storage_root": storage_root.display().to_string(),
+                    "would_recover": {
+                        "projects": stats.projects,
+                        "agents": stats.agents,
+                        "message_files": stats.message_files,
+                    }
+                })
+            );
+        } else {
+            ftui_runtime::ftui_println!("Would recover from archive:");
+            ftui_runtime::ftui_println!("  Projects:      {}", stats.projects);
+            ftui_runtime::ftui_println!("  Agents:        {}", stats.agents);
+            ftui_runtime::ftui_println!("  Message files: {}", stats.message_files);
+            ftui_runtime::ftui_println!("  Database path: {}", db_path.display());
+            ftui_runtime::ftui_println!("No changes made.");
+        }
+        return Ok(());
+    }
+
+    // Rename the corrupt DB out of the way (if it exists).
+    if db_path.exists() {
+        let quarantine = db_path.with_extension("corrupt");
+        ftui_runtime::ftui_println!(
+            "Moving corrupt database to {}",
+            quarantine.display()
+        );
+        std::fs::rename(&db_path, &quarantine)?;
+        // Also move WAL/SHM if present.
+        for ext in &["wal", "shm"] {
+            let aux = db_path.with_extension(format!("sqlite3-{ext}"));
+            if aux.exists() {
+                let _ = std::fs::remove_file(&aux);
+            }
+        }
+    }
+
+    ftui_runtime::ftui_println!(
+        "Reconstructing database from archive at {}",
+        storage_root.display()
+    );
+
+    let stats = mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
+        .map_err(|e| CliError::Other(format!("reconstruction failed: {e}")))?;
+
+    if json {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "db_path": db_path.display().to_string(),
+                "recovered": {
+                    "projects": stats.projects,
+                    "agents": stats.agents,
+                    "messages": stats.messages,
+                    "recipients": stats.recipients,
+                    "parse_errors": stats.parse_errors,
+                },
+                "warnings": stats.warnings,
+            })
+        );
+    } else {
+        ftui_runtime::ftui_println!("Reconstruction complete: {stats}");
+        if !stats.warnings.is_empty() {
+            ftui_runtime::ftui_println!("Warnings:");
+            for w in &stats.warnings {
+                ftui_runtime::ftui_println!("  - {w}");
+            }
+        }
+        if stats.parse_errors > 0 {
+            ftui_runtime::ftui_println!(
+                "Note: {} archive file(s) could not be parsed and were skipped.",
+                stats.parse_errors
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Quick archive stats for dry-run mode (no DB writes).
+struct ArchiveScanStats {
+    projects: usize,
+    agents: usize,
+    message_files: usize,
+}
+
+fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
+    let mut stats = ArchiveScanStats {
+        projects: 0,
+        agents: 0,
+        message_files: 0,
+    };
+
+    let projects_dir = storage_root.join("projects");
+    let entries = match std::fs::read_dir(&projects_dir) {
+        Ok(e) => e,
+        Err(_) => return stats,
+    };
+
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        stats.projects += 1;
+        let project_dir = entry.path();
+
+        // Count agents
+        let agents_dir = project_dir.join("agents");
+        if agents_dir.is_dir() {
+            if let Ok(agent_entries) = std::fs::read_dir(&agents_dir) {
+                for ae in agent_entries.flatten() {
+                    if ae.path().join("profile.json").exists() {
+                        stats.agents += 1;
+                    }
+                }
+            }
+        }
+
+        // Count message files
+        let messages_dir = project_dir.join("messages");
+        if messages_dir.is_dir() {
+            count_md_files_recursive(&messages_dir, &mut stats.message_files);
+        }
+    }
+
+    stats
+}
+
+fn count_md_files_recursive(dir: &Path, count: &mut usize) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count_md_files_recursive(&path, count);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            *count += 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

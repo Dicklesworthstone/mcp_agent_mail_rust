@@ -187,7 +187,7 @@ pub fn bundle_attachments(
                             "source is not a regular file",
                         ));
                     }
-                    let file_size = metadata.len() as usize;
+                    let file_size: usize = metadata.len().try_into().unwrap_or(usize::MAX);
 
                     if file_size <= inline_threshold {
                         let content = std::fs::read(source)?;
@@ -590,9 +590,9 @@ fn resolve_attachment_path(
     let candidate = root.join(path);
     let canonical = candidate.canonicalize().ok()?;
     if !canonical.starts_with(&root) {
-        if allow_absolute_paths {
-            return Some(canonical);
-        }
+        // Relative paths that escape root are always rejected, even when
+        // allow_absolute_paths is true (that flag only governs explicitly
+        // absolute input paths).
         return None;
     }
     Some(canonical)

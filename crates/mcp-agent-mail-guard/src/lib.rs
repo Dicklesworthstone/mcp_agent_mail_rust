@@ -447,7 +447,7 @@ def get_active_reservations():
             "FROM file_reservations fr "
             "JOIN agents a ON a.id = fr.agent_id "
             "JOIN projects p ON p.id = fr.project_id "
-            "WHERE fr.exclusive = 1 AND (fr.released_ts IS NULL OR fr.released_ts = 0 OR fr.released_ts = '0' OR fr.released_ts = '0.0' OR fr.released_ts = 'null') "
+            "WHERE fr.exclusive = 1 AND (fr.released_ts IS NULL OR fr.released_ts = 0) "
             "AND fr.expires_ts > ? AND (p.human_key = ? OR p.slug = ?)",
             (now_micros, PROJECT, PROJECT),
         ).fetchall()
