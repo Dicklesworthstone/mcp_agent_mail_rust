@@ -1274,38 +1274,7 @@ fn build_outbox_entries(
     let now_us = mcp_agent_mail_db::now_micros();
     let rows = conn
         .query_sync(
-            "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md,
-                    COALESCE(
-                        (
-                            SELECT SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END)
-                            FROM message_recipients mr
-                            WHERE mr.message_id = m.id
-                        ),
-                        0
-                    ) AS acked_count,
-                    COALESCE(
-                        (
-                            SELECT COUNT(*)
-                            FROM message_recipients mr
-                            WHERE mr.message_id = m.id
-                        ),
-                        0
-                    ) AS recipient_count,
-                    COALESCE(
-                        (
-                            SELECT GROUP_CONCAT(a.name)
-                            FROM message_recipients mr
-                            JOIN agents a ON a.id = mr.agent_id
-                            WHERE mr.message_id = m.id AND mr.kind = 'to'
-                        ),
-                        (
-                            SELECT GROUP_CONCAT(a.name)
-                            FROM message_recipients mr
-                            JOIN agents a ON a.id = mr.agent_id
-                            WHERE mr.message_id = m.id
-                        ),
-                        ''
-                    ) AS recipient_names
+            "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md
              FROM messages m
              WHERE m.sender_id = ? AND m.project_id = ?
              ORDER BY m.created_ts DESC
@@ -1326,21 +1295,62 @@ fn build_outbox_entries(
         let importance: String = row.get_named("importance").unwrap_or_default();
         let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
-        let acked_count: i64 = row.get_named("acked_count").unwrap_or(0);
-        let recipient_count: i64 = row.get_named("recipient_count").unwrap_or(0);
-        let recipient_names = row
-            .get_named::<String>("recipient_names")
-            .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|segment| !segment.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+        let ack_rows = conn
+            .query_sync(
+                "SELECT mr.id
+                 FROM message_recipients mr
+                 WHERE mr.message_id = ? AND mr.ack_ts IS NOT NULL",
+                &[Value::BigInt(id)],
+            )
+            .map_err(|e| CliError::Other(format!("outbox ack_count query failed: {e}")))?;
+        let acked_count = i64::try_from(ack_rows.len()).unwrap_or(0);
+
+        let recipient_rows_count = conn
+            .query_sync(
+                "SELECT mr.id
+                 FROM message_recipients mr
+                 WHERE mr.message_id = ?",
+                &[Value::BigInt(id)],
+            )
+            .map_err(|e| CliError::Other(format!("outbox recipient_count query failed: {e}")))?;
+        let recipient_count = i64::try_from(recipient_rows_count.len()).unwrap_or(0);
+
+        let to_rows = conn
+            .query_sync(
+                "SELECT a.name AS name
+                 FROM message_recipients mr
+                 JOIN agents a ON a.id = mr.agent_id
+                 WHERE mr.message_id = ? AND mr.kind = 'to'",
+                &[Value::BigInt(id)],
+            )
+            .map_err(|e| CliError::Other(format!("outbox recipient to-query failed: {e}")))?;
+        let recipient_rows = if to_rows.is_empty() {
+            conn.query_sync(
+                "SELECT a.name AS name
+                 FROM message_recipients mr
+                 JOIN agents a ON a.id = mr.agent_id
+                 WHERE mr.message_id = ?",
+                &[Value::BigInt(id)],
+            )
+            .map_err(|e| CliError::Other(format!("outbox recipient fallback query failed: {e}")))?
+        } else {
+            to_rows
+        };
+        let recipient_names = recipient_rows
+            .iter()
+            .filter_map(|r| {
+                r.get_named::<String>("name")
+                    .ok()
+                    .or_else(|| r.get_as::<String>(0).ok())
             })
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "(no recipients)".to_string());
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let recipient_names = if recipient_names.is_empty() {
+            "(no recipients)".to_string()
+        } else {
+            recipient_names
+        };
 
         let ack_status = if ack_required == 0 {
             "none".to_string()

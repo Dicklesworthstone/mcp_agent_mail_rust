@@ -6155,11 +6155,6 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
             "path must not be empty or root".to_string(),
         ));
     }
-    if safe_rel.is_empty() {
-        return Err(StorageError::InvalidPath(
-            "path must not be empty or root".to_string(),
-        ));
-    }
     // Use pre-canonicalized root to avoid repeated readlink syscalls.
     let root = &archive.canonical_root;
 

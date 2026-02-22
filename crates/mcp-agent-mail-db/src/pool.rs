@@ -517,8 +517,28 @@ impl DbPool {
             });
         }
 
-        let conn = DbConn::open_file(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("startup integrity check: open failed: {e}")))?;
+        let conn = match DbConn::open_file(&self.sqlite_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                if !is_corruption_error_message(&e.to_string()) {
+                    return Err(DbError::Sqlite(format!(
+                        "startup integrity check: open failed: {e}"
+                    )));
+                }
+                tracing::warn!(
+                    path = %self.sqlite_path,
+                    error = %e,
+                    "startup integrity check failed to open sqlite file; attempting auto-recovery"
+                );
+                ensure_sqlite_file_healthy(Path::new(&self.sqlite_path))
+                    .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
+                DbConn::open_file(&self.sqlite_path).map_err(|reopen| {
+                    DbError::Sqlite(format!(
+                        "startup integrity check: open failed after recovery: {reopen}"
+                    ))
+                })?
+            }
+        };
 
         match integrity::quick_check(&conn) {
             Ok(res) => Ok(res),
@@ -569,8 +589,29 @@ impl DbPool {
             });
         }
 
-        let conn = DbConn::open_file(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("full integrity check: open failed: {e}")))?;
+        let conn = match DbConn::open_file(&self.sqlite_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                if !is_corruption_error_message(&e.to_string()) {
+                    return Err(DbError::Sqlite(format!(
+                        "full integrity check: open failed: {e}"
+                    )));
+                }
+                tracing::warn!(
+                    path = %self.sqlite_path,
+                    error = %e,
+                    "full integrity check failed to open sqlite file; attempting auto-recovery"
+                );
+                ensure_sqlite_file_healthy(Path::new(&self.sqlite_path)).map_err(|re| {
+                    DbError::Sqlite(format!("full integrity recovery failed: {re}"))
+                })?;
+                DbConn::open_file(&self.sqlite_path).map_err(|reopen| {
+                    DbError::Sqlite(format!(
+                        "full integrity check: open failed after recovery: {reopen}"
+                    ))
+                })?
+            }
+        };
 
         integrity::full_check(&conn)
     }
@@ -679,6 +720,66 @@ impl DbPool {
 
         Ok(checkpointed)
     }
+
+    /// Create (or refresh) a `.bak` backup of the database file.
+    ///
+    /// Skips silently for `:memory:` databases or when the primary file
+    /// doesn't exist. Performs a WAL checkpoint first to ensure the backup
+    /// is self-contained.
+    ///
+    /// Returns `Ok(Some(path))` with the backup path on success, `Ok(None)`
+    /// if the operation was skipped (memory DB, missing file, or the existing
+    /// backup is younger than `max_age`).
+    pub fn create_proactive_backup(
+        &self,
+        max_age: std::time::Duration,
+    ) -> DbResult<Option<PathBuf>> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(None);
+        }
+        let primary = Path::new(&self.sqlite_path);
+        if !primary.exists() {
+            return Ok(None);
+        }
+
+        let bak_path = primary.with_file_name(format!(
+            "{}.bak",
+            primary
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("storage.sqlite3")
+        ));
+
+        // Skip if the existing backup is fresh enough.
+        if bak_path.is_file() {
+            if let Ok(meta) = bak_path.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if modified.elapsed().unwrap_or(max_age) < max_age {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        // Checkpoint WAL so the backup is self-contained.
+        let _ = self.wal_checkpoint();
+
+        std::fs::copy(primary, &bak_path).map_err(|e| {
+            DbError::Sqlite(format!(
+                "proactive backup failed: {} -> {}: {e}",
+                primary.display(),
+                bak_path.display()
+            ))
+        })?;
+
+        tracing::info!(
+            primary = %primary.display(),
+            backup = %bak_path.display(),
+            "created proactive database backup"
+        );
+
+        Ok(Some(bak_path))
+    }
 }
 
 static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<OnceCell<()>>>>> =
@@ -708,7 +809,11 @@ fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
     gate
 }
 
-fn is_corruption_error_message(message: &str) -> bool {
+/// Check whether an error message indicates SQLite file corruption.
+///
+/// Used by auto-recovery logic to decide whether to attempt backup
+/// restoration or reinitialization.
+pub fn is_corruption_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("database disk image is malformed")
         || lower.contains("malformed database schema")
@@ -938,24 +1043,90 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
 }
 
 #[allow(clippy::result_large_err)]
-fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
+fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    let quarantined_db = primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
+
+    if primary_path.exists() {
+        std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to quarantine corrupted database {}: {e}",
+                primary_path.display()
+            ))
+        })?;
+    }
+
+    if let Err(e) = quarantine_sidecar(primary_path, "-wal", &timestamp) {
+        tracing::warn!(
+            sidecar = %format!("{}-wal", primary_path.display()),
+            error = %e,
+            "failed to quarantine WAL sidecar during scratch reinit; continuing"
+        );
+    }
+    if let Err(e) = quarantine_sidecar(primary_path, "-shm", &timestamp) {
+        tracing::warn!(
+            sidecar = %format!("{}-shm", primary_path.display()),
+            error = %e,
+            "failed to quarantine SHM sidecar during scratch reinit; continuing"
+        );
+    }
+
+    let path_str = primary_path.to_string_lossy();
+    let conn = DbConn::open_file(path_str.as_ref()).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to initialize fresh sqlite file {}: {e}",
+            primary_path.display()
+        ))
+    })?;
+    drop(conn);
+
+    tracing::warn!(
+        primary = %primary_path.display(),
+        quarantined = %quarantined_db.display(),
+        "no healthy sqlite backup found; initialized fresh database file from scratch"
+    );
+    Ok(())
+}
+
+/// Verify and, if necessary, recover a SQLite database file.
+///
+/// Runs `PRAGMA quick_check` on the file. If corruption is detected:
+///
+/// 1. Search for a healthy `.bak` / `.backup-*` / `.recovery*` sibling.
+/// 2. Quarantine the corrupt file (rename to `*.corrupt-{timestamp}`).
+/// 3. Restore from the first healthy backup found.
+/// 4. If no healthy backup exists, reinitialize an empty database file.
+///
+/// Returns `Ok(())` when the file at `primary_path` is healthy (either
+/// originally or after successful recovery).
+#[allow(clippy::result_large_err)]
+pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     if sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
-    let Some(backup_path) = find_healthy_backup(primary_path) else {
+    if let Some(backup_path) = find_healthy_backup(primary_path) {
+        restore_from_backup(primary_path, &backup_path)?;
+        if sqlite_file_is_healthy(primary_path)? {
+            return Ok(());
+        }
         return Err(SqlError::Custom(format!(
-            "database file {} is malformed and no healthy backup was found",
-            primary_path.display()
+            "database file {} was restored from {}, but quick_check still failed",
+            primary_path.display(),
+            backup_path.display()
         )));
-    };
-    restore_from_backup(primary_path, &backup_path)?;
+    }
+
+    reinitialize_without_backup(primary_path)?;
     if sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
     Err(SqlError::Custom(format!(
-        "database file {} was restored from {}, but quick_check still failed",
-        primary_path.display(),
-        backup_path.display()
+        "database file {} was reinitialized without backup, but quick_check still failed",
+        primary_path.display()
     )))
 }
 
@@ -1437,16 +1608,53 @@ mod tests {
     }
 
     #[test]
-    fn ensure_sqlite_file_healthy_errors_without_backup() {
+    fn ensure_sqlite_file_healthy_reinitializes_without_backup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("storage.sqlite3");
         std::fs::write(&primary, b"broken").expect("write broken db");
 
-        let err = ensure_sqlite_file_healthy(&primary).expect_err("should fail without backup");
-        let message = err.to_string();
+        ensure_sqlite_file_healthy(&primary).expect("should reinitialize without backup");
+        let healthy = sqlite_file_is_healthy(&primary).expect("health check");
         assert!(
-            message.contains("no healthy backup"),
-            "expected clear no-backup error, got: {message}"
+            healthy,
+            "reinitialized sqlite file should pass quick_check"
+        );
+
+        let quarantined_any = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+            });
+        assert!(
+            quarantined_any,
+            "expected corrupted artifact to be quarantined during reinit"
+        );
+    }
+
+    #[test]
+    fn startup_integrity_check_recovers_open_failure_without_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("startup_corrupt.db");
+        std::fs::write(&primary, b"not-a-sqlite-file").expect("write corrupt file");
+
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", primary.display()),
+            run_migrations: false,
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        let result = pool
+            .run_startup_integrity_check()
+            .expect("startup integrity should auto-recover");
+        assert!(result.ok, "startup quick_check should report healthy after recovery");
+        assert!(
+            sqlite_file_is_healthy(&primary).expect("post-startup health check"),
+            "sqlite file should be healthy after startup recovery"
         );
     }
 

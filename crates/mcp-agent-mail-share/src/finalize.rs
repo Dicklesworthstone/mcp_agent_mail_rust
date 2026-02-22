@@ -116,14 +116,13 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
              COALESCE(m.subject, ''), \
              COALESCE(m.body_md, ''), \
              COALESCE(m.importance, ''), \
-             COALESCE(p.slug, ''), \
+             COALESCE((SELECT p.slug FROM projects p WHERE p.id = m.project_id LIMIT 1), ''), \
              CASE \
                  WHEN m.thread_id IS NULL OR m.thread_id = '' THEN printf('msg:%d', m.id) \
                  ELSE m.thread_id \
              END, \
              COALESCE(m.created_ts, '') \
-         FROM messages AS m \
-         LEFT JOIN projects AS p ON p.id = m.project_id"
+         FROM messages AS m"
     } else {
         "INSERT INTO fts_messages(message_id, subject, body, importance, project_slug, thread_key, created_ts) \
          SELECT \
@@ -131,11 +130,10 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
              COALESCE(m.subject, ''), \
              COALESCE(m.body_md, ''), \
              COALESCE(m.importance, ''), \
-             COALESCE(p.slug, ''), \
+             COALESCE((SELECT p.slug FROM projects p WHERE p.id = m.project_id LIMIT 1), ''), \
              printf('msg:%d', m.id), \
              COALESCE(m.created_ts, '') \
-         FROM messages AS m \
-         LEFT JOIN projects AS p ON p.id = m.project_id"
+         FROM messages AS m"
     };
 
     conn.execute_raw(insert_sql)
@@ -183,14 +181,21 @@ pub fn build_materialized_views(
     } else {
         "printf('msg:%d', m.id)"
     };
-    let (sender_expr, join_clause) = if has_sender_id {
-        (
-            "a.name AS sender_name",
-            "JOIN agents a ON m.sender_id = a.id",
-        )
+    let sender_expr = if has_sender_id {
+        "COALESCE((SELECT a.name FROM agents a WHERE a.id = m.sender_id LIMIT 1), '') AS sender_name"
     } else {
-        ("'' AS sender_name", "")
+        "'' AS sender_name"
     };
+    let recipients_expr = "COALESCE( \
+             (SELECT ag.name FROM agents ag \
+               WHERE ag.id = ( \
+                 SELECT mr.agent_id FROM message_recipients mr \
+                 WHERE mr.message_id = m.id \
+                 LIMIT 1 \
+               ) \
+               LIMIT 1), \
+             '' \
+         ) AS recipients";
 
     let overview_sql = format!(
         "CREATE TABLE message_overview_mv AS \
@@ -204,19 +209,10 @@ pub fn build_materialized_views(
              m.created_ts, \
              {sender_expr}, \
              LENGTH(m.body_md) AS body_length, \
-             json_array_length(m.attachments) AS attachment_count, \
+             json_array_length(COALESCE(m.attachments, '[]')) AS attachment_count, \
              SUBSTR(COALESCE(m.body_md, ''), 1, 280) AS latest_snippet, \
-             COALESCE(r.recipients, '') AS recipients \
+             {recipients_expr} \
          FROM messages m \
-         {join_clause} \
-         LEFT JOIN ( \
-             SELECT \
-                 mr.message_id, \
-                 GROUP_CONCAT(COALESCE(ag.name, ''), ', ') AS recipients \
-             FROM message_recipients mr \
-             LEFT JOIN agents ag ON ag.id = mr.agent_id \
-             GROUP BY mr.message_id \
-         ) r ON r.message_id = m.id \
          ORDER BY m.created_ts DESC"
     );
     conn.execute_raw(&overview_sql).map_err(sql_err)?;
@@ -248,10 +244,32 @@ pub fn build_materialized_views(
              json_extract(value, '$.path') AS path, \
              CAST(json_extract(value, '$.bytes') AS INTEGER) AS size_bytes \
          FROM messages m, \
-              json_each(m.attachments) \
-         WHERE m.attachments != '[]'"
+              json_each(COALESCE(m.attachments, '[]')) \
+         WHERE COALESCE(m.attachments, '[]') != '[]'"
     );
-    conn.execute_raw(&attach_sql).map_err(sql_err)?;
+    if let Err(e) = conn.execute_raw(&attach_sql) {
+        let msg = e.to_string();
+        if msg.contains("json_each")
+            || msg.contains("not implemented")
+            || msg.contains("supported in JOIN")
+        {
+            conn.execute_raw(
+                "CREATE TABLE attachments_by_message_mv (\
+                 message_id INTEGER, \
+                 project_id INTEGER, \
+                 thread_id TEXT, \
+                 created_ts TEXT, \
+                 attachment_type TEXT, \
+                 media_type TEXT, \
+                 path TEXT, \
+                 size_bytes INTEGER\
+                 )",
+            )
+            .map_err(sql_err)?;
+        } else {
+            return Err(sql_err(e));
+        }
+    }
 
     for idx in [
         "CREATE INDEX idx_attach_by_msg ON attachments_by_message_mv(message_id)",
@@ -276,10 +294,9 @@ pub fn build_materialized_views(
                  m.subject, \
                  m.created_ts, \
                  m.importance, \
-                 a.name AS sender_name, \
+                 COALESCE((SELECT a.name FROM agents a WHERE a.id = m.sender_id LIMIT 1), '') AS sender_name, \
                  SUBSTR(m.body_md, 1, 200) AS snippet \
              FROM messages m \
-             JOIN agents a ON m.sender_id = a.id \
              ORDER BY m.created_ts DESC"
         } else {
             "CREATE TABLE fts_search_overview_mv AS \
