@@ -261,7 +261,7 @@ pub fn compute_project_slug(human_key: &str) -> String {
     match mode {
         ProjectIdentityMode::GitRemote => {
             if let Some(url) = remote_url
-                && let Some(normalized) = normalize_remote_first_two(&url)
+                && let Some(normalized) = normalize_remote_last_two(&url)
             {
                 let base = normalized.rsplit('/').next().unwrap_or("repo").to_string();
                 let canonical = normalized;
