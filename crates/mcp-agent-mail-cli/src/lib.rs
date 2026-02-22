@@ -20829,9 +20829,10 @@ fn handle_doctor_reconstruct_with(
         .unwrap_or_else(|| config.storage_root.clone());
     let db_path = match db_path_override {
         Some(p) => p.to_path_buf(),
-        None => cfg
-            .sqlite_path()
-            .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?,
+        None => PathBuf::from(
+            cfg.sqlite_path()
+                .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?,
+        ),
     };
 
     if !storage_root.is_dir() {
