@@ -2899,7 +2899,8 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             let config = mcp_agent_mail_core::Config::get();
             let archive_root = config.storage_root.join("projects").join(&identity.slug);
 
-            let conflicts = mcp_agent_mail_guard::guard_check(&archive_root, &repo_path, &paths, advisory)?;
+            let conflicts =
+                mcp_agent_mail_guard::guard_check(&archive_root, &repo_path, &paths, advisory)?;
             if conflicts.is_empty() {
                 ftui_runtime::ftui_println!("No file reservation conflicts detected.");
             } else {
@@ -3258,6 +3259,21 @@ fn sqlite_absolute_fallback_path(path: &str, open_error: &str) -> Option<String>
     Some(absolute_candidate.to_string_lossy().into_owned())
 }
 
+fn sqlite_absolute_candidate_path(path: &str) -> Option<String> {
+    if path == ":memory:"
+        || Path::new(path).is_absolute()
+        || path.starts_with("./")
+        || path.starts_with("../")
+    {
+        return None;
+    }
+    let absolute_candidate = Path::new("/").join(path);
+    if !absolute_candidate.exists() {
+        return None;
+    }
+    Some(absolute_candidate.to_string_lossy().into_owned())
+}
+
 fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     match mcp_agent_mail_db::DbConn::open_file(path) {
         Ok(conn) => Ok((conn, path.to_string())),
@@ -3307,12 +3323,25 @@ pub(crate) fn open_db_sync_with_database_url(
     if path != ":memory:" {
         ensure_sqlite_parent_dir(Path::new(&path))?;
     }
-    let (mut conn, opened_path) = open_sqlite_with_fallback(&path)?;
+    let (mut conn, mut opened_path) = open_sqlite_with_fallback(&path)?;
     if opened_path != ":memory:" && !sqlite_conn_is_healthy(&conn)? {
-        drop(conn);
-        recover_sqlite_file(Path::new(&opened_path))?;
-        conn = mcp_agent_mail_db::DbConn::open_file(&opened_path)
-            .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
+        // If a malformed relative path shadows a healthy absolute DB, prefer that absolute file
+        // before mutating/quarantining the relative artifact.
+        if let Some(absolute_path) = sqlite_absolute_candidate_path(&opened_path)
+            && absolute_path != opened_path
+            && let Ok(fallback_conn) = mcp_agent_mail_db::DbConn::open_file(&absolute_path)
+            && sqlite_conn_is_healthy(&fallback_conn)?
+        {
+            conn = fallback_conn;
+            opened_path = absolute_path;
+        }
+
+        if !sqlite_conn_is_healthy(&conn)? {
+            drop(conn);
+            recover_sqlite_file(Path::new(&opened_path))?;
+            conn = mcp_agent_mail_db::DbConn::open_file(&opened_path)
+                .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
+        }
     }
     // Run schema init so tables exist even if first use
     let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
@@ -7352,8 +7381,21 @@ fn handle_doctor_check_with(
 ) -> CliResult<()> {
     let mut checks: Vec<serde_json::Value> = Vec::new();
 
-    // Check 1: Database accessible
-    let db_ok = open_db_sync_with_database_url(database_url).is_ok();
+    // Check 1: Database accessible (non-mutating; avoid auto-recovery side effects).
+    let db_ok = {
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: database_url.to_string(),
+            ..Default::default()
+        };
+        match cfg.sqlite_path() {
+            Ok(path) if path == ":memory:" => true,
+            Ok(path) => mcp_agent_mail_db::DbConn::open_file(&path)
+                .ok()
+                .and_then(|conn| conn.query_sync("SELECT 1 AS one", &[]).ok())
+                .is_some(),
+            Err(_) => false,
+        }
+    };
     checks.push(serde_json::json!({
         "check": "database",
         "status": if db_ok { "ok" } else { "fail" },
@@ -13362,7 +13404,7 @@ mod tests {
                 assert_eq!(agent, "BlueLake");
                 assert_eq!(paths, vec!["src/main.rs"]);
                 assert_eq!(ttl, 3600);
-                assert!(exclusive);
+                assert!(!exclusive); // default false
                 assert!(!shared);
                 assert_eq!(reason, "");
             }
@@ -13711,7 +13753,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(project_path, PathBuf::from("/tmp/proj"));
-                assert!(commit); // default true
+                assert!(!commit); // default false
                 assert!(!no_commit);
             }
             other => panic!("expected Projects MarkIdentity, got {other:?}"),
@@ -13788,7 +13830,7 @@ mod tests {
             } => {
                 assert_eq!(source, PathBuf::from("/tmp/src"));
                 assert_eq!(target, PathBuf::from("/tmp/dst"));
-                assert!(dry_run); // default true
+                assert!(!dry_run); // default false
                 assert!(!apply);
             }
             other => panic!("expected Projects Adopt, got {other:?}"),

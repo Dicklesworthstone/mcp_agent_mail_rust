@@ -721,7 +721,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
             let terms = extract_like_terms(&query.text, 5);
             let mut like_parts = Vec::new();
             for term in &terms {
-                let escaped = term.replace('%', "\\%").replace('_', "\\_");
+                let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
                 like_parts.push(
                     "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')".to_string(),
                 );
@@ -749,9 +749,11 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
              0.0 AS score"
                 .to_string(),
             "messages m JOIN agents a ON a.id = m.sender_id".to_string(),
+            // Use score ASC, id ASC to stay compatible with cursor pagination.
+            // All FilterOnly results have score=0.0, so effective ordering is id ASC.
             match query.ranking {
                 RankingMode::Relevance | RankingMode::Recency => {
-                    "ORDER BY m.created_ts DESC, m.id ASC".to_string()
+                    "ORDER BY score ASC, m.id ASC".to_string()
                 }
             },
         ),
@@ -910,7 +912,7 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let (select_cols, from_clause, order_clause) = {
         let mut like_parts = Vec::new();
         for term in &terms {
-            let escaped = term.replace('%', "\\%").replace('_', "\\_");
+            let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
             like_parts.push(
                 "(a.name LIKE ? ESCAPE '\\' OR a.task_description LIKE ? ESCAPE '\\')".to_string(),
             );
@@ -993,7 +995,7 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     let (select_cols, from_clause, order_clause) = {
         let mut like_parts = Vec::new();
         for term in &terms {
-            let escaped = term.replace('%', "\\%").replace('_', "\\_");
+            let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
             like_parts
                 .push("(p.slug LIKE ? ESCAPE '\\' OR p.human_key LIKE ? ESCAPE '\\')".to_string());
             let pattern = format!("%{escaped}%");

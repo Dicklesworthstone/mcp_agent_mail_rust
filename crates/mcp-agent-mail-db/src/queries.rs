@@ -2834,8 +2834,8 @@ async fn run_like_fallback(
         params.push(Value::Text(escaped));
         where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
     }
-    // Approximate FTS whitespace semantics (term union) in LIKE fallback mode.
-    let where_clause = where_parts.join(" OR ");
+    // Match FTS5 default semantics: all terms must appear (intersection).
+    let where_clause = where_parts.join(" AND ");
     params.push(Value::BigInt(limit));
 
     let sql = format!(
@@ -2868,8 +2868,8 @@ async fn run_like_fallback_product(
         params.push(Value::Text(escaped));
         where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
     }
-    // Approximate FTS whitespace semantics (term union) in LIKE fallback mode.
-    let where_clause = where_parts.join(" OR ");
+    // Match FTS5 default semantics: all terms must appear (intersection).
+    let where_clause = where_parts.join(" AND ");
     params.push(Value::BigInt(limit));
 
     let sql = format!(
@@ -3414,8 +3414,8 @@ async fn run_like_fallback_global(
     let mut params: Vec<Value> = Vec::with_capacity(terms.len() + 1);
 
     for term in terms {
-        conditions.push("(m.subject LIKE ? OR m.body_md LIKE ?)");
-        let pattern = format!("%{term}%");
+        conditions.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
+        let pattern = format!("%{}%", like_escape(term));
         params.push(Value::Text(pattern.clone()));
         params.push(Value::Text(pattern));
     }
@@ -3430,7 +3430,7 @@ async fn run_like_fallback_global(
          WHERE {} \
          ORDER BY m.created_ts DESC \
          LIMIT ?",
-        conditions.join(" OR ")
+        conditions.join(" AND ")
     );
     params.push(Value::BigInt(limit));
 
