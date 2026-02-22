@@ -1075,8 +1075,7 @@ fn is_unsupported_by_franken(id: &str) -> bool {
             "v1_create_trigger_messages_ai"
                 | "v1_create_trigger_messages_ad"
                 | "v1_create_trigger_messages_au"
-                |
-            "v6_backfill_inbox_stats"
+                | "v6_backfill_inbox_stats"
                 | "v6_trg_inbox_stats_insert"
                 | "v6_trg_inbox_stats_mark_read"
                 | "v6_trg_inbox_stats_ack"
@@ -1499,7 +1498,12 @@ mod tests {
         // Migrating should not delete existing rows.
         block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
         });
 
         let rows = conn
@@ -1521,7 +1525,7 @@ mod tests {
 
         block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
         });
 
         insert_inbox_stats_test_project(&conn);
@@ -2020,7 +2024,12 @@ mod tests {
         // Run migrations (v3 should convert TEXT timestamps).
         block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
         });
 
         // Verify projects.created_at is now INTEGER
@@ -2186,7 +2195,12 @@ mod tests {
         // Now run migrations — v4 should create indexes on existing tables.
         let applied = block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
         });
 
         // v4 indexes should be among applied migrations.

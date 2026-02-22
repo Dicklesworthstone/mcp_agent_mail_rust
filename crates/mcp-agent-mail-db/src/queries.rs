@@ -6904,7 +6904,7 @@ mod tests {
             .expect("create target");
             let target_id = target.id.expect("target id");
 
-            let since_ts = now_micros();
+            let since_ts = now_micros().saturating_sub(1_000);
 
             create_message_with_recipients(
                 &cx,

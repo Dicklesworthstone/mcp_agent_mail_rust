@@ -1,4 +1,4 @@
-//! Reconstruct a SQLite database from the Git archive.
+//! Reconstruct a `SQLite` database from the Git archive.
 //!
 //! When the database file is corrupt and no healthy backup exists, this module
 //! walks the per-project Git archive directories to recover:
@@ -53,7 +53,7 @@ impl std::fmt::Display for ReconstructStats {
 
 /// Reconstruct the database from the Git archive at `storage_root`.
 ///
-/// Opens (or creates) a fresh SQLite database at `db_path`, runs schema
+/// Opens (or creates) a fresh `SQLite` database at `db_path`, runs schema
 /// migrations, then walks the archive to recover data.
 ///
 /// # Errors
@@ -61,13 +61,14 @@ impl std::fmt::Display for ReconstructStats {
 /// Returns an error if the database cannot be opened or if schema creation
 /// fails. Individual archive files that fail to parse are skipped (counted
 /// in `parse_errors`).
-pub fn reconstruct_from_archive(
-    db_path: &Path,
-    storage_root: &Path,
-) -> DbResult<ReconstructStats> {
+pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
     let db_str = db_path.to_string_lossy();
-    let conn = DbConn::open_file(db_str.as_ref())
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: cannot open {}: {e}", db_path.display())))?;
+    let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
+        DbError::Sqlite(format!(
+            "reconstruct: cannot open {}: {e}",
+            db_path.display()
+        ))
+    })?;
 
     // Apply schema + PRAGMAs
     conn.execute_raw("PRAGMA journal_mode=WAL;")
@@ -92,8 +93,7 @@ pub fn reconstruct_from_archive(
 
     let mut stats = ReconstructStats::default();
 
-    // Maps for deduplication: (slug → project_id), ((project_id, name) → agent_id)
-    let mut project_ids: HashMap<String, i64> = HashMap::new();
+    // Maps for deduplication: ((project_id, name) → agent_id)
     let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
 
     let projects_dir = storage_root.join("projects");
@@ -134,32 +134,18 @@ pub fn reconstruct_from_archive(
         .map_err(|e| DbError::Sqlite(format!("reconstruct: insert project {slug}: {e}")))?;
 
         let pid = query_last_insert_or_existing_id(&conn, "projects", "slug", slug)?;
-        project_ids.insert(slug.clone(), pid);
         stats.projects += 1;
 
         // Phase 2: Discover agents for this project
         let agents_dir = project_path.join("agents");
         if agents_dir.is_dir() {
-            discover_agents(
-                &conn,
-                &agents_dir,
-                pid,
-                &mut agent_ids,
-                &mut stats,
-            )?;
+            discover_agents(&conn, &agents_dir, pid, &mut agent_ids, &mut stats)?;
         }
 
         // Phase 3: Discover messages for this project
         let messages_dir = project_path.join("messages");
         if messages_dir.is_dir() {
-            discover_messages(
-                &conn,
-                &messages_dir,
-                pid,
-                slug,
-                &mut agent_ids,
-                &mut stats,
-            )?;
+            discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats);
         }
     }
 
@@ -197,10 +183,9 @@ fn discover_agents(
             Ok(d) => d,
             Err(e) => {
                 stats.parse_errors += 1;
-                stats.warnings.push(format!(
-                    "Cannot read {}: {e}",
-                    profile_path.display()
-                ));
+                stats
+                    .warnings
+                    .push(format!("Cannot read {}: {e}", profile_path.display()));
                 continue;
             }
         };
@@ -209,10 +194,9 @@ fn discover_agents(
             Ok(v) => v,
             Err(e) => {
                 stats.parse_errors += 1;
-                stats.warnings.push(format!(
-                    "Cannot parse {}: {e}",
-                    profile_path.display()
-                ));
+                stats
+                    .warnings
+                    .push(format!("Cannot parse {}: {e}", profile_path.display()));
                 continue;
             }
         };
@@ -223,10 +207,11 @@ fn discover_agents(
         let attachments_policy = json_str(&profile, "attachments_policy").unwrap_or("auto");
         let contact_policy = json_str(&profile, "contact_policy").unwrap_or("auto");
 
-        // Parse inception timestamp
-        let inception_ts = parse_ts_from_json(&profile, "inception_ts");
+        // Parse inception timestamp (try both field names for compatibility)
+        let inception_ts = parse_ts_from_json(&profile, "inception_ts")
+            .or_else(|| parse_ts_from_json(&profile, "registered_ts"));
         let last_active_ts = parse_ts_from_json(&profile, "last_active_ts")
-            .unwrap_or_else(|| inception_ts.unwrap_or_else(|| crate::now_micros()));
+            .unwrap_or_else(|| inception_ts.unwrap_or_else(crate::now_micros));
         let inception_ts = inception_ts.unwrap_or(last_active_ts);
 
         conn.execute_raw(&format!(
@@ -265,10 +250,10 @@ fn discover_messages(
     project_slug: &str,
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
-) -> DbResult<()> {
+) {
     // Walk year directories
     let Ok(years) = std::fs::read_dir(messages_dir) else {
-        return Ok(());
+        return;
     };
 
     let mut message_files: Vec<PathBuf> = Vec::new();
@@ -316,8 +301,6 @@ fn discover_messages(
             }
         }
     }
-
-    Ok(())
 }
 
 /// Parse a single archive `.md` file and insert the message into the database.
@@ -333,8 +316,9 @@ fn parse_and_insert_message(
         .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
 
     // Parse JSON frontmatter between ---json and ---
-    let frontmatter = extract_json_frontmatter(&content)
-        .ok_or_else(|| DbError::Sqlite(format!("no JSON frontmatter in {}", file_path.display())))?;
+    let frontmatter = extract_json_frontmatter(&content).ok_or_else(|| {
+        DbError::Sqlite(format!("no JSON frontmatter in {}", file_path.display()))
+    })?;
 
     let msg: serde_json::Value = serde_json::from_str(frontmatter)
         .map_err(|e| DbError::Sqlite(format!("bad JSON in {}: {e}", file_path.display())))?;
@@ -351,19 +335,17 @@ fn parse_and_insert_message(
     let importance = json_str(&msg, "importance").unwrap_or("normal");
     let ack_required = msg
         .get("ack_required")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let created_ts = parse_ts_from_json(&msg, "created_ts")
         .or_else(|| parse_ts_from_json(&msg, "created"))
         .unwrap_or_else(crate::now_micros);
     let attachments = msg
         .get("attachments")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "[]".to_string());
+        .map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
 
     // Ensure sender agent exists
-    let sender_id =
-        ensure_agent_exists(conn, project_id, sender_name, agent_ids)?;
+    let sender_id = ensure_agent_exists(conn, project_id, sender_name, agent_ids)?;
 
     // Build recipient lists
     let to_names = json_str_array(&msg, "to");
@@ -371,7 +353,8 @@ fn parse_and_insert_message(
     let bcc_names = json_str_array(&msg, "bcc");
 
     // Insert message
-    let thread_sql = thread_id.map_or("NULL".to_string(), |t| format!("'{}'", escape_sql(t)));
+    let thread_sql =
+        thread_id.map_or_else(|| "NULL".to_string(), |t| format!("'{}'", escape_sql(t)));
 
     conn.execute_raw(&format!(
         "INSERT INTO messages \
@@ -563,7 +546,7 @@ fn query_last_insert_or_existing_id_composite(
     })
 }
 
-/// Get the MAX(id) from a table (fallback for last_insert_rowid).
+/// Get the MAX(id) from a table (fallback for `last_insert_rowid`).
 fn query_max_id(conn: &DbConn, table: &str) -> DbResult<i64> {
     let rows = conn
         .query_sync(&format!("SELECT MAX(id) AS id FROM {table}"), &[])
@@ -595,7 +578,8 @@ mod tests {
 
     #[test]
     fn extract_json_frontmatter_multiline() {
-        let content = "---json\n{\n  \"id\": 42,\n  \"from\": \"TestAgent\"\n}\n---\n\nHello world.\n";
+        let content =
+            "---json\n{\n  \"id\": 42,\n  \"from\": \"TestAgent\"\n}\n---\n\nHello world.\n";
         let fm = extract_json_frontmatter(content).expect("should extract");
         assert!(fm.contains("\"id\": 42"));
         assert!(fm.contains("\"from\": \"TestAgent\""));
@@ -765,7 +749,10 @@ Hello Bob, this is a test message.
 
         let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
         assert_eq!(stats.projects, 1);
-        assert_eq!(stats.agents, 1, "Alice from profile; Bob auto-created as placeholder");
+        assert_eq!(
+            stats.agents, 1,
+            "Alice from profile; Bob auto-created as placeholder"
+        );
         assert_eq!(stats.messages, 1);
         assert_eq!(stats.recipients, 1);
         assert_eq!(stats.parse_errors, 0);
@@ -773,7 +760,10 @@ Hello Bob, this is a test message.
         // Verify the message was inserted correctly
         let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
         let rows = conn
-            .query_sync("SELECT subject, body_md, thread_id FROM messages LIMIT 1", &[])
+            .query_sync(
+                "SELECT subject, body_md, thread_id FROM messages LIMIT 1",
+                &[],
+            )
             .unwrap();
         assert!(!rows.is_empty(), "message should exist in DB");
 
@@ -784,18 +774,12 @@ Hello Bob, this is a test message.
         assert_eq!(agent_rows.len(), 2, "Alice + Bob should both exist");
         // Verify Alice has the correct program from profile
         let alice_rows = conn
-            .query_sync(
-                "SELECT program FROM agents WHERE name = 'Alice'",
-                &[],
-            )
+            .query_sync("SELECT program FROM agents WHERE name = 'Alice'", &[])
             .unwrap();
         assert!(!alice_rows.is_empty());
         // Verify Bob was auto-created with 'unknown' program
         let bob_rows = conn
-            .query_sync(
-                "SELECT program FROM agents WHERE name = 'Bob'",
-                &[],
-            )
+            .query_sync("SELECT program FROM agents WHERE name = 'Bob'", &[])
             .unwrap();
         assert!(!bob_rows.is_empty());
     }

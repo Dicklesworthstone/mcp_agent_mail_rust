@@ -47,8 +47,8 @@ pub use pool::{
     DbPool, DbPoolConfig, auto_pool_size, create_pool, ensure_sqlite_file_healthy,
     ensure_sqlite_file_healthy_with_archive, get_or_create_pool, is_corruption_error_message,
 };
-pub use reconstruct::{ReconstructStats, reconstruct_from_archive};
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
+pub use reconstruct::{ReconstructStats, reconstruct_from_archive};
 pub use retry::{
     CIRCUIT_BREAKER, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL, CircuitBreaker,
     CircuitState, DbHealthStatus, RetryConfig, Subsystem, SubsystemCircuitStatus, circuit_for,

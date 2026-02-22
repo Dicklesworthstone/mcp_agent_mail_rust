@@ -751,14 +751,12 @@ impl DbPool {
         ));
 
         // Skip if the existing backup is fresh enough.
-        if bak_path.is_file() {
-            if let Ok(meta) = bak_path.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if modified.elapsed().unwrap_or(max_age) < max_age {
-                        return Ok(None);
-                    }
-                }
-            }
+        if bak_path.is_file()
+            && let Ok(meta) = bak_path.metadata()
+            && let Ok(modified) = meta.modified()
+            && modified.elapsed().unwrap_or(max_age) < max_age
+        {
+            return Ok(None);
         }
 
         // Checkpoint WAL so the backup is self-contained.
@@ -809,10 +807,11 @@ fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
     gate
 }
 
-/// Check whether an error message indicates SQLite file corruption.
+/// Check whether an error message indicates `SQLite` file corruption.
 ///
 /// Used by auto-recovery logic to decide whether to attempt backup
 /// restoration or reinitialization.
+#[must_use]
 pub fn is_corruption_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("database disk image is malformed")
@@ -1092,7 +1091,7 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
     Ok(())
 }
 
-/// Verify and, if necessary, recover a SQLite database file.
+/// Verify and, if necessary, recover a `SQLite` database file.
 ///
 /// Runs `PRAGMA quick_check` on the file. If corruption is detected:
 ///
@@ -1171,8 +1170,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         .unwrap_or("storage.sqlite3");
 
     if primary_path.exists() {
-        let quarantined =
-            primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
+        let quarantined = primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
         let _ = std::fs::rename(primary_path, &quarantined);
         let _ = quarantine_sidecar(primary_path, "-wal", &timestamp);
         let _ = quarantine_sidecar(primary_path, "-shm", &timestamp);
@@ -1695,20 +1693,12 @@ mod tests {
 
         ensure_sqlite_file_healthy(&primary).expect("should reinitialize without backup");
         let healthy = sqlite_file_is_healthy(&primary).expect("health check");
-        assert!(
-            healthy,
-            "reinitialized sqlite file should pass quick_check"
-        );
+        assert!(healthy, "reinitialized sqlite file should pass quick_check");
 
         let quarantined_any = std::fs::read_dir(dir.path())
             .expect("read dir")
             .flatten()
-            .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".corrupt-")
-            });
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"));
         assert!(
             quarantined_any,
             "expected corrupted artifact to be quarantined during reinit"
@@ -1731,7 +1721,10 @@ mod tests {
         let result = pool
             .run_startup_integrity_check()
             .expect("startup integrity should auto-recover");
-        assert!(result.ok, "startup quick_check should report healthy after recovery");
+        assert!(
+            result.ok,
+            "startup quick_check should report healthy after recovery"
+        );
         assert!(
             sqlite_file_is_healthy(&primary).expect("post-startup health check"),
             "sqlite file should be healthy after startup recovery"
@@ -2309,5 +2302,219 @@ mod tests {
 
         // Should not error when WAL doesn't exist.
         quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine noop");
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_sqlite_file_healthy_with_archive tests
+    // -----------------------------------------------------------------------
+
+    /// Archive-aware recovery should restore from backup when available.
+    #[test]
+    fn archive_recovery_prefers_backup_over_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let storage_root = dir.path().join("storage");
+
+        // Create a healthy backup with a marker table.
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
+            .unwrap();
+        drop(conn);
+        std::fs::copy(&primary, &backup).unwrap();
+
+        // Corrupt the primary.
+        std::fs::write(&primary, b"corrupted-data").unwrap();
+
+        // Create a minimal storage root (even though backup should win).
+        std::fs::create_dir_all(storage_root.join("projects").join("proj1")).unwrap();
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
+
+        // Should have restored from backup (marker table present).
+        let val = sqlite_marker_value(&primary);
+        assert_eq!(
+            val.as_deref(),
+            Some("from-backup"),
+            "backup should take priority over archive"
+        );
+    }
+
+    /// Archive-aware recovery should reconstruct from archive when no backup exists.
+    #[test]
+    fn archive_recovery_reconstructs_without_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        // Corrupt primary, no backup.
+        std::fs::write(&primary, b"corrupted-data").unwrap();
+
+        // Set up archive with a project + agent + message.
+        let proj_dir = storage_root.join("projects").join("test-proj");
+        let agent_dir = proj_dir.join("agents").join("SwiftFox");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"SwiftFox","role":"Coder","model":"claude","registered_ts":"2026-01-15T10:00:00"}"#,
+        ).unwrap();
+
+        let msg_dir = proj_dir.join("messages").join("2026").join("01");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            msg_dir.join("001_test.md"),
+            "---json\n{\n  \"id\": 1,\n  \"subject\": \"Test\",\n  \"from_agent\": \"SwiftFox\",\n  \"importance\": \"normal\",\n  \"to\": [\"CalmLake\"],\n  \"cc\": [],\n  \"bcc\": [],\n  \"thread_id\": \"t1\",\n  \"in_reply_to\": null,\n  \"created_ts\": \"2026-01-15T10:05:00\"\n}\n---\n\nTest body\n",
+        ).unwrap();
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
+
+        assert!(
+            sqlite_file_is_healthy(&primary).unwrap(),
+            "reconstructed DB should be healthy"
+        );
+
+        // Verify data was actually recovered from archive.
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+            .unwrap();
+        let count = rows
+            .first()
+            .and_then(|r| r.get_named::<i64>("n").ok())
+            .unwrap_or(0);
+        assert!(count >= 1, "should have at least 1 message from archive");
+    }
+
+    /// Archive-aware recovery should fall back to blank reinit when archive is empty.
+    #[test]
+    fn archive_recovery_reinits_with_empty_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        // Corrupt primary, no backup, empty storage.
+        std::fs::write(&primary, b"corrupted-data").unwrap();
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
+
+        assert!(
+            sqlite_file_is_healthy(&primary).unwrap(),
+            "reinitialized DB should be healthy"
+        );
+    }
+
+    /// Archive-aware recovery should skip when DB is already healthy.
+    #[test]
+    fn archive_recovery_noop_on_healthy_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+
+        // Create a healthy DB.
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO marker(value) VALUES('original')")
+            .unwrap();
+        drop(conn);
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
+
+        // Data should be untouched.
+        let val = sqlite_marker_value(&primary);
+        assert_eq!(
+            val.as_deref(),
+            Some("original"),
+            "healthy DB should not be touched"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // create_proactive_backup tests
+    // -----------------------------------------------------------------------
+
+    /// Proactive backup creates a .bak file after successful integrity check.
+    #[test]
+    fn proactive_backup_creates_bak_file() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_backup.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+
+        // Trigger migration so the file exists.
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().unwrap();
+        });
+
+        // Create backup with 0 max_age so it always writes.
+        let result = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(result.is_some(), "should create a backup");
+
+        let bak_path = result.unwrap();
+        assert!(bak_path.exists(), "backup file should exist");
+        assert!(
+            bak_path.to_string_lossy().ends_with(".bak"),
+            "should end with .bak"
+        );
+    }
+
+    /// Proactive backup skips when existing backup is fresh.
+    #[test]
+    fn proactive_backup_skips_fresh_backup() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_skip.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().unwrap();
+        });
+
+        // First backup should succeed.
+        let first = pool
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .unwrap();
+        assert!(first.is_some(), "first backup should create file");
+
+        // Second backup should skip (backup is <1 hour old).
+        let second = pool
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .unwrap();
+        assert!(second.is_none(), "should skip since backup is fresh");
+    }
+
+    /// Proactive backup is a no-op for :memory: databases.
+    #[test]
+    fn proactive_backup_noop_for_memory() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+
+        let result = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(result.is_none(), "memory DB should not create backup");
     }
 }

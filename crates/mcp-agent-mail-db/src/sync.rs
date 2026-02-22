@@ -89,7 +89,7 @@ pub fn dispatch_root_message(
     // 2. Resolve or auto-register sender
     let sender_rows = conn
         .query_sync(
-            "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+            "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
             &[
                 Value::BigInt(project_id),
                 Value::Text(sender_name.to_string()),
@@ -103,7 +103,7 @@ pub fn dispatch_root_message(
         // Auto-register
         conn.execute_sync(
             "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
-             VALUES (?, ?, 'tui-overseer', 'human', 'Human operator via TUI', ?, ?)",
+             VALUES (?1, ?2, 'tui-overseer', 'human', 'Human operator via TUI', ?3, ?4)",
             &[
                 Value::BigInt(project_id),
                 Value::Text(sender_name.to_string()),
@@ -115,7 +115,7 @@ pub fn dispatch_root_message(
         // Re-query ID
         let rows = conn
             .query_sync(
-                "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
                 &[
                     Value::BigInt(project_id),
                     Value::Text(sender_name.to_string()),
@@ -136,10 +136,9 @@ pub fn dispatch_root_message(
     // 3. Insert Message
     let thread_id_val = thread_id.map_or(Value::Null, |t| Value::Text(t.to_string()));
 
-    let msg_rows = conn.query_sync(
+    conn.execute_sync(
         "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, created_ts) \
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?) \
-         RETURNING id",
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
         &[
             Value::BigInt(project_id),
             Value::BigInt(sender_id),
@@ -149,7 +148,12 @@ pub fn dispatch_root_message(
             thread_id_val,
             Value::BigInt(now),
         ],
-    ).map_err(|e| DbError::Sqlite(e.to_string()))?;
+    )
+    .map_err(|e| DbError::Sqlite(e.to_string()))?;
+
+    let msg_rows = conn
+        .query_sync("SELECT last_insert_rowid() AS id", &[])
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
     let msg_id = msg_rows
         .into_iter()
@@ -162,7 +166,7 @@ pub fn dispatch_root_message(
         // Resolve recipient ID
         let rec_rows = conn
             .query_sync(
-                "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
                 &[Value::BigInt(project_id), Value::Text(name.clone())],
             )
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
@@ -171,7 +175,7 @@ pub fn dispatch_root_message(
             && let Ok(aid) = row.get_named::<i64>("id")
         {
             let _ = conn.execute_sync(
-                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, ?3)",
                 &[
                     Value::BigInt(msg_id),
                     Value::BigInt(aid),

@@ -712,6 +712,18 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
 
     let mut params: Vec<PlanParam> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
+    let cursor_score_expr = if query.ranking == RankingMode::Recency {
+        // Recency cursor is encoded as negative created_ts so ASC score order
+        // corresponds to newest-first message ordering.
+        "-CAST(COALESCE(m.created_ts, 0) AS REAL)"
+    } else {
+        "0.0"
+    };
+    let message_order_clause = if query.ranking == RankingMode::Recency {
+        "ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC"
+    } else {
+        "ORDER BY score ASC, m.id ASC"
+    };
 
     // ── SELECT + FROM + JOIN ───────────────────────────────────────
     // NOTE: FTS5 MATCH SQL was removed in Search V3 decommission (br-2tnl.8.4).
@@ -721,7 +733,10 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
             let terms = extract_like_terms(&query.text, 5);
             let mut like_parts = Vec::new();
             for term in &terms {
-                let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                let escaped = term
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
                 like_parts.push(
                     "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')".to_string(),
                 );
@@ -738,9 +753,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
                  0.0 AS score"
                     .to_string(),
                 "messages m JOIN agents a ON a.id = m.sender_id".to_string(),
-                // Use score ASC, id ASC for cursor-based pagination compatibility.
-                // All LIKE results have score=0.0, so this orders by id ASC.
-                "ORDER BY score ASC, m.id ASC".to_string(),
+                message_order_clause.to_string(),
             )
         }
         PlanMethod::FilterOnly => (
@@ -749,13 +762,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
              0.0 AS score"
                 .to_string(),
             "messages m JOIN agents a ON a.id = m.sender_id".to_string(),
-            // Use score ASC, id ASC to stay compatible with cursor pagination.
-            // All FilterOnly results have score=0.0, so effective ordering is id ASC.
-            match query.ranking {
-                RankingMode::Relevance | RankingMode::Recency => {
-                    "ORDER BY score ASC, m.id ASC".to_string()
-                }
-            },
+            message_order_clause.to_string(),
         ),
         PlanMethod::Empty | PlanMethod::TextMatch => unreachable!(),
     };
@@ -856,9 +863,11 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     if let Some(ref cursor_str) = query.cursor
         && let Some(cursor) = SearchCursor::decode(cursor_str)
     {
-        // For relevance ranking: score ASC, id ASC
-        // Cursor means: continue after (score, id)
-        where_clauses.push("(score > ? OR (score = ? AND m.id > ?))".to_string());
+        // Cursor means: continue after the last emitted (score, id) pair,
+        // where `score` is ranking-dependent (`relevance` or encoded recency).
+        where_clauses.push(format!(
+            "({cursor_score_expr} > ? OR ({cursor_score_expr} = ? AND m.id > ?))"
+        ));
         params.push(PlanParam::Float(cursor.score));
         params.push(PlanParam::Float(cursor.score));
         params.push(PlanParam::Int(cursor.id));
@@ -872,7 +881,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         format!(" WHERE {}", where_clauses.join(" AND "))
     };
 
-    let sql = format!("SELECT {select_cols} FROM {from_clause}{where_str} {order_clause} LIMIT ?",);
+    let sql = format!("SELECT {select_cols} FROM {from_clause}{where_str} {order_clause} LIMIT ?");
     params.push(PlanParam::Int(i64::try_from(limit).unwrap_or(50)));
 
     SearchPlan {
@@ -912,7 +921,10 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let (select_cols, from_clause, order_clause) = {
         let mut like_parts = Vec::new();
         for term in &terms {
-            let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let escaped = term
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
             like_parts.push(
                 "(a.name LIKE ? ESCAPE '\\' OR a.task_description LIKE ? ESCAPE '\\')".to_string(),
             );
@@ -995,7 +1007,10 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     let (select_cols, from_clause, order_clause) = {
         let mut like_parts = Vec::new();
         for term in &terms {
-            let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let escaped = term
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
             like_parts
                 .push("(p.slug LIKE ? ESCAPE '\\' OR p.human_key LIKE ? ESCAPE '\\')".to_string());
             let pattern = format!("%{escaped}%");
@@ -1456,8 +1471,29 @@ mod tests {
         let mut q = SearchQuery::messages("test", 1);
         q.cursor = Some(cursor.encode());
         let plan = plan_search(&q);
-        assert!(plan.sql.contains("score > ?"));
+        assert!(plan.sql.contains("0.0 > ?"));
         assert!(plan.sql.contains("m.id > ?"));
+        assert!(plan.facets_applied.contains(&"cursor".to_string()));
+    }
+
+    #[test]
+    fn plan_with_cursor_recency_uses_created_ts_expression() {
+        let cursor = SearchCursor {
+            score: -1_700_000_000_000_000.0,
+            id: 123,
+        };
+        let mut q = SearchQuery::messages("test", 1);
+        q.ranking = RankingMode::Recency;
+        q.cursor = Some(cursor.encode());
+        let plan = plan_search(&q);
+        assert!(
+            plan.sql
+                .contains("ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC")
+        );
+        assert!(
+            plan.sql
+                .contains("-CAST(COALESCE(m.created_ts, 0) AS REAL) > ?")
+        );
         assert!(plan.facets_applied.contains(&"cursor".to_string()));
     }
 

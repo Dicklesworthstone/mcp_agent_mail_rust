@@ -12,8 +12,8 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    DocKind, PlanMethod, PlanParam, RecoverySuggestion, SearchCursor, SearchQuery, SearchResponse,
-    SearchResult, ZeroResultGuidance, plan_search,
+    DocKind, PlanMethod, PlanParam, RankingMode, RecoverySuggestion, SearchCursor, SearchQuery,
+    SearchResponse, SearchResult, ZeroResultGuidance, plan_search,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -2723,7 +2723,7 @@ pub async fn execute_search(
 
     let raw_results = map_rows_to_results(&rows, query.doc_kind);
     let sql_row_count = raw_results.len();
-    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit());
+    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
 
     let redaction = options.redaction_policy.clone().unwrap_or_default();
     let scope_ctx = options.scope_ctx.clone().unwrap_or_else(|| ScopeContext {
@@ -2778,7 +2778,7 @@ fn finish_scoped_response(
     explain: Option<crate::search_planner::QueryExplain>,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let sql_row_count = raw_results.len();
-    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit());
+    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
     let redaction = options.redaction_policy.clone().unwrap_or_default();
     let scope_ctx = options.scope_ctx.clone().unwrap_or_else(|| ScopeContext {
         viewer: None,
@@ -2887,7 +2887,7 @@ pub async fn execute_search_simple(
         .record_legacy_query(latency_us, false);
 
     let raw_results = map_rows_to_results(&rows, query.doc_kind);
-    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit());
+    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
 
     let explain = if query.explain {
         Some(plan.explain())
@@ -3009,18 +3009,38 @@ fn map_project_row(row: &SqlRow) -> Option<SearchResult> {
 // ────────────────────────────────────────────────────────────────────
 
 /// Compute the next cursor if there are more results.
-fn compute_next_cursor(results: &[SearchResult], limit: usize) -> Option<String> {
+fn compute_next_cursor(
+    results: &[SearchResult],
+    limit: usize,
+    ranking: RankingMode,
+) -> Option<String> {
     if results.len() < limit {
         return None; // fewer than limit means no more pages
     }
     // Use the last result's (score, id) as cursor
     results.last().map(|r| {
-        let cursor = SearchCursor {
-            score: r.score.unwrap_or(0.0),
-            id: r.id,
+        let score = match ranking {
+            RankingMode::Recency => r.created_ts.map_or_else(
+                || r.score.unwrap_or(0.0),
+                |created_ts| -micros_to_f64_for_cursor(created_ts),
+            ),
+            RankingMode::Relevance => r.score.unwrap_or(0.0),
         };
+        let cursor = SearchCursor { score, id: r.id };
         cursor.encode()
     })
+}
+
+#[inline]
+fn micros_to_f64_for_cursor(micros: i64) -> f64 {
+    // Timestamps are stored in microseconds since Unix epoch. Casting is exact
+    // for all values within ±2^53, which covers practical project horizons.
+    const MAX_EXACT_I64_IN_F64: i64 = 9_007_199_254_740_992;
+    debug_assert!(micros.unsigned_abs() <= MAX_EXACT_I64_IN_F64 as u64);
+    #[allow(clippy::cast_precision_loss)]
+    {
+        micros as f64
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -3030,7 +3050,7 @@ fn compute_next_cursor(results: &[SearchResult], limit: usize) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search_planner::{Importance, SearchCursor};
+    use crate::search_planner::{Importance, RankingMode, SearchCursor};
     use mcp_agent_mail_core::metrics::global_metrics;
     #[cfg(feature = "hybrid")]
     use std::time::Duration;
@@ -3071,7 +3091,7 @@ mod tests {
             redacted: false,
             redaction_reason: None,
         }];
-        assert!(compute_next_cursor(&results, 50).is_none());
+        assert!(compute_next_cursor(&results, 50, RankingMode::Relevance).is_none());
     }
 
     #[test]
@@ -3096,14 +3116,67 @@ mod tests {
                 redaction_reason: None,
             })
             .collect();
-        let cursor = compute_next_cursor(&results, 50).unwrap();
+        let cursor = compute_next_cursor(&results, 50, RankingMode::Relevance).unwrap();
         let decoded = SearchCursor::decode(&cursor).unwrap();
         assert_eq!(decoded.id, 49);
     }
 
     #[test]
     fn next_cursor_empty_results() {
-        assert!(compute_next_cursor(&[], 50).is_none());
+        assert!(compute_next_cursor(&[], 50, RankingMode::Relevance).is_none());
+    }
+
+    #[test]
+    fn next_cursor_recency_uses_created_ts() {
+        let results = vec![SearchResult {
+            doc_kind: DocKind::Message,
+            id: 42,
+            project_id: Some(1),
+            title: "t".to_string(),
+            body: String::new(),
+            score: Some(0.0),
+            importance: None,
+            ack_required: None,
+            created_ts: Some(1_700_000_000_000_123),
+            thread_id: None,
+            from_agent: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+            redacted: false,
+            redaction_reason: None,
+        }];
+        let cursor = compute_next_cursor(&results, 1, RankingMode::Recency).unwrap();
+        let decoded = SearchCursor::decode(&cursor).unwrap();
+        assert_eq!(decoded.id, 42);
+        assert_eq!(
+            decoded.score.to_bits(),
+            (-1_700_000_000_000_123.0f64).to_bits()
+        );
+    }
+
+    #[test]
+    fn next_cursor_recency_falls_back_to_score_without_created_ts() {
+        let results = vec![SearchResult {
+            doc_kind: DocKind::Agent,
+            id: 7,
+            project_id: Some(1),
+            title: "a".to_string(),
+            body: String::new(),
+            score: Some(-3.25),
+            importance: None,
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+            redacted: false,
+            redaction_reason: None,
+        }];
+        let cursor = compute_next_cursor(&results, 1, RankingMode::Recency).unwrap();
+        let decoded = SearchCursor::decode(&cursor).unwrap();
+        assert_eq!(decoded.id, 7);
+        assert_eq!(decoded.score.to_bits(), (-3.25f64).to_bits());
     }
 
     #[test]

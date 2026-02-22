@@ -12,27 +12,18 @@
 //!   Capacity = total cache size. Re-access of a ghost key inserts directly
 //!   into Main instead of Small.
 //!
-//! Each queue is a `VecDeque` (FIFO). The `HashMap` maps keys to which queue
-//! they reside in, enabling O(1) lookup. Frequency counters are 2-bit
-//! (saturate at 3).
+//! Each queue is a `VecDeque` (FIFO). The `HashMap` maps keys to their nodes, enabling O(1) lookup.
+//! Frequency counters are 2-bit (saturate at 3).
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 
-/// Which queue a key currently resides in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Location {
-    Small,
-    Main,
-    Ghost,
-}
-
-/// An entry in the Small or Main queue.
+/// An entry in the S3-FIFO index.
 #[derive(Debug)]
-struct QueueEntry<K, V> {
-    key: K,
-    value: V,
-    freq: u8, // 2-bit, saturates at 3
+enum Node<V> {
+    Small { value: V, freq: u8 },
+    Main { value: V, freq: u8 },
+    Ghost,
 }
 
 /// S3-FIFO cache with O(1) amortized insert, get, and eviction.
@@ -52,10 +43,10 @@ struct QueueEntry<K, V> {
 /// assert_eq!(cache.get(&"key1"), Some(&100));
 /// ```
 pub struct S3FifoCache<K, V> {
-    small: VecDeque<QueueEntry<K, V>>,
-    main: VecDeque<QueueEntry<K, V>>,
+    small: VecDeque<K>,
+    main: VecDeque<K>,
     ghost: VecDeque<K>,
-    index: HashMap<K, Location>,
+    index: HashMap<K, Node<V>>,
     small_capacity: usize,
     main_capacity: usize,
     ghost_capacity: usize,
@@ -99,23 +90,12 @@ where
         K: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let loc = self.index.get(key)?;
-        match loc {
-            Location::Small => {
-                if let Some(entry) = self.small.iter_mut().find(|e| e.key.borrow() == key) {
-                    entry.freq = (entry.freq + 1).min(3);
-                    return Some(&entry.value);
-                }
-                None
+        match self.index.get_mut(key) {
+            Some(Node::Small { value, freq }) | Some(Node::Main { value, freq }) => {
+                *freq = (*freq + 1).min(3);
+                Some(value)
             }
-            Location::Main => {
-                if let Some(entry) = self.main.iter_mut().find(|e| e.key.borrow() == key) {
-                    entry.freq = (entry.freq + 1).min(3);
-                    return Some(&entry.value);
-                }
-                None
-            }
-            Location::Ghost => None, // ghost entries have no value
+            _ => None,
         }
     }
 
@@ -128,23 +108,12 @@ where
         K: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let loc = self.index.get(key)?;
-        match loc {
-            Location::Small => {
-                if let Some(entry) = self.small.iter_mut().find(|e| e.key.borrow() == key) {
-                    entry.freq = (entry.freq + 1).min(3);
-                    return Some(&mut entry.value);
-                }
-                None
+        match self.index.get_mut(key) {
+            Some(Node::Small { value, freq }) | Some(Node::Main { value, freq }) => {
+                *freq = (*freq + 1).min(3);
+                Some(value)
             }
-            Location::Main => {
-                if let Some(entry) = self.main.iter_mut().find(|e| e.key.borrow() == key) {
-                    entry.freq = (entry.freq + 1).min(3);
-                    return Some(&mut entry.value);
-                }
-                None
-            }
-            Location::Ghost => None,
+            _ => None,
         }
     }
 
@@ -155,7 +124,7 @@ where
         K: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        matches!(self.index.get(key), Some(Location::Small | Location::Main))
+        matches!(self.index.get(key), Some(Node::Small { .. } | Node::Main { .. }))
     }
 
     /// Insert a key-value pair into the cache.
@@ -164,47 +133,32 @@ where
     /// If the key exists in Small or Main, its value is updated in place.
     /// Otherwise, it enters Small.
     pub fn insert(&mut self, key: K, value: V) {
-        // Update existing entry in Small or Main
-        if let Some(loc) = self.index.get(&key) {
-            match loc {
-                Location::Small => {
-                    if let Some(entry) = self.small.iter_mut().find(|e| e.key == key) {
-                        entry.value = value;
-                        entry.freq = (entry.freq + 1).min(3);
-                    }
+        let is_ghost = if let Some(node) = self.index.get_mut(&key) {
+            match node {
+                Node::Small { value: v, freq } | Node::Main { value: v, freq } => {
+                    *v = value;
+                    *freq = (*freq + 1).min(3);
                     return;
                 }
-                Location::Main => {
-                    if let Some(entry) = self.main.iter_mut().find(|e| e.key == key) {
-                        entry.value = value;
-                        entry.freq = (entry.freq + 1).min(3);
-                    }
-                    return;
-                }
-                Location::Ghost => {
-                    // Remove from ghost, insert into main
-                    self.ghost.retain(|k| k != &key);
-                    self.index.remove(&key);
-                    self.evict_main_if_full();
-                    self.main.push_back(QueueEntry {
-                        key: key.clone(),
-                        value,
-                        freq: 0,
-                    });
-                    self.index.insert(key, Location::Main);
-                    return;
-                }
+                Node::Ghost => true,
             }
+        } else {
+            false
+        };
+
+        if is_ghost {
+            if let Some(pos) = self.ghost.iter().position(|k| k == &key) {
+                self.ghost.remove(pos);
+            }
+            self.evict_main_if_full();
+            self.main.push_back(key.clone());
+            self.index.insert(key, Node::Main { value, freq: 0 });
+            return;
         }
 
-        // New key: insert into Small
         self.evict_small_if_full();
-        self.small.push_back(QueueEntry {
-            key: key.clone(),
-            value,
-            freq: 0,
-        });
-        self.index.insert(key, Location::Small);
+        self.small.push_back(key.clone());
+        self.index.insert(key, Node::Small { value, freq: 0 });
     }
 
     /// Number of live entries (Small + Main, excludes Ghost).
@@ -231,24 +185,26 @@ where
         K: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let loc = self.index.remove(key)?;
-        match loc {
-            Location::Small => {
-                if let Some(pos) = self.small.iter().position(|e| e.key.borrow() == key) {
-                    return Some(self.small.remove(pos).unwrap().value);
+        match self.index.remove(key) {
+            Some(Node::Small { value, .. }) => {
+                if let Some(pos) = self.small.iter().position(|k| k.borrow() == key) {
+                    self.small.remove(pos);
+                }
+                Some(value)
+            }
+            Some(Node::Main { value, .. }) => {
+                if let Some(pos) = self.main.iter().position(|k| k.borrow() == key) {
+                    self.main.remove(pos);
+                }
+                Some(value)
+            }
+            Some(Node::Ghost) => {
+                if let Some(pos) = self.ghost.iter().position(|k| k.borrow() == key) {
+                    self.ghost.remove(pos);
                 }
                 None
             }
-            Location::Main => {
-                if let Some(pos) = self.main.iter().position(|e| e.key.borrow() == key) {
-                    return Some(self.main.remove(pos).unwrap().value);
-                }
-                None
-            }
-            Location::Ghost => {
-                self.ghost.retain(|k| k.borrow() != key);
-                None
-            }
+            None => None,
         }
     }
 
@@ -257,26 +213,23 @@ where
     /// Items with `freq >= 1` promote to Main; others go to Ghost.
     fn evict_small_if_full(&mut self) {
         while self.small.len() >= self.small_capacity {
-            let Some(entry) = self.small.pop_front() else {
+            let Some(key) = self.small.pop_front() else {
                 break;
             };
-            self.index.remove(&entry.key);
+            
+            let (value, freq) = match self.index.remove(&key) {
+                Some(Node::Small { value, freq }) => (value, freq),
+                _ => continue,
+            };
 
-            if entry.freq >= 1 {
-                // Promote to Main
+            if freq >= 1 {
                 self.evict_main_if_full();
-                self.index.insert(entry.key.clone(), Location::Main);
-                self.main.push_back(QueueEntry {
-                    key: entry.key,
-                    value: entry.value,
-                    freq: 0, // reset on promotion
-                });
+                self.main.push_back(key.clone());
+                self.index.insert(key, Node::Main { value, freq: 0 });
             } else {
-                // Demote to Ghost (key only)
                 self.evict_ghost_if_full();
-                self.index.insert(entry.key.clone(), Location::Ghost);
-                self.ghost.push_back(entry.key);
-                // value is dropped
+                self.ghost.push_back(key.clone());
+                self.index.insert(key, Node::Ghost);
             }
         }
     }
@@ -286,23 +239,21 @@ where
     /// Items with `freq >= 1` get reinserted at tail with freq reset.
     /// Others are permanently evicted.
     fn evict_main_if_full(&mut self) {
-        // Safety limit to prevent infinite loop if all entries have freq >= 1
         let mut budget = self.main.len() + 1;
         while self.main.len() >= self.main_capacity && budget > 0 {
             budget -= 1;
-            let Some(entry) = self.main.pop_front() else {
+            let Some(key) = self.main.pop_front() else {
                 break;
             };
-            if entry.freq >= 1 {
-                // Reinsert at tail with reset freq
-                self.main.push_back(QueueEntry {
-                    key: entry.key,
-                    value: entry.value,
-                    freq: 0,
-                });
-            } else {
-                // Permanent eviction
-                self.index.remove(&entry.key);
+            
+            let (value, freq) = match self.index.remove(&key) {
+                Some(Node::Main { value, freq }) => (value, freq),
+                _ => continue,
+            };
+
+            if freq >= 1 {
+                self.main.push_back(key.clone());
+                self.index.insert(key, Node::Main { value, freq: 0 });
             }
         }
     }
@@ -310,8 +261,8 @@ where
     /// Evict from Ghost until it is below capacity.
     fn evict_ghost_if_full(&mut self) {
         while self.ghost.len() >= self.ghost_capacity {
-            if let Some(evicted_key) = self.ghost.pop_front() {
-                self.index.remove(&evicted_key);
+            if let Some(key) = self.ghost.pop_front() {
+                self.index.remove(&key);
             }
         }
     }
@@ -344,10 +295,7 @@ where
 
     /// Iterate over all live keys (Small + Main queues, excluding Ghost).
     pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.small
-            .iter()
-            .map(|e| &e.key)
-            .chain(self.main.iter().map(|e| &e.key))
+        self.small.iter().chain(self.main.iter())
     }
 }
 
