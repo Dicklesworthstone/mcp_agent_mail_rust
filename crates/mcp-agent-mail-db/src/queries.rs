@@ -2834,8 +2834,8 @@ async fn run_like_fallback(
         params.push(Value::Text(escaped));
         where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
     }
-    // Match FTS5 default semantics: all terms must appear (intersection).
-    let where_clause = where_parts.join(" AND ");
+    // Fallback should stay permissive: match when any extracted term appears.
+    let where_clause = where_parts.join(" OR ");
     params.push(Value::BigInt(limit));
 
     let sql = format!(
@@ -2868,8 +2868,8 @@ async fn run_like_fallback_product(
         params.push(Value::Text(escaped));
         where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
     }
-    // Match FTS5 default semantics: all terms must appear (intersection).
-    let where_clause = where_parts.join(" AND ");
+    // Fallback should stay permissive: match when any extracted term appears.
+    let where_clause = where_parts.join(" OR ");
     params.push(Value::BigInt(limit));
 
     let sql = format!(
@@ -3430,7 +3430,7 @@ async fn run_like_fallback_global(
          WHERE {} \
          ORDER BY m.created_ts DESC \
          LIMIT ?",
-        conditions.join(" AND ")
+        conditions.join(" OR ")
     );
     params.push(Value::BigInt(limit));
 

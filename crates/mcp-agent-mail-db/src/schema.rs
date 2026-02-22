@@ -1066,11 +1066,16 @@ fn is_fts_migration(id: &str) -> bool {
 /// Migrations that use SQL features unsupported by `FrankenConnection`.
 ///
 /// Includes FTS5 virtual tables, queries with aggregate functions over JOINs,
-/// and CREATE INDEX with expressions (COLLATE NOCASE).
+/// CREATE INDEX with expressions (COLLATE NOCASE), and message triggers that
+/// depend on `fts_messages`.
 fn is_unsupported_by_franken(id: &str) -> bool {
     is_fts_migration(id)
         || matches!(
             id,
+            "v1_create_trigger_messages_ai"
+                | "v1_create_trigger_messages_ad"
+                | "v1_create_trigger_messages_au"
+                |
             "v6_backfill_inbox_stats"
                 | "v6_trg_inbox_stats_insert"
                 | "v6_trg_inbox_stats_mark_read"
@@ -1204,16 +1209,15 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
 /// Migrations excluding FTS5 virtual tables and FTS backfill inserts.
 ///
 /// Safe for databases that will be opened by `FrankenConnection`. The migration
-/// runner records only core schema migrations in the migrations table.
-///
-/// Base cleanup statements are applied idempotently at runtime without creating
-/// additional migration rows.
+/// runner records core schema migrations plus base cleanup drops in the
+/// migrations table.
 #[must_use]
 pub fn schema_migrations_base() -> Vec<Migration> {
-    let migrations: Vec<Migration> = schema_migrations()
+    let mut migrations: Vec<Migration> = schema_migrations()
         .into_iter()
         .filter(|m| !is_unsupported_by_franken(&m.id))
         .collect();
+    migrations.extend(base_trigger_cleanup_migrations());
     migrations
 }
 
@@ -1495,7 +1499,7 @@ mod tests {
         // Migrating should not delete existing rows.
         block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result().unwrap() }
         });
 
         let rows = conn
@@ -1517,7 +1521,7 @@ mod tests {
 
         block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result().unwrap() }
         });
 
         insert_inbox_stats_test_project(&conn);
@@ -2016,7 +2020,7 @@ mod tests {
         // Run migrations (v3 should convert TEXT timestamps).
         block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result().unwrap() }
         });
 
         // Verify projects.created_at is now INTEGER
@@ -2205,7 +2209,7 @@ mod tests {
         // Now run migrations — v4 should create indexes on existing tables.
         let applied = block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result().unwrap() }
         });
 
         // v4 indexes should be among applied migrations.
