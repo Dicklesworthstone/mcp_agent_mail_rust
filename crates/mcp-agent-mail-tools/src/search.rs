@@ -297,9 +297,12 @@ pub(crate) fn summarize_messages(
 
             // Mentions
             for token in stripped.split_whitespace() {
-                let cleaned_start = token.trim_start_matches(|c: char| MENTION_TRIM.contains(&c) || c == '"' || c == '\'');
+                let cleaned_start = token.trim_start_matches(|c: char| {
+                    MENTION_TRIM.contains(&c) || c == '"' || c == '\''
+                });
                 if let Some(rest) = cleaned_start.strip_prefix('@') {
-                    let name = rest.trim_matches(|c: char| MENTION_TRIM.contains(&c) || c == '"' || c == '\'');
+                    let name = rest
+                        .trim_matches(|c: char| MENTION_TRIM.contains(&c) || c == '"' || c == '\'');
                     if !name.is_empty() {
                         *mentions.entry(name.to_string()).or_insert(0) += 1;
                     }
@@ -662,7 +665,11 @@ pub async fn search_messages(
 ) -> McpResult<String> {
     let max_results_raw = limit.unwrap_or(20).clamp(1, 1000);
     let max_results = max_results_raw.unsigned_abs() as usize;
-    let offset_val = if cursor.is_some() { 0 } else { offset.unwrap_or(0).max(0).unsigned_abs() as usize };
+    let offset_val = if cursor.is_some() {
+        0
+    } else {
+        offset.unwrap_or(0).max(0).unsigned_abs() as usize
+    };
     let planner_limit = max_results.saturating_add(offset_val).min(1000);
     let want_explain = explain.unwrap_or(false);
 

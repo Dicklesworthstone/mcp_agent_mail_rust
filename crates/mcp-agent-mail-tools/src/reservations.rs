@@ -127,7 +127,7 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
 fn relativize_path(project_root: &str, path: &str) -> Option<String> {
     let normalized_slash = path.replace('\\', "/");
     let path_path = std::path::Path::new(&normalized_slash);
-    
+
     let rel_path = if path_path.is_absolute() {
         if let Ok(rel) = path_path.strip_prefix(project_root) {
             rel

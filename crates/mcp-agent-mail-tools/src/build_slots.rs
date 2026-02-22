@@ -230,31 +230,32 @@ pub async fn renew_build_slot(
     let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
 
-    let branch = compute_branch(&project.human_key);
-    let holder_id = safe_component(&format!(
-        "{agent_name}__{}",
-        branch.clone().unwrap_or_else(|| "unknown".to_string())
-    ));
-    let lease_path = slot_path.join(format!("{holder_id}.json"));
+    let mut renewed = false;
+    let active = read_active_leases(&slot_path, now);
 
-    // If lease doesn't exist, do not renew (prevent acquiring without conflict check).
-    let Ok(text) = std::fs::read_to_string(&lease_path) else {
+    for mut current in active {
+        if current.agent == agent_name {
+            let holder_id = safe_component(&format!(
+                "{}__{}",
+                current.agent,
+                current.branch.clone().unwrap_or_else(|| "unknown".to_string())
+            ));
+            let lease_path = slot_path.join(format!("{holder_id}.json"));
+
+            current.expires_ts.clone_from(&new_exp);
+            let _ = write_lease_json(&lease_path, &current);
+            renewed = true;
+        }
+    }
+
+    if !renewed {
         let response = RenewBuildSlotResponse {
             renewed: false,
             expires_ts: String::new(),
         };
         return serde_json::to_string(&response)
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
-    };
-
-    let mut current = serde_json::from_str::<BuildSlotLease>(&text)
-        .map_err(|e| McpError::internal_error(format!("Failed to parse existing lease: {e}")))?;
-
-    current.slot = slot;
-    current.agent = agent_name;
-    current.branch = branch;
-    current.expires_ts.clone_from(&new_exp);
-    let _ = write_lease_json(&lease_path, &current);
+    }
 
     let response = RenewBuildSlotResponse {
         renewed: true,
@@ -287,31 +288,48 @@ pub async fn release_build_slot(
 
     let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
-    let branch = compute_branch(&project.human_key);
-    let holder_id = safe_component(&format!(
-        "{agent_name}__{}",
-        branch.clone().unwrap_or_else(|| "unknown".to_string())
-    ));
-    let lease_path = slot_path.join(format!("{holder_id}.json"));
-
+    
     let mut released = false;
-    let mut data = std::fs::read_to_string(&lease_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<BuildSlotLease>(&t).ok())
-        .unwrap_or_else(|| BuildSlotLease {
-            slot,
-            agent: agent_name,
+    let active = read_active_leases(&slot_path, now);
+
+    for mut lease in active {
+        if lease.agent == agent_name {
+            let holder_id = safe_component(&format!(
+                "{}__{}",
+                lease.agent,
+                lease.branch.clone().unwrap_or_else(|| "unknown".to_string())
+            ));
+            let lease_path = slot_path.join(format!("{holder_id}.json"));
+
+            lease.released_ts = Some(now_iso.clone());
+            lease.expires_ts.clone_from(&now_iso);
+            if write_lease_json(&lease_path, &lease).is_ok() {
+                released = true;
+            }
+        }
+    }
+
+    if !released {
+        let branch = compute_branch(&project.human_key);
+        let holder_id = safe_component(&format!(
+            "{agent_name}__{}",
+            branch.clone().unwrap_or_else(|| "unknown".to_string())
+        ));
+        let lease_path = slot_path.join(format!("{holder_id}.json"));
+
+        let data = BuildSlotLease {
+            slot: slot.clone(),
+            agent: agent_name.clone(),
             branch,
             exclusive: true,
             acquired_ts: now_iso.clone(),
             expires_ts: now_iso.clone(),
-            released_ts: None,
-        });
+            released_ts: Some(now_iso.clone()),
+        };
 
-    data.released_ts = Some(now_iso.clone());
-    data.expires_ts.clone_from(&now_iso);
-    if write_lease_json(&lease_path, &data).is_ok() {
-        released = true;
+        if write_lease_json(&lease_path, &data).is_ok() {
+            released = true;
+        }
     }
 
     let response = ReleaseBuildSlotResponse {

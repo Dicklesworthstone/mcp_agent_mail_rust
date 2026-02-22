@@ -533,10 +533,7 @@ pub async fn macro_contact_handshake(
 
     // Fast path: auto-accept same-project without welcome message.
     let is_same_project = to_project.as_ref().is_none_or(|p| p == &project_key);
-    if should_auto_accept
-        && is_same_project
-        && welcome_subject.is_none()
-        && welcome_body.is_none()
+    if should_auto_accept && is_same_project && welcome_subject.is_none() && welcome_body.is_none()
     {
         let pool = get_db_pool()?;
         let project = resolve_project(ctx, &pool, &project_key).await?;

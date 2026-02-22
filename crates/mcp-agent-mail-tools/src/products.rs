@@ -571,7 +571,11 @@ pub async fn summarize_thread_product(
         rows.extend(msgs);
     }
 
-    rows.sort_by(|a, b| a.created_ts.cmp(&b.created_ts).then_with(|| a.id.cmp(&b.id)));
+    rows.sort_by(|a, b| {
+        a.created_ts
+            .cmp(&b.created_ts)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     let use_llm = llm_mode.unwrap_or(true);
     let mut summary = crate::search::summarize_messages(&rows);
 

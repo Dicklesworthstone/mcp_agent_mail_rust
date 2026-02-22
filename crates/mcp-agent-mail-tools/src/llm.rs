@@ -438,9 +438,7 @@ async fn complete_single(
     let body_bytes =
         serde_json::to_vec(&payload).map_err(|e| LlmError::ParseError(e.to_string()))?;
 
-    let mut headers = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-    ];
+    let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     if is_anthropic {
         headers.push(("x-api-key".to_string(), auth.replace("Bearer ", "")));
         headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));

@@ -397,10 +397,9 @@ fn sanitize_thread_id(raw: &str, fallback: &str) -> String {
     let sanitized: String = raw
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
-        .skip_while(|c| !c.is_ascii_alphanumeric())
         .take(128)
         .collect();
-    if sanitized.is_empty() {
+    if sanitized.is_empty() || !sanitized.as_bytes()[0].is_ascii_alphanumeric() {
         return fallback.to_string();
     }
     sanitized
