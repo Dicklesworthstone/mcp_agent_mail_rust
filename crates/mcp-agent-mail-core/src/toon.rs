@@ -287,7 +287,10 @@ fn parse_token_line(line: &str) -> Option<(u64, u64)> {
 
     // Extract first ~N
     let json_start = trimmed.find('~')? + 1;
-    let json_end = trimmed[json_start..].find(|c: char| !c.is_ascii_digit())? + json_start;
+    let json_end = trimmed[json_start..]
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len() - json_start)
+        + json_start;
     let json_val: u64 = trimmed[json_start..json_end].parse().ok()?;
 
     // Find arrow (-> or →) and extract second ~N
