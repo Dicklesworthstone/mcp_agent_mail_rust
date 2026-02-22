@@ -1130,6 +1130,86 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     )))
 }
 
+/// Like [`ensure_sqlite_file_healthy`], but attempts to reconstruct the
+/// database from the Git archive before falling back to a blank reinitialize.
+///
+/// Recovery priority:
+/// 1. `.bak` / `.backup-*` / `.recovery*` backup files
+/// 2. Git archive reconstruction (recovers messages + agents)
+/// 3. Blank reinitialization (empty database)
+#[allow(clippy::result_large_err)]
+pub fn ensure_sqlite_file_healthy_with_archive(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    if sqlite_file_is_healthy(primary_path)? {
+        return Ok(());
+    }
+
+    // Priority 1: Restore from backup
+    if let Some(backup_path) = find_healthy_backup(primary_path) {
+        restore_from_backup(primary_path, &backup_path)?;
+        if sqlite_file_is_healthy(primary_path)? {
+            return Ok(());
+        }
+        tracing::warn!(
+            "backup restore didn't produce a healthy file; falling through to archive reconstruction"
+        );
+    }
+
+    // Priority 2: Reconstruct from Git archive
+    tracing::warn!(
+        storage_root = %storage_root.display(),
+        "no healthy backup found; attempting database reconstruction from Git archive"
+    );
+
+    // Quarantine the corrupt file first
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+
+    if primary_path.exists() {
+        let quarantined =
+            primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
+        let _ = std::fs::rename(primary_path, &quarantined);
+        let _ = quarantine_sidecar(primary_path, "-wal", &timestamp);
+        let _ = quarantine_sidecar(primary_path, "-shm", &timestamp);
+    }
+
+    match crate::reconstruct::reconstruct_from_archive(primary_path, storage_root) {
+        Ok(stats) => {
+            if sqlite_file_is_healthy(primary_path)? {
+                tracing::warn!(
+                    %stats,
+                    "database successfully reconstructed from Git archive"
+                );
+                return Ok(());
+            }
+            tracing::warn!(
+                "reconstructed database failed quick_check; falling through to blank reinit"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "archive reconstruction failed; falling through to blank reinitialize"
+            );
+        }
+    }
+
+    // Priority 3: Blank reinitialization
+    reinitialize_without_backup(primary_path)?;
+    if sqlite_file_is_healthy(primary_path)? {
+        return Ok(());
+    }
+    Err(SqlError::Custom(format!(
+        "all recovery strategies exhausted for {}",
+        primary_path.display()
+    )))
+}
+
 /// Get (or create) a cached pool for the given config.
 ///
 /// Uses a read-first / write-on-miss pattern so concurrent callers sharing

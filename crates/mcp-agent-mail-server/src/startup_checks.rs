@@ -470,6 +470,14 @@ fn probe_database(config: &Config) -> ProbeResult {
 
 /// Run `PRAGMA quick_check` on the database to detect corruption.
 ///
+/// When corruption is detected, attempts automatic recovery:
+///
+/// 1. Restore from a healthy `.bak` / `.backup-*` / `.recovery*` file.
+/// 2. If no healthy backup exists, reinitialize an empty database.
+///
+/// Startup only fails if recovery itself fails. Successful recovery
+/// logs a warning and allows startup to continue.
+///
 /// Skipped when `INTEGRITY_CHECK_ON_STARTUP=false` or for in-memory databases.
 fn probe_integrity(config: &Config) -> ProbeResult {
     if !config.integrity_check_on_startup {
@@ -489,6 +497,12 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     let pool = match mcp_agent_mail_db::DbPool::new(&pool_config) {
         Ok(p) => p,
         Err(e) => {
+            let err_str = e.to_string();
+            // If pool creation itself failed due to corruption, attempt
+            // file-level recovery before giving up.
+            if mcp_agent_mail_db::is_corruption_error_message(&err_str) {
+                return attempt_probe_recovery(config);
+            }
             return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
                 problem: format!("Cannot create pool for integrity check: {e}"),
@@ -498,29 +512,70 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     };
 
     match pool.run_startup_integrity_check() {
-        Ok(_) => ProbeResult::Ok { name: "integrity" },
-        Err(mcp_agent_mail_db::DbError::IntegrityCorruption { message, details }) => {
-            let detail_str = if details.len() > 5 {
-                format!(
-                    "{} (and {} more)",
-                    details[..5].join("; "),
-                    details.len() - 5
-                )
-            } else {
-                details.join("; ")
-            };
-            ProbeResult::Fail(ProbeFailure {
+        Ok(_) => {
+            // Integrity check passed — create a proactive backup so future
+            // corruption has something to restore from.
+            if let Err(e) = pool.create_proactive_backup(Duration::from_secs(3600)) {
+                tracing::warn!(error = %e, "proactive backup failed (non-fatal)");
+            }
+            ProbeResult::Ok { name: "integrity" }
+        }
+        Err(ref e) => {
+            let err_str = e.to_string();
+            tracing::warn!(
+                error = %err_str,
+                "startup integrity check failed; attempting automatic recovery"
+            );
+            attempt_probe_recovery(config)
+        }
+    }
+}
+
+/// Attempt file-level recovery when the integrity probe detects corruption.
+///
+/// Uses the archive-aware recovery path which tries, in order:
+/// 1. Restore from a healthy `.bak` / `.backup-*` / `.recovery*` backup
+/// 2. Reconstruct from the Git archive (recovers messages + agents)
+/// 3. Reinitialize an empty database (last resort)
+fn attempt_probe_recovery(config: &Config) -> ProbeResult {
+    let db_path = match sqlite_file_path_from_database_url(&config.database_url) {
+        Some(p) => p,
+        None => {
+            return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
-                problem: format!("SQLite corruption detected: {message}"),
-                fix: format!(
-                    "Back up the database, run PRAGMA wal_checkpoint(TRUNCATE) + VACUUM, then copy and re-check integrity. Details: {detail_str}"
-                ),
-            })
+                problem: "Cannot determine database file path for recovery".into(),
+                fix: "Check DATABASE_URL format".into(),
+            });
+        }
+    };
+
+    let storage_root = std::path::Path::new(&config.storage_root);
+
+    let result = if storage_root.is_dir() {
+        mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(&db_path, storage_root)
+    } else {
+        mcp_agent_mail_db::ensure_sqlite_file_healthy(&db_path)
+    };
+
+    match result {
+        Ok(()) => {
+            tracing::warn!(
+                path = %db_path.display(),
+                "database auto-recovered from corruption; startup will continue with recovered data"
+            );
+            ProbeResult::Ok { name: "integrity" }
         }
         Err(e) => ProbeResult::Fail(ProbeFailure {
             name: "integrity",
-            problem: format!("Integrity check failed: {e}"),
-            fix: "Check database file permissions and disk health".into(),
+            problem: format!(
+                "SQLite corruption detected and automatic recovery failed: {e}"
+            ),
+            fix: format!(
+                "Run `am doctor repair` to attempt manual recovery, or \
+                 `am doctor reconstruct` to rebuild the database from the Git archive. \
+                 The corrupt file has been quarantined at {}.corrupt-*",
+                db_path.display()
+            ),
         }),
     }
 }

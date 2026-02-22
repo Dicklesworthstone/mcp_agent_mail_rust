@@ -22,6 +22,7 @@ pub mod mail_explorer;
 pub mod models;
 pub mod pool;
 pub mod queries;
+pub mod reconstruct;
 pub mod retry;
 pub mod s3fifo;
 pub mod schema;
@@ -42,7 +43,11 @@ pub use integrity::{
     incremental_check, integrity_metrics, is_full_check_due, quick_check,
 };
 pub use models::*;
-pub use pool::{DbPool, DbPoolConfig, auto_pool_size, create_pool, get_or_create_pool};
+pub use pool::{
+    DbPool, DbPoolConfig, auto_pool_size, create_pool, ensure_sqlite_file_healthy,
+    ensure_sqlite_file_healthy_with_archive, get_or_create_pool, is_corruption_error_message,
+};
+pub use reconstruct::{ReconstructStats, reconstruct_from_archive};
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use retry::{
     CIRCUIT_BREAKER, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL, CircuitBreaker,
