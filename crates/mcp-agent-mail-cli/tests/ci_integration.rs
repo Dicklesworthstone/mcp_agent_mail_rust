@@ -261,7 +261,7 @@ fn test_default_gates_count() {
     use mcp_agent_mail_cli::ci::default_gates;
 
     let gates = default_gates();
-    assert_eq!(gates.len(), 15, "should have 15 default gates");
+    assert_eq!(gates.len(), 16, "should have 16 default gates");
 }
 
 #[test]
@@ -378,5 +378,5 @@ fn test_ci_parallel_produces_valid_report() {
     let parsed: serde_json::Value = serde_json::from_str(&content).expect("parse JSON");
 
     assert_eq!(parsed["schema_version"], "am_ci_gate_report.v1");
-    assert_eq!(parsed["gates"].as_array().unwrap().len(), 15);
+    assert_eq!(parsed["gates"].as_array().unwrap().len(), 16);
 }

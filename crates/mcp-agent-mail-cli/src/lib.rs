@@ -137,8 +137,8 @@ pub enum Commands {
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
-        /// Output JSON (shorthand for --format json, default true for detect).
-        #[arg(long, default_value_t = true)]
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
         json: bool,
         /// Path to baseline JSON for regression comparison.
         #[arg(long)]
@@ -949,10 +949,10 @@ pub struct ShareStaticExportArgs {
     #[arg(long = "project", short = 'p')]
     pub projects: Vec<String>,
     /// Include archive visualization routes.
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub include_archive: bool,
     /// Generate client-side search index artifact.
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub include_search_index: bool,
 }
 
@@ -2811,11 +2811,9 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             dry_run,
             yes,
         } => handle_doctor_restore(backup_path, dry_run, yes),
-        DoctorCommand::Reconstruct {
-            dry_run,
-            yes,
-            json,
-        } => handle_doctor_reconstruct(dry_run, yes, json),
+        DoctorCommand::Reconstruct { dry_run, yes, json } => {
+            handle_doctor_reconstruct(dry_run, yes, json)
+        }
     }
 }
 
@@ -2915,10 +2913,19 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
                     .collect()
             };
 
-            let human_key = repo_path.to_string_lossy().to_string();
-            let identity = mcp_agent_mail_core::identity::resolve_project_identity(&human_key);
-            let config = mcp_agent_mail_core::Config::get();
-            let archive_root = config.storage_root.join("projects").join(&identity.slug);
+            let config = mcp_agent_mail_core::Config::from_env();
+            let archive_root = if repo_path.join("file_reservations").is_dir() {
+                repo_path.clone()
+            } else {
+                let human_key = repo_path.to_string_lossy().to_string();
+                let identity = mcp_agent_mail_core::identity::resolve_project_identity(&human_key);
+                let candidate = config.storage_root.join("projects").join(&identity.slug);
+                if candidate.join("file_reservations").is_dir() {
+                    candidate
+                } else {
+                    repo_path.clone()
+                }
+            };
 
             let conflicts =
                 mcp_agent_mail_guard::guard_check(&archive_root, &repo_path, &paths, advisory)?;
@@ -3092,7 +3099,10 @@ fn sqlite_conn_quick_check_ok(conn: &mcp_agent_mail_db::DbConn) -> CliResult<boo
     }
 
     if checks.is_empty() {
-        return Ok(rows.is_empty());
+        // No integrity_check values parsed; database is only OK if we got
+        // no rows at all AND expected that (unlikely — PRAGMA quick_check
+        // should always return at least one row).
+        return Ok(false);
     }
 
     Ok(checks.len() == 1 && checks[0] == "ok")
@@ -7101,7 +7111,7 @@ fn handle_projects_adopt_with_conn(
     config: &Config,
     source: &str,
     target: &str,
-    dry_run: bool,
+    _dry_run: bool,
     apply: bool,
 ) -> CliResult<()> {
     let source_project = find_project_for_adopt(conn, source)?;
@@ -7161,7 +7171,8 @@ fn handle_projects_adopt_with_conn(
         return Ok(());
     }
 
-    let effective_dry_run = if apply { false } else { dry_run };
+    // Safety contract: adoption is dry-run by default; --apply is required to mutate.
+    let effective_dry_run = !apply;
     if effective_dry_run {
         return Ok(());
     }
@@ -8644,7 +8655,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     agent.id.unwrap_or(0),
                     false,
                     None,
-                    inbox_limit as usize,
+                    inbox_limit.max(0) as usize,
                 )
                 .await,
             )?;
@@ -8780,7 +8791,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     agent.id.unwrap_or(0),
                     false,
                     None,
-                    inbox_limit as usize,
+                    inbox_limit.max(0) as usize,
                 )
                 .await,
             )?;
@@ -9189,6 +9200,26 @@ mod tests {
                 }
                 _ => {}
             }
+        }
+        None
+    }
+
+    /// Extract the first JSON object that looks like doctor-check output.
+    fn extract_doctor_check_json(s: &str) -> Option<serde_json::Value> {
+        let mut cursor = s;
+        while let Some(json_str) = extract_json_block(cursor) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str)
+                && parsed.get("healthy").and_then(|v| v.as_bool()).is_some()
+                && parsed.get("checks").and_then(|v| v.as_array()).is_some()
+            {
+                return Some(parsed);
+            }
+
+            let next = json_str.len();
+            if next >= cursor.len() {
+                break;
+            }
+            cursor = &cursor[next..];
         }
         None
     }
@@ -13021,12 +13052,7 @@ mod tests {
         let cli = Cli::try_parse_from(["am", "doctor", "reconstruct"]).unwrap();
         match cli.command.unwrap() {
             Commands::Doctor {
-                action:
-                    DoctorCommand::Reconstruct {
-                        dry_run,
-                        yes,
-                        json,
-                    },
+                action: DoctorCommand::Reconstruct { dry_run, yes, json },
             } => {
                 assert!(!dry_run);
                 assert!(!yes);
@@ -13038,17 +13064,11 @@ mod tests {
 
     #[test]
     fn parse_doctor_reconstruct_all_flags() {
-        let cli =
-            Cli::try_parse_from(["am", "doctor", "reconstruct", "--dry-run", "-y", "--json"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["am", "doctor", "reconstruct", "--dry-run", "-y", "--json"])
+            .unwrap();
         match cli.command.unwrap() {
             Commands::Doctor {
-                action:
-                    DoctorCommand::Reconstruct {
-                        dry_run,
-                        yes,
-                        json,
-                    },
+                action: DoctorCommand::Reconstruct { dry_run, yes, json },
             } => {
                 assert!(dry_run);
                 assert!(yes);
@@ -13069,10 +13089,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             CliError::InvalidArgument(msg) => {
-                assert!(
-                    msg.contains("storage root does not exist"),
-                    "got: {msg}"
-                );
+                assert!(msg.contains("storage root does not exist"), "got: {msg}");
             }
             other => panic!("expected InvalidArgument, got: {other:?}"),
         }
@@ -13085,12 +13102,7 @@ mod tests {
         std::fs::create_dir_all(&projects_dir).unwrap();
         let db_path = tmp.path().join("test.db");
 
-        let result = handle_doctor_reconstruct_with(
-            Some(&db_path),
-            Some(tmp.path()),
-            true,
-            true,
-        );
+        let result = handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, true);
         assert!(result.is_ok());
     }
 
@@ -13119,12 +13131,7 @@ mod tests {
 
         let db_path = tmp.path().join("reconstructed.db");
 
-        let result = handle_doctor_reconstruct_with(
-            Some(&db_path),
-            Some(storage),
-            false,
-            true,
-        );
+        let result = handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true);
         assert!(result.is_ok(), "reconstruct failed: {result:?}");
         assert!(db_path.exists(), "reconstructed DB file should exist");
     }
@@ -18040,16 +18047,15 @@ mod tests {
             let result = handle_doctor_check_with(db_url, storage, None, false, None, true);
             let output = capture.drain_to_string();
             assert!(result.is_ok(), "doctor check should not error: {result:?}");
-            if let Some(json_str) = extract_json_block(&output) {
-                return serde_json::from_str(json_str)
-                    .unwrap_or_else(|e| panic!("invalid JSON: {e}\n{json_str}"));
+            if let Some(parsed) = extract_doctor_check_json(&output) {
+                return parsed;
             }
             if attempt == 0 {
                 // StdioCapture can miss output from async runtime work; retry
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        panic!("doctor check produced no JSON output after 2 attempts");
+        panic!("doctor check produced no matching JSON output after 2 attempts");
     }
 
     #[test]
@@ -19829,10 +19835,13 @@ fn compose_archive_basename(
 
 fn ensure_unique_archive_path(base_dir: &Path, base_name: &str) -> PathBuf {
     let mut candidate = base_dir.join(format!("{base_name}.zip"));
-    let mut counter = 1;
+    let mut counter = 1u32;
     while candidate.exists() {
         candidate = base_dir.join(format!("{base_name}-{counter:02}.zip"));
-        counter += 1;
+        counter = counter.saturating_add(1);
+        if counter == u32::MAX {
+            break;
+        }
     }
     candidate
 }
@@ -20663,8 +20672,8 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                 for entry in &entries {
                     ftui_runtime::ftui_println!(
                         "{:<32} {:<25} {:>10} {:<9} {:<20} {}",
-                        &entry.file[..entry.file.len().min(32)],
-                        &entry.created_at[..entry.created_at.len().min(25)],
+                        truncate_str(&entry.file, 32),
+                        truncate_str(&entry.created_at, 25),
                         format_bytes(entry.size_bytes),
                         entry.scrub_preset,
                         entry.projects.join(", "),
@@ -21006,15 +21015,19 @@ fn handle_doctor_reconstruct_with(
 
     // Rename the corrupt DB out of the way (if it exists).
     if db_path.exists() {
-        let quarantine = db_path.with_extension("corrupt");
-        ftui_runtime::ftui_println!(
-            "Moving corrupt database to {}",
-            quarantine.display()
-        );
+        let base_name = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("storage.sqlite3");
+        let quarantine = db_path.with_file_name(format!("{base_name}.corrupt"));
+        ftui_runtime::ftui_println!("Moving corrupt database to {}", quarantine.display());
         std::fs::rename(&db_path, &quarantine)?;
-        // Also move WAL/SHM if present.
-        for ext in &["wal", "shm"] {
-            let aux = db_path.with_extension(format!("sqlite3-{ext}"));
+        // Also remove WAL/SHM sidecars if present.
+        // SQLite names these by appending -wal/-shm to the full filename.
+        for suffix in &["-wal", "-shm"] {
+            let mut aux_os = db_path.as_os_str().to_os_string();
+            aux_os.push(suffix);
+            let aux = PathBuf::from(aux_os);
             if aux.exists() {
                 let _ = std::fs::remove_file(&aux);
             }
@@ -21093,12 +21106,12 @@ fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
 
         // Count agents
         let agents_dir = project_dir.join("agents");
-        if agents_dir.is_dir() {
-            if let Ok(agent_entries) = std::fs::read_dir(&agents_dir) {
-                for ae in agent_entries.flatten() {
-                    if ae.path().join("profile.json").exists() {
-                        stats.agents += 1;
-                    }
+        if agents_dir.is_dir()
+            && let Ok(agent_entries) = std::fs::read_dir(&agents_dir)
+        {
+            for ae in agent_entries.flatten() {
+                if ae.path().join("profile.json").exists() {
+                    stats.agents += 1;
                 }
             }
         }
@@ -21263,7 +21276,11 @@ fn render_table_text(title: Option<&str>, headers: &[&str], rows: Vec<Vec<String
 
     // Render headless to a buffer and print as text. Keep the width stable for tests.
     let width: u16 = 120;
-    let height = (row_count + 4).clamp(6, 200).try_into().unwrap_or(200u16);
+    let height = row_count
+        .saturating_add(4)
+        .clamp(6, 200)
+        .try_into()
+        .unwrap_or(200u16);
 
     let mut pool = ftui::GraphemePool::new();
     let mut frame = ftui::Frame::new(width, height, &mut pool);
@@ -21644,13 +21661,14 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
 
 /// Format microsecond timestamp as ISO-8601 string.
 fn format_micros_as_iso(micros: i64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-    let secs = micros / 1_000_000;
-    let nanos = ((micros % 1_000_000) * 1000) as u32;
-    let dt = UNIX_EPOCH + Duration::new(secs as u64, nanos);
-    // Format as ISO-8601 (simplified)
-    let datetime = chrono::DateTime::<chrono::Utc>::from(dt);
-    datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    let secs = micros.div_euclid(1_000_000);
+    let sub_micros = micros.rem_euclid(1_000_000) as u32;
+    let nanos = sub_micros.saturating_mul(1000);
+    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
+        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    } else {
+        "1970-01-01T00:00:00Z".to_string()
+    }
 }
 
 /// Default check-inbox rate limit interval in seconds.
@@ -24040,8 +24058,13 @@ fn handle_tooling_locks(format: Option<output::CliOutputFormat>, json_mode: bool
                 .and_then(|o| o.get("created_ts"))
                 .and_then(serde_json::Value::as_f64)
                 .map(|ts| {
-                    let secs = ts as i64;
-                    let nanos = ((ts - secs as f64) * 1e9) as u32;
+                    // created_ts is seconds since epoch (f64 from SystemTime::as_secs_f64)
+                    if !ts.is_finite() {
+                        return format!("{ts}");
+                    }
+                    let secs_f = ts.floor();
+                    let secs = secs_f as i64;
+                    let nanos = ((ts - secs_f) * 1e9).clamp(0.0, 999_999_999.0) as u32;
                     chrono::DateTime::from_timestamp(secs, nanos)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| format!("{ts}"))

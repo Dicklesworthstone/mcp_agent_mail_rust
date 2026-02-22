@@ -936,7 +936,9 @@ fn write_receipt(
                 path = candidate;
                 break;
             }
-            suffix += 1;
+            suffix = suffix
+                .checked_add(1)
+                .ok_or_else(|| CliError::Other("too many legacy import receipts".to_string()))?;
         }
     }
     let content = serde_json::to_string_pretty(receipt)

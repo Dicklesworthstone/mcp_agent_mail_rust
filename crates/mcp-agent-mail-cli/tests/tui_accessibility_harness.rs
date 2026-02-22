@@ -14,6 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use mcp_agent_mail_server::tui_theme::{
+    MIN_THEME_ACCENT_CONTRAST, MIN_THEME_TEXT_CONTRAST, collect_theme_contrast_metrics,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -226,16 +229,32 @@ fn native_tui_accessibility_gate() {
     // Step 1: native contrast threshold gate.
     let step = 1usize;
     let mut checks = Vec::new();
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(&repo_root).args([
-        "test",
-        "-p",
-        "mcp-agent-mail-server",
-        "theme_palettes_meet_min_contrast_thresholds",
-        "--",
-        "--nocapture",
-    ]);
-    let outcome = run_with_timeout(&mut cmd, Duration::from_secs(300));
+    let step_started = Instant::now();
+    let metrics = collect_theme_contrast_metrics();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut failures_by_theme = Vec::new();
+    for metric in &metrics {
+        stdout.push_str(&metric.log_line());
+        stdout.push('\n');
+        for (dimension, value, minimum) in
+            metric.failing_dimensions(MIN_THEME_TEXT_CONTRAST, MIN_THEME_ACCENT_CONTRAST)
+        {
+            failures_by_theme.push((metric.theme, dimension, value, minimum));
+        }
+    }
+    for (theme, dimension, value, minimum) in &failures_by_theme {
+        stderr.push_str(&format!(
+            "theme={theme:?} {dimension}={value:.2} minimum={minimum:.1}\n"
+        ));
+    }
+    let outcome = CommandOutcome {
+        exit_code: Some(if failures_by_theme.is_empty() { 0 } else { 1 }),
+        stdout,
+        stderr,
+        duration_ms: step_started.elapsed().as_millis() as u64,
+        timed_out: false,
+    };
     let (stdout_path, stderr_path) =
         write_step_outputs(&run_root, step, "contrast_native", &outcome);
     let combined = format!("{}\n{}", outcome.stdout, outcome.stderr);
@@ -246,7 +265,7 @@ fn native_tui_accessibility_gate() {
         "exit_code == 0",
         format!("exit_code={:?}", outcome.exit_code),
         outcome.exit_code == Some(0) && !outcome.timed_out,
-        "Re-run the contrast test directly and inspect theme-level failures.",
+        "Inspect step_001 logs for dimension-level threshold failures.",
     );
     push_check(
         &mut checks,
@@ -259,17 +278,15 @@ fn native_tui_accessibility_gate() {
             "missing theme=".to_string()
         },
         combined.contains("theme="),
-        "Run with --nocapture and verify contrast reporting is emitted.",
+        "Ensure collect_theme_contrast_metrics() emits one line per theme.",
     );
     let step_passed = checks.iter().all(|check| check.passed);
     steps.push(StepRecord {
         step,
         name: "contrast_native".to_string(),
-        command:
-            "cargo test -p mcp-agent-mail-server theme_palettes_meet_min_contrast_thresholds -- --nocapture"
-                .to_string(),
+        command: "native tui_theme::collect_theme_contrast_metrics() threshold gate".to_string(),
         cwd: repo_root.display().to_string(),
-        timeout_ms: 300_000,
+        timeout_ms: 5_000,
         duration_ms: outcome.duration_ms,
         exit_code: outcome.exit_code,
         timed_out: outcome.timed_out,
@@ -283,11 +300,14 @@ fn native_tui_accessibility_gate() {
     let step = 2usize;
     let mut checks = Vec::new();
     let adapter_manifest = run_root.join("adapter_result.json");
+    let adapter_target_dir = run_root.join("cargo_target");
+    fs::create_dir_all(&adapter_target_dir).expect("create adapter target dir");
     let seed = 2_026_021_300u64 + u64::from(std::process::id());
     let mut cmd = Command::new("bash");
     cmd.current_dir(&repo_root)
         .arg("scripts/e2e_tui_a11y.sh")
         .env("AM_E2E_KEEP_TMP", "1")
+        .env("CARGO_TARGET_DIR", adapter_target_dir.display().to_string())
         .env("E2E_CLOCK_MODE", "deterministic")
         .env("E2E_SEED", seed.to_string())
         .env("AM_TUI_A11Y_SKIP_CONTRAST", "1")
@@ -467,7 +487,7 @@ fn native_tui_accessibility_gate() {
     steps.push(StepRecord {
         step,
         name: "shell_adapter".to_string(),
-        command: "bash scripts/e2e_tui_a11y.sh (AM_TUI_A11Y_SKIP_CONTRAST=1, AM_TUI_A11Y_ADAPTER_OUTPUT=<path>)".to_string(),
+        command: "bash scripts/e2e_tui_a11y.sh (CARGO_TARGET_DIR=<isolated>, AM_TUI_A11Y_SKIP_CONTRAST=1, AM_TUI_A11Y_ADAPTER_OUTPUT=<path>)".to_string(),
         cwd: repo_root.display().to_string(),
         timeout_ms: 900_000,
         duration_ms: outcome.duration_ms,
@@ -498,6 +518,7 @@ fn native_tui_accessibility_gate() {
                 "status": adapter_status,
                 "exit_code": adapter_exit_code,
                 "artifact_dir": adapter_artifact_dir,
+                "cargo_target_dir": adapter_target_dir.display().to_string(),
                 "summary_path": adapter_summary_path,
                 "bundle_path": adapter_bundle_path,
                 "trace_path": adapter_trace_path
