@@ -26,29 +26,29 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.2.0", path = "/dp/fastmcp_rust/crates/fastmcp", package = "fastmcp-rust" }
-fastmcp-core = { version = "0.2.0", path = "/dp/fastmcp_rust/crates/fastmcp-core" }
-fastmcp-server = { version = "0.2.0", path = "/dp/fastmcp_rust/crates/fastmcp-server" }
-fastmcp-transport = { version = "0.2.0", path = "/dp/fastmcp_rust/crates/fastmcp-transport" }
-fastmcp-protocol = { version = "0.2.0", path = "/dp/fastmcp_rust/crates/fastmcp-protocol" }
+fastmcp = { version = "0.2.0", package = "fastmcp-rust" }
+fastmcp-core = "0.2.0"
+fastmcp-server = "0.2.0"
+fastmcp-transport = "0.2.0"
+fastmcp-protocol = "0.2.0"
 
-asupersync = { version = "0.2.0", path = "/dp/asupersync", features = ["tls-webpki-roots"] }
+asupersync = { version = "0.2.5", features = ["tls-webpki-roots"] }
 
-sqlmodel = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel" }
-sqlmodel-core = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-query = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
-sqlmodel-schema = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
-sqlmodel-session = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
-sqlmodel-pool = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel = "0.2.0"
+sqlmodel-core = "0.2.0"
+sqlmodel-query = "0.2.0"
+sqlmodel-schema = "0.2.0"
+sqlmodel-session = "0.2.0"
+sqlmodel-pool = "0.2.0"
 sqlmodel-frankensqlite = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
 
-ftui = { version = "0.2.0", path = "/dp/frankentui/crates/ftui" }
-ftui-runtime = { version = "0.2.0", path = "/dp/frankentui/crates/ftui-runtime", features = ["native-backend"] }
-ftui-extras = { version = "0.2.0", path = "/dp/frankentui/crates/ftui-extras", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
-ftui-widgets = { version = "0.2.0", path = "/dp/frankentui/crates/ftui-widgets", features = ["debug-overlay", "regex-search"] }
-ftui-tty = { version = "0.2.0", path = "/dp/frankentui/crates/ftui-tty" }
-ftui-harness = { version = "0.2.0", path = "/dp/frankentui/crates/ftui-harness" }
-ftui-render = { version = "0.2.0", path = "/dp/frankentui/crates/ftui-render" }
+ftui = "0.2.1"
+ftui-runtime = { version = "0.2.1", features = ["native-backend"] }
+ftui-extras = { version = "0.2.1", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
+ftui-widgets = { version = "0.2.1", features = ["debug-overlay", "regex-search"] }
+ftui-tty = "0.2.1"
+ftui-harness = "0.2.1"
+ftui-render = "0.2.1"
 beads_rust = { path = "/dp/beads_rust" }
 toon = { version = "0.2.0", package = "tru", path = "/dp/toon_rust" }
 
@@ -147,9 +147,4 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Force a single asupersync throughout the dependency graph to avoid
-# type-identity mismatches (Cx/Outcome/etc).
-# Uses /dp/ canonical path to match frankensearch's Cargo.toml.
-asupersync = { path = "/dp/asupersync" }
-# Local hotfix: avoid panic-on-read in uring-fs (1.4.0) under release panic=abort.
 uring-fs = { path = "vendor/uring-fs" }
