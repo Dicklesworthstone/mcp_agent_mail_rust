@@ -10,12 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use std::{collections::HashMap};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE;
 use mcp_agent_mail_db::sqlmodel_core::{Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
+#[cfg(test)]
+use mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{
@@ -79,22 +81,20 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn fetch_counts(&self) -> DbSnapshotCounts {
-        let now = now_micros();
-        let reservation_count_sql = format!(
+        let reservation_count_sql =
             "SELECT \
              (SELECT COUNT(*) FROM projects) AS projects_count, \
              (SELECT COUNT(*) FROM agents) AS agents_count, \
              (SELECT COUNT(*) FROM messages) AS messages_count, \
-             (SELECT COUNT(*) FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?) \
-               AS reservations_count, \
              (SELECT COUNT(*) FROM agent_links) AS contacts_count, \
              (SELECT COUNT(*) FROM message_recipients \
                WHERE ack_ts IS NULL \
-                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)) AS ack_pending_count"
-        );
+                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)) AS ack_pending_count";
+        let now = now_micros();
+        let reservation_count = self.count_active_reservations(now);
         let batched = self
             .conn
-            .query_sync(&reservation_count_sql, &[Value::BigInt(now)])
+            .query_sync(reservation_count_sql, &[])
             .ok()
             .and_then(|rows| rows.into_iter().next())
             .map(|row| {
@@ -108,7 +108,7 @@ impl<'a> DbStatQueryBatcher<'a> {
                     projects: read_count("projects_count"),
                     agents: read_count("agents_count"),
                     messages: read_count("messages_count"),
-                    file_reservations: read_count("reservations_count"),
+                    file_reservations: reservation_count,
                     contact_links: read_count("contacts_count"),
                     ack_pending: read_count("ack_pending_count"),
                 }
@@ -133,14 +133,7 @@ impl<'a> DbStatQueryBatcher<'a> {
             messages: self
                 .run_count_query("SELECT COUNT(*) AS c FROM messages", &[])
                 .unwrap_or(0),
-            file_reservations: self
-                .run_count_query(
-                    &format!(
-                        "SELECT COUNT(*) AS c FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
-                    ),
-                    &[Value::BigInt(now)],
-                )
-                .unwrap_or(0),
+            file_reservations: self.count_active_reservations(now),
             contact_links: self
                 .run_count_query("SELECT COUNT(*) AS c FROM agent_links", &[])
                 .unwrap_or(0),
@@ -163,6 +156,28 @@ impl<'a> DbStatQueryBatcher<'a> {
             .next()
             .and_then(|row| row.get_named::<i64>("c").ok())
             .and_then(|v| u64::try_from(v).ok())
+    }
+
+    fn count_active_reservations(&self, now: i64) -> u64 {
+        let rows = match self.conn.query_sync(
+            "SELECT expires_ts AS raw_expires_ts, released_ts AS raw_released_ts FROM file_reservations",
+            &[],
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return 0,
+        };
+        #[cfg(test)]
+        if let Some(first) = rows.first() {
+            debug_row_shape("count_active_reservations", first);
+        }
+        u64::try_from(
+            rows.into_iter()
+                .filter(|row| {
+                    is_active_reservation_row(row, now, "raw_expires_ts", "raw_released_ts")
+                })
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
     }
 }
 
@@ -235,10 +250,31 @@ impl DbPoller {
         let mut last_health_emit = now
             .checked_sub(HEALTH_PULSE_HEARTBEAT_INTERVAL)
             .unwrap_or(now);
+        let mut panic_recovery_active = false;
 
         while !self.stop.load(Ordering::Relaxed) {
             // Fetch fresh snapshot
-            if let Some(snapshot) = fetch_db_stats(&self.database_url) {
+            let snapshot = match catch_optional_panic(|| fetch_db_stats(&self.database_url)) {
+                Ok(snapshot) => {
+                    if panic_recovery_active {
+                        tracing::info!(
+                            "tui-db-poller recovered after a panic; resuming normal polling"
+                        );
+                        panic_recovery_active = false;
+                    }
+                    snapshot
+                }
+                Err(_) => {
+                    if !panic_recovery_active {
+                        tracing::warn!(
+                            "tui-db-poller recovered from a panic while polling DB; keeping UI alive"
+                        );
+                        panic_recovery_active = true;
+                    }
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
                 let changed = snapshot_delta(&prev, &snapshot).any_changed();
                 // Always refresh shared DB stats so timestamp/list snapshots
                 // stay current even when aggregate counters are steady.
@@ -295,6 +331,17 @@ impl Drop for DbPollerHandle {
 // ──────────────────────────────────────────────────────────────────────
 // DB query helpers
 // ──────────────────────────────────────────────────────────────────────
+
+/// Run a closure that returns `Option<T>`, converting unwind panics into `Err`.
+///
+/// The TUI poller uses this to keep the UI responsive when underlying storage
+/// layers panic unexpectedly (for example, during transient driver failures).
+fn catch_optional_panic<T, F>(fetcher: F) -> std::thread::Result<Option<T>>
+where
+    F: FnOnce() -> Option<T> + std::panic::UnwindSafe,
+{
+    std::panic::catch_unwind(fetcher)
+}
 
 /// Fetch a complete [`DbStatSnapshot`] from the database.
 ///
@@ -358,26 +405,24 @@ fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
     let sql = format!(
         "SELECT p.id, p.slug, p.human_key, p.created_at, \
          COALESCE(ac.cnt, 0) AS agent_count, \
-         COALESCE(mc.cnt, 0) AS message_count, \
-         COALESCE(rc.cnt, 0) AS reservation_count \
+         COALESCE(mc.cnt, 0) AS message_count \
          FROM projects p \
          LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM agents GROUP BY project_id) ac \
            ON ac.project_id = p.id \
          LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM messages GROUP BY project_id) mc \
            ON mc.project_id = p.id \
-         LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM file_reservations \
-           WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? GROUP BY project_id) rc \
-           ON rc.project_id = p.id \
          ORDER BY p.created_at DESC \
          LIMIT {MAX_PROJECTS}"
     );
-    conn.query_sync(&sql, &[Value::BigInt(now)])
+    let reservation_counts = fetch_active_reservation_counts_by_project(conn, now);
+    conn.query_sync(&sql, &[])
         .ok()
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
+                    let project_id = row.get_named::<i64>("id").ok()?;
                     Some(ProjectSummary {
-                        id: row.get_named::<i64>("id").ok()?,
+                        id: project_id,
                         slug: row.get_named::<String>("slug").ok()?,
                         human_key: row.get_named::<String>("human_key").ok()?,
                         agent_count: row
@@ -390,17 +435,38 @@ fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
                             .ok()
                             .and_then(|v| u64::try_from(v).ok())
                             .unwrap_or(0),
-                        reservation_count: row
-                            .get_named::<i64>("reservation_count")
-                            .ok()
-                            .and_then(|v| u64::try_from(v).ok())
-                            .unwrap_or(0),
+                        reservation_count: reservation_counts.get(&project_id).copied().unwrap_or(0),
                         created_at: row.get_named::<i64>("created_at").ok().unwrap_or(0),
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn fetch_active_reservation_counts_by_project(conn: &DbConn, now: i64) -> HashMap<i64, u64> {
+    let rows = match conn.query_sync(
+        "SELECT project_id, expires_ts AS raw_expires_ts, released_ts AS raw_released_ts FROM file_reservations",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(_) => return HashMap::new(),
+    };
+    #[cfg(test)]
+    if let Some(first) = rows.first() {
+        debug_row_shape("fetch_active_reservation_counts_by_project", first);
+    }
+    let mut counts = HashMap::new();
+    for row in rows {
+        if !is_active_reservation_row(&row, now, "raw_expires_ts", "raw_released_ts") {
+            continue;
+        }
+        let Some(project_id) = parse_raw_i64(&row, "project_id") else {
+            continue;
+        };
+        *counts.entry(project_id).or_insert(0) += 1;
+    }
+    counts
 }
 
 /// Fetch the contact links list with agent names resolved.
@@ -450,12 +516,39 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 /// - Anything else → 0
 fn parse_raw_ts(row: &Row, col: &str) -> i64 {
     match row.get_by_name(col) {
+        Some(Value::Timestamp(v)) => *v,
+        Some(Value::TimestampTz(v)) => *v,
+        Some(Value::Time(v)) => *v,
+        Some(Value::Date(v)) => i64::from(*v),
         Some(Value::BigInt(v)) => *v,
         Some(Value::Int(v)) => i64::from(*v),
+        Some(Value::SmallInt(v)) => i64::from(*v),
+        Some(Value::TinyInt(v)) => i64::from(*v),
+        Some(Value::Bool(v)) => i64::from(*v),
         Some(Value::Double(v)) => parse_float_ts(*v),
         Some(Value::Float(v)) => parse_float_ts(f64::from(*v)),
+        Some(Value::Decimal(s)) => parse_text_timestamp(s),
         Some(Value::Text(s)) => parse_text_timestamp(s),
         _ => 0,
+    }
+}
+
+fn parse_raw_i64(row: &Row, col: &str) -> Option<i64> {
+    match row.get_by_name(col) {
+        Some(Value::Timestamp(v)) => Some(*v),
+        Some(Value::TimestampTz(v)) => Some(*v),
+        Some(Value::Time(v)) => Some(*v),
+        Some(Value::Date(v)) => Some(i64::from(*v)),
+        Some(Value::BigInt(v)) => Some(*v),
+        Some(Value::Int(v)) => Some(i64::from(*v)),
+        Some(Value::SmallInt(v)) => Some(i64::from(*v)),
+        Some(Value::TinyInt(v)) => Some(i64::from(*v)),
+        Some(Value::Bool(v)) => Some(i64::from(*v)),
+        Some(Value::Double(v)) => Some(parse_float_ts(*v)),
+        Some(Value::Float(v)) => Some(parse_float_ts(f64::from(*v))),
+        Some(Value::Decimal(s)) => s.trim().parse::<i64>().ok(),
+        Some(Value::Text(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
     }
 }
 
@@ -490,6 +583,10 @@ fn parse_text_timestamp(s: &str) -> i64 {
     // Pure numeric string → microseconds
     if let Ok(v) = s.parse::<i64>() {
         return v;
+    }
+    // Decimal numeric text is also treated as microseconds.
+    if let Ok(v) = s.parse::<f64>() {
+        return parse_float_ts(v);
     }
     // Try YYYY-MM-DD HH:MM:SS[.ffffff] format
     // Split on space → date part + time part
@@ -533,6 +630,52 @@ fn parse_text_timestamp(s: &str) -> i64 {
     unix_seconds * 1_000_000 + frac_micros
 }
 
+fn is_active_reservation_row(row: &Row, now: i64, expires_col: &str, released_col: &str) -> bool {
+    parse_raw_ts(row, expires_col) > now && released_ts_is_active(row.get_by_name(released_col))
+}
+
+fn released_ts_is_active(raw: Option<&Value>) -> bool {
+    match raw {
+        None | Some(Value::Null) => true,
+        Some(Value::Timestamp(v)) => *v <= 0,
+        Some(Value::TimestampTz(v)) => *v <= 0,
+        Some(Value::Time(v)) => *v <= 0,
+        Some(Value::Date(v)) => *v <= 0,
+        Some(Value::BigInt(v)) => *v <= 0,
+        Some(Value::Int(v)) => *v <= 0,
+        Some(Value::SmallInt(v)) => *v <= 0,
+        Some(Value::TinyInt(v)) => *v <= 0,
+        Some(Value::Bool(v)) => !*v,
+        Some(Value::Double(v)) => *v <= 0.0,
+        Some(Value::Float(v)) => *v <= 0.0,
+        Some(Value::Decimal(s)) => released_text_is_active(s),
+        Some(Value::Text(s)) => released_text_is_active(s),
+        _ => false,
+    }
+}
+
+fn released_text_is_active(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(lower.as_str(), "0" | "null" | "none") {
+        return true;
+    }
+    trimmed.parse::<f64>().is_ok_and(|number| number <= 0.0)
+}
+
+#[cfg(test)]
+fn debug_row_shape(context: &str, row: &Row) {
+    if std::env::var("AM_DEBUG_TUI_POLLER").ok().as_deref() != Some("1") {
+        return;
+    }
+    let columns: Vec<String> = row.column_names().map(ToString::to_string).collect();
+    let values: Vec<Value> = row.values().cloned().collect();
+    eprintln!("{context}: columns={columns:?} values={values:?}");
+}
+
 /// Days from civil date (year, month 1-12, day 1-31) to Unix epoch.
 /// Adapted from Howard Hinnant's `days_from_civil` algorithm.
 const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -551,13 +694,6 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// background poller snapshot is unavailable or stale.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
-    // Use a subquery to pre-filter active reservations so the complex
-    // ACTIVE_RESERVATION_PREDICATE runs in a simple context (FrankenConnection
-    // evaluates it incorrectly when combined with CASE/WHEN in the SELECT).
-    //
-    // Return raw created_ts / expires_ts and convert to micros in Rust, because
-    // FrankenConnection does not support strftime / negated GLOB character
-    // classes needed for the SQL-side timestamp conversion.
     let now = now_micros();
     let sql = format!(
         "SELECT \
@@ -567,16 +703,15 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
            fr.path_pattern, \
            fr.\"exclusive\", \
            fr.created_ts AS raw_created_ts, \
-           fr.expires_ts AS raw_expires_ts \
+           fr.expires_ts AS raw_expires_ts, \
+           fr.released_ts AS raw_released_ts \
          FROM file_reservations fr \
          LEFT JOIN projects p ON p.id = fr.project_id \
          LEFT JOIN agents a ON a.id = fr.agent_id \
-         WHERE fr.id IN (SELECT id FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?) \
-         ORDER BY fr.expires_ts ASC \
-         LIMIT {MAX_RESERVATIONS}"
+         ORDER BY fr.id ASC"
     );
 
-    let rows = match conn.query_sync(&sql, &[Value::BigInt(now)]) {
+    let rows = match conn.query_sync(&sql, &[]) {
         Ok(rows) => rows,
         Err(err) => {
             tracing::debug!(
@@ -586,9 +721,17 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
             return Vec::new();
         }
     };
+    #[cfg(test)]
+    if let Some(first) = rows.first() {
+        debug_row_shape("fetch_reservation_snapshots", first);
+    }
 
-    rows.into_iter()
+    let mut snapshots: Vec<_> = rows
+        .into_iter()
         .filter_map(|row| {
+            if !is_active_reservation_row(&row, now, "raw_expires_ts", "raw_released_ts") {
+                return None;
+            }
             Some(ReservationSnapshot {
                 id: row.get_named::<i64>("id").ok()?,
                 project_slug: row
@@ -609,7 +752,12 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
                 released_ts: None,
             })
         })
-        .collect()
+        .collect();
+    snapshots.sort_by_key(|snapshot| (snapshot.expires_ts, snapshot.id));
+    if snapshots.len() > MAX_RESERVATIONS {
+        snapshots.truncate(MAX_RESERVATIONS);
+    }
+    snapshots
 }
 
 /// Read `CONSOLE_POLL_INTERVAL_MS` from environment, default 2000ms.
@@ -702,6 +850,8 @@ impl SnapshotDelta {
 mod tests {
     use super::*;
     use mcp_agent_mail_core::Config;
+
+    const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000; // 2100-01-01T00:00:00Z
 
     // ── Delta detection ──────────────────────────────────────────────
 
@@ -1008,7 +1158,7 @@ mod tests {
         conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
             .expect("create");
         conn.execute_sync(
-            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER, expires_ts INTEGER)",
             &[],
         )
         .expect("create");
@@ -1063,7 +1213,7 @@ mod tests {
         conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
             .expect("create");
         conn.execute_sync(
-            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER, expires_ts INTEGER)",
             &[],
         )
         .expect("create");
@@ -1084,8 +1234,15 @@ mod tests {
 
         thread::sleep(Duration::from_millis(120));
         let first = state.db_stats_snapshot().expect("first snapshot");
-        thread::sleep(Duration::from_millis(120));
-        let second = state.db_stats_snapshot().expect("second snapshot");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut second = first.clone();
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+            second = state.db_stats_snapshot().expect("second snapshot");
+            if second.timestamp_micros > first.timestamp_micros {
+                break;
+            }
+        }
 
         assert!(
             second.timestamp_micros > first.timestamp_micros,
@@ -1117,7 +1274,7 @@ mod tests {
         )
         .expect("create messages");
         conn.execute_sync(
-            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, released_ts INTEGER)",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, released_ts INTEGER, expires_ts INTEGER)",
             &[],
         )
         .expect("create reservations");
@@ -1151,8 +1308,8 @@ mod tests {
         )
         .expect("insert messages");
         conn.execute_sync(
-            "INSERT INTO file_reservations (id, project_id, released_ts) VALUES
-             (20, 1, NULL), (21, 1, 12345)",
+            "INSERT INTO file_reservations (id, project_id, released_ts, expires_ts) VALUES
+             (20, 1, NULL, 4102444800000000), (21, 1, 12345, 4102444800000000)",
             &[],
         )
         .expect("insert reservations");
@@ -1218,6 +1375,18 @@ mod tests {
     }
 
     #[test]
+    fn catch_optional_panic_returns_value_when_no_panic() {
+        let result = catch_optional_panic(|| Some(7_u64));
+        assert_eq!(result.expect("no panic expected"), Some(7));
+    }
+
+    #[test]
+    fn catch_optional_panic_converts_panic_to_error() {
+        let result = catch_optional_panic::<u64, _>(|| panic!("boom"));
+        assert!(result.is_err(), "panic should be captured");
+    }
+
+    #[test]
     fn reservation_snapshots_keep_rows_when_agent_or_project_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_reservation_orphans.db");
@@ -1251,7 +1420,7 @@ mod tests {
             "INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
              VALUES
-                (1, 111, 222, 'src/**', 1, 1000000, 2000000, NULL)",
+                (1, 111, 222, 'src/**', 1, 1000000, 4102444800000000, NULL)",
             &[],
         )
         .expect("insert orphan reservation");
@@ -1301,9 +1470,9 @@ mod tests {
             "INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
              VALUES
-                (1, 1, 2, 'src/**', 1, '2026-02-10 10:00:00.123456', '2026-02-10 11:00:00.123456', NULL),
-                (2, 1, 2, 'tests/**', 0, '2026-02-10 10:10:00.000000', '2026-02-10 11:10:00.000000', ''),
-                (3, 1, 2, 'docs/**', 0, '2026-02-10 10:20:00.000000', '2026-02-10 11:20:00.000000', '2026-02-10 10:30:00.000000')",
+                (1, 1, 2, 'src/**', 1, '2099-12-31 10:00:00.123456', '2099-12-31 11:00:00.123456', NULL),
+                (2, 1, 2, 'tests/**', 0, '2099-12-31 10:10:00.000000', '2099-12-31 11:10:00.000000', ''),
+                (3, 1, 2, 'docs/**', 0, '2099-12-31 10:20:00.000000', '2099-12-31 11:20:00.000000', '2099-12-31 10:30:00.000000')",
             &[],
         )
         .expect("insert reservations");
@@ -1354,7 +1523,7 @@ mod tests {
         conn.execute_sync(
             "INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
-             VALUES (1, 1, 1, 'broken/**', 1, 'not-a-date', 'still-not-a-date', NULL)",
+             VALUES (1, 1, 1, 'broken/**', 1, 'not-a-date', '4102444800000000', NULL)",
             &[],
         )
         .expect("insert reservation");
@@ -1363,7 +1532,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path_pattern, "broken/**");
         assert_eq!(rows[0].granted_ts, 0);
-        assert_eq!(rows[0].expires_ts, 0);
+        assert_eq!(rows[0].expires_ts, FAR_FUTURE_MICROS);
     }
 
     #[test]
@@ -1404,9 +1573,9 @@ mod tests {
             "INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
              VALUES
-                (1, 1, 1, 'src/**', 1, 1000, 2000, 0),
-                (2, 1, 1, 'tests/**', 1, 1000, 2000, NULL),
-                (3, 1, 1, 'docs/**', 1, 1000, 2000, 123456)",
+                (1, 1, 1, 'src/**', 1, 1000, 4102444800000000, 0),
+                (2, 1, 1, 'tests/**', 1, 1000, 4102444800000000, NULL),
+                (3, 1, 1, 'docs/**', 1, 1000, 4102444800000000, 123456)",
             &[],
         )
         .expect("insert reservations");
@@ -1455,8 +1624,8 @@ mod tests {
             "INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
              VALUES
-                (1, 1, 1, 'src/**', 1, '1771210958613964', '1771218158613964', '0'),
-                (2, 1, 1, 'docs/**', 1, '1771210958613999', '1771218158613999', '1771211000000000')",
+                (1, 1, 1, 'src/**', 1, '1771210958613964', '4102444800000000', '0'),
+                (2, 1, 1, 'docs/**', 1, '1771210958613999', '4102444800000000', '1771211000000000')",
             &[],
         )
         .expect("insert reservations");
@@ -1465,7 +1634,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path_pattern, "src/**");
         assert_eq!(rows[0].granted_ts, 1_771_210_958_613_964);
-        assert_eq!(rows[0].expires_ts, 1_771_218_158_613_964);
+        assert_eq!(rows[0].expires_ts, FAR_FUTURE_MICROS);
     }
 
     #[test]
@@ -1506,9 +1675,9 @@ mod tests {
             "INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
              VALUES
-                (1, 1, 1, 'src/**', 1, 1000, 2000, '0.0'),
-                (2, 1, 1, 'tests/**', 0, 1000, 2000, '-1'),
-                (3, 1, 1, 'docs/**', 1, 1000, 2000, '1771211000000000')",
+                (1, 1, 1, 'src/**', 1, 1000, 4102444800000000, '0.0'),
+                (2, 1, 1, 'tests/**', 0, 1000, 4102444800000000, '-1'),
+                (3, 1, 1, 'docs/**', 1, 1000, 4102444800000000, '1771211000000000')",
             &[],
         )
         .expect("insert reservations");
@@ -1559,11 +1728,11 @@ mod tests {
             "INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
              VALUES
-                (1, 1, 1, 'src/**', 1, 1000, 2000, NULL),
-                (2, 1, 1, 'tests/**', 1, 1000, 2000, '0'),
-                (3, 1, 1, 'docs/**', 1, 1000, 2000, 'null'),
-                (4, 1, 1, 'tmp/**', 1, 1000, 2000, '0.0'),
-                (5, 1, 1, 'build/**', 1, 1000, 2000, '1771211000000000')",
+                (1, 1, 1, 'src/**', 1, 1000, 4102444800000000, NULL),
+                (2, 1, 1, 'tests/**', 1, 1000, 4102444800000000, '0'),
+                (3, 1, 1, 'docs/**', 1, 1000, 4102444800000000, 'null'),
+                (4, 1, 1, 'tmp/**', 1, 1000, 4102444800000000, '0.0'),
+                (5, 1, 1, 'build/**', 1, 1000, 4102444800000000, '1771211000000000')",
             &[],
         )
         .expect("insert reservations");
@@ -1688,7 +1857,7 @@ mod tests {
         conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
             .expect("create");
         conn.execute_sync(
-            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER, expires_ts INTEGER)",
             &[],
         )
         .expect("create");
@@ -1790,7 +1959,7 @@ mod tests {
         )
         .expect("create messages");
         conn.execute_sync(
-            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, released_ts INTEGER)",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, released_ts INTEGER, expires_ts INTEGER)",
             &[],
         )
         .expect("create reservations");
@@ -1811,7 +1980,7 @@ mod tests {
         )
         .expect("insert messages");
         conn.execute_sync(
-            "INSERT INTO file_reservations (project_id, released_ts) VALUES (1, NULL)",
+            "INSERT INTO file_reservations (project_id, released_ts, expires_ts) VALUES (1, NULL, 4102444800000000)",
             &[],
         )
         .expect("insert reservation");

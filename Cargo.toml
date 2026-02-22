@@ -34,12 +34,12 @@ fastmcp-protocol = "0.2.0"
 
 asupersync = { version = "0.2.5", features = ["tls-webpki-roots"] }
 
-sqlmodel = "0.2.0"
-sqlmodel-core = "0.2.0"
-sqlmodel-query = "0.2.0"
-sqlmodel-schema = "0.2.0"
-sqlmodel-session = "0.2.0"
-sqlmodel-pool = "0.2.0"
+sqlmodel = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-core = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-query = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-pool = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
 sqlmodel-frankensqlite = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
 
 ftui = "0.2.1"
@@ -148,3 +148,10 @@ inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
 uring-fs = { path = "vendor/uring-fs" }
+sqlmodel = { path = "/dp/sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-core = { path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-query = { path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-pool = { path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-frankensqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }

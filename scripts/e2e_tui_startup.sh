@@ -333,6 +333,56 @@ start_server_pty() {
     echo "${pid}"
 }
 
+# `am` default launch path (interactive): setup + auto-clear + server + TUI.
+# This intentionally exercises the exact path users hit when they run `am`
+# with no subcommand in a terminal.
+start_am_default_pty() {
+    local label="$1"
+    local port="$2"
+    local db_path="$3"
+    local storage_root="$4"
+    local bin="$5"
+
+    local typescript="${E2E_ARTIFACT_DIR}/server_${label}.typescript"
+    e2e_log "Starting am default PTY launch (${label}): 127.0.0.1:${port}"
+    e2e_log "  typescript: ${typescript}"
+
+    local timeout_s="${AM_E2E_SERVER_TIMEOUT_S:-15}"
+    local started_ms="$(_e2e_now_ms)"
+    local -a cmd_parts=(
+        env
+        -u
+        HTTP_BEARER_TOKEN
+        "DATABASE_URL=sqlite:////${db_path}"
+        "STORAGE_ROOT=${storage_root}"
+        "HTTP_HOST=127.0.0.1"
+        "HTTP_PORT=${port}"
+        "HTTP_RBAC_ENABLED=0"
+        "HTTP_RATE_LIMIT_ENABLED=0"
+        "HTTP_JWT_ENABLED=0"
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1"
+        "HOME=${storage_root}"
+        timeout "${timeout_s}s" "${bin}"
+    )
+
+    local launcher_cmd=""
+    local part
+    for part in "${cmd_parts[@]}"; do
+        printf -v launcher_cmd '%s %q' "${launcher_cmd}" "${part}"
+    done
+    launcher_cmd="${launcher_cmd# }"
+    printf -v launcher_cmd 'cd %q && %s' "${storage_root}" "${launcher_cmd}"
+
+    (
+        script -q -f -c "${launcher_cmd}" \
+            "${typescript}"
+    ) >/dev/null 2>&1 &
+
+    local pid="$!"
+    startup_write_start_artifacts "${label}" "${started_ms}" "${pid}" "${typescript}" "${timeout_s}" "pty_am_default" "${launcher_cmd}"
+    echo "${pid}"
+}
+
 # Headless mode (--no-tui) captures stderr directly (no PTY needed).
 start_server_headless() {
     local label="$1"
@@ -730,6 +780,7 @@ for cmd in script timeout python3 curl; do
 done
 
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+AM_BIN="$(e2e_ensure_binary "am" | tail -n 1)"
 
 TOOLS_LIST_PAYLOAD='{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}'
 
@@ -806,6 +857,33 @@ sleep 0.3
 NORM2="${E2E_ARTIFACT_DIR}/server_tui_ready.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_tui_ready.typescript" "${NORM2}"
 e2e_assert_file_contains "bootstrap banner in PTY" "${NORM2}" "am: Starting MCP Agent Mail server"
+
+# ────────────────────────────────────────────────────────────────────
+# Case 2b: `am` default interactive launch does not panic in poller thread
+# ────────────────────────────────────────────────────────────────────
+e2e_case_banner "am_default_launch_no_tui_poller_panic"
+WORK2B="$(e2e_mktemp "e2e_tui_startup_am_default")"
+DB2B="${WORK2B}/db.sqlite3"
+STORAGE2B="${WORK2B}/storage"
+mkdir -p "${STORAGE2B}"
+PORT2B="$(pick_port)"
+
+PID2B="$(start_am_default_pty "am_default" "${PORT2B}" "${DB2B}" "${STORAGE2B}" "${AM_BIN}")"
+wait_for_server_start_or_fail "am_default" "${PID2B}" "${PORT2B}" "am default launch failed to reach ready state"
+
+# Keep process alive briefly after readiness to expose early background-thread crashes.
+sleep 1.0
+stop_server "${PID2B}"
+sleep 0.3
+
+NORM2B="${E2E_ARTIFACT_DIR}/server_am_default.normalized.txt"
+normalize_transcript "${E2E_ARTIFACT_DIR}/server_am_default.typescript" "${NORM2B}"
+e2e_assert_file_contains "am default path executed setup warning" "${NORM2B}" "AGENT_MAIL_AGENT not set"
+e2e_assert_file_not_contains "am default: no panic backtrace" "${NORM2B}" "panicked at"
+e2e_assert_file_not_contains "am default: no poller panic thread label" "${NORM2B}" "tui-db-poller"
+e2e_assert_file_not_contains "am default: no abort instruction signal" "${NORM2B}" "IOT instruction"
+e2e_assert_file_not_contains "am default: no core dump marker" "${NORM2B}" "core dumped"
+e2e_assert_file_not_contains "am default: no Option unwrap panic marker" "${NORM2B}" 'Option::unwrap()'
 
 # ────────────────────────────────────────────────────────────────────
 # Case 3: API mode bootstrap works

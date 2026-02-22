@@ -121,8 +121,7 @@ fn segments_overlap(p1: &str, p2: &str) -> bool {
                     return false;
                 }
             }
-            (None, None) => return true, // Both ended and matched all segments
-            _ => return true,            // Length mismatch: one is a directory prefix of the other, assume overlap
+            _ => return true, // Ended or length mismatch: conservatively assume overlap
         }
     }
 }
