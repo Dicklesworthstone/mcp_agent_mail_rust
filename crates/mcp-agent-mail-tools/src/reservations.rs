@@ -254,11 +254,11 @@ pub async fn file_reservation_paths(
         ));
     }
 
-    let ttl = ttl_seconds.unwrap_or(3600).max(0);
-    if ttl < 60 {
-        tracing::info!(
-            "ttl_seconds={} is below recommended minimum (60s); continuing anyway",
-            ttl
+    let ttl = ttl_seconds.unwrap_or(3600).max(60);
+    if ttl_seconds.is_some_and(|t| t < 60) {
+        tracing::warn!(
+            "ttl_seconds={} clamped to minimum 60s",
+            ttl_seconds.unwrap_or(0)
         );
     }
 

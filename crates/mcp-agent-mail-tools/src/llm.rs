@@ -161,6 +161,17 @@ pub fn choose_best_available_model(preferred: &str) -> String {
         return preferred.to_string();
     }
 
+    // If the preferred model matches a known model whose API key is available, use it
+    let lower = preferred.to_ascii_lowercase();
+    if !lower.is_empty() {
+        for &(env_var, model) in MODEL_PRIORITY {
+            if model.to_ascii_lowercase().contains(&lower) && get_env_var(env_var).is_some() {
+                return model.to_string();
+            }
+        }
+    }
+
+    // Fall back to first available API key
     for &(env_var, model) in MODEL_PRIORITY {
         if get_env_var(env_var).is_some() {
             return model.to_string();

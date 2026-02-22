@@ -1336,13 +1336,41 @@ pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
 
     let total = locks.len() as u64;
 
+    // Count locks missing owner metadata (filter_map above only keeps those with owner data)
+    let total_raw = raw_locks.len() as u64;
+    let metadata_missing = total_raw.saturating_sub(total);
+
+    // Count stale locks: PID no longer alive on this host
+    let stale = locks
+        .iter()
+        .filter(|l| {
+            l.holder
+                .strip_prefix("pid:")
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some_and(|pid| {
+                    // Check /proc/<pid> on Linux; fall back to conservative (not stale)
+                    #[cfg(target_os = "linux")]
+                    {
+                        !std::path::Path::new(&format!("/proc/{pid}")).exists()
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = pid;
+                        false
+                    }
+                })
+        })
+        .count() as u64;
+
+    let active = total.saturating_sub(stale);
+
     let response = LocksResponse {
         locks,
         summary: LocksSummary {
             total,
-            active: total,
-            stale: 0,
-            metadata_missing: 0,
+            active,
+            stale,
+            metadata_missing,
         },
     };
 
@@ -1419,169 +1447,10 @@ pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<St
     let agent = query.get("agent").cloned();
     let project = query.get("project").cloned();
 
-    // Return static entries matching Python fixture format when agent and project are specified
-    let mut entries = if agent.is_some() && project.is_some() {
-        let agent_name = agent.as_deref().unwrap_or("");
-        let project_name = project.as_deref().unwrap_or("");
-        vec![
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "acquire_build_slot".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "build_slots".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "renew_build_slot".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "build_slots".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "release_build_slot".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "build_slots".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "register_agent".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "identity".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "request_contact".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "contact".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "list_contacts".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "contact".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "send_message".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "messaging".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "send_message".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "messaging".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "send_message".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "messaging".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "file_reservation_paths".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "file_reservations".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "file_reservation_paths".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "file_reservations".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "renew_file_reservations".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "file_reservations".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "renew_file_reservations".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "file_reservations".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "release_file_reservations".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "file_reservations".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "force_release_file_reservation".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "file_reservations".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "whois".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "identity".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "macro_prepare_thread".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "workflow_macros".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "macro_prepare_thread".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "workflow_macros".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "file_reservation_paths".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "file_reservations".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "release_file_reservations".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "file_reservations".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "macro_file_reservation_cycle".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "workflow_macros".to_string(),
-            },
-            ToolingRecentEntry {
-                timestamp: None,
-                tool: "macro_contact_handshake".to_string(),
-                project: project_name.to_string(),
-                agent: agent_name.to_string(),
-                cluster: "workflow_macros".to_string(),
-            },
-        ]
-    } else {
-        vec![]
-    };
+    // Per-tool activity tracking is not yet implemented; return real data only.
+    // Previously returned hardcoded static entries which misled consumers.
+    let _ = (agent, project, config);
+    let mut entries: Vec<ToolingRecentEntry> = vec![];
 
     if config.tool_filter.enabled {
         entries.retain(|entry| tool_filter_allows(config, &entry.tool));
@@ -1983,7 +1852,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         body_md: msg.body_md,
         importance: msg.importance,
         ack_required: msg.ack_required != 0,
-        created_ts: None, // Python shows null for created_ts in resource
+        created_ts: Some(micros_to_iso(msg.created_ts)),
         attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
         from: sender.name,
     };
@@ -2084,7 +1953,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
             subject: row.subject,
             importance: row.importance,
             ack_required: row.ack_required != 0,
-            created_ts: None, // Python shows null
+            created_ts: Some(micros_to_iso(row.created_ts)),
             attachments: serde_json::from_str(&row.attachments).unwrap_or_default(),
             from,
             body_md: if include_bodies {
@@ -2255,7 +2124,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
                 from: row.sender_name.clone(),
-                created_ts: None, // Python shows null for created_ts in inbox
+                created_ts: Some(micros_to_iso(msg.created_ts)),
                 kind: row.kind.clone(),
                 attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
                 body_md: if include_bodies {
@@ -2440,7 +2309,7 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
-                created_ts: None,
+                created_ts: Some(micros_to_iso(msg.created_ts)),
                 attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
                 from: row.sender_name.clone(),
                 kind: row.kind.clone(),
@@ -2537,7 +2406,7 @@ pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
-                created_ts: None,
+                created_ts: Some(micros_to_iso(msg.created_ts)),
                 attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
                 from: row.sender_name.clone(),
                 kind: row.kind.clone(),
@@ -2713,6 +2582,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         let importance: String = row.get_named("importance").unwrap_or_default();
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
         let attachments_json: String = row.get_named("attachments").unwrap_or_default();
+        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
 
         // Get recipients for this message
         let recip_sql = "SELECT a.name, r.kind FROM message_recipients r \
@@ -2751,7 +2621,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
             subject,
             importance,
             ack_required: ack_required != 0,
-            created_ts: None,
+            created_ts: Some(micros_to_iso(created_ts)),
             attachments: serde_json::from_str(&attachments_json).unwrap_or_default(),
             from: agent_name.clone(),
             body_md,
@@ -2884,7 +2754,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
-                created_ts: None,
+                created_ts: Some(micros_to_iso(msg.created_ts)),
                 attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
                 from: Some(row.sender_name.clone()),
                 kind: row.kind.clone(),
@@ -2947,7 +2817,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
         .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
     let agent_id = agent_row.id.unwrap_or(0);
 
-    // Fetch inbox and filter for ack_required (not yet acked)
+    // Fetch full inbox (no pre-limit) so post-filter for ack_required gets enough rows
     let inbox_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::fetch_inbox(
             ctx.cx(),
@@ -2956,15 +2826,16 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
             agent_id,
             false,
             None,
-            limit,
+            500, // fetch generously; limit applied after filter
         )
         .await,
     )?;
 
-    // Filter for ack_required messages that haven't been acknowledged yet
+    // Filter for ack_required messages that haven't been acknowledged yet, then apply limit
     let messages: Vec<ViewMessageEntry> = inbox_rows
         .into_iter()
         .filter(|row| row.message.ack_required != 0 && row.ack_ts.is_none())
+        .take(limit)
         .map(|row| {
             let msg = &row.message;
             ViewMessageEntry {
@@ -2975,7 +2846,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: true,
-                created_ts: None,
+                created_ts: Some(micros_to_iso(msg.created_ts)),
                 attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
                 from: None, // ack-required view doesn't include from
                 kind: row.kind.clone(),
@@ -3104,7 +2975,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: true,
-                created_ts: None,
+                created_ts: Some(micros_to_iso(msg.created_ts)),
                 attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
                 kind: row.kind.clone(),
                 read_at: row.read_ts.map(mcp_agent_mail_db::micros_to_iso),
@@ -3212,7 +3083,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
                 subject: msg.subject.clone(),
                 importance: msg.importance.clone(),
                 ack_required: true,
-                created_ts: None,
+                created_ts: Some(micros_to_iso(msg.created_ts)),
                 attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
                 from: None,
                 kind: row.kind.clone(),
