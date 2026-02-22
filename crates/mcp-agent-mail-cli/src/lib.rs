@@ -137,8 +137,8 @@ pub enum Commands {
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
-        /// Output JSON (shorthand for --format json).
-        #[arg(long, default_value_t = false)]
+        /// Output JSON (shorthand for --format json, default true for detect).
+        #[arg(long, default_value_t = true)]
         json: bool,
         /// Path to baseline JSON for regression comparison.
         #[arg(long)]
@@ -1219,8 +1219,8 @@ pub enum MailCommand {
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
-        /// Output JSON (shorthand for --format json).
-        #[arg(long, default_value_t = false)]
+        /// Output JSON (shorthand for --format json, default true for detect).
+        #[arg(long, default_value_t = true)]
         json: bool,
     },
     /// Reply to an existing message.
@@ -7380,6 +7380,7 @@ fn handle_doctor_check_with(
     json: bool,
 ) -> CliResult<()> {
     let mut checks: Vec<serde_json::Value> = Vec::new();
+    let mut db_file_sanity_failed = false;
 
     // Check 1: Database accessible (non-mutating; avoid auto-recovery side effects).
     let db_ok = {
@@ -7413,6 +7414,7 @@ fn handle_doctor_check_with(
             if db_path != ":memory:" && path.exists() {
                 let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
                 if file_size == 0 {
+                    db_file_sanity_failed = true;
                     checks.push(serde_json::json!({
                         "check": "db_file_sanity",
                         "status": "fail",
@@ -7428,6 +7430,9 @@ fn handle_doctor_check_with(
                         })
                         .map(|s| s == "ok")
                         .unwrap_or(false);
+                    if !qc_ok {
+                        db_file_sanity_failed = true;
+                    }
                     checks.push(serde_json::json!({
                         "check": "db_file_sanity",
                         "status": if qc_ok { "ok" } else { "fail" },
@@ -7437,6 +7442,13 @@ fn handle_doctor_check_with(
                             "PRAGMA quick_check failed (possible corruption)".to_string()
                         },
                     }));
+                } else {
+                    db_file_sanity_failed = true;
+                    checks.push(serde_json::json!({
+                        "check": "db_file_sanity",
+                        "status": "fail",
+                        "detail": "Cannot open database file for sanity check",
+                    }));
                 }
             }
         }
@@ -7444,49 +7456,57 @@ fn handle_doctor_check_with(
 
     // Check 1c: Pool initialization (including migrations)
     {
-        let pool_cfg = mcp_agent_mail_db::DbPoolConfig {
-            database_url: database_url.to_string(),
-            ..Default::default()
-        };
-        match mcp_agent_mail_db::pool::DbPool::new(&pool_cfg) {
-            Ok(pool) => {
-                let pool_result: Result<(), String> = context::run_async(async {
-                    let cx = asupersync::Cx::for_request();
-                    match pool.acquire(&cx).await {
-                        asupersync::Outcome::Ok(_conn) => Ok(()),
-                        asupersync::Outcome::Err(e) => Err(CliError::Other(format!("{e}"))),
-                        asupersync::Outcome::Cancelled(_) => {
-                            Err(CliError::Other("cancelled".to_string()))
+        if db_file_sanity_failed {
+            checks.push(serde_json::json!({
+                "check": "pool_init",
+                "status": "fail",
+                "detail": "Skipped because db_file_sanity failed (potential corruption)",
+            }));
+        } else {
+            let pool_cfg = mcp_agent_mail_db::DbPoolConfig {
+                database_url: database_url.to_string(),
+                ..Default::default()
+            };
+            match mcp_agent_mail_db::pool::DbPool::new(&pool_cfg) {
+                Ok(pool) => {
+                    let pool_result: Result<(), String> = context::run_async(async {
+                        let cx = asupersync::Cx::for_request();
+                        match pool.acquire(&cx).await {
+                            asupersync::Outcome::Ok(_conn) => Ok(()),
+                            asupersync::Outcome::Err(e) => Err(CliError::Other(format!("{e}"))),
+                            asupersync::Outcome::Cancelled(_) => {
+                                Err(CliError::Other("cancelled".to_string()))
+                            }
+                            asupersync::Outcome::Panicked(p) => {
+                                Err(CliError::Other(format!("panic: {}", p.message())))
+                            }
                         }
-                        asupersync::Outcome::Panicked(p) => {
-                            Err(CliError::Other(format!("panic: {}", p.message())))
+                    })
+                    .map_err(|e| e.to_string());
+                    match pool_result {
+                        Ok(()) => {
+                            checks.push(serde_json::json!({
+                                "check": "pool_init",
+                                "status": "ok",
+                                "detail": "Pool initialization + migrations OK",
+                            }));
                         }
-                    }
-                })
-                .map_err(|e| e.to_string());
-                match pool_result {
-                    Ok(()) => {
-                        checks.push(serde_json::json!({
-                            "check": "pool_init",
-                            "status": "ok",
-                            "detail": "Pool initialization + migrations OK",
-                        }));
-                    }
-                    Err(msg) => {
-                        checks.push(serde_json::json!({
-                            "check": "pool_init",
-                            "status": "fail",
-                            "detail": format!("Pool/migration failure: {msg}"),
-                        }));
+                        Err(msg) => {
+                            checks.push(serde_json::json!({
+                                "check": "pool_init",
+                                "status": "fail",
+                                "detail": format!("Pool/migration failure: {msg}"),
+                            }));
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                checks.push(serde_json::json!({
-                    "check": "pool_init",
-                    "status": "fail",
-                    "detail": format!("Cannot create pool: {e}"),
-                }));
+                Err(e) => {
+                    checks.push(serde_json::json!({
+                        "check": "pool_init",
+                        "status": "fail",
+                        "detail": format!("Cannot create pool: {e}"),
+                    }));
+                }
             }
         }
     }

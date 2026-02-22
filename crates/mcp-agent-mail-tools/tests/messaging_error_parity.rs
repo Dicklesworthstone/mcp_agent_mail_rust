@@ -255,6 +255,8 @@ fn test_reply_message_not_found() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("reply to nonexistent message should fail");
@@ -321,6 +323,8 @@ fn test_reply_message_subject_prefix() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("reply should succeed");
@@ -344,6 +348,8 @@ fn test_reply_message_subject_prefix() {
             reply_id,
             "BlueLake".to_string(),
             "Second reply".to_string(),
+            None,
+            None,
             None,
             None,
             None,

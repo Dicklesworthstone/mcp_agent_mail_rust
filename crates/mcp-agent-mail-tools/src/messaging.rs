@@ -1844,7 +1844,7 @@ effective_free_bytes={free}"
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Reply to an existing message, preserving or establishing a thread.\n\nBehavior\n--------\n- Inherits original `importance` and `ack_required` flags\n- `thread_id` is taken from the original message if present; otherwise, the original id is used\n- Subject is prefixed with `subject_prefix` if not already present\n- Defaults `to` to the original sender if not explicitly provided\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nmessage_id : int\n    The id of the message you are replying to.\nsender_name : str\n    Your agent name (must be registered in the project).\nbody_md : str\n    Reply body in Markdown.\nto, cc, bcc : Optional[list[str]]\n    Recipients by agent name. If omitted, `to` defaults to original sender.\nsubject_prefix : str\n    Prefix to apply (default \"Re:\"). Case-insensitive idempotent.\n\nDo / Don't\n----------\nDo:\n- Keep the subject focused; avoid topic drift within a thread.\n- Reply to the original sender unless new stakeholders are strictly required.\n- Preserve importance/ack flags from the original unless there is a clear reason to change.\n- Use CC for FYI only; BCC sparingly and with intention.\n\nDon't:\n- Change `thread_id` when continuing the same discussion.\n- Escalate to many recipients; prefer targeted replies and start a new thread for new topics.\n- Attach large binaries in replies unless essential; reference prior attachments where possible.\n\nReturns\n-------\ndict\n    Message payload including `thread_id` and `reply_to`.\n\nExamples\n--------\nMinimal reply to original sender:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Questions about the migration plan...\"\n}}}\n```\n\nReply with explicit recipients and CC:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6c\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Looping ops.\",\"to\":[\"GreenCastle\"],\"cc\":[\"RedCat\"],\"subject_prefix\":\"RE:\"\n}}}\n```"
+    description = "Reply to an existing message, preserving or establishing a thread.\n\nBehavior\n--------\n- Inherits original `importance` and `ack_required` flags unless overridden\n- `thread_id` is taken from the original message if present; otherwise, the original id is used\n- Subject is prefixed with `subject_prefix` if not already present\n- Defaults `to` to the original sender if not explicitly provided\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nmessage_id : int\n    The id of the message you are replying to.\nsender_name : str\n    Your agent name (must be registered in the project).\nbody_md : str\n    Reply body in Markdown.\nto, cc, bcc : Optional[list[str]]\n    Recipients by agent name. If omitted, `to` defaults to original sender.\nsubject_prefix : str\n    Prefix to apply (default \"Re:\"). Case-insensitive idempotent.\nimportance : Optional[str]\n    Override importance level {\"low\",\"normal\",\"high\",\"urgent\"}. Inherits from original if omitted.\nack_required : Optional[bool]\n    Override acknowledgement requirement. Inherits from original if omitted.\n\nDo / Don't\n----------\nDo:\n- Keep the subject focused; avoid topic drift within a thread.\n- Reply to the original sender unless new stakeholders are strictly required.\n- Preserve importance/ack flags from the original unless there is a clear reason to change.\n- Use CC for FYI only; BCC sparingly and with intention.\n\nDon't:\n- Change `thread_id` when continuing the same discussion.\n- Escalate to many recipients; prefer targeted replies and start a new thread for new topics.\n- Attach large binaries in replies unless essential; reference prior attachments where possible.\n\nReturns\n-------\ndict\n    Message payload including `thread_id` and `reply_to`.\n\nExamples\n--------\nMinimal reply to original sender:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Questions about the migration plan...\"\n}}}\n```\n\nReply with explicit recipients and CC:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6c\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Looping ops.\",\"to\":[\"GreenCastle\"],\"cc\":[\"RedCat\"],\"subject_prefix\":\"RE:\"\n}}}\n```"
 )]
 pub async fn reply_message(
     ctx: &McpContext,
@@ -1856,9 +1856,30 @@ pub async fn reply_message(
     cc: Option<Vec<String>>,
     bcc: Option<Vec<String>>,
     subject_prefix: Option<String>,
+    importance: Option<String>,
+    ack_required: Option<bool>,
 ) -> McpResult<String> {
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
     let config = &Config::get();
+
+    // Validate importance override if provided
+    if let Some(ref imp) = importance {
+        let lower = imp.to_ascii_lowercase();
+        if !["low", "normal", "high", "urgent"].contains(&lower.as_str()) {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "Invalid argument value: importance='{imp}'. \
+                     Must be: low, normal, high, or urgent."
+                ),
+                true,
+                json!({
+                    "field": "importance",
+                    "error_detail": imp,
+                }),
+            ));
+        }
+    }
 
     // ── Per-message size limits (fail fast before any DB/archive work) ──
     // Reply has no subject yet (inherited below) and no attachment_paths, so
@@ -2363,8 +2384,8 @@ effective_free_bytes={free}"
             &subject,
             &body_md,
             Some(&thread_id),
-            &original.importance,
-            original.ack_required != 0,
+            &importance.unwrap_or_else(|| original.importance.clone()),
+            ack_required.unwrap_or(original.ack_required != 0),
             "[]", // No attachments for reply by default
             &recipient_refs,
         )
