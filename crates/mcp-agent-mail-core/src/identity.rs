@@ -136,6 +136,7 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
     None
 }
 
+#[cfg(test)]
 fn normalize_remote_first_two(url: &str) -> Option<String> {
     let (host, mut path) = parse_remote_url(url)?;
     if path.starts_with('/') {

@@ -267,6 +267,22 @@ pub fn generate_token() -> String {
     hex
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, Option<String>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn env_value_for_setup(key: &str) -> Option<String> {
+    #[cfg(test)]
+    {
+        if let Some(value) = TEST_ENV_OVERRIDES.with(|cell| cell.borrow().get(key).cloned()) {
+            return value;
+        }
+    }
+    std::env::var(key).ok()
+}
+
 /// Resolve the bearer token from multiple sources in priority order:
 /// explicit flag > `HTTP_BEARER_TOKEN` env var > .env file > generate new.
 #[must_use]
@@ -276,7 +292,7 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> String {
     {
         return t.to_string();
     }
-    if let Ok(t) = std::env::var("HTTP_BEARER_TOKEN")
+    if let Some(t) = env_value_for_setup("HTTP_BEARER_TOKEN")
         && !t.is_empty()
     {
         return t;
@@ -1023,6 +1039,50 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    enum EnvVarPrevious {
+        Missing,
+        Present(Option<String>),
+    }
+
+    struct EnvVarGuard {
+        key: String,
+        previous: EnvVarPrevious,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &str) -> Self {
+            let previous = TEST_ENV_OVERRIDES.with(|cell| {
+                let mut map = cell.borrow_mut();
+                let previous = map
+                    .get(key)
+                    .cloned()
+                    .map_or(EnvVarPrevious::Missing, EnvVarPrevious::Present);
+                map.insert(key.to_string(), None);
+                previous
+            });
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            TEST_ENV_OVERRIDES.with(|cell| {
+                let mut map = cell.borrow_mut();
+                match &self.previous {
+                    EnvVarPrevious::Present(previous) => {
+                        map.insert(self.key.clone(), previous.clone());
+                    }
+                    EnvVarPrevious::Missing => {
+                        map.remove(&self.key);
+                    }
+                }
+            });
+        }
+    }
+
     #[test]
     fn generate_token_is_64_hex_chars() {
         let t = generate_token();
@@ -1046,6 +1106,7 @@ mod tests {
 
     #[test]
     fn resolve_token_generates_when_no_source() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-env");
         let t = resolve_token(None, &missing);
@@ -1054,6 +1115,7 @@ mod tests {
 
     #[test]
     fn resolve_token_reads_env_file() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -1889,6 +1951,7 @@ mod tests {
 
     #[test]
     fn resolve_token_env_file_quoted_values() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN=\"double-quoted-token\"\n").unwrap();
         let t = resolve_token(None, tmp.path());
@@ -1897,6 +1960,7 @@ mod tests {
 
     #[test]
     fn resolve_token_env_file_single_quoted() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN='single-quoted-token'\n").unwrap();
         let t = resolve_token(None, tmp.path());
@@ -1905,6 +1969,7 @@ mod tests {
 
     #[test]
     fn resolve_token_empty_explicit_falls_through() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-env");
         let t = resolve_token(Some(""), &missing);

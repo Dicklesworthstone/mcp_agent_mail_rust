@@ -2250,7 +2250,7 @@ mod tests {
             "sqlite+aiosqlite:///./storage.sqlite3".to_string()
         );
         assert!(config.contact_enforcement_enabled);
-        assert!(config.allow_absolute_attachment_paths);
+        assert!(!config.allow_absolute_attachment_paths);
     }
 
     #[test]
