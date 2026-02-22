@@ -94,9 +94,7 @@ impl Eq for VectorHit {}
 
 impl PartialEq for VectorHit {
     fn eq(&self, other: &Self) -> bool {
-        self.doc_id == other.doc_id
-            && self.doc_kind == other.doc_kind
-            && (self.score - other.score).abs() < f32::EPSILON
+        self.cmp(other) == Ordering::Equal
     }
 }
 

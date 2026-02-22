@@ -28,6 +28,7 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
 
     // Create FTS5 virtual table
     let create_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
+            message_id UNINDEXED, \
             subject, \
             body, \
             importance UNINDEXED, \
@@ -57,6 +58,7 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
     // export run), rebuild it so the populate SQL stays valid.
     let mut needs_rebuild = false;
     for col in [
+        "message_id",
         "subject",
         "body",
         "importance",
@@ -108,7 +110,7 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
 
     // Populate from messages + projects
     let insert_sql = if has_thread_id {
-        "INSERT INTO fts_messages(rowid, subject, body, importance, project_slug, thread_key, created_ts) \
+        "INSERT INTO fts_messages(message_id, subject, body, importance, project_slug, thread_key, created_ts) \
          SELECT \
              m.id, \
              COALESCE(m.subject, ''), \
@@ -123,7 +125,7 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
          FROM messages AS m \
          LEFT JOIN projects AS p ON p.id = m.project_id"
     } else {
-        "INSERT INTO fts_messages(rowid, subject, body, importance, project_slug, thread_key, created_ts) \
+        "INSERT INTO fts_messages(message_id, subject, body, importance, project_slug, thread_key, created_ts) \
          SELECT \
              m.id, \
              COALESCE(m.subject, ''), \
@@ -567,7 +569,7 @@ mod tests {
         // Verify FTS search works
         let results = conn
             .query_sync(
-                "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'Hello'",
+                "SELECT message_id FROM fts_messages WHERE fts_messages MATCH 'Hello'",
                 &[],
             )
             .unwrap();
@@ -746,7 +748,7 @@ mod tests {
         // FTS search
         let rows = conn
             .query_sync(
-                "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'test'",
+                "SELECT message_id FROM fts_messages WHERE fts_messages MATCH 'test'",
                 &[],
             )
             .unwrap();
@@ -1038,7 +1040,10 @@ mod tests {
 
         let conn = DbConn::open_file(db.display().to_string()).unwrap();
         let rows = conn
-            .query_sync("SELECT thread_key FROM fts_messages WHERE rowid = 1", &[])
+            .query_sync(
+                "SELECT thread_key FROM fts_messages WHERE message_id = 1",
+                &[],
+            )
             .unwrap();
         let thread_key: String = rows[0].get_named("thread_key").unwrap();
         assert_eq!(

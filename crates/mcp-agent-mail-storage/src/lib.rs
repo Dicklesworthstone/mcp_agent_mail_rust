@@ -340,7 +340,15 @@ pub fn wbq_flush() {
     if let Some(wbq) = WBQ.get() {
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         if wbq.sender.send(WbqMsg::Flush(done_tx)).is_ok() {
-            let _ = done_rx.recv_timeout(Duration::from_secs(30));
+            match done_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!("wbq_flush timed out after 30s; drain thread may be stuck");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::warn!("wbq_flush: drain thread channel disconnected");
+                }
+            }
         }
     }
 }
@@ -886,7 +894,8 @@ impl FileLock {
         }
         #[cfg(not(unix))]
         {
-            Ok(true)
+            // Without inode comparison we cannot confirm identity; be conservative
+            Ok(false)
         }
     }
 
@@ -2945,7 +2954,10 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
                     use fs2::FileExt;
                     if f.try_lock_exclusive().is_ok() {
-                        // We got the lock. Delete the file.
+                        // Drop the flock handle BEFORE removing, to avoid
+                        // the race where another process opens + locks between
+                        // our delete and our drop.
+                        drop(f);
                         if std::fs::remove_file(&path).is_ok() {
                             result.locks_removed.push(path.display().to_string());
                             // Try to remove corresponding metadata file

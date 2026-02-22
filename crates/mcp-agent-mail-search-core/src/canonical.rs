@@ -249,9 +249,11 @@ pub fn canonicalize(doc_kind: DocKind, title: &str, body: &str, policy: CanonPol
 
     let stripped = strip_markdown(&raw);
 
-    let redacted = match policy {
-        CanonPolicy::Full | CanonPolicy::RedactSecrets => redact_secrets(&stripped),
-        CanonPolicy::TitleOnly => stripped,
+    let redacted = if matches!(policy, CanonPolicy::TitleOnly) {
+        stripped
+    } else {
+        // Full and RedactSecrets both scrub obvious secrets from canonical text.
+        redact_secrets(&stripped)
     };
 
     let normalized = normalize_text(&redacted);

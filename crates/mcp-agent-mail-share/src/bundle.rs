@@ -96,16 +96,14 @@ pub fn bundle_attachments(
         message: format!("cannot open snapshot: {e}"),
     })?;
 
-    let _rows = conn
+    // Verify the messages table is accessible (schema check)
+    let _ = conn
         .query_sync(
-            "SELECT id, attachments \
-             FROM messages \
-             WHERE attachments != '[]' AND attachments != '' \
-             ORDER BY id ASC",
+            "SELECT 1 FROM messages LIMIT 0",
             &[],
         )
         .map_err(|e| ShareError::Sqlite {
-            message: format!("SELECT messages failed: {e}"),
+            message: format!("messages table not accessible: {e}"),
         })?;
 
     let attachments_dir = output_dir.join("attachments");

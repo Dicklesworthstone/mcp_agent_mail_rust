@@ -283,7 +283,7 @@ fn retry_probe(
 ) -> Result<ProbeResponse, ProbeError> {
     let mut last_err = None;
 
-    for attempt in 0..=config.retries {
+    for attempt in 0..config.retries {
         if attempt > 0 {
             std::thread::sleep(config.retry_delay);
         }

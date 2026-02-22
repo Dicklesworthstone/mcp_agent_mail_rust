@@ -896,14 +896,15 @@ fn check_path_conflicts(
         // because the directory itself is within the reserved scope.
         for res in &active_indices {
             let pat_norm = normalize_path(&res.path_pattern, ignorecase);
-            
+
             // Check if the path is a prefix of the pattern's base directory
             // (e.g. path "src", pattern "src/main.rs" or "src/**")
             if pat_norm.starts_with(&normalized)
-                && (normalized.is_empty() || pat_norm
-                    .as_bytes()
-                    .get(normalized.len())
-                    .is_some_and(|&c| c == b'/'))
+                && (normalized.is_empty()
+                    || pat_norm
+                        .as_bytes()
+                        .get(normalized.len())
+                        .is_some_and(|&c| c == b'/'))
             {
                 conflicts.push(GuardConflict {
                     path: path.clone(),
@@ -913,15 +914,20 @@ fn check_path_conflicts(
                 });
                 break;
             }
-            
+
             // Also check the reverse: pattern's literal base is a prefix of the path
             // (needed for non-glob patterns like "src/utils" matching "src/utils/file.rs")
-            let has_glob = res.path_pattern.contains('*') || res.path_pattern.contains('?') || res.path_pattern.contains('[') || res.path_pattern.contains('{');
-            if !has_glob && normalized.starts_with(&pat_norm) 
-                && (pat_norm.is_empty() || normalized
-                    .as_bytes()
-                    .get(pat_norm.len())
-                    .is_some_and(|&c| c == b'/')) 
+            let has_glob = res.path_pattern.contains('*')
+                || res.path_pattern.contains('?')
+                || res.path_pattern.contains('[')
+                || res.path_pattern.contains('{');
+            if !has_glob
+                && normalized.starts_with(&pat_norm)
+                && (pat_norm.is_empty()
+                    || normalized
+                        .as_bytes()
+                        .get(pat_norm.len())
+                        .is_some_and(|&c| c == b'/'))
             {
                 conflicts.push(GuardConflict {
                     path: path.clone(),
@@ -947,8 +953,12 @@ fn normalize_path(path: &str, ignorecase: bool) -> String {
         match component {
             "" | "." => {}
             ".." => {
-                // Pop the previous segment if possible (don't go above root)
-                parts.pop();
+                if parts.is_empty() {
+                    // Clamp traversal at root so `../x` normalizes to `x`.
+                    // This keeps matching conservative and prevents escape prefixes.
+                } else {
+                    parts.pop();
+                }
             }
             other => parts.push(other),
         }
@@ -1107,7 +1117,9 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
         }
 
         let mut rev_list_cmd = Command::new("git");
-        rev_list_cmd.current_dir(repo_root).args(["rev-list", "--topo-order"]);
+        rev_list_cmd
+            .current_dir(repo_root)
+            .args(["rev-list", "--topo-order"]);
         let diff_range = if remote_sha.chars().all(|c| c == '0') {
             rev_list_cmd.args([local_sha, "--not", "--remotes"]);
             None
