@@ -438,6 +438,10 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
                 .disk_pressure_level
                 .load();
             let r = if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+                tracing::warn!(
+                    "[wbq-drain] disk pressure critical, skipping write-behind op"
+                );
+                metrics.storage.wbq_errors_total.inc();
                 Ok(())
             } else {
                 wbq_execute_op(&envelope.op)
@@ -843,12 +847,12 @@ impl FileLock {
         }
         self.held = false;
 
-        // Drop the file handle to release the OS-level flock
-        self.lock_file = None;
-        // Remove metadata file
+        // Remove files BEFORE releasing flock to prevent race where another
+        // process acquires the lock between flock release and file removal.
         let _ = fs::remove_file(&self.metadata_path);
-        // Remove lock file
         let _ = fs::remove_file(&self.path);
+        // Now drop the file handle to release the OS-level flock
+        self.lock_file = None;
         Ok(())
     }
 
