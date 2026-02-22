@@ -242,7 +242,9 @@ fn load_env_file_value(path: &Path, key: &str) -> Option<String> {
             continue;
         }
         let normalized = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-        let (lhs, rhs) = normalized.split_once('=')?;
+        let Some((lhs, rhs)) = normalized.split_once('=') else {
+            continue;
+        };
         if lhs.trim() != key {
             continue;
         }

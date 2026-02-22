@@ -258,7 +258,7 @@ impl SyncState {
         let max_idx = delta
             .changed_cells
             .iter()
-            .map(|change| change.idx as usize + 1)
+            .map(|change| (change.idx as usize).saturating_add(1))
             .max()
             .unwrap_or(0);
         let min_capacity = self.cell_capacity().max(max_idx);
