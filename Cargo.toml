@@ -32,7 +32,7 @@ fastmcp-server = "0.2.0"
 fastmcp-transport = "0.2.0"
 fastmcp-protocol = "0.2.0"
 
-asupersync = { version = "0.2.5", features = ["tls-webpki-roots"] }
+asupersync = { version = "0.2.5", path = "/dp/asupersync", features = ["tls-webpki-roots"] }
 
 sqlmodel = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel" }
 sqlmodel-core = { version = "0.2.0", path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
@@ -148,6 +148,11 @@ inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
 uring-fs = { path = "vendor/uring-fs" }
+asupersync = { path = "/dp/asupersync" }
+asupersync-macros = { path = "/dp/asupersync/asupersync-macros" }
+franken-kernel = { path = "/dp/asupersync/franken_kernel" }
+franken-evidence = { path = "/dp/asupersync/franken_evidence" }
+franken-decision = { path = "/dp/asupersync/franken_decision" }
 sqlmodel = { path = "/dp/sqlmodel_rust/crates/sqlmodel" }
 sqlmodel-core = { path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
 sqlmodel-query = { path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
