@@ -2300,6 +2300,42 @@ effective_free_bytes={free}"
                     attempted.push(name.clone());
                 }
             }
+
+            // Re-check contact approval after handshake attempts (mirrors send_message)
+            if !attempted.is_empty() {
+                let approved_ids = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::list_approved_contact_ids(
+                        ctx.cx(),
+                        &pool,
+                        project_id,
+                        sender_id,
+                        &candidate_ids,
+                    )
+                    .await,
+                )
+                .unwrap_or_default();
+                let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
+
+                blocked.retain(|name| {
+                    if let Some(agent) = recipient_map.get(&name.to_lowercase()) {
+                        let rec_id = agent.id.unwrap_or(0);
+                        let mut policy = agent.contact_policy.to_lowercase();
+                        if !["open", "auto", "contacts_only", "block_all"]
+                            .contains(&policy.as_str())
+                        {
+                            policy = "auto".to_string();
+                        }
+                        let approved = approved_set.contains(&rec_id);
+                        if policy == "open" {
+                            return false;
+                        }
+                        if (policy == "auto" || policy == "contacts_only") && approved {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
         }
 
         if !blocked.is_empty() {
