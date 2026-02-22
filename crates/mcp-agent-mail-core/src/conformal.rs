@@ -76,6 +76,7 @@ impl ConformalPredictor {
     ///   Must be in (0, 1).
     #[must_use]
     pub fn new(window: usize, coverage: f64) -> Self {
+        let coverage = coverage.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON);
         Self {
             observations: VecDeque::with_capacity(window.min(1024)),
             window,
