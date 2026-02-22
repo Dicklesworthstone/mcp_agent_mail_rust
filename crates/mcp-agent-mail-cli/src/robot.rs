@@ -1293,13 +1293,13 @@ fn build_outbox_entries(
                     ) AS recipient_count,
                     COALESCE(
                         (
-                            SELECT GROUP_CONCAT(a.name, ', ')
+                            SELECT GROUP_CONCAT(a.name)
                             FROM message_recipients mr
                             JOIN agents a ON a.id = mr.agent_id
                             WHERE mr.message_id = m.id AND mr.kind = 'to'
                         ),
                         (
-                            SELECT GROUP_CONCAT(a.name, ', ')
+                            SELECT GROUP_CONCAT(a.name)
                             FROM message_recipients mr
                             JOIN agents a ON a.id = mr.agent_id
                             WHERE mr.message_id = m.id
@@ -1331,6 +1331,14 @@ fn build_outbox_entries(
         let recipient_names = row
             .get_named::<String>("recipient_names")
             .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|segment| !segment.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "(no recipients)".to_string());
 
@@ -1830,9 +1838,8 @@ fn build_search(
     let mut filter_params: Vec<Value> = Vec::new();
 
     if let Some(kind) = kind_filter {
-        extra_where.push_str(
-            " AND m.id IN (SELECT message_id FROM message_recipients WHERE kind = ?)",
-        );
+        extra_where
+            .push_str(" AND m.id IN (SELECT message_id FROM message_recipients WHERE kind = ?)");
         filter_params.push(Value::Text(kind.to_string()));
     }
     if let Some(imp) = importance_filter {
