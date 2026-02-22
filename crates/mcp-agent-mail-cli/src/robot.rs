@@ -1641,10 +1641,12 @@ fn build_message(
             .ok()
             .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
             .unwrap_or(0);
-        if acked_count >= total_recipients && total_recipients > 0 {
+        if total_recipients > 0 && acked_count >= total_recipients {
             "done".to_string()
-        } else if acked_count > 0 {
+        } else if total_recipients > 0 && acked_count > 0 {
             format!("partial ({acked_count}/{total_recipients})")
+        } else if acked_count > 0 {
+            format!("acked ({acked_count})")
         } else {
             "pending".to_string()
         }

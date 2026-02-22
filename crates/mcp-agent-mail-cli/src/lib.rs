@@ -13017,6 +13017,119 @@ mod tests {
     }
 
     #[test]
+    fn parse_doctor_reconstruct_defaults() {
+        let cli = Cli::try_parse_from(["am", "doctor", "reconstruct"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Reconstruct {
+                        dry_run,
+                        yes,
+                        json,
+                    },
+            } => {
+                assert!(!dry_run);
+                assert!(!yes);
+                assert!(!json);
+            }
+            _ => panic!("expected Doctor Reconstruct"),
+        }
+    }
+
+    #[test]
+    fn parse_doctor_reconstruct_all_flags() {
+        let cli =
+            Cli::try_parse_from(["am", "doctor", "reconstruct", "--dry-run", "-y", "--json"])
+                .unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Reconstruct {
+                        dry_run,
+                        yes,
+                        json,
+                    },
+            } => {
+                assert!(dry_run);
+                assert!(yes);
+                assert!(json);
+            }
+            _ => panic!("expected Doctor Reconstruct"),
+        }
+    }
+
+    #[test]
+    fn doctor_reconstruct_rejects_missing_storage_root() {
+        let result = handle_doctor_reconstruct_with(
+            Some(Path::new("/tmp/nonexistent.db")),
+            Some(Path::new("/nonexistent/storage/root")),
+            false,
+            false,
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            CliError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("storage root does not exist"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_reconstruct_dry_run_empty_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let db_path = tmp.path().join("test.db");
+
+        let result = handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(tmp.path()),
+            true,
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn doctor_reconstruct_with_archive_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path();
+
+        // Set up a minimal archive: 1 project, 1 agent, 1 message
+        let proj_dir = storage.join("projects").join("test-project");
+        let agent_dir = proj_dir.join("agents").join("SwiftFox");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"SwiftFox","role":"Coder","model":"claude","registered_ts":"2026-01-15T10:00:00"}"#,
+        )
+        .unwrap();
+
+        let msg_dir = proj_dir.join("messages").join("2026").join("01");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            msg_dir.join("001_hello.md"),
+            "---json\n{\n  \"id\": 1,\n  \"subject\": \"Hello\",\n  \"from_agent\": \"SwiftFox\",\n  \"importance\": \"normal\",\n  \"to\": [\"BraveLion\"],\n  \"cc\": [],\n  \"bcc\": [],\n  \"thread_id\": \"t1\",\n  \"in_reply_to\": null,\n  \"created_ts\": \"2026-01-15T10:05:00\"\n}\n---\n\nHello BraveLion!\n",
+        )
+        .unwrap();
+
+        let db_path = tmp.path().join("reconstructed.db");
+
+        let result = handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(storage),
+            false,
+            true,
+        );
+        assert!(result.is_ok(), "reconstruct failed: {result:?}");
+        assert!(db_path.exists(), "reconstructed DB file should exist");
+    }
+
+    #[test]
     fn doctor_backups_lists_sqlite3_files_only() {
         let tmp = tempfile::tempdir().unwrap();
         let backup_dir = tmp.path().join("backups");

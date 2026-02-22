@@ -1499,7 +1499,7 @@ mod tests {
         // Migrating should not delete existing rows.
         block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
         });
 
         let rows = conn
@@ -2106,18 +2106,17 @@ mod tests {
             move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
         });
 
-        // Query sqlite_master for v4 indexes.
-        let rows = conn
-            .query_sync(
-                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name",
-                &[],
-            )
-            .expect("query indexes");
-
-        let index_names: Vec<String> = rows
-            .iter()
-            .map(|r| r.get_named::<String>("name").unwrap())
-            .collect();
+        // Collect indexes from table-local metadata (works across sqlite backends).
+        let mut index_names: Vec<String> = Vec::new();
+        for table in ["message_recipients", "messages", "agent_links"] {
+            let rows = conn
+                .query_sync(&format!("PRAGMA index_list({table})"), &[])
+                .expect("query index_list");
+            index_names.extend(
+                rows.iter()
+                    .filter_map(|r| r.get_named::<String>("name").ok()),
+            );
+        }
 
         // v4 composite indexes must exist.
         assert!(
