@@ -6,6 +6,16 @@
       "status": "ok"
     },
     {
+      "check": "db_file_sanity",
+      "detail": "quick_check OK (147456 bytes)",
+      "status": "ok"
+    },
+    {
+      "check": "pool_init",
+      "detail": "Pool initialization + migrations OK",
+      "status": "ok"
+    },
+    {
       "check": "storage_root",
       "detail": "<TMP_ROOT>/storage_root",
       "status": "warn"

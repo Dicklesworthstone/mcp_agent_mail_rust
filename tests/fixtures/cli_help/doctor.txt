@@ -5,7 +5,8 @@ Commands:
   repair
   backups
   restore
-  help     Print this message or the help of the given subcommand(s)
+  reconstruct  Reconstruct the database from the Git archive
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
