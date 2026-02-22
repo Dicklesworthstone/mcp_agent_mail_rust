@@ -189,10 +189,10 @@ pub fn diversify<S: BuildHasher>(
     let mut sender_counts: HashMap<&str, usize> = HashMap::new();
 
     let mut demotions: usize = 0;
-    let top_score = window_hits.first().map_or(0.0, |h| h.rrf_score);
 
     for position in 0..window {
-        let mut best_idx: Option<usize> = None;
+        let mut best_violating_idx: Option<usize> = None;
+        let mut best_valid_idx: Option<usize> = None;
 
         for (idx, hit) in window_hits.iter().enumerate() {
             if placed[idx] {
@@ -202,41 +202,53 @@ pub fn diversify<S: BuildHasher>(
             let meta = metadata.get(&hit.doc_id);
             let would_violate = would_violate_caps(meta, &thread_counts, &sender_counts, config);
 
-            // A hit is eligible for diversity demotion only if it's "near-tied"
-            // with the top score. Hits with a clear lead are never demoted.
-            let is_near_tied = (top_score - hit.rrf_score).abs() <= config.score_tolerance;
-            let should_skip = would_violate && is_near_tied;
-
-            if best_idx.is_none() || !should_skip {
-                best_idx = Some(idx);
-                if !should_skip {
-                    break; // Found a non-violating candidate — take it
+            if would_violate {
+                if best_violating_idx.is_none() {
+                    best_violating_idx = Some(idx);
                 }
+            } else {
+                best_valid_idx = Some(idx);
+                break; // Found the best valid candidate
             }
         }
 
-        if let Some(idx) = best_idx {
-            placed[idx] = true;
-            let hit = &window_hits[idx];
-            let meta = metadata.get(&hit.doc_id);
-
-            // Update counts
-            if let Some(m) = meta {
-                if let Some(ref tid) = m.thread_id {
-                    *thread_counts.entry(tid.as_str()).or_insert(0) += 1;
-                }
-                if let Some(ref s) = m.sender {
-                    *sender_counts.entry(s.as_str()).or_insert(0) += 1;
+        let idx_to_take = match (best_violating_idx, best_valid_idx) {
+            (Some(v_idx), Some(valid_idx)) => {
+                let v_score = window_hits[v_idx].rrf_score;
+                let valid_score = window_hits[valid_idx].rrf_score;
+                // A violating hit is eligible for diversity demotion only if it's "near-tied"
+                // with the next valid hit. Hits with a clear lead are never demoted.
+                if (v_score - valid_score).abs() <= config.score_tolerance {
+                    valid_idx
+                } else {
+                    v_idx
                 }
             }
+            (Some(v_idx), None) => v_idx,
+            (None, Some(valid_idx)) => valid_idx,
+            (None, None) => break,
+        };
 
-            // Track if this was a demotion (placed out of original order)
-            if idx != position {
-                demotions += 1;
+        placed[idx_to_take] = true;
+        let hit = &window_hits[idx_to_take];
+        let meta = metadata.get(&hit.doc_id);
+
+        // Update counts
+        if let Some(m) = meta {
+            if let Some(ref tid) = m.thread_id {
+                *thread_counts.entry(tid.as_str()).or_insert(0) += 1;
             }
-
-            result.push(hit.clone());
+            if let Some(ref s) = m.sender {
+                *sender_counts.entry(s.as_str()).or_insert(0) += 1;
+            }
         }
+
+        // Track if this was a demotion (placed out of original order)
+        if idx_to_take != position {
+            demotions += 1;
+        }
+
+        result.push(hit.clone());
     }
 
     // Append any unplaced window hits (shouldn't happen, but safety)

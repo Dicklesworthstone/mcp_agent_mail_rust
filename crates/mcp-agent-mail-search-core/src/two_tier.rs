@@ -846,7 +846,7 @@ pub trait TwoTierEmbedder: Send + Sync {
 /// Two-tier searcher that coordinates fast and quality search.
 pub struct TwoTierSearcher<'a> {
     index: &'a TwoTierIndex,
-    fast_embedder: Arc<dyn TwoTierEmbedder>,
+    fast_embedder: Option<Arc<dyn TwoTierEmbedder>>,
     quality_embedder: Option<Arc<dyn TwoTierEmbedder>>,
     config: TwoTierConfig,
     metrics_recorder: Option<Arc<std::sync::Mutex<TwoTierMetrics>>>,
@@ -856,7 +856,7 @@ impl<'a> TwoTierSearcher<'a> {
     /// Create a new two-tier searcher.
     pub fn new(
         index: &'a TwoTierIndex,
-        fast_embedder: Arc<dyn TwoTierEmbedder>,
+        fast_embedder: Option<Arc<dyn TwoTierEmbedder>>,
         quality_embedder: Option<Arc<dyn TwoTierEmbedder>>,
         config: TwoTierConfig,
     ) -> Self {
@@ -896,7 +896,10 @@ impl<'a> TwoTierSearcher<'a> {
     /// Perform fast-only search.
     pub fn search_fast_only(&self, query: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
         let start = Instant::now();
-        let query_vec = self.fast_embedder.embed(query)?;
+        let fast_embedder = self.fast_embedder.as_ref().ok_or_else(|| {
+            SearchError::ModeUnavailable("fast embedder not available".into())
+        })?;
+        let query_vec = fast_embedder.embed(query)?;
         let results = self.index.search_fast(&query_vec, k);
         debug!(
             query_len = query.len(),

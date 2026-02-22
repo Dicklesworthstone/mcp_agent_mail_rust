@@ -98,10 +98,7 @@ pub fn bundle_attachments(
 
     // Verify the messages table is accessible (schema check)
     let _ = conn
-        .query_sync(
-            "SELECT 1 FROM messages LIMIT 0",
-            &[],
-        )
+        .query_sync("SELECT 1 FROM messages LIMIT 0", &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("messages table not accessible: {e}"),
         })?;

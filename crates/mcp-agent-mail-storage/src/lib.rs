@@ -446,9 +446,7 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
                 .disk_pressure_level
                 .load();
             let r = if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
-                tracing::warn!(
-                    "[wbq-drain] disk pressure critical, skipping write-behind op"
-                );
+                tracing::warn!("[wbq-drain] disk pressure critical, skipping write-behind op");
                 metrics.storage.wbq_errors_total.inc();
                 Ok(())
             } else {
@@ -2617,18 +2615,21 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                 // New-format owner files may carry "unknown" start ticks (e.g., non-Linux).
                 // Be conservative: never remove an alive-PID lock in that case.
                 if has_start_ticks_field {
-                    // On non-Unix, pid_alive() returns true blindly. If the lock is very old,
-                    // we must assume it's stale because we can't verify the PID identity.
-                    #[cfg(not(unix))]
-                    if lock_file_age_seconds(&lock_path)
-                        .is_some_and(|age| age > max_age_seconds * 2.0)
-                    {
-                        tracing::info!(
-                            "[git-lock] non-unix stale lock force clean (age={age:.1}s)"
-                        );
-                        let _ = fs::remove_file(&lock_path);
-                        let _ = fs::remove_file(&owner_path);
-                        return true;
+                    // If we cannot verify start ticks (e.g., macOS, Windows, or reading a 0),
+                    // we must fall back to an age-based timeout to prevent permanent deadlocks
+                    // from PID reuse. We use a more conservative timeout (2x) than the legacy format.
+                    if owner_start_ticks.is_none() || process_start_ticks(pid).is_none() {
+                        if lock_file_age_seconds(&lock_path)
+                            .is_some_and(|age| age > max_age_seconds * 2.0)
+                        {
+                            tracing::info!(
+                                "[git-lock] index.lock held by alive PID {pid} but start ticks unavailable, force clean (age > {:.1}s)",
+                                max_age_seconds * 2.0
+                            );
+                            let _ = fs::remove_file(&lock_path);
+                            let _ = fs::remove_file(&owner_path);
+                            return true;
+                        }
                     }
 
                     tracing::debug!(
