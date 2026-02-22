@@ -571,9 +571,9 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
     Some(cleaned)
 }
 
-/// Precomputed set of all 4,526 valid lowercased agent names for O(1) lookup.
+/// Precomputed set of all 9,900 valid lowercased agent names for O(1) lookup.
 ///
-/// Initialized on first access. 62 adjectives × 73 nouns ≈ 54 KB.
+/// Initialized on first access. 75 adjectives × 132 nouns ≈ 300 KB.
 fn valid_names_set() -> &'static std::collections::HashSet<String> {
     static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -590,8 +590,8 @@ fn valid_names_set() -> &'static std::collections::HashSet<String> {
 
 /// Validates that an agent name follows the adjective+noun pattern.
 ///
-/// Uses a precomputed `HashSet` of all 4,526 valid names for O(1) lookup,
-/// replacing the previous O(62×73) linear scan.
+/// Uses a precomputed `HashSet` of all 9,900 valid names for O(1) lookup,
+/// replacing the previous O(75×132) linear scan.
 ///
 /// # Examples
 /// ```
