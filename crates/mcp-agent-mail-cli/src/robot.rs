@@ -1106,7 +1106,7 @@ fn build_inbox(
     agent_name: &str,
     urgent_only: bool,
     ack_overdue_only: bool,
-    _unread_only: bool,
+    unread_only: bool,
     show_all: bool,
     limit: usize,
     include_bodies: bool,
@@ -1122,8 +1122,10 @@ fn build_inbox(
         "AND priority_bucket <= 2"
     } else if show_all {
         "" // no filter
+    } else if unread_only {
+        "AND priority_bucket <= 5" // unread only (read_ts IS NULL)
     } else {
-        "AND priority_bucket <= 5" // default (and unread_only): unread only
+        "AND priority_bucket <= 6" // include read but un-acked messages
     };
 
     let sql = format!(
@@ -1273,18 +1275,39 @@ fn build_outbox_entries(
     let rows = conn
         .query_sync(
             "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md,
-                    COALESCE(SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END), 0) AS acked_count,
-                    COALESCE(COUNT(mr.id), 0) AS recipient_count,
                     COALESCE(
-                        GROUP_CONCAT(CASE WHEN mr.kind = 'to' THEN a.name END, ', '),
-                        GROUP_CONCAT(a.name, ', '),
+                        (
+                            SELECT SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END)
+                            FROM message_recipients mr
+                            WHERE mr.message_id = m.id
+                        ),
+                        0
+                    ) AS acked_count,
+                    COALESCE(
+                        (
+                            SELECT COUNT(*)
+                            FROM message_recipients mr
+                            WHERE mr.message_id = m.id
+                        ),
+                        0
+                    ) AS recipient_count,
+                    COALESCE(
+                        (
+                            SELECT GROUP_CONCAT(a.name, ', ')
+                            FROM message_recipients mr
+                            JOIN agents a ON a.id = mr.agent_id
+                            WHERE mr.message_id = m.id AND mr.kind = 'to'
+                        ),
+                        (
+                            SELECT GROUP_CONCAT(a.name, ', ')
+                            FROM message_recipients mr
+                            JOIN agents a ON a.id = mr.agent_id
+                            WHERE mr.message_id = m.id
+                        ),
                         ''
                     ) AS recipient_names
              FROM messages m
-             LEFT JOIN message_recipients mr ON mr.message_id = m.id
-             LEFT JOIN agents a ON a.id = mr.agent_id
              WHERE m.sender_id = ? AND m.project_id = ?
-             GROUP BY m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md
              ORDER BY m.created_ts DESC
              LIMIT ?",
             &[
@@ -1770,6 +1793,7 @@ fn build_search(
     conn: &DbConn,
     project_id: i64,
     query: &str,
+    kind_filter: Option<&str>,
     importance_filter: Option<&str>,
     since: Option<&str>,
     limit: usize,
@@ -1805,6 +1829,12 @@ fn build_search(
     let mut extra_where = String::new();
     let mut filter_params: Vec<Value> = Vec::new();
 
+    if let Some(kind) = kind_filter {
+        extra_where.push_str(
+            " AND m.id IN (SELECT message_id FROM message_recipients WHERE kind = ?)",
+        );
+        filter_params.push(Value::Text(kind.to_string()));
+    }
     if let Some(imp) = importance_filter {
         extra_where.push_str(" AND m.importance = ?");
         filter_params.push(Value::Text(imp.to_string()));
@@ -1850,8 +1880,10 @@ fn build_search(
                 let mut like_parts: Vec<String> = Vec::with_capacity(terms.len());
                 for term in terms {
                     let escaped = format!("%{}%", mcp_agent_mail_db::queries::like_escape(&term));
-                    like_parts
-                        .push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')".to_string());
+                    like_parts.push(
+                        "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')"
+                            .to_string(),
+                    );
                     like_params.push(Value::Text(escaped.clone()));
                     like_params.push(Value::Text(escaped));
                 }
@@ -1872,11 +1904,12 @@ fn build_search(
                      ORDER BY m.created_ts DESC, m.id DESC
                      LIMIT ?"
                 );
-                conn.query_sync(&like_sql, &like_params).map_err(|like_err| {
-                    CliError::Other(format!(
-                        "search query failed: fts_error={fts_err}; like_error={like_err}"
-                    ))
-                })?
+                conn.query_sync(&like_sql, &like_params)
+                    .map_err(|like_err| {
+                        CliError::Other(format!(
+                            "search query failed: fts_error={fts_err}; like_error={like_err}"
+                        ))
+                    })?
             }
         }
     };
@@ -2130,13 +2163,9 @@ fn build_reservations(
     ))
 }
 
-/// Check for glob pattern overlap using the robust implementation from tools.
-///
-/// Delegates to `mcp_agent_mail_tools::pattern_overlap::CompiledPattern` to ensure
-/// consistency with server-side conflict detection. Handles complex globs,
-/// normalization, and symmetric matching correctly.
+/// Check whether `path` matches `pattern` with one-way glob semantics.
 fn glob_matches(pattern: &str, path: &str) -> bool {
-    mcp_agent_mail_tools::patterns_overlap(pattern, path)
+    mcp_agent_mail_core::pattern_overlap::CompiledPattern::new(pattern).matches(path)
 }
 
 // ── Timeline command implementation ─────────────────────────────────────────
@@ -2313,11 +2342,13 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
             .and_then(|r| r.get_named("cnt").ok())
             .unwrap_or(0);
 
-        // Count urgent messages
+        // Count urgent/high unread messages
         let urgent: i64 = conn
             .query_sync(
-                "SELECT COUNT(*) AS cnt FROM messages
-                 WHERE project_id = ? AND importance IN ('urgent', 'high')",
+                "SELECT COUNT(*) AS cnt FROM message_recipients mr
+                 JOIN messages m ON m.id = mr.message_id
+                 WHERE m.project_id = ? AND m.importance IN ('urgent', 'high')
+                 AND mr.read_ts IS NULL",
                 &[Value::BigInt(pid)],
             )
             .unwrap_or_default()
@@ -3048,7 +3079,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Search {
             query,
-            kind: _,
+            kind,
             importance,
             since,
         } => {
@@ -3058,6 +3089,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 &conn,
                 project_id,
                 &query,
+                kind.as_deref(),
                 importance.as_deref(),
                 since.as_deref(),
                 20,
@@ -5267,5 +5299,4 @@ mod tests {
             other => panic!("unexpected navigate result: {other:?}"),
         }
     }
-
 }
