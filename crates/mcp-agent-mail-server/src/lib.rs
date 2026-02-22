@@ -79,6 +79,7 @@ use asupersync::http::h1::types::{
 };
 use asupersync::messaging::RedisClient;
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::runtime::reactor::create_reactor;
 use asupersync::time::{timeout, wall_now};
 use asupersync::{Budget, Cx};
 use fastmcp::prelude::*;
@@ -825,8 +826,12 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
         config.clone(),
     ));
 
+    let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::new()
-        .worker_threads(std::thread::available_parallelism().map_or(4, |n| n.get().min(32)))
+        .with_reactor(reactor)
+        // Keep the HTTP runtime single-threaded to avoid asupersync worker
+        // wake storms that can peg CPU in idle local-dev/TUI sessions.
+        .worker_threads(1)
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 
@@ -839,7 +844,16 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
         })
         .await?;
 
-        listener.run(&handle).await?;
+        // Run listener on a runtime task so async I/O sees an attached Cx/driver.
+        // Running `listener.run` directly in root `block_on` can spin on accept().
+        let run_handle = handle
+            .clone()
+            .try_spawn(async move { listener.run(&handle).await })
+            .map_err(|err| {
+                std::io::Error::other(format!("failed to spawn HTTP listener: {err}"))
+            })?;
+
+        let _stats = run_handle.await?;
         Ok::<(), std::io::Error>(())
     });
 
@@ -865,6 +879,16 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {
+        return run_http(config);
+    }
+
+    // Guard against degenerate PTY geometry (e.g. `stty size` => `0 0`) which can
+    // trigger high-frequency redraw loops in the fullscreen renderer.
+    if let Some((cols, rows)) = degenerate_stty_size() {
+        eprintln!(
+            "[warn] Detected invalid terminal size ({cols}x{rows}); \
+             disabling TUI to avoid runaway CPU (headless HTTP mode)"
+        );
         return run_http(config);
     }
 
@@ -995,8 +1019,11 @@ fn run_http_server_thread(
         config,
     ));
 
+    let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::new()
-        .worker_threads(std::thread::available_parallelism().map_or(4, |n| n.get().min(32)))
+        .with_reactor(reactor)
+        // Match `run_http`: single worker avoids idle spin storms.
+        .worker_threads(1)
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 
@@ -1035,7 +1062,16 @@ fn run_http_server_thread(
             local_addr,
         }));
 
-        let _stats = listener.run(&handle).await?;
+        // See `run_http`: listener must run in a spawned runtime task to avoid
+        // fallback wake-loops when polled from root `block_on`.
+        let run_handle = handle
+            .clone()
+            .try_spawn(async move { listener.run(&handle).await })
+            .map_err(|err| {
+                std::io::Error::other(format!("failed to spawn HTTP listener: {err}"))
+            })?;
+
+        let _stats = run_handle.await?;
         Ok::<(), std::io::Error>(())
     })
 }
@@ -1671,6 +1707,9 @@ struct StartupDashboard {
 impl StartupDashboard {
     fn maybe_start(config: &mcp_agent_mail_core::Config) -> Option<Arc<Self>> {
         if !config.log_rich_enabled || !std::io::stdout().is_terminal() {
+            return None;
+        }
+        if degenerate_stty_size().is_some() {
             return None;
         }
 
@@ -2798,6 +2837,34 @@ fn parse_env_u16(key: &str, default: u16) -> u16 {
         .and_then(|v| v.parse::<u16>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(default)
+}
+
+fn parse_stty_size(stdout: &[u8]) -> Option<(u16, u16)> {
+    let text = std::str::from_utf8(stdout).ok()?.trim();
+    let mut parts = text.split_whitespace();
+    let rows = parts.next()?.parse::<u16>().ok()?;
+    let cols = parts.next()?.parse::<u16>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((cols, rows))
+}
+
+fn degenerate_stty_size() -> Option<(u16, u16)> {
+    let output = std::process::Command::new("stty")
+        .arg("size")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let (cols, rows) = parse_stty_size(&output.stdout)?;
+    if cols == 0 || rows == 0 {
+        return Some((cols, rows));
+    }
+    None
 }
 
 fn request_panel_width_from_columns(columns: u16) -> usize {
@@ -10872,6 +10939,19 @@ mod tests {
         assert_eq!(request_panel_width_from_columns(60), 60);
         assert_eq!(request_panel_width_from_columns(100), 100);
         assert_eq!(request_panel_width_from_columns(200), 140);
+    }
+
+    #[test]
+    fn parse_stty_size_parses_rows_and_cols() {
+        assert_eq!(parse_stty_size(b"24 80\n"), Some((80, 24)));
+    }
+
+    #[test]
+    fn parse_stty_size_rejects_malformed_output() {
+        assert_eq!(parse_stty_size(b""), None);
+        assert_eq!(parse_stty_size(b"0\n"), None);
+        assert_eq!(parse_stty_size(b"abc def\n"), None);
+        assert_eq!(parse_stty_size(b"24 80 1\n"), None);
     }
 
     #[test]
