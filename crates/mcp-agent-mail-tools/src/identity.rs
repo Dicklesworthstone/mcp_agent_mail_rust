@@ -206,6 +206,15 @@ pub struct ProjectWithIdentityResponse {
     pub identity: mcp_agent_mail_core::ProjectIdentity,
 }
 
+/// Default capabilities granted to every registered agent regardless of
+/// transport or auth method (Bearer token, JWT, or unauthenticated local).
+pub const DEFAULT_AGENT_CAPABILITIES: &[&str] = &[
+    "send_message",
+    "fetch_inbox",
+    "file_reservation_paths",
+    "acknowledge_message",
+];
+
 /// Agent response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResponse {
@@ -218,6 +227,8 @@ pub struct AgentResponse {
     pub last_active_ts: String,
     pub project_id: i64,
     pub attachments_policy: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// Whois response with optional recent commits
@@ -613,6 +624,7 @@ Check that all parameters have valid values."
         last_active_ts: micros_to_iso(row.last_active_ts),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
+        capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
     };
 
     serde_json::to_string(&response)
@@ -803,6 +815,7 @@ Choose a different name (or omit the name to auto-generate one)."
         last_active_ts: micros_to_iso(row.last_active_ts),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
+        capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
     };
 
     serde_json::to_string(&response)
@@ -895,6 +908,7 @@ pub async fn whois(
             last_active_ts: micros_to_iso(agent_row.last_active_ts),
             project_id: agent_row.project_id,
             attachments_policy: agent_row.attachments_policy,
+            capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
         },
         recent_commits,
     };
@@ -1035,6 +1049,7 @@ mod tests {
             last_active_ts: "2026-02-06T01:00:00Z".into(),
             project_id: 1,
             attachments_policy: "auto".into(),
+            capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -1043,6 +1058,7 @@ mod tests {
         assert_eq!(json["attachments_policy"], "auto");
         assert_eq!(json["id"], 42);
         assert_eq!(json["project_id"], 1);
+        assert!(json["capabilities"].as_array().unwrap().len() >= 4);
     }
 
     #[test]
@@ -1057,6 +1073,7 @@ mod tests {
             last_active_ts: "2026-02-06T01:00:00Z".into(),
             project_id: 1,
             attachments_policy: "auto".into(),
+            capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
         };
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: AgentResponse = serde_json::from_str(&json_str).unwrap();
@@ -1078,6 +1095,7 @@ mod tests {
                 last_active_ts: "2026-02-06T00:00:00Z".into(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
+                capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
             },
             recent_commits: vec![CommitInfo {
                 hexsha: "abc123".into(),
@@ -1107,6 +1125,7 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "none".into(),
+                capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
             },
             recent_commits: vec![],
         };

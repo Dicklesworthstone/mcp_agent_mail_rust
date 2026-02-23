@@ -1407,7 +1407,10 @@ pub fn tooling_capabilities(_ctx: &McpContext, agent: String) -> McpResult<Strin
     let snapshot = ToolingCapabilitiesSnapshot {
         agent: agent_name,
         project: query.get("project").cloned().unwrap_or_default(),
-        capabilities: vec![],
+        capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         generated_at: None,
     };
 
