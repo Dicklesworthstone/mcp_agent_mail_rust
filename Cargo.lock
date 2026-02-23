@@ -2135,7 +2135,7 @@ dependencies = [
  "fsqlite-ext-json",
  "fsqlite-ext-rtree",
  "fsqlite-types",
- "fsqlite-vfs 0.1.1",
+ "fsqlite-vfs 0.1.2",
 ]
 
 [[package]]
@@ -2197,7 +2197,7 @@ dependencies = [
  "fsqlite-planner 0.1.1",
  "fsqlite-types",
  "fsqlite-vdbe 0.1.1",
- "fsqlite-vfs 0.1.1",
+ "fsqlite-vfs 0.1.2",
  "fsqlite-wal 0.1.1",
  "serde",
  "tracing",
@@ -2345,7 +2345,7 @@ dependencies = [
  "chacha20poly1305",
  "fsqlite-error",
  "fsqlite-types",
- "fsqlite-vfs 0.1.1",
+ "fsqlite-vfs 0.1.2",
  "parking_lot",
  "xxhash-rust",
 ]
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "advisory-lock",
  "fsqlite-error",
@@ -2505,7 +2505,7 @@ dependencies = [
  "crc32c",
  "fsqlite-error",
  "fsqlite-types",
- "fsqlite-vfs 0.1.1",
+ "fsqlite-vfs 0.1.2",
  "tracing",
  "xxhash-rust",
 ]

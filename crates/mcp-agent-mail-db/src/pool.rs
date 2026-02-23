@@ -347,15 +347,9 @@ impl DbPool {
                 async move {
                     // Ensure parent directory exists for file-backed DBs.
                     if sqlite_path != ":memory:"
-                        && let Some(parent) = Path::new(&sqlite_path).parent()
-                        && !parent.as_os_str().is_empty()
-                        && !parent.exists()
-                        && let Err(e) = std::fs::create_dir_all(parent)
+                        && let Err(e) = ensure_sqlite_parent_dir_exists(&sqlite_path)
                     {
-                        return Outcome::Err(SqlError::Custom(format!(
-                            "failed to create db dir {}: {e}",
-                            parent.display()
-                        )));
+                        return Outcome::Err(e);
                     }
 
                     // For file-backed DBs, run DB-wide init (journal mode, migrations) once
@@ -371,45 +365,18 @@ impl DbPool {
                                 let cx2 = cx2.clone();
                                 let sqlite_path = sqlite_path.clone();
                                 async move {
-                                    // Use DbConn for DB-wide init.
-                                    if let Err(e) =
-                                        ensure_sqlite_file_healthy(Path::new(&sqlite_path))
+                                    match initialize_sqlite_file_once(
+                                        &cx2,
+                                        &sqlite_path,
+                                        run_migrations,
+                                    )
+                                    .await
                                     {
-                                        return Err(Outcome::Err(e));
+                                        Outcome::Ok(()) => Ok(()),
+                                        Outcome::Err(e) => Err(Outcome::Err(e)),
+                                        Outcome::Cancelled(r) => Err(Outcome::Cancelled(r)),
+                                        Outcome::Panicked(p) => Err(Outcome::Panicked(p)),
                                     }
-                                    let mig_conn = DbConn::open_file(&sqlite_path)
-                                        .map_err(Outcome::<(), SqlError>::Err)?;
-
-                                    if let Err(e) =
-                                        mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
-                                    {
-                                        return Err(Outcome::Err(e));
-                                    }
-                                    if run_migrations {
-                                        match schema::migrate_to_latest_base(&cx2, &mig_conn).await
-                                        {
-                                            Outcome::Ok(_) => {}
-                                            Outcome::Err(e) => return Err(Outcome::Err(e)),
-                                            Outcome::Cancelled(r) => {
-                                                return Err(Outcome::Cancelled(r));
-                                            }
-                                            Outcome::Panicked(p) => {
-                                                return Err(Outcome::Panicked(p));
-                                            }
-                                        }
-                                    }
-                                    // Always enforce startup cleanup for legacy identity FTS
-                                    // artifacts. These can be reintroduced by historical/full
-                                    // migration paths and have caused post-crash rowid/index
-                                    // mismatch failures (e.g. fts_projects corruption paths).
-                                    // Drop all FTS artifacts (Tantivy handles search now).
-                                    if let Err(e) = schema::enforce_runtime_fts_cleanup(&mig_conn) {
-                                        return Err(Outcome::Err(e));
-                                    }
-                                    // Close migration connection first. Some paths can leave
-                                    // implicit transaction state when no migrations are applied.
-                                    drop(mig_conn);
-                                    Ok(())
                                 }
                             })
                             .await;
@@ -426,21 +393,44 @@ impl DbPool {
                     }
 
                     // Now open pool connection (migrations are complete).
-                    let conn = if sqlite_path == ":memory:" {
+                    let mut conn = if sqlite_path == ":memory:" {
                         match DbConn::open_memory() {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
                     } else {
-                        match DbConn::open_file(&sqlite_path) {
+                        match open_sqlite_file_with_recovery(&sqlite_path) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
                     };
 
                     // Per-connection PRAGMAs matching legacy Python `db.py` event listeners.
-                    if let Err(e) = conn.execute_raw(&init_sql) {
-                        return Outcome::Err(e);
+                    if let Err(first_init_err) = conn.execute_raw(&init_sql) {
+                        if sqlite_path == ":memory:"
+                            || !is_sqlite_recovery_error_message(&first_init_err.to_string())
+                        {
+                            return Outcome::Err(first_init_err);
+                        }
+
+                        tracing::warn!(
+                            path = %sqlite_path,
+                            error = %first_init_err,
+                            "sqlite connection init PRAGMAs failed with recoverable error; attempting automatic recovery"
+                        );
+
+                        drop(conn);
+                        if let Err(recovery_err) = recover_sqlite_file(Path::new(&sqlite_path)) {
+                            return Outcome::Err(recovery_err);
+                        }
+
+                        conn = match open_sqlite_file_with_recovery(&sqlite_path) {
+                            Ok(c) => c,
+                            Err(e) => return Outcome::Err(e),
+                        };
+                        if let Err(second_init_err) = conn.execute_raw(&init_sql) {
+                            return Outcome::Err(second_init_err);
+                        }
                     }
 
                     Outcome::Ok(conn)
@@ -530,7 +520,7 @@ impl DbPool {
                     error = %e,
                     "startup integrity check failed to open sqlite file; attempting auto-recovery"
                 );
-                ensure_sqlite_file_healthy(Path::new(&self.sqlite_path))
+                recover_sqlite_file(Path::new(&self.sqlite_path))
                     .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
                 DbConn::open_file(&self.sqlite_path).map_err(|reopen| {
                     DbError::Sqlite(format!(
@@ -550,7 +540,7 @@ impl DbPool {
                 // Close connection before attempting restore (Windows/locking safety)
                 drop(conn);
 
-                if let Err(e) = ensure_sqlite_file_healthy(Path::new(&self.sqlite_path)) {
+                if let Err(e) = recover_sqlite_file(Path::new(&self.sqlite_path)) {
                     return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
                 }
 
@@ -602,7 +592,7 @@ impl DbPool {
                     error = %e,
                     "full integrity check failed to open sqlite file; attempting auto-recovery"
                 );
-                ensure_sqlite_file_healthy(Path::new(&self.sqlite_path)).map_err(|re| {
+                recover_sqlite_file(Path::new(&self.sqlite_path)).map_err(|re| {
                     DbError::Sqlite(format!("full integrity recovery failed: {re}"))
                 })?;
                 DbConn::open_file(&self.sqlite_path).map_err(|reopen| {
@@ -807,6 +797,169 @@ fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
     gate
 }
 
+#[allow(clippy::result_large_err)]
+async fn run_sqlite_init_once(cx: &Cx, sqlite_path: &str, run_migrations: bool) -> Outcome<(), SqlError> {
+    let mig_conn = match DbConn::open_file(sqlite_path) {
+        Ok(conn) => conn,
+        Err(err) => return Outcome::Err(err),
+    };
+
+    if let Err(err) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
+        return Outcome::Err(err);
+    }
+
+    if run_migrations {
+        match schema::migrate_to_latest_base(cx, &mig_conn).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    // Always enforce startup cleanup for legacy identity FTS artifacts.
+    // These can be reintroduced by historical/full migration paths and have
+    // caused post-crash rowid/index mismatch failures.
+    if let Err(err) = schema::enforce_runtime_fts_cleanup(&mig_conn) {
+        return Outcome::Err(err);
+    }
+
+    drop(mig_conn);
+    Outcome::Ok(())
+}
+
+#[must_use]
+fn should_retry_sqlite_init_error(error: &SqlError) -> bool {
+    is_sqlite_recovery_error_message(&error.to_string())
+}
+
+#[must_use]
+pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    is_corruption_error_message(message)
+        || lower.contains("out of memory")
+        || lower.contains("cursor stack is empty")
+        || lower.contains("called `option::unwrap()` on a `none` value")
+        || lower.contains("internal error")
+}
+
+#[must_use]
+fn sqlite_absolute_fallback_path(path: &str, open_error: &str) -> Option<String> {
+    if path == ":memory:"
+        || Path::new(path).is_absolute()
+        || path.starts_with("./")
+        || path.starts_with("../")
+        || !is_sqlite_recovery_error_message(open_error)
+    {
+        return None;
+    }
+    let absolute_candidate = Path::new("/").join(path);
+    if !absolute_candidate.exists() {
+        return None;
+    }
+    Some(absolute_candidate.to_string_lossy().into_owned())
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_sqlite_parent_dir_exists(path: &str) -> Result<(), SqlError> {
+    if path == ":memory:" {
+        return Ok(());
+    }
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            SqlError::Custom(format!("failed to create db dir {}: {e}", parent.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// Open a file-backed sqlite connection and automatically recover from
+/// corruption-like open failures when possible.
+#[allow(clippy::result_large_err)]
+pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlError> {
+    if sqlite_path == ":memory:" {
+        return DbConn::open_memory();
+    }
+    ensure_sqlite_parent_dir_exists(sqlite_path)?;
+
+    match DbConn::open_file(sqlite_path) {
+        Ok(conn) => Ok(conn),
+        Err(primary_err) => {
+            let primary_msg = primary_err.to_string();
+
+            if let Some(fallback_path) = sqlite_absolute_fallback_path(sqlite_path, &primary_msg) {
+                match DbConn::open_file(&fallback_path) {
+                    Ok(conn) => return Ok(conn),
+                    Err(fallback_err) => {
+                        return Err(SqlError::Custom(format!(
+                            "cannot open sqlite at {sqlite_path}: {primary_err}; fallback {fallback_path} failed: {fallback_err}"
+                        )));
+                    }
+                }
+            }
+
+            if !is_sqlite_recovery_error_message(&primary_msg) {
+                return Err(primary_err);
+            }
+
+            recover_sqlite_file(Path::new(sqlite_path))?;
+            DbConn::open_file(sqlite_path).map_err(|reopen_err| {
+                SqlError::Custom(format!(
+                    "cannot open sqlite at {sqlite_path}: {primary_err}; reopen after recovery failed: {reopen_err}"
+                ))
+            })
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn initialize_sqlite_file_once(
+    cx: &Cx,
+    sqlite_path: &str,
+    run_migrations: bool,
+) -> Outcome<(), SqlError> {
+    let path = Path::new(sqlite_path);
+    if let Err(err) = recover_sqlite_file(path) {
+        return Outcome::Err(err);
+    }
+
+    match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
+        ok @ Outcome::Ok(_) => ok,
+        non_err @ (Outcome::Cancelled(_) | Outcome::Panicked(_)) => non_err,
+        Outcome::Err(first_err) => {
+            if !should_retry_sqlite_init_error(&first_err) {
+                return Outcome::Err(first_err);
+            }
+
+            match sqlite_file_is_healthy(path) {
+                Ok(false) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %first_err,
+                        "sqlite init failed and health probes detected corruption; attempting automatic recovery"
+                    );
+                    if let Err(recover_err) = recover_sqlite_file(path) {
+                        return Outcome::Err(recover_err);
+                    }
+                }
+                Ok(true) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %first_err,
+                        "sqlite init failed but file-level health probes passed; retrying initialization once"
+                    );
+                }
+                Err(health_err) => return Outcome::Err(health_err),
+            }
+
+            run_sqlite_init_once(cx, sqlite_path, run_migrations).await
+        }
+    }
+}
+
 /// Check whether an error message indicates `SQLite` file corruption.
 ///
 /// Used by auto-recovery logic to decide whether to attempt backup
@@ -821,8 +974,8 @@ pub fn is_corruption_error_message(message: &str) -> bool {
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_quick_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
-    let rows = conn.query_sync("PRAGMA quick_check", &[])?;
+fn sqlite_pragma_check_is_ok(conn: &DbConn, pragma_sql: &str) -> Result<bool, SqlError> {
+    let rows = conn.query_sync(pragma_sql, &[])?;
     let mut details: Vec<String> = Vec::with_capacity(rows.len());
     for row in &rows {
         if let Ok(v) = row.get_named::<String>("quick_check") {
@@ -838,6 +991,47 @@ fn sqlite_quick_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
         return Ok(true);
     }
     Ok(details.len() == 1 && details[0] == "ok")
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_quick_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
+    sqlite_pragma_check_is_ok(conn, "PRAGMA quick_check")
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_incremental_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
+    sqlite_pragma_check_is_ok(conn, "PRAGMA integrity_check(1)")
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_table_has_column(conn: &DbConn, table: &str, column: &str) -> Result<bool, SqlError> {
+    let rows = conn.query_sync(&format!("PRAGMA table_info({table})"), &[])?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .any(|name| name == column))
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
+    let messages_has_ack_required = sqlite_table_has_column(conn, "messages", "ack_required")?;
+    let recipients_has_ack_ts = sqlite_table_has_column(conn, "message_recipients", "ack_ts")?;
+    let recipients_has_message_id = sqlite_table_has_column(conn, "message_recipients", "message_id")?;
+
+    // Skip schema-specific smoke probes on partially initialized/legacy schemas.
+    if !(messages_has_ack_required && recipients_has_ack_ts && recipients_has_message_id) {
+        return Ok(true);
+    }
+
+    conn.query_sync(
+        "SELECT 1 \
+         FROM message_recipients \
+         WHERE ack_ts IS NULL \
+           AND message_id IN (SELECT id FROM messages WHERE ack_required = 1) \
+         LIMIT 1",
+        &[],
+    )
+    .map(|_| true)
 }
 
 #[allow(clippy::result_large_err)]
@@ -857,14 +1051,48 @@ fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     };
 
     match sqlite_quick_check_is_ok(&conn) {
-        Ok(ok) => Ok(ok),
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
         Err(e) => {
             if is_corruption_error_message(&e.to_string()) {
+                return Ok(false);
+            }
+            return Err(e);
+        }
+    }
+
+    match sqlite_incremental_check_is_ok(&conn) {
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
+        Err(e) => {
+            if is_corruption_error_message(&e.to_string()) {
+                return Ok(false);
+            }
+            return Err(e);
+        }
+    }
+
+    match sqlite_ack_pending_probe_is_ok(&conn) {
+        Ok(ok) => Ok(ok),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_corruption_error_message(&msg) || msg.to_ascii_lowercase().contains("out of memory") {
                 return Ok(false);
             }
             Err(e)
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
+    if let Some(storage_root) = env_value("STORAGE_ROOT") {
+        let storage_root_path = Path::new(&storage_root);
+        if storage_root_path.is_dir() {
+            return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
+        }
+    }
+    ensure_sqlite_file_healthy(primary_path)
 }
 
 fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
@@ -921,7 +1149,7 @@ fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
             Ok(true) => return Some(candidate),
             Ok(false) => tracing::warn!(
                 candidate = %candidate.display(),
-                "sqlite backup candidate failed quick_check; skipping"
+                "sqlite backup candidate failed health probes; skipping"
             ),
             Err(e) => tracing::warn!(
                 candidate = %candidate.display(),
@@ -1093,7 +1321,8 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
 
 /// Verify and, if necessary, recover a `SQLite` database file.
 ///
-/// Runs `PRAGMA quick_check` on the file. If corruption is detected:
+/// Runs layered health probes (`quick_check`, `integrity_check(1)`, and
+/// a schema-aware query smoke test) on the file. If corruption is detected:
 ///
 /// 1. Search for a healthy `.bak` / `.backup-*` / `.recovery*` sibling.
 /// 2. Quarantine the corrupt file (rename to `*.corrupt-{timestamp}`).
@@ -1113,7 +1342,7 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
             return Ok(());
         }
         return Err(SqlError::Custom(format!(
-            "database file {} was restored from {}, but quick_check still failed",
+            "database file {} was restored from {}, but health probes still failed",
             primary_path.display(),
             backup_path.display()
         )));
@@ -1124,7 +1353,7 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
         return Ok(());
     }
     Err(SqlError::Custom(format!(
-        "database file {} was reinitialized without backup, but quick_check still failed",
+        "database file {} was reinitialized without backup, but health probes still failed",
         primary_path.display()
     )))
 }
@@ -1186,7 +1415,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
                 return Ok(());
             }
             tracing::warn!(
-                "reconstructed database failed quick_check; falling through to blank reinit"
+                "reconstructed database failed health probes; falling through to blank reinit"
             );
         }
         Err(e) => {
@@ -2186,6 +2415,21 @@ mod tests {
         assert!(!is_corruption_error_message("table not found"));
         assert!(!is_corruption_error_message("database is locked"));
         assert!(!is_corruption_error_message(""));
+    }
+
+    #[test]
+    fn sqlite_recovery_error_message_detection() {
+        assert!(is_sqlite_recovery_error_message(
+            "database disk image is malformed"
+        ));
+        assert!(is_sqlite_recovery_error_message("Query error: out of memory"));
+        assert!(is_sqlite_recovery_error_message("cursor stack is empty"));
+        assert!(is_sqlite_recovery_error_message(
+            "called `Option::unwrap()` on a `None` value"
+        ));
+        assert!(is_sqlite_recovery_error_message("internal error"));
+        assert!(!is_sqlite_recovery_error_message("database is locked"));
+        assert!(!is_sqlite_recovery_error_message("table not found"));
     }
 
     /// Verify `sqlite_file_is_healthy` returns false for a corrupt file.
