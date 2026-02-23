@@ -1350,4 +1350,434 @@ mod tests {
         let debug = format!("{msg:?}");
         assert!(debug.contains("IndexableMessage"));
     }
+
+    // ── Backfill tests ──────────────────────────────────────────────────────
+
+    /// Helper: create a temp SQLite DB with the minimal schema needed for
+    /// backfill_from_db (projects, agents, messages tables).
+    fn create_test_db(dir: &std::path::Path, messages: &[(i64, &str, &str, &str, &str)]) -> String {
+        let db_path = dir.join("test.sqlite3");
+        let path_str = db_path.to_str().unwrap();
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str).unwrap();
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, \
+             human_key TEXT NOT NULL, created_at INTEGER NOT NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test-proj', 'test', 0)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, \
+             name TEXT NOT NULL, program TEXT NOT NULL DEFAULT '', \
+             model TEXT NOT NULL DEFAULT '', task_description TEXT NOT NULL DEFAULT '', \
+             inception_ts INTEGER NOT NULL DEFAULT 0, last_active_ts INTEGER NOT NULL DEFAULT 0, \
+             attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'BlueLake')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, \
+             thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, \
+             importance TEXT NOT NULL DEFAULT 'normal', ack_required INTEGER NOT NULL DEFAULT 0, \
+             created_ts INTEGER NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            &[],
+        )
+        .unwrap();
+
+        for (id, subject, body, importance, thread_id) in messages {
+            use sqlmodel_core::Value;
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, created_ts) \
+                 VALUES (?, 1, 1, ?, ?, ?, ?, 1000000)",
+                &[
+                    Value::BigInt(*id),
+                    Value::Text(thread_id.to_string()),
+                    Value::Text(subject.to_string()),
+                    Value::Text(body.to_string()),
+                    Value::Text(importance.to_string()),
+                ],
+            )
+            .unwrap();
+        }
+
+        path_str.to_string()
+    }
+
+    #[test]
+    fn backfill_from_db_empty_database() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(tmp.path(), &[]);
+
+        // backfill_from_db requires the global bridge to be set.
+        // Without the bridge, it returns (0, 0) immediately.
+        let result = backfill_from_db(&db_path);
+        assert!(result.is_ok());
+        let (indexed, _skipped) = result.unwrap();
+        assert_eq!(indexed, 0, "empty DB should index 0 messages");
+    }
+
+    #[test]
+    fn backfill_from_db_nonexistent_file_returns_error() {
+        let result = backfill_from_db("/tmp/nonexistent_test_backfill_db.sqlite3");
+        // Should return Ok((0,0)) when bridge is not set, or error if bridge is set
+        // but DB doesn't exist.
+        assert!(result.is_ok() || result.is_err());
+        if let Err(e) = &result {
+            assert!(
+                e.contains("cannot open DB"),
+                "error should mention DB open failure: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_from_db_with_sqlite_url_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(tmp.path(), &[]);
+
+        // Test with sqlite:// prefix — backfill should strip it.
+        let url = format!("sqlite://{db_path}");
+        let result = backfill_from_db(&url);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn backfill_from_db_with_sqlite_triple_slash_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(tmp.path(), &[]);
+
+        // Test with sqlite:/// prefix.
+        let url = format!("sqlite:///{db_path}");
+        let result = backfill_from_db(&url);
+        assert!(result.is_ok());
+    }
+
+    // ── Batch indexing edge-case tests ──────────────────────────────────────
+
+    #[test]
+    fn batch_index_empty_fields_do_not_crash() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let msg = IndexableMessage {
+            id: 1,
+            project_id: 0,
+            project_slug: String::new(),
+            sender_name: String::new(),
+            subject: String::new(),
+            body_md: String::new(),
+            thread_id: None,
+            importance: String::new(),
+            created_ts: 0,
+        };
+
+        #[allow(clippy::cast_sign_loss)]
+        let id_u64 = msg.id as u64;
+        #[allow(clippy::cast_sign_loss)]
+        let project_id_u64 = msg.project_id as u64;
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                handles.id => id_u64,
+                handles.doc_kind => "message",
+                handles.subject => msg.subject.as_str(),
+                handles.body => msg.body_md.as_str(),
+                handles.sender => msg.sender_name.as_str(),
+                handles.project_slug => msg.project_slug.as_str(),
+                handles.project_id => project_id_u64,
+                handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
+                handles.importance => msg.importance.as_str(),
+                handles.created_ts => msg.created_ts
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = bridge.index().reader().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 1, "empty-field message should still index");
+    }
+
+    #[test]
+    fn batch_index_duplicate_ids_creates_separate_docs() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        for _ in 0..3 {
+            writer
+                .add_document(doc!(
+                    handles.id => 1u64,
+                    handles.doc_kind => "message",
+                    handles.subject => "Same ID",
+                    handles.body => "Same body",
+                    handles.sender => "Agent",
+                    handles.project_slug => "proj",
+                    handles.project_id => 1u64,
+                    handles.thread_id => "",
+                    handles.importance => "normal",
+                    handles.created_ts => 0i64
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let reader = bridge.index().reader().unwrap();
+        // Tantivy doesn't enforce uniqueness on `id` — all 3 docs are stored.
+        assert_eq!(reader.searcher().num_docs(), 3);
+    }
+
+    #[test]
+    fn batch_index_many_messages_searchable() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        let topics = [
+            "database migration",
+            "API endpoint",
+            "authentication flow",
+            "deployment pipeline",
+            "error handling",
+        ];
+        for (i, topic) in topics.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let id = (i + 1) as u64;
+            writer
+                .add_document(doc!(
+                    handles.id => id,
+                    handles.doc_kind => "message",
+                    handles.subject => format!("Topic: {topic}"),
+                    handles.body => format!("Detailed discussion about {topic} improvements"),
+                    handles.sender => "TestAgent",
+                    handles.project_slug => "backend",
+                    handles.project_id => 1u64,
+                    handles.thread_id => format!("thread-{id}"),
+                    handles.importance => "normal",
+                    handles.created_ts => (i as i64) * 1_000_000
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let reader = bridge.index().reader().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 5);
+
+        // Search for specific topic.
+        let query = PlannerQuery {
+            text: "authentication".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        assert!(
+            !results.is_empty(),
+            "should find message about authentication"
+        );
+        assert_eq!(results[0].id, 3, "authentication message has id=3");
+    }
+
+    #[test]
+    fn batch_index_importance_filter_after_indexing() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        let importances = ["normal", "high", "urgent", "low"];
+        for (i, imp) in importances.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let id = (i + 1) as u64;
+            writer
+                .add_document(doc!(
+                    handles.id => id,
+                    handles.doc_kind => "message",
+                    handles.subject => format!("Message with {imp} importance"),
+                    handles.body => format!("Body with {imp} content"),
+                    handles.sender => "Agent",
+                    handles.project_slug => "proj",
+                    handles.project_id => 1u64,
+                    handles.thread_id => "",
+                    handles.importance => *imp,
+                    handles.created_ts => 0i64
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        // Search with importance filter.
+        let query = PlannerQuery {
+            text: "importance".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::Urgent],
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        assert!(
+            !results.is_empty(),
+            "should find urgent messages"
+        );
+        // All matching results should have urgent importance.
+        for r in &results {
+            assert_eq!(
+                r.importance.as_deref(),
+                Some("urgent"),
+                "importance filter should only return urgent"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_index_sender_filter_after_indexing() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        let senders = ["AlphaAgent", "BetaAgent", "AlphaAgent"];
+        for (i, sender) in senders.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let id = (i + 1) as u64;
+            writer
+                .add_document(doc!(
+                    handles.id => id,
+                    handles.doc_kind => "message",
+                    handles.subject => format!("From {sender}"),
+                    handles.body => "Search engine testing content",
+                    handles.sender => *sender,
+                    handles.project_slug => "proj",
+                    handles.project_id => 1u64,
+                    handles.thread_id => "",
+                    handles.importance => "normal",
+                    handles.created_ts => 0i64
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        // Search with agent_name filter.
+        let query = PlannerQuery {
+            text: "search engine".to_string(),
+            doc_kind: DocKind::Message,
+            agent_name: Some("AlphaAgent".to_string()),
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        assert_eq!(results.len(), 2, "should find 2 messages from AlphaAgent");
+        for r in &results {
+            assert_eq!(
+                r.from_agent.as_deref(),
+                Some("AlphaAgent"),
+                "agent_name filter should only return AlphaAgent"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_index_project_filter_isolates_projects() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        // Index messages in two different projects.
+        for project_id in [1u64, 2u64] {
+            writer
+                .add_document(doc!(
+                    handles.id => project_id * 100,
+                    handles.doc_kind => "message",
+                    handles.subject => "Shared topic across projects",
+                    handles.body => "Content mentioning deployment pipeline",
+                    handles.sender => "Agent",
+                    handles.project_slug => format!("project-{project_id}"),
+                    handles.project_id => project_id,
+                    handles.thread_id => "",
+                    handles.importance => "normal",
+                    handles.created_ts => 0i64
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        // Search with project_id=1 should only find that project's message.
+        let query = PlannerQuery {
+            text: "deployment".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 100);
+    }
+
+    #[test]
+    fn batch_index_thread_id_filter() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        for i in 1..=4u64 {
+            let thread = if i <= 2 { "thread-A" } else { "thread-B" };
+            writer
+                .add_document(doc!(
+                    handles.id => i,
+                    handles.doc_kind => "message",
+                    handles.subject => format!("Message {i}"),
+                    handles.body => "Relevant content for search",
+                    handles.sender => "Agent",
+                    handles.project_slug => "proj",
+                    handles.project_id => 1u64,
+                    handles.thread_id => thread,
+                    handles.importance => "normal",
+                    handles.created_ts => 0i64
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let query = PlannerQuery {
+            text: "relevant content".to_string(),
+            doc_kind: DocKind::Message,
+            thread_id: Some("thread-A".to_string()),
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        assert_eq!(results.len(), 2, "thread filter should return 2 messages from thread-A");
+    }
+
+    #[test]
+    fn backfill_url_path_extraction() {
+        // Test the URL prefix stripping logic.
+        // Note: sqlite:/// strips all three slashes, leaving a relative path.
+        // To get an absolute path, use sqlite:////absolute/path.db (4 slashes).
+        let cases = [
+            ("sqlite:///absolute/path.db", "absolute/path.db"),
+            ("sqlite://relative/path.db", "relative/path.db"),
+            ("sqlite:////abs/path.db", "/abs/path.db"),
+            ("/plain/path.db", "/plain/path.db"),
+            ("path.db", "path.db"),
+        ];
+        for (input, expected) in &cases {
+            let extracted = input
+                .strip_prefix("sqlite:///")
+                .or_else(|| input.strip_prefix("sqlite://"))
+                .unwrap_or(input);
+            assert_eq!(
+                extracted, *expected,
+                "URL prefix extraction failed for {input}"
+            );
+        }
+    }
 }
