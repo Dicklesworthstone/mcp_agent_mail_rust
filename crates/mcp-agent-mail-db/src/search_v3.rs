@@ -470,10 +470,15 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         .map_or(0, |r| r.searcher().num_docs());
 
     // Open a sync read-only connection via C SQLite (not FrankenSQLite).
-    let db_path = db_url
-        .strip_prefix("sqlite:///")
-        .or_else(|| db_url.strip_prefix("sqlite://"))
-        .unwrap_or(db_url);
+    let db_path_owned = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
+        ":memory:".to_string()
+    } else if let Some(path) = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)
+    {
+        path.to_string_lossy().into_owned()
+    } else {
+        db_url.to_string()
+    };
+    let db_path = &db_path_owned;
 
     let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path)
         .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
@@ -526,8 +531,12 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
             sender_name: row.get_named::<String>("sender_name").unwrap_or_default(),
             subject: row.get_named::<String>("subject").unwrap_or_default(),
             body_md: row.get_named::<String>("body_md").unwrap_or_default(),
-            thread_id: row.get_named::<Option<String>>("thread_id").unwrap_or_default(),
-            importance: row.get_named::<String>("importance").unwrap_or_else(|_| "normal".to_string()),
+            thread_id: row
+                .get_named::<Option<String>>("thread_id")
+                .unwrap_or_default(),
+            importance: row
+                .get_named::<String>("importance")
+                .unwrap_or_else(|_| "normal".to_string()),
             created_ts: row.get_named::<i64>("created_ts").unwrap_or(0),
         };
         batch.push(msg);
@@ -1214,7 +1223,11 @@ mod tests {
         let bridge = TantivyBridge::in_memory();
         let handles = bridge.handles();
 
-        let msg = make_indexable(100, "Indexing test subject", "Body about database migration");
+        let msg = make_indexable(
+            100,
+            "Indexing test subject",
+            "Body about database migration",
+        );
 
         #[allow(clippy::cast_sign_loss)]
         let id_u64 = msg.id as u64;
@@ -1503,7 +1516,11 @@ mod tests {
         writer.commit().unwrap();
 
         let reader = bridge.index().reader().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 1, "empty-field message should still index");
+        assert_eq!(
+            reader.searcher().num_docs(),
+            1,
+            "empty-field message should still index"
+        );
     }
 
     #[test]
@@ -1622,10 +1639,7 @@ mod tests {
             ..Default::default()
         };
         let results = bridge.search(&query);
-        assert!(
-            !results.is_empty(),
-            "should find urgent messages"
-        );
+        assert!(!results.is_empty(), "should find urgent messages");
         // All matching results should have urgent importance.
         for r in &results {
             assert_eq!(
@@ -1752,26 +1766,33 @@ mod tests {
             ..Default::default()
         };
         let results = bridge.search(&query);
-        assert_eq!(results.len(), 2, "thread filter should return 2 messages from thread-A");
+        assert_eq!(
+            results.len(),
+            2,
+            "thread filter should return 2 messages from thread-A"
+        );
     }
 
     #[test]
     fn backfill_url_path_extraction() {
-        // Test the URL prefix stripping logic.
-        // Note: sqlite:/// strips all three slashes, leaving a relative path.
-        // To get an absolute path, use sqlite:////absolute/path.db (4 slashes).
         let cases = [
-            ("sqlite:///absolute/path.db", "absolute/path.db"),
+            ("sqlite+aiosqlite:///absolute/path.db", "absolute/path.db"),
             ("sqlite://relative/path.db", "relative/path.db"),
             ("sqlite:////abs/path.db", "/abs/path.db"),
             ("/plain/path.db", "/plain/path.db"),
             ("path.db", "path.db"),
+            ("sqlite:///:memory:", ":memory:"),
         ];
         for (input, expected) in &cases {
-            let extracted = input
-                .strip_prefix("sqlite:///")
-                .or_else(|| input.strip_prefix("sqlite://"))
-                .unwrap_or(input);
+            let extracted = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(input) {
+                ":memory:".to_string()
+            } else if let Some(path) =
+                mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(input)
+            {
+                path.to_string_lossy().into_owned()
+            } else {
+                input.to_string()
+            };
             assert_eq!(
                 extracted, *expected,
                 "URL prefix extraction failed for {input}"

@@ -2182,6 +2182,8 @@ pub async fn get_messages_details_by_ids(
 /// - If `thread_id` is a numeric string, it is treated as a root message id.
 ///   The thread includes the root message (`id = root`) and any replies (`thread_id = "{root}"`).
 /// - Otherwise, the thread includes messages where `thread_id = thread_id`.
+/// - If `limit` is set, the most recent `limit` messages are selected and returned in
+///   chronological order (oldest-to-newest within that limited window).
 #[allow(clippy::too_many_lines)]
 pub async fn list_thread_messages(
     cx: &Cx,
@@ -2217,18 +2219,22 @@ pub async fn list_thread_messages(
     }
     params.push(Value::Text(thread_id.to_string()));
 
-    sql.push_str(" ORDER BY m.created_ts ASC");
-
-    if let Some(limit) = limit {
+    let reverse_to_chronological = if let Some(limit) = limit {
         if limit < 1 {
             return Outcome::Err(DbError::invalid("limit", "limit must be at least 1"));
         }
         let Ok(limit_i64) = i64::try_from(limit) else {
             return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
         };
+        // Select newest N first to avoid loading entire long-running threads.
+        sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC");
         sql.push_str(" LIMIT ?");
         params.push(Value::BigInt(limit_i64));
-    }
+        true
+    } else {
+        sql.push_str(" ORDER BY m.created_ts ASC, m.id ASC");
+        false
+    };
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     match rows_out {
@@ -2292,6 +2298,9 @@ pub async fn list_thread_messages(
                     attachments,
                     from,
                 });
+            }
+            if reverse_to_chronological {
+                out.reverse();
             }
             Outcome::Ok(out)
         }
@@ -3952,145 +3961,147 @@ pub fn release_reservations<'a>(
     agent_id: i64,
     paths: Option<&'a [&'a str]>,
     reservation_ids: Option<&'a [i64]>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
+> {
     Box::pin(async move {
-    // Avoid exceeding SQLite bind parameter limits by chunking very large filters.
-    // Each chunk call uses the same logic below and commits independently.
-    if let Some(ids) = reservation_ids
-        && ids.len() > MAX_IN_CLAUSE_ITEMS
-    {
-        let mut released = Vec::new();
-        for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-            let rows = match release_reservations(
-                cx,
-                pool,
-                project_id,
-                agent_id,
-                paths,
-                Some(chunk),
-            )
-            .await
-            {
-                Outcome::Ok(rows) => rows,
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
-            };
-            released.extend(rows);
+        // Avoid exceeding SQLite bind parameter limits by chunking very large filters.
+        // Each chunk call uses the same logic below and commits independently.
+        if let Some(ids) = reservation_ids
+            && ids.len() > MAX_IN_CLAUSE_ITEMS
+        {
+            let mut released = Vec::new();
+            for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+                let rows =
+                    match release_reservations(cx, pool, project_id, agent_id, paths, Some(chunk))
+                        .await
+                    {
+                        Outcome::Ok(rows) => rows,
+                        Outcome::Err(e) => return Outcome::Err(e),
+                        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => return Outcome::Panicked(p),
+                    };
+                released.extend(rows);
+            }
+            return Outcome::Ok(released);
         }
-        return Outcome::Ok(released);
-    }
 
-    if let Some(pats) = paths
-        && pats.len() > MAX_IN_CLAUSE_ITEMS
-    {
-        let mut released = Vec::new();
-        for chunk in pats.chunks(MAX_IN_CLAUSE_ITEMS) {
-            let rows = match release_reservations(
-                cx,
-                pool,
-                project_id,
-                agent_id,
-                Some(chunk),
-                reservation_ids,
-            )
-            .await
-            {
-                Outcome::Ok(rows) => rows,
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
-            };
-            released.extend(rows);
+        if let Some(pats) = paths
+            && pats.len() > MAX_IN_CLAUSE_ITEMS
+        {
+            let mut released = Vec::new();
+            for chunk in pats.chunks(MAX_IN_CLAUSE_ITEMS) {
+                let rows = match release_reservations(
+                    cx,
+                    pool,
+                    project_id,
+                    agent_id,
+                    Some(chunk),
+                    reservation_ids,
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                released.extend(rows);
+            }
+            return Outcome::Ok(released);
         }
-        return Outcome::Ok(released);
-    }
 
-    let now = now_micros();
+        let now = now_micros();
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    let mut filter_sql =
-        format!(" WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})");
-    let mut filter_params: Vec<Value> = vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
-    append_release_reservation_filters(&mut filter_sql, &mut filter_params, reservation_ids, paths);
+        let mut filter_sql =
+            format!(" WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})");
+        let mut filter_params: Vec<Value> =
+            vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
+        append_release_reservation_filters(
+            &mut filter_sql,
+            &mut filter_params,
+            reservation_ids,
+            paths,
+        );
 
-    let select_sql = format!("{FILE_RESERVATION_SELECT_COLUMNS_SQL}{filter_sql}");
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &select_sql, &filter_params).await);
-    let mut reservations: Vec<FileReservationRow> = match rows_out {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                match decode_file_reservation_row(&row) {
-                    Ok(decoded) => out.push(decoded),
-                    Err(e) => {
-                        rollback_tx(cx, &tracked).await;
-                        return Outcome::Err(e);
+        let select_sql = format!("{FILE_RESERVATION_SELECT_COLUMNS_SQL}{filter_sql}");
+        let rows_out = map_sql_outcome(traw_query(cx, &tracked, &select_sql, &filter_params).await);
+        let mut reservations: Vec<FileReservationRow> = match rows_out {
+            Outcome::Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match decode_file_reservation_row(&row) {
+                        Ok(decoded) => out.push(decoded),
+                        Err(e) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(e);
+                        }
                     }
                 }
+                out
             }
-            out
-        }
-        Outcome::Err(e) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Cancelled(r);
-        }
-        Outcome::Panicked(p) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Panicked(p);
-        }
-    };
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        };
 
-    if reservations.is_empty() {
+        if reservations.is_empty() {
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            return Outcome::Ok(reservations);
+        }
+
+        let update_sql = format!("UPDATE file_reservations SET released_ts = ?{filter_sql}");
+        let mut update_params = Vec::with_capacity(1 + filter_params.len());
+        update_params.push(Value::BigInt(now));
+        update_params.extend(filter_params.iter().cloned());
+
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &update_params).await)
+        );
+
+        let verify_sql = format!("SELECT COUNT(*) FROM file_reservations{filter_sql}");
+        let verify_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &filter_params).await)
+        );
+        let remaining_active = verify_rows
+            .first()
+            .and_then(row_first_i64)
+            .unwrap_or_default();
+        if remaining_active != 0 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "release_reservations left {remaining_active} active rows after update"
+            )));
+        }
+        for reservation in &mut reservations {
+            reservation.released_ts = Some(now);
+        }
+
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-        return Outcome::Ok(reservations);
-    }
-
-    let update_sql = format!("UPDATE file_reservations SET released_ts = ?{filter_sql}");
-    let mut update_params = Vec::with_capacity(1 + filter_params.len());
-    update_params.push(Value::BigInt(now));
-    update_params.extend(filter_params.iter().cloned());
-
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &update_params).await)
-    );
-
-    let verify_sql = format!("SELECT COUNT(*) FROM file_reservations{filter_sql}");
-    let verify_rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &filter_params).await)
-    );
-    let remaining_active = verify_rows
-        .first()
-        .and_then(row_first_i64)
-        .unwrap_or_default();
-    if remaining_active != 0 {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::Internal(format!(
-            "release_reservations left {remaining_active} active rows after update"
-        )));
-    }
-    for reservation in &mut reservations {
-        reservation.released_ts = Some(now);
-    }
-
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(reservations)
+        Outcome::Ok(reservations)
     }) // Box::pin(async move {
 }
 
@@ -6362,6 +6373,84 @@ mod tests {
             assert_eq!(ensured.id, by_human_key.id);
             assert_eq!(ensured.slug, by_slug.slug);
             assert_eq!(human_key, by_human_key.human_key);
+        });
+    }
+
+    #[test]
+    fn list_thread_messages_limit_returns_latest_window_in_order() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("thread_limit_latest_window.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-thread-limit-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let sender_id = sender.id.expect("sender id");
+            let recipient_id = recipient.id.expect("recipient id");
+            let recipients = [(recipient_id, "to")];
+
+            for idx in 1..=4 {
+                create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender_id,
+                    &format!("msg-{idx}"),
+                    "body",
+                    Some("THREAD-LIMIT"),
+                    "normal",
+                    false,
+                    "[]",
+                    &recipients,
+                )
+                .await
+                .into_result()
+                .expect("create message");
+            }
+
+            let rows = list_thread_messages(&cx, &pool, project_id, "THREAD-LIMIT", Some(2))
+                .await
+                .into_result()
+                .expect("list thread messages");
+
+            assert_eq!(rows.len(), 2, "should return the requested window size");
+            assert_eq!(rows[0].subject, "msg-3");
+            assert_eq!(rows[1].subject, "msg-4");
         });
     }
 

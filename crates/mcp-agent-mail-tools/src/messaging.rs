@@ -82,10 +82,7 @@ pub(crate) fn enqueue_message_semantic_index(
 pub(crate) fn enqueue_message_lexical_index(msg: &mcp_agent_mail_db::search_v3::IndexableMessage) {
     match mcp_agent_mail_db::search_v3::index_message(msg) {
         Ok(true) => {
-            tracing::debug!(
-                message_id = msg.id,
-                "indexed message in Tantivy"
-            );
+            tracing::debug!(message_id = msg.id, "indexed message in Tantivy");
         }
         Ok(false) => {} // bridge not initialized, silent skip
         Err(e) => {
@@ -1451,13 +1448,13 @@ effective_free_bytes={free}"
         if let Some(thread) = thread_id.as_deref() {
             let thread = thread.trim();
             if !thread.is_empty() {
-                let mut thread_rows = db_outcome_to_mcp_result(
+                let thread_rows = db_outcome_to_mcp_result(
                     mcp_agent_mail_db::queries::list_thread_messages(
                         ctx.cx(),
                         &pool,
                         project_id,
                         thread,
-                        None,
+                        Some(500),
                     )
                     .await,
                 )
@@ -1471,10 +1468,6 @@ effective_free_bytes={free}"
                         .inc();
                     Vec::new()
                 });
-                if thread_rows.len() > 500 {
-                    let keep_from = thread_rows.len().saturating_sub(500);
-                    thread_rows.drain(..keep_from);
-                }
                 let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
                 for row in &thread_rows {
                     auto_ok_names.insert(row.from.clone());
@@ -4544,9 +4537,7 @@ mod tests {
 
     #[test]
     fn explicit_to_null_value() {
-        assert!(!send_message_has_explicit_to_recipients(Some(
-            &Value::Null
-        )));
+        assert!(!send_message_has_explicit_to_recipients(Some(&Value::Null)));
     }
 
     // ── normalize_send_message_to_argument tests ────────────────────
