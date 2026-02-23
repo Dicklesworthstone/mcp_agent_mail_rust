@@ -4010,17 +4010,26 @@ pub async fn release_reservations(
     update_params.push(Value::BigInt(now));
     update_params.extend(filter_params.iter().cloned());
 
-    let affected = try_in_tx!(
+    try_in_tx!(
         cx,
         &tracked,
         map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &update_params).await)
     );
-    let affected = usize::try_from(affected).unwrap_or_default();
-    if affected != reservations.len() {
+
+    let verify_sql = format!("SELECT COUNT(*) FROM file_reservations{filter_sql}");
+    let verify_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &filter_params).await)
+    );
+    let remaining_active = verify_rows
+        .first()
+        .and_then(row_first_i64)
+        .unwrap_or_default();
+    if remaining_active != 0 {
         rollback_tx(cx, &tracked).await;
         return Outcome::Err(DbError::Internal(format!(
-            "release_reservations updated {affected} rows but selected {}",
-            reservations.len()
+            "release_reservations left {remaining_active} active rows after update"
         )));
     }
     for reservation in &mut reservations {

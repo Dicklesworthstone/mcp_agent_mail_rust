@@ -572,7 +572,7 @@ impl TwoTierIndex {
             }
             return best.map_or_else(Vec::new, |entry| vec![self.scored_entry_to_result(entry)]);
         }
-        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        let mut heap = BinaryHeap::with_capacity(limit);
 
         for (idx, embedding) in self
             .fast_embeddings
@@ -581,9 +581,12 @@ impl TwoTierIndex {
             .enumerate()
         {
             let score = dot_product_f16_simd(embedding, query_vec);
-            heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
-            if heap.len() > limit {
-                heap.pop();
+            if heap.len() < limit {
+                heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
+            } else if let Some(mut top) = heap.peek_mut() {
+                if score > top.0.score {
+                    *top = std::cmp::Reverse(ScoredEntry { score, idx });
+                }
             }
         }
 
@@ -637,7 +640,7 @@ impl TwoTierIndex {
             }
             return best.map_or_else(Vec::new, |entry| vec![self.scored_entry_to_result(entry)]);
         }
-        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        let mut heap = BinaryHeap::with_capacity(limit);
 
         for (idx, (embedding, has_quality)) in self
             .quality_embeddings
@@ -649,9 +652,12 @@ impl TwoTierIndex {
                 continue;
             }
             let score = dot_product_f16_simd(embedding, query_vec);
-            heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
-            if heap.len() > limit {
-                heap.pop();
+            if heap.len() < limit {
+                heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
+            } else if let Some(mut top) = heap.peek_mut() {
+                if score > top.0.score {
+                    *top = std::cmp::Reverse(ScoredEntry { score, idx });
+                }
             }
         }
 

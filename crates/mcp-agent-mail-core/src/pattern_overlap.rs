@@ -8,10 +8,11 @@ fn normalize_pattern(pattern: &str) -> String {
         normalized = normalized.replace("//", "/");
     }
 
-    while normalized.starts_with("./") {
-        normalized = normalized[2..].to_string();
+    let mut slice = normalized.as_str();
+    while let Some(rest) = slice.strip_prefix("./") {
+        slice = rest;
     }
-    normalized.trim_start_matches('/').to_string()
+    slice.trim_start_matches('/').to_string()
 }
 
 #[derive(Debug, Clone)]

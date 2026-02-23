@@ -732,19 +732,25 @@ fn is_truthy_value(value: Option<&str>) -> bool {
 }
 
 fn is_guard_gated_from_values(
+    enforcement_enabled: Option<&str>,
     worktrees_enabled: Option<&str>,
     git_identity_enabled: Option<&str>,
 ) -> bool {
-    is_truthy_value(worktrees_enabled) || is_truthy_value(git_identity_enabled)
+    if let Some(val) = enforcement_enabled {
+        return is_truthy_value(Some(val));
+    }
+    // Default to true unless specifically disabled, but fallback to legacy worktrees checks
+    // if enforcement is completely unset, though in Rust the config defaults to true.
+    true
 }
 
 /// Check if the guard gate is enabled.
 ///
-/// The guard is only active if `WORKTREES_ENABLED` or `GIT_IDENTITY_ENABLED` is truthy.
-/// Returns `false` (gate closed = guard inactive) by default.
+/// The guard is active if `FILE_RESERVATIONS_ENFORCEMENT_ENABLED` is true (default).
 #[must_use]
 pub fn is_guard_gated() -> bool {
     is_guard_gated_from_values(
+        std::env::var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED").ok().as_deref(),
         std::env::var("WORKTREES_ENABLED").ok().as_deref(),
         std::env::var("GIT_IDENTITY_ENABLED").ok().as_deref(),
     )
@@ -1336,11 +1342,11 @@ mod tests {
     }
 
     #[test]
-    fn guard_gate_from_values_requires_either_flag() {
-        assert!(!is_guard_gated_from_values(None, None));
-        assert!(is_guard_gated_from_values(Some("1"), None));
-        assert!(is_guard_gated_from_values(None, Some("yes")));
-        assert!(!is_guard_gated_from_values(Some("0"), Some("no")));
+    fn guard_gate_from_values_checks_enforcement_flag() {
+        assert!(is_guard_gated_from_values(None, None, None)); // Default true
+        assert!(is_guard_gated_from_values(Some("1"), None, None));
+        assert!(is_guard_gated_from_values(Some("true"), Some("0"), Some("0")));
+        assert!(!is_guard_gated_from_values(Some("0"), Some("1"), Some("1")));
     }
 
     // -----------------------------------------------------------------------

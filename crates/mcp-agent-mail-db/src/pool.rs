@@ -1407,7 +1407,12 @@ pub fn ensure_sqlite_file_healthy_with_archive(
 
     if primary_path.exists() {
         let quarantined = primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
-        let _ = std::fs::rename(primary_path, &quarantined);
+        std::fs::rename(primary_path, &quarantined).map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to quarantine corrupted database {}: {e}",
+                primary_path.display()
+            ))
+        })?;
         let _ = quarantine_sidecar(primary_path, "-wal", &timestamp);
         let _ = quarantine_sidecar(primary_path, "-shm", &timestamp);
     }
