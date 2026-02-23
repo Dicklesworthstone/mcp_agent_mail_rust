@@ -468,4 +468,355 @@ mod tests {
         assert_eq!(state.messages_received, 2);
         assert_eq!(state.cells, vec![11]);
     }
+
+    // ── decode_snapshot_cells edge cases ──
+
+    #[test]
+    fn decode_snapshot_cells_empty_input() {
+        let result = SyncState::decode_snapshot_cells(&[], 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decode_snapshot_cells_empty_input_with_expected_len_pads() {
+        let result = SyncState::decode_snapshot_cells(&[], 4);
+        assert_eq!(result, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_snapshot_cells_non_aligned_bytes_fallback() {
+        // 3 bytes is not a multiple of 4 — uses byte-level fallback
+        let result = SyncState::decode_snapshot_cells(&[10, 20, 30], 3);
+        assert_eq!(result, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn decode_snapshot_cells_non_aligned_pads_to_expected() {
+        let result = SyncState::decode_snapshot_cells(&[1, 2], 5);
+        assert_eq!(result, vec![1, 2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_snapshot_cells_non_aligned_truncates_to_expected() {
+        let result = SyncState::decode_snapshot_cells(&[1, 2, 3, 4, 5], 3);
+        assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn decode_snapshot_cells_aligned_le_bytes() {
+        // 8 bytes = 2 u32s in little-endian
+        let raw = [
+            0x01, 0x00, 0x00, 0x00, // 1
+            0xFF, 0x00, 0x00, 0x00, // 255
+        ];
+        let result = SyncState::decode_snapshot_cells(&raw, 2);
+        assert_eq!(result, vec![1, 255]);
+    }
+
+    #[test]
+    fn decode_snapshot_cells_aligned_pads_short_input() {
+        // 4 bytes = 1 u32 but expected 3
+        let raw = [0x42, 0x00, 0x00, 0x00];
+        let result = SyncState::decode_snapshot_cells(&raw, 3);
+        assert_eq!(result, vec![0x42, 0, 0]);
+    }
+
+    #[test]
+    fn decode_snapshot_cells_aligned_truncates_long_input() {
+        let raw = [
+            0x01, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00,
+        ];
+        let result = SyncState::decode_snapshot_cells(&raw, 2);
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
+    fn decode_snapshot_cells_zero_expected_returns_decoded_as_is() {
+        let raw = [0x05, 0x00, 0x00, 0x00];
+        let result = SyncState::decode_snapshot_cells(&raw, 0);
+        // expected_len=0 skips resize/truncate
+        assert_eq!(result, vec![5]);
+    }
+
+    // ── apply_delta edge cases ──
+
+    #[test]
+    fn apply_delta_empty_changes() {
+        let mut state = SyncState {
+            cols: 2,
+            rows: 2,
+            cells: vec![1, 2, 3, 4],
+            ..SyncState::default()
+        };
+        state.apply_delta(StateDelta {
+            seq: 5,
+            changed_cells: vec![],
+            screen_transition: None,
+            cursor: None,
+            timestamp_us: 100,
+        });
+        assert_eq!(state.cells, vec![1, 2, 3, 4]);
+        assert_eq!(state.last_seq, 5);
+        assert_eq!(state.messages_received, 1);
+    }
+
+    #[test]
+    fn apply_delta_expands_cells_for_out_of_bounds_index() {
+        let mut state = SyncState {
+            cols: 2,
+            rows: 2,
+            cells: vec![0, 0, 0, 0],
+            ..SyncState::default()
+        };
+        // idx=7 is beyond 4-cell grid; should expand
+        state.apply_delta(StateDelta {
+            seq: 1,
+            changed_cells: vec![CellChange { idx: 7, data: 42 }],
+            screen_transition: None,
+            cursor: None,
+            timestamp_us: 1,
+        });
+        assert!(state.cells.len() >= 8);
+        assert_eq!(state.cells[7], 42);
+    }
+
+    #[test]
+    fn apply_delta_seq_uses_max_not_replace() {
+        let mut state = SyncState {
+            last_seq: 10,
+            ..SyncState::default()
+        };
+        state.apply_delta(StateDelta {
+            seq: 5, // older than current
+            changed_cells: vec![],
+            screen_transition: None,
+            cursor: None,
+            timestamp_us: 1,
+        });
+        assert_eq!(state.last_seq, 10, "should keep higher seq");
+    }
+
+    #[test]
+    fn apply_delta_no_screen_transition_preserves_screen_id() {
+        let mut state = SyncState {
+            screen_id: 3,
+            ..SyncState::default()
+        };
+        state.apply_delta(StateDelta {
+            seq: 1,
+            changed_cells: vec![],
+            screen_transition: None,
+            cursor: None,
+            timestamp_us: 1,
+        });
+        assert_eq!(state.screen_id, 3);
+    }
+
+    #[test]
+    fn apply_delta_no_cursor_preserves_cursor() {
+        let mut state = SyncState {
+            cursor_x: 5,
+            cursor_y: 10,
+            cursor_visible: false,
+            ..SyncState::default()
+        };
+        state.apply_delta(StateDelta {
+            seq: 1,
+            changed_cells: vec![],
+            screen_transition: None,
+            cursor: None,
+            timestamp_us: 1,
+        });
+        assert_eq!(state.cursor_x, 5);
+        assert_eq!(state.cursor_y, 10);
+        assert!(!state.cursor_visible);
+    }
+
+    #[test]
+    fn apply_delta_duplicate_indices_last_wins() {
+        let mut state = SyncState {
+            cols: 2,
+            rows: 1,
+            cells: vec![0, 0],
+            ..SyncState::default()
+        };
+        state.apply_delta(StateDelta {
+            seq: 1,
+            changed_cells: vec![
+                CellChange { idx: 0, data: 10 },
+                CellChange { idx: 0, data: 20 },
+            ],
+            screen_transition: None,
+            cursor: None,
+            timestamp_us: 1,
+        });
+        assert_eq!(state.cells[0], 20, "last write to same idx should win");
+    }
+
+    // ── apply_snapshot edge cases ──
+
+    #[test]
+    fn apply_snapshot_resets_seq_to_zero() {
+        let mut state = SyncState {
+            last_seq: 99,
+            ..SyncState::default()
+        };
+        state.apply_snapshot(StateSnapshot {
+            screen_id: 1,
+            screen_title: "Reset".to_string(),
+            cells: vec![],
+            cols: 1,
+            rows: 1,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: true,
+            timestamp_us: 500,
+        });
+        assert_eq!(state.last_seq, 0, "snapshot should reset sequence");
+    }
+
+    #[test]
+    fn apply_snapshot_messages_received_saturates() {
+        let mut state = SyncState {
+            messages_received: u64::MAX,
+            ..SyncState::default()
+        };
+        state.apply_snapshot(StateSnapshot {
+            screen_id: 1,
+            screen_title: "Sat".to_string(),
+            cells: vec![],
+            cols: 1,
+            rows: 1,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: true,
+            timestamp_us: 0,
+        });
+        assert_eq!(state.messages_received, u64::MAX, "should saturate, not overflow");
+    }
+
+    // ── apply_message edge cases ──
+
+    #[test]
+    fn apply_message_resize_is_ignored() {
+        let mut state = SyncState::default();
+        state.apply_message(&WsMessage::Resize { cols: 120, rows: 40 });
+        assert_eq!(state.messages_received, 0);
+        assert_eq!(state.cols, 80, "resize message should not alter state");
+    }
+
+    #[test]
+    fn apply_message_pong_is_ignored() {
+        let mut state = SyncState::default();
+        state.apply_message(&WsMessage::Pong);
+        assert_eq!(state.messages_received, 0);
+    }
+
+    // ── WsMessage serde edge cases ──
+
+    #[test]
+    fn ws_message_resize_roundtrip() {
+        let msg = WsMessage::Resize { cols: 120, rows: 40 };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: WsMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, WsMessage::Resize { cols: 120, rows: 40 }));
+    }
+
+    #[test]
+    fn ws_message_pong_roundtrip() {
+        let msg = WsMessage::Pong;
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: WsMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, WsMessage::Pong));
+    }
+
+    #[test]
+    fn ws_message_state_delta_roundtrip() {
+        let delta = StateDelta {
+            seq: 42,
+            changed_cells: vec![CellChange { idx: 0, data: 7 }],
+            screen_transition: Some(3),
+            cursor: Some((1, 2, false)),
+            timestamp_us: 999,
+        };
+        let msg = WsMessage::StateDelta(delta);
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: WsMessage = serde_json::from_str(&json).unwrap();
+        if let WsMessage::StateDelta(d) = parsed {
+            assert_eq!(d.seq, 42);
+            assert_eq!(d.changed_cells.len(), 1);
+            assert_eq!(d.screen_transition, Some(3));
+            assert_eq!(d.cursor, Some((1, 2, false)));
+        } else {
+            panic!("expected StateDelta variant");
+        }
+    }
+
+    #[test]
+    fn scroll_input_event_roundtrip() {
+        let event = InputEvent::Scroll { x: 5, y: 10, delta: -3 };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: InputEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, InputEvent::Scroll { x: 5, y: 10, delta: -3 }));
+    }
+
+    // ── SyncState default ──
+
+    #[test]
+    fn sync_state_default_has_correct_dimensions() {
+        let state = SyncState::default();
+        assert_eq!(state.cols, 80);
+        assert_eq!(state.rows, 24);
+        assert_eq!(state.cells.len(), 80 * 24);
+        assert!(state.cells.iter().all(|&c| c == 0));
+        assert_eq!(state.screen_id, 1);
+        assert_eq!(state.screen_title, "Dashboard");
+        assert!(state.cursor_visible);
+        assert_eq!(state.last_seq, 0);
+        assert_eq!(state.messages_received, 0);
+    }
+
+    // ── AppConfig default ──
+
+    #[test]
+    fn app_config_default_values() {
+        let config = AppConfig::default();
+        assert_eq!(config.websocket_url, "ws://127.0.0.1:8765/ws");
+        assert_eq!(config.canvas_selector, "#terminal");
+        assert!(!config.high_contrast);
+        assert_eq!(config.font_size_px, 14);
+        assert!(!config.debug_overlay);
+    }
+
+    #[test]
+    fn app_config_serde_roundtrip() {
+        let config = AppConfig {
+            websocket_url: "ws://custom:9999/ws".to_string(),
+            canvas_selector: "#custom".to_string(),
+            high_contrast: true,
+            font_size_px: 20,
+            debug_overlay: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.websocket_url, "ws://custom:9999/ws");
+        assert!(parsed.high_contrast);
+        assert_eq!(parsed.font_size_px, 20);
+        assert!(parsed.debug_overlay);
+    }
+
+    // ── native test helper ──
+
+    #[test]
+    fn native_test_snapshot_has_expected_defaults() {
+        let snap = native::test_snapshot();
+        assert_eq!(snap.screen_id, 1);
+        assert_eq!(snap.screen_title, "Dashboard");
+        assert!(snap.cells.is_empty());
+        assert_eq!(snap.cols, 80);
+        assert_eq!(snap.rows, 24);
+        assert_eq!(snap.timestamp_us, 0);
+    }
 }
