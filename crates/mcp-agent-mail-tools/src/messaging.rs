@@ -1379,11 +1379,18 @@ effective_free_bytes={free}"
         if config.max_total_message_bytes > 0 {
             let mut total_size = subject.len().saturating_add(final_body.len());
             for meta in &all_attachment_meta {
-                if meta.get("type").and_then(serde_json::Value::as_str) == Some("file")
+                let att_type = meta.get("type").and_then(serde_json::Value::as_str);
+                if (att_type == Some("file") || att_type == Some("inline"))
                     && let Some(bytes) = meta.get("bytes").and_then(serde_json::Value::as_u64)
                 {
                     if let Ok(bytes_usize) = usize::try_from(bytes) {
-                        total_size = total_size.saturating_add(bytes_usize);
+                        let effective_bytes = if att_type == Some("inline") {
+                            // Base64 encoding adds ~33% overhead
+                            bytes_usize.saturating_mul(4).saturating_div(3)
+                        } else {
+                            bytes_usize
+                        };
+                        total_size = total_size.saturating_add(effective_bytes);
                     } else {
                         // On 32-bit platforms, treat oversized metadata as exceeding limits.
                         total_size = usize::MAX;

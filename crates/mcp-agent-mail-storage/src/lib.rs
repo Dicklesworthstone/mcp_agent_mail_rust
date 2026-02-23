@@ -5551,30 +5551,33 @@ pub fn get_communication_graph(
         }
         seen += 1;
 
-        let subject = commit.summary().unwrap_or("");
-        if !subject.starts_with("mail: ") {
-            continue;
-        }
+        let message = commit.message().unwrap_or("");
+        for line in message.lines() {
+            let line = line.trim_start_matches("- ").trim();
+            if !line.starts_with("mail: ") {
+                continue;
+            }
 
-        // Parse "mail: Sender -> Recipient1, Recipient2 | Subject"
-        let rest = &subject[6..];
-        let sender_part = if let Some((sp, _)) = rest.split_once(" | ") {
-            sp
-        } else {
-            rest
-        };
+            // Parse "mail: Sender -> Recipient1, Recipient2 | Subject"
+            let rest = &line[6..];
+            let sender_part = if let Some((sp, _)) = rest.split_once(" | ") {
+                sp
+            } else {
+                rest
+            };
 
-        if let Some((sender, recipients_str)) = sender_part.split_once(" -> ") {
-            let sender = sender.trim().to_string();
-            agent_stats.entry(sender.clone()).or_insert((0, 0)).0 += 1;
+            if let Some((sender, recipients_str)) = sender_part.split_once(" -> ") {
+                let sender = sender.trim().to_string();
+                agent_stats.entry(sender.clone()).or_insert((0, 0)).0 += 1;
 
-            for r in recipients_str.split(',') {
-                let recipient = r.trim().to_string();
-                if recipient.is_empty() {
-                    continue;
+                for r in recipients_str.split(',') {
+                    let recipient = r.trim().to_string();
+                    if recipient.is_empty() {
+                        continue;
+                    }
+                    agent_stats.entry(recipient.clone()).or_insert((0, 0)).1 += 1;
+                    *connections.entry((sender.clone(), recipient)).or_insert(0) += 1;
                 }
-                agent_stats.entry(recipient.clone()).or_insert((0, 0)).1 += 1;
-                *connections.entry((sender.clone(), recipient)).or_insert(0) += 1;
             }
         }
     }
@@ -5663,6 +5666,8 @@ pub fn get_timeline_commits(
             ("file_reservation".to_string(), None, Vec::new())
         } else if subject.starts_with("chore: ") {
             ("chore".to_string(), None, Vec::new())
+        } else if subject.starts_with("batch: ") {
+            ("batch".to_string(), None, Vec::new())
         } else {
             ("other".to_string(), None, Vec::new())
         };
