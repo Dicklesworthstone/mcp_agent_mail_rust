@@ -3417,4 +3417,5 @@ mod tests {
         cfg.app_environment = AppEnvironment::Production;
         assert!(cfg.is_production());
     }
+
 }

@@ -1537,4 +1537,124 @@ mod tests {
         assert_eq!(VALID_NOUNS.len(), 132);
         assert_eq!(valid_names_set().len(), 75 * 132);
     }
+
+    // ── looks_like_email ─────────────────────────────────────────────
+
+    #[test]
+    fn email_valid_basic() {
+        assert!(looks_like_email("user@example.com"));
+    }
+
+    #[test]
+    fn email_with_subdomain() {
+        assert!(looks_like_email("admin@mail.example.co.uk"));
+    }
+
+    #[test]
+    fn email_no_at_sign() {
+        assert!(!looks_like_email("notanemail"));
+    }
+
+    #[test]
+    fn email_no_dot_after_at() {
+        assert!(!looks_like_email("user@localhost"));
+    }
+
+    #[test]
+    fn email_empty_string() {
+        assert!(!looks_like_email(""));
+    }
+
+    #[test]
+    fn email_just_at_and_dot() {
+        assert!(looks_like_email("@."));
+    }
+
+    // ── looks_like_broadcast ─────────────────────────────────────────
+
+    #[test]
+    fn broadcast_all_tokens_recognized() {
+        for token in BROADCAST_TOKENS {
+            assert!(looks_like_broadcast(token), "{token:?} should be broadcast");
+        }
+    }
+
+    #[test]
+    fn broadcast_case_insensitive() {
+        assert!(looks_like_broadcast("ALL"));
+        assert!(looks_like_broadcast("Everyone"));
+        assert!(looks_like_broadcast("BROADCAST"));
+    }
+
+    #[test]
+    fn broadcast_with_whitespace() {
+        assert!(looks_like_broadcast("  all  "));
+        assert!(looks_like_broadcast("\teveryone\t"));
+    }
+
+    #[test]
+    fn broadcast_non_broadcast_strings() {
+        assert!(!looks_like_broadcast("some_agent"));
+        assert!(!looks_like_broadcast(""));
+        assert!(!looks_like_broadcast("all_agents"));
+    }
+
+    // ── looks_like_descriptive_name ──────────────────────────────────
+
+    #[test]
+    fn descriptive_name_keywords_match() {
+        assert!(looks_like_descriptive_name("developer"));
+        assert!(looks_like_descriptive_name("my-agent"));
+        assert!(looks_like_descriptive_name("code-assistant"));
+        assert!(looks_like_descriptive_name("DevWorker"));
+    }
+
+    #[test]
+    fn descriptive_name_partial_match() {
+        // "dev" is a keyword, so "dev-tools" should match
+        assert!(looks_like_descriptive_name("dev-tools"));
+    }
+
+    #[test]
+    fn descriptive_name_non_matching() {
+        assert!(!looks_like_descriptive_name("RedFox"));
+        assert!(!looks_like_descriptive_name("abc123"));
+        assert!(!looks_like_descriptive_name(""));
+    }
+
+    // ── generate_agent_name ──────────────────────────────────────────
+
+    #[test]
+    fn generate_agent_name_produces_valid_name() {
+        let name = generate_agent_name();
+        assert!(
+            is_valid_agent_name(&name),
+            "generated name '{name}' should be valid"
+        );
+    }
+
+    #[test]
+    fn generate_agent_name_nonempty() {
+        let name = generate_agent_name();
+        assert!(!name.is_empty());
+        assert!(name.len() >= 4, "name should be at least 4 chars: '{name}'");
+    }
+
+    #[test]
+    fn generate_agent_name_pascal_case() {
+        let name = generate_agent_name();
+        assert!(
+            name.chars().next().unwrap().is_uppercase(),
+            "name should start with uppercase: '{name}'"
+        );
+    }
+
+    #[test]
+    fn generate_agent_name_multiple_calls_produce_names() {
+        // All calls should produce valid names (they may differ due to time-based seed)
+        for _ in 0..5 {
+            let name = generate_agent_name();
+            assert!(is_valid_agent_name(&name), "'{name}' should be valid");
+        }
+    }
 }
