@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mcp_agent_mail_db::DbConn;
+use sqlmodel_sqlite::SqliteConnection;
 
 use crate::ShareError;
 
@@ -59,9 +59,10 @@ pub fn create_sqlite_snapshot(
 
     // Checkpoint WAL if requested.
     if checkpoint {
-        let checkpoint_conn = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
-            message: format!("cannot open source DB {source_str}: {e}"),
-        })?;
+        let checkpoint_conn =
+            SqliteConnection::open_file(&source_str).map_err(|e| ShareError::Sqlite {
+                message: format!("cannot open source DB {source_str}: {e}"),
+            })?;
         checkpoint_conn
             .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|e| ShareError::Sqlite {
@@ -132,7 +133,7 @@ mod tests {
         let dest = dir.path().join("dest.sqlite3");
 
         // Create a minimal source DB
-        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(source.display().to_string()).unwrap();
         conn.execute_raw("CREATE TABLE test_data (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
         conn.execute_raw("INSERT INTO test_data VALUES (1, 'hello')")
@@ -145,7 +146,7 @@ mod tests {
         assert!(dest.exists());
 
         // Verify data in copy
-        let copy_conn = DbConn::open_file(dest.display().to_string()).unwrap();
+        let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
         let rows = copy_conn
             .query_sync("SELECT name FROM test_data WHERE id = 1", &[])
             .unwrap();
@@ -166,7 +167,7 @@ mod tests {
         let dest = dir.path().join("dest.sqlite3");
 
         // Create source and dest
-        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(source.display().to_string()).unwrap();
         conn.execute_raw("CREATE TABLE t (id INTEGER)").unwrap();
         drop(conn);
         std::fs::write(&dest, b"existing").unwrap();
@@ -190,9 +191,11 @@ mod tests {
         use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
 
-        // 1. Create a seeded source database
+        // 1. Create a seeded source database using C SQLite so downstream
+        //    pipeline steps (scrub/finalize) can open it with SqliteConnection.
         let source = dir.path().join("source.sqlite3");
-        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        let conn =
+            sqlmodel_sqlite::SqliteConnection::open_file(source.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         ).unwrap();
@@ -247,9 +250,10 @@ mod tests {
         std::fs::create_dir_all(&storage).unwrap();
         std::fs::write(storage.join("test.txt"), b"attachment content").unwrap();
 
-        // 2. Snapshot
+        // 2. Snapshot (skip checkpoint — fresh DB has no WAL, and the
+        //    FrankenConnection checkpoint would corrupt a C-SQLite file)
         let snapshot = dir.path().join("snapshot.sqlite3");
-        create_sqlite_snapshot(&source, &snapshot, true).unwrap();
+        create_sqlite_snapshot(&source, &snapshot, false).unwrap();
         assert!(snapshot.exists());
 
         // 3. Project scope (keep all)

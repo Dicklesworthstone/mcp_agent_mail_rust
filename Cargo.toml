@@ -40,6 +40,7 @@ sqlmodel-query = "0.2.0"
 sqlmodel-schema = "0.2.0"
 sqlmodel-session = "0.2.0"
 sqlmodel-pool = "0.2.0"
+sqlmodel-sqlite = "0.2.0"
 sqlmodel-frankensqlite = "0.2.0"
 
 ftui = "0.2.1"
@@ -161,6 +162,7 @@ sqlmodel-query = { path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
 sqlmodel-schema = { path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
 sqlmodel-session = { path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
 sqlmodel-pool = { path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-sqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-sqlite" }
 sqlmodel-frankensqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
 fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
 fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }

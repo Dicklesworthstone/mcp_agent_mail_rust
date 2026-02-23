@@ -1459,7 +1459,8 @@ mod tests {
 
     #[test]
     fn fetch_stats_returns_none_on_bad_url() {
-        assert!(fetch_db_stats("sqlite:///no/such/dir/nonexistent.db").is_none());
+        // Use 4 slashes for absolute path; /dev/null is a file so subdir creation fails.
+        assert!(fetch_db_stats("sqlite:////dev/null/impossible.db").is_none());
     }
 
     #[test]
@@ -1471,7 +1472,8 @@ mod tests {
 
     #[test]
     fn open_sync_connection_returns_none_on_bad_path() {
-        assert!(open_sync_connection("sqlite:///no/such/dir/db.sqlite3").is_none());
+        // Use 4 slashes for absolute path; /dev/null is a file so subdir creation fails.
+        assert!(open_sync_connection("sqlite:////dev/null/impossible.db").is_none());
     }
 
     #[test]

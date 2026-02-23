@@ -14,7 +14,9 @@ use sqlmodel_core::Value as SqlValue;
 use crate::{ScrubPreset, ShareError};
 
 /// Connection type for offline snapshot manipulation.
-type Conn = mcp_agent_mail_db::DbConn;
+///
+/// Uses C-backed SQLite for reliable UPDATE/changes() tracking.
+type Conn = sqlmodel_sqlite::SqliteConnection;
 
 /// Keys to remove from attachment metadata dicts during scrubbing.
 const ATTACHMENT_REDACT_KEYS: &[&str] = &[

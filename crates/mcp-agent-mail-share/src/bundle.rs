@@ -18,7 +18,10 @@ use crate::scrub::ScrubSummary;
 use crate::{ShareError, ShareResult};
 
 static BUILTIN_VIEWER_ASSETS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/viewer_assets");
-type Conn = mcp_agent_mail_db::DbConn;
+/// Connection type for offline snapshot manipulation.
+///
+/// Uses C-backed SQLite for reliable offline operations.
+type Conn = sqlmodel_sqlite::SqliteConnection;
 
 /// Per-attachment entry in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]

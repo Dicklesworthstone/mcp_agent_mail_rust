@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use mcp_agent_mail_db::DbConn;
+use sqlmodel_sqlite::SqliteConnection;
 
 use crate::ShareError;
 
@@ -457,10 +457,14 @@ pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareE
 
 // --- helpers ---
 
-/// Open a FrankenSQLite-backed connection for offline snapshot manipulation.
-fn open_conn(path: &Path) -> Result<DbConn, ShareError> {
+/// Open a C-backed SQLite connection for offline snapshot manipulation.
+///
+/// Finalization requires features that FrankenSQLite does not support
+/// (PRAGMA journal_mode changes, VACUUM, FTS5 virtual tables), so we
+/// use the real C SQLite driver here.
+fn open_conn(path: &Path) -> Result<SqliteConnection, ShareError> {
     let path_str = path.display().to_string();
-    DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+    SqliteConnection::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open {path_str}: {e}"),
     })
 }
@@ -471,7 +475,7 @@ fn sql_err(e: impl std::fmt::Display) -> ShareError {
     }
 }
 
-fn column_exists(conn: &DbConn, table: &str, column: &str) -> Result<bool, ShareError> {
+fn column_exists(conn: &SqliteConnection, table: &str, column: &str) -> Result<bool, ShareError> {
     // PRAGMA table_info returns 0 rows on FrankenConnection; fall back to
     // a direct SELECT probe when PRAGMA yields nothing.
     let rows = conn
@@ -507,7 +511,7 @@ mod tests {
     /// Create a test DB with the standard schema.
     fn create_test_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test_finalize.sqlite3");
-        let conn = DbConn::open_file(db_path.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db_path.display().to_string()).unwrap();
 
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
@@ -576,7 +580,7 @@ mod tests {
         assert!(fts_ok, "FTS5 should be available");
 
         // Verify data in FTS table
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT COUNT(*) AS cnt FROM fts_messages", &[])
             .unwrap();
@@ -600,7 +604,7 @@ mod tests {
 
         // Simulate a legacy export that created an FTS table without newer columns like
         // "importance" and "thread_key". The export pipeline should rebuild it.
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE VIRTUAL TABLE fts_messages USING fts5(subject, body, project_slug UNINDEXED)",
         )
@@ -610,7 +614,7 @@ mod tests {
         let fts_ok = build_search_indexes(&db).unwrap();
         assert!(fts_ok, "FTS5 should be available");
 
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("PRAGMA table_info(fts_messages)", &[])
             .unwrap();
@@ -643,7 +647,7 @@ mod tests {
         }
 
         // Verify message_overview_mv
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT COUNT(*) AS cnt FROM message_overview_mv", &[])
             .unwrap();
@@ -681,7 +685,7 @@ mod tests {
         assert!(indexes.contains(&"idx_messages_thread".to_string()));
 
         // Verify lowercase columns populated
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT subject_lower, sender_lower FROM messages WHERE id = 1",
@@ -702,7 +706,7 @@ mod tests {
         finalize_snapshot_for_export(&db).unwrap();
 
         // Verify journal mode
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn.query_sync("PRAGMA journal_mode", &[]).unwrap();
         let mode: String = rows[0].get_named("journal_mode").unwrap();
         assert_eq!(mode, "delete");
@@ -724,7 +728,7 @@ mod tests {
         let db = create_test_db(dir.path());
 
         // Inflate DB then delete to leave free pages.
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let big_body = "x".repeat(10_000);
         for i in 0..200 {
             conn.execute_raw(&format!(
@@ -760,7 +764,7 @@ mod tests {
         assert!(!result.indexes_created.is_empty());
 
         // Verify everything is queryable
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
 
         // FTS search
         let rows = conn
@@ -796,7 +800,7 @@ mod tests {
         // Simulate the server schema having a different FTS layout + triggers that refer to
         // `fts_messages(message_id, ...)`. The share export pipeline rebuilds `fts_messages`, so
         // those triggers must be removed before any message updates.
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE VIRTUAL TABLE fts_messages USING fts5(message_id UNINDEXED, subject, body)",
         )
@@ -847,7 +851,7 @@ mod tests {
         assert!(fts_ok);
 
         // Verify the virtual table schema matches
-        let conn = DbConn::open_file(snapshot.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(snapshot.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT sql FROM sqlite_master WHERE name = 'fts_messages'",
@@ -867,7 +871,7 @@ mod tests {
         let db = create_test_db(dir.path());
 
         // Remove all messages so the DB is empty
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         conn.execute_raw("DELETE FROM message_recipients").unwrap();
         conn.execute_raw("DELETE FROM messages").unwrap();
         drop(conn);
@@ -875,7 +879,7 @@ mod tests {
         let fts_ok = build_search_indexes(&db).unwrap();
         assert!(fts_ok, "FTS5 should still succeed on empty table");
 
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT COUNT(*) AS cnt FROM fts_messages", &[])
             .unwrap();
@@ -899,7 +903,7 @@ mod tests {
         assert!(second);
 
         // Verify same data (no duplicates)
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT COUNT(*) AS cnt FROM fts_messages", &[])
             .unwrap();
@@ -927,7 +931,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
 
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         conn.execute_raw("DELETE FROM message_recipients").unwrap();
         conn.execute_raw("DELETE FROM messages").unwrap();
         drop(conn);
@@ -937,7 +941,7 @@ mod tests {
         assert!(views.contains(&"attachments_by_message_mv".to_string()));
 
         // Verify overview is empty
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT COUNT(*) AS cnt FROM message_overview_mv", &[])
             .unwrap();
@@ -948,7 +952,7 @@ mod tests {
     /// Create a test DB without sender_id column on messages.
     fn create_test_db_no_sender_id(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test_no_sender.sqlite3");
-        let conn = DbConn::open_file(db_path.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db_path.display().to_string()).unwrap();
 
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
@@ -1000,7 +1004,7 @@ mod tests {
     /// Create a test DB without thread_id column on messages.
     fn create_test_db_no_thread_id(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test_no_thread.sqlite3");
-        let conn = DbConn::open_file(db_path.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db_path.display().to_string()).unwrap();
 
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
@@ -1055,7 +1059,7 @@ mod tests {
         let fts_ok = build_search_indexes(&db).unwrap();
         assert!(fts_ok);
 
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT thread_key FROM fts_messages WHERE message_id = 1",
@@ -1073,7 +1077,7 @@ mod tests {
     fn column_exists_returns_false_for_missing() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
 
         assert!(!column_exists(&conn, "messages", "nonexistent_column").unwrap());
     }
@@ -1082,7 +1086,7 @@ mod tests {
     fn column_exists_returns_true_for_existing() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
 
         assert!(column_exists(&conn, "messages", "subject").unwrap());
         assert!(column_exists(&conn, "messages", "sender_id").unwrap());
@@ -1095,7 +1099,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
 
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         conn.execute_raw("DELETE FROM message_recipients").unwrap();
         conn.execute_raw("DELETE FROM messages").unwrap();
         conn.execute_raw("DELETE FROM agents").unwrap();
@@ -1118,7 +1122,7 @@ mod tests {
         assert!(views.contains(&"message_overview_mv".to_string()));
 
         // Verify overview created with empty sender_name
-        let conn = DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT sender_name FROM message_overview_mv WHERE id = 1",
@@ -1151,7 +1155,7 @@ mod tests {
         assert!(views.contains(&"attachments_by_message_mv".to_string()));
 
         // Verify overview has expected columns
-        let conn = DbConn::open_file(snapshot.display().to_string()).unwrap();
+        let conn = SqliteConnection::open_file(snapshot.display().to_string()).unwrap();
         let rows = conn
             .query_sync("PRAGMA table_info(message_overview_mv)", &[])
             .unwrap();

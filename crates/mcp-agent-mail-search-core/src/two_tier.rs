@@ -1708,7 +1708,8 @@ mod tests {
             "quality",
             axis_query(config.quality_dimension),
         ));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 3).collect();
         assert_eq!(phases.len(), 2, "should emit initial and refined phases");
@@ -1773,7 +1774,8 @@ mod tests {
             "quality",
             axis_query(config.quality_dimension),
         ));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
         assert_eq!(phases.len(), 1, "fast-only should emit only Initial phase");
@@ -1803,7 +1805,8 @@ mod tests {
             "quality",
             axis_query(config.quality_dimension),
         ));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 0).collect();
         assert_eq!(phases.len(), 2);
@@ -1858,7 +1861,8 @@ mod tests {
             "quality",
             axis_query(config.quality_dimension),
         ));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 1000).collect();
         assert_eq!(phases.len(), 2);
@@ -1910,7 +1914,8 @@ mod tests {
             "quality",
             axis_query(config.quality_dimension),
         ));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
         assert_eq!(phases.len(), 2);
@@ -1961,7 +1966,8 @@ mod tests {
             "quality",
             axis_query(config.quality_dimension),
         ));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 2).collect();
         assert_eq!(phases.len(), 1);
@@ -2011,7 +2017,8 @@ mod tests {
             "quality",
             axis_query(config.quality_dimension),
         ));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 3).collect();
         assert_eq!(phases.len(), 2);
@@ -2073,7 +2080,8 @@ mod tests {
             "quality",
             axis_query(config.quality_dimension),
         ));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 3).collect();
         assert_eq!(phases.len(), 2);
@@ -2307,7 +2315,8 @@ mod tests {
         let fast_embedder: Arc<dyn TwoTierEmbedder> =
             Arc::new(StubEmbedder::new("fast", vec![1.0, 0.0, 0.0, 0.0]));
         let quality_embedder: Arc<dyn TwoTierEmbedder> = Arc::new(FailingEmbedder);
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
         assert_eq!(phases.len(), 2, "should yield initial + refinement failed");
@@ -2345,7 +2354,8 @@ mod tests {
         let fast_embedder: Arc<dyn TwoTierEmbedder> = Arc::new(FailingEmbedder);
         let quality_embedder: Arc<dyn TwoTierEmbedder> =
             Arc::new(StubEmbedder::new("quality", vec![1.0, 0.0, 0.0, 0.0]));
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
         // In quality_only mode with failing fast, should still try quality refinement

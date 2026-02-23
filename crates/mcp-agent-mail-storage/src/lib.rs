@@ -2967,7 +2967,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                             }
                             Err(_) => {}
                         }
-                        
+
                         if removed {
                             result.locks_removed.push(path.display().to_string());
                             // Try to remove corresponding metadata file

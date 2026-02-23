@@ -85,7 +85,10 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
 
     let mut pool_config = DbPoolConfig::from_env();
     pool_config.database_url.clone_from(&config.database_url);
-    pool_config.run_migrations = false;
+    // Keep migrations enabled here: this worker can be the first component to
+    // acquire a pooled connection (e.g. proactive backup checkpointing in
+    // stdio mode), and that first-acquire path must remain schema-safe.
+    pool_config.run_migrations = true;
 
     let pool = match mcp_agent_mail_db::create_pool(&pool_config) {
         Ok(pool) => pool,

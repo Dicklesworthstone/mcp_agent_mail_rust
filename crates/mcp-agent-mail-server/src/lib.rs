@@ -13731,7 +13731,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_compose_envelope_inserts_new_message_and_uses_returning_id() {
+    fn dispatch_compose_envelope_inserts_new_message_and_uses_last_insert_rowid() {
         use mcp_agent_mail_db::sqlmodel_core::Value;
 
         let temp = tempfile::tempdir().expect("tempdir");

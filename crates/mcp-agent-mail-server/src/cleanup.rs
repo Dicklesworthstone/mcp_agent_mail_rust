@@ -270,20 +270,50 @@ fn check_filesystem_activity(
         return false;
     }
 
-    let matches = collect_matching_paths(workspace, path_pattern);
-    if matches.is_empty() {
+    let pattern = path_pattern.trim();
+    if pattern.is_empty() {
         return false;
     }
 
-    for path in &matches {
-        if let Ok(metadata) = path.metadata()
-            && let Ok(modified) = metadata.modified()
-        {
-            let mtime_us = modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-            if (now_us - mtime_us) <= grace_us {
-                return true;
+    let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
+
+    if has_glob {
+        let base_str = workspace.to_string_lossy();
+        let base_escaped = glob::Pattern::escape(&base_str);
+        // We use format! instead of Path::join because base_escaped is a string
+        // that may contain glob escape sequences that Path::join could mishandle.
+        let full_pattern = if base_str.ends_with('/') || base_str.ends_with('\\') {
+            format!("{base_escaped}{pattern}")
+        } else {
+            format!("{base_escaped}/{pattern}")
+        };
+        
+        if let Ok(paths) = glob::glob(&full_pattern) {
+            for entry in paths.flatten() {
+                if let Ok(metadata) = entry.metadata()
+                    && let Ok(modified) = metadata.modified()
+                {
+                    let mtime_us = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
+                    if (now_us - mtime_us) <= grace_us {
+                        return true;
+                    }
+                }
+            }
+        }
+    } else {
+        let candidate = workspace.join(pattern);
+        if candidate.exists() {
+            if let Ok(metadata) = candidate.metadata()
+                && let Ok(modified) = metadata.modified()
+            {
+                let mtime_us = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
+                if (now_us - mtime_us) <= grace_us {
+                    return true;
+                }
             }
         }
     }
@@ -331,6 +361,7 @@ fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_u
 ///
 /// Mirrors legacy `_collect_matching_paths`: if the pattern contains glob chars,
 /// use globbing; otherwise treat as a literal path.
+#[cfg(test)]
 fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf> {
     let pattern = pattern.trim();
     if pattern.is_empty() {
@@ -388,12 +419,11 @@ fn write_cleanup_artifacts(
             && released_ids.contains(&id)
         {
             // We need the agent name, which isn't in FileReservationRow, so we look it up
-            let agent_name = match block_on(async {
-                queries::get_agent_by_id(cx, pool, row.agent_id).await
-            }) {
-                Outcome::Ok(agent) => agent.name,
-                _ => format!("agent_{}", row.agent_id),
-            };
+            let agent_name =
+                match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {
+                    Outcome::Ok(agent) => agent.name,
+                    _ => format!("agent_{}", row.agent_id),
+                };
 
             res_jsons.push(serde_json::json!({
                 "id": id,

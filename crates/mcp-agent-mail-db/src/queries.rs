@@ -1658,6 +1658,7 @@ pub struct ThreadMessageRow {
 /// 3. Invokes `checker` with the list of active reservations.
 /// 4. If `checker` returns `Ok(inserts)`, performs batch INSERT and commits.
 /// 5. If `checker` returns `Err(msg)`, rolls back and returns `DbError::Conflict`.
+#[allow(clippy::too_many_lines)]
 pub async fn atomic_file_reservation_check_and_create<F>(
     cx: &Cx,
     pool: &DbPool,
@@ -1751,12 +1752,7 @@ where
             params.push(Value::Text(reason.clone()));
 
             created_rows.push(FileReservationRow {
-                id: None, // populated below via reload if possible, or left None?
-                // Ideally we reload, but batch insert makes reloading IDs hard in SQLite without RETURNING.
-                // FrankenSQLite supports RETURNING?
-                // Let's assume standard SQLite logic. RETURNING is supported in recent SQLite.
-                // But to be safe and consistent with other queries, we might skip ID reload if not strictly needed?
-                // Wait, the tool returns IDs. We need them.
+                id: None,
                 project_id,
                 agent_id: *agent_id,
                 path_pattern: path.clone(),
@@ -1768,22 +1764,38 @@ where
             });
         }
 
-        // If we can use RETURNING, great. If not, we have to query back.
-        // Let's use RETURNING clause which is robust in modern SQLite (3.35+).
-        // Since we control the environment (bundled sqlite), we can rely on RETURNING.
+        // Use RETURNING to map inserted IDs deterministically to this chunk without race windows.
         query.push_str(" RETURNING id");
+        let id_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &query, &params).await)
+        );
 
-        let ids_outcome = map_sql_outcome(traw_query(cx, &tracked, &query, &params).await);
-        let id_rows = try_in_tx!(cx, &tracked, ids_outcome);
-
-        // Assign IDs back to created_rows slice corresponding to this chunk
         let start_idx = created_rows.len() - chunk.len();
+        if id_rows.len() != chunk.len() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "file reservation insert returned {} ids for {} rows",
+                id_rows.len(),
+                chunk.len()
+            )));
+        }
+
         for (j, row) in id_rows.iter().enumerate() {
-            if let Some(id) = row_first_i64(row)
-                && let Some(cr) = created_rows.get_mut(start_idx + j)
-            {
-                cr.id = Some(id);
-            }
+            let Some(id) = row_first_i64(row) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "file reservation insert RETURNING id yielded non-integer id".to_string(),
+                ));
+            };
+            let Some(cr) = created_rows.get_mut(start_idx + j) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "file reservation insert ID mapping overflowed result buffer".to_string(),
+                ));
+            };
+            cr.id = Some(id);
         }
     }
 
@@ -1817,11 +1829,10 @@ pub async fn create_message(
     let tracked = tracked(&*conn);
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Insert message using RETURNING id to safely get the generated ID without races.
+    // Insert message using traw_execute and then fetch id.
     let sql = "INSERT INTO messages \
                (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-               RETURNING id";
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
@@ -1834,15 +1845,21 @@ pub async fn create_message(
         Value::Text(attachments.to_string()),
     ];
 
+    try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+    );
+
     let rows = try_in_tx!(
         cx,
         &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, sql, &params).await)
+        map_sql_outcome(traw_query(cx, &tracked, "SELECT last_insert_rowid()", &[]).await)
     );
     let message_id = rows
         .first()
         .and_then(row_first_i64)
-        .ok_or_else(|| DbError::Internal("Message INSERT RETURNING id failed".to_string()));
+        .ok_or_else(|| DbError::Internal("Message INSERT last_insert_rowid() failed".to_string()));
 
     let message_id = match message_id {
         Ok(id) => id,
@@ -1977,11 +1994,10 @@ async fn create_message_with_recipients_tx(
     // Use MVCC concurrent transaction for page-level parallelism.
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
 
-    // Insert message using RETURNING id to safely get the generated ID without races.
+    // Insert message using traw_execute and then fetch id.
     let sql = "INSERT INTO messages \
                (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-               RETURNING id";
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
@@ -1994,15 +2010,21 @@ async fn create_message_with_recipients_tx(
         Value::Text(attachments.to_string()),
     ];
 
+    try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(traw_execute(cx, tracked, sql, &params).await)
+    );
+
     let rows = try_in_tx!(
         cx,
         tracked,
-        map_sql_outcome(traw_query(cx, tracked, sql, &params).await)
+        map_sql_outcome(traw_query(cx, tracked, "SELECT last_insert_rowid()", &[]).await)
     );
     let message_id = rows
         .first()
         .and_then(row_first_i64)
-        .ok_or_else(|| DbError::Internal("Message INSERT RETURNING id failed".to_string()));
+        .ok_or_else(|| DbError::Internal("Message INSERT last_insert_rowid() failed".to_string()));
 
     let message_id = match message_id {
         Ok(id) => id,
@@ -3411,7 +3433,7 @@ async fn run_like_fallback_global(
     }
 
     let mut conditions = Vec::with_capacity(terms.len());
-    let mut params: Vec<Value> = Vec::with_capacity(terms.len() + 1);
+    let mut params: Vec<Value> = Vec::with_capacity(terms.len() * 2 + 1);
 
     for term in terms {
         conditions.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
@@ -3886,37 +3908,12 @@ pub async fn get_active_reservations(
     }
 }
 
-/// Release file reservations
-pub async fn release_reservations(
-    cx: &Cx,
-    pool: &DbPool,
-    project_id: i64,
-    agent_id: i64,
-    paths: Option<&[&str]>,
+fn append_release_reservation_filters(
+    sql: &mut String,
+    params: &mut Vec<Value>,
     reservation_ids: Option<&[i64]>,
-) -> Outcome<Vec<FileReservationRow>, DbError> {
-    let now = now_micros();
-
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-    let mut sql = format!(
-        "UPDATE file_reservations SET released_ts = ? \
-         WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
-    );
-    let mut params: Vec<Value> = vec![
-        Value::BigInt(now),
-        Value::BigInt(project_id),
-        Value::BigInt(agent_id),
-    ];
-
+    paths: Option<&[&str]>,
+) {
     if let Some(ids) = reservation_ids
         && !ids.is_empty()
     {
@@ -3944,11 +3941,38 @@ pub async fn release_reservations(
         }
         sql.push(')');
     }
+}
 
-    sql.push_str(" RETURNING id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts");
+/// Release file reservations
+#[allow(clippy::too_many_lines)]
+pub async fn release_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    paths: Option<&[&str]>,
+    reservation_ids: Option<&[i64]>,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    let now = now_micros();
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    let result = match rows_out {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+    let mut filter_sql =
+        format!(" WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})");
+    let mut filter_params: Vec<Value> = vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
+    append_release_reservation_filters(&mut filter_sql, &mut filter_params, reservation_ids, paths);
+
+    let select_sql = format!("{FILE_RESERVATION_SELECT_COLUMNS_SQL}{filter_sql}");
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &select_sql, &filter_params).await);
+    let mut reservations: Vec<FileReservationRow> = match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
@@ -3960,26 +3984,51 @@ pub async fn release_reservations(
                     }
                 }
             }
-            Outcome::Ok(out)
+            out
         }
         Outcome::Err(e) => {
             rollback_tx(cx, &tracked).await;
-            Outcome::Err(e)
+            return Outcome::Err(e);
         }
         Outcome::Cancelled(r) => {
             rollback_tx(cx, &tracked).await;
-            Outcome::Cancelled(r)
+            return Outcome::Cancelled(r);
         }
         Outcome::Panicked(p) => {
             rollback_tx(cx, &tracked).await;
-            Outcome::Panicked(p)
+            return Outcome::Panicked(p);
         }
     };
 
-    if result.is_ok() {
+    if reservations.is_empty() {
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        return Outcome::Ok(reservations);
     }
-    result
+
+    let update_sql = format!("UPDATE file_reservations SET released_ts = ?{filter_sql}");
+    let mut update_params = Vec::with_capacity(1 + filter_params.len());
+    update_params.push(Value::BigInt(now));
+    update_params.extend(filter_params.iter().cloned());
+
+    let affected = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &update_params).await)
+    );
+    let affected = usize::try_from(affected).unwrap_or_default();
+    if affected != reservations.len() {
+        rollback_tx(cx, &tracked).await;
+        return Outcome::Err(DbError::Internal(format!(
+            "release_reservations updated {affected} rows but selected {}",
+            reservations.len()
+        )));
+    }
+    for reservation in &mut reservations {
+        reservation.released_ts = Some(now);
+    }
+
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    Outcome::Ok(reservations)
 }
 
 /// Renew file reservations

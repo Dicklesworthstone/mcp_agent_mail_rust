@@ -269,6 +269,13 @@ pub async fn file_reservation_paths(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
+    // Warn about suspicious patterns (matching Python's ctx.info behavior)
+    for pattern in &paths {
+        if let Some(warning) = detect_suspicious_file_reservation(pattern) {
+            tracing::warn!("[warn] {}", warning);
+        }
+    }
+
     // Normalize paths relative to project root
     let mut normalized_paths = Vec::with_capacity(paths.len());
     for p in &paths {
@@ -295,13 +302,6 @@ pub async fn file_reservation_paths(
                     json!({ "path": p, "project_root": project.human_key }),
                 ));
             }
-        }
-    }
-
-    // Warn about suspicious patterns (matching Python's ctx.info behavior)
-    for pattern in &normalized_paths {
-        if let Some(warning) = detect_suspicious_file_reservation(pattern) {
-            tracing::warn!("[warn] {}", warning);
         }
     }
 

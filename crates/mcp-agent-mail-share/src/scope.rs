@@ -12,7 +12,9 @@ use sqlmodel_core::Value;
 use crate::ShareError;
 
 /// Connection type for offline snapshot manipulation.
-type Conn = mcp_agent_mail_db::DbConn;
+///
+/// Uses C-backed SQLite for reliable offline operations.
+type Conn = sqlmodel_sqlite::SqliteConnection;
 
 /// A project record from the `projects` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]

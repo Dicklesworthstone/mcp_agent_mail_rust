@@ -17,9 +17,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value as SqlValue;
+use sqlmodel_sqlite::SqliteConnection;
 
 use crate::{ExportRedactionPolicy, RedactionAuditLog, RedactionReason, ShareError, ShareResult};
 
@@ -239,7 +239,7 @@ pub fn render_static_site(
     config: &StaticRenderConfig,
 ) -> ShareResult<StaticRenderResult> {
     let path_str = snapshot_path.display().to_string();
-    let conn = DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+    let conn = SqliteConnection::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot for static render: {e}"),
     })?;
 
@@ -462,7 +462,7 @@ pub fn render_static_site(
 
 // ── Data discovery ──────────────────────────────────────────────────────
 
-fn discover_projects(conn: &DbConn) -> ShareResult<Vec<ProjectInfo>> {
+fn discover_projects(conn: &SqliteConnection) -> ShareResult<Vec<ProjectInfo>> {
     let rows = conn
         .query_sync(
             "SELECT p.slug, p.human_key, \
@@ -487,7 +487,10 @@ fn discover_projects(conn: &DbConn) -> ShareResult<Vec<ProjectInfo>> {
     Ok(projects)
 }
 
-fn discover_messages(conn: &DbConn, config: &StaticRenderConfig) -> ShareResult<Vec<MessageInfo>> {
+fn discover_messages(
+    conn: &SqliteConnection,
+    config: &StaticRenderConfig,
+) -> ShareResult<Vec<MessageInfo>> {
     // Fetch messages joined with sender agent and project
     let rows = conn
         .query_sync(
@@ -545,7 +548,7 @@ fn discover_messages(conn: &DbConn, config: &StaticRenderConfig) -> ShareResult<
     Ok(messages)
 }
 
-fn fetch_recipients(conn: &DbConn, message_id: i64) -> Vec<String> {
+fn fetch_recipients(conn: &SqliteConnection, message_id: i64) -> Vec<String> {
     conn.query_sync(
         "SELECT a.name FROM message_recipients r \
          JOIN agents a ON a.id = r.agent_id \
@@ -1313,7 +1316,7 @@ mod tests {
         let db_path = dir.path().join("test.sqlite3");
 
         // Create minimal schema
-        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
         conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
             &[],
@@ -1358,7 +1361,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
 
-        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
         conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
             &[],
@@ -1483,7 +1486,7 @@ mod tests {
     /// Helper: create a fixture DB with messages containing secrets.
     fn create_secret_fixture_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("secrets.sqlite3");
-        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
         conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
             &[],
@@ -1849,7 +1852,7 @@ mod tests {
 
         // Create a DB without secrets
         let db_path = dir.path().join("clean.sqlite3");
-        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
         conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
             &[],
@@ -1902,7 +1905,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
 
-        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
         conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
             &[],
