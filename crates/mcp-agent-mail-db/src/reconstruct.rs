@@ -4,6 +4,7 @@
 //! walks the per-project Git archive directories to recover:
 //!
 //! - **Projects** — from subdirectory names under `{storage_root}/projects/`
+//!   plus optional `project.json` metadata for exact `human_key` recovery
 //! - **Agents** — from `agents/{name}/profile.json` files
 //! - **Messages** — from `messages/{YYYY}/{MM}/*.md` files (JSON frontmatter)
 //! - **Message recipients** — from the `to`, `cc`, `bcc` arrays in frontmatter
@@ -170,8 +171,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
 
     for (slug, project_path) in &project_dirs {
         let now = crate::now_micros();
-        // Derive human_key from slug (replace - with /)
-        let human_key = format!("/{}", slug.replace('-', "/"));
+        let human_key = read_project_human_key(project_path, slug, &mut stats);
 
         conn.execute_sync(
             "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
@@ -416,8 +416,7 @@ fn parse_and_insert_message(
     let bcc_names = json_str_array(&msg, "bcc");
 
     // Insert message
-    let thread_id_val =
-        thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
+    let thread_id_val = thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
 
     conn.execute_sync(
         "INSERT INTO messages \
@@ -516,6 +515,94 @@ fn insert_recipient(conn: &DbConn, message_id: i64, agent_id: i64, kind: &str) -
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// Load canonical `human_key` from `project.json` when available.
+///
+/// Falls back to a synthetic `/{slug}` path when metadata is missing or
+/// malformed. The fallback remains absolute so downstream path validation
+/// continues to work.
+fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut ReconstructStats) -> String {
+    let metadata_path = project_path.join("project.json");
+    let fallback = format!("/{slug}");
+
+    if !metadata_path.is_file() {
+        stats.warnings.push(format!(
+            "Missing {}; using fallback human_key '{}'",
+            metadata_path.display(),
+            fallback
+        ));
+        return fallback;
+    }
+
+    let metadata_str = match std::fs::read_to_string(&metadata_path) {
+        Ok(s) => s,
+        Err(e) => {
+            stats.parse_errors += 1;
+            stats.warnings.push(format!(
+                "Cannot read {}: {e}; using fallback human_key '{}'",
+                metadata_path.display(),
+                fallback
+            ));
+            return fallback;
+        }
+    };
+
+    let metadata_json: serde_json::Value = match serde_json::from_str(&metadata_str) {
+        Ok(v) => v,
+        Err(e) => {
+            stats.parse_errors += 1;
+            stats.warnings.push(format!(
+                "Cannot parse {}: {e}; using fallback human_key '{}'",
+                metadata_path.display(),
+                fallback
+            ));
+            return fallback;
+        }
+    };
+
+    let Some(human_key) = metadata_json
+        .get("human_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        stats.parse_errors += 1;
+        stats.warnings.push(format!(
+            "Missing/empty human_key in {}; using fallback human_key '{}'",
+            metadata_path.display(),
+            fallback
+        ));
+        return fallback;
+    };
+
+    if !Path::new(human_key).is_absolute() {
+        stats.parse_errors += 1;
+        stats.warnings.push(format!(
+            "Non-absolute human_key '{}' in {}; using fallback human_key '{}'",
+            human_key,
+            metadata_path.display(),
+            fallback
+        ));
+        return fallback;
+    }
+
+    if let Some(metadata_slug) = metadata_json
+        .get("slug")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && metadata_slug != slug
+    {
+        stats.warnings.push(format!(
+            "Project metadata slug mismatch in {}: dir slug='{}', metadata slug='{}'",
+            metadata_path.display(),
+            slug,
+            metadata_slug
+        ));
+    }
+
+    human_key.to_string()
+}
 
 /// Extract JSON frontmatter from a `---json\n...\n---` block.
 fn extract_json_frontmatter(content: &str) -> Option<&str> {
@@ -767,6 +854,81 @@ mod tests {
         assert_eq!(stats.agents, 1);
         assert_eq!(stats.messages, 0);
         assert_eq!(stats.parse_errors, 0);
+    }
+
+    #[test]
+    fn reconstruct_uses_project_metadata_human_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let metadata = serde_json::json!({
+            "slug": "test-project",
+            "human_key": "/data/projects/exact-human-key",
+        });
+        std::fs::write(
+            project_dir.join("project.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.projects, 1);
+
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT slug, human_key FROM projects WHERE slug = 'test-project'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let human_key = rows[0]
+            .get_by_name("human_key")
+            .and_then(|v| match v {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("human_key text");
+        assert_eq!(human_key, "/data/projects/exact-human-key");
+    }
+
+    #[test]
+    fn reconstruct_falls_back_when_project_metadata_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.projects, 1);
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("Missing") && w.contains("project.json"))
+        );
+
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT human_key FROM projects WHERE slug = 'test-project'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let human_key = rows[0]
+            .get_by_name("human_key")
+            .and_then(|v| match v {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("human_key text");
+        assert_eq!(human_key, "/test-project");
     }
 
     #[test]

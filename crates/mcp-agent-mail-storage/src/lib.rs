@@ -3118,6 +3118,46 @@ pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
     })
 }
 
+/// Persist stable project metadata used by DB reconstruction.
+///
+/// Writes `projects/{slug}/project.json` containing the canonical `human_key`.
+/// If the file already exists with identical content, this is a no-op.
+pub fn write_project_metadata_with_config(
+    archive: &ProjectArchive,
+    config: &Config,
+    human_key: &str,
+) -> Result<()> {
+    if !Path::new(human_key).is_absolute() {
+        return Err(StorageError::InvalidPath(
+            "project human_key must be an absolute path".to_string(),
+        ));
+    }
+
+    let metadata_path = archive.root.join("project.json");
+    let metadata = serde_json::json!({
+        "slug": archive.slug,
+        "human_key": human_key,
+    });
+
+    // Avoid needless commits when ensure_project is called repeatedly.
+    if let Ok(existing) = fs::read_to_string(&metadata_path)
+        && let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing)
+        && existing_json == metadata
+    {
+        return Ok(());
+    }
+
+    write_json(&metadata_path, &metadata)?;
+    let rel = rel_path_cached(&archive.canonical_repo_root, &metadata_path)?;
+    enqueue_async_commit(
+        &archive.repo_root,
+        config,
+        &format!("project: metadata {}", archive.slug),
+        &[rel],
+    );
+    Ok(())
+}
+
 /// Initialize a git repository at `root` if one does not already exist.
 ///
 /// Configures gpgsign=false and writes `.gitattributes`.
@@ -6461,6 +6501,25 @@ mod tests {
         assert_eq!(archive.slug, "test-project");
         assert!(archive.root.exists());
         assert!(archive.root.ends_with("projects/test-project"));
+    }
+
+    #[test]
+    fn test_write_project_metadata_with_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        write_project_metadata_with_config(&archive, &config, "/tmp/proj").unwrap();
+        let metadata_path = archive.root.join("project.json");
+        assert!(metadata_path.exists());
+
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        assert_eq!(metadata["slug"], "proj");
+        assert_eq!(metadata["human_key"], "/tmp/proj");
+
+        // Rewriting with the same data should remain a no-op and still succeed.
+        write_project_metadata_with_config(&archive, &config, "/tmp/proj").unwrap();
     }
 
     #[test]

@@ -451,9 +451,24 @@ Check that all parameters have valid values."
     )?;
     enqueue_project_semantic_index(&row);
 
-    // Ensure the git archive directory exists for this project
-    if let Err(e) = mcp_agent_mail_storage::ensure_archive(config, &row.slug) {
-        tracing::warn!("Failed to ensure archive for project '{}': {e}", row.slug);
+    // Ensure the git archive directory exists for this project and persist
+    // canonical project metadata for DB reconstruction.
+    match mcp_agent_mail_storage::ensure_archive(config, &row.slug) {
+        Ok(archive) => {
+            if let Err(e) = mcp_agent_mail_storage::write_project_metadata_with_config(
+                &archive,
+                config,
+                &row.human_key,
+            ) {
+                tracing::warn!(
+                    "Failed to persist project metadata for project '{}': {e}",
+                    row.slug
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to ensure archive for project '{}': {e}", row.slug);
+        }
     }
 
     // Always return extended format with identity fields (null when not resolved)
@@ -624,7 +639,10 @@ Check that all parameters have valid values."
         last_active_ts: micros_to_iso(row.last_active_ts),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
-        capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+        capabilities: DEFAULT_AGENT_CAPABILITIES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
     };
 
     serde_json::to_string(&response)
@@ -815,7 +833,10 @@ Choose a different name (or omit the name to auto-generate one)."
         last_active_ts: micros_to_iso(row.last_active_ts),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
-        capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+        capabilities: DEFAULT_AGENT_CAPABILITIES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
     };
 
     serde_json::to_string(&response)
@@ -908,7 +929,10 @@ pub async fn whois(
             last_active_ts: micros_to_iso(agent_row.last_active_ts),
             project_id: agent_row.project_id,
             attachments_policy: agent_row.attachments_policy,
-            capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+            capabilities: DEFAULT_AGENT_CAPABILITIES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         },
         recent_commits,
     };
@@ -1049,7 +1073,10 @@ mod tests {
             last_active_ts: "2026-02-06T01:00:00Z".into(),
             project_id: 1,
             attachments_policy: "auto".into(),
-            capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+            capabilities: DEFAULT_AGENT_CAPABILITIES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -1073,7 +1100,10 @@ mod tests {
             last_active_ts: "2026-02-06T01:00:00Z".into(),
             project_id: 1,
             attachments_policy: "auto".into(),
-            capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+            capabilities: DEFAULT_AGENT_CAPABILITIES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         };
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: AgentResponse = serde_json::from_str(&json_str).unwrap();
@@ -1095,7 +1125,10 @@ mod tests {
                 last_active_ts: "2026-02-06T00:00:00Z".into(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
-                capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+                capabilities: DEFAULT_AGENT_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             },
             recent_commits: vec![CommitInfo {
                 hexsha: "abc123".into(),
@@ -1125,7 +1158,10 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "none".into(),
-                capabilities: DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+                capabilities: DEFAULT_AGENT_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             },
             recent_commits: vec![],
         };
