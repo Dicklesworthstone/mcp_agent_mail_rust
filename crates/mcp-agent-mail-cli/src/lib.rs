@@ -11917,8 +11917,9 @@ mod tests {
         );
 
         // Restored DB should contain only the scoped project.
+        // The snapshot is in C SQLite format, so use SqliteConnection.
         let restored_conn =
-            mcp_agent_mail_db::DbConn::open_file(restore_db.display().to_string()).unwrap();
+            sqlmodel_sqlite::SqliteConnection::open_file(restore_db.display().to_string()).unwrap();
         let rows = restored_conn
             .query_sync("SELECT slug FROM projects ORDER BY id", &[])
             .unwrap();
@@ -19988,8 +19989,9 @@ fn iso_from_micros(micros: i64) -> String {
 }
 
 fn projects_included_from_snapshot(snapshot_path: &Path) -> CliResult<Vec<serde_json::Value>> {
+    // Snapshots are always in C SQLite format (created by the share pipeline).
     let path_str = snapshot_path.display().to_string();
-    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str)
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_str)
         .map_err(|e| CliError::Other(format!("cannot open snapshot for metadata: {e}")))?;
     let rows = conn
         .query_sync(

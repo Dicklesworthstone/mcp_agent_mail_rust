@@ -358,20 +358,18 @@ pub fn maybe_chunk_database(
     let mut sha_lines = Vec::new();
     let mut index = 0usize;
     let mut file = std::fs::File::open(snapshot_path)?;
-    let mut buf = vec![0u8; chunk_bytes];
-
     loop {
-        let n = file.read(&mut buf)?;
+        let mut chunk = Vec::with_capacity(chunk_bytes);
+        let n = file.by_ref().take(chunk_bytes as u64).read_to_end(&mut chunk)?;
         if n == 0 {
             break;
         }
-        let chunk = &buf[..n];
 
         let chunk_name = format!("{index:05}.bin");
         let chunk_path = chunks_dir.join(&chunk_name);
-        std::fs::write(&chunk_path, chunk)?;
+        std::fs::write(&chunk_path, &chunk)?;
 
-        let hash = hex_sha256(chunk);
+        let hash = hex_sha256(&chunk);
         sha_lines.push(format!("{hash}  chunks/{chunk_name}\n"));
 
         index += 1;

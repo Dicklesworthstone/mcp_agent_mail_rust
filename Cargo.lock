@@ -4733,6 +4733,7 @@ dependencies = [
  "sha2",
  "similar",
  "sqlmodel-core",
+ "sqlmodel-sqlite",
  "tempfile",
  "thiserror",
  "tru",

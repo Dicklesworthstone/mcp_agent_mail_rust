@@ -3945,14 +3945,67 @@ fn append_release_reservation_filters(
 
 /// Release file reservations
 #[allow(clippy::too_many_lines)]
-pub async fn release_reservations(
-    cx: &Cx,
-    pool: &DbPool,
+pub fn release_reservations<'a>(
+    cx: &'a Cx,
+    pool: &'a DbPool,
     project_id: i64,
     agent_id: i64,
-    paths: Option<&[&str]>,
-    reservation_ids: Option<&[i64]>,
-) -> Outcome<Vec<FileReservationRow>, DbError> {
+    paths: Option<&'a [&'a str]>,
+    reservation_ids: Option<&'a [i64]>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>> {
+    Box::pin(async move {
+    // Avoid exceeding SQLite bind parameter limits by chunking very large filters.
+    // Each chunk call uses the same logic below and commits independently.
+    if let Some(ids) = reservation_ids
+        && ids.len() > MAX_IN_CLAUSE_ITEMS
+    {
+        let mut released = Vec::new();
+        for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let rows = match release_reservations(
+                cx,
+                pool,
+                project_id,
+                agent_id,
+                paths,
+                Some(chunk),
+            )
+            .await
+            {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            released.extend(rows);
+        }
+        return Outcome::Ok(released);
+    }
+
+    if let Some(pats) = paths
+        && pats.len() > MAX_IN_CLAUSE_ITEMS
+    {
+        let mut released = Vec::new();
+        for chunk in pats.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let rows = match release_reservations(
+                cx,
+                pool,
+                project_id,
+                agent_id,
+                Some(chunk),
+                reservation_ids,
+            )
+            .await
+            {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            released.extend(rows);
+        }
+        return Outcome::Ok(released);
+    }
+
     let now = now_micros();
 
     let conn = match acquire_conn(cx, pool).await {
@@ -4038,6 +4091,7 @@ pub async fn release_reservations(
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     Outcome::Ok(reservations)
+    }) // Box::pin(async move {
 }
 
 /// Renew file reservations
@@ -5298,7 +5352,8 @@ pub async fn get_reservations_by_ids(
 
 /// Release specific file reservations by their IDs.
 ///
-/// Sets `released_ts = now` for all given IDs that have `released_ts IS NULL`.
+/// Sets `released_ts = now` for all given IDs that are still logically active
+/// under [`ACTIVE_RESERVATION_PREDICATE`] (including legacy sentinel values).
 /// Returns the number of rows affected.
 pub async fn release_reservations_by_ids(
     cx: &Cx,
@@ -5327,7 +5382,8 @@ pub async fn release_reservations_by_ids(
         // Build parameterized IN clause.
         let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
         let sql = format!(
-            "UPDATE file_reservations SET released_ts = ? WHERE id IN ({}) AND released_ts IS NULL",
+            "UPDATE file_reservations SET released_ts = ? \
+             WHERE id IN ({}) AND ({ACTIVE_RESERVATION_PREDICATE})",
             placeholders.join(",")
         );
 

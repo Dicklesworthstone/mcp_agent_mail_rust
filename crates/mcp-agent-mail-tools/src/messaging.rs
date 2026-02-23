@@ -1868,7 +1868,8 @@ pub async fn reply_message(
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
     let config = &Config::get();
 
-    // Validate importance override if provided
+    // Validate importance override if provided (resolved to final value after
+    // the original message is fetched below).
     if let Some(ref imp) = importance {
         let lower = imp.to_ascii_lowercase();
         if !["low", "normal", "high", "urgent"].contains(&lower.as_str()) {
@@ -1941,6 +1942,13 @@ effective_free_bytes={free}"
             }),
         ));
     }
+
+    // Resolve importance: use override if provided, otherwise inherit from original.
+    let importance_val = if let Some(ref imp) = importance {
+        imp.to_ascii_lowercase()
+    } else {
+        original.importance.clone()
+    };
 
     // Resolve sender
     let sender = resolve_agent(
@@ -2390,7 +2398,7 @@ effective_free_bytes={free}"
             &subject,
             &body_md,
             Some(&thread_id),
-            &importance.unwrap_or_else(|| original.importance.clone()),
+            &importance_val,
             ack_required.unwrap_or(original.ack_required != 0),
             "[]", // No attachments for reply by default
             &recipient_refs,

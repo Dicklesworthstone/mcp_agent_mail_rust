@@ -21,14 +21,108 @@ use crate::ShareError;
 /// Order matters: tables with foreign-key references must come after the
 /// tables they reference so that data can be inserted without violating
 /// constraints (when `PRAGMA foreign_keys = ON`).
-const KNOWN_TABLES: &[&str] = &[
-    "projects",
-    "agents",
-    "messages",
-    "message_recipients",
-    "file_reservations",
-    "agent_links",
-    "build_slots",
+///
+/// Each entry: (table_name, has_id_primary_key, column_names).
+const KNOWN_TABLES: &[(&str, bool, &[&str])] = &[
+    (
+        "projects",
+        true,
+        &["id", "slug", "human_key", "created_at"],
+    ),
+    (
+        "products",
+        true,
+        &["id", "product_uid", "name", "created_at"],
+    ),
+    (
+        "product_project_links",
+        true,
+        &["id", "product_id", "project_id", "created_at"],
+    ),
+    (
+        "agents",
+        true,
+        &[
+            "id",
+            "project_id",
+            "name",
+            "program",
+            "model",
+            "task_description",
+            "inception_ts",
+            "last_active_ts",
+            "attachments_policy",
+            "contact_policy",
+        ],
+    ),
+    (
+        "messages",
+        true,
+        &[
+            "id",
+            "project_id",
+            "sender_id",
+            "thread_id",
+            "subject",
+            "body_md",
+            "importance",
+            "ack_required",
+            "created_ts",
+            "attachments",
+        ],
+    ),
+    (
+        "message_recipients",
+        false,
+        &["message_id", "agent_id", "kind", "read_ts", "ack_ts"],
+    ),
+    (
+        "file_reservations",
+        true,
+        &[
+            "id",
+            "project_id",
+            "agent_id",
+            "path_pattern",
+            "exclusive",
+            "reason",
+            "created_ts",
+            "expires_ts",
+            "released_ts",
+        ],
+    ),
+    (
+        "agent_links",
+        true,
+        &[
+            "id",
+            "a_project_id",
+            "a_agent_id",
+            "b_project_id",
+            "b_agent_id",
+            "status",
+            "reason",
+            "created_ts",
+            "updated_ts",
+            "expires_ts",
+        ],
+    ),
+    (
+        "project_sibling_suggestions",
+        true,
+        &[
+            "id",
+            "project_a_id",
+            "project_b_id",
+            "score",
+            "status",
+            "rationale",
+            "created_ts",
+            "evaluated_ts",
+            "confirmed_ts",
+            "dismissed_ts",
+        ],
+    ),
 ];
 
 /// Create a snapshot of the source SQLite database at `destination`.
@@ -78,104 +172,69 @@ pub fn create_sqlite_snapshot(
 
     let source_str = source.display().to_string();
 
-    // Open source with FrankenSQLite (runtime driver)
-    let src_conn = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
-        message: format!("cannot open source DB {source_str}: {e}"),
-    })?;
-
-    // Checkpoint WAL if requested (best-effort).
-    if checkpoint {
-        let _ = src_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
-    }
-
     // Create destination with C SQLite
     let dest_str = dest.display().to_string();
     let dst_conn = SqliteConnection::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot create destination DB {dest_str}: {e}"),
     })?;
 
-    // Transfer schema + data
-    transfer_tables(&src_conn, &dst_conn)?;
+    // Try FrankenSQLite first (runtime format), fall back to C SQLite.
+    // Runtime databases are created by FrankenSQLite which produces files that
+    // C SQLite cannot read.  Fixture/external databases are C SQLite and
+    // FrankenSQLite may not be able to read those.
+    let frank_ok = match DbConn::open_file(&source_str) {
+        Ok(src) => {
+            if checkpoint {
+                let _ = src.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+            }
+            // Probe with a known table to confirm we can actually read.
+            let probe = format!(
+                "SELECT \"id\" FROM \"projects\" LIMIT 1"
+            );
+            match src.query_sync(&probe, &[]) {
+                Ok(_) => {
+                    transfer_tables_frank(&src, &dst_conn)?;
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    };
+
+    if !frank_ok {
+        // Fall back to C SQLite for the source (e.g. fixture files).
+        let src_c = SqliteConnection::open_file(&source_str).map_err(|e| ShareError::Sqlite {
+            message: format!("cannot open source DB {source_str}: {e}"),
+        })?;
+        if checkpoint {
+            let _ = src_c.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+        transfer_tables_c(&src_c, &dst_conn)?;
+    }
 
     Ok(dest)
 }
 
 /// Transfer tables from a FrankenSQLite source to a C-SQLite destination.
-fn transfer_tables(src: &DbConn, dst: &SqliteConnection) -> Result<(), ShareError> {
-    for &table in KNOWN_TABLES {
-        // Probe whether the table exists in the source by selecting one row.
-        let probe = format!("SELECT * FROM \"{table}\" LIMIT 1");
-        let sample_rows = match src.query_sync(&probe, &[]) {
-            Ok(rows) => rows,
-            Err(_) => continue, // Table doesn't exist — skip.
-        };
-
-        // Discover columns from the sample row.
-        let columns: Vec<String> = if let Some(row) = sample_rows.first() {
-            row.column_names().map(ToString::to_string).collect()
-        } else {
-            // Table exists but is empty.  Try a zero-limit query with a
-            // header hint; if we still can't discover columns, skip.
-            let zero = format!("SELECT * FROM \"{table}\" LIMIT 0");
-            match src.query_sync(&zero, &[]) {
-                Ok(rows) if !rows.is_empty() => {
-                    rows[0].column_names().map(ToString::to_string).collect()
-                }
-                _ => continue,
-            }
-        };
-
-        if columns.is_empty() {
-            continue;
-        }
-
-        // Build CREATE TABLE.  Use INTEGER PRIMARY KEY for `id` columns so
-        // C SQLite assigns the correct rowid alias.  Other columns are left
-        // untyped (SQLite is dynamically typed).
-        let col_defs: Vec<String> = columns
-            .iter()
-            .map(|c| {
-                if c == "id" {
-                    format!("\"{c}\" INTEGER PRIMARY KEY")
-                } else {
-                    format!("\"{c}\"")
-                }
-            })
-            .collect();
-
-        // message_recipients uses a composite PK — add it if applicable.
-        let pk_suffix = if table == "message_recipients" {
-            ", PRIMARY KEY(\"message_id\", \"agent_id\")"
-        } else {
-            ""
-        };
-
-        let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS \"{table}\" ({}{pk_suffix})",
-            col_defs.join(", ")
-        );
-        dst.execute_raw(&create_sql).map_err(|e| ShareError::Sqlite {
-            message: format!("CREATE TABLE {table} failed: {e}"),
-        })?;
-
-        // Build parameterised INSERT template.
+fn transfer_tables_frank(src: &DbConn, dst: &SqliteConnection) -> Result<(), ShareError> {
+    for &(table, has_id, columns) in KNOWN_TABLES {
         let col_list = columns
             .iter()
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        let placeholders = (0..columns.len())
-            .map(|i| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let insert_sql = format!(
-            "INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})"
-        );
 
-        // Copy data in chunks (tables with `id` column) or all-at-once.
-        let has_id = columns.contains(&"id".to_string());
+        // Probe whether the table exists in the source.
+        let probe = format!("SELECT {col_list} FROM \"{table}\" LIMIT 1");
+        if src.query_sync(&probe, &[]).is_err() {
+            continue;
+        }
+
+        create_dst_table(dst, table, has_id, columns)?;
+        let (insert_sql, placeholders_count) = build_insert(table, columns, &col_list);
+
         let mut last_id: i64 = -1;
-
         loop {
             let (select_sql, params): (String, Vec<Value>) = if has_id {
                 (
@@ -204,7 +263,6 @@ fn transfer_tables(src: &DbConn, dst: &SqliteConnection) -> Result<(), ShareErro
                     .iter()
                     .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
                     .collect();
-
                 if has_id {
                     if let Some(val) = row.get_by_name("id") {
                         last_id = match val {
@@ -214,20 +272,132 @@ fn transfer_tables(src: &DbConn, dst: &SqliteConnection) -> Result<(), ShareErro
                         };
                     }
                 }
-
                 dst.execute_sync(&insert_sql, &values)
                     .map_err(|e| ShareError::Sqlite {
                         message: format!("INSERT into {table} failed: {e}"),
                     })?;
             }
+            if !has_id {
+                break;
+            }
+        }
+        let _ = placeholders_count;
+    }
+    Ok(())
+}
 
-            // Tables without id — all rows fetched in one batch.
+/// Transfer tables from a C-SQLite source to a C-SQLite destination.
+fn transfer_tables_c(src: &SqliteConnection, dst: &SqliteConnection) -> Result<(), ShareError> {
+    for &(table, has_id, columns) in KNOWN_TABLES {
+        let col_list = columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Probe whether the table exists in the source.
+        let probe = format!("SELECT {col_list} FROM \"{table}\" LIMIT 1");
+        if src.query_sync(&probe, &[]).is_err() {
+            continue;
+        }
+
+        create_dst_table(dst, table, has_id, columns)?;
+        let (insert_sql, _) = build_insert(table, columns, &col_list);
+
+        let mut last_id: i64 = -1;
+        loop {
+            let (select_sql, params): (String, Vec<Value>) = if has_id {
+                (
+                    format!(
+                        "SELECT {col_list} FROM \"{table}\" WHERE \"id\" > ?1 \
+                         ORDER BY \"id\" ASC LIMIT 1000"
+                    ),
+                    vec![Value::BigInt(last_id)],
+                )
+            } else {
+                (format!("SELECT {col_list} FROM \"{table}\""), vec![])
+            };
+
+            let rows = src
+                .query_sync(&select_sql, &params)
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("SELECT from {table} failed: {e}"),
+                })?;
+
+            if rows.is_empty() {
+                break;
+            }
+
+            for row in &rows {
+                let values: Vec<Value> = columns
+                    .iter()
+                    .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
+                    .collect();
+                if has_id {
+                    if let Some(val) = row.get_by_name("id") {
+                        last_id = match val {
+                            Value::BigInt(v) => *v,
+                            Value::Int(v) => i64::from(*v),
+                            _ => last_id,
+                        };
+                    }
+                }
+                dst.execute_sync(&insert_sql, &values)
+                    .map_err(|e| ShareError::Sqlite {
+                        message: format!("INSERT into {table} failed: {e}"),
+                    })?;
+            }
             if !has_id {
                 break;
             }
         }
     }
     Ok(())
+}
+
+/// Create a table in the C-SQLite destination.
+fn create_dst_table(
+    dst: &SqliteConnection,
+    table: &str,
+    has_id: bool,
+    columns: &[&str],
+) -> Result<(), ShareError> {
+    let col_defs: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            if *c == "id" {
+                format!("\"{c}\" INTEGER PRIMARY KEY")
+            } else {
+                format!("\"{c}\"")
+            }
+        })
+        .collect();
+
+    let pk_suffix = if !has_id && table == "message_recipients" {
+        ", PRIMARY KEY(\"message_id\", \"agent_id\")"
+    } else {
+        ""
+    };
+
+    let create_sql = format!(
+        "CREATE TABLE IF NOT EXISTS \"{table}\" ({}{pk_suffix})",
+        col_defs.join(", ")
+    );
+    dst.execute_raw(&create_sql).map_err(|e| ShareError::Sqlite {
+        message: format!("CREATE TABLE {table} failed: {e}"),
+    })
+}
+
+/// Build INSERT OR REPLACE SQL and return it with placeholder count.
+fn build_insert(table: &str, columns: &[&str], col_list: &str) -> (String, usize) {
+    let placeholders = (0..columns.len())
+        .map(|i| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})"
+    );
+    (sql, columns.len())
 }
 
 /// Full snapshot preparation pipeline.
@@ -289,9 +459,11 @@ mod tests {
 
         // Create a minimal source DB with FrankenSQLite (like runtime).
         let conn = DbConn::open_file(source.display().to_string()).unwrap();
-        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
-            .unwrap();
-        conn.execute_raw("INSERT INTO projects VALUES (1, 'hello')")
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'hello', '/test', 0)")
             .unwrap();
         drop(conn);
 
@@ -325,8 +497,10 @@ mod tests {
 
         // Create source
         let conn = DbConn::open_file(source.display().to_string()).unwrap();
-        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY)")
-            .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
         drop(conn);
         std::fs::write(&dest, b"existing").unwrap();
 

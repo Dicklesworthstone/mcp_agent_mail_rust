@@ -7,22 +7,23 @@
 
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::disk::DiskPressure;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static WORKER: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 const STARTUP_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1GiB
 
 #[inline]
-fn monitor_interval_seconds(seconds: u64) -> Duration {
-    Duration::from_secs(seconds.max(5))
+const fn monitor_interval_seconds(seconds: u64) -> Duration {
+    Duration::from_secs(if seconds > 5 { seconds } else { 5 })
 }
 
 #[inline]
-fn should_emit_startup_warning(effective_free_bytes: Option<u64>) -> bool {
-    effective_free_bytes.is_some_and(|free| free < STARTUP_WARN_BYTES)
+const fn should_emit_startup_warning(effective_free_bytes: Option<u64>) -> bool {
+    matches!(effective_free_bytes, Some(free) if free < STARTUP_WARN_BYTES)
 }
 
 #[inline]
@@ -39,18 +40,26 @@ pub fn start(config: &Config) {
     // immediately after startup.
     let _ = mcp_agent_mail_core::disk::sample_and_record(config);
 
-    let config = config.clone();
-    let _ = WORKER.get_or_init(|| {
+    let mut worker = WORKER.lock().unwrap();
+    if worker.is_none() {
+        let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
-        std::thread::Builder::new()
-            .name("disk-monitor".into())
-            .spawn(move || monitor_loop(&config))
-            .expect("failed to spawn disk monitor worker")
-    });
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("disk-monitor".into())
+                .spawn(move || monitor_loop(&config))
+                .expect("failed to spawn disk monitor worker"),
+        );
+    }
 }
 
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
+    if let Ok(mut worker) = WORKER.lock() {
+        if let Some(handle) = worker.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn monitor_loop(config: &Config) {
