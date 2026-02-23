@@ -1064,7 +1064,7 @@ pub fn ansi_to_line(input: &str) -> ftui::text::Line<'static> {
                     } else {
                         params_str
                             .split(';')
-                            .filter_map(|s| s.parse::<u8>().ok())
+                            .map(|s| s.parse::<u8>().unwrap_or(0))
                             .collect()
                     };
                     let mut pi = 0;

@@ -851,6 +851,60 @@ fn reserve_and_release_roundtrip() {
 }
 
 #[test]
+fn release_reservations_large_batch_handles_many_rows() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+
+    let paths: Vec<String> = (0..1100)
+        .map(|idx| format!("src/generated/path_{idx}.rs"))
+        .collect();
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let expected = path_refs.len();
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &path_refs,
+            3600,
+            true,
+            "bulk-release-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("bulk reserve failed: {other:?}"),
+        }
+    });
+    assert_eq!(created.len(), expected, "expected all reservations created");
+
+    let pool3 = pool.clone();
+    let released = block_on(|cx| async move {
+        match queries::release_reservations(&cx, &pool3, pid, agent_id, None, None).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("bulk release failed: {other:?}"),
+        }
+    });
+    assert_eq!(
+        released.len(),
+        expected,
+        "expected all reservations released"
+    );
+
+    let pool4 = pool.clone();
+    let active =
+        block_on(|cx| async move { queries::get_active_reservations(&cx, &pool4, pid).await });
+    match active {
+        Outcome::Ok(rows) => assert!(rows.is_empty(), "all reservations should be inactive"),
+        other => panic!("active reservation check failed: {other:?}"),
+    }
+}
+
+#[test]
 fn renew_no_active_reservations_returns_empty() {
     let (pool, _dir) = make_pool();
     let pid = setup_project(&pool);

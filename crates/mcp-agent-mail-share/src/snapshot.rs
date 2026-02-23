@@ -1,20 +1,41 @@
-//! Step 1: SQLite snapshot creation via WAL checkpoint + filesystem copy.
+//! Step 1: SQLite snapshot creation via SQL-level dump and restore.
 //!
-//! Creates an atomic, clean copy of the source database suitable for
-//! offline manipulation (scoping, scrubbing, etc.).
+//! Creates an atomic, clean C-SQLite copy of the source database suitable for
+//! offline manipulation (scoping, scrubbing, finalization with FTS5/VACUUM).
+//!
+//! The source DB may be in FrankenSQLite format (used at runtime), which is
+//! not file-level compatible with C SQLite.  Instead of a byte-level file
+//! copy we read schema + data through the FrankenSQLite driver and re-create
+//! them in a fresh C-SQLite file.
 
 use std::path::{Path, PathBuf};
 
+use mcp_agent_mail_db::DbConn;
+use sqlmodel_core::Value;
 use sqlmodel_sqlite::SqliteConnection;
 
 use crate::ShareError;
 
+/// Known tables produced by the `mcp-agent-mail-db` schema.
+///
+/// Order matters: tables with foreign-key references must come after the
+/// tables they reference so that data can be inserted without violating
+/// constraints (when `PRAGMA foreign_keys = ON`).
+const KNOWN_TABLES: &[&str] = &[
+    "projects",
+    "agents",
+    "messages",
+    "message_recipients",
+    "file_reservations",
+    "agent_links",
+    "build_slots",
+];
+
 /// Create a snapshot of the source SQLite database at `destination`.
 ///
-/// 1. Opens source DB.
-/// 2. If `checkpoint` is true, runs `PRAGMA wal_checkpoint(TRUNCATE)` to
-///    flush WAL frames into the main DB before copying.
-/// 3. Copies the source DB file into the destination.
+/// 1. Opens source DB with FrankenSQLite (runtime driver).
+/// 2. If `checkpoint` is true, runs `PRAGMA wal_checkpoint(TRUNCATE)`.
+/// 3. Transfers schema + data to a fresh C-SQLite destination file.
 ///
 /// Returns the destination path on success.
 ///
@@ -57,22 +78,156 @@ pub fn create_sqlite_snapshot(
 
     let source_str = source.display().to_string();
 
-    // Checkpoint WAL if requested.
+    // Open source with FrankenSQLite (runtime driver)
+    let src_conn = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open source DB {source_str}: {e}"),
+    })?;
+
+    // Checkpoint WAL if requested (best-effort).
     if checkpoint {
-        let checkpoint_conn =
-            SqliteConnection::open_file(&source_str).map_err(|e| ShareError::Sqlite {
-                message: format!("cannot open source DB {source_str}: {e}"),
-            })?;
-        checkpoint_conn
-            .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(|e| ShareError::Sqlite {
-                message: format!("WAL checkpoint failed: {e}"),
-            })?;
+        let _ = src_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
     }
 
-    std::fs::copy(source, &dest)?;
+    // Create destination with C SQLite
+    let dest_str = dest.display().to_string();
+    let dst_conn = SqliteConnection::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot create destination DB {dest_str}: {e}"),
+    })?;
+
+    // Transfer schema + data
+    transfer_tables(&src_conn, &dst_conn)?;
 
     Ok(dest)
+}
+
+/// Transfer tables from a FrankenSQLite source to a C-SQLite destination.
+fn transfer_tables(src: &DbConn, dst: &SqliteConnection) -> Result<(), ShareError> {
+    for &table in KNOWN_TABLES {
+        // Probe whether the table exists in the source by selecting one row.
+        let probe = format!("SELECT * FROM \"{table}\" LIMIT 1");
+        let sample_rows = match src.query_sync(&probe, &[]) {
+            Ok(rows) => rows,
+            Err(_) => continue, // Table doesn't exist — skip.
+        };
+
+        // Discover columns from the sample row.
+        let columns: Vec<String> = if let Some(row) = sample_rows.first() {
+            row.column_names().map(ToString::to_string).collect()
+        } else {
+            // Table exists but is empty.  Try a zero-limit query with a
+            // header hint; if we still can't discover columns, skip.
+            let zero = format!("SELECT * FROM \"{table}\" LIMIT 0");
+            match src.query_sync(&zero, &[]) {
+                Ok(rows) if !rows.is_empty() => {
+                    rows[0].column_names().map(ToString::to_string).collect()
+                }
+                _ => continue,
+            }
+        };
+
+        if columns.is_empty() {
+            continue;
+        }
+
+        // Build CREATE TABLE.  Use INTEGER PRIMARY KEY for `id` columns so
+        // C SQLite assigns the correct rowid alias.  Other columns are left
+        // untyped (SQLite is dynamically typed).
+        let col_defs: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                if c == "id" {
+                    format!("\"{c}\" INTEGER PRIMARY KEY")
+                } else {
+                    format!("\"{c}\"")
+                }
+            })
+            .collect();
+
+        // message_recipients uses a composite PK — add it if applicable.
+        let pk_suffix = if table == "message_recipients" {
+            ", PRIMARY KEY(\"message_id\", \"agent_id\")"
+        } else {
+            ""
+        };
+
+        let create_sql = format!(
+            "CREATE TABLE IF NOT EXISTS \"{table}\" ({}{pk_suffix})",
+            col_defs.join(", ")
+        );
+        dst.execute_raw(&create_sql).map_err(|e| ShareError::Sqlite {
+            message: format!("CREATE TABLE {table} failed: {e}"),
+        })?;
+
+        // Build parameterised INSERT template.
+        let col_list = columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (0..columns.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_sql = format!(
+            "INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})"
+        );
+
+        // Copy data in chunks (tables with `id` column) or all-at-once.
+        let has_id = columns.contains(&"id".to_string());
+        let mut last_id: i64 = -1;
+
+        loop {
+            let (select_sql, params): (String, Vec<Value>) = if has_id {
+                (
+                    format!(
+                        "SELECT {col_list} FROM \"{table}\" WHERE \"id\" > ?1 \
+                         ORDER BY \"id\" ASC LIMIT 1000"
+                    ),
+                    vec![Value::BigInt(last_id)],
+                )
+            } else {
+                (format!("SELECT {col_list} FROM \"{table}\""), vec![])
+            };
+
+            let rows = src
+                .query_sync(&select_sql, &params)
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("SELECT from {table} failed: {e}"),
+                })?;
+
+            if rows.is_empty() {
+                break;
+            }
+
+            for row in &rows {
+                let values: Vec<Value> = columns
+                    .iter()
+                    .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
+                    .collect();
+
+                if has_id {
+                    if let Some(val) = row.get_by_name("id") {
+                        last_id = match val {
+                            Value::BigInt(v) => *v,
+                            Value::Int(v) => i64::from(*v),
+                            _ => last_id,
+                        };
+                    }
+                }
+
+                dst.execute_sync(&insert_sql, &values)
+                    .map_err(|e| ShareError::Sqlite {
+                        message: format!("INSERT into {table} failed: {e}"),
+                    })?;
+            }
+
+            // Tables without id — all rows fetched in one batch.
+            if !has_id {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Full snapshot preparation pipeline.
@@ -132,30 +287,32 @@ mod tests {
         let source = dir.path().join("source.sqlite3");
         let dest = dir.path().join("dest.sqlite3");
 
-        // Create a minimal source DB
-        let conn = SqliteConnection::open_file(source.display().to_string()).unwrap();
-        conn.execute_raw("CREATE TABLE test_data (id INTEGER PRIMARY KEY, name TEXT)")
+        // Create a minimal source DB with FrankenSQLite (like runtime).
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
             .unwrap();
-        conn.execute_raw("INSERT INTO test_data VALUES (1, 'hello')")
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'hello')")
             .unwrap();
         drop(conn);
 
-        // Snapshot it
-        let result = create_sqlite_snapshot(&source, &dest, true);
+        // Snapshot it (converts FrankenSQLite → C SQLite).
+        let result = create_sqlite_snapshot(&source, &dest, false);
         assert!(result.is_ok());
         assert!(dest.exists());
 
-        // Verify data in copy
+        // Verify data in copy using C SQLite.
         let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
         let rows = copy_conn
-            .query_sync("SELECT name FROM test_data WHERE id = 1", &[])
+            .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        let name: String = rows[0].get_named("name").unwrap();
+        let name: String = rows[0].get_named("slug").unwrap();
         assert_eq!(name, "hello");
 
-        // Verify integrity on the copied DB (byte-identical is not guaranteed).
-        let rows = copy_conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
+        // Verify integrity on the C SQLite copy.
+        let rows = copy_conn
+            .query_sync("PRAGMA integrity_check", &[])
+            .unwrap();
         let result: String = rows[0].get_named("integrity_check").unwrap();
         assert_eq!(result, "ok");
     }
@@ -166,20 +323,22 @@ mod tests {
         let source = dir.path().join("source.sqlite3");
         let dest = dir.path().join("dest.sqlite3");
 
-        // Create source and dest
-        let conn = SqliteConnection::open_file(source.display().to_string()).unwrap();
-        conn.execute_raw("CREATE TABLE t (id INTEGER)").unwrap();
+        // Create source
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY)")
+            .unwrap();
         drop(conn);
         std::fs::write(&dest, b"existing").unwrap();
 
-        let result = create_sqlite_snapshot(&source, &dest, true);
+        let result = create_sqlite_snapshot(&source, &dest, false);
         assert!(matches!(
             result,
             Err(ShareError::SnapshotDestinationExists { .. })
         ));
     }
 
-    /// Full pipeline integration: snapshot → scope → scrub → finalize → attachments → chunk → scaffold → sign → verify
+    /// Full pipeline integration: snapshot → scope → scrub → finalize →
+    /// attachments → chunk → scaffold → sign → verify
     #[test]
     fn full_pipeline_integration() {
         use crate::bundle::{
@@ -191,11 +350,9 @@ mod tests {
         use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
 
-        // 1. Create a seeded source database using C SQLite so downstream
-        //    pipeline steps (scrub/finalize) can open it with SqliteConnection.
+        // 1. Create a seeded source database with FrankenSQLite (like runtime).
         let source = dir.path().join("source.sqlite3");
-        let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(source.display().to_string()).unwrap();
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         ).unwrap();
@@ -250,8 +407,7 @@ mod tests {
         std::fs::create_dir_all(&storage).unwrap();
         std::fs::write(storage.join("test.txt"), b"attachment content").unwrap();
 
-        // 2. Snapshot (skip checkpoint — fresh DB has no WAL, and the
-        //    FrankenConnection checkpoint would corrupt a C-SQLite file)
+        // 2. Snapshot (FrankenSQLite → C SQLite conversion)
         let snapshot = dir.path().join("snapshot.sqlite3");
         create_sqlite_snapshot(&source, &snapshot, false).unwrap();
         assert!(snapshot.exists());

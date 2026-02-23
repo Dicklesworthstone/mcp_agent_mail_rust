@@ -308,7 +308,6 @@ pub async fn release_build_slot(
             let lease_path = slot_path.join(format!("{holder_id}.json"));
 
             lease.released_ts = Some(now_iso.clone());
-            lease.expires_ts.clone_from(&now_iso);
             if write_lease_json(&lease_path, &lease).is_ok() {
                 released = true;
             }
