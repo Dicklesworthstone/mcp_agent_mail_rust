@@ -69,6 +69,7 @@ struct DbStatQueryBatcher<'a> {
 }
 
 impl<'a> DbStatQueryBatcher<'a> {
+    #[allow(dead_code)]
     const fn new(conn: &'a DbConn) -> Self {
         Self {
             conn,
@@ -411,6 +412,7 @@ fn maybe_attempt_sqlite_recovery(sqlite_path: &str, reason: &str) {
 
     let sqlite_path_buf = Path::new(sqlite_path).to_path_buf();
     let storage_root = mcp_agent_mail_core::config::env_value("STORAGE_ROOT");
+    #[allow(clippy::option_if_let_else)]
     let recovery_result = if let Some(root) = storage_root {
         let root_path = Path::new(&root);
         if root_path.is_dir() {

@@ -384,27 +384,27 @@ fn write_cleanup_artifacts(
 
     let mut res_jsons = Vec::new();
     for row in all_reservations {
-        if let Some(id) = row.id {
-            if released_ids.contains(&id) {
-                // We need the agent name, which isn't in FileReservationRow, so we look it up
-                let agent_name = match block_on(async {
-                    queries::get_agent_by_id(cx, pool, row.agent_id).await
-                }) {
-                    Outcome::Ok(agent) => agent.name,
-                    _ => format!("agent_{}", row.agent_id),
-                };
+        if let Some(id) = row.id
+            && released_ids.contains(&id)
+        {
+            // We need the agent name, which isn't in FileReservationRow, so we look it up
+            let agent_name = match block_on(async {
+                queries::get_agent_by_id(cx, pool, row.agent_id).await
+            }) {
+                Outcome::Ok(agent) => agent.name,
+                _ => format!("agent_{}", row.agent_id),
+            };
 
-                res_jsons.push(serde_json::json!({
-                    "id": id,
-                    "agent": agent_name,
-                    "path_pattern": row.path_pattern,
-                    "exclusive": row.exclusive != 0,
-                    "reason": row.reason,
-                    "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
-                    "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
-                    "released_ts": mcp_agent_mail_db::micros_to_iso(row.released_ts.unwrap_or(mcp_agent_mail_db::now_micros())),
-                }));
-            }
+            res_jsons.push(serde_json::json!({
+                "id": id,
+                "agent": agent_name,
+                "path_pattern": row.path_pattern,
+                "exclusive": row.exclusive != 0,
+                "reason": row.reason,
+                "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
+                "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
+                "released_ts": mcp_agent_mail_db::micros_to_iso(row.released_ts.unwrap_or_else(mcp_agent_mail_db::now_micros)),
+            }));
         }
     }
 
