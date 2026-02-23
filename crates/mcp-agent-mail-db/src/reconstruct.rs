@@ -20,6 +20,7 @@
 use crate::DbConn;
 use crate::error::{DbError, DbResult};
 use crate::schema;
+use asupersync::{Cx, Outcome};
 use sqlmodel_core::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -71,25 +72,48 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
     })?;
 
     // Apply schema + PRAGMAs
-    conn.execute_raw("PRAGMA journal_mode=WAL;")
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: WAL mode: {e}")))?;
+    // Rebuild in rollback-journal mode for maximum compatibility with
+    // subsequent pool/migration startup. WAL-mode rebuilds can leave a large
+    // sidecar and trigger malformed-image failures when the next runtime opens
+    // the file with different connection settings.
+    conn.execute_raw("PRAGMA journal_mode='DELETE';")
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: journal_mode='DELETE': {e}")))?;
     conn.execute_raw("PRAGMA synchronous=NORMAL;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: synchronous: {e}")))?;
     conn.execute_raw("PRAGMA busy_timeout=60000;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: busy_timeout: {e}")))?;
 
-    // Apply schema DDL — use base mode (no FTS5 virtual tables, which
-    // FrankenConnection doesn't support). FTS triggers would fire on insert
-    // and fail if the virtual table doesn't exist, so we skip them.
-    let ddl = schema::init_schema_sql_base();
-    for stmt in ddl.split(';') {
-        let stmt = stmt.trim();
-        if stmt.is_empty() {
-            continue;
+    // Initialize schema through the same base migration runner used by pooled
+    // startup paths. This keeps migration metadata and runtime cleanup in sync
+    // with normal server boot behavior.
+    conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: PRAGMA_DB_INIT_BASE_SQL: {e}")))?;
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: build runtime: {e}")))?;
+    let cx = Cx::for_request();
+    let migrate_outcome = runtime.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await });
+    match migrate_outcome {
+        Outcome::Ok(_) => {}
+        Outcome::Err(e) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: migrate_to_latest_base: {e}"
+            )));
         }
-        conn.execute_raw(&format!("{stmt};"))
-            .map_err(|e| DbError::Sqlite(format!("reconstruct: DDL: {e}")))?;
+        Outcome::Cancelled(reason) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: migrate_to_latest_base cancelled: {reason}"
+            )));
+        }
+        Outcome::Panicked(payload) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: migrate_to_latest_base panicked: {}",
+                payload.message()
+            )));
+        }
     }
+    schema::enforce_runtime_fts_cleanup(&conn)
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: enforce_runtime_fts_cleanup: {e}")))?;
 
     let mut stats = ReconstructStats::default();
 
@@ -126,11 +150,14 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         // Derive human_key from slug (replace - with /)
         let human_key = format!("/{}", slug.replace('-', "/"));
 
-        conn.execute_raw(&format!(
-            "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES ('{}', '{}', {now})",
-            escape_sql(slug),
-            escape_sql(&human_key),
-        ))
+        conn.execute_sync(
+            "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text(slug.to_string()),
+                Value::Text(human_key.clone()),
+                Value::BigInt(now),
+            ],
+        )
         .map_err(|e| DbError::Sqlite(format!("reconstruct: insert project {slug}: {e}")))?;
 
         let pid = query_last_insert_or_existing_id(&conn, "projects", "slug", slug)?;
@@ -148,6 +175,14 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
             discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats);
         }
     }
+
+    // Rebuild indexes from table content to avoid carrying forward corrupt
+    // btree pages from a damaged source lifecycle.
+    conn.execute_raw("REINDEX")
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: REINDEX: {e}")))?;
+
+    // Ensure no WAL sidecar remains from prior runs and flush btree changes.
+    let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
 
     tracing::info!(%stats, "database reconstruction from archive complete");
     Ok(stats)
@@ -214,17 +249,22 @@ fn discover_agents(
             .unwrap_or_else(|| inception_ts.unwrap_or_else(crate::now_micros));
         let inception_ts = inception_ts.unwrap_or(last_active_ts);
 
-        conn.execute_raw(&format!(
+        conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
              (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-             VALUES ({project_id}, '{}', '{}', '{}', '{}', {inception_ts}, {last_active_ts}, '{}', '{}')",
-            escape_sql(&agent_name),
-            escape_sql(program),
-            escape_sql(model),
-            escape_sql(task_description),
-            escape_sql(attachments_policy),
-            escape_sql(contact_policy),
-        ))
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(agent_name.clone()),
+                Value::Text(program.to_string()),
+                Value::Text(model.to_string()),
+                Value::Text(task_description.to_string()),
+                Value::BigInt(inception_ts),
+                Value::BigInt(last_active_ts),
+                Value::Text(attachments_policy.to_string()),
+                Value::Text(contact_policy.to_string()),
+            ],
+        )
         .map_err(|e| DbError::Sqlite(format!("reconstruct: insert agent {agent_name}: {e}")))?;
 
         let aid = query_last_insert_or_existing_id_composite(
@@ -353,23 +393,34 @@ fn parse_and_insert_message(
     let bcc_names = json_str_array(&msg, "bcc");
 
     // Insert message
-    let thread_sql =
-        thread_id.map_or_else(|| "NULL".to_string(), |t| format!("'{}'", escape_sql(t)));
-
-    conn.execute_raw(&format!(
+    let thread_val = thread_id
+        .map(|s| Value::Text(s.to_string()))
+        .unwrap_or(Value::Null);
+    conn.execute_sync(
         "INSERT INTO messages \
          (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-         VALUES ({project_id}, {sender_id}, {thread_sql}, '{}', '{}', '{}', {}, {created_ts}, '{}')",
-        escape_sql(subject),
-        escape_sql(body_md),
-        escape_sql(importance),
-        i32::from(ack_required),
-        escape_sql(&attachments),
-    ))
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            Value::BigInt(project_id),
+            Value::BigInt(sender_id),
+            thread_val,
+            Value::Text(subject.to_string()),
+            Value::Text(body_md.to_string()),
+            Value::Text(importance.to_string()),
+            Value::Int(i32::from(ack_required)),
+            Value::BigInt(created_ts),
+            Value::Text(attachments),
+        ],
+    )
     .map_err(|e| DbError::Sqlite(format!("insert message: {e}")))?;
 
-    // Get the message ID (last_insert_rowid may not work with frankensqlite)
-    let message_id = query_max_id(conn, "messages")?;
+    // Get the message ID from this connection context.
+    let message_id = conn
+        .query_sync("SELECT last_insert_rowid() AS id", &[])
+        .map_err(|e| DbError::Sqlite(format!("query last_insert_rowid: {e}")))?
+        .first()
+        .and_then(|r| r.get_named::<i64>("id").ok())
+        .ok_or_else(|| DbError::Sqlite("insert message returned no rowid".to_string()))?;
 
     stats.messages += 1;
 
@@ -406,12 +457,17 @@ fn ensure_agent_exists(
     }
 
     let now = crate::now_micros();
-    conn.execute_raw(&format!(
+    conn.execute_sync(
         "INSERT OR IGNORE INTO agents \
          (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-         VALUES ({project_id}, '{}', 'unknown', 'unknown', '', {now}, {now}, 'auto', 'auto')",
-        escape_sql(name),
-    ))
+         VALUES (?, ?, 'unknown', 'unknown', '', ?, ?, 'auto', 'auto')",
+        &[
+            Value::BigInt(project_id),
+            Value::Text(name.to_string()),
+            Value::BigInt(now),
+            Value::BigInt(now),
+        ],
+    )
     .map_err(|e| DbError::Sqlite(format!("ensure agent {name}: {e}")))?;
 
     let aid = query_last_insert_or_existing_id_composite(
@@ -427,11 +483,16 @@ fn ensure_agent_exists(
 }
 
 fn insert_recipient(conn: &DbConn, message_id: i64, agent_id: i64, kind: &str) -> DbResult<()> {
-    conn.execute_raw(&format!(
-        "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind) \
-         VALUES ({message_id}, {agent_id}, '{kind}')"
-    ))
-    .map_err(|e| DbError::Sqlite(format!("insert recipient: {e}")))
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
+        &[
+            Value::BigInt(message_id),
+            Value::BigInt(agent_id),
+            Value::Text(kind.to_string()),
+        ],
+    )
+    .map_err(|e| DbError::Sqlite(format!("insert recipient: {e}")))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
