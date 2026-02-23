@@ -2052,41 +2052,46 @@ fn handle_default_launch() -> CliResult<()> {
         ));
     }
 
-    // Step 2: Clear the port if something is already listening
-    auto_clear_port(host, port);
+    // Step 2: Clear the port only if an existing Agent Mail server is listening
+    auto_clear_port(host, port)?;
 
     // Step 3: Start HTTP server with TUI (default settings)
     handle_serve_http(None, None, None, false)
 }
 
-/// If something is already listening on `host:port`, kill it so we can start fresh.
-fn auto_clear_port(host: &str, port: u16) {
+/// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
+///
+/// Refuses to terminate non-Agent-Mail processes.
+fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
     use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
 
     let status = check_port_status(host, port);
     match status {
-        PortStatus::Free => {}
+        PortStatus::Free => Ok(()),
         PortStatus::AgentMailServer => {
             eprintln!(
                 "[info] Existing Agent Mail server on {host}:{port} — stopping it to start fresh"
             );
-            kill_port_holder(port);
+            kill_port_holder(host, port)
         }
-        PortStatus::OtherProcess { ref description } => {
-            eprintln!(
-                "[info] Port {port} in use by: {description} — killing to free it for Agent Mail"
-            );
-            kill_port_holder(port);
-        }
+        PortStatus::OtherProcess { ref description } => Err(CliError::Other(format!(
+            "Port {host}:{port} is in use by another process ({description}). \
+             Refusing to terminate non-Agent-Mail process; stop it manually or choose a different port."
+        ))),
         PortStatus::Error { ref message, .. } => {
             eprintln!("[warn] Could not check port {port}: {message} — proceeding anyway");
+            Ok(())
         }
     }
 }
 
 /// Kill whatever process is holding `port` using `fuser` (Linux) or `lsof` (macOS).
 /// Attempts graceful termination (SIGTERM) before forceful kill (SIGKILL).
-fn kill_port_holder(port: u16) {
+fn kill_port_holder(host: &str, port: u16) -> CliResult<()> {
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+
+    let mut has_kill_tool = false;
+
     // Try fuser first (Linux, fastest)
     // First, try SIGTERM
     let term_result = std::process::Command::new("fuser")
@@ -2096,6 +2101,7 @@ fn kill_port_holder(port: u16) {
         .status();
 
     if let Ok(s) = term_result {
+        has_kill_tool = true;
         // fuser returns 0 if it successfully identified processes
         if s.success() {
             // Give the OS a moment to release the port
@@ -2110,7 +2116,7 @@ fn kill_port_holder(port: u16) {
 
             // If check fails (exit code 1), it means no processes found -> success
             if check_result.is_ok_and(|s| !s.success()) {
-                return;
+                return Ok(());
             }
 
             // Still held: FORCE KILL
@@ -2120,7 +2126,6 @@ fn kill_port_holder(port: u16) {
                 .stderr(std::process::Stdio::null())
                 .status();
             std::thread::sleep(std::time::Duration::from_millis(300));
-            return;
         }
     }
 
@@ -2130,11 +2135,12 @@ fn kill_port_holder(port: u16) {
         .output();
 
     if let Ok(out) = lsof_output {
+        has_kill_tool = true;
         let pids_str = String::from_utf8_lossy(&out.stdout);
         let pids: Vec<String> = pids_str.split_whitespace().map(|s| s.to_string()).collect();
 
         if pids.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Try SIGTERM (15)
@@ -2152,6 +2158,23 @@ fn kill_port_holder(port: u16) {
                 .status();
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    match check_port_status(host, port) {
+        PortStatus::Free => Ok(()),
+        PortStatus::AgentMailServer | PortStatus::OtherProcess { .. } => {
+            let tool_hint = if has_kill_tool {
+                ""
+            } else {
+                " (no available kill tool: fuser/lsof)"
+            };
+            Err(CliError::Other(format!(
+                "Failed to stop existing Agent Mail server on {host}:{port}{tool_hint}"
+            )))
+        }
+        PortStatus::Error { message, .. } => Err(CliError::Other(format!(
+            "Stopped existing Agent Mail server on {host}:{port}, but could not verify port state: {message}"
+        ))),
     }
 }
 
@@ -2588,7 +2611,7 @@ fn handle_serve_http(
     no_auth: bool,
 ) -> CliResult<()> {
     let config = build_http_config(host, port, path, no_auth);
-    auto_clear_port(&config.http_host, config.http_port);
+    auto_clear_port(&config.http_host, config.http_port)?;
     mcp_agent_mail_server::run_http_with_tui(&config)?;
     Ok(())
 }
