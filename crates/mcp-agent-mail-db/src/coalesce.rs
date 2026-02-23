@@ -248,7 +248,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
     ///
     /// If joining fails (timeout or leader error), the closure `f` is called
     /// directly as a fallback.
-    #[allow(clippy::needless_pass_by_value)] // key is cloned into the map; owned is correct
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // key is cloned into the map; owned is correct
     pub fn execute_or_join<F, E>(&self, key: K, f: F) -> Result<CoalesceOutcome<V>, E>
     where
         F: FnOnce() -> Result<V, E>,

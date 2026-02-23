@@ -185,6 +185,20 @@ fn send_msg(
     })
 }
 
+/// Update a reservation's `released_ts` via raw SQL (legacy sentinel simulation).
+fn set_reservation_released_ts(pool: &DbPool, reservation_id: i64, released_ts: i64) {
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET released_ts = {released_ts} WHERE id = {reservation_id}"
+            ))
+            .expect("update released_ts");
+        }
+    });
+}
+
 // =============================================================================
 // Identity error path tests (br-3h13.4.1)
 // =============================================================================
@@ -900,6 +914,116 @@ fn release_reservations_large_batch_handles_many_rows() {
         block_on(|cx| async move { queries::get_active_reservations(&cx, &pool4, pid).await });
     match active {
         Outcome::Ok(rows) => assert!(rows.is_empty(), "all reservations should be inactive"),
+        other => panic!("active reservation check failed: {other:?}"),
+    }
+}
+
+#[test]
+fn release_reservations_large_id_filter_handles_many_rows() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+
+    let paths: Vec<String> = (0..1100)
+        .map(|idx| format!("src/generated/id_filter_{idx}.rs"))
+        .collect();
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let expected = path_refs.len();
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &path_refs,
+            3600,
+            true,
+            "bulk-id-release-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("bulk reserve failed: {other:?}"),
+        }
+    });
+    assert_eq!(created.len(), expected, "expected all reservations created");
+
+    let release_ids: Vec<i64> = created
+        .iter()
+        .map(|row| row.id.expect("created reservation id"))
+        .collect();
+    let pool3 = pool.clone();
+    let released = block_on(|cx| async move {
+        match queries::release_reservations(&cx, &pool3, pid, agent_id, None, Some(&release_ids))
+            .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("bulk id-filter release failed: {other:?}"),
+        }
+    });
+    assert_eq!(
+        released.len(),
+        expected,
+        "expected all reservations released via id filter"
+    );
+
+    let pool4 = pool.clone();
+    let active =
+        block_on(|cx| async move { queries::get_active_reservations(&cx, &pool4, pid).await });
+    match active {
+        Outcome::Ok(rows) => assert!(rows.is_empty(), "all reservations should be inactive"),
+        other => panic!("active reservation check failed: {other:?}"),
+    }
+}
+
+#[test]
+fn release_reservations_by_ids_releases_legacy_sentinel_rows() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &["legacy/sentinel.rs"],
+            3600,
+            true,
+            "legacy-sentinel-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("reserve failed: {other:?}"),
+        }
+    });
+    let reservation_id = created
+        .first()
+        .and_then(|row| row.id)
+        .expect("created reservation id");
+
+    // Simulate legacy rows that are logically active but not NULL.
+    set_reservation_released_ts(&pool, reservation_id, 0);
+
+    let pool3 = pool.clone();
+    let affected = block_on(|cx| async move {
+        match queries::release_reservations_by_ids(&cx, &pool3, &[reservation_id]).await {
+            Outcome::Ok(count) => count,
+            other => panic!("release_reservations_by_ids failed: {other:?}"),
+        }
+    });
+    assert_eq!(affected, 1, "legacy sentinel row should be released");
+
+    let pool4 = pool.clone();
+    let active =
+        block_on(|cx| async move { queries::get_active_reservations(&cx, &pool4, pid).await });
+    match active {
+        Outcome::Ok(rows) => assert!(rows.is_empty(), "legacy sentinel row should be inactive"),
         other => panic!("active reservation check failed: {other:?}"),
     }
 }

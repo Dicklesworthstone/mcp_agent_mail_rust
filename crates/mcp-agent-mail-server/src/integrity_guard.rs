@@ -280,12 +280,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::duration_suboptimal_units)]
     fn full_check_interval_large_value() {
         let mut config = Config::from_env();
         config.integrity_check_interval_hours = 24;
         assert_eq!(
             full_check_interval(&config),
-            Some(Duration::from_secs(24 * 3600))
+            Some(Duration::from_secs(86_400))
         );
     }
 
@@ -490,9 +491,9 @@ mod tests {
 
     #[test]
     fn constants_are_reasonable() {
-        assert!(DEFAULT_QUICK_CHECK_INTERVAL_SECS >= 60, "quick check should be at least 1 minute");
-        assert!(MIN_FULL_CHECK_INTERVAL_SECS >= 3600, "full check minimum should be at least 1 hour");
-        assert!(RECOVERY_MIN_INTERVAL_SECS >= 10, "recovery throttle should be at least 10 seconds");
-        assert!(BACKUP_MAX_AGE_SECS >= 600, "backup max age should be at least 10 minutes");
+        const _: () = assert!(DEFAULT_QUICK_CHECK_INTERVAL_SECS >= 60, "quick check should be at least 1 minute");
+        const _: () = assert!(MIN_FULL_CHECK_INTERVAL_SECS >= 3600, "full check minimum should be at least 1 hour");
+        const _: () = assert!(RECOVERY_MIN_INTERVAL_SECS >= 10, "recovery throttle should be at least 10 seconds");
+        const _: () = assert!(BACKUP_MAX_AGE_SECS >= 600, "backup max age should be at least 10 minutes");
     }
 }

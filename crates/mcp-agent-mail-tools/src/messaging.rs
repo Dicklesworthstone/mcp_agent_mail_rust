@@ -4430,7 +4430,7 @@ mod tests {
 
     #[test]
     fn python_type_name_float() {
-        assert_eq!(python_json_type_name(&json!(3.14)), "float");
+        assert_eq!(python_json_type_name(&json!(3.15_f64)), "float");
         assert_eq!(python_json_type_name(&json!(0.0)), "float");
     }
 
@@ -4464,7 +4464,7 @@ mod tests {
     #[test]
     fn python_repr_numbers() {
         assert_eq!(python_value_repr(&json!(42)), "42");
-        assert_eq!(python_value_repr(&json!(3.14)), "3.14");
+        assert_eq!(python_value_repr(&json!(3.15_f64)), "3.15");
     }
 
     #[test]
@@ -4486,11 +4486,11 @@ mod tests {
     fn python_repr_array_and_object_use_json() {
         let arr = json!([1, "two"]);
         let repr = python_value_repr(&arr);
-        assert!(repr.contains("["), "array repr should use JSON format");
+        assert!(repr.contains('['), "array repr should use JSON format");
 
         let obj = json!({"key": "val"});
         let repr = python_value_repr(&obj);
-        assert!(repr.contains("{"), "object repr should use JSON format");
+        assert!(repr.contains('{'), "object repr should use JSON format");
     }
 
     // ── send_message_has_explicit_to_recipients tests ───────────────
