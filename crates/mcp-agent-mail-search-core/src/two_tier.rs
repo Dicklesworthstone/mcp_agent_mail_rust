@@ -583,10 +583,10 @@ impl TwoTierIndex {
             let score = dot_product_f16_simd(embedding, query_vec);
             if heap.len() < limit {
                 heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
-            } else if let Some(mut top) = heap.peek_mut() {
-                if score > top.0.score {
-                    *top = std::cmp::Reverse(ScoredEntry { score, idx });
-                }
+            } else if let Some(mut top) = heap.peek_mut()
+                && score > top.0.score
+            {
+                *top = std::cmp::Reverse(ScoredEntry { score, idx });
             }
         }
 
@@ -654,10 +654,10 @@ impl TwoTierIndex {
             let score = dot_product_f16_simd(embedding, query_vec);
             if heap.len() < limit {
                 heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
-            } else if let Some(mut top) = heap.peek_mut() {
-                if score > top.0.score {
-                    *top = std::cmp::Reverse(ScoredEntry { score, idx });
-                }
+            } else if let Some(mut top) = heap.peek_mut()
+                && score > top.0.score
+            {
+                *top = std::cmp::Reverse(ScoredEntry { score, idx });
             }
         }
 

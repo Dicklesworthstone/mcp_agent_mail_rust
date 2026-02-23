@@ -334,9 +334,8 @@ pub struct IndexableMessage {
 /// This is intentionally fire-and-forget safe: callers should not fail the
 /// message send operation if indexing fails.
 pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
-    let bridge = match get_bridge() {
-        Some(b) => b,
-        None => return Ok(false), // bridge not initialized, skip silently
+    let Some(bridge) = get_bridge() else {
+        return Ok(false); // bridge not initialized, skip silently
     };
 
     let handles = bridge.handles();
@@ -396,9 +395,8 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
         return Ok(0);
     }
 
-    let bridge = match get_bridge() {
-        Some(b) => b,
-        None => return Ok(0),
+    let Some(bridge) = get_bridge() else {
+        return Ok(0);
     };
 
     let handles = bridge.handles();
@@ -453,15 +451,16 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 
 /// Backfill the Tantivy index with all messages from the database.
 ///
-/// Uses a sync `SqliteConnection` (C SQLite) to scan the messages table joined
+/// Uses a sync `SqliteConnection` (C `SQLite`) to scan the messages table joined
 /// with agents and projects, then batch-indexes everything. Skips documents
 /// that are already in the index (idempotent via doc-count watermark).
 ///
 /// Returns `(indexed_count, skipped_count)`.
 pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
-    let bridge = match get_bridge() {
-        Some(b) => b,
-        None => return Ok((0, 0)),
+    const BATCH_SIZE: usize = 500;
+
+    let Some(bridge) = get_bridge() else {
+        return Ok((0, 0));
     };
 
     // Check how many docs are already in the index.
@@ -516,7 +515,6 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         .query_sync(sql, &[])
         .map_err(|e| format!("backfill: query failed: {e}"))?;
 
-    const BATCH_SIZE: usize = 500;
     let mut batch: Vec<IndexableMessage> = Vec::with_capacity(BATCH_SIZE);
     let mut total_indexed = 0_usize;
 
@@ -1353,8 +1351,8 @@ mod tests {
 
     // ── Backfill tests ──────────────────────────────────────────────────────
 
-    /// Helper: create a temp SQLite DB with the minimal schema needed for
-    /// backfill_from_db (projects, agents, messages tables).
+    /// Helper: create a temp `SQLite` DB with the minimal schema needed for
+    /// `backfill_from_db` (projects, agents, messages tables).
     fn create_test_db(dir: &std::path::Path, messages: &[(i64, &str, &str, &str, &str)]) -> String {
         let db_path = dir.join("test.sqlite3");
         let path_str = db_path.to_str().unwrap();
@@ -1564,7 +1562,7 @@ mod tests {
                     handles.project_id => 1u64,
                     handles.thread_id => format!("thread-{id}"),
                     handles.importance => "normal",
-                    handles.created_ts => (i as i64) * 1_000_000
+                    handles.created_ts => i64::try_from(i).unwrap_or(0) * 1_000_000
                 ))
                 .unwrap();
         }
