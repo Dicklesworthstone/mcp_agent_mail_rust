@@ -2079,7 +2079,7 @@ mod tests {
             GateConfig::new(
                 "E2E dual-mode",
                 GateCategory::Quality,
-                ["bash", "scripts/e2e_dual_mode.sh"],
+                ["am", "e2e", "run", "--project", ".", "dual_mode"],
             )
             .expected_artifact("tests/artifacts/dual_mode/*"),
             GateConfig::new("Clippy", GateCategory::Quality, ["cargo", "clippy"]),
@@ -2090,7 +2090,7 @@ mod tests {
                 category: GateCategory::Quality,
                 status: GateStatus::Pass,
                 elapsed_seconds: 14,
-                command: "bash scripts/e2e_dual_mode.sh".to_string(),
+                command: "am e2e run --project . dual_mode".to_string(),
                 stderr_tail: None,
                 error: None,
             },

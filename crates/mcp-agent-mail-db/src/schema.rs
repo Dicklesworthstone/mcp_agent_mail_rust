@@ -1252,7 +1252,17 @@ async fn ensure_inbox_stats_insert_trigger_compat<C: Connection>(
             }
         }
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+        Outcome::Panicked(p) => {
+            if is_known_trigger_engine_instability_message(p.message()) {
+                tracing::warn!(
+                    panic = %p.message(),
+                    "backend panicked while creating inbox_stats compatibility trigger; continuing without trigger"
+                );
+                Outcome::Ok(())
+            } else {
+                Outcome::Panicked(p)
+            }
+        }
     }
 }
 

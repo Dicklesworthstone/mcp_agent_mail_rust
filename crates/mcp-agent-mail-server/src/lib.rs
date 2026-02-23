@@ -32,6 +32,7 @@ mod ack_ttl;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
+mod integrity_guard;
 mod mail_ui;
 mod markdown;
 mod retention;
@@ -776,6 +777,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
     heal_storage_lock_artifacts(config);
+    integrity_guard::start(config);
     disk_monitor::start(config);
     mcp_agent_mail_storage::wbq_start();
     build_server(config).run_stdio();
@@ -809,6 +811,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    integrity_guard::start(config);
     disk_monitor::start(config);
     let dashboard = StartupDashboard::maybe_start(config);
     set_dashboard_handle(dashboard.clone());
@@ -861,6 +864,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     tool_metrics::shutdown();
     ack_ttl::shutdown();
     cleanup::shutdown();
+    integrity_guard::shutdown();
     disk_monitor::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
@@ -916,6 +920,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    integrity_guard::start(config);
     disk_monitor::start(config);
 
     // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
@@ -960,6 +965,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         tool_metrics::shutdown();
         ack_ttl::shutdown();
         cleanup::shutdown();
+        integrity_guard::shutdown();
         disk_monitor::shutdown();
         mcp_agent_mail_storage::wbq_shutdown();
         mcp_agent_mail_storage::flush_async_commits();
@@ -982,6 +988,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     tool_metrics::shutdown();
     ack_ttl::shutdown();
     cleanup::shutdown();
+    integrity_guard::shutdown();
     disk_monitor::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();

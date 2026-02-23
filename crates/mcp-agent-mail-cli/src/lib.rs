@@ -4886,7 +4886,8 @@ fn handle_file_reservations_with_conn(
                 let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let sql = format!(
                     "UPDATE file_reservations SET released_ts = ? \
-                     WHERE {base_where} AND id IN ({placeholders})"
+                     WHERE {base_where} AND id IN ({placeholders}) \
+                     RETURNING id"
                 );
                 let mut params: Vec<sqlmodel_core::Value> = vec![
                     sqlmodel_core::Value::BigInt(now_us),
@@ -4901,7 +4902,8 @@ fn handle_file_reservations_with_conn(
                 let placeholders: String = paths.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let sql = format!(
                     "UPDATE file_reservations SET released_ts = ? \
-                     WHERE {base_where} AND path_pattern IN ({placeholders})"
+                     WHERE {base_where} AND path_pattern IN ({placeholders}) \
+                     RETURNING id"
                 );
                 let mut params: Vec<sqlmodel_core::Value> = vec![
                     sqlmodel_core::Value::BigInt(now_us),
@@ -4914,8 +4916,11 @@ fn handle_file_reservations_with_conn(
                 (sql, params)
             } else {
                 // Release all active reservations for this agent.
-                let sql =
-                    format!("UPDATE file_reservations SET released_ts = ? WHERE {base_where}");
+                let sql = format!(
+                    "UPDATE file_reservations SET released_ts = ? \
+                     WHERE {base_where} \
+                     RETURNING id"
+                );
                 let params = vec![
                     sqlmodel_core::Value::BigInt(now_us),
                     sqlmodel_core::Value::BigInt(project_id),
@@ -15879,6 +15884,45 @@ mod tests {
             .unwrap();
         let released: Option<i64> = rows.first().unwrap().get_named("released_ts").ok();
         assert!(released.is_some(), "released_ts must be set");
+    }
+
+    #[test]
+    fn integration_file_reservations_release_all_clears_active_rows() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec![],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "release-all failed: {result:?}");
+        assert!(
+            output.contains("Released 1 reservation(s)"),
+            "expected one released reservation, got: {output}"
+        );
+
+        let active_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM file_reservations \
+                 WHERE project_id = 1 AND agent_id = 1 AND released_ts IS NULL",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|row| row.get_named("n").ok())
+            .unwrap_or_default();
+        assert_eq!(active_count, 0, "all active reservations must be released");
     }
 
     #[test]
