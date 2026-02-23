@@ -252,12 +252,9 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_project(&self, slug: &str) -> Option<ProjectRow> {
         let mut cache = self.projects_by_slug.write();
-        let entry = match cache.get_mut(slug) {
-            Some(e) => e,
-            None => {
-                CACHE_METRICS.record_project_miss();
-                return None;
-            }
+        let Some(entry) = cache.get_mut(slug) else {
+            CACHE_METRICS.record_project_miss();
+            return None;
         };
         if entry.is_expired(PROJECT_TTL) {
             let slug_owned = slug.to_owned();
@@ -283,12 +280,9 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_project_by_human_key(&self, human_key: &str) -> Option<ProjectRow> {
         let mut cache = self.projects_by_human_key.write();
-        let entry = match cache.get_mut(human_key) {
-            Some(e) => e,
-            None => {
-                CACHE_METRICS.record_project_miss();
-                return None;
-            }
+        let Some(entry) = cache.get_mut(human_key) else {
+            CACHE_METRICS.record_project_miss();
+            return None;
         };
         if entry.is_expired(PROJECT_TTL) {
             cache.remove(human_key);
@@ -329,12 +323,9 @@ impl ReadCache {
     pub fn get_agent_scoped(&self, scope: &str, project_id: i64, name: &str) -> Option<AgentRow> {
         let key = (scope_fingerprint(scope), project_id, InternedStr::new(name));
         let mut cache = self.agents_by_key.write();
-        let entry = match cache.get_mut(&key) {
-            Some(e) => e,
-            None => {
-                CACHE_METRICS.record_agent_miss();
-                return None;
-            }
+        let Some(entry) = cache.get_mut(&key) else {
+            CACHE_METRICS.record_agent_miss();
+            return None;
         };
         if entry.is_expired(AGENT_TTL) {
             cache.remove(&key);
@@ -358,12 +349,9 @@ impl ReadCache {
     pub fn get_agent_by_id_scoped(&self, scope: &str, agent_id: i64) -> Option<AgentRow> {
         let key = (scope_fingerprint(scope), agent_id);
         let mut cache = self.agents_by_id.write();
-        let entry = match cache.get_mut(&key) {
-            Some(e) => e,
-            None => {
-                CACHE_METRICS.record_agent_miss();
-                return None;
-            }
+        let Some(entry) = cache.get_mut(&key) else {
+            CACHE_METRICS.record_agent_miss();
+            return None;
         };
         if entry.is_expired(AGENT_TTL) {
             cache.remove(&key);

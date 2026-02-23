@@ -931,7 +931,7 @@ async fn initialize_sqlite_file_once(
     }
 
     match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
-        ok @ Outcome::Ok(_) => ok,
+        ok @ Outcome::Ok(()) => ok,
         non_err @ (Outcome::Cancelled(_) | Outcome::Panicked(_)) => non_err,
         Outcome::Err(first_err) => {
             if !should_retry_sqlite_init_error(&first_err) {

@@ -81,7 +81,7 @@ Use `docs/RELEASE_CHECKLIST.md` as the canonical sign-off ledger.
   ```
 - [ ] E2E dual-mode: 84+ assertions pass
   ```bash
-  bash scripts/e2e_dual_mode.sh
+  am e2e run --project . dual_mode
   ```
 - [ ] Help snapshots match golden fixtures
   ```bash

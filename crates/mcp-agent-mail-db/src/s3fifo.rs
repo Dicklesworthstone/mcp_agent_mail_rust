@@ -91,7 +91,7 @@ where
         Q: std::hash::Hash + Eq + ?Sized,
     {
         match self.index.get_mut(key) {
-            Some(Node::Small { value, freq }) | Some(Node::Main { value, freq }) => {
+            Some(Node::Small { value, freq } | Node::Main { value, freq }) => {
                 *freq = (*freq + 1).min(3);
                 Some(value)
             }
@@ -109,7 +109,7 @@ where
         Q: std::hash::Hash + Eq + ?Sized,
     {
         match self.index.get_mut(key) {
-            Some(Node::Small { value, freq }) | Some(Node::Main { value, freq }) => {
+            Some(Node::Small { value, freq } | Node::Main { value, freq }) => {
                 *freq = (*freq + 1).min(3);
                 Some(value)
             }
@@ -220,9 +220,8 @@ where
                 break;
             };
 
-            let (value, freq) = match self.index.remove(&key) {
-                Some(Node::Small { value, freq }) => (value, freq),
-                _ => continue,
+            let Some(Node::Small { value, freq }) = self.index.remove(&key) else {
+                continue;
             };
 
             if freq >= 1 {
@@ -249,9 +248,8 @@ where
                 break;
             };
 
-            let (value, freq) = match self.index.remove(&key) {
-                Some(Node::Main { value, freq }) => (value, freq),
-                _ => continue,
+            let Some(Node::Main { value, freq }) = self.index.remove(&key) else {
+                continue;
             };
 
             if freq >= 1 {

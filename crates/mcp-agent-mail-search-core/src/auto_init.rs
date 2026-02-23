@@ -348,8 +348,8 @@ impl TwoTierContext {
     /// Returns `None` if no embedders are available.
     #[must_use]
     pub fn create_searcher<'a>(&self, index: &'a TwoTierIndex) -> Option<TwoTierSearcher<'a>> {
-        let fast_embedder: Arc<dyn TwoTierEmbedder> = match get_fast_embedder() {
-            Some(_) => Arc::new(FastEmbedderWrapper),
+        let fast_embedder: Option<Arc<dyn TwoTierEmbedder>> = match get_fast_embedder() {
+            Some(_) => Some(Arc::new(FastEmbedderWrapper)),
             None => return None,
         };
 

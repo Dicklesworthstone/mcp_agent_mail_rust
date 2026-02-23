@@ -2620,18 +2620,17 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                     // If we cannot verify start ticks (e.g., macOS, Windows, or reading a 0),
                     // we must fall back to an age-based timeout to prevent permanent deadlocks
                     // from PID reuse. We use a more conservative timeout (2x) than the legacy format.
-                    if owner_start_ticks.is_none() || process_start_ticks(pid).is_none() {
-                        if lock_file_age_seconds(&lock_path)
+                    if (owner_start_ticks.is_none() || process_start_ticks(pid).is_none())
+                        && lock_file_age_seconds(&lock_path)
                             .is_some_and(|age| age > max_age_seconds * 2.0)
-                        {
-                            tracing::info!(
-                                "[git-lock] index.lock held by alive PID {pid} but start ticks unavailable, force clean (age > {:.1}s)",
-                                max_age_seconds * 2.0
-                            );
-                            let _ = fs::remove_file(&lock_path);
-                            let _ = fs::remove_file(&owner_path);
-                            return true;
-                        }
+                    {
+                        tracing::info!(
+                            "[git-lock] index.lock held by alive PID {pid} but start ticks unavailable, force clean (age > {:.1}s)",
+                            max_age_seconds * 2.0
+                        );
+                        let _ = fs::remove_file(&lock_path);
+                        let _ = fs::remove_file(&owner_path);
+                        return true;
                     }
 
                     tracing::debug!(

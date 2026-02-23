@@ -643,7 +643,7 @@ mod tests {
 
             let searcher = TwoTierSearcher::new(
                 &index,
-                Arc::new(FixedEmbedder::new("fast", vec![1.0, 0.0])),
+                Some(Arc::new(FixedEmbedder::new("fast", vec![1.0, 0.0]))),
                 Some(Arc::new(FixedEmbedder::new("quality", vec![1.0, 0.0]))),
                 config,
             );

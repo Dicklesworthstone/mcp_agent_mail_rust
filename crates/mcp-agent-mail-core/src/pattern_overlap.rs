@@ -80,10 +80,10 @@ impl CompiledPattern {
         // 1. Check subset/containment (existing logic)
         // If one pattern matches the other's *string representation*, they definitely overlap.
         // This handles cases like `src/*.rs` matching `src/main.rs`.
-        if let (Some(a), Some(b)) = (&self.matcher, &other.matcher) {
-            if a.is_match(&other.norm) || b.is_match(&self.norm) {
-                return true;
-            }
+        if let (Some(a), Some(b)) = (&self.matcher, &other.matcher)
+            && (a.is_match(&other.norm) || b.is_match(&self.norm))
+        {
+            return true;
         }
 
         // 2. Heuristic check for intersecting paths/globs
