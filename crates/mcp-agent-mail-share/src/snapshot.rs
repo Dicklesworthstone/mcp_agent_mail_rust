@@ -24,11 +24,7 @@ use crate::ShareError;
 ///
 /// Each entry: (table_name, has_id_primary_key, column_names).
 const KNOWN_TABLES: &[(&str, bool, &[&str])] = &[
-    (
-        "projects",
-        true,
-        &["id", "slug", "human_key", "created_at"],
-    ),
+    ("projects", true, &["id", "slug", "human_key", "created_at"]),
     (
         "products",
         true,
@@ -260,9 +256,7 @@ fn transfer_tables_frank(src: &DbConn, dst: &SqliteConnection) -> Result<(), Sha
                     .iter()
                     .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
                     .collect();
-                if has_id
-                    && let Some(val) = row.get_by_name("id")
-                {
+                if has_id && let Some(val) = row.get_by_name("id") {
                     last_id = match val {
                         Value::BigInt(v) => *v,
                         Value::Int(v) => i64::from(*v),
@@ -330,9 +324,7 @@ fn transfer_tables_c(src: &SqliteConnection, dst: &SqliteConnection) -> Result<(
                     .iter()
                     .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
                     .collect();
-                if has_id
-                    && let Some(val) = row.get_by_name("id")
-                {
+                if has_id && let Some(val) = row.get_by_name("id") {
                     last_id = match val {
                         Value::BigInt(v) => *v,
                         Value::Int(v) => i64::from(*v),
@@ -380,9 +372,10 @@ fn create_dst_table(
         "CREATE TABLE IF NOT EXISTS \"{table}\" ({}{pk_suffix})",
         col_defs.join(", ")
     );
-    dst.execute_raw(&create_sql).map_err(|e| ShareError::Sqlite {
-        message: format!("CREATE TABLE {table} failed: {e}"),
-    })
+    dst.execute_raw(&create_sql)
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("CREATE TABLE {table} failed: {e}"),
+        })
 }
 
 /// Build INSERT OR REPLACE SQL and return it with placeholder count.
@@ -391,9 +384,7 @@ fn build_insert(table: &str, columns: &[&str], col_list: &str) -> (String, usize
         .map(|i| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})"
-    );
+    let sql = format!("INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})");
     (sql, columns.len())
 }
 
@@ -479,9 +470,7 @@ mod tests {
         assert_eq!(name, "hello");
 
         // Verify integrity on the C SQLite copy.
-        let rows = copy_conn
-            .query_sync("PRAGMA integrity_check", &[])
-            .unwrap();
+        let rows = copy_conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
         let result: String = rows[0].get_named("integrity_check").unwrap();
         assert_eq!(result, "ok");
     }

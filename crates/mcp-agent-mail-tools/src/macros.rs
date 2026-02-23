@@ -853,7 +853,10 @@ mod tests {
                 last_active_ts: "2026-01-01T00:00:00Z".into(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
-                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             },
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
@@ -992,7 +995,10 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
-                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             },
             thread: PreparedThread {
                 thread_id: "br-1".into(),
@@ -1162,7 +1168,10 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
-                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             },
             file_reservations: ReservationResponse {
                 granted: vec![GrantedReservation {
@@ -1202,7 +1211,10 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
-                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             },
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
@@ -1253,7 +1265,10 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
-                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES.iter().map(|s| (*s).to_string()).collect(),
+                capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             },
             thread: PreparedThread {
                 thread_id: "nonexistent".into(),

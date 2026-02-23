@@ -402,13 +402,7 @@ mod tests {
             let sqlite_path = tmp.path().join("test.sqlite3");
             let storage_root = tmp.path().join("storage");
 
-            handle_integrity_error(
-                "test",
-                msg,
-                &sqlite_path,
-                &storage_root,
-                &mut last_recovery,
-            );
+            handle_integrity_error("test", msg, &sqlite_path, &storage_root, &mut last_recovery);
 
             assert!(
                 last_recovery.is_some(),
@@ -432,13 +426,7 @@ mod tests {
             let sqlite_path = tmp.path().join("test.sqlite3");
             let storage_root = tmp.path().join("storage");
 
-            handle_integrity_error(
-                "test",
-                msg,
-                &sqlite_path,
-                &storage_root,
-                &mut last_recovery,
-            );
+            handle_integrity_error("test", msg, &sqlite_path, &storage_root, &mut last_recovery);
 
             assert!(
                 last_recovery.is_none(),
@@ -491,9 +479,21 @@ mod tests {
 
     #[test]
     fn constants_are_reasonable() {
-        const _: () = assert!(DEFAULT_QUICK_CHECK_INTERVAL_SECS >= 60, "quick check should be at least 1 minute");
-        const _: () = assert!(MIN_FULL_CHECK_INTERVAL_SECS >= 3600, "full check minimum should be at least 1 hour");
-        const _: () = assert!(RECOVERY_MIN_INTERVAL_SECS >= 10, "recovery throttle should be at least 10 seconds");
-        const _: () = assert!(BACKUP_MAX_AGE_SECS >= 600, "backup max age should be at least 10 minutes");
+        const _: () = assert!(
+            DEFAULT_QUICK_CHECK_INTERVAL_SECS >= 60,
+            "quick check should be at least 1 minute"
+        );
+        const _: () = assert!(
+            MIN_FULL_CHECK_INTERVAL_SECS >= 3600,
+            "full check minimum should be at least 1 hour"
+        );
+        const _: () = assert!(
+            RECOVERY_MIN_INTERVAL_SECS >= 10,
+            "recovery throttle should be at least 10 seconds"
+        );
+        const _: () = assert!(
+            BACKUP_MAX_AGE_SECS >= 600,
+            "backup max age should be at least 10 minutes"
+        );
     }
 }

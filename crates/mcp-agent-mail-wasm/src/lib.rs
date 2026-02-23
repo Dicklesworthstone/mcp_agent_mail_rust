@@ -524,9 +524,7 @@ mod tests {
     #[test]
     fn decode_snapshot_cells_aligned_truncates_long_input() {
         let raw = [
-            0x01, 0x00, 0x00, 0x00,
-            0x02, 0x00, 0x00, 0x00,
-            0x03, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
         ];
         let result = SyncState::decode_snapshot_cells(&raw, 2);
         assert_eq!(result, vec![1, 2]);
@@ -694,7 +692,11 @@ mod tests {
             cursor_visible: true,
             timestamp_us: 0,
         });
-        assert_eq!(state.messages_received, u64::MAX, "should saturate, not overflow");
+        assert_eq!(
+            state.messages_received,
+            u64::MAX,
+            "should saturate, not overflow"
+        );
     }
 
     // ── apply_message edge cases ──
@@ -702,7 +704,10 @@ mod tests {
     #[test]
     fn apply_message_resize_is_ignored() {
         let mut state = SyncState::default();
-        state.apply_message(&WsMessage::Resize { cols: 120, rows: 40 });
+        state.apply_message(&WsMessage::Resize {
+            cols: 120,
+            rows: 40,
+        });
         assert_eq!(state.messages_received, 0);
         assert_eq!(state.cols, 80, "resize message should not alter state");
     }
@@ -718,10 +723,19 @@ mod tests {
 
     #[test]
     fn ws_message_resize_roundtrip() {
-        let msg = WsMessage::Resize { cols: 120, rows: 40 };
+        let msg = WsMessage::Resize {
+            cols: 120,
+            rows: 40,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WsMessage = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, WsMessage::Resize { cols: 120, rows: 40 }));
+        assert!(matches!(
+            parsed,
+            WsMessage::Resize {
+                cols: 120,
+                rows: 40
+            }
+        ));
     }
 
     #[test]
@@ -756,10 +770,21 @@ mod tests {
 
     #[test]
     fn scroll_input_event_roundtrip() {
-        let event = InputEvent::Scroll { x: 5, y: 10, delta: -3 };
+        let event = InputEvent::Scroll {
+            x: 5,
+            y: 10,
+            delta: -3,
+        };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: InputEvent = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, InputEvent::Scroll { x: 5, y: 10, delta: -3 }));
+        assert!(matches!(
+            parsed,
+            InputEvent::Scroll {
+                x: 5,
+                y: 10,
+                delta: -3
+            }
+        ));
     }
 
     // ── SyncState default ──

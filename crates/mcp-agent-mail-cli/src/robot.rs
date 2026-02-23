@@ -5379,14 +5379,8 @@ mod tests {
 
     #[test]
     fn resolve_format_prose_command_without_explicit_returns_markdown() {
-        assert_eq!(
-            resolve_format(None, "thread"),
-            OutputFormat::Markdown
-        );
-        assert_eq!(
-            resolve_format(None, "message"),
-            OutputFormat::Markdown
-        );
+        assert_eq!(resolve_format(None, "thread"), OutputFormat::Markdown);
+        assert_eq!(resolve_format(None, "message"), OutputFormat::Markdown);
     }
 
     #[test]
@@ -5452,8 +5446,11 @@ mod tests {
             items: vec![],
             count: 0,
         };
-        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data)
-            .with_alert("warn", "something happened", Some("fix it".into()));
+        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data).with_alert(
+            "warn",
+            "something happened",
+            Some("fix it".into()),
+        );
         let json = serde_json::to_value(&envelope).unwrap();
         let alerts = json["_alerts"].as_array().unwrap();
         assert_eq!(alerts.len(), 1);
@@ -5467,8 +5464,8 @@ mod tests {
             items: vec![],
             count: 0,
         };
-        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data)
-            .with_action("am robot status");
+        let envelope =
+            RobotEnvelope::new("test", OutputFormat::Json, data).with_action("am robot status");
         let json = serde_json::to_value(&envelope).unwrap();
         let actions = json["_actions"].as_array().unwrap();
         assert_eq!(actions.len(), 1);

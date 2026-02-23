@@ -268,7 +268,13 @@ mod tests {
         let conn = test_conn();
         let err = update_message_thread_id(&conn, 99999, "new-thread").unwrap_err();
         assert!(
-            matches!(err, DbError::NotFound { entity: "Message", .. }),
+            matches!(
+                err,
+                DbError::NotFound {
+                    entity: "Message",
+                    ..
+                }
+            ),
             "expected NotFound, got {err:?}"
         );
     }
@@ -281,7 +287,10 @@ mod tests {
         let mid = insert_message(&conn, pid, aid, "original-thread");
 
         let result = update_message_thread_id(&conn, mid, "original-thread").unwrap();
-        assert!(!result, "should return false when thread_id is already the target");
+        assert!(
+            !result,
+            "should return false when thread_id is already the target"
+        );
     }
 
     #[test]
@@ -338,18 +347,16 @@ mod tests {
     #[test]
     fn dispatch_root_message_no_project_returns_not_found() {
         let conn = test_conn();
-        let err = dispatch_root_message(
-            &conn,
-            "SomeAgent",
-            "Hello",
-            "Body",
-            "normal",
-            None,
-            &[],
-        )
-        .unwrap_err();
+        let err = dispatch_root_message(&conn, "SomeAgent", "Hello", "Body", "normal", None, &[])
+            .unwrap_err();
         assert!(
-            matches!(err, DbError::NotFound { entity: "Project", .. }),
+            matches!(
+                err,
+                DbError::NotFound {
+                    entity: "Project",
+                    ..
+                }
+            ),
             "expected Project NotFound, got {err:?}"
         );
     }
@@ -375,13 +382,13 @@ mod tests {
 
         // Verify agent was created
         let rows = conn
-            .query_sync("SELECT name, program FROM agents WHERE name = 'NewAgent'", &[])
+            .query_sync(
+                "SELECT name, program FROM agents WHERE name = 'NewAgent'",
+                &[],
+            )
             .unwrap();
         let row = rows.into_iter().next().expect("agent should exist");
-        assert_eq!(
-            row.get_named::<String>("program").unwrap(),
-            "tui-overseer"
-        );
+        assert_eq!(row.get_named::<String>("program").unwrap(), "tui-overseer");
     }
 
     #[test]
@@ -405,7 +412,10 @@ mod tests {
 
         // Verify only one agent with that name
         let rows = conn
-            .query_sync("SELECT COUNT(*) AS cnt FROM agents WHERE name = 'ExistingAgent'", &[])
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents WHERE name = 'ExistingAgent'",
+                &[],
+            )
             .unwrap();
         let cnt = rows
             .into_iter()
@@ -450,16 +460,9 @@ mod tests {
         let conn = test_conn();
         let _pid = insert_project(&conn);
 
-        let msg_id = dispatch_root_message(
-            &conn,
-            "Agent",
-            "No thread",
-            "Body",
-            "normal",
-            None,
-            &[],
-        )
-        .unwrap();
+        let msg_id =
+            dispatch_root_message(&conn, "Agent", "No thread", "Body", "normal", None, &[])
+                .unwrap();
 
         let rows = conn
             .query_sync(
@@ -544,16 +547,8 @@ mod tests {
         let conn = test_conn();
         let _pid = insert_project(&conn);
 
-        let msg_id = dispatch_root_message(
-            &conn,
-            "Agent",
-            "Urgent",
-            "Body",
-            "urgent",
-            None,
-            &[],
-        )
-        .unwrap();
+        let msg_id =
+            dispatch_root_message(&conn, "Agent", "Urgent", "Body", "urgent", None, &[]).unwrap();
 
         let rows = conn
             .query_sync(

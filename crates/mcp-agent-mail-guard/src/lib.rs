@@ -752,7 +752,9 @@ fn is_guard_gated_from_values(
 #[must_use]
 pub fn is_guard_gated() -> bool {
     is_guard_gated_from_values(
-        std::env::var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED").ok().as_deref(),
+        std::env::var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED")
+            .ok()
+            .as_deref(),
         std::env::var("WORKTREES_ENABLED").ok().as_deref(),
         std::env::var("GIT_IDENTITY_ENABLED").ok().as_deref(),
     )
@@ -1347,7 +1349,11 @@ mod tests {
     fn guard_gate_from_values_checks_enforcement_flag() {
         assert!(is_guard_gated_from_values(None, None, None)); // Default true
         assert!(is_guard_gated_from_values(Some("1"), None, None));
-        assert!(is_guard_gated_from_values(Some("true"), Some("0"), Some("0")));
+        assert!(is_guard_gated_from_values(
+            Some("true"),
+            Some("0"),
+            Some("0")
+        ));
         assert!(!is_guard_gated_from_values(Some("0"), Some("1"), Some("1")));
     }
 
@@ -1356,7 +1362,11 @@ mod tests {
         // WORKTREES_ENABLED=false must NOT disable the file reservation guard
         assert!(is_guard_gated_from_values(None, Some("false"), None));
         assert!(is_guard_gated_from_values(None, Some("0"), None));
-        assert!(is_guard_gated_from_values(None, Some("false"), Some("false")));
+        assert!(is_guard_gated_from_values(
+            None,
+            Some("false"),
+            Some("false")
+        ));
         assert!(is_guard_gated_from_values(None, None, Some("false")));
         assert!(is_guard_gated_from_values(None, None, Some("0")));
     }

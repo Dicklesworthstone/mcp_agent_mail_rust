@@ -360,7 +360,10 @@ pub fn maybe_chunk_database(
     let mut file = std::fs::File::open(snapshot_path)?;
     loop {
         let mut chunk = Vec::with_capacity(chunk_bytes);
-        let n = file.by_ref().take(chunk_bytes as u64).read_to_end(&mut chunk)?;
+        let n = file
+            .by_ref()
+            .take(chunk_bytes as u64)
+            .read_to_end(&mut chunk)?;
         if n == 0 {
             break;
         }

@@ -294,7 +294,7 @@ fn check_filesystem_activity(
         } else {
             format!("{base_escaped}/{pattern}")
         };
-        
+
         if let Ok(paths) = glob::glob(&full_pattern) {
             for entry in paths.flatten() {
                 if let Ok(metadata) = entry.metadata()

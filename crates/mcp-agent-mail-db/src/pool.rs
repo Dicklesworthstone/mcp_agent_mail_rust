@@ -2811,9 +2811,7 @@ mod tests {
 
     #[test]
     fn corruption_error_detects_no_healthy_backup() {
-        assert!(is_corruption_error_message(
-            "no healthy backup was found"
-        ));
+        assert!(is_corruption_error_message("no healthy backup was found"));
     }
 
     #[test]
@@ -2821,9 +2819,7 @@ mod tests {
         assert!(is_corruption_error_message(
             "DATABASE DISK IMAGE IS MALFORMED"
         ));
-        assert!(is_corruption_error_message(
-            "File Is Not A Database"
-        ));
+        assert!(is_corruption_error_message("File Is Not A Database"));
     }
 
     #[test]
@@ -2868,9 +2864,7 @@ mod tests {
 
     #[test]
     fn recovery_error_detects_cursor_stack_empty() {
-        assert!(is_sqlite_recovery_error_message(
-            "cursor stack is empty"
-        ));
+        assert!(is_sqlite_recovery_error_message("cursor stack is empty"));
     }
 
     #[test]
@@ -2897,56 +2891,49 @@ mod tests {
 
     #[test]
     fn fallback_path_returns_none_for_memory_db() {
-        assert!(sqlite_absolute_fallback_path(
-            ":memory:",
-            "database disk image is malformed"
-        )
-        .is_none());
+        assert!(
+            sqlite_absolute_fallback_path(":memory:", "database disk image is malformed").is_none()
+        );
     }
 
     #[test]
     fn fallback_path_returns_none_for_absolute_path() {
-        assert!(sqlite_absolute_fallback_path(
-            "/data/db.sqlite3",
-            "database disk image is malformed"
-        )
-        .is_none());
+        assert!(
+            sqlite_absolute_fallback_path("/data/db.sqlite3", "database disk image is malformed")
+                .is_none()
+        );
     }
 
     #[test]
     fn fallback_path_returns_none_for_dot_relative() {
-        assert!(sqlite_absolute_fallback_path(
-            "./data/db.sqlite3",
-            "database disk image is malformed"
-        )
-        .is_none());
+        assert!(
+            sqlite_absolute_fallback_path("./data/db.sqlite3", "database disk image is malformed")
+                .is_none()
+        );
     }
 
     #[test]
     fn fallback_path_returns_none_for_dotdot_relative() {
-        assert!(sqlite_absolute_fallback_path(
-            "../data/db.sqlite3",
-            "database disk image is malformed"
-        )
-        .is_none());
+        assert!(
+            sqlite_absolute_fallback_path("../data/db.sqlite3", "database disk image is malformed")
+                .is_none()
+        );
     }
 
     #[test]
     fn fallback_path_returns_none_for_non_recovery_error() {
-        assert!(sqlite_absolute_fallback_path(
-            "data/db.sqlite3",
-            "connection refused"
-        )
-        .is_none());
+        assert!(sqlite_absolute_fallback_path("data/db.sqlite3", "connection refused").is_none());
     }
 
     #[test]
     fn fallback_path_returns_none_when_absolute_candidate_does_not_exist() {
-        assert!(sqlite_absolute_fallback_path(
-            "nonexistent/path/db.sqlite3",
-            "database disk image is malformed"
-        )
-        .is_none());
+        assert!(
+            sqlite_absolute_fallback_path(
+                "nonexistent/path/db.sqlite3",
+                "database disk image is malformed"
+            )
+            .is_none()
+        );
     }
 
     // ── ensure_sqlite_parent_dir_exists ─────────────────────────────────
@@ -2985,8 +2972,7 @@ mod tests {
     fn open_real_file_succeeds() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.sqlite3");
-        let conn =
-            open_sqlite_file_with_recovery(db_path.to_str().unwrap()).unwrap();
+        let conn = open_sqlite_file_with_recovery(db_path.to_str().unwrap()).unwrap();
         let rows = conn.query_sync("SELECT 1 AS val", &[]).unwrap();
         assert_eq!(rows.len(), 1);
     }
@@ -2995,8 +2981,7 @@ mod tests {
     fn open_creates_parent_dirs_if_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("sub/dir/test.sqlite3");
-        let conn =
-            open_sqlite_file_with_recovery(db_path.to_str().unwrap()).unwrap();
+        let conn = open_sqlite_file_with_recovery(db_path.to_str().unwrap()).unwrap();
         let rows = conn.query_sync("SELECT 1 AS val", &[]).unwrap();
         assert_eq!(rows.len(), 1);
     }
