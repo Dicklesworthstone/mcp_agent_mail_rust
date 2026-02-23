@@ -734,6 +734,21 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
                 "[startup-search] initialized search v3 bridge at {}",
                 index_dir.display()
             );
+            // Backfill existing messages into the Tantivy index.
+            match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
+                Ok((indexed, _skipped)) if indexed > 0 => {
+                    tracing::info!(
+                        indexed,
+                        "[startup-search] backfilled messages into Tantivy index"
+                    );
+                }
+                Ok(_) => {} // nothing to backfill or already up-to-date
+                Err(err) => {
+                    tracing::warn!(
+                        "[startup-search] Tantivy backfill failed (non-fatal): {err}"
+                    );
+                }
+            }
         }
         Err(err) => {
             tracing::warn!(

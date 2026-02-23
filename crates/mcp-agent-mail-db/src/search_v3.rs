@@ -449,6 +449,112 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
     Ok(messages.len())
 }
 
+// ── Startup backfill ─────────────────────────────────────────────────────
+
+/// Backfill the Tantivy index with all messages from the database.
+///
+/// Uses a sync `SqliteConnection` (C SQLite) to scan the messages table joined
+/// with agents and projects, then batch-indexes everything. Skips documents
+/// that are already in the index (idempotent via doc-count watermark).
+///
+/// Returns `(indexed_count, skipped_count)`.
+pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
+    let bridge = match get_bridge() {
+        Some(b) => b,
+        None => return Ok((0, 0)),
+    };
+
+    // Check how many docs are already in the index.
+    let existing_count = bridge
+        .index()
+        .reader()
+        .map_or(0, |r| r.searcher().num_docs());
+
+    // Open a sync read-only connection via C SQLite (not FrankenSQLite).
+    let db_path = db_url
+        .strip_prefix("sqlite:///")
+        .or_else(|| db_url.strip_prefix("sqlite://"))
+        .unwrap_or(db_url);
+
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path)
+        .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
+
+    // Count messages in DB.
+    let count_rows = conn
+        .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+        .map_err(|e| format!("backfill: count query failed: {e}"))?;
+    let db_count = count_rows
+        .first()
+        .and_then(|r| r.get_named::<i64>("cnt").ok())
+        .unwrap_or(0);
+
+    #[allow(clippy::cast_sign_loss)]
+    let db_count_u64 = db_count as u64;
+
+    // If the index already has at least as many docs as the DB, skip.
+    if existing_count >= db_count_u64 {
+        tracing::info!(
+            existing_count,
+            db_count,
+            "backfill: index already up-to-date, skipping"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        return Ok((0, db_count_u64 as usize));
+    }
+
+    // Fetch all messages with sender name and project slug.
+    let sql = "SELECT m.id AS id, m.project_id AS project_id, \
+               p.slug AS slug, a.name AS sender_name, \
+               m.subject AS subject, m.body_md AS body_md, \
+               m.thread_id AS thread_id, m.importance AS importance, \
+               m.created_ts AS created_ts \
+               FROM messages m \
+               JOIN agents a ON a.id = m.sender_id \
+               JOIN projects p ON p.id = m.project_id \
+               ORDER BY m.id";
+    let rows = conn
+        .query_sync(sql, &[])
+        .map_err(|e| format!("backfill: query failed: {e}"))?;
+
+    const BATCH_SIZE: usize = 500;
+    let mut batch: Vec<IndexableMessage> = Vec::with_capacity(BATCH_SIZE);
+    let mut total_indexed = 0_usize;
+
+    for row in &rows {
+        let msg = IndexableMessage {
+            id: row.get_named::<i64>("id").unwrap_or(0),
+            project_id: row.get_named::<i64>("project_id").unwrap_or(0),
+            project_slug: row.get_named::<String>("slug").unwrap_or_default(),
+            sender_name: row.get_named::<String>("sender_name").unwrap_or_default(),
+            subject: row.get_named::<String>("subject").unwrap_or_default(),
+            body_md: row.get_named::<String>("body_md").unwrap_or_default(),
+            thread_id: row.get_named::<Option<String>>("thread_id").unwrap_or_default(),
+            importance: row.get_named::<String>("importance").unwrap_or_else(|_| "normal".to_string()),
+            created_ts: row.get_named::<i64>("created_ts").unwrap_or(0),
+        };
+        batch.push(msg);
+
+        if batch.len() >= BATCH_SIZE {
+            total_indexed += index_messages_batch(&batch)?;
+            batch.clear();
+        }
+    }
+
+    // Flush remaining batch.
+    if !batch.is_empty() {
+        total_indexed += index_messages_batch(&batch)?;
+    }
+
+    tracing::info!(
+        total_indexed,
+        db_count,
+        existing_count,
+        "backfill: Tantivy index populated from database"
+    );
+
+    Ok((total_indexed, 0))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

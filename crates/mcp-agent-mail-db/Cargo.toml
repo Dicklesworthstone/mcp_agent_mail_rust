@@ -28,6 +28,7 @@ sqlmodel-schema.workspace = true
 sqlmodel-session.workspace = true
 sqlmodel-pool.workspace = true
 sqlmodel-frankensqlite.workspace = true
+sqlmodel-sqlite.workspace = true
 
 # LRU cache
 indexmap.workspace = true
