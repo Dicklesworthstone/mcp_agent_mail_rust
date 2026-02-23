@@ -76,6 +76,49 @@ pub(crate) fn enqueue_message_semantic_index(
     );
 }
 
+/// Index a message into the Tantivy lexical search index (fire-and-forget).
+///
+/// Runs synchronously but is best-effort: failures are logged, never propagated.
+pub(crate) fn enqueue_message_lexical_index(
+    message_id: i64,
+    project_id: i64,
+    project_slug: &str,
+    sender_name: &str,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    created_ts: i64,
+) {
+    let msg = mcp_agent_mail_db::search_v3::IndexableMessage {
+        id: message_id,
+        project_id,
+        project_slug: project_slug.to_string(),
+        sender_name: sender_name.to_string(),
+        subject: subject.to_string(),
+        body_md: body_md.to_string(),
+        thread_id: thread_id.map(String::from),
+        importance: importance.to_string(),
+        created_ts,
+    };
+    match mcp_agent_mail_db::search_v3::index_message(&msg) {
+        Ok(true) => {
+            tracing::debug!(
+                message_id,
+                "indexed message in Tantivy"
+            );
+        }
+        Ok(false) => {} // bridge not initialized, silent skip
+        Err(e) => {
+            tracing::warn!(
+                message_id,
+                error = %e,
+                "failed to index message in Tantivy (non-fatal)"
+            );
+        }
+    }
+}
+
 pub(crate) fn enqueue_agent_semantic_index(agent: &mcp_agent_mail_db::AgentRow) {
     let _ = mcp_agent_mail_db::search_service::enqueue_semantic_document(
         mcp_agent_mail_db::search_planner::DocKind::Agent,
@@ -1728,6 +1771,17 @@ effective_free_bytes={free}"
 
     let message_id = message.id.unwrap_or(0);
     enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
+    enqueue_message_lexical_index(
+        message_id,
+        project_id,
+        &project.slug,
+        &sender_name,
+        &message.subject,
+        &message.body_md,
+        thread_id.as_deref(),
+        &message.importance,
+        message.created_ts,
+    );
 
     // Emit notification signals for to/cc recipients only (never bcc).
     //
@@ -2408,6 +2462,17 @@ effective_free_bytes={free}"
 
     let reply_id = reply.id.unwrap_or(0);
     enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
+    enqueue_message_lexical_index(
+        reply_id,
+        project_id,
+        &project.slug,
+        &sender_name,
+        &reply.subject,
+        &reply.body_md,
+        Some(&thread_id),
+        &reply.importance,
+        reply.created_ts,
+    );
 
     // Emit notification signals for to/cc recipients only (never bcc).
     // Mirrors the send_message notification logic for parity with Python.

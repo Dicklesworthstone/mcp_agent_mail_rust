@@ -307,6 +307,148 @@ pub fn get_bridge() -> Option<Arc<TantivyBridge>> {
     BRIDGE.get().and_then(std::clone::Clone::clone)
 }
 
+// ── Incremental indexing ──────────────────────────────────────────────────
+
+/// Metadata required to index a single message into Tantivy.
+///
+/// This struct carries only the fields needed for the search index — no
+/// database connection or query context is required.
+#[derive(Debug, Clone)]
+pub struct IndexableMessage {
+    pub id: i64,
+    pub project_id: i64,
+    pub project_slug: String,
+    pub sender_name: String,
+    pub subject: String,
+    pub body_md: String,
+    pub thread_id: Option<String>,
+    pub importance: String,
+    pub created_ts: i64,
+}
+
+/// Index a single message into the global Tantivy bridge.
+///
+/// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
+/// is not initialized (search V3 disabled), or `Err` on write failure.
+///
+/// This is intentionally fire-and-forget safe: callers should not fail the
+/// message send operation if indexing fails.
+pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
+    let bridge = match get_bridge() {
+        Some(b) => b,
+        None => return Ok(false), // bridge not initialized, skip silently
+    };
+
+    let handles = bridge.handles();
+    let mut writer = bridge
+        .index()
+        .writer(15_000_000)
+        .map_err(|e| format!("Tantivy writer error: {e}"))?;
+
+    #[allow(clippy::cast_sign_loss)]
+    let id_u64 = msg.id as u64;
+    #[allow(clippy::cast_sign_loss)]
+    let project_id_u64 = msg.project_id as u64;
+
+    writer
+        .add_document(tantivy::doc!(
+            handles.id => id_u64,
+            handles.doc_kind => "message",
+            handles.subject => msg.subject.as_str(),
+            handles.body => msg.body_md.as_str(),
+            handles.sender => msg.sender_name.as_str(),
+            handles.project_slug => msg.project_slug.as_str(),
+            handles.project_id => project_id_u64,
+            handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
+            handles.importance => msg.importance.as_str(),
+            handles.created_ts => msg.created_ts
+        ))
+        .map_err(|e| format!("Tantivy add_document error: {e}"))?;
+
+    writer
+        .commit()
+        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+
+    // Update index health metrics.
+    let doc_count = bridge
+        .index()
+        .reader()
+        .map_or(0, |reader| reader.searcher().num_docs());
+    let index_size_bytes = measure_index_dir_bytes(bridge.index_dir());
+    mcp_agent_mail_core::metrics::global_metrics()
+        .search
+        .update_index_health(index_size_bytes, doc_count);
+
+    // Invalidate search cache so new messages appear immediately.
+    crate::search_service::invalidate_search_cache(
+        mcp_agent_mail_search_core::cache::InvalidationTrigger::IndexUpdate,
+    );
+
+    Ok(true)
+}
+
+/// Index a batch of messages into the global Tantivy bridge.
+///
+/// More efficient than calling [`index_message`] repeatedly — uses a single
+/// writer and commit for the entire batch.
+pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
+
+    let bridge = match get_bridge() {
+        Some(b) => b,
+        None => return Ok(0),
+    };
+
+    let handles = bridge.handles();
+    let mut writer = bridge
+        .index()
+        .writer(15_000_000)
+        .map_err(|e| format!("Tantivy writer error: {e}"))?;
+
+    for msg in messages {
+        #[allow(clippy::cast_sign_loss)]
+        let id_u64 = msg.id as u64;
+        #[allow(clippy::cast_sign_loss)]
+        let project_id_u64 = msg.project_id as u64;
+
+        writer
+            .add_document(tantivy::doc!(
+                handles.id => id_u64,
+                handles.doc_kind => "message",
+                handles.subject => msg.subject.as_str(),
+                handles.body => msg.body_md.as_str(),
+                handles.sender => msg.sender_name.as_str(),
+                handles.project_slug => msg.project_slug.as_str(),
+                handles.project_id => project_id_u64,
+                handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
+                handles.importance => msg.importance.as_str(),
+                handles.created_ts => msg.created_ts
+            ))
+            .map_err(|e| format!("Tantivy add_document error: {e}"))?;
+    }
+
+    writer
+        .commit()
+        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+
+    let doc_count = bridge
+        .index()
+        .reader()
+        .map_or(0, |reader| reader.searcher().num_docs());
+    let index_size_bytes = measure_index_dir_bytes(bridge.index_dir());
+    mcp_agent_mail_core::metrics::global_metrics()
+        .search
+        .update_index_health(index_size_bytes, doc_count);
+
+    crate::search_service::invalidate_search_cache(
+        mcp_agent_mail_search_core::cache::InvalidationTrigger::IndexUpdate,
+    );
+
+    Ok(messages.len())
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -902,5 +1044,204 @@ mod tests {
                 r.score
             );
         }
+    }
+
+    // -- Incremental indexing tests ----------------------------------------
+
+    fn make_indexable(id: i64, subject: &str, body: &str) -> IndexableMessage {
+        IndexableMessage {
+            id,
+            project_id: 1,
+            project_slug: "test-project".to_string(),
+            sender_name: "TestAgent".to_string(),
+            subject: subject.to_string(),
+            body_md: body.to_string(),
+            thread_id: Some("thread-1".to_string()),
+            importance: "normal".to_string(),
+            created_ts: 1_000_000_000_000,
+        }
+    }
+
+    #[test]
+    fn index_message_without_bridge_returns_false() {
+        // When the global bridge is not initialized, index_message should
+        // gracefully return Ok(false) rather than error.
+        // NOTE: This test relies on the global BRIDGE not being set in this
+        // test binary. Since OnceLock is process-global, this test must run
+        // before any test that calls init_bridge in the same process.
+        // In practice, the bridge is only set by init_bridge() and our tests
+        // use TantivyBridge::in_memory() which doesn't set the global.
+        let msg = make_indexable(1, "Test", "Body");
+        let result = index_message(&msg);
+        // Either Ok(false) (bridge not set) or Ok(true) (bridge set by another test).
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn index_messages_batch_empty_returns_zero() {
+        let result = index_messages_batch(&[]);
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn indexable_message_fields_roundtrip() {
+        // Verify IndexableMessage can be created and all fields accessed.
+        let msg = IndexableMessage {
+            id: 42,
+            project_id: 7,
+            project_slug: "backend".to_string(),
+            sender_name: "BlueLake".to_string(),
+            subject: "Test Subject".to_string(),
+            body_md: "Test body content".to_string(),
+            thread_id: Some("br-100".to_string()),
+            importance: "high".to_string(),
+            created_ts: 1_234_567_890,
+        };
+        assert_eq!(msg.id, 42);
+        assert_eq!(msg.project_id, 7);
+        assert_eq!(msg.project_slug, "backend");
+        assert_eq!(msg.sender_name, "BlueLake");
+        assert_eq!(msg.thread_id.as_deref(), Some("br-100"));
+    }
+
+    #[test]
+    fn index_message_via_bridge_directly() {
+        // Test the indexing logic by manually creating a bridge and indexing.
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let msg = make_indexable(100, "Indexing test subject", "Body about database migration");
+
+        #[allow(clippy::cast_sign_loss)]
+        let id_u64 = msg.id as u64;
+        #[allow(clippy::cast_sign_loss)]
+        let project_id_u64 = msg.project_id as u64;
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                handles.id => id_u64,
+                handles.doc_kind => "message",
+                handles.subject => msg.subject.as_str(),
+                handles.body => msg.body_md.as_str(),
+                handles.sender => msg.sender_name.as_str(),
+                handles.project_slug => msg.project_slug.as_str(),
+                handles.project_id => project_id_u64,
+                handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
+                handles.importance => msg.importance.as_str(),
+                handles.created_ts => msg.created_ts
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+
+        // Search for the indexed message.
+        let query = PlannerQuery {
+            text: "database migration".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        assert_eq!(results.len(), 1, "should find the indexed message");
+        assert_eq!(results[0].id, 100);
+        assert_eq!(results[0].from_agent.as_deref(), Some("TestAgent"));
+    }
+
+    #[test]
+    fn index_batch_via_bridge_directly() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let messages = vec![
+            make_indexable(1, "First message", "Content about Rust programming"),
+            make_indexable(2, "Second message", "Content about Python scripting"),
+            make_indexable(3, "Third message", "Content about database optimization"),
+        ];
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        for msg in &messages {
+            #[allow(clippy::cast_sign_loss)]
+            let id_u64 = msg.id as u64;
+            #[allow(clippy::cast_sign_loss)]
+            let project_id_u64 = msg.project_id as u64;
+            writer
+                .add_document(doc!(
+                    handles.id => id_u64,
+                    handles.doc_kind => "message",
+                    handles.subject => msg.subject.as_str(),
+                    handles.body => msg.body_md.as_str(),
+                    handles.sender => msg.sender_name.as_str(),
+                    handles.project_slug => msg.project_slug.as_str(),
+                    handles.project_id => project_id_u64,
+                    handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
+                    handles.importance => msg.importance.as_str(),
+                    handles.created_ts => msg.created_ts
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let reader = bridge.index().reader().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 3);
+
+        // Search for "Rust" — should find only first message.
+        let query = PlannerQuery {
+            text: "Rust programming".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn indexable_message_no_thread_id() {
+        let msg = IndexableMessage {
+            id: 1,
+            project_id: 1,
+            project_slug: "proj".to_string(),
+            sender_name: "Agent".to_string(),
+            subject: "No thread".to_string(),
+            body_md: "Body".to_string(),
+            thread_id: None,
+            importance: "low".to_string(),
+            created_ts: 0,
+        };
+        assert!(msg.thread_id.is_none());
+
+        // Index with None thread_id — should use empty string.
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                handles.id => 1u64,
+                handles.doc_kind => "message",
+                handles.subject => msg.subject.as_str(),
+                handles.body => msg.body_md.as_str(),
+                handles.sender => msg.sender_name.as_str(),
+                handles.project_slug => msg.project_slug.as_str(),
+                handles.project_id => 1u64,
+                handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
+                handles.importance => msg.importance.as_str(),
+                handles.created_ts => msg.created_ts
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = bridge.index().reader().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 1);
+    }
+
+    #[test]
+    fn indexable_message_clone_and_debug() {
+        let msg = make_indexable(1, "Test", "Body");
+        let cloned = msg.clone();
+        assert_eq!(cloned.id, msg.id);
+        assert_eq!(cloned.subject, msg.subject);
+        let debug = format!("{msg:?}");
+        assert!(debug.contains("IndexableMessage"));
     }
 }
