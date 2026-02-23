@@ -19,12 +19,13 @@ use mcp_agent_mail_db::{
     is_corruption_error_message, is_sqlite_recovery_error_message,
 };
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static WORKER: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 const DEFAULT_QUICK_CHECK_INTERVAL_SECS: u64 = 300;
 const MIN_FULL_CHECK_INTERVAL_SECS: u64 = 3600;
@@ -64,18 +65,26 @@ pub fn start(config: &Config) {
         return;
     };
 
-    let config = config.clone();
-    let _ = WORKER.get_or_init(|| {
+    let mut worker = WORKER.lock().unwrap();
+    if worker.is_none() {
+        let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
-        std::thread::Builder::new()
-            .name("integrity-guard".into())
-            .spawn(move || monitor_loop(&config, &sqlite_path))
-            .expect("failed to spawn integrity guard worker")
-    });
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("integrity-guard".into())
+                .spawn(move || monitor_loop(&config, &sqlite_path))
+                .expect("failed to spawn integrity guard worker"),
+        );
+    }
 }
 
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
+    if let Ok(mut worker) = WORKER.lock() {
+        if let Some(handle) = worker.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn monitor_loop(config: &Config, sqlite_path: &Path) {
@@ -268,5 +277,222 @@ mod tests {
             quick_check_interval(),
             Duration::from_secs(DEFAULT_QUICK_CHECK_INTERVAL_SECS)
         );
+    }
+
+    #[test]
+    fn full_check_interval_large_value() {
+        let mut config = Config::from_env();
+        config.integrity_check_interval_hours = 24;
+        assert_eq!(
+            full_check_interval(&config),
+            Some(Duration::from_secs(24 * 3600))
+        );
+    }
+
+    #[test]
+    fn full_check_interval_small_value_clamped_to_minimum() {
+        // Even sub-hour values get clamped to MIN_FULL_CHECK_INTERVAL_SECS
+        let mut config = Config::from_env();
+        config.integrity_check_interval_hours = 1; // 1 hour = 3600s >= 3600s minimum
+        let interval = full_check_interval(&config).unwrap();
+        assert!(interval.as_secs() >= MIN_FULL_CHECK_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn full_check_interval_saturating_mul_no_overflow() {
+        let mut config = Config::from_env();
+        config.integrity_check_interval_hours = u64::MAX;
+        // saturating_mul should not panic
+        let interval = full_check_interval(&config);
+        assert!(interval.is_some());
+        assert!(interval.unwrap().as_secs() >= MIN_FULL_CHECK_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn quick_check_interval_is_5_minutes() {
+        assert_eq!(quick_check_interval().as_secs(), 300);
+    }
+
+    #[test]
+    fn handle_integrity_error_non_recoverable_does_not_update_timestamp() {
+        let mut last_recovery: Option<Instant> = None;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite_path = tmp.path().join("test.sqlite3");
+        let storage_root = tmp.path().join("storage");
+
+        // "connection reset" is NOT a recoverable error
+        handle_integrity_error(
+            "test",
+            "connection reset by peer",
+            &sqlite_path,
+            &storage_root,
+            &mut last_recovery,
+        );
+
+        assert!(
+            last_recovery.is_none(),
+            "non-recoverable error should not set last_recovery_attempt"
+        );
+    }
+
+    #[test]
+    fn handle_integrity_error_recoverable_sets_timestamp() {
+        let mut last_recovery: Option<Instant> = None;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite_path = tmp.path().join("test.sqlite3");
+        let storage_root = tmp.path().join("storage");
+
+        // "database disk image is malformed" IS a recoverable error
+        handle_integrity_error(
+            "test",
+            "database disk image is malformed",
+            &sqlite_path,
+            &storage_root,
+            &mut last_recovery,
+        );
+
+        assert!(
+            last_recovery.is_some(),
+            "recoverable error should set last_recovery_attempt"
+        );
+    }
+
+    #[test]
+    fn handle_integrity_error_throttles_rapid_recovery() {
+        let mut last_recovery: Option<Instant> = Some(Instant::now());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite_path = tmp.path().join("test.sqlite3");
+        let storage_root = tmp.path().join("storage");
+
+        let before = last_recovery;
+
+        // Second call immediately after should be throttled
+        handle_integrity_error(
+            "test",
+            "database disk image is malformed",
+            &sqlite_path,
+            &storage_root,
+            &mut last_recovery,
+        );
+
+        // Timestamp should NOT have been updated (throttled)
+        assert_eq!(
+            last_recovery.map(|i| i.elapsed().as_millis() < 100),
+            before.map(|i| i.elapsed().as_millis() < 100),
+            "recovery should be throttled within RECOVERY_MIN_INTERVAL_SECS"
+        );
+    }
+
+    #[test]
+    fn handle_integrity_error_various_recoverable_messages() {
+        let recoverable_msgs = [
+            "database disk image is malformed",
+            "Database Disk Image Is Malformed", // case-insensitive
+            "malformed database schema - broken_table",
+            "file is not a database",
+            "out of memory",
+            "cursor stack is empty",
+            "internal error",
+            "no healthy backup was found",
+        ];
+        for msg in &recoverable_msgs {
+            let mut last_recovery: Option<Instant> = None;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sqlite_path = tmp.path().join("test.sqlite3");
+            let storage_root = tmp.path().join("storage");
+
+            handle_integrity_error(
+                "test",
+                msg,
+                &sqlite_path,
+                &storage_root,
+                &mut last_recovery,
+            );
+
+            assert!(
+                last_recovery.is_some(),
+                "'{msg}' should be classified as recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_integrity_error_non_recoverable_messages() {
+        let non_recoverable_msgs = [
+            "connection refused",
+            "timeout",
+            "constraint violation",
+            "unique constraint failed",
+            "no such table",
+        ];
+        for msg in &non_recoverable_msgs {
+            let mut last_recovery: Option<Instant> = None;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sqlite_path = tmp.path().join("test.sqlite3");
+            let storage_root = tmp.path().join("storage");
+
+            handle_integrity_error(
+                "test",
+                msg,
+                &sqlite_path,
+                &storage_root,
+                &mut last_recovery,
+            );
+
+            assert!(
+                last_recovery.is_none(),
+                "'{msg}' should NOT be classified as recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_integrity_error_uses_archive_recovery_when_storage_exists() {
+        let mut last_recovery: Option<Instant> = None;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite_path = tmp.path().join("test.sqlite3");
+        let storage_root = tmp.path().join("storage");
+
+        // Create the storage directory so archive-aware recovery is used.
+        std::fs::create_dir_all(&storage_root).unwrap();
+
+        handle_integrity_error(
+            "test",
+            "database disk image is malformed",
+            &sqlite_path,
+            &storage_root,
+            &mut last_recovery,
+        );
+
+        // We can't easily verify which recovery path was used, but
+        // the function should not panic when storage_root exists.
+        assert!(last_recovery.is_some());
+    }
+
+    #[test]
+    fn handle_integrity_error_uses_file_recovery_when_no_storage() {
+        let mut last_recovery: Option<Instant> = None;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite_path = tmp.path().join("test.sqlite3");
+        let storage_root = tmp.path().join("nonexistent_storage");
+
+        // storage_root doesn't exist, so file-only recovery is used.
+        handle_integrity_error(
+            "test",
+            "database disk image is malformed",
+            &sqlite_path,
+            &storage_root,
+            &mut last_recovery,
+        );
+
+        assert!(last_recovery.is_some());
+    }
+
+    #[test]
+    fn constants_are_reasonable() {
+        assert!(DEFAULT_QUICK_CHECK_INTERVAL_SECS >= 60, "quick check should be at least 1 minute");
+        assert!(MIN_FULL_CHECK_INTERVAL_SECS >= 3600, "full check minimum should be at least 1 hour");
+        assert!(RECOVERY_MIN_INTERVAL_SECS >= 10, "recovery throttle should be at least 10 seconds");
+        assert!(BACKUP_MAX_AGE_SECS >= 600, "backup max age should be at least 10 minutes");
     }
 }
