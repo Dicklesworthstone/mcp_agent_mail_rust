@@ -733,20 +733,16 @@ fn is_truthy_value(value: Option<&str>) -> bool {
 
 fn is_guard_gated_from_values(
     enforcement_enabled: Option<&str>,
-    worktrees_enabled: Option<&str>,
-    git_identity_enabled: Option<&str>,
+    _worktrees_enabled: Option<&str>,
+    _git_identity_enabled: Option<&str>,
 ) -> bool {
     if let Some(val) = enforcement_enabled {
         return is_truthy_value(Some(val));
     }
-    if let Some(val) = worktrees_enabled {
-        return is_truthy_value(Some(val));
-    }
-    if let Some(val) = git_identity_enabled {
-        return is_truthy_value(Some(val));
-    }
-    // Default to true unless specifically disabled, but fallback to legacy worktrees checks
-    // if enforcement is completely unset, though in Rust the config defaults to true.
+    // Default to true: the file reservation guard is active unless explicitly
+    // disabled via FILE_RESERVATIONS_ENFORCEMENT_ENABLED=false.
+    // WORKTREES_ENABLED and GIT_IDENTITY_ENABLED control their own features
+    // and must NOT gate the file reservation guard.
     true
 }
 
@@ -1353,6 +1349,16 @@ mod tests {
         assert!(is_guard_gated_from_values(Some("1"), None, None));
         assert!(is_guard_gated_from_values(Some("true"), Some("0"), Some("0")));
         assert!(!is_guard_gated_from_values(Some("0"), Some("1"), Some("1")));
+    }
+
+    #[test]
+    fn guard_gate_not_disabled_by_worktrees_false() {
+        // WORKTREES_ENABLED=false must NOT disable the file reservation guard
+        assert!(is_guard_gated_from_values(None, Some("false"), None));
+        assert!(is_guard_gated_from_values(None, Some("0"), None));
+        assert!(is_guard_gated_from_values(None, Some("false"), Some("false")));
+        assert!(is_guard_gated_from_values(None, None, Some("false")));
+        assert!(is_guard_gated_from_values(None, None, Some("0")));
     }
 
     // -----------------------------------------------------------------------

@@ -136,9 +136,39 @@ fn guard_check_full_bypass_returns_empty_conflicts() {
 }
 
 #[test]
-fn guard_check_full_gated_when_neither_flag_set() {
+fn guard_check_full_active_when_neither_flag_set() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _guard = EnvGuard::save(&[
+        "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+        "WORKTREES_ENABLED",
+        "GIT_IDENTITY_ENABLED",
+        "AGENT_MAIL_BYPASS",
+        "AGENT_NAME",
+    ]);
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = make_archive_with_reservations(td.path());
+
+    unsafe {
+        std::env::remove_var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED");
+        std::env::remove_var("WORKTREES_ENABLED");
+        std::env::remove_var("GIT_IDENTITY_ENABLED");
+        std::env::remove_var("AGENT_MAIL_BYPASS");
+        std::env::set_var("AGENT_NAME", "DifferentAgent");
+    }
+
+    // Guard defaults to active, so conflicts should be detected
+    let result = guard_check_full(&archive, &archive, &["app/api/users.py".to_string()])
+        .expect("guard_check_full");
+    assert!(!result.gated, "guard should be active when no flags are set");
+    assert_eq!(result.conflicts.len(), 1, "should detect conflict");
+}
+
+#[test]
+fn guard_check_full_gated_when_enforcement_explicitly_disabled() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvGuard::save(&[
+        "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
         "WORKTREES_ENABLED",
         "GIT_IDENTITY_ENABLED",
         "AGENT_MAIL_BYPASS",
@@ -148,6 +178,7 @@ fn guard_check_full_gated_when_neither_flag_set() {
     let archive = make_archive_with_reservations(td.path());
 
     unsafe {
+        std::env::set_var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "0");
         std::env::remove_var("WORKTREES_ENABLED");
         std::env::remove_var("GIT_IDENTITY_ENABLED");
         std::env::remove_var("AGENT_MAIL_BYPASS");
@@ -155,7 +186,7 @@ fn guard_check_full_gated_when_neither_flag_set() {
 
     let result = guard_check_full(&archive, &archive, &["app/api/users.py".to_string()])
         .expect("guard_check_full");
-    assert!(result.gated, "guard should be gated when no flags are set");
+    assert!(result.gated, "guard should be gated when enforcement explicitly disabled");
     assert!(
         result.conflicts.is_empty(),
         "gated guard should have no conflicts"
@@ -346,15 +377,57 @@ fn is_guard_gated_with_git_identity_enabled() {
 }
 
 #[test]
-fn is_guard_gated_false_when_neither_set() {
+fn is_guard_gated_true_when_neither_set() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvGuard::save(&["WORKTREES_ENABLED", "GIT_IDENTITY_ENABLED"]);
+    let _guard = EnvGuard::save(&[
+        "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+        "WORKTREES_ENABLED",
+        "GIT_IDENTITY_ENABLED",
+    ]);
 
     unsafe {
+        std::env::remove_var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED");
+        std::env::remove_var("WORKTREES_ENABLED");
+        std::env::remove_var("GIT_IDENTITY_ENABLED");
+    }
+    // Guard defaults to true when no flags are set -- the file reservation
+    // system should be active unless explicitly disabled.
+    assert!(mcp_agent_mail_guard::is_guard_gated());
+}
+
+#[test]
+fn is_guard_gated_false_only_when_enforcement_explicitly_disabled() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvGuard::save(&[
+        "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+        "WORKTREES_ENABLED",
+        "GIT_IDENTITY_ENABLED",
+    ]);
+
+    unsafe {
+        std::env::set_var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "false");
         std::env::remove_var("WORKTREES_ENABLED");
         std::env::remove_var("GIT_IDENTITY_ENABLED");
     }
     assert!(!mcp_agent_mail_guard::is_guard_gated());
+}
+
+#[test]
+fn is_guard_gated_not_disabled_by_worktrees_false() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvGuard::save(&[
+        "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+        "WORKTREES_ENABLED",
+        "GIT_IDENTITY_ENABLED",
+    ]);
+
+    unsafe {
+        std::env::remove_var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED");
+        std::env::set_var("WORKTREES_ENABLED", "false");
+        std::env::remove_var("GIT_IDENTITY_ENABLED");
+    }
+    // WORKTREES_ENABLED=false must NOT disable the guard
+    assert!(mcp_agent_mail_guard::is_guard_gated());
 }
 
 #[test]
