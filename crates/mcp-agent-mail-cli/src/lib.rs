@@ -9181,10 +9181,10 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
-    /// Extract the first top-level JSON object `{...}` from a string that may
-    /// contain non-JSON text (e.g. from concurrent test output).
-    fn extract_json_block(s: &str) -> Option<&str> {
-        let start = s.find('{')?;
+    /// Extract the first top-level JSON value delimited by `open`/`close` from a
+    /// string that may contain non-JSON text (e.g. from concurrent test output).
+    fn extract_json_delimited(s: &str, open: char, close: char) -> Option<&str> {
+        let start = s.find(open)?;
         let mut depth = 0i32;
         let mut in_string = false;
         let mut escape = false;
@@ -9196,8 +9196,8 @@ mod tests {
             match ch {
                 '\\' if in_string => escape = true,
                 '"' => in_string = !in_string,
-                '{' if !in_string => depth += 1,
-                '}' if !in_string => {
+                c if c == open && !in_string => depth += 1,
+                c if c == close && !in_string => {
                     depth -= 1;
                     if depth == 0 {
                         return Some(&s[start..start + i + 1]);
@@ -9207,6 +9207,16 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Extract the first top-level JSON object `{...}` from a string.
+    fn extract_json_block(s: &str) -> Option<&str> {
+        extract_json_delimited(s, '{', '}')
+    }
+
+    /// Extract the first top-level JSON array `[...]` from a string.
+    fn extract_json_array(s: &str) -> Option<&str> {
+        extract_json_delimited(s, '[', ']')
     }
 
     /// Extract the first JSON object that looks like doctor-check output.
@@ -9753,9 +9763,8 @@ mod tests {
 
         assert!(result.is_ok(), "bench --list --json failed: {result:?}");
         let trimmed = output.trim();
-        let json_start = trimmed.find('[').unwrap_or(0);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&trimmed[json_start..]).expect("valid benchmark list json");
+        let json_str = extract_json_array(trimmed).expect("valid benchmark list json");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let rows = parsed.as_array().expect("benchmark list array");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["name"], "help");
@@ -14988,8 +14997,8 @@ mod tests {
         // Parse JSON output - should be empty array.
         // Extract from first JSON-like character to tolerate leaked ftui_println.
         let trimmed = output.trim();
-        let json_start = trimmed.find(['[', '{']).unwrap_or(0);
-        let parsed: serde_json::Value = serde_json::from_str(&trimmed[json_start..]).unwrap();
+        let json_str = extract_json_array(trimmed).expect("valid JSON array");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert!(parsed.is_array(), "expected JSON array, got: {parsed}");
         assert_eq!(parsed.as_array().unwrap().len(), 0);
     }
@@ -15321,15 +15330,8 @@ mod tests {
         assert!(result.is_ok(), "beads ready failed: {result:?}");
         // Extract JSON array from potentially polluted capture output (prefix + suffix).
         let trimmed = output.trim();
-        let json_start = trimmed.find('[').unwrap_or(0);
-        let json_slice = &trimmed[json_start..];
-        // Find matching closing bracket to ignore trailing noise.
-        let json_end = json_slice
-            .find("]\n")
-            .or_else(|| json_slice.rfind(']'))
-            .map_or(json_slice.len(), |i| i + 1);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json_slice[..json_end]).expect("should be valid JSON");
+        let json_str = extract_json_array(trimmed).expect("should be valid JSON array");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert!(parsed.as_array().expect("should be array").is_empty());
     }
 
