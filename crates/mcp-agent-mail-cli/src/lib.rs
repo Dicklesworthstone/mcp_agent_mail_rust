@@ -15319,11 +15319,17 @@ mod tests {
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "beads ready failed: {result:?}");
-        // Extract JSON array from potentially polluted capture output.
+        // Extract JSON array from potentially polluted capture output (prefix + suffix).
         let trimmed = output.trim();
         let json_start = trimmed.find('[').unwrap_or(0);
+        let json_slice = &trimmed[json_start..];
+        // Find matching closing bracket to ignore trailing noise.
+        let json_end = json_slice
+            .find("]\n")
+            .or_else(|| json_slice.rfind(']'))
+            .map_or(json_slice.len(), |i| i + 1);
         let parsed: serde_json::Value =
-            serde_json::from_str(&trimmed[json_start..]).expect("should be valid JSON");
+            serde_json::from_str(&json_slice[..json_end]).expect("should be valid JSON");
         assert!(parsed.as_array().expect("should be array").is_empty());
     }
 
