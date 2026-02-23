@@ -4428,4 +4428,289 @@ mod tests {
         let truncated = truncate_subject(&prefixed);
         assert_eq!(truncated, prefixed, "short subject should not be truncated");
     }
+
+    // ── python_json_type_name tests ─────────────────────────────────
+
+    #[test]
+    fn python_type_name_null() {
+        assert_eq!(python_json_type_name(&Value::Null), "NoneType");
+    }
+
+    #[test]
+    fn python_type_name_bool() {
+        assert_eq!(python_json_type_name(&json!(true)), "bool");
+        assert_eq!(python_json_type_name(&json!(false)), "bool");
+    }
+
+    #[test]
+    fn python_type_name_int() {
+        assert_eq!(python_json_type_name(&json!(42)), "int");
+        assert_eq!(python_json_type_name(&json!(-1)), "int");
+        assert_eq!(python_json_type_name(&json!(0)), "int");
+    }
+
+    #[test]
+    fn python_type_name_float() {
+        assert_eq!(python_json_type_name(&json!(3.14)), "float");
+        assert_eq!(python_json_type_name(&json!(0.0)), "float");
+    }
+
+    #[test]
+    fn python_type_name_string() {
+        assert_eq!(python_json_type_name(&json!("hello")), "str");
+        assert_eq!(python_json_type_name(&json!("")), "str");
+    }
+
+    #[test]
+    fn python_type_name_list_and_dict() {
+        assert_eq!(python_json_type_name(&json!([1, 2])), "list");
+        assert_eq!(python_json_type_name(&json!([])), "list");
+        assert_eq!(python_json_type_name(&json!({"k": "v"})), "dict");
+        assert_eq!(python_json_type_name(&json!({})), "dict");
+    }
+
+    // ── python_value_repr tests ─────────────────────────────────────
+
+    #[test]
+    fn python_repr_null() {
+        assert_eq!(python_value_repr(&Value::Null), "None");
+    }
+
+    #[test]
+    fn python_repr_booleans() {
+        assert_eq!(python_value_repr(&json!(true)), "True");
+        assert_eq!(python_value_repr(&json!(false)), "False");
+    }
+
+    #[test]
+    fn python_repr_numbers() {
+        assert_eq!(python_value_repr(&json!(42)), "42");
+        assert_eq!(python_value_repr(&json!(3.14)), "3.14");
+    }
+
+    #[test]
+    fn python_repr_string_with_single_quotes() {
+        assert_eq!(python_value_repr(&json!("hello")), "'hello'");
+        assert_eq!(
+            python_value_repr(&json!("it's")),
+            "'it\\'s'",
+            "single quotes should be escaped"
+        );
+    }
+
+    #[test]
+    fn python_repr_empty_string() {
+        assert_eq!(python_value_repr(&json!("")), "''");
+    }
+
+    #[test]
+    fn python_repr_array_and_object_use_json() {
+        let arr = json!([1, "two"]);
+        let repr = python_value_repr(&arr);
+        assert!(repr.contains("["), "array repr should use JSON format");
+
+        let obj = json!({"key": "val"});
+        let repr = python_value_repr(&obj);
+        assert!(repr.contains("{"), "object repr should use JSON format");
+    }
+
+    // ── send_message_has_explicit_to_recipients tests ───────────────
+
+    #[test]
+    fn explicit_to_none() {
+        assert!(!send_message_has_explicit_to_recipients(None));
+    }
+
+    #[test]
+    fn explicit_to_empty_string() {
+        let val = json!("");
+        assert!(!send_message_has_explicit_to_recipients(Some(&val)));
+    }
+
+    #[test]
+    fn explicit_to_whitespace_only_string() {
+        let val = json!("   ");
+        assert!(!send_message_has_explicit_to_recipients(Some(&val)));
+    }
+
+    #[test]
+    fn explicit_to_valid_string() {
+        let val = json!("BlueLake");
+        assert!(send_message_has_explicit_to_recipients(Some(&val)));
+    }
+
+    #[test]
+    fn explicit_to_empty_array() {
+        let val = json!([]);
+        assert!(!send_message_has_explicit_to_recipients(Some(&val)));
+    }
+
+    #[test]
+    fn explicit_to_array_with_empty_strings() {
+        let val = json!(["", "  "]);
+        assert!(!send_message_has_explicit_to_recipients(Some(&val)));
+    }
+
+    #[test]
+    fn explicit_to_array_with_valid_name() {
+        let val = json!(["BlueLake", ""]);
+        assert!(send_message_has_explicit_to_recipients(Some(&val)));
+    }
+
+    #[test]
+    fn explicit_to_non_string_value() {
+        let val = json!(42);
+        assert!(!send_message_has_explicit_to_recipients(Some(&val)));
+    }
+
+    #[test]
+    fn explicit_to_null_value() {
+        assert!(!send_message_has_explicit_to_recipients(Some(
+            &Value::Null
+        )));
+    }
+
+    // ── normalize_send_message_to_argument tests ────────────────────
+
+    #[test]
+    fn normalize_to_string_wraps_in_array() {
+        let mut args = serde_json::Map::new();
+        args.insert("to".to_string(), json!("BlueLake"));
+        normalize_send_message_to_argument(&mut args).unwrap();
+        assert_eq!(args.get("to"), Some(&json!(["BlueLake"])));
+    }
+
+    #[test]
+    fn normalize_to_valid_array_is_noop() {
+        let mut args = serde_json::Map::new();
+        args.insert("to".to_string(), json!(["BlueLake", "RedPeak"]));
+        normalize_send_message_to_argument(&mut args).unwrap();
+        assert_eq!(args.get("to"), Some(&json!(["BlueLake", "RedPeak"])));
+    }
+
+    #[test]
+    fn normalize_to_absent_is_noop() {
+        let mut args = serde_json::Map::new();
+        args.insert("subject".to_string(), json!("Test"));
+        normalize_send_message_to_argument(&mut args).unwrap();
+        assert!(!args.contains_key("to"));
+    }
+
+    #[test]
+    fn normalize_to_array_with_non_string_errors() {
+        let mut args = serde_json::Map::new();
+        args.insert("to".to_string(), json!(["BlueLake", 42]));
+        let result = normalize_send_message_to_argument(&mut args);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn normalize_to_number_errors_with_type_name() {
+        let mut args = serde_json::Map::new();
+        args.insert("to".to_string(), json!(42));
+        let result = normalize_send_message_to_argument(&mut args);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("list of agent names"),
+            "{}",
+            err.message
+        );
+    }
+
+    // ── normalize_send_message_cc_bcc_argument tests ────────────────
+
+    #[test]
+    fn normalize_cc_null_is_noop() {
+        let mut args = serde_json::Map::new();
+        args.insert("cc".to_string(), Value::Null);
+        normalize_send_message_cc_bcc_argument(&mut args, "cc").unwrap();
+        // Null stays in the map (not removed).
+        assert_eq!(args.get("cc"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn normalize_cc_string_wraps_in_array() {
+        let mut args = serde_json::Map::new();
+        args.insert("cc".to_string(), json!("Agent"));
+        normalize_send_message_cc_bcc_argument(&mut args, "cc").unwrap();
+        assert_eq!(args.get("cc"), Some(&json!(["Agent"])));
+    }
+
+    #[test]
+    fn normalize_bcc_valid_array_is_noop() {
+        let mut args = serde_json::Map::new();
+        args.insert("bcc".to_string(), json!(["A", "B"]));
+        normalize_send_message_cc_bcc_argument(&mut args, "bcc").unwrap();
+        assert_eq!(args.get("bcc"), Some(&json!(["A", "B"])));
+    }
+
+    #[test]
+    fn normalize_cc_array_with_non_string_errors() {
+        let mut args = serde_json::Map::new();
+        args.insert("cc".to_string(), json!(["Agent", true]));
+        let result = normalize_send_message_cc_bcc_argument(&mut args, "cc");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn normalize_bcc_absent_is_noop() {
+        let mut args = serde_json::Map::new();
+        normalize_send_message_cc_bcc_argument(&mut args, "bcc").unwrap();
+        assert!(!args.contains_key("bcc"));
+    }
+
+    #[test]
+    fn normalize_cc_object_errors() {
+        let mut args = serde_json::Map::new();
+        args.insert("cc".to_string(), json!({"name": "Agent"}));
+        let result = normalize_send_message_cc_bcc_argument(&mut args, "cc");
+        assert!(result.is_err());
+    }
+
+    // ── enqueue_message_lexical_index non-fatal behavior ────────────
+
+    #[test]
+    fn enqueue_lexical_index_does_not_panic() {
+        // When the global Tantivy bridge is not initialized,
+        // enqueue_message_lexical_index should silently no-op.
+        enqueue_message_lexical_index(
+            1,
+            1,
+            "test-project",
+            "TestAgent",
+            "Test Subject",
+            "Test body",
+            Some("thread-1"),
+            "normal",
+            1_000_000,
+        );
+        // If we reach here, the function didn't panic.
+    }
+
+    #[test]
+    fn enqueue_lexical_index_none_thread_id_does_not_panic() {
+        enqueue_message_lexical_index(
+            2,
+            1,
+            "proj",
+            "Agent",
+            "Subject",
+            "Body",
+            None,
+            "high",
+            0,
+        );
+    }
+
+    #[test]
+    fn enqueue_lexical_index_empty_fields_does_not_panic() {
+        enqueue_message_lexical_index(
+            0, 0, "", "", "", "", None, "", 0,
+        );
+    }
 }
