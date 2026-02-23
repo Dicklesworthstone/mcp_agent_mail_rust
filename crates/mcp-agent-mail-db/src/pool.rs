@@ -2775,4 +2775,239 @@ mod tests {
             .unwrap();
         assert!(result.is_none(), "memory DB should not create backup");
     }
+
+    // ── auto_pool_size ─────────────────────────────────────────────────
+
+    #[test]
+    fn auto_pool_size_returns_valid_bounds() {
+        let (min, max) = auto_pool_size();
+        assert!(min >= 10, "min should be at least 10, got {min}");
+        assert!(max >= 50, "max should be at least 50, got {max}");
+        assert!(min <= 50, "min should be at most 50, got {min}");
+        assert!(max <= 200, "max should be at most 200, got {max}");
+        assert!(min <= max, "min ({min}) should not exceed max ({max})");
+    }
+
+    // ── is_corruption_error_message ────────────────────────────────────
+
+    #[test]
+    fn corruption_error_detects_malformed_image() {
+        assert!(is_corruption_error_message(
+            "database disk image is malformed"
+        ));
+    }
+
+    #[test]
+    fn corruption_error_detects_malformed_schema() {
+        assert!(is_corruption_error_message(
+            "malformed database schema - broken_table"
+        ));
+    }
+
+    #[test]
+    fn corruption_error_detects_not_a_database() {
+        assert!(is_corruption_error_message("file is not a database"));
+    }
+
+    #[test]
+    fn corruption_error_detects_no_healthy_backup() {
+        assert!(is_corruption_error_message(
+            "no healthy backup was found"
+        ));
+    }
+
+    #[test]
+    fn corruption_error_case_insensitive() {
+        assert!(is_corruption_error_message(
+            "DATABASE DISK IMAGE IS MALFORMED"
+        ));
+        assert!(is_corruption_error_message(
+            "File Is Not A Database"
+        ));
+    }
+
+    #[test]
+    fn corruption_error_rejects_unrelated_messages() {
+        assert!(!is_corruption_error_message("connection refused"));
+        assert!(!is_corruption_error_message("timeout"));
+        assert!(!is_corruption_error_message("constraint violation"));
+        assert!(!is_corruption_error_message("unique constraint failed"));
+        assert!(!is_corruption_error_message("no such table"));
+        assert!(!is_corruption_error_message(""));
+    }
+
+    #[test]
+    fn corruption_error_detects_embedded_in_longer_message() {
+        assert!(is_corruption_error_message(
+            "SqlError: database disk image is malformed (while running SELECT)"
+        ));
+    }
+
+    // ── is_sqlite_recovery_error_message ───────────────────────────────
+
+    #[test]
+    fn recovery_error_includes_all_corruption_patterns() {
+        // All corruption patterns are also recovery patterns
+        assert!(is_sqlite_recovery_error_message(
+            "database disk image is malformed"
+        ));
+        assert!(is_sqlite_recovery_error_message(
+            "malformed database schema"
+        ));
+        assert!(is_sqlite_recovery_error_message("file is not a database"));
+        assert!(is_sqlite_recovery_error_message(
+            "no healthy backup was found"
+        ));
+    }
+
+    #[test]
+    fn recovery_error_detects_out_of_memory() {
+        assert!(is_sqlite_recovery_error_message("out of memory"));
+        assert!(is_sqlite_recovery_error_message("OUT OF MEMORY"));
+    }
+
+    #[test]
+    fn recovery_error_detects_cursor_stack_empty() {
+        assert!(is_sqlite_recovery_error_message(
+            "cursor stack is empty"
+        ));
+    }
+
+    #[test]
+    fn recovery_error_detects_unwrap_none() {
+        assert!(is_sqlite_recovery_error_message(
+            "called `option::unwrap()` on a `none` value"
+        ));
+    }
+
+    #[test]
+    fn recovery_error_detects_internal_error() {
+        assert!(is_sqlite_recovery_error_message("internal error"));
+    }
+
+    #[test]
+    fn recovery_error_rejects_non_recovery_messages() {
+        assert!(!is_sqlite_recovery_error_message("connection refused"));
+        assert!(!is_sqlite_recovery_error_message("timeout"));
+        assert!(!is_sqlite_recovery_error_message("no such table"));
+        assert!(!is_sqlite_recovery_error_message(""));
+    }
+
+    // ── sqlite_absolute_fallback_path ──────────────────────────────────
+
+    #[test]
+    fn fallback_path_returns_none_for_memory_db() {
+        assert!(sqlite_absolute_fallback_path(
+            ":memory:",
+            "database disk image is malformed"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fallback_path_returns_none_for_absolute_path() {
+        assert!(sqlite_absolute_fallback_path(
+            "/data/db.sqlite3",
+            "database disk image is malformed"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fallback_path_returns_none_for_dot_relative() {
+        assert!(sqlite_absolute_fallback_path(
+            "./data/db.sqlite3",
+            "database disk image is malformed"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fallback_path_returns_none_for_dotdot_relative() {
+        assert!(sqlite_absolute_fallback_path(
+            "../data/db.sqlite3",
+            "database disk image is malformed"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fallback_path_returns_none_for_non_recovery_error() {
+        assert!(sqlite_absolute_fallback_path(
+            "data/db.sqlite3",
+            "connection refused"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fallback_path_returns_none_when_absolute_candidate_does_not_exist() {
+        assert!(sqlite_absolute_fallback_path(
+            "nonexistent/path/db.sqlite3",
+            "database disk image is malformed"
+        )
+        .is_none());
+    }
+
+    // ── ensure_sqlite_parent_dir_exists ─────────────────────────────────
+
+    #[test]
+    fn ensure_parent_dir_noop_for_memory_db() {
+        assert!(ensure_sqlite_parent_dir_exists(":memory:").is_ok());
+    }
+
+    #[test]
+    fn ensure_parent_dir_creates_missing_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nested = tmp.path().join("a/b/c/test.sqlite3");
+        assert!(!tmp.path().join("a").exists());
+        ensure_sqlite_parent_dir_exists(nested.to_str().unwrap()).unwrap();
+        assert!(tmp.path().join("a/b/c").exists());
+    }
+
+    #[test]
+    fn ensure_parent_dir_ok_when_already_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite3");
+        assert!(ensure_sqlite_parent_dir_exists(db_path.to_str().unwrap()).is_ok());
+    }
+
+    // ── open_sqlite_file_with_recovery ──────────────────────────────────
+
+    #[test]
+    fn open_memory_db_succeeds() {
+        let conn = open_sqlite_file_with_recovery(":memory:").unwrap();
+        let rows = conn.query_sync("SELECT 1 AS val", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn open_real_file_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite3");
+        let conn =
+            open_sqlite_file_with_recovery(db_path.to_str().unwrap()).unwrap();
+        let rows = conn.query_sync("SELECT 1 AS val", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn open_creates_parent_dirs_if_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("sub/dir/test.sqlite3");
+        let conn =
+            open_sqlite_file_with_recovery(db_path.to_str().unwrap()).unwrap();
+        let rows = conn.query_sync("SELECT 1 AS val", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    // ── DbPoolConfig::from_env ──────────────────────────────────────────
+
+    #[test]
+    fn pool_config_from_env_has_defaults() {
+        let config = DbPoolConfig::from_env();
+        assert!(!config.database_url.is_empty() || config.database_url.is_empty()); // just ensure it doesn't panic
+        assert!(config.min_connections > 0);
+        assert!(config.max_connections >= config.min_connections);
+    }
 }

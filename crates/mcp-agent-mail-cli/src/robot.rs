@@ -5320,4 +5320,184 @@ mod tests {
             other => panic!("unexpected navigate result: {other:?}"),
         }
     }
+
+    // ── is_prose_command ────────────────────────────────────────────────
+
+    #[test]
+    fn is_prose_command_thread_is_true() {
+        assert!(is_prose_command("thread"));
+    }
+
+    #[test]
+    fn is_prose_command_message_is_true() {
+        assert!(is_prose_command("message"));
+    }
+
+    #[test]
+    fn is_prose_command_status_is_false() {
+        assert!(!is_prose_command("status"));
+    }
+
+    #[test]
+    fn is_prose_command_inbox_is_false() {
+        assert!(!is_prose_command("inbox"));
+    }
+
+    #[test]
+    fn is_prose_command_outbox_is_false() {
+        assert!(!is_prose_command("outbox"));
+    }
+
+    #[test]
+    fn is_prose_command_empty_string_is_false() {
+        assert!(!is_prose_command(""));
+    }
+
+    #[test]
+    fn is_prose_command_case_sensitive() {
+        assert!(!is_prose_command("Thread"));
+        assert!(!is_prose_command("MESSAGE"));
+    }
+
+    // ── resolve_format ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_format_explicit_json_overrides_prose() {
+        assert_eq!(
+            resolve_format(Some(OutputFormat::Json), "thread"),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn resolve_format_explicit_toon_overrides_prose() {
+        assert_eq!(
+            resolve_format(Some(OutputFormat::Toon), "message"),
+            OutputFormat::Toon
+        );
+    }
+
+    #[test]
+    fn resolve_format_prose_command_without_explicit_returns_markdown() {
+        assert_eq!(
+            resolve_format(None, "thread"),
+            OutputFormat::Markdown
+        );
+        assert_eq!(
+            resolve_format(None, "message"),
+            OutputFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn resolve_format_non_prose_without_explicit_uses_terminal_detection() {
+        // In test context stdout is piped → Json
+        let fmt = resolve_format(None, "status");
+        // When piped (test runner), should be Json; when TTY, Toon.
+        // We accept either since we can't control the test runner's TTY status.
+        assert!(fmt == OutputFormat::Json || fmt == OutputFormat::Toon);
+    }
+
+    #[test]
+    fn resolve_format_explicit_markdown_for_non_prose() {
+        assert_eq!(
+            resolve_format(Some(OutputFormat::Markdown), "status"),
+            OutputFormat::Markdown
+        );
+    }
+
+    // ── format_output ──────────────────────────────────────────────────
+
+    #[test]
+    fn format_output_json_produces_valid_json() {
+        let data = TestData {
+            items: vec!["a".into()],
+            count: 1,
+        };
+        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data);
+        let result = format_output(&envelope, OutputFormat::Json).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 1);
+    }
+
+    #[test]
+    fn format_output_toon_produces_non_empty_string() {
+        let data = TestData {
+            items: vec!["x".into()],
+            count: 42,
+        };
+        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data);
+        let result = format_output(&envelope, OutputFormat::Toon).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn format_output_markdown_falls_back_to_toon_for_non_renderable() {
+        let data = TestData {
+            items: vec![],
+            count: 0,
+        };
+        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data);
+        // Markdown on a non-MarkdownRenderable type falls through to TOON
+        let md_result = format_output(&envelope, OutputFormat::Markdown).unwrap();
+        let toon_result = format_output(&envelope, OutputFormat::Toon).unwrap();
+        assert_eq!(md_result, toon_result);
+    }
+
+    // ── RobotEnvelope builder ──────────────────────────────────────────
+
+    #[test]
+    fn envelope_with_alert_populates_alerts_array() {
+        let data = TestData {
+            items: vec![],
+            count: 0,
+        };
+        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data)
+            .with_alert("warn", "something happened", Some("fix it".into()));
+        let json = serde_json::to_value(&envelope).unwrap();
+        let alerts = json["_alerts"].as_array().unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0]["severity"], "warn");
+        assert_eq!(alerts[0]["summary"], "something happened");
+    }
+
+    #[test]
+    fn envelope_with_action_populates_actions_array() {
+        let data = TestData {
+            items: vec![],
+            count: 0,
+        };
+        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data)
+            .with_action("am robot status");
+        let json = serde_json::to_value(&envelope).unwrap();
+        let actions = json["_actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0], "am robot status");
+    }
+
+    #[test]
+    fn envelope_meta_contains_command() {
+        let data = TestData {
+            items: vec![],
+            count: 0,
+        };
+        let envelope = RobotEnvelope::new("inbox", OutputFormat::Json, data);
+        assert_eq!(envelope._meta.command, "inbox");
+    }
+
+    #[test]
+    fn envelope_chain_multiple_alerts_and_actions() {
+        let data = TestData {
+            items: vec![],
+            count: 0,
+        };
+        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data)
+            .with_alert("error", "a1", None)
+            .with_alert("warn", "a2", Some("fix".into()))
+            .with_action("cmd1")
+            .with_action("cmd2");
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["_alerts"].as_array().unwrap().len(), 2);
+        assert_eq!(json["_actions"].as_array().unwrap().len(), 2);
+    }
 }
