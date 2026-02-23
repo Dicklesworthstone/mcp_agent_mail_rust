@@ -1167,7 +1167,7 @@ impl MessageBrowserScreen {
             } else {
                 let cfg = DbPoolConfig::from_env();
                 if let Ok(path) = cfg.sqlite_path() {
-                    self.db_conn = DbConn::open_file(&path).ok();
+                    self.db_conn = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path).ok();
                     self.db_conn_attempted = true;
                 }
             }
@@ -1205,7 +1205,7 @@ impl MessageBrowserScreen {
         }
         let cfg = DbPoolConfig::from_env();
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = DbConn::open_file(&path).ok();
+            self.db_conn = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path).ok();
             self.db_conn_attempted = true;
         }
     }
@@ -2175,7 +2175,7 @@ impl MessageBrowserScreen {
             ..Default::default()
         };
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = DbConn::open_file(&path).ok();
+            self.db_conn = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path).ok();
         }
     }
 

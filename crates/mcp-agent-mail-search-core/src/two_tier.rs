@@ -896,9 +896,10 @@ impl<'a> TwoTierSearcher<'a> {
     /// Perform fast-only search.
     pub fn search_fast_only(&self, query: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
         let start = Instant::now();
-        let fast_embedder = self.fast_embedder.as_ref().ok_or_else(|| {
-            SearchError::ModeUnavailable("fast embedder not available".into())
-        })?;
+        let fast_embedder = self
+            .fast_embedder
+            .as_ref()
+            .ok_or_else(|| SearchError::ModeUnavailable("fast embedder not available".into()))?;
         let query_vec = fast_embedder.embed(query)?;
         let results = self.index.search_fast(&query_vec, k);
         debug!(

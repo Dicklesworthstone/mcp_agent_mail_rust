@@ -1273,7 +1273,7 @@ fn load_recipes(pool: &DbPool) -> Vec<RecipeView> {
     if path == ":memory:" {
         return Vec::new();
     }
-    let Ok(conn) = mcp_agent_mail_db::DbConn::open_file(path) else {
+    let Ok(conn) = mcp_agent_mail_db::open_sqlite_file_with_recovery(path) else {
         return Vec::new();
     };
     let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();

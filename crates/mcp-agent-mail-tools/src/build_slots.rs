@@ -238,7 +238,10 @@ pub async fn renew_build_slot(
             let holder_id = safe_component(&format!(
                 "{}__{}",
                 current.agent,
-                current.branch.clone().unwrap_or_else(|| "unknown".to_string())
+                current
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
             ));
             let lease_path = slot_path.join(format!("{holder_id}.json"));
 
@@ -288,7 +291,7 @@ pub async fn release_build_slot(
 
     let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
-    
+
     let mut released = false;
     let active = read_active_leases(&slot_path, now);
 
@@ -297,7 +300,10 @@ pub async fn release_build_slot(
             let holder_id = safe_component(&format!(
                 "{}__{}",
                 lease.agent,
-                lease.branch.clone().unwrap_or_else(|| "unknown".to_string())
+                lease
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
             ));
             let lease_path = slot_path.join(format!("{holder_id}.json"));
 

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,12 @@ use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 #[cfg(test)]
 use mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE;
-use mcp_agent_mail_db::sqlmodel_core::{Row, Value};
+use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
+use mcp_agent_mail_db::{
+    ensure_sqlite_file_healthy, ensure_sqlite_file_healthy_with_archive,
+    is_sqlite_recovery_error_message, open_sqlite_file_with_recovery,
+};
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{
@@ -41,6 +46,9 @@ const MAX_CONTACTS: usize = 200;
 const MAX_RESERVATIONS: usize = 1000;
 /// Maximum silent interval before a heartbeat `HealthPulse` is emitted.
 const HEALTH_PULSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// Minimum interval between poller-triggered sqlite recovery attempts per path.
+const POLLER_RECOVERY_MIN_INTERVAL: Duration = Duration::from_secs(15);
+static POLLER_RECOVERY_GATES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 /// Batched aggregate counters used to populate [`DbStatSnapshot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -57,11 +65,32 @@ struct DbSnapshotCounts {
 /// with fewer round-trips.
 struct DbStatQueryBatcher<'a> {
     conn: &'a DbConn,
+    sqlite_path: Option<&'a str>,
 }
 
 impl<'a> DbStatQueryBatcher<'a> {
     const fn new(conn: &'a DbConn) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            sqlite_path: None,
+        }
+    }
+
+    const fn new_with_path(conn: &'a DbConn, sqlite_path: &'a str) -> Self {
+        Self {
+            conn,
+            sqlite_path: Some(sqlite_path),
+        }
+    }
+
+    fn handle_query_error(&self, error: &SqlError) {
+        let message = error.to_string();
+        if !is_sqlite_recovery_error_message(&message) {
+            return;
+        }
+        if let Some(path) = self.sqlite_path {
+            maybe_attempt_sqlite_recovery(path, &message);
+        }
     }
 
     fn fetch_snapshot(&self) -> DbStatSnapshot {
@@ -92,10 +121,15 @@ impl<'a> DbStatQueryBatcher<'a> {
                  AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)) AS ack_pending_count";
         let now = now_micros();
         let reservation_count = self.count_active_reservations(now);
-        let batched = self
-            .conn
-            .query_sync(reservation_count_sql, &[])
-            .ok()
+        let batched_rows = match self.conn.query_sync(reservation_count_sql, &[]) {
+            Ok(rows) => Some(rows),
+            Err(err) => {
+                self.handle_query_error(&err);
+                None
+            }
+        };
+
+        let batched = batched_rows
             .and_then(|rows| rows.into_iter().next())
             .map(|row| {
                 let read_count = |key: &str| {
@@ -149,13 +183,17 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn run_count_query(&self, sql: &str, params: &[Value]) -> Option<u64> {
-        self.conn
-            .query_sync(sql, params)
-            .ok()?
-            .into_iter()
-            .next()
-            .and_then(|row| row.get_named::<i64>("c").ok())
-            .and_then(|v| u64::try_from(v).ok())
+        match self.conn.query_sync(sql, params) {
+            Ok(rows) => rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.get_named::<i64>("c").ok())
+                .and_then(|v| u64::try_from(v).ok()),
+            Err(err) => {
+                self.handle_query_error(&err);
+                None
+            }
+        }
     }
 
     fn count_active_reservations(&self, now: i64) -> u64 {
@@ -167,11 +205,15 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn count_active_reservations_fallback_scan(&self, now: i64) -> u64 {
-        let Ok(rows) = self.conn.query_sync(
+        let rows = match self.conn.query_sync(
             "SELECT expires_ts AS raw_expires_ts, released_ts AS raw_released_ts FROM file_reservations",
             &[],
-        ) else {
-            return 0;
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                self.handle_query_error(&err);
+                return 0;
+            }
         };
         #[cfg(test)]
         if let Some(first) = rows.first() {
@@ -347,14 +389,62 @@ where
     std::panic::catch_unwind(fetcher)
 }
 
+fn maybe_attempt_sqlite_recovery(sqlite_path: &str, reason: &str) {
+    if sqlite_path == ":memory:" {
+        return;
+    }
+
+    let gates = POLLER_RECOVERY_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    {
+        let mut guard = match gates.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(last_attempt) = guard.get(sqlite_path)
+            && now.duration_since(*last_attempt) < POLLER_RECOVERY_MIN_INTERVAL
+        {
+            return;
+        }
+        guard.insert(sqlite_path.to_string(), now);
+    }
+
+    let sqlite_path_buf = Path::new(sqlite_path).to_path_buf();
+    let storage_root = mcp_agent_mail_core::config::env_value("STORAGE_ROOT");
+    let recovery_result = if let Some(root) = storage_root {
+        let root_path = Path::new(&root);
+        if root_path.is_dir() {
+            ensure_sqlite_file_healthy_with_archive(&sqlite_path_buf, root_path)
+        } else {
+            ensure_sqlite_file_healthy(&sqlite_path_buf)
+        }
+    } else {
+        ensure_sqlite_file_healthy(&sqlite_path_buf)
+    };
+
+    match recovery_result {
+        Ok(()) => tracing::warn!(
+            path = %sqlite_path,
+            reason = %reason,
+            "tui poller auto-recovered sqlite file after recoverable query error"
+        ),
+        Err(err) => tracing::warn!(
+            path = %sqlite_path,
+            reason = %reason,
+            error = %err,
+            "tui poller attempted sqlite recovery but it failed"
+        ),
+    }
+}
+
 /// Fetch a complete [`DbStatSnapshot`] from the database.
 ///
 /// Opens a fresh sync connection, runs aggregate queries, and returns
 /// the snapshot.  On any error, returns `None` so callers can keep the
 /// previous snapshot instead of clearing existing data.
 fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
-    let conn = open_sync_connection(database_url)?;
-    Some(DbStatQueryBatcher::new(&conn).fetch_snapshot())
+    let (conn, sqlite_path) = open_sync_connection_with_path(database_url)?;
+    Some(DbStatQueryBatcher::new_with_path(&conn, &sqlite_path).fetch_snapshot())
 }
 
 /// Open a sync `SQLite` connection from a database URL (public for compose dispatch).
@@ -365,6 +455,10 @@ pub fn open_sync_connection_pub(database_url: &str) -> Option<DbConn> {
 
 /// Open a sync `SQLite` connection from a database URL.
 fn open_sync_connection(database_url: &str) -> Option<DbConn> {
+    open_sync_connection_with_path(database_url).map(|(conn, _)| conn)
+}
+
+fn open_sync_connection_with_path(database_url: &str) -> Option<(DbConn, String)> {
     // `:memory:` URLs would create a brand-new private DB per poll cycle,
     // which diverges from the server pool and yields misleading empty
     // snapshots. Skip polling in that mode instead of reporting false zeros.
@@ -388,7 +482,20 @@ fn open_sync_connection(database_url: &str) -> Option<DbConn> {
             path = absolute_candidate.to_string_lossy().into_owned();
         }
     }
-    DbConn::open_file(&path).ok()
+    match open_sqlite_file_with_recovery(&path) {
+        Ok(conn) => Some((conn, path)),
+        Err(err) => {
+            let err_msg = err.to_string();
+            if is_sqlite_recovery_error_message(&err_msg) {
+                maybe_attempt_sqlite_recovery(&path, &err_msg);
+                open_sqlite_file_with_recovery(&path)
+                    .ok()
+                    .map(|conn| (conn, path))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Fetch the agent list ordered by most recently active.

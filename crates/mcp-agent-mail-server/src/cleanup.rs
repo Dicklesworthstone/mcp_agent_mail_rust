@@ -387,11 +387,13 @@ fn write_cleanup_artifacts(
         if let Some(id) = row.id {
             if released_ids.contains(&id) {
                 // We need the agent name, which isn't in FileReservationRow, so we look it up
-                let agent_name = match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {
+                let agent_name = match block_on(async {
+                    queries::get_agent_by_id(cx, pool, row.agent_id).await
+                }) {
                     Outcome::Ok(agent) => agent.name,
                     _ => format!("agent_{}", row.agent_id),
                 };
-                
+
                 res_jsons.push(serde_json::json!({
                     "id": id,
                     "agent": agent_name,

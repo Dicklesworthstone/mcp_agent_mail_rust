@@ -48,7 +48,8 @@ pub(crate) struct ReservationIndex {
 impl ReservationIndex {
     /// Build an index from an iterator of `(raw_pattern, reservation_ref)` pairs.
     pub fn build(reservations: impl Iterator<Item = (String, ReservationRef)>) -> Self {
-        let mut exact_by_prefix: HashMap<String, Vec<(CompiledPattern, ReservationRef)>> = HashMap::new();
+        let mut exact_by_prefix: HashMap<String, Vec<(CompiledPattern, ReservationRef)>> =
+            HashMap::new();
         let mut globs_by_prefix: HashMap<String, Vec<(CompiledPattern, ReservationRef)>> =
             HashMap::new();
         let mut root_globs: Vec<(CompiledPattern, ReservationRef)> = Vec::new();
@@ -125,9 +126,7 @@ impl ReservationIndex {
             // We use patterns_overlap to handle directory prefix overlaps (e.g. `src` vs `src/main.rs`).
             if let Some(entries) = self.exact_by_prefix.get(prefix) {
                 for (exact_pat, rref) in entries {
-                    if exact_pat.normalized() == req_norm
-                        || exact_pat.overlaps(request_pat)
-                    {
+                    if exact_pat.normalized() == req_norm || exact_pat.overlaps(request_pat) {
                         conflicts.push(rref);
                     }
                 }
@@ -135,9 +134,7 @@ impl ReservationIndex {
             // Also check exact entries with empty prefix (root-level exact paths).
             if let Some(entries) = self.exact_by_prefix.get("") {
                 for (exact_pat, rref) in entries {
-                    if exact_pat.normalized() == req_norm
-                        || exact_pat.overlaps(request_pat)
-                    {
+                    if exact_pat.normalized() == req_norm || exact_pat.overlaps(request_pat) {
                         conflicts.push(rref);
                     }
                 }
@@ -155,9 +152,7 @@ impl ReservationIndex {
             // Root exact request (no prefix): must check ALL groups because it acts as a directory prefix for everything.
             for entries in self.exact_by_prefix.values() {
                 for (exact_pat, rref) in entries {
-                    if exact_pat.normalized() == req_norm
-                        || exact_pat.overlaps(request_pat)
-                    {
+                    if exact_pat.normalized() == req_norm || exact_pat.overlaps(request_pat) {
                         conflicts.push(rref);
                     }
                 }

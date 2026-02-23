@@ -603,7 +603,7 @@ impl ReservationsScreen {
             }
         };
 
-        let conn = match mcp_agent_mail_db::DbConn::open_file(&path) {
+        let conn = match mcp_agent_mail_db::open_sqlite_file_with_recovery(&path) {
             Ok(conn) => conn,
             Err(err) => {
                 self.fallback_issue = Some(format!(

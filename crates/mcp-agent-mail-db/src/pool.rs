@@ -798,7 +798,11 @@ fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
 }
 
 #[allow(clippy::result_large_err)]
-async fn run_sqlite_init_once(cx: &Cx, sqlite_path: &str, run_migrations: bool) -> Outcome<(), SqlError> {
+async fn run_sqlite_init_once(
+    cx: &Cx,
+    sqlite_path: &str,
+    run_migrations: bool,
+) -> Outcome<(), SqlError> {
     let mig_conn = match DbConn::open_file(sqlite_path) {
         Ok(conn) => conn,
         Err(err) => return Outcome::Err(err),
@@ -1016,7 +1020,8 @@ fn sqlite_table_has_column(conn: &DbConn, table: &str, column: &str) -> Result<b
 fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
     let messages_has_ack_required = sqlite_table_has_column(conn, "messages", "ack_required")?;
     let recipients_has_ack_ts = sqlite_table_has_column(conn, "message_recipients", "ack_ts")?;
-    let recipients_has_message_id = sqlite_table_has_column(conn, "message_recipients", "message_id")?;
+    let recipients_has_message_id =
+        sqlite_table_has_column(conn, "message_recipients", "message_id")?;
 
     // Skip schema-specific smoke probes on partially initialized/legacy schemas.
     if !(messages_has_ack_required && recipients_has_ack_ts && recipients_has_message_id) {
@@ -1076,7 +1081,9 @@ fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
         Ok(ok) => Ok(ok),
         Err(e) => {
             let msg = e.to_string();
-            if is_corruption_error_message(&msg) || msg.to_ascii_lowercase().contains("out of memory") {
+            if is_corruption_error_message(&msg)
+                || msg.to_ascii_lowercase().contains("out of memory")
+            {
                 return Ok(false);
             }
             Err(e)
@@ -2422,7 +2429,9 @@ mod tests {
         assert!(is_sqlite_recovery_error_message(
             "database disk image is malformed"
         ));
-        assert!(is_sqlite_recovery_error_message("Query error: out of memory"));
+        assert!(is_sqlite_recovery_error_message(
+            "Query error: out of memory"
+        ));
         assert!(is_sqlite_recovery_error_message("cursor stack is empty"));
         assert!(is_sqlite_recovery_error_message(
             "called `Option::unwrap()` on a `None` value"

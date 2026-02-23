@@ -2161,7 +2161,7 @@ fn coalescer_commit_batch(
         );
 
         coalescer_commit_with_retry(repo_root, &config, &combined_msg, &merged_paths)
-            .map(|()| requests.len())
+            .map(|()| (1, requests.len()))
     } else if requests.len() == 1 {
         // Single request — commit directly
         coalescer_commit_with_retry(
@@ -2170,7 +2170,7 @@ fn coalescer_commit_batch(
             &requests[0].message,
             &requests[0].rel_paths,
         )
-        .map(|()| 1)
+        .map(|()| (1, 1))
     } else {
         // Path conflicts — commit sequentially
         let mut total = 0;
@@ -2193,24 +2193,26 @@ fn coalescer_commit_batch(
             );
             Err(e)
         } else {
-            Ok(total)
+            Ok((total, total))
         }
     };
 
     // Update stats
     match commit_result {
-        Ok(batch_size) => {
+        Ok((num_commits, batched_items)) => {
             let mut s = stats
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.commits += 1;
-            s.batched += batch_size;
+            s.commits += num_commits;
+            s.batched += batched_items;
 
             let mut sizes = batch_sizes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            sizes.push_back(batch_size);
-            if sizes.len() > 100 {
+            for _ in 0..num_commits {
+                sizes.push_back(batched_items / num_commits);
+            }
+            while sizes.len() > 100 {
                 sizes.pop_front();
             }
             let avg = if sizes.is_empty() {
@@ -2955,11 +2957,19 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
                     use fs2::FileExt;
                     if f.try_lock_exclusive().is_ok() {
-                        // Drop the flock handle BEFORE removing, to avoid
-                        // the race where another process opens + locks between
-                        // our delete and our drop.
-                        drop(f);
-                        if std::fs::remove_file(&path).is_ok() {
+                        let mut removed = false;
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => removed = true,
+                            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                                // Windows can require closing/unlocking first before unlinking.
+                                let _ = f.unlock();
+                                drop(f);
+                                removed = std::fs::remove_file(&path).is_ok();
+                            }
+                            Err(_) => {}
+                        }
+                        
+                        if removed {
                             result.locks_removed.push(path.display().to_string());
                             // Try to remove corresponding metadata file
                             let name = path.file_name().unwrap_or_default().to_string_lossy();

@@ -12,10 +12,10 @@
 #![forbid(unsafe_code)]
 
 use mcp_agent_mail_core::{Config, kpi_record_sample};
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::now_micros;
+use mcp_agent_mail_db::{DbConn, open_sqlite_file_with_recovery};
 use mcp_agent_mail_tools::{
     MetricsSnapshotEntry, reset_tool_latencies, slow_tools, tool_metrics_snapshot,
 };
@@ -192,7 +192,7 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
-    let conn = DbConn::open_file(&path).ok()?;
+    let conn = open_sqlite_file_with_recovery(&path).ok()?;
     let _ = conn.execute_raw("PRAGMA busy_timeout = 60000;");
     Some(conn)
 }

@@ -124,7 +124,10 @@ where
         K: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        matches!(self.index.get(key), Some(Node::Small { .. } | Node::Main { .. }))
+        matches!(
+            self.index.get(key),
+            Some(Node::Small { .. } | Node::Main { .. })
+        )
     }
 
     /// Insert a key-value pair into the cache.
@@ -216,7 +219,7 @@ where
             let Some(key) = self.small.pop_front() else {
                 break;
             };
-            
+
             let (value, freq) = match self.index.remove(&key) {
                 Some(Node::Small { value, freq }) => (value, freq),
                 _ => continue,
@@ -245,7 +248,7 @@ where
             let Some(key) = self.main.pop_front() else {
                 break;
             };
-            
+
             let (value, freq) = match self.index.remove(&key) {
                 Some(Node::Main { value, freq }) => (value, freq),
                 _ => continue,

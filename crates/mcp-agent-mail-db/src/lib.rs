@@ -46,6 +46,7 @@ pub use models::*;
 pub use pool::{
     DbPool, DbPoolConfig, auto_pool_size, create_pool, ensure_sqlite_file_healthy,
     ensure_sqlite_file_healthy_with_archive, get_or_create_pool, is_corruption_error_message,
+    is_sqlite_recovery_error_message, open_sqlite_file_with_recovery,
 };
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use reconstruct::{ReconstructStats, reconstruct_from_archive};

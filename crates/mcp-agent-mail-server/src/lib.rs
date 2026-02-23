@@ -3049,7 +3049,7 @@ fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
     let Ok(path) = cfg.sqlite_path() else {
         return DashboardDbStats::default();
     };
-    let Ok(conn) = mcp_agent_mail_db::DbConn::open_file(&path) else {
+    let Ok(conn) = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path) else {
         return DashboardDbStats::default();
     };
     let agents_list = conn
