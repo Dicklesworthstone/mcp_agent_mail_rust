@@ -818,8 +818,8 @@ impl Default for Config {
             tui_screen_reader: false,
             tui_keymap_profile: "default".to_string(),
             tui_active_preset: "default".to_string(),
-            tui_effects: false,
-            tui_ambient: "off".to_string(),
+            tui_effects: true,
+            tui_ambient: "subtle".to_string(),
             tui_debug: false,
             export_dir: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -2795,8 +2795,8 @@ mod tests {
     #[test]
     fn tui_v3_defaults() {
         let config = Config::default();
-        assert!(!config.tui_effects);
-        assert_eq!(config.tui_ambient, "off");
+        assert!(config.tui_effects);
+        assert_eq!(config.tui_ambient, "subtle");
         assert!(!config.tui_debug);
         let expected_export_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -2842,7 +2842,7 @@ mod tests {
             ("AM_TUI_THEME", "matrix"),
         ]);
         let config = Config::from_env();
-        assert_eq!(config.tui_ambient, "off");
+        assert_eq!(config.tui_ambient, "subtle");
         let expected_export_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".mcp_agent_mail")
