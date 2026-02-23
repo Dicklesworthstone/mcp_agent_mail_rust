@@ -54,11 +54,13 @@ use crate::tui_widgets::{
     AmbientEffectRenderer, AmbientHealthInput, AmbientMode, AmbientRenderTelemetry,
 };
 
-/// How often the TUI ticks (33 ms ≈ 30 fps).
+/// How often the TUI ticks (100 ms ≈ 10 fps).
 ///
-/// 30 fps is more than adequate for a TUI and halves terminal output compared
-/// to 60 fps.  Input latency stays imperceptible (< 50 ms round-trip).
-const TICK_INTERVAL: Duration = Duration::from_millis(33);
+/// 10 fps is more than adequate for a data-dashboard TUI.  Input latency
+/// stays imperceptible (< 120 ms round-trip including terminal I/O).
+/// Previous 33 ms (30 fps) caused excessive terminal writes and visible
+/// flashing, especially with ambient effects enabled.
+const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
@@ -72,17 +74,16 @@ const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
 const PALETTE_DB_CACHE_TTL_MICROS: i64 = 5 * 1_000_000;
 const PALETTE_USAGE_HALF_LIFE_MICROS: i64 = 60 * 60 * 1_000_000;
 const SCREEN_TRANSITION_TICKS: u8 = 2;
-const TOAST_ENTRANCE_TICKS: u8 = 10;
-const TOAST_EXIT_TICKS: u8 = 7;
+const TOAST_ENTRANCE_TICKS: u8 = 3;
+const TOAST_EXIT_TICKS: u8 = 2;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
 const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
-/// Ambient effects only re-render every Nth frame.  At 30 fps this means the
-/// plasma/fire/metaball animation updates at ~5 fps, which is more than enough
-/// for a subtle background effect and eliminates the per-frame full-screen diff
-/// that was causing visible flashing and high CPU usage.
-const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 6;
+/// Ambient effects only re-render every Nth frame.  At 10 fps with N=2 the
+/// animation updates at ~5 fps, which is imperceptibly smooth for a subtle
+/// background wash while keeping terminal output minimal on intervening frames.
+const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 2;
 
 fn command_palette_theme_style() -> PaletteStyle {
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -3020,7 +3021,7 @@ impl MailAppModel {
                                 .duration(Duration::from_secs(2)),
                         );
                         // Execute all steps immediately.
-                        self.execute_macro_steps();
+                        return Some(self.execute_macro_steps());
                     }
                     return Some(Cmd::none());
                 }
@@ -3040,7 +3041,7 @@ impl MailAppModel {
                 if let Some(name) = id.strip_prefix(macro_ids::DRY_RUN_PREFIX) {
                     // Use the playback engine so dry-run leaves a structured log for forensics.
                     if self.macro_engine.start_playback(name, PlaybackMode::DryRun) {
-                        self.execute_macro_steps();
+                        return Some(self.execute_macro_steps());
                     }
                     if let Some(steps) = self.macro_engine.preview(name) {
                         let preview: Vec<String> = steps
@@ -3072,7 +3073,8 @@ impl MailAppModel {
     }
 
     /// Execute all remaining steps in a continuous-mode macro.
-    fn execute_macro_steps(&mut self) {
+    fn execute_macro_steps(&mut self) -> Cmd<MailMsg> {
+        let mut cmds = Vec::new();
         loop {
             match self.macro_engine.next_step() {
                 Some((action_id, PlaybackMode::DryRun)) => {
@@ -3087,11 +3089,12 @@ impl MailAppModel {
                         // Should not happen, but guard against it.
                         break;
                     }
-                    let _ = self.dispatch_palette_action_from_macro(&action_id);
+                    cmds.push(self.dispatch_palette_action_from_macro(&action_id));
                 }
                 None => break,
             }
         }
+        Cmd::batch(cmds)
     }
 }
 
@@ -3210,12 +3213,12 @@ impl Model for MailAppModel {
 
                 // Drain deferred confirmed actions (from modal callbacks).
                 // Side-effects (toast, navigation) are applied inside
-                // `dispatch_execute_operation`; we discard the returned Cmd
-                // because the tick handler must always return Cmd::tick.
-                let _ = self.drain_deferred_confirmed_action();
+                // `dispatch_execute_operation`.
+                let deferred_cmd = self.drain_deferred_confirmed_action();
 
                 // Drain browser-ingress events and process them through the
                 // same terminal handling path as local input.
+                let mut remote_cmds = Vec::new();
                 let remote_events = self
                     .state
                     .drain_remote_terminal_events(REMOTE_EVENTS_PER_TICK);
@@ -3225,10 +3228,13 @@ impl Model for MailAppModel {
                         if matches!(cmd, Cmd::Quit) {
                             return Cmd::quit();
                         }
+                        remote_cmds.push(cmd);
                     }
                 }
 
-                Cmd::tick(TICK_INTERVAL)
+                let mut all_cmds = vec![Cmd::tick(TICK_INTERVAL), deferred_cmd];
+                all_cmds.extend(remote_cmds);
+                Cmd::batch(all_cmds)
             }
 
             // ── Terminal events (key, mouse, resize, etc.) ─────────
@@ -3346,7 +3352,7 @@ impl Model for MailAppModel {
                     match key.code {
                         KeyCode::Enter => {
                             if let Some(action_id) = self.macro_engine.confirm_step() {
-                                let _ = self.dispatch_palette_action_from_macro(&action_id);
+                                let cmd = self.dispatch_palette_action_from_macro(&action_id);
                                 // Show progress toast.
                                 if let Some(label) =
                                     self.macro_engine.playback_state().status_label()
@@ -3357,6 +3363,7 @@ impl Model for MailAppModel {
                                             .duration(Duration::from_secs(3)),
                                     );
                                 }
+                                return cmd;
                             }
                             return Cmd::none();
                         }
@@ -3727,24 +3734,31 @@ impl Model for MailAppModel {
                         return map_screen_cmd(cmd);
                     }
                 }
-                // Fallback to global dispatch (e.g. for toast-only actions or cross-cutting concerns).
-                // Note: deeply nested recursion is prevented because global dispatch returns
-                // Cmd::none() for unknown actions, or specific Cmds for known ones.
-                // However, if global dispatch emits ActionExecute for the SAME op, we loop.
-                // We must ensure global dispatch only emits ActionExecute for ops it expects
-                // the screen to handle *via the next loop*, or handle them directly.
-                //
-                // Actually, dispatch_execute_operation emits ActionExecute for "acknowledge", etc.
-                // So if the screen didn't handle it above, we call dispatch_execute_operation,
-                // which emits ActionExecute, which comes back here... LOOP.
-                //
-                // Fix: Only call dispatch_execute_operation if it's NOT one of the screen-delegated ops
-                // that we just failed to handle.
-                // Or better: dispatch_execute_operation should be the *origin* of these messages,
-                // not the fallback handler.
-                //
-                // If the screen didn't handle it, and it's a batch action, we should log a warning.
-                // But dispatch_execute_operation handles "view_body" etc internally.
+
+                // Avoid infinite loop if the screen didn't handle a server-dispatched operation
+                let cmd_name = op.split_once(':').map_or(op.as_str(), |(c, _)| c);
+                if matches!(
+                    cmd_name,
+                    "acknowledge"
+                        | "mark_read"
+                        | "renew"
+                        | "release"
+                        | "force_release"
+                        | "summarize"
+                        | "approve_contact"
+                        | "deny_contact"
+                        | "block_contact"
+                        | "batch_acknowledge"
+                        | "batch_mark_read"
+                        | "batch_mark_unread"
+                ) {
+                    self.notifications.notify(
+                        Toast::new(format!("Action not supported on this screen: {cmd_name}"))
+                            .icon(ToastIcon::Warning)
+                            .duration(Duration::from_secs(3)),
+                    );
+                    return Cmd::none();
+                }
 
                 self.dispatch_execute_operation(op, ctx)
             }
@@ -3776,10 +3790,9 @@ impl Model for MailAppModel {
         // positive when on schedule and drops toward 0 only when frames are
         // arriving significantly late (2× the expected interval or more).
         //
-        // Note: TICK_INTERVAL is set to 33ms (~30fps) to reduce terminal write
-        // pressure while keeping interactions smooth.
-        // and responsive input handling. The Bayesian diff strategy uses this
-        // budget to decide whether to skip frames under load.
+        // TICK_INTERVAL is 100ms (~10fps) — adequate for a data-dashboard TUI.
+        // The Bayesian diff strategy uses this budget to decide whether to
+        // skip frames under load.
         let tick_budget_ms = TICK_INTERVAL.as_secs_f64() * 1000.0;
         let now = Instant::now();
         let budget_remaining_ms = self.last_view_instant.get().map_or(tick_budget_ms, |prev| {
@@ -3828,12 +3841,10 @@ impl Model for MailAppModel {
         Paragraph::new("")
             .style(Style::default().bg(tp.bg_deep))
             .render(area, frame);
-        // Throttle ambient effects to every Nth frame.  Animated effects
-        // (plasma, fire, metaballs) change every cell's bg color, defeating
-        // the diff engine and causing full-screen terminal writes on every
-        // frame.  By only re-rendering every 6th frame the ambient animation
-        // runs at ~5 fps which is imperceptibly smooth for a subtle background
-        // wash while keeping terminal output minimal on intervening frames.
+        // Throttle ambient effects to every Nth frame.  At 10fps with N=2
+        // the animation updates at ~5 fps.  On intervening frames,
+        // render_cached replays the previous buffer so the diff engine only
+        // sees cell changes from widget updates, not ambient animation.
         let should_render_ambient = self
             .tick_count
             .is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES)
@@ -9549,33 +9560,29 @@ mod tests {
 
     #[test]
     fn toast_entrance_slide_progresses_over_ticks() {
-        // TOAST_ENTRANCE_TICKS=10, formula: (10 - age) * 2
-        assert_eq!(entrance_slide_columns(0), 20);
-        assert_eq!(entrance_slide_columns(1), 18);
-        assert_eq!(entrance_slide_columns(2), 16);
-        assert_eq!(entrance_slide_columns(3), 14);
-        assert_eq!(entrance_slide_columns(4), 12);
-        assert_eq!(entrance_slide_columns(9), 2);
+        // TOAST_ENTRANCE_TICKS=3, formula: (3 - age) * 2
+        assert_eq!(entrance_slide_columns(0), 6); // (3-0)*2
+        assert_eq!(entrance_slide_columns(1), 4); // (3-1)*2
+        assert_eq!(entrance_slide_columns(2), 2); // (3-2)*2
+        assert_eq!(entrance_slide_columns(3), 0); // fully entered
     }
 
     #[test]
     fn toast_exit_fade_levels_progress_over_ticks() {
-        // TOAST_EXIT_TICKS=7, formula: 7 - remaining + 1 (if 1..=7)
+        // TOAST_EXIT_TICKS=2, formula: 2 - remaining + 1 (if 1..=2)
         assert_eq!(exit_fade_level(None), 0);
-        assert_eq!(exit_fade_level(Some(7)), 1); // 7-7+1
-        assert_eq!(exit_fade_level(Some(3)), 5); // 7-3+1
-        assert_eq!(exit_fade_level(Some(2)), 6); // 7-2+1
-        assert_eq!(exit_fade_level(Some(1)), 7); // 7-1+1
+        assert_eq!(exit_fade_level(Some(2)), 1); // 2-2+1
+        assert_eq!(exit_fade_level(Some(1)), 2); // 2-1+1
         assert_eq!(exit_fade_level(Some(0)), 0);
     }
 
     #[test]
     fn toast_remaining_ticks_rounds_up() {
-        // TICK_INTERVAL=33ms, formula: ceil(ms / 33)
+        // TICK_INTERVAL=100ms, formula: ceil(ms / 100)
         assert_eq!(remaining_ticks_from_duration(Duration::from_millis(1)), 1);
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 3); // ceil(99/33)
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 4); // ceil(100/33)
-        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 4); // ceil(101/33)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 1); // ceil(99/100)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 1); // ceil(100/100)
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 2); // ceil(101/100)
     }
 
     #[test]
@@ -9599,7 +9606,7 @@ mod tests {
             .expect("toast border should be rendered");
 
         assert!(
-            first_non_space >= 9,
+            first_non_space >= 3,
             "expected entrance offset to shift toast right, got column {first_non_space}",
         );
     }

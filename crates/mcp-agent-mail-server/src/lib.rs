@@ -744,9 +744,7 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
                 }
                 Ok(_) => {} // nothing to backfill or already up-to-date
                 Err(err) => {
-                    tracing::warn!(
-                        "[startup-search] Tantivy backfill failed (non-fatal): {err}"
-                    );
+                    tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
                 }
             }
         }
@@ -1676,20 +1674,17 @@ fn should_force_mux_left_split(
 }
 
 fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
-    // Bias toward full redraw on any dirty frame to eliminate stale-glyph
-    // artifacts from aggressive diff minimization on complex multi-pane UIs.
-    let redraw_biased = ftui_runtime::DiffStrategyConfig {
-        c_emit: 0.0,
-        hysteresis_ratio: 0.0,
-        uncertainty_guard_variance: 0.0,
-        ..Default::default()
-    };
+    // Use the well-calibrated ftui defaults for Bayesian diff strategy.
+    // The default c_emit=6.0 reflects real I/O cost (emit ~6× more expensive
+    // than scan), so the optimizer naturally prefers incremental diffs over
+    // full redraws.  dirty_spans + tile_skip further reduce terminal writes
+    // for sparse updates.  hysteresis_ratio=0.05 prevents strategy thrashing,
+    // and uncertainty_guard keeps incremental updates when change-rate is
+    // uncertain.
+    //
+    // Previous config (c_emit=0.0, no spans, no tiles) forced full terminal
+    // rewrites every frame (~30/s), causing visible flashing and ~20% CPU.
     ftui_runtime::terminal_writer::RuntimeDiffConfig::default()
-        .with_bayesian_enabled(true)
-        .with_dirty_rows_enabled(true)
-        .with_dirty_spans_enabled(false)
-        .with_tile_skip_enabled(false)
-        .with_strategy_config(redraw_biased)
 }
 
 struct StartupDashboard {

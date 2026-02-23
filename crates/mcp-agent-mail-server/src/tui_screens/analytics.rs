@@ -151,6 +151,9 @@ pub struct AnalyticsScreen {
     severity_filter: AnalyticsSeverityFilter,
     sort_mode: AnalyticsSortMode,
     focus: AnalyticsFocus,
+    /// Cached viz snapshot — rebuilt in `tick()`, read in `view()`.
+    /// Prevents `view()` from doing I/O (DB queries, connection opens) every frame.
+    cached_viz: AnalyticsVizSnapshot,
 }
 
 impl AnalyticsScreen {
@@ -173,6 +176,7 @@ impl AnalyticsScreen {
             severity_filter: AnalyticsSeverityFilter::All,
             sort_mode: AnalyticsSortMode::Priority,
             focus: AnalyticsFocus::List,
+            cached_viz: AnalyticsVizSnapshot::default(),
         }
     }
 
@@ -1463,13 +1467,12 @@ fn render_viz_metric_tile(
 fn render_runtime_viz_fallback(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &TuiSharedState,
+    snapshot: &AnalyticsVizSnapshot,
     focus: AnalyticsFocus,
     filter: AnalyticsSeverityFilter,
     sort_mode: AnalyticsSortMode,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let snapshot = build_runtime_viz_snapshot(state);
     let title = format!(
         " Analytics Data Viz · {} · {} · {} ",
         focus.label(),
@@ -1843,20 +1846,22 @@ impl MailScreen for AnalyticsScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let tp = crate::tui_theme::TuiThemePalette::current();
         fill_rect(frame, area, tp.bg_deep);
-        let runtime_snapshot = build_runtime_viz_snapshot(state);
+        // Use the cached viz snapshot (rebuilt in tick()) — no I/O in the render path.
+        let runtime_snapshot = &self.cached_viz;
         let runtime_has_signal = runtime_snapshot.total_calls > 0
             || runtime_snapshot.total_errors > 0
             || runtime_snapshot.persisted_samples > 0
-            || state
-                .sparkline_snapshot()
-                .iter()
-                .any(|sample| *sample > 0.0);
+            || !runtime_snapshot.sparkline.is_empty()
+                && runtime_snapshot
+                    .sparkline
+                    .iter()
+                    .any(|sample| *sample > 0.0);
 
         let mut cards_area = area;
         let viz_band_h = if area.height >= ANALYTICS_VIZ_BAND_MIN_HEIGHT {
@@ -1872,7 +1877,7 @@ impl MailScreen for AnalyticsScreen {
             render_runtime_viz_fallback(
                 frame,
                 viz_area,
-                state,
+                runtime_snapshot,
                 self.focus,
                 self.severity_filter,
                 self.sort_mode,
@@ -1891,14 +1896,14 @@ impl MailScreen for AnalyticsScreen {
                 render_runtime_viz_fallback(
                     frame,
                     area,
-                    state,
+                    runtime_snapshot,
                     self.focus,
                     self.severity_filter,
                     self.sort_mode,
                 );
             }
             if cards_area.height > 0 {
-                render_empty_state(frame, cards_area, &runtime_snapshot, runtime_has_signal);
+                render_empty_state(frame, cards_area, runtime_snapshot, runtime_has_signal);
             }
             return;
         }
@@ -1907,7 +1912,7 @@ impl MailScreen for AnalyticsScreen {
                 render_runtime_viz_fallback(
                     frame,
                     area,
-                    state,
+                    runtime_snapshot,
                     self.focus,
                     self.severity_filter,
                     self.sort_mode,
@@ -2070,7 +2075,7 @@ impl MailScreen for AnalyticsScreen {
                         render_runtime_viz_fallback(
                             frame,
                             detail_viz,
-                            state,
+                            runtime_snapshot,
                             self.focus,
                             self.severity_filter,
                             self.sort_mode,
@@ -2217,6 +2222,8 @@ impl MailScreen for AnalyticsScreen {
             .is_none_or(|last| tick_count.wrapping_sub(last) >= REFRESH_INTERVAL_TICKS);
         if should_refresh {
             self.refresh_feed(Some(state));
+            // Rebuild viz snapshot here (in tick) so view() never does I/O.
+            self.cached_viz = build_runtime_viz_snapshot(state);
             self.last_refresh_tick = Some(tick_count);
         }
     }
