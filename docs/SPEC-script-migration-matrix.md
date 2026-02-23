@@ -228,6 +228,57 @@ Notes:
 
 ---
 
+## Cross-Platform Native Command Matrix (T10.8)
+
+Canonical portability gate for migrated native command surfaces runs in
+`.github/workflows/ci.yml` job `native-command-matrix` across:
+
+- `ubuntu-latest`
+- `macos-latest`
+- `windows-latest`
+
+### Matrix Coverage
+
+| Case ID | Command | Sensitivity exercised |
+|---------|---------|-----------------------|
+| `ci_help` | `am ci --help` | Core command wiring + clap help rendering |
+| `flake_triage_help` | `am flake-triage --help` | Subcommand registration + output stability |
+| `bench_help` | `am bench --help` | Nested command parsing |
+| `check_inbox_help` | `am check-inbox --help` | Legacy-hook replacement command surface |
+| `golden_verify_help` | `am golden verify --help` | Nested migration command path |
+| `serve_http_help` | `am serve-http --help` | Serve options + transport flags |
+| `e2e_run_help` | `am e2e run --help` | Native E2E entrypoint contract |
+| `share_wizard_help` | `am share wizard --help` | Share wizard native flow |
+| `share_verify_live_help` | `am share deploy verify-live --help` | Deploy validation command surface |
+| `doctor_check_help` | `am doctor check --help` | Diagnostics command path |
+| `check_inbox_direct_json` | `am check-inbox --direct --json --project <cwd> --agent MatrixProbe --rate-limit 0` | Project path normalization + JSON/newline output stability |
+| `config_set_port_envfile` | `am config set-port 8765 --env-file "<artifact_root>/tmp env file.env"` | Filesystem path quoting + env-file handling |
+| `config_show_port` | `am config show-port` | Config read path portability after env-file mutation |
+
+This matrix intentionally mixes help-surface checks with functional probes so
+platform-sensitive behavior is exercised across path normalization, quoting,
+encoding/newline-safe JSON output, and env-file read/write flows.
+
+### Artifact Contract
+
+Per-OS artifacts are required under:
+`tests/artifacts/cli/native_command_matrix/<os>/`
+
+Required files:
+- `environment.json` (runner fingerprint + timestamp)
+- `summary.json` (total/pass/fail + per-case timing)
+- `commands/<case_id>/command.txt`
+- `commands/<case_id>/stdout.txt`
+- `commands/<case_id>/stderr.txt`
+- `commands/<case_id>/exit_code.txt`
+- `commands/<case_id>/timing_ms.txt`
+
+Failure policy:
+- Any non-zero `exit_code` in any case fails the matrix job.
+- `skip-guard` treats `native-command-matrix` as required for CI success.
+
+---
+
 ## UX Consistency Smoke Suite (T10.7)
 
 To prevent migration regressions in operator-facing UX, run:
@@ -307,6 +358,51 @@ If rollback is triggered:
 - [ ] Release checklist references rollback trigger/steps and artifact evidence requirements.
 - [ ] CI/gate commands remain native-first with no contradictory script-only workflow.
 - [ ] At least one deterministic reproduction path exists per shim.
+
+---
+
+## CI Workflow Cutover Status (br-2rfq)
+
+**Date:** 2026-02-23
+
+GitHub Actions workflow jobs have been cut over to native `am e2e run` invocations
+where safe and where the native runner supports the required artifact semantics.
+
+### `.github/workflows/ci.yml`
+
+| Job | Step | Before | After | Status |
+|-----|------|--------|-------|--------|
+| `e2e-dual-mode` | E2E dual-mode suite | `bash scripts/e2e_dual_mode.sh` | `am e2e run --project . dual_mode` | **Migrated** |
+| `e2e-dual-mode` | E2E mode matrix suite | `bash scripts/e2e_mode_matrix.sh` | `am e2e run --project . mode_matrix` | **Migrated** |
+| `e2e-dual-mode` | E2E web parity suite | `bash tests/e2e/test_http.sh` | `am e2e run --project . http` | **Migrated** |
+| `e2e-dual-mode` | E2E static export | `bash tests/e2e/test_share.sh` | `am e2e run --project . share` | **Migrated** |
+| `perf-security` | Soak harness (quick) | `bash tests/e2e/test_soak_harness.sh --quick` | `am e2e run --project . soak_harness` (env vars) | **Migrated** |
+| `search-v3-e2e` | Search V3 suites | 5× `bash tests/e2e/test_search_v3_*.sh` | `am e2e run --project . search_v3_*` (single invocation) | **Migrated** |
+
+### `.github/workflows/search-v3-weekly.yml`
+
+| Step | Before | After | Status |
+|------|--------|-------|--------|
+| Weekly bundle | `scripts/e2e_search_v3_weekly_bundle.sh --strict-freshness` | (unchanged) | **Retained** |
+
+**Rationale for retaining weekly bundle:** The orchestration script provides
+`--strict-freshness` validation and weekly-specific rollup reports that the native
+runner does not replicate. Individual suites within it are exercised by the native
+runner in the main CI workflow.
+
+### Artifact Validation Steps
+
+`source scripts/e2e_lib.sh; e2e_validate_bundle_tree tests/artifacts` calls remain
+unchanged across all workflow jobs. No native `am e2e validate-bundle` command
+exists; the bash utility function is the authoritative artifact validator.
+
+### Rollback Path
+
+If any native runner invocation regresses versus the prior script-based execution:
+1. Replace `am e2e run --project . <suite>` with `bash tests/e2e/test_<suite>.sh`
+   (or `bash scripts/e2e_<suite>.sh` for scripts/ directory suites).
+2. Open incident bead documenting the regression.
+3. Revalidate artifact contract before restoring native path.
 
 ---
 

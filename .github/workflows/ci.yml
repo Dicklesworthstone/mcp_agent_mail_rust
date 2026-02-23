@@ -104,6 +104,134 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # ── Cross-platform native command matrix ───────────────────────────
+  native-command-matrix:
+    name: Native Command Matrix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI binary
+        run: cargo build -p mcp-agent-mail-cli
+
+      - name: Run native command portability matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AM_BIN="target/debug/am"
+          ARTIFACT_ROOT="tests/artifacts/cli/native_command_matrix/${{ matrix.os }}"
+          mkdir -p "${ARTIFACT_ROOT}/commands"
+          export ARTIFACT_ROOT
+
+          PYTHON_BIN="python3"
+          if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+            PYTHON_BIN="python"
+          fi
+
+          cat > "${ARTIFACT_ROOT}/environment.json" <<EOF
+          {
+            "runner_os": "${{ runner.os }}",
+            "runner_arch": "${{ runner.arch }}",
+            "matrix_os": "${{ matrix.os }}",
+            "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          run_case() {
+            local case_id="$1"
+            shift
+            local case_dir="${ARTIFACT_ROOT}/commands/${case_id}"
+            mkdir -p "${case_dir}"
+
+            printf '%q ' "$@" > "${case_dir}/command.txt"
+            printf '\n' >> "${case_dir}/command.txt"
+
+            local started_ns ended_ns elapsed_ms exit_code
+            started_ns="$("${PYTHON_BIN}" -c 'import time; print(time.time_ns())')"
+            if "$@" > "${case_dir}/stdout.txt" 2> "${case_dir}/stderr.txt"; then
+              exit_code=0
+            else
+              exit_code=$?
+            fi
+            ended_ns="$("${PYTHON_BIN}" -c 'import time; print(time.time_ns())')"
+            elapsed_ms="$("${PYTHON_BIN}" -c "print(round((${ended_ns}-${started_ns})/1_000_000, 3))")"
+
+            printf '%s\n' "${exit_code}" > "${case_dir}/exit_code.txt"
+            printf '%s\n' "${elapsed_ms}" > "${case_dir}/timing_ms.txt"
+
+            if [ "${exit_code}" -ne 0 ]; then
+              echo "Command case ${case_id} failed with exit ${exit_code}"
+              return 1
+            fi
+          }
+
+          run_case ci_help "${AM_BIN}" ci --help
+          run_case flake_triage_help "${AM_BIN}" flake-triage --help
+          run_case bench_help "${AM_BIN}" bench --help
+          run_case check_inbox_help "${AM_BIN}" check-inbox --help
+          run_case golden_verify_help "${AM_BIN}" golden verify --help
+          run_case serve_http_help "${AM_BIN}" serve-http --help
+          run_case e2e_run_help "${AM_BIN}" e2e run --help
+          run_case share_wizard_help "${AM_BIN}" share wizard --help
+          run_case share_verify_live_help "${AM_BIN}" share deploy verify-live --help
+          run_case doctor_check_help "${AM_BIN}" doctor check --help
+          run_case check_inbox_direct_json "${AM_BIN}" check-inbox --direct --json --project "${PWD}" --agent MatrixProbe --rate-limit 0
+          run_case config_set_port_envfile "${AM_BIN}" config set-port 8765 --env-file "${ARTIFACT_ROOT}/tmp env file.env"
+          run_case config_show_port "${AM_BIN}" config show-port
+
+          "${PYTHON_BIN}" - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["ARTIFACT_ROOT"])
+          command_root = root / "commands"
+          cases = []
+          failures = 0
+
+          for case_dir in sorted(p for p in command_root.iterdir() if p.is_dir()):
+              exit_code = int((case_dir / "exit_code.txt").read_text(encoding="utf-8").strip())
+              elapsed_ms = float((case_dir / "timing_ms.txt").read_text(encoding="utf-8").strip())
+              cases.append(
+                  {
+                      "id": case_dir.name,
+                      "exit_code": exit_code,
+                      "elapsed_ms": elapsed_ms,
+                  }
+              )
+              if exit_code != 0:
+                  failures += 1
+
+          summary = {
+              "total": len(cases),
+              "pass": len(cases) - failures,
+              "fail": failures,
+              "cases": cases,
+          }
+          (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+
+          if failures:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload native matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-command-matrix-${{ matrix.os }}
+          path: tests/artifacts/cli/native_command_matrix/${{ matrix.os }}/
+          retention-days: 14
+          if-no-files-found: error
+
   # ── Semantic conformance ────────────────────────────────────────────
   conformance:
     name: Semantic Conformance
@@ -171,14 +299,14 @@ jobs:
           HTTP_PATH: "/mcp/"
 
       - name: Soak harness perf trend suite (quick)
-        run: |
-          SOAK_SEED=42 \
-          SOAK_PROJECTS=3 \
-          SOAK_AGENTS_PER_PROJECT=3 \
-          SUSTAINED_LOAD_RPS=60 \
-          SUSTAINED_LOAD_SECS=5 \
-          SOAK_DURATION_SECS=5 \
-          bash tests/e2e/test_soak_harness.sh --quick
+        run: am e2e run --project . soak_harness
+        env:
+          SOAK_SEED: "42"
+          SOAK_PROJECTS: "3"
+          SOAK_AGENTS_PER_PROJECT: "3"
+          SUSTAINED_LOAD_RPS: "60"
+          SUSTAINED_LOAD_SECS: "5"
+          SOAK_DURATION_SECS: "5"
 
       - name: Verify perf trend artifacts
         if: always()
@@ -222,9 +350,9 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-  # ── E2E dual-mode shell suite ───────────────────────────────────────
+  # ── E2E dual-mode native suite ──────────────────────────────────────
   e2e-dual-mode:
-    name: E2E Dual-Mode
+    name: E2E Dual-Mode (Native)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: test
@@ -239,16 +367,16 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: E2E dual-mode suite
-        run: bash scripts/e2e_dual_mode.sh
+        run: am e2e run --project . dual_mode
 
       - name: E2E mode matrix suite
-        run: bash scripts/e2e_mode_matrix.sh
+        run: am e2e run --project . mode_matrix
 
       - name: E2E web parity suite (HTTP wrapper, includes mail_ui)
-        run: bash tests/e2e/test_http.sh
+        run: am e2e run --project . http
 
       - name: E2E static export conformance suite
-        run: bash tests/e2e/test_share.sh
+        run: am e2e run --project . share
 
       - name: Validate artifact bundles
         if: always()
@@ -286,43 +414,35 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tests/artifacts/search_v3_ci
-          FAILED=0
 
-          run_suite() {
-            local suite_script="$1"
-            local suite_name
-            suite_name="$(basename "${suite_script}" .sh)"
-            local log_file="tests/artifacts/search_v3_ci/${suite_name}.log"
-
-            echo "::group::${suite_name}"
-            if E2E_CLOCK_MODE=deterministic \
-              E2E_SEED=424242 \
-              SEARCH_V3_LOG_ROOT="${PWD}/tests/artifacts/search_v3" \
-              SV3_ARTIFACT_ROOT="${PWD}/tests/artifacts/search_v3" \
-              bash "${suite_script}" 2>&1 | tee "${log_file}"; then
-              echo "PASS: ${suite_name}"
-            else
-              echo "FAIL: ${suite_name}"
-              FAILED=1
-            fi
-            echo "::endgroup::"
-          }
-
-          run_suite tests/e2e/test_search_v3_stdio.sh
-          run_suite tests/e2e/test_search_v3_http.sh
-          run_suite tests/e2e/test_search_v3_shadow_parity.sh
-          run_suite tests/e2e/test_search_v3_resilience.sh
-          run_suite tests/e2e/test_search_v3_load_concurrency.sh
+          # Native runner dispatches all 5 suites and reports results.
+          # Environment variables pass through to underlying test scripts.
+          if am e2e run --project . \
+            search_v3_stdio \
+            search_v3_http \
+            search_v3_shadow_parity \
+            search_v3_resilience \
+            search_v3_load_concurrency \
+            2>&1 | tee tests/artifacts/search_v3_ci/native_runner.log; then
+            FAILED=0
+          else
+            FAILED=1
+          fi
 
           cat > tests/artifacts/search_v3_ci/required_suites.txt <<'EOF'
-          tests/e2e/test_search_v3_stdio.sh
-          tests/e2e/test_search_v3_http.sh
-          tests/e2e/test_search_v3_shadow_parity.sh
-          tests/e2e/test_search_v3_resilience.sh
-          tests/e2e/test_search_v3_load_concurrency.sh
+          search_v3_stdio
+          search_v3_http
+          search_v3_shadow_parity
+          search_v3_resilience
+          search_v3_load_concurrency
           EOF
 
           echo "SEARCH_V3_E2E_FAILED=${FAILED}" >> "${GITHUB_ENV}"
+        env:
+          E2E_CLOCK_MODE: "deterministic"
+          E2E_SEED: "424242"
+          SEARCH_V3_LOG_ROOT: "${{ github.workspace }}/tests/artifacts/search_v3"
+          SV3_ARTIFACT_ROOT: "${{ github.workspace }}/tests/artifacts/search_v3"
 
       - name: Run Search V3 diagnostics rust tests
         if: always()
@@ -519,7 +639,7 @@ jobs:
     name: Skip Guard
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [test, mode-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, snapshots]
+    needs: [test, mode-matrix, native-command-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, snapshots]
     if: always()
     steps:
       - name: Verify all required jobs passed
@@ -527,6 +647,7 @@ jobs:
           echo "Job results:"
           echo "  test: ${{ needs.test.result }}"
           echo "  mode-matrix: ${{ needs.mode-matrix.result }}"
+          echo "  native-command-matrix: ${{ needs.native-command-matrix.result }}"
           echo "  conformance: ${{ needs.conformance.result }}"
           echo "  perf-security: ${{ needs.perf-security.result }}"
           echo "  e2e-dual-mode: ${{ needs.e2e-dual-mode.result }}"
@@ -537,6 +658,7 @@ jobs:
           for result in \
             "${{ needs.test.result }}" \
             "${{ needs.mode-matrix.result }}" \
+            "${{ needs.native-command-matrix.result }}" \
             "${{ needs.conformance.result }}" \
             "${{ needs.perf-security.result }}" \
             "${{ needs.e2e-dual-mode.result }}" \

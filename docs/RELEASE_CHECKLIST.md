@@ -25,6 +25,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 | Dual-mode E2E correctness | Pass rate = `100%` (`fail=0`) for `E2E dual-mode` and `E2E mode matrix` | `am e2e run --project . dual_mode`, `am e2e run --project . mode_matrix`, and CI gate report | `tests/artifacts/dual_mode/*/run_summary.json` |
 | Security/privacy | Pass rate = `100%` (`fail=0`) for `E2E security/privacy` | `am e2e run --project . security_privacy` and CI gate report | `tests/artifacts/security_privacy/*/*` |
 | Accessibility | Pass rate = `100%` (`fail=0`) for `E2E TUI accessibility` | `am e2e run --project . tui_a11y` and CI gate report | `tests/artifacts/tui_a11y/*/*` |
+| Cross-platform native command portability | Pass rate = `100%` (`fail=0`) for native command matrix on Linux/macOS/Windows | CI job `native-command-matrix` in `.github/workflows/ci.yml` | `tests/artifacts/cli/native_command_matrix/<os>/summary.json` |
 | Performance budgets | `perf_security_regressions=status:pass` + `perf_guardrails=status:pass` with no budget/delta violations | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture`, `cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture`, and CI gate report | `tests/artifacts/cli/perf_security/*`, `tests/artifacts/cli/perf_guardrails/*`, benchmark artifacts |
 | Determinism | Golden/export checks report zero mismatches | `am golden verify` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
 | Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, and sign-off row completed | `am ci --report tests/artifacts/ci/gate_report.json` | `tests/artifacts/ci/gate_report.json`, sign-off ledger row |
@@ -36,6 +37,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 | Unit/integration + harness coverage | `br-3vwi.10` track outputs (`mode_matrix_harness`, `semantic_conformance`) | CI logs + `tests/artifacts/dual_mode/*` |
 | Security/privacy | `br-3vwi.10.14` security/privacy E2E suite | `tests/artifacts/security_privacy/*` |
 | Accessibility | `br-3vwi.10.13` keyboard/focus/contrast suite | `tests/artifacts/tui_a11y/*` |
+| Cross-platform portability | `br-3lc7f` native command matrix evidence | `tests/artifacts/cli/native_command_matrix/<os>/summary.json` |
 | Performance | `br-3vwi.10.11` perf regression script pack | perf regression logs and trend artifacts |
 | Deterministic replay/export | `br-3vwi.10.19` + `br-3vwi.10.22` | replay artifacts + share/export artifacts |
 | Rollout governance + operator readiness | `br-3vwi.11.1` + `br-3vwi.12.1` + `br-3vwi.12.2` | `docs/ROLLOUT_PLAYBOOK.md`, `docs/RELEASE_CHECKLIST.md`, CI gate report |
