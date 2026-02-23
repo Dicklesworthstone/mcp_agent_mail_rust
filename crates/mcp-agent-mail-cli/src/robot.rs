@@ -1129,7 +1129,9 @@ fn build_inbox(
     };
 
     let sql = format!(
-        "SELECT sub.*, a_sender.name AS sender_name
+        "SELECT sub.id, sub.subject, sub.thread_id, sub.importance, sub.ack_required,
+                sub.created_ts, sub.sender_id, sub.read_ts, sub.ack_ts, sub.body_md,
+                sub.priority_bucket, a_sender.name AS sender_name
          FROM (
              SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required,
                     m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, m.body_md,
