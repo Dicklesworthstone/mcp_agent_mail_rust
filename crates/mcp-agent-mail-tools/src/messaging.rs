@@ -79,39 +79,18 @@ pub(crate) fn enqueue_message_semantic_index(
 /// Index a message into the Tantivy lexical search index (fire-and-forget).
 ///
 /// Runs synchronously but is best-effort: failures are logged, never propagated.
-pub(crate) fn enqueue_message_lexical_index(
-    message_id: i64,
-    project_id: i64,
-    project_slug: &str,
-    sender_name: &str,
-    subject: &str,
-    body_md: &str,
-    thread_id: Option<&str>,
-    importance: &str,
-    created_ts: i64,
-) {
-    let msg = mcp_agent_mail_db::search_v3::IndexableMessage {
-        id: message_id,
-        project_id,
-        project_slug: project_slug.to_string(),
-        sender_name: sender_name.to_string(),
-        subject: subject.to_string(),
-        body_md: body_md.to_string(),
-        thread_id: thread_id.map(String::from),
-        importance: importance.to_string(),
-        created_ts,
-    };
-    match mcp_agent_mail_db::search_v3::index_message(&msg) {
+pub(crate) fn enqueue_message_lexical_index(msg: &mcp_agent_mail_db::search_v3::IndexableMessage) {
+    match mcp_agent_mail_db::search_v3::index_message(msg) {
         Ok(true) => {
             tracing::debug!(
-                message_id,
+                message_id = msg.id,
                 "indexed message in Tantivy"
             );
         }
         Ok(false) => {} // bridge not initialized, silent skip
         Err(e) => {
             tracing::warn!(
-                message_id,
+                message_id = msg.id,
                 error = %e,
                 "failed to index message in Tantivy (non-fatal)"
             );
@@ -1771,17 +1750,17 @@ effective_free_bytes={free}"
 
     let message_id = message.id.unwrap_or(0);
     enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
-    enqueue_message_lexical_index(
-        message_id,
+    enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
+        id: message_id,
         project_id,
-        &project.slug,
-        &sender_name,
-        &message.subject,
-        &message.body_md,
-        thread_id.as_deref(),
-        &message.importance,
-        message.created_ts,
-    );
+        project_slug: project.slug.clone(),
+        sender_name: sender_name.clone(),
+        subject: message.subject.clone(),
+        body_md: message.body_md.clone(),
+        thread_id: thread_id.clone(),
+        importance: message.importance.clone(),
+        created_ts: message.created_ts,
+    });
 
     // Emit notification signals for to/cc recipients only (never bcc).
     //
@@ -2462,17 +2441,17 @@ effective_free_bytes={free}"
 
     let reply_id = reply.id.unwrap_or(0);
     enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
-    enqueue_message_lexical_index(
-        reply_id,
+    enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
+        id: reply_id,
         project_id,
-        &project.slug,
-        &sender_name,
-        &reply.subject,
-        &reply.body_md,
-        Some(&thread_id),
-        &reply.importance,
-        reply.created_ts,
-    );
+        project_slug: project.slug.clone(),
+        sender_name: sender_name.clone(),
+        subject: reply.subject.clone(),
+        body_md: reply.body_md.clone(),
+        thread_id: Some(thread_id.clone()),
+        importance: reply.importance.clone(),
+        created_ts: reply.created_ts,
+    });
 
     // Emit notification signals for to/cc recipients only (never bcc).
     // Mirrors the send_message notification logic for parity with Python.
@@ -4678,39 +4657,47 @@ mod tests {
     fn enqueue_lexical_index_does_not_panic() {
         // When the global Tantivy bridge is not initialized,
         // enqueue_message_lexical_index should silently no-op.
-        enqueue_message_lexical_index(
-            1,
-            1,
-            "test-project",
-            "TestAgent",
-            "Test Subject",
-            "Test body",
-            Some("thread-1"),
-            "normal",
-            1_000_000,
-        );
+        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
+            id: 1,
+            project_id: 1,
+            project_slug: "test-project".into(),
+            sender_name: "TestAgent".into(),
+            subject: "Test Subject".into(),
+            body_md: "Test body".into(),
+            thread_id: Some("thread-1".into()),
+            importance: "normal".into(),
+            created_ts: 1_000_000,
+        });
         // If we reach here, the function didn't panic.
     }
 
     #[test]
     fn enqueue_lexical_index_none_thread_id_does_not_panic() {
-        enqueue_message_lexical_index(
-            2,
-            1,
-            "proj",
-            "Agent",
-            "Subject",
-            "Body",
-            None,
-            "high",
-            0,
-        );
+        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
+            id: 2,
+            project_id: 1,
+            project_slug: "proj".into(),
+            sender_name: "Agent".into(),
+            subject: "Subject".into(),
+            body_md: "Body".into(),
+            thread_id: None,
+            importance: "high".into(),
+            created_ts: 0,
+        });
     }
 
     #[test]
     fn enqueue_lexical_index_empty_fields_does_not_panic() {
-        enqueue_message_lexical_index(
-            0, 0, "", "", "", "", None, "", 0,
-        );
+        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
+            id: 0,
+            project_id: 0,
+            project_slug: String::new(),
+            sender_name: String::new(),
+            subject: String::new(),
+            body_md: String::new(),
+            thread_id: None,
+            importance: String::new(),
+            created_ts: 0,
+        });
     }
 }

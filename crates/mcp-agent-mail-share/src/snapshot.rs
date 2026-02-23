@@ -188,10 +188,7 @@ pub fn create_sqlite_snapshot(
                 let _ = src.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
             }
             // Probe with a known table to confirm we can actually read.
-            let probe = format!(
-                "SELECT \"id\" FROM \"projects\" LIMIT 1"
-            );
-            match src.query_sync(&probe, &[]) {
+            match src.query_sync("SELECT \"id\" FROM \"projects\" LIMIT 1", &[]) {
                 Ok(_) => {
                     transfer_tables_frank(&src, &dst_conn)?;
                     true
@@ -263,14 +260,14 @@ fn transfer_tables_frank(src: &DbConn, dst: &SqliteConnection) -> Result<(), Sha
                     .iter()
                     .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
                     .collect();
-                if has_id {
-                    if let Some(val) = row.get_by_name("id") {
-                        last_id = match val {
-                            Value::BigInt(v) => *v,
-                            Value::Int(v) => i64::from(*v),
-                            _ => last_id,
-                        };
-                    }
+                if has_id
+                    && let Some(val) = row.get_by_name("id")
+                {
+                    last_id = match val {
+                        Value::BigInt(v) => *v,
+                        Value::Int(v) => i64::from(*v),
+                        _ => last_id,
+                    };
                 }
                 dst.execute_sync(&insert_sql, &values)
                     .map_err(|e| ShareError::Sqlite {
@@ -333,14 +330,14 @@ fn transfer_tables_c(src: &SqliteConnection, dst: &SqliteConnection) -> Result<(
                     .iter()
                     .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
                     .collect();
-                if has_id {
-                    if let Some(val) = row.get_by_name("id") {
-                        last_id = match val {
-                            Value::BigInt(v) => *v,
-                            Value::Int(v) => i64::from(*v),
-                            _ => last_id,
-                        };
-                    }
+                if has_id
+                    && let Some(val) = row.get_by_name("id")
+                {
+                    last_id = match val {
+                        Value::BigInt(v) => *v,
+                        Value::Int(v) => i64::from(*v),
+                        _ => last_id,
+                    };
                 }
                 dst.execute_sync(&insert_sql, &values)
                     .map_err(|e| ShareError::Sqlite {

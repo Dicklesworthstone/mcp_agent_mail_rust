@@ -3944,7 +3944,7 @@ fn append_release_reservation_filters(
 }
 
 /// Release file reservations
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::must_use_candidate)]
 pub fn release_reservations<'a>(
     cx: &'a Cx,
     pool: &'a DbPool,
