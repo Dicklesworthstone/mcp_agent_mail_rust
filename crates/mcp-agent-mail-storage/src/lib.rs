@@ -9751,7 +9751,9 @@ mod tests {
         // Simulate a new-format owner file where start ticks are unavailable.
         fs::write(&owner_path, format!("{pid}\n{now}\n0\n")).unwrap();
 
-        let removed = try_clean_stale_git_lock(&archive.repo_root, 0.0);
+        // Use a large max_age so the age-based fallback (2x threshold) never
+        // triggers for a freshly-created lock file.
+        let removed = try_clean_stale_git_lock(&archive.repo_root, 3600.0);
         assert!(
             !removed,
             "must not remove lock owned by alive PID when start ticks are unknown"
