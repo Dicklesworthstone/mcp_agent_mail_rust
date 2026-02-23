@@ -22,7 +22,7 @@ use mcp_agent_mail_db::{
     },
 };
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
@@ -30,7 +30,8 @@ use tracing::{info, warn};
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Worker handle for join-on-shutdown.
-static WORKER: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Start the file reservation cleanup worker (if enabled).
 ///
@@ -40,27 +41,33 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let config = config.clone();
-    let _ = WORKER.get_or_init(|| {
+    let mut worker = WORKER.lock().unwrap();
+    if worker.is_none() {
+        let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
-        std::thread::Builder::new()
-            .name("file-res-cleanup".into())
-            .spawn(move || {
-                let rt = asupersync::runtime::RuntimeBuilder::new()
-                    .worker_threads(1)
-                    .build()
-                    .expect("build cleanup runtime");
-                rt.block_on(async move { cleanup_loop(&config) });
-            })
-            .expect("failed to spawn file reservation cleanup worker")
-    });
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("file-res-cleanup".into())
+                .spawn(move || {
+                    let rt = asupersync::runtime::RuntimeBuilder::new()
+                        .worker_threads(1)
+                        .build()
+                        .expect("build cleanup runtime");
+                    rt.block_on(async move { cleanup_loop(&config) });
+                })
+                .expect("failed to spawn file reservation cleanup worker"),
+        );
+    }
 }
 
 /// Signal the worker to stop and wait for it to finish.
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
-    // We cannot take from OnceLock, so just signal; the thread will exit on
-    // the next iteration check.
+    if let Ok(mut worker) = WORKER.lock()
+        && let Some(handle) = worker.take()
+    {
+        let _ = handle.join();
+    }
 }
 
 fn cleanup_loop(config: &Config) {
@@ -304,16 +311,15 @@ fn check_filesystem_activity(
         }
     } else {
         let candidate = workspace.join(pattern);
-        if candidate.exists() {
-            if let Ok(metadata) = candidate.metadata()
-                && let Ok(modified) = metadata.modified()
-            {
-                let mtime_us = modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-                if (now_us - mtime_us) <= grace_us {
-                    return true;
-                }
+        if candidate.exists()
+            && let Ok(metadata) = candidate.metadata()
+            && let Ok(modified) = metadata.modified()
+        {
+            let mtime_us = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
+            if (now_us - mtime_us) <= grace_us {
+                return true;
             }
         }
     }

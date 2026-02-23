@@ -17,7 +17,7 @@ use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros,
     queries::{self, list_unacknowledged_messages},
 };
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
@@ -25,7 +25,8 @@ use tracing::{info, warn};
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Worker handle for join-on-shutdown.
-static WORKER: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Start the ACK TTL scan worker (if enabled).
 ///
@@ -35,25 +36,33 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let config = config.clone();
-    let _ = WORKER.get_or_init(|| {
+    let mut worker = WORKER.lock().unwrap();
+    if worker.is_none() {
+        let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
-        std::thread::Builder::new()
-            .name("ack-ttl-scan".into())
-            .spawn(move || {
-                let rt = asupersync::runtime::RuntimeBuilder::new()
-                    .worker_threads(1)
-                    .build()
-                    .expect("build ack-ttl runtime");
-                rt.block_on(async move { ack_ttl_loop(&config) });
-            })
-            .expect("failed to spawn ACK TTL scan worker")
-    });
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("ack-ttl-scan".into())
+                .spawn(move || {
+                    let rt = asupersync::runtime::RuntimeBuilder::new()
+                        .worker_threads(1)
+                        .build()
+                        .expect("build ack-ttl runtime");
+                    rt.block_on(async move { ack_ttl_loop(&config) });
+                })
+                .expect("failed to spawn ACK TTL scan worker"),
+        );
+    }
 }
 
 /// Signal the worker to stop.
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
+    if let Ok(mut worker) = WORKER.lock()
+        && let Some(handle) = worker.take()
+    {
+        let _ = handle.join();
+    }
 }
 
 fn ack_ttl_loop(config: &Config) {

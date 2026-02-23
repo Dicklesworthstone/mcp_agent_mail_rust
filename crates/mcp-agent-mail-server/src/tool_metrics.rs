@@ -19,7 +19,7 @@ use mcp_agent_mail_db::{DbConn, open_sqlite_file_with_recovery};
 use mcp_agent_mail_tools::{
     MetricsSnapshotEntry, reset_tool_latencies, slow_tools, tool_metrics_snapshot,
 };
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
@@ -27,7 +27,8 @@ use tracing::{info, warn};
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Worker handle for join-on-shutdown.
-static WORKER: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 const TOOL_METRICS_SNAPSHOTS_TABLE: &str = "tool_metrics_snapshots";
 const METRICS_RETENTION_DAYS: i64 = 30;
@@ -56,25 +57,33 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let config = config.clone();
-    let _ = WORKER.get_or_init(|| {
+    let mut worker = WORKER.lock().unwrap();
+    if worker.is_none() {
+        let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
-        std::thread::Builder::new()
-            .name("tool-metrics-emit".into())
-            .spawn(move || {
-                let rt = asupersync::runtime::RuntimeBuilder::new()
-                    .worker_threads(1)
-                    .build()
-                    .expect("build tool-metrics runtime");
-                rt.block_on(async move { metrics_loop(&config) });
-            })
-            .expect("failed to spawn tool metrics emit worker")
-    });
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("tool-metrics-emit".into())
+                .spawn(move || {
+                    let rt = asupersync::runtime::RuntimeBuilder::new()
+                        .worker_threads(1)
+                        .build()
+                        .expect("build tool-metrics runtime");
+                    rt.block_on(async move { metrics_loop(&config) });
+                })
+                .expect("failed to spawn tool metrics emit worker"),
+        );
+    }
 }
 
 /// Signal the worker to stop.
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
+    if let Ok(mut worker) = WORKER.lock()
+        && let Some(handle) = worker.take()
+    {
+        let _ = handle.join();
+    }
 }
 
 fn metrics_loop(config: &Config) {

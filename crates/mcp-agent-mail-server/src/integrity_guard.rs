@@ -80,10 +80,10 @@ pub fn start(config: &Config) {
 
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
-    if let Ok(mut worker) = WORKER.lock() {
-        if let Some(handle) = worker.take() {
-            let _ = handle.join();
-        }
+    if let Ok(mut worker) = WORKER.lock()
+        && let Some(handle) = worker.take()
+    {
+        let _ = handle.join();
     }
 }
 
