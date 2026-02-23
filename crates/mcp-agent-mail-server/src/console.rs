@@ -853,6 +853,7 @@ fn truncate_to_vis_width(s: &str, max_vis: usize) -> String {
             vis += 1;
         } else {
             out.push('…');
+            out.push_str("\x1b[0m");
             break;
         }
     }

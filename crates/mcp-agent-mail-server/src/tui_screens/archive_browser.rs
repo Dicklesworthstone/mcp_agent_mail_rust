@@ -1351,6 +1351,66 @@ mod tests {
     }
 
     #[test]
+    fn truncate_path_label_short_path_unchanged() {
+        assert_eq!(truncate_path_label("foo/bar.rs", 20), "foo/bar.rs");
+    }
+
+    #[test]
+    fn truncate_path_label_exact_length_unchanged() {
+        assert_eq!(truncate_path_label("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_path_label_truncates_from_left() {
+        let result = truncate_path_label("very/long/path/to/file.rs", 10);
+        assert!(result.starts_with('…'));
+        assert_eq!(result.chars().count(), 10);
+        assert!(result.ends_with("o/file.rs"));
+    }
+
+    #[test]
+    fn truncate_path_label_max_zero_returns_empty() {
+        assert_eq!(truncate_path_label("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_path_label_max_one_returns_ellipsis() {
+        assert_eq!(truncate_path_label("anything", 1), "…");
+    }
+
+    #[test]
+    fn truncate_path_label_unicode_counts_chars_not_bytes() {
+        // 4 chars, but > 4 bytes in UTF-8
+        let result = truncate_path_label("日本語テスト", 4);
+        assert!(result.starts_with('…'));
+        assert_eq!(result.chars().count(), 4);
+    }
+
+    #[test]
+    fn format_file_size_boundary_values() {
+        assert_eq!(format_file_size(1023), "1023 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1024 * 1024 - 1), "1024.0 KB");
+        assert_eq!(format_file_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_file_size(1024 * 1024 * 1024 - 1), "1024.0 MB");
+        assert_eq!(format_file_size(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn add_line_numbers_empty_string() {
+        let result = add_line_numbers("");
+        // "".lines() returns an empty iterator, so the result is empty
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn add_line_numbers_single_line() {
+        let result = add_line_numbers("hello");
+        assert!(result.contains("1 \u{2502} hello"));
+        assert!(!result.contains("2 \u{2502}"));
+    }
+
+    #[test]
     fn test_scan_directory_with_filter() {
         let tmp = std::env::temp_dir().join("archive_browser_filter_test");
         let _ = std::fs::remove_dir_all(&tmp);

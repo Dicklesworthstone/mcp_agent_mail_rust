@@ -4808,6 +4808,7 @@ dependencies = [
  "sqlmodel-query",
  "sqlmodel-schema",
  "sqlmodel-session",
+ "sqlmodel-sqlite",
  "tantivy",
  "tempfile",
  "thiserror",

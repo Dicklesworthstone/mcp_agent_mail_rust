@@ -1126,7 +1126,7 @@ pub fn install_precommit_guard(
     code_repo_path: String,
 ) -> McpResult<String> {
     let config = &Config::get();
-    if !config.worktrees_enabled {
+    if !config.file_reservations_enforcement_enabled {
         return serde_json::to_string(&serde_json::json!({ "hook": "" }))
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }

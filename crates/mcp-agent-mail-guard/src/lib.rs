@@ -739,6 +739,12 @@ fn is_guard_gated_from_values(
     if let Some(val) = enforcement_enabled {
         return is_truthy_value(Some(val));
     }
+    if let Some(val) = worktrees_enabled {
+        return is_truthy_value(Some(val));
+    }
+    if let Some(val) = git_identity_enabled {
+        return is_truthy_value(Some(val));
+    }
     // Default to true unless specifically disabled, but fallback to legacy worktrees checks
     // if enforcement is completely unset, though in Rust the config defaults to true.
     true

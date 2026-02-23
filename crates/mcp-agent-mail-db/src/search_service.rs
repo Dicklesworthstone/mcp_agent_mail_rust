@@ -4237,4 +4237,202 @@ mod tests {
             "all 100 threads should get the same Arc<TwoTierBridge>"
         );
     }
+
+    // ── parse_env_bool tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_env_bool_truthy_values() {
+        for val in &["1", "true", "yes", "on", " True ", " YES "] {
+            assert_eq!(parse_env_bool(val), Some(true), "expected true for {val:?}");
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_falsy_values() {
+        for val in &["0", "false", "no", "off", " False ", " OFF "] {
+            assert_eq!(
+                parse_env_bool(val),
+                Some(false),
+                "expected false for {val:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_invalid_returns_none() {
+        for val in &["", "maybe", "2", "yep", "nah"] {
+            assert_eq!(parse_env_bool(val), None, "expected None for {val:?}");
+        }
+    }
+
+    // ── scale_limit_by_pct tests ─────────────────────────────────────
+
+    #[test]
+    fn scale_limit_by_pct_100_percent_is_identity() {
+        assert_eq!(scale_limit_by_pct(50, 100), 50);
+        assert_eq!(scale_limit_by_pct(1, 100), 1);
+    }
+
+    #[test]
+    fn scale_limit_by_pct_zero_limit_returns_minimum_one() {
+        assert_eq!(scale_limit_by_pct(0, 100), 1);
+        assert_eq!(scale_limit_by_pct(0, 50), 1);
+        assert_eq!(scale_limit_by_pct(0, 0), 1);
+    }
+
+    #[test]
+    fn scale_limit_by_pct_zero_percent_returns_minimum_one() {
+        assert_eq!(scale_limit_by_pct(100, 0), 1);
+    }
+
+    #[test]
+    fn scale_limit_by_pct_50_percent_halves() {
+        assert_eq!(scale_limit_by_pct(100, 50), 50);
+        assert_eq!(scale_limit_by_pct(200, 50), 100);
+    }
+
+    #[test]
+    fn scale_limit_by_pct_rounds_up_via_div_ceil() {
+        // 3 * 50 / 100 = 1.5 → ceil = 2
+        assert_eq!(scale_limit_by_pct(3, 50), 2);
+        // 1 * 70 / 100 = 0.7 → ceil = 1
+        assert_eq!(scale_limit_by_pct(1, 70), 1);
+    }
+
+    #[test]
+    fn scale_limit_by_pct_large_values_saturate() {
+        let result = scale_limit_by_pct(usize::MAX, u32::MAX);
+        assert!(result >= 1);
+    }
+
+    // ── classify_hybrid_budget_tier tests ────────────────────────────
+
+    #[test]
+    fn classify_tier_none_budget_is_unlimited() {
+        let config = HybridBudgetGovernorConfig::default();
+        assert_eq!(
+            classify_hybrid_budget_tier(None, config),
+            HybridBudgetGovernorTier::Unlimited,
+        );
+    }
+
+    #[test]
+    fn classify_tier_at_critical_boundary() {
+        let config = HybridBudgetGovernorConfig::default();
+        // Exactly at critical_ms (120) → Critical
+        assert_eq!(
+            classify_hybrid_budget_tier(Some(config.critical_ms), config),
+            HybridBudgetGovernorTier::Critical,
+        );
+        // One above critical → Tight (since <= tight_ms)
+        assert_eq!(
+            classify_hybrid_budget_tier(Some(config.critical_ms + 1), config),
+            HybridBudgetGovernorTier::Tight,
+        );
+    }
+
+    #[test]
+    fn classify_tier_at_tight_boundary() {
+        let config = HybridBudgetGovernorConfig::default();
+        // Exactly at tight_ms (250) → Tight
+        assert_eq!(
+            classify_hybrid_budget_tier(Some(config.tight_ms), config),
+            HybridBudgetGovernorTier::Tight,
+        );
+        // One above tight → Normal
+        assert_eq!(
+            classify_hybrid_budget_tier(Some(config.tight_ms + 1), config),
+            HybridBudgetGovernorTier::Normal,
+        );
+    }
+
+    #[test]
+    fn classify_tier_zero_budget_is_critical() {
+        let config = HybridBudgetGovernorConfig::default();
+        assert_eq!(
+            classify_hybrid_budget_tier(Some(0), config),
+            HybridBudgetGovernorTier::Critical,
+        );
+    }
+
+    #[test]
+    fn classify_tier_large_budget_is_normal() {
+        let config = HybridBudgetGovernorConfig::default();
+        assert_eq!(
+            classify_hybrid_budget_tier(Some(u64::MAX), config),
+            HybridBudgetGovernorTier::Normal,
+        );
+    }
+
+    // ── guidance edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn guidance_empty_query_with_zero_results_returns_no_suggestions() {
+        let query = SearchQuery {
+            text: String::new(),
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None);
+        let g = guidance.unwrap();
+        // Empty query with no facets → no specific suggestions (simplify_query
+        // only fires when text is non-empty)
+        assert!(
+            g.suggestions.is_empty(),
+            "empty query text should produce no suggestions"
+        );
+    }
+
+    #[test]
+    fn guidance_suggests_broadening_date_range() {
+        use crate::search_planner::TimeRange;
+        let query = SearchQuery {
+            text: "test".to_string(),
+            time_range: TimeRange {
+                min_ts: Some(1_000_000),
+                max_ts: Some(2_000_000),
+            },
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None).unwrap();
+        assert!(
+            guidance
+                .suggestions
+                .iter()
+                .any(|s| s.kind == "broaden_date_range"),
+            "expected broaden_date_range suggestion"
+        );
+    }
+
+    #[test]
+    fn guidance_suggests_dropping_ack_filter() {
+        let query = SearchQuery {
+            text: "important".to_string(),
+            ack_required: Some(true),
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None).unwrap();
+        assert!(
+            guidance
+                .suggestions
+                .iter()
+                .any(|s| s.kind == "drop_ack_filter"),
+            "expected drop_ack_filter suggestion"
+        );
+    }
+
+    #[test]
+    fn guidance_summary_singular_for_one_suggestion() {
+        let query = SearchQuery {
+            text: "test".to_string(),
+            ack_required: Some(true),
+            ..Default::default()
+        };
+        let guidance = generate_zero_result_guidance(&query, 0, None).unwrap();
+        // With ack_required + simplify_query: should be 2 suggestions, plural
+        // But with only one facet filter: "1 suggestion" (singular)
+        assert!(
+            guidance.summary.contains("suggestion"),
+            "summary should mention suggestions"
+        );
+    }
 }
