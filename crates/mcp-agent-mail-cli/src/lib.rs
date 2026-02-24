@@ -2686,7 +2686,9 @@ fn handle_check_inbox(
         check_inbox_direct(&config)
     } else {
         // Build HTTP config and fetch via JSON-RPC
-        let server_url = format!("http://{}:{}/api/", host, port);
+        let config = Config::from_env();
+        let server_urls = check_inbox_server_urls(&host, port, &config.http_path);
+        let server_url = check_inbox_server_url(&host, port, &config.http_path);
         let bearer_token = std::env::var("AGENT_MAIL_TOKEN")
             .or_else(|_| std::env::var("HTTP_BEARER_TOKEN"))
             .ok()
@@ -2707,7 +2709,7 @@ fn handle_check_inbox(
             .build()
             .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
 
-        rt.block_on(async { fetch_inbox_via_jsonrpc(&config).await })
+        rt.block_on(async { fetch_inbox_via_jsonrpc_with_fallback(&config, &server_urls).await })
     };
 
     // Handle result - exit silently on any error (fail-safe for hooks)
@@ -2764,38 +2766,65 @@ fn handle_check_inbox(
     Ok(())
 }
 
+fn normalize_http_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "mcp" | "/mcp" | "/mcp/" => return "/mcp/".to_string(),
+        "api" | "/api" | "/api/" => return "/api/".to_string(),
+        _ => {}
+    }
+
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+
+    let mut with_leading = trimmed.to_string();
+    if !with_leading.starts_with('/') {
+        with_leading.insert(0, '/');
+    }
+
+    let without_trailing = with_leading.trim_end_matches('/');
+    if without_trailing.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{without_trailing}/")
+    }
+}
+
+fn check_inbox_server_url(host: &str, port: u16, http_path: &str) -> String {
+    check_inbox_server_urls(host, port, http_path)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| format!("http://{host}:{port}/"))
+}
+
+fn mcp_base_alias_path(path: &str) -> Option<&'static str> {
+    match path {
+        "/api/" => Some("/mcp/"),
+        "/mcp/" => Some("/api/"),
+        _ => None,
+    }
+}
+
+fn check_inbox_server_urls(host: &str, port: u16, http_path: &str) -> Vec<String> {
+    let primary_path = normalize_http_path(http_path);
+    let mut urls = vec![format!("http://{host}:{port}{primary_path}")];
+    if let Some(alias_path) = mcp_base_alias_path(&primary_path) {
+        let alias_url = format!("http://{host}:{port}{alias_path}");
+        if alias_url != urls[0] {
+            urls.push(alias_url);
+        }
+    }
+    urls
+}
+
 fn build_http_config(
     host: Option<String>,
     port: Option<u16>,
     path: Option<String>,
     no_auth: bool,
 ) -> Config {
-    fn normalize_http_path(raw: &str) -> String {
-        let trimmed = raw.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        match lower.as_str() {
-            "mcp" | "/mcp" | "/mcp/" => return "/mcp/".to_string(),
-            "api" | "/api" | "/api/" => return "/api/".to_string(),
-            _ => {}
-        }
-
-        if trimmed.is_empty() {
-            return "/".to_string();
-        }
-
-        let mut with_leading = trimmed.to_string();
-        if !with_leading.starts_with('/') {
-            with_leading.insert(0, '/');
-        }
-
-        let without_trailing = with_leading.trim_end_matches('/');
-        if without_trailing.is_empty() {
-            "/".to_string()
-        } else {
-            format!("{without_trailing}/")
-        }
-    }
-
     let mut config = Config::from_env();
     if let Some(host) = host {
         config.http_host = host;
@@ -9284,6 +9313,44 @@ mod tests {
         assert_eq!(
             normalize_agent_mail_url("http://127.0.0.1:8765/mcp/"),
             "http://127.0.0.1:8765/mcp/"
+        );
+    }
+
+    #[test]
+    fn check_inbox_server_url_honors_http_path() {
+        assert_eq!(
+            check_inbox_server_url("127.0.0.1", 8765, "/custom/path"),
+            "http://127.0.0.1:8765/custom/path/"
+        );
+        assert_eq!(
+            check_inbox_server_url("127.0.0.1", 8765, "mcp"),
+            "http://127.0.0.1:8765/mcp/"
+        );
+    }
+
+    #[test]
+    fn check_inbox_server_urls_support_api_mcp_aliases() {
+        assert_eq!(
+            check_inbox_server_urls("127.0.0.1", 8765, "api"),
+            vec![
+                "http://127.0.0.1:8765/api/".to_string(),
+                "http://127.0.0.1:8765/mcp/".to_string(),
+            ]
+        );
+        assert_eq!(
+            check_inbox_server_urls("127.0.0.1", 8765, "/mcp/"),
+            vec![
+                "http://127.0.0.1:8765/mcp/".to_string(),
+                "http://127.0.0.1:8765/api/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_inbox_server_urls_do_not_alias_custom_paths() {
+        assert_eq!(
+            check_inbox_server_urls("127.0.0.1", 8765, "/custom/path"),
+            vec!["http://127.0.0.1:8765/custom/path/".to_string()]
         );
     }
 
@@ -21613,6 +21680,28 @@ pub async fn fetch_inbox_via_jsonrpc(
         .ok_or_else(|| CliError::Other("missing JSON-RPC result payload".to_string()))?;
 
     parse_fetch_inbox_rows(result)
+}
+
+async fn fetch_inbox_via_jsonrpc_with_fallback(
+    config: &CheckInboxRpcConfig,
+    server_urls: &[String],
+) -> CliResult<CheckInboxRpcResult> {
+    let mut last_error: Option<CliError> = None;
+    let mut attempt_config = config.clone();
+
+    for server_url in server_urls {
+        attempt_config.server_url = server_url.clone();
+        match fetch_inbox_via_jsonrpc(&attempt_config).await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        CliError::Other("no server URLs configured for check-inbox HTTP mode".to_string())
+    }))
 }
 
 /// Configuration for direct DB inbox check (bypasses HTTP).

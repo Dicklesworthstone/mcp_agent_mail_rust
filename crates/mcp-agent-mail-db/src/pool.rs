@@ -1107,8 +1107,11 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     let Some(file_name) = primary_path.file_name().and_then(|n| n.to_str()) else {
         return Vec::new();
     };
-    let Some(parent) = primary_path.parent() else {
-        return Vec::new();
+    let parent = primary_path.parent().unwrap_or_else(|| Path::new("."));
+    let scan_dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
     };
 
     let bak = primary_path.with_file_name(format!("{file_name}.bak"));
@@ -1122,7 +1125,7 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
 
     let backup_prefix = format!("{file_name}.backup-");
     let recovery_prefix = format!("{file_name}.recovery");
-    if let Ok(entries) = std::fs::read_dir(parent) {
+    if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -1888,6 +1891,37 @@ mod tests {
             candidates.first().map(PathBuf::as_path),
             Some(dot_bak.as_path()),
             ".bak should be first-priority backup candidate"
+        );
+    }
+
+    #[test]
+    fn sqlite_backup_candidates_include_series_for_relative_primary_path() {
+        struct CwdGuard {
+            previous: PathBuf,
+        }
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.previous);
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::current_dir().expect("current_dir");
+        let _cwd_guard = CwdGuard { previous };
+        std::env::set_current_dir(dir.path()).expect("set cwd");
+
+        let primary = PathBuf::from("storage.sqlite3");
+        let backup_series = PathBuf::from("storage.sqlite3.backup-20260212_000000");
+        std::fs::write(&primary, b"primary").expect("write primary");
+        std::fs::write(&backup_series, b"series").expect("write backup series");
+
+        let candidates = sqlite_backup_candidates(&primary);
+        assert!(
+            candidates.iter().any(|c| {
+                c.file_name().and_then(|n| n.to_str())
+                    == Some("storage.sqlite3.backup-20260212_000000")
+            }),
+            "relative primary path should still discover backup-series candidates"
         );
     }
 
