@@ -545,6 +545,7 @@ pub async fn register_agent(
     // Validate or generate agent name
     let agent_name = match name {
         Some(n) => {
+            let n = n.trim().to_string();
             if !is_valid_agent_name(&n) {
                 // Check for specific mistake types before generic error
                 if let Some((mistake_type, message)) = detect_agent_name_mistake(&n) {
@@ -709,6 +710,7 @@ pub async fn create_agent_identity(
     // Generate or validate agent name
     let agent_name = match name_hint {
         Some(hint) => {
+            let hint = hint.trim().to_string();
             // Strict validation: name_hint MUST be a valid agent name format.
             if !is_valid_agent_name(&hint) {
                 // Check for specific mistake types before generic error
