@@ -9301,17 +9301,21 @@ mod tests {
     }
 
     #[test]
-    fn normalize_agent_mail_url_defaults_to_api_path() {
+    fn normalize_agent_mail_url_uses_configured_http_path() {
         assert_eq!(
-            normalize_agent_mail_url("127.0.0.1:8765"),
+            normalize_agent_mail_url("127.0.0.1:8765", "/mcp/"),
+            "http://127.0.0.1:8765/mcp/"
+        );
+        assert_eq!(
+            normalize_agent_mail_url("http://127.0.0.1:8765", "api"),
             "http://127.0.0.1:8765/api/"
         );
         assert_eq!(
-            normalize_agent_mail_url("http://127.0.0.1:8765"),
-            "http://127.0.0.1:8765/api/"
+            normalize_agent_mail_url("http://127.0.0.1:8765", "/custom/base"),
+            "http://127.0.0.1:8765/custom/base/"
         );
         assert_eq!(
-            normalize_agent_mail_url("http://127.0.0.1:8765/mcp/"),
+            normalize_agent_mail_url("http://127.0.0.1:8765/mcp/", "/api/"),
             "http://127.0.0.1:8765/mcp/"
         );
     }
@@ -9367,11 +9371,25 @@ mod tests {
             .expect("config should parse");
         assert_eq!(cfg.project_key, "/tmp/proj");
         assert_eq!(cfg.agent_name, "BlueLake");
-        assert_eq!(cfg.server_url, "http://127.0.0.1:8765/api/");
+        assert_eq!(cfg.server_url, "http://127.0.0.1:8765/mcp/");
         assert_eq!(cfg.bearer_token.as_deref(), Some("token-123"));
         assert_eq!(cfg.limit, 10);
         assert!(!cfg.include_bodies);
         assert_eq!(cfg.timeout_seconds, 3);
+    }
+
+    #[test]
+    fn check_inbox_rpc_config_honors_http_path_env() {
+        let env: HashMap<String, String> = HashMap::from_iter([
+            ("AGENT_MAIL_PROJECT".to_string(), "/tmp/proj".to_string()),
+            ("AGENT_MAIL_AGENT".to_string(), "BlueLake".to_string()),
+            ("AGENT_MAIL_URL".to_string(), "127.0.0.1:8765".to_string()),
+            ("HTTP_PATH".to_string(), "api".to_string()),
+        ]);
+
+        let cfg = check_inbox_rpc_config_from_env_reader(|key| env.get(key).cloned())
+            .expect("config should parse");
+        assert_eq!(cfg.server_url, "http://127.0.0.1:8765/api/");
     }
 
     #[test]
@@ -21450,7 +21468,7 @@ fn value_looks_like_template(value: &str) -> bool {
         || (trimmed.starts_with('<') && trimmed.ends_with('>'))
 }
 
-fn normalize_agent_mail_url(raw: &str) -> String {
+fn normalize_agent_mail_url(raw: &str, http_path: &str) -> String {
     let trimmed = raw.trim();
     let base = if trimmed.is_empty() {
         DEFAULT_AGENT_MAIL_URL.to_string()
@@ -21473,7 +21491,8 @@ fn normalize_agent_mail_url(raw: &str) -> String {
         }
         return full;
     }
-    format!("{with_scheme}/api/")
+    let normalized_path = normalize_http_path(http_path);
+    format!("{with_scheme}{normalized_path}")
 }
 
 fn check_inbox_rpc_config_from_env_reader<F>(read_env: F) -> Option<CheckInboxRpcConfig>
@@ -21487,7 +21506,8 @@ where
     }
 
     let raw_url = read_env("AGENT_MAIL_URL").unwrap_or_else(|| DEFAULT_AGENT_MAIL_URL.to_string());
-    let server_url = normalize_agent_mail_url(&raw_url);
+    let http_path = read_env("HTTP_PATH").unwrap_or_else(|| "/mcp/".to_string());
+    let server_url = normalize_agent_mail_url(&raw_url, &http_path);
     let bearer_token = read_env("AGENT_MAIL_TOKEN")
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && !value_looks_like_template(v));
