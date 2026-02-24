@@ -157,6 +157,44 @@ fn relativize_path(project_root: &str, path: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+fn normalize_filter_paths(
+    project_root: &str,
+    paths: Option<Vec<String>>,
+) -> McpResult<Option<Vec<String>>> {
+    let Some(paths) = paths else {
+        return Ok(None);
+    };
+
+    let mut normalized_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        match relativize_path(project_root, &path) {
+            Some(rel) => {
+                if rel.is_empty() {
+                    return Err(legacy_tool_error(
+                        "INVALID_PATH",
+                        "Cannot target the project root directory itself. Please use more specific patterns.",
+                        true,
+                        json!({ "path": path }),
+                    ));
+                }
+                normalized_paths.push(rel);
+            }
+            None => {
+                return Err(legacy_tool_error(
+                    "INVALID_PATH",
+                    format!(
+                        "Path '{path}' is outside the project root '{project_root}'. File reservations must be within the project directory.",
+                    ),
+                    true,
+                    json!({ "path": path, "project_root": project_root }),
+                ));
+            }
+        }
+    }
+
+    Ok(Some(normalized_paths))
+}
+
 fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
@@ -539,6 +577,7 @@ pub async fn release_file_reservations(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
+    let normalized_paths = normalize_filter_paths(&project.human_key, paths)?;
 
     let agent = resolve_agent(
         ctx,
@@ -552,7 +591,7 @@ pub async fn release_file_reservations(
     let agent_id = agent.id.unwrap_or(0);
 
     // Convert paths to slice of &str
-    let paths_ref: Option<Vec<&str>> = paths
+    let paths_ref: Option<Vec<&str>> = normalized_paths
         .as_ref()
         .map(|p| p.iter().map(String::as_str).collect());
 
@@ -615,7 +654,7 @@ pub async fn release_file_reservations(
         released_rows.len(),
         agent_name,
         project_key,
-        paths,
+        normalized_paths,
         file_reservation_ids
     );
 
@@ -649,6 +688,7 @@ pub async fn renew_file_reservations(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
+    let normalized_paths = normalize_filter_paths(&project.human_key, paths)?;
 
     let agent = resolve_agent(
         ctx,
@@ -662,7 +702,7 @@ pub async fn renew_file_reservations(
     let agent_id = agent.id.unwrap_or(0);
 
     // Convert paths to slice of &str
-    let paths_ref: Option<Vec<&str>> = paths
+    let paths_ref: Option<Vec<&str>> = normalized_paths
         .as_ref()
         .map(|p| p.iter().map(String::as_str).collect());
 
@@ -673,7 +713,7 @@ pub async fn renew_file_reservations(
     let previous_expires_by_id = collect_previous_expiries(
         &existing_rows,
         agent_id,
-        paths.as_deref(),
+        normalized_paths.as_deref(),
         file_reservation_ids.as_deref(),
     );
 
@@ -749,7 +789,7 @@ pub async fn renew_file_reservations(
         agent_name,
         project_key,
         extend,
-        paths,
+        normalized_paths,
         file_reservation_ids
     );
 
@@ -1549,6 +1589,42 @@ mod tests {
             relativize_path(root, "/project/src/../internal"),
             Some("internal".to_string())
         );
+    }
+
+    #[test]
+    fn normalize_filter_paths_normalizes_relative_and_backslash_forms() {
+        let root = "/project";
+        let normalized = normalize_filter_paths(
+            root,
+            Some(vec![
+                "./src/main.rs".to_string(),
+                "src\\lib.rs".to_string(),
+                "src//deep///file.rs".to_string(),
+            ]),
+        )
+        .expect("normalized paths");
+        assert_eq!(
+            normalized,
+            Some(vec![
+                "src/main.rs".to_string(),
+                "src/lib.rs".to_string(),
+                "src/deep/file.rs".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn normalize_filter_paths_rejects_absolute_outside_root() {
+        let root = "/project";
+        let err = normalize_filter_paths(root, Some(vec!["/other/main.rs".to_string()]));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn normalize_filter_paths_rejects_project_root_target() {
+        let root = "/project";
+        let err = normalize_filter_paths(root, Some(vec![".".to_string()]));
+        assert!(err.is_err());
     }
 
     #[test]
