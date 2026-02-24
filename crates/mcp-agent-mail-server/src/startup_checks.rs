@@ -194,16 +194,18 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
     }
     let body = String::from_utf8_lossy(&body_bytes).to_string();
 
-    // Check for Agent Mail signatures in headers or body
-    // The server sets Server header or returns JSON with known fields
+    // Check for Agent Mail signatures in headers or body.
+    // Currently the server does NOT set a Server HTTP header, so detection
+    // relies on the JSON body from /health returning {"status":"ready"}.
     let combined = format!("{headers}{body}").to_lowercase();
 
-    // Agent Mail health endpoint returns JSON like {"status":"healthy"} or {"ok":true}
-    // or has mcp-agent-mail in Server header
+    // Primary: body contains {"status":"ready"} (or legacy "healthy") / {"ok":true}.
+    // Defensive: headers/body contain "mcp-agent-mail" (would match if a Server
+    // header is added in the future).
     combined.contains("mcp-agent-mail")
         || combined.contains("mcp_agent_mail")
         || combined.contains("agent-mail")
-        || (combined.contains("status") && combined.contains("healthy"))
+        || (combined.contains("\"status\"") && (combined.contains("ready") || combined.contains("healthy")))
         || combined.contains("\"ok\":true")
         || combined.contains("\"ok\": true")
 }

@@ -1833,9 +1833,7 @@ fn render_lines_with_columns(
     for col_idx in 0..cols {
         let col = u16::try_from(col_idx).unwrap_or(u16::MAX);
         let width = if col_idx == cols - 1 {
-            let used = base_width
-                .saturating_mul(col)
-                .saturating_add(col.min(total_gap));
+            let used = base_width.saturating_mul(col);
             available_width.saturating_sub(used)
         } else {
             base_width
