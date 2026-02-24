@@ -472,7 +472,7 @@ pub async fn file_reservation_paths(
             .map(|r| {
                 serde_json::json!({
                     "id": r.id.unwrap_or(0),
-                    "agent": &agent_name,
+                    "agent": &agent.name,
                     "path_pattern": &r.path_pattern,
                     "exclusive": r.exclusive != 0,
                     "reason": &r.reason,
@@ -576,7 +576,7 @@ pub async fn release_file_reservations(
             .map(|r| {
                 serde_json::json!({
                     "id": r.id.unwrap_or(0),
-                    "agent": &agent_name,
+                    "agent": &agent.name,
                     "path_pattern": &r.path_pattern,
                     "exclusive": r.exclusive != 0,
                     "reason": &r.reason,
@@ -696,7 +696,7 @@ pub async fn renew_file_reservations(
             .map(|r| {
                 serde_json::json!({
                     "id": r.id.unwrap_or(0),
-                    "agent": &agent_name,
+                    "agent": &agent.name,
                     "path_pattern": &r.path_pattern,
                     "exclusive": r.exclusive != 0,
                     "reason": &r.reason,

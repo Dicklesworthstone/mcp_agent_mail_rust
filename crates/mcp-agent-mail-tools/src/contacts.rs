@@ -122,6 +122,7 @@ pub(crate) async fn resolve_or_register_sender(
     project_slug: &str,
     project_human_key: &str,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    let from_agent = from_agent.trim();
     match resolve_agent(
         ctx,
         pool,

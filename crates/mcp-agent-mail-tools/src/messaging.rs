@@ -735,6 +735,7 @@ async fn push_recipient(
     all_recipients: &mut SmallVec<[(i64, String); 8]>,
     resolved_list: &mut SmallVec<[String; 4]>,
 ) -> McpResult<()> {
+    let name = name.trim();
     let name_key = name.to_lowercase();
     let agent = if let Some(existing) = recipient_map.get(&name_key) {
         existing.clone()

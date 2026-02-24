@@ -1577,6 +1577,7 @@ impl CommitCoalescer {
                 }
             }
         }
+        rq.depth.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Enqueue a commit request. **Non-blocking, fire-and-forget.**
@@ -1648,16 +1649,14 @@ impl CommitCoalescer {
             // Re-check under lock
             if q.len() < COALESCER_REPO_QUEUE_CAP {
                 q.push_back(fields);
-                drop(q);
                 rq.depth.fetch_add(1, Ordering::Relaxed);
+                drop(q);
             } else {
                 drop(q);
                 Self::spill_to_repo(&rq, fields);
-                rq.depth.fetch_add(1, Ordering::Relaxed);
             }
         } else {
             Self::spill_to_repo(&rq, fields);
-            rq.depth.fetch_add(1, Ordering::Relaxed);
         }
 
         // Wake a worker
@@ -1862,6 +1861,9 @@ fn coalescer_pool_worker(
                     break;
                 }
             }
+            if !batch.is_empty() {
+                rq.depth.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+            }
         }
 
         // Drain spill if we have room
@@ -1871,18 +1873,8 @@ fn coalescer_pool_worker(
             batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
 
         if drained_count == 0 {
-            // We found nothing, but we were invoked. If depth > 0, it's a desync.
-            // Reset to 0 to prevent busy loop.
-            rq.depth.store(0, Ordering::Relaxed);
+            // Nothing found to process. Depth should now be perfectly synchronized.
             std::thread::sleep(Duration::from_millis(1));
-        } else {
-            // Use fetch_update to atomically saturate-subtract, preventing wrap-around race
-            // where a concurrent enqueue (add) could be overwritten by a blind store(0).
-            let _ = rq
-                .depth
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    Some(val.saturating_sub(drained_count))
-                });
         }
 
         // Phase 4: Commit
@@ -2005,6 +1997,7 @@ fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<Coales
     if repo.pending_requests == 0 {
         return None;
     }
+    rq.depth.fetch_sub(repo.pending_requests, Ordering::Relaxed);
     Some(CoalescerSpilledWork {
         repo_root: repo_root.to_path_buf(),
         pending_requests: repo.pending_requests,
