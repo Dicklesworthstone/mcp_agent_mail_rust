@@ -1435,6 +1435,8 @@ impl MessageBrowserScreen {
             ));
         }
 
+        let ack_required = self.quick_reply_form.as_ref().map(|form| form.ack_required);
+
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx, 1);
         let result = block_on(mcp_agent_mail_tools::messaging::reply_message(
@@ -1448,7 +1450,7 @@ impl MessageBrowserScreen {
             None,
             None,
             None,
-            None,
+            ack_required,
         ));
 
         match result {

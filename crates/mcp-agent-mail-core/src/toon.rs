@@ -11,6 +11,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 
 use crate::config::Config;
 
@@ -162,8 +163,6 @@ fn implicit_json() -> FormatDecision {
 
 /// Default encoder binary name.
 const DEFAULT_ENCODER: &str = "tru";
-const ENCODER_KEY_SEPARATOR: &str = "\u{1F}";
-const ENCODER_RESULT_KEY_SEPARATOR: &str = "\u{1E}";
 const ENCODER_VALIDATION_CACHE_CAPACITY: usize = 16;
 const ENCODER_RESULT_CACHE_CAPACITY: usize = 64;
 const ENCODER_RESULT_CACHE_MAX_PAYLOAD_BYTES: usize = 16 * 1024;
@@ -255,7 +254,17 @@ fn encoder_validation_cache() -> &'static Mutex<EncoderValidationCache> {
 }
 
 fn encoder_command_key(encoder_parts: &[String]) -> String {
-    encoder_parts.join(ENCODER_KEY_SEPARATOR)
+    // Use length-prefixed segments to avoid separator-collision ambiguity.
+    // Format: "<len>:<part>|<len>:<part>|..."
+    let total_len: usize = encoder_parts.iter().map(String::len).sum();
+    let mut key = String::with_capacity(total_len + encoder_parts.len() * 8);
+    for part in encoder_parts {
+        key.push_str(&part.len().to_string());
+        key.push(':');
+        key.push_str(part);
+        key.push('|');
+    }
+    key
 }
 
 fn cached_validated_encoder(key: &str) -> Option<String> {
@@ -293,12 +302,23 @@ fn encoder_result_cache_key(
         return None;
     }
 
-    let mut key = String::with_capacity(command_key.len() + json_payload.len() + 3);
+    // Length-prefix command and hash payload to avoid collisions while
+    // keeping cache keys small for large-but-cacheable payloads.
+    // Format: "<cmd_len>:<cmd>|<stats>|<payload_len>:<sha1(payload)>"
+    let mut payload_hasher = Sha1::new();
+    payload_hasher.update(json_payload.as_bytes());
+    let payload_sha1 = format!("{:x}", payload_hasher.finalize());
+
+    let mut key = String::with_capacity(command_key.len() + payload_sha1.len() + 48);
+    key.push_str(&command_key.len().to_string());
+    key.push(':');
     key.push_str(command_key);
-    key.push_str(ENCODER_RESULT_KEY_SEPARATOR);
+    key.push('|');
     key.push(if stats_enabled { '1' } else { '0' });
-    key.push_str(ENCODER_RESULT_KEY_SEPARATOR);
-    key.push_str(json_payload);
+    key.push('|');
+    key.push_str(&json_payload.len().to_string());
+    key.push(':');
+    key.push_str(&payload_sha1);
     Some(key)
 }
 
@@ -568,10 +588,23 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
         }
     })?;
 
-    // Write JSON to stdin
-    if let Some(ref mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(json_payload.as_bytes());
+    // Write JSON to stdin; propagate write failures explicitly.
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(EncoderError::OsError(
+            "TOON encoder stdin unavailable".to_string(),
+        ));
+    };
+    if let Err(e) = stdin.write_all(json_payload.as_bytes()) {
+        // Ensure subprocess is not left running if stdin write fails early.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(EncoderError::OsError(format!(
+            "TOON encoder stdin write failed: {e}"
+        )));
     }
+    drop(stdin);
 
     let output = child
         .wait_with_output()
@@ -1005,6 +1038,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn encoder_command_key_is_collision_resistant_for_separator_content() {
+        // Old separator-join scheme would collide for these two vectors.
+        let sep = '\u{1F}';
+        let parts_a = vec!["a".to_string(), format!("b{sep}c")];
+        let parts_b = vec![format!("a{sep}b"), "c".to_string()];
+        let key_a = encoder_command_key(&parts_a);
+        let key_b = encoder_command_key(&parts_b);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn encoder_result_key_is_collision_resistant_for_separator_content() {
+        // Old separator-join scheme would collide for these tuples.
+        let sep = '\u{1E}';
+        let key_a = encoder_result_cache_key("a", false, &format!("b{sep}0{sep}c"))
+            .expect("small payload should be cacheable");
+        let key_b = encoder_result_cache_key(&format!("a{sep}0{sep}b"), false, "c")
+            .expect("small payload should be cacheable");
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn encoder_result_key_does_not_embed_raw_payload() {
+        let payload = r#"{"alpha":"very-unique-payload-marker-12345"}"#;
+        let key =
+            encoder_result_cache_key("tru", false, payload).expect("small payload should cache");
+        assert!(!key.contains(payload));
+        assert!(key.contains(&payload.len().to_string()));
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_encoder_caches_validation_for_same_command() {
@@ -1116,6 +1180,60 @@ esac
             encode_count, 1,
             "encode subprocess should run once for cached payload"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_encoder_reports_stdin_write_failure() {
+        let _test_guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_validation_cache_for_tests();
+        clear_result_cache_for_tests();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("mock_tru.sh");
+        let script = r#"#!/usr/bin/env bash
+set -eo pipefail
+arg="$1"
+case "$arg" in
+  --help)
+    echo "reference implementation in rust"
+    ;;
+  --version)
+    echo "tru 0.1.0"
+    ;;
+  --encode)
+    # Force parent write failures by closing stdin immediately.
+    exec 0<&-
+    sleep 0.05
+    ;;
+  *)
+    echo "unexpected arg: $arg" >&2
+    exit 1
+    ;;
+esac
+"#;
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mut config = test_config();
+        config.toon_bin = Some(script_path.to_string_lossy().to_string());
+
+        // Ensure write_all cannot complete before the child closes the read end.
+        let payload = format!(r#"{{"data":"{}"}}"#, "x".repeat(1_048_576));
+        let err = run_encoder(&config, &payload).expect_err("write should fail");
+        match err {
+            EncoderError::OsError(message) => {
+                assert!(
+                    message.contains("stdin write failed"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     // -- Fallback envelope --

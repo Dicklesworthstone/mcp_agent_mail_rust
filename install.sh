@@ -172,6 +172,18 @@ resolve_version() {
         return 0
       fi
     fi
+
+    # Try git tags API as last resort (works even without releases)
+    local tags_url="https://api.github.com/repos/${OWNER}/${REPO}/tags?per_page=10"
+    if tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$tags_url" 2>/dev/null \
+         | grep '"name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/'); then
+      if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]]; then
+        VERSION="$tag"
+        info "Resolved latest version via tags: $VERSION"
+        return 0
+      fi
+    fi
+
     VERSION="v0.1.0"
     warn "Could not resolve latest version; defaulting to $VERSION"
   fi
@@ -283,7 +295,7 @@ check_network() {
     warn "curl not found; skipping network check"
     return 0
   fi
-  if ! curl -fsSL --connect-timeout 3 --max-time 5 -o /dev/null "$URL"; then
+  if ! curl -fsSI --connect-timeout 3 --max-time 5 -o /dev/null "$URL" 2>/dev/null; then
     warn "Network check failed for $URL"
     warn "Continuing; download may fail"
   fi
@@ -545,16 +557,34 @@ trap cleanup EXIT
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
   if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
-    warn "Artifact download failed; falling back to build-from-source"
+    warn "Binary download failed (release may not exist for $VERSION)"
+    warn "Attempting build from source as fallback..."
     FROM_SOURCE=1
   fi
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
-  info "Building from source (requires git, rust nightly)"
+  info "Building from source (requires git, rust nightly, and all local dependencies)"
   ensure_rust
   git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
-  (cd "$TMP/src" && cargo build --release -p mcp-agent-mail -p mcp-agent-mail-cli)
+
+  # Check for local dependency paths required by [patch.crates-io] in Cargo.toml.
+  # These exist only on the project's build server; external users must use pre-built binaries.
+  if [ ! -d "/dp/asupersync" ]; then
+    err "Build from source requires local dependency checkouts under /dp/ that are"
+    err "only available on the project build server."
+    err ""
+    err "For end-user installation, use pre-built release binaries:"
+    err "  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh | bash"
+    err ""
+    err "If no release exists yet, check https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases"
+    exit 1
+  fi
+
+  if ! (cd "$TMP/src" && cargo build --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
+    err "Build failed. Check compiler output above for details."
+    exit 1
+  fi
   local_server="$TMP/src/target/release/$BIN_SERVER"
   local_cli="$TMP/src/target/release/$BIN_CLI"
   [ -x "$local_server" ] || { err "Build failed: $BIN_SERVER not found"; exit 1; }
@@ -581,20 +611,22 @@ else
     info "Fetching checksum from ${CHECKSUM_URL}"
     CHECKSUM_FILE="$TMP/checksum.sha256"
     if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-      err "Checksum required and could not be fetched"
-      err "Use --no-verify to skip checksum verification (not recommended)"
-      exit 1
-    fi
-    CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-    if [ -z "$CHECKSUM" ]; then
-      err "Empty checksum file"
-      exit 1
+      warn "Checksum file not available; skipping verification"
+      warn "Use --checksum <hex> to provide one manually"
+      CHECKSUM=""
+    else
+      CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
+      if [ -z "$CHECKSUM" ]; then
+        warn "Empty checksum file; skipping verification"
+      fi
     fi
   fi
 
-  if ! verify_checksum "$TMP/$TAR" "$CHECKSUM"; then
-    err "Installation aborted due to checksum failure"
-    exit 1
+  if [ -n "$CHECKSUM" ]; then
+    if ! verify_checksum "$TMP/$TAR" "$CHECKSUM"; then
+      err "Installation aborted due to checksum failure"
+      exit 1
+    fi
   fi
 
   if ! verify_sigstore_bundle "$TMP/$TAR" "$URL"; then

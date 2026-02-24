@@ -33,6 +33,9 @@ use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
+use ftui_runtime::tick_strategy::{
+    Predictive, PredictiveStrategyConfig, TickDecision, TickStrategy,
+};
 use mcp_agent_mail_db::DbPoolConfig;
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
@@ -77,16 +80,51 @@ const SCREEN_TRANSITION_TICKS: u8 = 2;
 const TOAST_ENTRANCE_TICKS: u8 = 3;
 const TOAST_EXIT_TICKS: u8 = 2;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
-/// Inactive screens tick once every N frames to avoid unnecessary I/O.
-/// At 10fps (100ms tick), 5 means inactive screens refresh every ~500ms.
-const INACTIVE_SCREEN_TICK_DIVISOR: u64 = 5;
+/// Fallback divisor before predictive transitions have enough observations.
+/// At 10fps (100ms tick), 12 means unknown inactive screens refresh ~1.2s.
+const SCREEN_TICK_FALLBACK_DIVISOR: u64 = 12;
+/// Predictive confidence warm-up threshold.
+const SCREEN_TICK_MIN_OBSERVATIONS: u64 = 8;
+/// Periodic predictive decay cadence.
+const SCREEN_TICK_DECAY_INTERVAL_TICKS: u64 = 600;
+/// Auto-save disabled in `am` (runtime persistence feature is not enabled).
+const SCREEN_TICK_AUTO_SAVE_INTERVAL_TICKS: u64 = 0;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
 const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
-/// Ambient effects only re-render every Nth frame.  At 10 fps with N=2 the
-/// animation updates at ~5 fps, which is imperceptibly smooth for a subtle
-/// background wash while keeping terminal output minimal on intervening frames.
-const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 2;
+/// Ambient effects only re-render every Nth frame. At 10 fps with N=4 the
+/// animation updates at ~2.5 fps, reducing terminal write churn and flicker.
+const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 4;
+
+fn default_screen_tick_strategy() -> Box<dyn TickStrategy> {
+    Box::new(Predictive::new(PredictiveStrategyConfig {
+        fallback_divisor: SCREEN_TICK_FALLBACK_DIVISOR,
+        min_observations: SCREEN_TICK_MIN_OBSERVATIONS,
+        decay_interval: SCREEN_TICK_DECAY_INTERVAL_TICKS,
+        auto_save_interval: SCREEN_TICK_AUTO_SAVE_INTERVAL_TICKS,
+        ..PredictiveStrategyConfig::default()
+    }))
+}
+
+const fn screen_tick_key(id: MailScreenId) -> &'static str {
+    match id {
+        MailScreenId::Dashboard => "dashboard",
+        MailScreenId::Messages => "messages",
+        MailScreenId::Threads => "threads",
+        MailScreenId::Search => "search",
+        MailScreenId::Agents => "agents",
+        MailScreenId::Reservations => "reservations",
+        MailScreenId::ToolMetrics => "tool_metrics",
+        MailScreenId::SystemHealth => "system_health",
+        MailScreenId::Timeline => "timeline",
+        MailScreenId::Projects => "projects",
+        MailScreenId::Contacts => "contacts",
+        MailScreenId::Explorer => "explorer",
+        MailScreenId::Analytics => "analytics",
+        MailScreenId::Attachments => "attachments",
+        MailScreenId::ArchiveBrowser => "archive_browser",
+    }
+}
 
 fn command_palette_theme_style() -> PaletteStyle {
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -999,6 +1037,8 @@ pub struct MailAppModel {
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
+    /// Adaptive per-screen tick strategy from frankentui.
+    screen_tick_strategy: Box<dyn TickStrategy>,
     accessibility: crate::tui_persist::AccessibilitySettings,
     macro_engine: MacroEngine,
     /// Tracks active reservations for expiry warnings.
@@ -1129,6 +1169,7 @@ impl MailAppModel {
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
             tick_count: 0,
+            screen_tick_strategy: default_screen_tick_strategy(),
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
             macro_engine: MacroEngine::new(),
             reservation_tracker: HashMap::new(),
@@ -1339,6 +1380,10 @@ impl MailAppModel {
         self.remember_focus_for_screen(from);
         self.screen_manager.set_active_screen(id);
         let to = self.screen_manager.active_screen();
+        if from != to {
+            self.screen_tick_strategy
+                .on_screen_transition(screen_tick_key(from), screen_tick_key(to));
+        }
         self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
         self.show_coach_hint_if_eligible(id);
@@ -1379,6 +1424,10 @@ impl MailAppModel {
         self.remember_focus_for_screen(from);
         self.screen_manager.apply_deep_link(target);
         let to = self.screen_manager.active_screen();
+        if from != to {
+            self.screen_tick_strategy
+                .on_screen_transition(screen_tick_key(from), screen_tick_key(to));
+        }
         self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
     }
@@ -1677,6 +1726,7 @@ impl MailAppModel {
     /// Operations are parsed as `"command:arg"` pairs. Known operations are
     /// mapped to deep-links, screen messages, or navigation actions. Unknown
     /// operations show an informational toast.
+    #[allow(clippy::too_many_lines)]
     fn dispatch_execute_operation(&mut self, operation: &str, context: &str) -> Cmd<MailMsg> {
         let (cmd, arg) = match operation.split_once(':') {
             Some((c, a)) => (c, a),
@@ -3145,17 +3195,23 @@ impl Model for MailAppModel {
                 let tick_count = self.tick_count;
                 let tick_state = &self.state;
                 let active_id = self.screen_manager.active_screen();
-                let is_background_tick =
-                    tick_count.is_multiple_of(INACTIVE_SCREEN_TICK_DIVISOR);
+                let active_tick_key = screen_tick_key(active_id);
                 let panics = self.screen_panics.get_mut();
                 let mut tick_panics: Vec<(MailScreenId, String)> = Vec::new();
                 for (id, screen) in self.screen_manager.iter_mut() {
                     if panics.contains_key(&id) {
                         continue;
                     }
-                    // Only tick the active screen every frame; inactive
-                    // screens tick at a reduced rate to avoid cumulative I/O.
-                    if id != active_id && !is_background_tick {
+                    let should_tick = if id == active_id {
+                        true
+                    } else {
+                        self.screen_tick_strategy.should_tick(
+                            screen_tick_key(id),
+                            tick_count,
+                            active_tick_key,
+                        ) == TickDecision::Tick
+                    };
+                    if !should_tick {
                         continue;
                     }
                     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -3168,6 +3224,7 @@ impl Model for MailAppModel {
                 for (id, msg) in tick_panics {
                     panics.insert(id, msg);
                 }
+                self.screen_tick_strategy.maintenance_tick(tick_count);
 
                 // Generate toasts from new high-priority events and track reservations
                 let new_events = self.state.events_since(self.last_toast_seq);
@@ -3329,7 +3386,10 @@ impl Model for MailAppModel {
                                     ModalSeverity::Warning,
                                     move |result| {
                                         if matches!(result, DialogResult::Ok) {
-                                            let _ = action_tx.send(("compose_discard".to_string(), String::new()));
+                                            let _ = action_tx.send((
+                                                "compose_discard".to_string(),
+                                                String::new(),
+                                            ));
                                         }
                                     },
                                 );
@@ -4201,6 +4261,7 @@ fn map_screen_cmd(cmd: Cmd<MailScreenMsg>) -> Cmd<MailMsg> {
         Cmd::SaveState => Cmd::save_state(),
         Cmd::RestoreState => Cmd::restore_state(),
         Cmd::SetMouseCapture(b) => Cmd::set_mouse_capture(b),
+        Cmd::SetTickStrategy(s) => Cmd::SetTickStrategy(s),
         Cmd::Task(spec, f) => Cmd::Task(spec, Box::new(move || MailMsg::Screen(f()))),
     }
 }
@@ -10271,6 +10332,36 @@ mod tests {
         // screen activation should catch the panic via catch_unwind.
         model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
 
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
+    }
+
+    #[test]
+    fn inactive_screen_tick_is_throttled_then_periodically_refreshed() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_tick = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+
+        // Active screen is Dashboard by default. Inactive screens should not
+        // tick immediately under the predictive fallback divisor.
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert!(
+            !model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages)
+        );
+
+        // Inactive screens are still refreshed periodically at the fallback
+        // divisor boundary.
+        for _ in 1..SCREEN_TICK_FALLBACK_DIVISOR {
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+        }
         assert!(
             model
                 .screen_panics

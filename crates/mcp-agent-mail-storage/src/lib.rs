@@ -2738,7 +2738,7 @@ fn commit_paths_lockfree(
     // Lock-free commits bypass the index by design; sync index to HEAD so
     // status/porcelain views remain clean for tooling and tests.
     if let Err(err) = try_restore_index_to_head(repo) {
-        tracing::debug!("[git-lockfree] failed to sync index after commit: {err}");
+        tracing::warn!("[git-lockfree] failed to sync index after commit: {err}");
     }
 
     Ok(())
@@ -6321,7 +6321,6 @@ pub fn check_archive_consistency(
         // Build the expected canonical path:
         // {storage_root}/projects/{slug}/messages/{YYYY}/{MM}/{iso}__{slug}__{id}.md
         let project_dir = storage_root.join("projects").join(&msg.project_slug);
-        let archive_root = project_dir.join("archive");
 
         // Parse the ISO timestamp to extract year/month
         let (year, month) = match parse_year_month(&msg.created_ts_iso) {
@@ -6344,7 +6343,7 @@ pub fn check_archive_consistency(
             &iso_filename
         };
 
-        let messages_dir = archive_root.join("messages").join(&year).join(&month);
+        let messages_dir = project_dir.join("messages").join(&year).join(&month);
 
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
         // We check both the computed path and do a directory scan fallback

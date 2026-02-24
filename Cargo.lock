@@ -465,7 +465,7 @@ dependencies = [
  "fsqlite-planner 0.1.0",
  "fsqlite-types",
  "fsqlite-vdbe 0.1.0",
- "fsqlite-vfs 0.1.0",
+ "fsqlite-vfs",
  "fsqlite-wal 0.1.0",
  "indicatif 0.18.4",
  "once_cell",
@@ -2135,7 +2135,7 @@ dependencies = [
  "fsqlite-ext-json",
  "fsqlite-ext-rtree",
  "fsqlite-types",
- "fsqlite-vfs 0.1.2",
+ "fsqlite-vfs",
 ]
 
 [[package]]
@@ -2197,7 +2197,7 @@ dependencies = [
  "fsqlite-planner 0.1.1",
  "fsqlite-types",
  "fsqlite-vdbe 0.1.1",
- "fsqlite-vfs 0.1.2",
+ "fsqlite-vfs",
  "fsqlite-wal 0.1.1",
  "serde",
  "tracing",
@@ -2332,7 +2332,7 @@ dependencies = [
  "chacha20poly1305",
  "fsqlite-error",
  "fsqlite-types",
- "fsqlite-vfs 0.1.0",
+ "fsqlite-vfs",
  "parking_lot",
  "xxhash-rust",
 ]
@@ -2345,7 +2345,7 @@ dependencies = [
  "chacha20poly1305",
  "fsqlite-error",
  "fsqlite-types",
- "fsqlite-vfs 0.1.2",
+ "fsqlite-vfs",
  "parking_lot",
  "xxhash-rust",
 ]
@@ -2444,26 +2444,11 @@ dependencies = [
  "fsqlite-func 0.1.1",
  "fsqlite-mvcc 0.1.1",
  "fsqlite-pager 0.1.1",
+ "fsqlite-parser 0.1.1",
  "fsqlite-types",
  "fsqlite-wal 0.1.1",
  "tempfile",
  "tracing",
-]
-
-[[package]]
-name = "fsqlite-vfs"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cfb884b3a03a3041d7b77d344565a437453ec79aa0061bf614abeab15cb5c9d"
-dependencies = [
- "advisory-lock",
- "fsqlite-error",
- "fsqlite-types",
- "libc",
- "nix 0.29.0",
- "pollster",
- "tracing",
- "uring-fs",
 ]
 
 [[package]]
@@ -2475,9 +2460,7 @@ dependencies = [
  "fsqlite-types",
  "libc",
  "nix 0.29.0",
- "pollster",
  "tracing",
- "uring-fs",
 ]
 
 [[package]]
@@ -2491,7 +2474,7 @@ dependencies = [
  "crc32c",
  "fsqlite-error",
  "fsqlite-types",
- "fsqlite-vfs 0.1.0",
+ "fsqlite-vfs",
  "tracing",
  "xxhash-rust",
 ]
@@ -2505,7 +2488,7 @@ dependencies = [
  "crc32c",
  "fsqlite-error",
  "fsqlite-types",
- "fsqlite-vfs 0.1.2",
+ "fsqlite-vfs",
  "tracing",
  "xxhash-rust",
 ]
@@ -5840,12 +5823,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pollster"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
-
-[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8163,10 +8140,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uring-fs"
-version = "1.4.0"
-
-[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9180,3 +9153,7 @@ checksum = "410e9ecef634c709e3831c2cfdb8d9c32164fae1c67496d5b68fff728eec37fe"
 dependencies = [
  "zune-core 0.5.1",
 ]
+
+[[patch.unused]]
+name = "uring-fs"
+version = "1.4.0"

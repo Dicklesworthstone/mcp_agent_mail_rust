@@ -1490,34 +1490,23 @@ pub async fn set_agent_contact_policy(
     let tracked = tracked(&*conn);
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Read current row first so we can preserve attachments_policy explicitly.
-    // Some engines can clobber this field on partial UPDATE statements.
-    let current_sql = "SELECT id, project_id, name, program, model, task_description, \
-                       inception_ts, last_active_ts, attachments_policy, contact_policy \
-                       FROM agents WHERE id = ? LIMIT 1";
-    let current_rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, current_sql, &[Value::BigInt(agent_id)]).await)
-    );
-    let Some(current_agent) = current_rows.first().map(decode_agent_row_indexed) else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
-    };
-
     let now = now_micros();
-    let sql = "UPDATE agents SET attachments_policy = ?, contact_policy = ?, last_active_ts = ? WHERE id = ?";
+    let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
     let params = [
-        Value::Text(current_agent.attachments_policy.clone()),
         Value::Text(policy.to_string()),
         Value::BigInt(now),
         Value::BigInt(agent_id),
     ];
-    try_in_tx!(
+    let rows_affected = try_in_tx!(
         cx,
         &tracked,
         map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
     );
+
+    if rows_affected == 0 {
+        rollback_tx(cx, &tracked).await;
+        return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+    }
 
     // Fetch updated agent using raw SQL with explicit column order.
     let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
@@ -1594,9 +1583,8 @@ pub async fn set_agent_contact_policy_by_name(
         )));
     };
 
-    let sql = "UPDATE agents SET attachments_policy = ?, contact_policy = ?, last_active_ts = ? WHERE id = ?";
+    let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
     let params = [
-        Value::Text(current_agent.attachments_policy.clone()),
         Value::Text(policy.to_string()),
         Value::BigInt(now),
         Value::BigInt(current_id),

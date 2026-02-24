@@ -691,11 +691,18 @@ pub fn looks_like_model_name(value: &str) -> bool {
 /// Check if a value looks like an email address.
 #[must_use]
 pub fn looks_like_email(value: &str) -> bool {
-    value.contains('@')
-        && value
-            .split('@')
-            .next_back()
-            .is_some_and(|s| s.contains('.'))
+    if let Some((local, domain)) = value.rsplit_once('@') {
+        if local.is_empty() {
+            return false;
+        }
+        if let Some((domain_part, tld_part)) = domain.rsplit_once('.') {
+            !domain_part.is_empty() && !tld_part.is_empty()
+        } else {
+            false
+        }
+    } else {
+        false
+    }
 }
 
 /// Check if a value looks like an attempt to broadcast to all agents.
@@ -1091,8 +1098,10 @@ mod tests {
         assert!(looks_like_email("alice@example.com"));
         assert!(looks_like_email("ops@alerts.dev"));
         assert!(!looks_like_email("alice@localhost"));
+        assert!(!looks_like_email("@example.com"));
         assert!(!looks_like_email("BlueLake"));
         assert!(!looks_like_email("not-an-email@"));
+        assert!(!looks_like_email("@."));
     }
 
     #[test]
@@ -1567,7 +1576,12 @@ mod tests {
 
     #[test]
     fn email_just_at_and_dot() {
-        assert!(looks_like_email("@."));
+        assert!(!looks_like_email("@."));
+    }
+
+    #[test]
+    fn email_empty_local_part() {
+        assert!(!looks_like_email("@example.com"));
     }
 
     // ── looks_like_broadcast ─────────────────────────────────────────

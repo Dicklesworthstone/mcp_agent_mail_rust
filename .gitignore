@@ -104,6 +104,8 @@ target-rch*/
 
 # Vendored dependencies (local overrides)
 vendor/
+# But track uring-fs (required for builds; no crates.io release)
+!vendor/uring-fs/
 
 # Beads backup/conflict files
 .beads/*.bak_*

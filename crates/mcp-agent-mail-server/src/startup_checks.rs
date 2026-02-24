@@ -205,7 +205,8 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
     combined.contains("mcp-agent-mail")
         || combined.contains("mcp_agent_mail")
         || combined.contains("agent-mail")
-        || (combined.contains("\"status\"") && (combined.contains("ready") || combined.contains("healthy")))
+        || (combined.contains("\"status\"")
+            && (combined.contains("ready") || combined.contains("healthy")))
         || combined.contains("\"ok\":true")
         || combined.contains("\"ok\": true")
 }
