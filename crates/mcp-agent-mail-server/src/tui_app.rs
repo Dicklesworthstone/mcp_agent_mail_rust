@@ -77,6 +77,9 @@ const SCREEN_TRANSITION_TICKS: u8 = 2;
 const TOAST_ENTRANCE_TICKS: u8 = 3;
 const TOAST_EXIT_TICKS: u8 = 2;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
+/// Inactive screens tick once every N frames to avoid unnecessary I/O.
+/// At 10fps (100ms tick), 5 means inactive screens refresh every ~500ms.
+const INACTIVE_SCREEN_TICK_DIVISOR: u64 = 5;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
 const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
@@ -1339,6 +1342,22 @@ impl MailAppModel {
         self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
         self.show_coach_hint_if_eligible(id);
+        // Force-tick the newly active screen so it shows fresh data
+        // immediately (inactive screens tick at a reduced rate).
+        if from != to {
+            let tick_count = self.tick_count;
+            let tick_state = &self.state;
+            if let Some(screen) = self.screen_manager.get_mut(to) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    screen.tick(tick_count, tick_state);
+                }));
+                if let Err(payload) = result {
+                    self.screen_panics
+                        .get_mut()
+                        .insert(to, panic_payload_to_string(&payload));
+                }
+            }
+        }
     }
 
     /// Show a one-shot coach hint toast for the given screen if eligible.
@@ -1758,6 +1777,10 @@ impl MailAppModel {
                         .icon(ToastIcon::Info)
                         .duration(Duration::from_secs(2)),
                 );
+                Cmd::none()
+            }
+            "compose_discard" => {
+                self.compose_state = None;
                 Cmd::none()
             }
 
@@ -3121,10 +3144,18 @@ impl Model for MailAppModel {
                 }
                 let tick_count = self.tick_count;
                 let tick_state = &self.state;
+                let active_id = self.screen_manager.active_screen();
+                let is_background_tick =
+                    tick_count.is_multiple_of(INACTIVE_SCREEN_TICK_DIVISOR);
                 let panics = self.screen_panics.get_mut();
                 let mut tick_panics: Vec<(MailScreenId, String)> = Vec::new();
                 for (id, screen) in self.screen_manager.iter_mut() {
                     if panics.contains_key(&id) {
+                        continue;
+                    }
+                    // Only tick the active screen every frame; inactive
+                    // screens tick at a reduced rate to avoid cumulative I/O.
+                    if id != active_id && !is_background_tick {
                         continue;
                     }
                     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -3291,8 +3322,17 @@ impl Model for MailAppModel {
                                 self.compose_state = None;
                             }
                             ComposeAction::ConfirmClose => {
-                                // TODO: show modal confirmation for unsaved changes
-                                self.compose_state = None;
+                                let action_tx = self.action_tx.clone();
+                                self.modal_manager.show_confirmation(
+                                    "Discard Message",
+                                    "You have unsaved changes. Discard them?",
+                                    ModalSeverity::Warning,
+                                    move |result| {
+                                        if matches!(result, DialogResult::Ok) {
+                                            let _ = action_tx.send(("compose_discard".to_string(), String::new()));
+                                        }
+                                    },
+                                );
                             }
                             ComposeAction::Send => {
                                 if let Some(mut cs) = self.compose_state.take() {
@@ -6140,6 +6180,15 @@ mod tests {
         MailAppModel::new(state)
     }
 
+    /// Check whether a `Cmd` contains a `Cmd::Tick` (at any nesting level).
+    fn cmd_contains_tick(cmd: &Cmd<MailMsg>) -> bool {
+        match cmd {
+            Cmd::Tick(_) => true,
+            Cmd::Batch(cmds) | Cmd::Sequence(cmds) => cmds.iter().any(cmd_contains_tick),
+            _ => false,
+        }
+    }
+
     fn test_model_with_debug(debug: bool) -> MailAppModel {
         let config = Config {
             tui_debug: debug,
@@ -6874,7 +6923,11 @@ mod tests {
         assert_eq!(state.remote_terminal_queue_len(), 2);
 
         let cmd = model.update(MailMsg::Terminal(Event::Tick));
-        assert!(matches!(cmd, Cmd::Tick(_)));
+        // Tick handler batches Tick + deferred_cmd + remote_cmds
+        assert!(
+            cmd_contains_tick(&cmd),
+            "tick handler should return a cmd containing Cmd::Tick"
+        );
         assert_eq!(state.remote_terminal_queue_len(), 0);
         assert_eq!(model.active_screen(), MailScreenId::Messages);
     }
@@ -7346,7 +7399,11 @@ mod tests {
         let mut model = test_model();
         let cmd = model.update(MailMsg::Terminal(Event::Tick));
         assert_eq!(model.tick_count, 1);
-        assert!(matches!(cmd, Cmd::Tick(_)));
+        // Tick handler returns Cmd::batch([Tick, deferred_cmd, ...remote_cmds])
+        assert!(
+            cmd_contains_tick(&cmd),
+            "tick handler should return a cmd containing Cmd::Tick"
+        );
     }
 
     #[test]
@@ -10209,9 +10266,10 @@ mod tests {
         let mut screen = PanickingScreen::new();
         screen.panic_on_tick = true;
         model.set_screen(MailScreenId::Messages, Box::new(screen));
-
-        // Tick should catch the panic.
-        model.update(MailMsg::Terminal(Event::Tick));
+        // Switch to Messages so it's the active screen (inactive screens
+        // are only ticked at a reduced rate).  The force-tick during
+        // screen activation should catch the panic via catch_unwind.
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
 
         assert!(
             model
