@@ -1,11 +1,66 @@
 use globset::{GlobBuilder, GlobMatcher};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
+
+const PATTERN_CACHE_CAPACITY: usize = 256;
+
+thread_local! {
+    static PATTERN_CACHE: RefCell<PatternCache> = RefCell::new(PatternCache::new(PATTERN_CACHE_CAPACITY));
+}
+
+#[derive(Debug)]
+struct PatternCache {
+    capacity: usize,
+    entries: HashMap<String, Arc<CompiledPattern>>,
+    order: VecDeque<String>,
+}
+
+impl PatternCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get_or_insert(&mut self, raw: &str) -> Arc<CompiledPattern> {
+        if let Some(compiled) = self.entries.get(raw) {
+            return Arc::clone(compiled);
+        }
+
+        let compiled = Arc::new(CompiledPattern::new(raw));
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+
+        let key = raw.to_owned();
+        self.entries.insert(key.clone(), Arc::clone(&compiled));
+        self.order.push_back(key);
+        compiled
+    }
+}
 
 fn normalize_pattern(pattern: &str) -> String {
-    let mut normalized = pattern.trim().replace('\\', "/");
-
-    // Collapse consecutive slashes
-    while normalized.contains("//") {
-        normalized = normalized.replace("//", "/");
+    let trimmed = pattern.trim();
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut prev_slash = false;
+    for ch in trimmed.chars() {
+        let mapped = if ch == '\\' { '/' } else { ch };
+        if mapped == '/' {
+            if !prev_slash {
+                normalized.push('/');
+            }
+            prev_slash = true;
+        } else {
+            normalized.push(mapped);
+            prev_slash = false;
+        }
     }
 
     let mut slice = normalized.as_str();
@@ -19,24 +74,56 @@ fn normalize_pattern(pattern: &str) -> String {
 pub struct CompiledPattern {
     norm: String,
     matcher: Option<GlobMatcher>,
+    is_glob: bool,
+    first_literal_segment_end: Option<usize>,
 }
 
 /// Returns `true` if the string contains glob metacharacters (`*`, `?`, `[`, `{`).
 #[must_use]
 pub fn has_glob_meta(s: &str) -> bool {
-    s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+    s.bytes().any(|b| matches!(b, b'*' | b'?' | b'[' | b'{'))
+}
+
+fn first_literal_segment_end(norm: &str) -> Option<usize> {
+    let seg_end = norm.find('/').unwrap_or(norm.len());
+    let seg = &norm[..seg_end];
+    if seg.is_empty() || has_glob_meta(seg) {
+        None
+    } else {
+        Some(seg_end)
+    }
+}
+
+fn is_directory_prefix(prefix: &str, full: &str) -> bool {
+    !prefix.is_empty()
+        && full.starts_with(prefix)
+        && full
+            .as_bytes()
+            .get(prefix.len())
+            .is_some_and(|b| *b == b'/')
 }
 
 impl CompiledPattern {
     #[must_use]
     pub fn new(raw: &str) -> Self {
         let norm = normalize_pattern(raw);
-        let matcher = GlobBuilder::new(&norm)
-            .literal_separator(true)
-            .build()
-            .ok()
-            .map(|g| g.compile_matcher());
-        Self { norm, matcher }
+        let is_glob = has_glob_meta(&norm);
+        let first_literal_segment_end = first_literal_segment_end(&norm);
+        let matcher = if is_glob {
+            GlobBuilder::new(&norm)
+                .literal_separator(true)
+                .build()
+                .ok()
+                .map(|g| g.compile_matcher())
+        } else {
+            None
+        };
+        Self {
+            norm,
+            matcher,
+            is_glob,
+            first_literal_segment_end,
+        }
     }
 
     /// Returns the normalized pattern string.
@@ -47,8 +134,8 @@ impl CompiledPattern {
 
     /// Returns `true` if the normalized pattern contains glob metacharacters.
     #[must_use]
-    pub fn is_glob(&self) -> bool {
-        has_glob_meta(&self.norm)
+    pub const fn is_glob(&self) -> bool {
+        self.is_glob
     }
 
     /// Returns the first literal segment if it doesn't contain glob chars.
@@ -56,12 +143,7 @@ impl CompiledPattern {
     /// E.g. `"src/api/*.rs"` → `Some("src")`, `"*.rs"` → `None`.
     #[must_use]
     pub fn first_literal_segment(&self) -> Option<&str> {
-        let seg = self.norm.split('/').next().unwrap_or("");
-        if seg.is_empty() || has_glob_meta(seg) {
-            None
-        } else {
-            Some(seg)
-        }
+        self.first_literal_segment_end.map(|end| &self.norm[..end])
     }
 
     /// Returns `true` if the glob matcher matches the given path string.
@@ -70,6 +152,7 @@ impl CompiledPattern {
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
         self.matcher.as_ref().is_some_and(|m| m.is_match(path))
+            || (!self.is_glob && self.norm == path)
     }
 
     #[must_use]
@@ -78,13 +161,41 @@ impl CompiledPattern {
             return true;
         }
 
+        // Distinct exact literals overlap only when one is a slash-boundary
+        // directory prefix of the other.
+        if !self.is_glob && !other.is_glob {
+            return is_directory_prefix(&self.norm, &other.norm)
+                || is_directory_prefix(&other.norm, &self.norm);
+        }
+
         // 1. Check subset/containment (existing logic)
         // If one pattern matches the other's *string representation*, they definitely overlap.
         // This handles cases like `src/*.rs` matching `src/main.rs`.
-        if let (Some(a), Some(b)) = (&self.matcher, &other.matcher)
-            && (a.is_match(&other.norm) || b.is_match(&self.norm))
+        if let Some(a) = &self.matcher
+            && (!other.is_glob || other.matcher.is_some())
+            && a.is_match(&other.norm)
         {
             return true;
+        }
+        if let Some(b) = &other.matcher
+            && (!self.is_glob || self.matcher.is_some())
+            && b.is_match(&self.norm)
+        {
+            return true;
+        }
+
+        // Invalid glob patterns (failed compile) do not match anything.
+        if (self.is_glob && self.matcher.is_none()) || (other.is_glob && other.matcher.is_none()) {
+            return false;
+        }
+
+        // If both patterns start with different literal first segments, they are disjoint.
+        if let (Some(left_end), Some(right_end)) = (
+            self.first_literal_segment_end,
+            other.first_literal_segment_end,
+        ) && self.norm[..left_end] != other.norm[..right_end]
+        {
+            return false;
         }
 
         // 2. Heuristic check for intersecting paths/globs
@@ -162,9 +273,12 @@ fn segment_pair_overlaps(s1: &str, s2: &str) -> bool {
 /// Returns true when two glob/literal patterns overlap under Agent Mail semantics.
 #[must_use]
 pub fn patterns_overlap(left: &str, right: &str) -> bool {
-    let left = CompiledPattern::new(left);
-    let right = CompiledPattern::new(right);
-    left.overlaps(&right)
+    PATTERN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let left = cache.get_or_insert(left);
+        let right = cache.get_or_insert(right);
+        left.overlaps(&right)
+    })
 }
 
 #[cfg(test)]
@@ -190,6 +304,9 @@ mod tests {
 
         let invalid_same = CompiledPattern::new(" [abc ");
         assert!(invalid.overlaps(&invalid_same));
+
+        let invalid_other = CompiledPattern::new("[def");
+        assert!(!invalid.overlaps(&invalid_other));
     }
 
     // ── normalize_pattern tests ──────────────────────────────────────
@@ -327,6 +444,22 @@ mod tests {
     }
 
     #[test]
+    fn overlaps_exact_prefix_paths_do_not_overlap() {
+        let a = CompiledPattern::new("src/main");
+        let b = CompiledPattern::new("src/main.rs");
+        assert!(!a.overlaps(&b));
+        assert!(!b.overlaps(&a));
+    }
+
+    #[test]
+    fn overlaps_exact_directory_prefix_paths_overlap() {
+        let a = CompiledPattern::new("src");
+        let b = CompiledPattern::new("src/main.rs");
+        assert!(a.overlaps(&b));
+        assert!(b.overlaps(&a));
+    }
+
+    #[test]
     fn overlaps_glob_contains_exact() {
         let glob = CompiledPattern::new("src/**");
         let exact = CompiledPattern::new("src/main.rs");
@@ -419,6 +552,26 @@ mod tests {
         assert!(patterns_overlap("src/**", "src/main.rs"));
         assert!(!patterns_overlap("src/*.rs", "docs/*.md"));
         assert!(patterns_overlap("./src/main.rs", "src/main.rs"));
+    }
+
+    #[test]
+    fn patterns_overlap_repeated_calls_are_stable() {
+        for _ in 0..32 {
+            assert!(patterns_overlap("src/**/*.rs", "src/main.rs"));
+            assert!(!patterns_overlap("docs/*.md", "src/main.rs"));
+            assert!(patterns_overlap("src", "src/main.rs"));
+        }
+    }
+
+    #[test]
+    fn patterns_overlap_cache_eviction_preserves_correctness() {
+        for i in 0..(PATTERN_CACHE_CAPACITY + 64) {
+            let left = format!("dir{i}/**/*.rs");
+            let right = format!("dir{i}/main.rs");
+            assert!(patterns_overlap(&left, &right));
+        }
+        assert!(patterns_overlap("src/**/*.rs", "src/main.rs"));
+        assert!(!patterns_overlap("src/*.rs", "docs/readme.md"));
     }
 
     // ── edge cases ───────────────────────────────────────────────────

@@ -6,8 +6,11 @@ use crate::config::Config;
 use crate::config::ProjectIdentityMode;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryInfo {
@@ -45,6 +48,70 @@ fn short_sha1(text: &str, n: usize) -> String {
     hex.chars().take(n).collect()
 }
 
+#[derive(Clone, Debug)]
+struct ResolvePathCacheEntry {
+    canonical: PathBuf,
+    validated_at: Instant,
+}
+
+const RESOLVE_PATH_CACHE_MAX_ENTRIES: usize = 2048;
+#[cfg(test)]
+const RESOLVE_PATH_CACHE_FRESHNESS: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const RESOLVE_PATH_CACHE_FRESHNESS: Duration = Duration::from_secs(2);
+
+static RESOLVE_PATH_CACHE: OnceLock<Mutex<HashMap<String, ResolvePathCacheEntry>>> =
+    OnceLock::new();
+
+fn resolve_path_cache() -> &'static Mutex<HashMap<String, ResolvePathCacheEntry>> {
+    RESOLVE_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resolve_path_cache_key(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn resolve_path_cache_get(path: &Path) -> Option<PathBuf> {
+    let key = resolve_path_cache_key(path);
+    let mut cache = resolve_path_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = cache.get(&key)?;
+    if entry.validated_at.elapsed() <= RESOLVE_PATH_CACHE_FRESHNESS {
+        return Some(entry.canonical.clone());
+    }
+    cache.remove(&key);
+    None
+}
+
+fn resolve_path_cache_insert(path: &Path, canonical: &Path) {
+    let key = resolve_path_cache_key(path);
+    let mut cache = resolve_path_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !cache.contains_key(&key)
+        && cache.len() >= RESOLVE_PATH_CACHE_MAX_ENTRIES
+        && let Some(victim) = cache.keys().next().cloned()
+    {
+        cache.remove(&victim);
+    }
+    cache.insert(
+        key,
+        ResolvePathCacheEntry {
+            canonical: canonical.to_path_buf(),
+            validated_at: Instant::now(),
+        },
+    );
+}
+
+fn resolve_path_cache_remove(path: &Path) {
+    let key = resolve_path_cache_key(path);
+    let mut cache = resolve_path_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.remove(&key);
+}
+
 /// Normalize a human-readable value into a slug.
 #[must_use]
 pub fn slugify(value: &str) -> String {
@@ -70,6 +137,18 @@ pub fn slugify(value: &str) -> String {
 fn resolve_path(human_key: &str) -> PathBuf {
     let expanded = shellexpand::tilde(human_key).into_owned();
     let path = PathBuf::from(expanded);
+    if path.is_absolute() {
+        if let Some(cached) = resolve_path_cache_get(&path) {
+            return cached;
+        }
+        if let Ok(canonical) = std::fs::canonicalize(&path) {
+            resolve_path_cache_insert(&path, &canonical);
+            return canonical;
+        }
+        // Remove stale entries if the path can no longer be canonicalized.
+        resolve_path_cache_remove(&path);
+        return path;
+    }
     std::fs::canonicalize(&path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path
@@ -839,5 +918,39 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let slug = compute_project_slug(&tmp.path().display().to_string());
         assert!(!slug.is_empty());
+    }
+
+    #[test]
+    fn resolve_path_absolute_missing_returns_input_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist");
+        let resolved = resolve_path(&missing.display().to_string());
+        assert_eq!(resolved, missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_cache_revalidates_after_freshness_window() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target_a = tmp.path().join("a");
+        let target_b = tmp.path().join("b");
+        std::fs::create_dir_all(&target_a).expect("create target a");
+        std::fs::create_dir_all(&target_b).expect("create target b");
+
+        let link = tmp.path().join("link");
+        symlink(&target_a, &link).expect("symlink to target a");
+
+        let first = resolve_path(&link.display().to_string());
+        assert_eq!(first, target_a.canonicalize().expect("canonical a"));
+
+        std::fs::remove_file(&link).expect("remove old link");
+        symlink(&target_b, &link).expect("symlink to target b");
+
+        std::thread::sleep(RESOLVE_PATH_CACHE_FRESHNESS + Duration::from_millis(10));
+
+        let second = resolve_path(&link.display().to_string());
+        assert_eq!(second, target_b.canonicalize().expect("canonical b"));
     }
 }

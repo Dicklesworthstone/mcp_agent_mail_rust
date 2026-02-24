@@ -4,10 +4,11 @@
 //! and envelope construction for TOON-encoded responses. Falls back gracefully
 //! to JSON on any encoder failure.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +162,184 @@ fn implicit_json() -> FormatDecision {
 
 /// Default encoder binary name.
 const DEFAULT_ENCODER: &str = "tru";
+const ENCODER_KEY_SEPARATOR: &str = "\u{1F}";
+const ENCODER_RESULT_KEY_SEPARATOR: &str = "\u{1E}";
+const ENCODER_VALIDATION_CACHE_CAPACITY: usize = 16;
+const ENCODER_RESULT_CACHE_CAPACITY: usize = 64;
+const ENCODER_RESULT_CACHE_MAX_PAYLOAD_BYTES: usize = 16 * 1024;
+
+#[derive(Debug)]
+struct EncoderValidationCache {
+    capacity: usize,
+    entries: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl EncoderValidationCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, key: String, exe: String) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), exe);
+            if let Some(pos) = self.order.iter().position(|existing| existing == &key) {
+                let _ = self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            return;
+        }
+
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+
+        self.entries.insert(key.clone(), exe);
+        self.order.push_back(key);
+    }
+}
+
+static ENCODER_VALIDATION_CACHE: OnceLock<Mutex<EncoderValidationCache>> = OnceLock::new();
+
+#[derive(Debug)]
+struct EncoderResultCache {
+    capacity: usize,
+    entries: HashMap<String, EncoderSuccess>,
+    order: VecDeque<String>,
+}
+
+impl EncoderResultCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, key: String, result: EncoderSuccess) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), result);
+            if let Some(pos) = self.order.iter().position(|existing| existing == &key) {
+                let _ = self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            return;
+        }
+
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+
+        self.entries.insert(key.clone(), result);
+        self.order.push_back(key);
+    }
+}
+
+static ENCODER_RESULT_CACHE: OnceLock<Mutex<EncoderResultCache>> = OnceLock::new();
+
+fn encoder_validation_cache() -> &'static Mutex<EncoderValidationCache> {
+    ENCODER_VALIDATION_CACHE.get_or_init(|| {
+        Mutex::new(EncoderValidationCache::new(
+            ENCODER_VALIDATION_CACHE_CAPACITY,
+        ))
+    })
+}
+
+fn encoder_command_key(encoder_parts: &[String]) -> String {
+    encoder_parts.join(ENCODER_KEY_SEPARATOR)
+}
+
+fn cached_validated_encoder(key: &str) -> Option<String> {
+    let mut cache = encoder_validation_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let cached = cache.entries.get(key).cloned()?;
+    if let Some(pos) = cache.order.iter().position(|existing| existing == key) {
+        let _ = cache.order.remove(pos);
+    }
+    cache.order.push_back(key.to_string());
+    drop(cache);
+    Some(cached)
+}
+
+fn store_validated_encoder(key: String, exe: String) {
+    let mut cache = encoder_validation_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(key, exe);
+}
+
+fn encoder_result_cache() -> &'static Mutex<EncoderResultCache> {
+    ENCODER_RESULT_CACHE
+        .get_or_init(|| Mutex::new(EncoderResultCache::new(ENCODER_RESULT_CACHE_CAPACITY)))
+}
+
+fn encoder_result_cache_key(
+    command_key: &str,
+    stats_enabled: bool,
+    json_payload: &str,
+) -> Option<String> {
+    if json_payload.len() > ENCODER_RESULT_CACHE_MAX_PAYLOAD_BYTES {
+        return None;
+    }
+
+    let mut key = String::with_capacity(command_key.len() + json_payload.len() + 3);
+    key.push_str(command_key);
+    key.push_str(ENCODER_RESULT_KEY_SEPARATOR);
+    key.push(if stats_enabled { '1' } else { '0' });
+    key.push_str(ENCODER_RESULT_KEY_SEPARATOR);
+    key.push_str(json_payload);
+    Some(key)
+}
+
+fn cached_encoder_result(key: &str) -> Option<EncoderSuccess> {
+    let mut cache = encoder_result_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let cached = cache.entries.get(key).cloned()?;
+    if let Some(pos) = cache.order.iter().position(|existing| existing == key) {
+        let _ = cache.order.remove(pos);
+    }
+    cache.order.push_back(key.to_string());
+    drop(cache);
+    Some(cached)
+}
+
+fn store_encoder_result(key: String, result: &EncoderSuccess) {
+    let mut cache = encoder_result_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(key, result.clone());
+}
+
+#[cfg(test)]
+fn clear_validation_cache_for_tests() {
+    let mut cache = encoder_validation_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.entries.clear();
+    cache.order.clear();
+}
+
+#[cfg(test)]
+fn clear_result_cache_for_tests() {
+    let mut cache = encoder_result_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.entries.clear();
+    cache.order.clear();
+}
 
 /// Resolve the encoder binary path from config.
 ///
@@ -351,7 +530,22 @@ fn parse_saved_line(line: &str) -> Option<(u64, f64)> {
 /// Returns the TOON-encoded string on success, or an error description.
 pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess, EncoderError> {
     let encoder_parts = resolve_encoder(config);
-    let exe = validate_encoder(&encoder_parts).map_err(EncoderError::Validation)?;
+    let command_key = encoder_command_key(&encoder_parts);
+    let result_cache_key =
+        encoder_result_cache_key(&command_key, config.toon_stats_enabled, json_payload);
+    if let Some(cache_key) = result_cache_key.as_deref()
+        && let Some(cached) = cached_encoder_result(cache_key)
+    {
+        return Ok(cached);
+    }
+
+    let exe = if let Some(cached) = cached_validated_encoder(&command_key) {
+        cached
+    } else {
+        let validated = validate_encoder(&encoder_parts).map_err(EncoderError::Validation)?;
+        store_validated_encoder(command_key, validated.clone());
+        validated
+    };
 
     let mut cmd = Command::new(&exe);
     // Pass any extra args from config (e.g. TOON_BIN="tru --experimental")
@@ -408,16 +602,20 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
         None
     };
 
-    Ok(EncoderSuccess {
+    let success = EncoderSuccess {
         encoded: stdout,
         encoder: exe,
         stats,
         stats_raw,
-    })
+    };
+    if let Some(cache_key) = result_cache_key {
+        store_encoder_result(cache_key, &success);
+    }
+    Ok(success)
 }
 
 /// Successful encoder result.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EncoderSuccess {
     pub encoded: String,
     pub encoder: String,
@@ -565,13 +763,29 @@ pub fn apply_tool_format(
     let payload: serde_json::Value =
         serde_json::from_str(json_result).map_err(|e| format!("json serialization failed: {e}"))?;
 
-    apply_toon_format(&payload, format_value, config)?.map_or_else(
-        || Ok(json_result.to_string()),
-        |envelope| {
-            serde_json::to_string(&envelope)
-                .map_err(|e| format!("Failed to serialize envelope: {e}"))
+    let envelope = match run_encoder(config, json_result) {
+        Ok(success) => ToonEnvelope {
+            format: "toon".to_string(),
+            data: serde_json::Value::String(success.encoded),
+            meta: ToonMeta {
+                requested: decision.requested,
+                source: decision.source,
+                encoder: Some(success.encoder),
+                toon_error: None,
+                toon_stderr: None,
+                toon_stats: success.stats,
+                toon_stats_raw: success.stats_raw,
+            },
         },
-    )
+        Err(err) => fallback_envelope(
+            payload,
+            &decision,
+            &err.to_error_string(),
+            err.stderr().map(String::from),
+        ),
+    };
+
+    serde_json::to_string(&envelope).map_err(|e| format!("Failed to serialize envelope: {e}"))
 }
 
 /// Convenience: apply format to a resource response (already JSON string).
@@ -587,6 +801,13 @@ pub fn apply_resource_format<S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_config() -> Config {
         Config {
@@ -781,6 +1002,119 @@ mod tests {
                 "/usr/local/bin/tru".to_string(),
                 "--experimental".to_string()
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_encoder_caches_validation_for_same_command() {
+        let _test_guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_validation_cache_for_tests();
+        clear_result_cache_for_tests();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("mock_tru.sh");
+        let counter_path = temp.path().join("counter.log");
+        let script = r#"#!/usr/bin/env bash
+set -eo pipefail
+counter="$(dirname "$0")/counter.log"
+arg="$1"
+case "$arg" in
+  --help)
+    echo "help" >> "$counter"
+    echo "reference implementation in rust"
+    ;;
+  --version)
+    echo "version" >> "$counter"
+    echo "tru 0.1.0"
+    ;;
+  --encode)
+    cat >/dev/null
+    echo "encoded-ok"
+    ;;
+  *)
+    echo "unexpected arg: $arg" >&2
+    exit 1
+    ;;
+esac
+"#;
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mut config = test_config();
+        config.toon_bin = Some(script_path.to_string_lossy().to_string());
+
+        let first = run_encoder(&config, "{\"id\":1}").expect("first run");
+        let second = run_encoder(&config, "{\"id\":2}").expect("second run");
+        assert_eq!(first.encoded.trim(), "encoded-ok");
+        assert_eq!(second.encoded.trim(), "encoded-ok");
+
+        let counter = fs::read_to_string(&counter_path).expect("counter read");
+        let help_count = counter.lines().filter(|l| *l == "help").count();
+        assert_eq!(
+            help_count, 1,
+            "validation should run once for cached command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_encoder_caches_result_for_same_payload() {
+        let _test_guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_validation_cache_for_tests();
+        clear_result_cache_for_tests();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("mock_tru.sh");
+        let counter_path = temp.path().join("counter.log");
+        let script = r#"#!/usr/bin/env bash
+set -eo pipefail
+counter="$(dirname "$0")/counter.log"
+arg="$1"
+case "$arg" in
+  --help)
+    echo "help" >> "$counter"
+    echo "reference implementation in rust"
+    ;;
+  --version)
+    echo "version" >> "$counter"
+    echo "tru 0.1.0"
+    ;;
+  --encode)
+    echo "encode" >> "$counter"
+    cat >/dev/null
+    echo "encoded-ok"
+    ;;
+  *)
+    echo "unexpected arg: $arg" >&2
+    exit 1
+    ;;
+esac
+"#;
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mut config = test_config();
+        config.toon_bin = Some(script_path.to_string_lossy().to_string());
+
+        let first = run_encoder(&config, "{\"id\":1}").expect("first run");
+        let second = run_encoder(&config, "{\"id\":1}").expect("second run");
+        assert_eq!(first.encoded.trim(), "encoded-ok");
+        assert_eq!(second.encoded.trim(), "encoded-ok");
+
+        let counter = fs::read_to_string(&counter_path).expect("counter read");
+        let encode_count = counter.lines().filter(|l| *l == "encode").count();
+        assert_eq!(
+            encode_count, 1,
+            "encode subprocess should run once for cached payload"
         );
     }
 
