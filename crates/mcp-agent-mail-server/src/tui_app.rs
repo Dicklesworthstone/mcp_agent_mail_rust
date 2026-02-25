@@ -1073,8 +1073,6 @@ pub struct MailAppModel {
     /// Last non-high-contrast theme to restore after toggling HC off.
     last_non_hc_theme: ThemeId,
     screen_transition: Option<ScreenTransition>,
-    /// Whether a resize event was observed since the last `view()`.
-    resize_detected: Cell<bool>,
     /// Screens that have panicked. Key: screen id, Value: error message.
     /// When a screen is in this map, a fallback error UI is shown instead.
     /// Uses `RefCell` so that `view(&self)` can record panics.
@@ -1184,7 +1182,6 @@ impl MailAppModel {
             last_content_area: RefCell::new(Rect::new(0, 0, 1, 1)),
             last_non_hc_theme,
             screen_transition: None,
-            resize_detected: Cell::new(false),
             screen_panics: RefCell::new(HashMap::new()),
             mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher::new(),
             coach_hints: CoachHintManager::new(),
@@ -3292,11 +3289,6 @@ impl Model for MailAppModel {
 
             // ── Terminal events (key, mouse, resize, etc.) ─────────
             MailMsg::Terminal(ref event) => {
-                // Track resize events for the Bayesian diff strategy.
-                if matches!(event, Event::Resize { .. }) {
-                    self.resize_detected.set(true);
-                }
-
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                     && Self::is_inspector_toggle_key(key)
@@ -3849,8 +3841,6 @@ impl Model for MailAppModel {
         // The app renders its own caret/highlight treatment in widgets. Keep the
         // terminal cursor hidden to prevent visible cursor trails during refresh.
         frame.cursor_visible = false;
-
-        self.resize_detected.set(false);
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
         // Paint the theme background.  The buffer is already cleared by ftui's
@@ -5749,6 +5739,7 @@ const MIN_DECORATIVE_CONTRAST_RATIO_LIGHT_SURFACE: f64 = 1.55;
 fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiThemePalette) {
     let height = frame.buffer.height();
     let width = frame.buffer.width();
+    let fallback_surface = contrast_guard_surface(tp);
 
     for y in 0..height {
         for x in 0..width {
@@ -5769,11 +5760,7 @@ fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiTheme
             let is_continuation = snapshot.is_continuation();
             let needs_surface_materialization = bg_color.a() == 0;
             let needs_text_materialization = fg_color.a() == 0;
-            let effective_bg = if needs_surface_materialization {
-                infer_effective_background(frame, x, y, tp)
-            } else {
-                bg_color
-            };
+            let effective_bg = materialize_effective_background(bg_color, fallback_surface);
             let materialized_fg = if needs_text_materialization {
                 best_readable_fg(effective_bg, tp)
             } else {
@@ -5816,51 +5803,22 @@ fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiTheme
     }
 }
 
-fn infer_effective_background(
-    frame: &Frame,
-    x: u16,
-    y: u16,
-    tp: &crate::tui_theme::TuiThemePalette,
-) -> PackedRgba {
-    // Prefer nearby painted backgrounds over global fallbacks for transparent cells.
-    const OFFSETS: &[(i16, i16)] = &[
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1),
-        (-1, -1),
-        (1, -1),
-        (-1, 1),
-        (1, 1),
-    ];
-    for radius in 1_i32..=3 {
-        for &(dx, dy) in OFFSETS {
-            let neighbor = (
-                i32::from(x) + i32::from(dx) * radius,
-                i32::from(y) + i32::from(dy) * radius,
-            );
-            if neighbor.0 < 0 || neighbor.1 < 0 {
-                continue;
-            }
-            let Ok(nx) = u16::try_from(neighbor.0) else {
-                continue;
-            };
-            let Ok(ny) = u16::try_from(neighbor.1) else {
-                continue;
-            };
-            let Some(neighbor) = frame.buffer.get(nx, ny) else {
-                continue;
-            };
-            if neighbor.bg.a() != 0 {
-                return neighbor.bg;
-            }
-        }
-    }
+#[inline]
+const fn contrast_guard_surface(tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
     if tp.bg_surface.a() != 0 {
         tp.bg_surface
-    } else {
+    } else if tp.panel_bg.a() != 0 {
         tp.panel_bg
+    } else if tp.bg_deep.a() != 0 {
+        tp.bg_deep
+    } else {
+        PackedRgba::rgb(0, 0, 0)
     }
+}
+
+#[inline]
+const fn materialize_effective_background(bg: PackedRgba, fallback: PackedRgba) -> PackedRgba {
+    if bg.a() == 0 { fallback } else { bg }
 }
 
 fn minimum_text_contrast_for_bg(bg: PackedRgba) -> f64 {
@@ -5994,15 +5952,29 @@ fn perceived_luma(color: PackedRgba) -> u8 {
     u8::try_from(luma).unwrap_or(u8::MAX)
 }
 
-fn srgb_channel_to_linear(c: u8) -> f64 {
-    let cs = f64::from(c) / 255.0;
-    if cs <= 0.04045 {
-        cs / 12.92
-    } else {
-        ((cs + 0.055) / 1.055).powf(2.4)
-    }
+static SRGB_LINEAR_LUT: OnceLock<[f64; 256]> = OnceLock::new();
+
+fn srgb_linear_lut() -> &'static [f64; 256] {
+    SRGB_LINEAR_LUT.get_or_init(|| {
+        let mut table = [0.0_f64; 256];
+        for (value, entry) in (0_u8..=u8::MAX).zip(table.iter_mut()) {
+            let cs = f64::from(value) / 255.0;
+            *entry = if cs <= 0.04045 {
+                cs / 12.92
+            } else {
+                ((cs + 0.055) / 1.055).powf(2.4)
+            };
+        }
+        table
+    })
 }
 
+#[inline]
+fn srgb_channel_to_linear(c: u8) -> f64 {
+    srgb_linear_lut()[usize::from(c)]
+}
+
+#[inline]
 fn rel_luminance(c: PackedRgba) -> f64 {
     let r = srgb_channel_to_linear(c.r());
     let g = srgb_channel_to_linear(c.g());
@@ -6010,6 +5982,7 @@ fn rel_luminance(c: PackedRgba) -> f64 {
     0.2126_f64.mul_add(r, 0.7152_f64.mul_add(g, 0.0722 * b))
 }
 
+#[inline]
 fn contrast_ratio(fg: PackedRgba, bg: PackedRgba) -> f64 {
     let l1 = rel_luminance(fg);
     let l2 = rel_luminance(bg);

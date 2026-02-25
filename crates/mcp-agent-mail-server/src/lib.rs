@@ -1348,6 +1348,16 @@ fn run_tui_main_thread(
     let screen_tick_strategy = ftui_runtime::tick_strategy::TickStrategyKind::Predictive {
         config: ftui_runtime::tick_strategy::PredictiveConfig::new(12),
     };
+    // Explicit resize coalescer wiring keeps bursty terminal resize streams
+    // (mux panes, split toggles, drag-resize) from forcing repeated redraws.
+    let resize_coalescer = ftui_runtime::resize_coalescer::CoalescerConfig {
+        steady_delay_ms: 12,
+        burst_delay_ms: 44,
+        hard_deadline_ms: 96,
+        cooldown_frames: 4,
+        enable_logging: env_truthy("AM_TUI_RESIZE_LOG"),
+        ..ftui_runtime::resize_coalescer::CoalescerConfig::default().with_bocpd()
+    };
     let tui_config = ftui_runtime::program::ProgramConfig::fullscreen()
         .with_mouse()
         .with_tick_strategy(screen_tick_strategy)
@@ -1364,7 +1374,9 @@ fn run_tui_main_thread(
             min_samples: 20,  // Calibrate after ~2s
             window_size: 100, // ~10s sliding window
             ..Default::default()
-        });
+        })
+        .with_resize_behavior(ftui_runtime::program::ResizeBehavior::Throttled)
+        .with_resize_coalescer(resize_coalescer);
 
     let mut program = Program::with_native_backend(model, tui_config)?;
     program.run()
@@ -1699,17 +1711,32 @@ fn should_force_mux_left_split(
 }
 
 fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
-    // Use the well-calibrated ftui defaults for Bayesian diff strategy.
-    // The default c_emit=6.0 reflects real I/O cost (emit ~6× more expensive
-    // than scan), so the optimizer naturally prefers incremental diffs over
-    // full redraws.  dirty_spans + tile_skip further reduce terminal writes
-    // for sparse updates.  hysteresis_ratio=0.05 prevents strategy thrashing,
-    // and uncertainty_guard keeps incremental updates when change-rate is
-    // uncertain.
-    //
-    // Previous config (c_emit=0.0, no spans, no tiles) forced full terminal
-    // rewrites every frame (~30/s), causing visible flashing and ~20% CPU.
-    ftui_runtime::terminal_writer::RuntimeDiffConfig::default()
+    // Explicitly tune the runtime diff path so sparse TUI updates remain
+    // incremental and strategy switches do not thrash at overlay boundaries.
+    let strategy = ftui_render::diff_strategy::DiffStrategyConfig {
+        // Model terminal emit cost higher than scan to bias away from redraw.
+        c_emit: 8.0,
+        // Ignore tiny micro-noise updates when adapting the posterior.
+        min_observation_cells: 8,
+        // Add extra switch friction so command-palette/modal edges do not flap.
+        hysteresis_ratio: 0.08,
+        // Keep uncertainty guard active a bit earlier under bursty churn.
+        uncertainty_guard_variance: 0.0015,
+        ..Default::default()
+    };
+    let dirty_spans = ftui_render::buffer::DirtySpanConfig::default()
+        .with_guard_band(1)
+        .with_max_spans_per_row(96);
+    let tiles = ftui_render::diff::TileDiffConfig::default()
+        // Enable tile skipping on medium terminals (not only very large grids).
+        .with_min_cells_for_tiles(2_000)
+        .with_dense_cell_ratio(0.22)
+        .with_dense_tile_ratio(0.55);
+
+    ftui_runtime::terminal_writer::RuntimeDiffConfig::new()
+        .with_strategy_config(strategy)
+        .with_dirty_span_config(dirty_spans)
+        .with_tile_diff_config(tiles)
 }
 
 struct StartupDashboard {
