@@ -59,10 +59,24 @@ pub enum CliError {
 pub type CliResult<T> = Result<T, CliError>;
 
 #[derive(Parser, Debug)]
-#[command(name = "am", version, about = "MCP Agent Mail CLI (Rust)")]
+#[command(name = "am", version = version_with_update_hint(), about = "MCP Agent Mail CLI (Rust)")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+/// Build a version string that includes an update hint if a cached check exists.
+fn version_with_update_hint() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let base = env!("CARGO_PKG_VERSION");
+        // Check update cache (fast, no network)
+        if let Some(UpdateCheckResult::UpdateAvailable { latest, .. }) = read_update_cache() {
+            format!("{base} (update available: {latest} — run `am self-update`)")
+        } else {
+            base.to_string()
+        }
+    })
 }
 
 #[derive(Subcommand, Debug)]
@@ -343,6 +357,12 @@ pub enum Commands {
         /// Only check for updates without installing.
         #[arg(long, default_value_t = false)]
         check: bool,
+        /// Reinstall the current version (force re-download).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Install a specific version instead of the latest.
+        #[arg(long)]
+        version: Option<String>,
     },
 }
 
@@ -2017,12 +2037,15 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Robot(args) => robot::handle_robot(args),
         Commands::Legacy(args) => legacy::handle_legacy(args),
         Commands::Upgrade(args) => legacy::handle_upgrade(args),
-        Commands::SelfUpdate { check } => {
+        Commands::SelfUpdate {
+            check,
+            force,
+            version,
+        } => {
             if check {
                 handle_self_update_check()
             } else {
-                // For now, just check. Full download+replace is T6.2+T6.3.
-                handle_self_update_check()
+                handle_self_update_full(force, version)
             }
         }
     }
@@ -6122,21 +6145,12 @@ fn handle_migrate_cmd(check: bool, force: bool, backup_dir: Option<PathBuf>) -> 
 
     // Print summary
     ftui_runtime::ftui_println!("Migration complete in {:.1}s", elapsed.as_secs_f64());
-    ftui_runtime::ftui_println!(
-        "  Converted: {} rows",
-        summary.total_converted
-    );
+    ftui_runtime::ftui_println!("  Converted: {} rows", summary.total_converted);
     if summary.total_skipped > 0 {
-        ftui_runtime::ftui_println!(
-            "  Skipped:   {} rows (parse errors)",
-            summary.total_skipped
-        );
+        ftui_runtime::ftui_println!("  Skipped:   {} rows (parse errors)", summary.total_skipped);
     }
     if summary.total_nulls > 0 {
-        ftui_runtime::ftui_println!(
-            "  NULLs:     {} (left as-is)",
-            summary.total_nulls
-        );
+        ftui_runtime::ftui_println!("  NULLs:     {} (left as-is)", summary.total_nulls);
     }
     ftui_runtime::ftui_println!("  Backup:    {}", backup_path.display());
     ftui_runtime::ftui_println!("  Format:    {after}");
@@ -6152,10 +6166,7 @@ fn handle_migrate_cmd(check: bool, force: bool, backup_dir: Option<PathBuf>) -> 
         ftui_runtime::ftui_eprintln!(
             "Warning: migration completed with errors. Review warnings above."
         );
-        ftui_runtime::ftui_eprintln!(
-            "Original database preserved at: {}",
-            backup_path.display()
-        );
+        ftui_runtime::ftui_eprintln!("Original database preserved at: {}", backup_path.display());
     }
 
     if after.needs_migration() {
@@ -6173,15 +6184,11 @@ fn create_db_backup(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Path
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let backup_name = format!(
         "{}.bak.{timestamp}",
-        db_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        db_path.file_name().unwrap_or_default().to_string_lossy()
     );
 
-    let backup_parent = backup_dir.unwrap_or_else(|| {
-        db_path.parent().unwrap_or_else(|| Path::new("."))
-    });
+    let backup_parent =
+        backup_dir.unwrap_or_else(|| db_path.parent().unwrap_or_else(|| Path::new(".")));
 
     std::fs::create_dir_all(backup_parent).map_err(|e| {
         CliError::Other(format!(
@@ -6223,13 +6230,9 @@ enum UpdateCheckResult {
         url: String,
     },
     /// The current version is up to date.
-    UpToDate {
-        current: String,
-    },
+    UpToDate { current: String },
     /// The check failed (network error, rate limit, etc.).
-    CheckFailed {
-        reason: String,
-    },
+    CheckFailed { reason: String },
 }
 
 /// Cache file path for update check results.
@@ -6268,7 +6271,10 @@ fn write_update_cache(result: &UpdateCheckResult) {
         "checked_at": chrono::Utc::now().to_rfc3339(),
         "result": result,
     });
-    let _ = std::fs::write(&path, serde_json::to_string_pretty(&cached).unwrap_or_default());
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&cached).unwrap_or_default(),
+    );
 }
 
 /// Compare two semver-like version strings (e.g., "0.1.0" vs "0.2.0").
@@ -6315,16 +6321,20 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
         Err(e) => {
             return UpdateCheckResult::CheckFailed {
                 reason: format!("runtime error: {e}"),
-            }
+            };
         }
     };
 
     let response = match rt.block_on(async {
         let client = asupersync::http::h1::HttpClient::new();
-        let url = "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/releases/latest";
+        let url =
+            "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/releases/latest";
         let headers = vec![
             ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
-            ("Accept".to_string(), "application/vnd.github+json".to_string()),
+            (
+                "Accept".to_string(),
+                "application/vnd.github+json".to_string(),
+            ),
         ];
         client
             .request(asupersync::http::h1::Method::Get, url, headers, vec![])
@@ -6334,7 +6344,7 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
         Err(e) => {
             return UpdateCheckResult::CheckFailed {
                 reason: format!("HTTP error: {e}"),
-            }
+            };
         }
     };
 
@@ -6354,7 +6364,7 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
         Err(e) => {
             return UpdateCheckResult::CheckFailed {
                 reason: format!("JSON parse error: {e}"),
-            }
+            };
         }
     };
 
@@ -6363,7 +6373,7 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
         None => {
             return UpdateCheckResult::CheckFailed {
                 reason: "no tag_name in release".to_string(),
-            }
+            };
         }
     };
 
@@ -6410,6 +6420,466 @@ fn handle_self_update_check() -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+/// Detect the current platform target triple (mirrors install.sh detect_platform).
+fn detect_platform_target() -> Option<String> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    match (os, arch) {
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu".to_string()),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu".to_string()),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin".to_string()),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin".to_string()),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc".to_string()),
+        _ => None,
+    }
+}
+
+/// Construct the download URL for a release asset.
+fn release_asset_url(version: &str, target: &str) -> (String, String) {
+    let ext = if target.contains("windows") {
+        "zip"
+    } else {
+        "tar.xz"
+    };
+    let filename = format!("mcp-agent-mail-{target}.{ext}");
+    let url = format!(
+        "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/download/v{version}/{filename}"
+    );
+    (url, filename)
+}
+
+/// Result of downloading and verifying a release binary.
+#[derive(Debug)]
+struct DownloadedRelease {
+    /// Directory containing extracted binaries.
+    extract_dir: PathBuf,
+    /// Path to the `am` binary.
+    am_binary: PathBuf,
+    /// Path to the `mcp-agent-mail` binary.
+    server_binary: PathBuf,
+    /// Version downloaded.
+    version: String,
+}
+
+/// Download a file from a URL to a local path using asupersync HttpClient.
+/// Returns the response body bytes.
+fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
+    use asupersync::runtime::RuntimeBuilder;
+
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| format!("runtime error: {e}"))?;
+
+    let url_owned = url.to_string();
+    let result = rt.block_on(async move {
+        let client = asupersync::http::h1::HttpClient::new();
+        let headers = vec![
+            ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
+            ("Accept".to_string(), "application/octet-stream".to_string()),
+        ];
+        client
+            .request(
+                asupersync::http::h1::Method::Get,
+                &url_owned,
+                headers,
+                vec![],
+            )
+            .await
+    });
+
+    let response = result.map_err(|e| format!("HTTP error: {e}"))?;
+
+    if response.status == 404 {
+        return Err(format!("asset not found (404): {url}"));
+    }
+    if response.status != 200 {
+        return Err(format!("HTTP {}: {url}", response.status));
+    }
+
+    Ok(response.body)
+}
+
+/// Verify SHA256 checksum of downloaded data against a checksum file.
+fn verify_sha256(data: &[u8], expected_hex: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(data);
+    let actual = hex::encode(hash);
+    actual == expected_hex.trim().to_lowercase()
+}
+
+/// Extract binaries from a .tar.xz archive into a temporary directory.
+/// Returns the directory path containing extracted files.
+fn extract_tar_xz(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("tar")
+        .args(["xJf", &archive_path.to_string_lossy(), "-C", &dest_dir.to_string_lossy()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .map_err(|e| format!("failed to run tar: {e}"))?;
+    if !status.success() {
+        return Err(format!("tar extraction failed with exit code {:?}", status.code()));
+    }
+    Ok(())
+}
+
+/// Extract binaries from a .zip archive (Windows).
+fn extract_zip(archive_data: &[u8], dest_dir: &Path) -> Result<(), String> {
+    use std::io::Cursor;
+    let reader = Cursor::new(archive_data);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("invalid zip archive: {e}"))?;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("zip entry error: {e}"))?;
+        let name = file.name().to_string();
+        let outpath = dest_dir.join(&name);
+        if file.is_dir() {
+            std::fs::create_dir_all(&outpath)
+                .map_err(|e| format!("mkdir {}: {e}", outpath.display()))?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            }
+            let mut outfile = std::fs::File::create(&outpath)
+                .map_err(|e| format!("create {}: {e}", outpath.display()))?;
+            std::io::copy(&mut file, &mut outfile)
+                .map_err(|e| format!("write {}: {e}", outpath.display()))?;
+            // Set executable permission on Unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if name.ends_with("am") || name.ends_with("mcp-agent-mail") {
+                    std::fs::set_permissions(&outpath, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| format!("chmod {}: {e}", outpath.display()))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Download, verify, and extract a release. Returns paths to the extracted binaries.
+fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, String> {
+    let target = detect_platform_target()
+        .ok_or_else(|| format!("unsupported platform: {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
+
+    let (asset_url, filename) = release_asset_url(version, &target);
+    let checksum_url = format!("{asset_url}.sha256");
+
+    // Download checksum file first (small, validates availability)
+    ftui_runtime::ftui_eprintln!("Downloading checksum...");
+    let checksum_body = download_file_sync(&checksum_url)?;
+    let checksum_text = String::from_utf8(checksum_body)
+        .map_err(|_| "checksum file is not valid UTF-8".to_string())?;
+    // Checksum file format: "<hex>  <filename>" or just "<hex>"
+    let expected_hash = checksum_text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "empty checksum file".to_string())?
+        .to_string();
+
+    // Download the archive
+    ftui_runtime::ftui_eprintln!("Downloading {filename}...");
+    let archive_data = download_file_sync(&asset_url)?;
+    ftui_runtime::ftui_eprintln!("Downloaded {} bytes", archive_data.len());
+
+    // Verify SHA256
+    if !verify_sha256(&archive_data, &expected_hash) {
+        return Err("SHA256 checksum verification failed — download may be corrupted".to_string());
+    }
+    ftui_runtime::ftui_eprintln!("Checksum verified.");
+
+    // Create temp directory for extraction
+    let tmp_dir = std::env::temp_dir().join(format!("am-update-{version}"));
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)
+            .map_err(|e| format!("clean temp dir: {e}"))?;
+    }
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("create temp dir: {e}"))?;
+
+    // Extract
+    if filename.ends_with(".tar.xz") {
+        // Write to file first (tar reads from file)
+        let archive_path = tmp_dir.join(&filename);
+        std::fs::write(&archive_path, &archive_data)
+            .map_err(|e| format!("write archive: {e}"))?;
+        extract_tar_xz(&archive_path, &tmp_dir)?;
+        // Clean up the archive file
+        let _ = std::fs::remove_file(&archive_path);
+    } else if filename.ends_with(".zip") {
+        extract_zip(&archive_data, &tmp_dir)?;
+    } else {
+        return Err(format!("unsupported archive format: {filename}"));
+    }
+
+    // Find extracted binaries
+    let (am_name, server_name) = if target.contains("windows") {
+        ("am.exe", "mcp-agent-mail.exe")
+    } else {
+        ("am", "mcp-agent-mail")
+    };
+
+    let am_binary = find_binary_in_dir(&tmp_dir, am_name)
+        .ok_or_else(|| format!("{am_name} not found in extracted archive"))?;
+    let server_binary = find_binary_in_dir(&tmp_dir, server_name)
+        .ok_or_else(|| format!("{server_name} not found in extracted archive"))?;
+
+    Ok(DownloadedRelease {
+        extract_dir: tmp_dir,
+        am_binary,
+        server_binary,
+        version: version.to_string(),
+    })
+}
+
+/// Search for a binary file by name in a directory tree (max depth 2).
+fn find_binary_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    // Check directly in dir
+    let direct = dir.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    // Check one level deep (tarball might have a subdirectory)
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let nested = entry.path().join(name);
+                if nested.is_file() {
+                    return Some(nested);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find the install directory for the current `am` binary.
+fn find_install_dir() -> Result<PathBuf, String> {
+    // First try: the binary that's currently running
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("cannot determine current executable: {e}"))?;
+    let dir = current_exe
+        .parent()
+        .ok_or_else(|| "current executable has no parent directory".to_string())?;
+    Ok(dir.to_path_buf())
+}
+
+/// Atomically replace a single binary (Unix).
+///
+/// Strategy: write new → rename old to .old.tmp → rename new to target (atomic).
+#[cfg(unix)]
+fn atomic_replace_binary(
+    new_binary: &Path,
+    target_path: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = target_path.parent().ok_or("no parent directory")?;
+    let name = target_path
+        .file_name()
+        .ok_or("no filename")?
+        .to_string_lossy();
+
+    let tmp_new = dir.join(format!(".{name}.new.tmp"));
+    let tmp_old = dir.join(format!(".{name}.old.tmp"));
+
+    // 1. Copy new binary to staging location
+    std::fs::copy(new_binary, &tmp_new)
+        .map_err(|e| format!("stage new binary: {e}"))?;
+
+    // 2. Set executable permissions
+    std::fs::set_permissions(&tmp_new, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod: {e}"))?;
+
+    // 3. On macOS, handle Gatekeeper quarantine
+    #[cfg(target_os = "macos")]
+    {
+        // Copy quarantine xattr from old binary if it exists, or remove it from new
+        let _ = std::process::Command::new("xattr")
+            .args(["-d", "com.apple.quarantine"])
+            .arg(&tmp_new)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    // 4. Rename old binary to backup (if it exists)
+    if target_path.exists() {
+        // Remove any leftover old backup
+        let _ = std::fs::remove_file(&tmp_old);
+        std::fs::rename(target_path, &tmp_old)
+            .map_err(|e| format!("backup old binary: {e}"))?;
+    }
+
+    // 5. Rename new binary to target (atomic on same filesystem)
+    if let Err(e) = std::fs::rename(&tmp_new, target_path) {
+        // Rollback: restore old binary
+        if tmp_old.exists() {
+            let _ = std::fs::rename(&tmp_old, target_path);
+        }
+        return Err(format!("atomic rename failed: {e}"));
+    }
+
+    // 6. Clean up old backup
+    let _ = std::fs::remove_file(&tmp_old);
+
+    Ok(())
+}
+
+/// Atomically replace a single binary (Windows).
+///
+/// On Windows, running binaries are locked. We rename the running binary
+/// out of the way (Windows allows renaming locked files), then move the
+/// new binary into place.
+#[cfg(windows)]
+fn atomic_replace_binary(
+    new_binary: &Path,
+    target_path: &Path,
+) -> Result<(), String> {
+    let dir = target_path.parent().ok_or("no parent directory")?;
+    let name = target_path
+        .file_name()
+        .ok_or("no filename")?
+        .to_string_lossy();
+
+    let tmp_new = dir.join(format!("{name}.new.tmp"));
+    let tmp_old = dir.join(format!("{name}.old.tmp"));
+
+    // 1. Copy new binary to staging location
+    std::fs::copy(new_binary, &tmp_new)
+        .map_err(|e| format!("stage new binary: {e}"))?;
+
+    // 2. Rename old binary out of the way (Windows allows this even if locked)
+    if target_path.exists() {
+        let _ = std::fs::remove_file(&tmp_old);
+        std::fs::rename(target_path, &tmp_old)
+            .map_err(|e| format!("backup old binary: {e}"))?;
+    }
+
+    // 3. Rename new binary to target
+    if let Err(e) = std::fs::rename(&tmp_new, target_path) {
+        // Rollback: restore old binary
+        if tmp_old.exists() {
+            let _ = std::fs::rename(&tmp_old, target_path);
+        }
+        return Err(format!("rename failed: {e}"));
+    }
+
+    // 4. Schedule cleanup of old binary (it may be locked)
+    // Try to delete; if it fails, it will be cleaned up on next update
+    let _ = std::fs::remove_file(&tmp_old);
+
+    Ok(())
+}
+
+/// Replace both `am` and `mcp-agent-mail` binaries atomically.
+fn replace_binaries(release: &DownloadedRelease) -> Result<(), String> {
+    let install_dir = find_install_dir()?;
+
+    // Verify write access
+    let test_file = install_dir.join(".am-update-test");
+    std::fs::write(&test_file, b"test")
+        .map_err(|e| format!("no write access to {}: {e}", install_dir.display()))?;
+    let _ = std::fs::remove_file(&test_file);
+
+    let (am_name, server_name) = if cfg!(windows) {
+        ("am.exe", "mcp-agent-mail.exe")
+    } else {
+        ("am", "mcp-agent-mail")
+    };
+
+    let am_target = install_dir.join(am_name);
+    let server_target = install_dir.join(server_name);
+
+    // Replace am first
+    ftui_runtime::ftui_eprintln!("Replacing {am_name}...");
+    atomic_replace_binary(&release.am_binary, &am_target)?;
+
+    // Replace mcp-agent-mail
+    ftui_runtime::ftui_eprintln!("Replacing {server_name}...");
+    if let Err(e) = atomic_replace_binary(&release.server_binary, &server_target) {
+        // am was already replaced but server failed — report but don't rollback am
+        // (having a newer am with old server is better than a broken state)
+        ftui_runtime::ftui_eprintln!(
+            "Warning: {server_name} replacement failed ({e}), but {am_name} was updated"
+        );
+    }
+
+    Ok(())
+}
+
+/// Full self-update: check, download, verify, and replace.
+///
+/// Supports `--force` (reinstall current version) and `--version X` (specific version).
+fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliResult<()> {
+    let current = env!("CARGO_PKG_VERSION");
+
+    let version_to_install = if let Some(ref v) = target_version {
+        // Specific version requested
+        let v = v.trim_start_matches('v');
+        ftui_runtime::ftui_println!("Installing version {v} (current: {current})");
+        v.to_string()
+    } else if force {
+        // Force reinstall current version
+        ftui_runtime::ftui_println!("Force reinstalling v{current}");
+        current.to_string()
+    } else {
+        // Normal update: check for newer version
+        let result = check_for_update();
+        match result {
+            UpdateCheckResult::UpdateAvailable {
+                current: cur,
+                latest,
+                url: _,
+            } => {
+                ftui_runtime::ftui_println!("Update available: {cur} -> {latest}");
+                latest
+            }
+            UpdateCheckResult::UpToDate { current: cur } => {
+                ftui_runtime::ftui_println!("Already up to date (v{cur})");
+                return Ok(());
+            }
+            UpdateCheckResult::CheckFailed { reason } => {
+                ftui_runtime::ftui_eprintln!("Update check failed: {reason}");
+                return Err(CliError::Other(format!("update check failed: {reason}")));
+            }
+        }
+    };
+
+    let release = match download_and_verify_release(&version_to_install) {
+        Ok(r) => r,
+        Err(e) => {
+            ftui_runtime::ftui_eprintln!("Download failed: {e}");
+            return Err(CliError::Other(format!("self-update download failed: {e}")));
+        }
+    };
+
+    ftui_runtime::ftui_println!("Downloaded and verified v{}", release.version);
+
+    // Perform atomic binary replacement
+    match replace_binaries(&release) {
+        Ok(()) => {
+            ftui_runtime::ftui_println!(
+                "Update complete (v{current} -> v{}). Restart am to use the new version.",
+                release.version
+            );
+            // Clean up temp directory
+            let _ = std::fs::remove_dir_all(&release.extract_dir);
+            Ok(())
+        }
+        Err(e) => {
+            ftui_runtime::ftui_eprintln!("Binary replacement failed: {e}");
+            ftui_runtime::ftui_eprintln!(
+                "New binaries are staged at: {}", release.extract_dir.display()
+            );
+            Err(CliError::Other(format!("self-update replacement failed: {e}")))
+        }
+    }
 }
 
 // ── End self-update ──────────────────────────────────────────────────────
@@ -8053,10 +8523,7 @@ fn handle_doctor_check_with(
         let expected_str = expected_path.to_string_lossy().to_string();
 
         // Try both login and non-login shell contexts
-        let shells: &[(&str, &str, &str)] = &[
-            ("zsh", "zsh", "-lc"),
-            ("bash", "bash", "-lc"),
-        ];
+        let shells: &[(&str, &str, &str)] = &[("zsh", "zsh", "-lc"), ("bash", "bash", "-lc")];
 
         let mut resolution_detail = String::new();
         let mut resolution_status = "ok";
@@ -8103,14 +8570,12 @@ fn handle_doctor_check_with(
             if which_out == "NOT_FOUND" || which_out.is_empty() {
                 if resolution_detail.is_empty() {
                     resolution_status = "warn";
-                    resolution_detail = format!(
-                        "'am' not found in {label} PATH. Expected: {expected_str}"
-                    );
+                    resolution_detail =
+                        format!("'am' not found in {label} PATH. Expected: {expected_str}");
                 }
             } else if which_out != expected_str {
-                resolution_detail = format!(
-                    "'am' resolves to {which_out} in {label} (expected {expected_str})"
-                );
+                resolution_detail =
+                    format!("'am' resolves to {which_out} in {label} (expected {expected_str})");
                 // Not necessarily a failure — could be a different install path
                 if resolution_status != "fail" {
                     resolution_status = "warn";
@@ -12120,7 +12585,11 @@ mod tests {
     fn clap_parses_migrate_check() {
         let m = Cli::try_parse_from(["am", "migrate", "--check"]).unwrap();
         match m.command {
-            Some(Commands::Migrate { check, force, backup_dir }) => {
+            Some(Commands::Migrate {
+                check,
+                force,
+                backup_dir,
+            }) => {
                 assert!(check);
                 assert!(!force);
                 assert!(backup_dir.is_none());
@@ -12131,9 +12600,14 @@ mod tests {
 
     #[test]
     fn clap_parses_migrate_force_with_backup() {
-        let m = Cli::try_parse_from(["am", "migrate", "--force", "--backup-dir", "/tmp/bak"]).unwrap();
+        let m =
+            Cli::try_parse_from(["am", "migrate", "--force", "--backup-dir", "/tmp/bak"]).unwrap();
         match m.command {
-            Some(Commands::Migrate { check, force, backup_dir }) => {
+            Some(Commands::Migrate {
+                check,
+                force,
+                backup_dir,
+            }) => {
                 assert!(!check);
                 assert!(force);
                 assert_eq!(backup_dir, Some(PathBuf::from("/tmp/bak")));
@@ -24998,4 +25472,241 @@ fn format_bytes(bytes: u64) -> String {
         current /= 1024.0;
     }
     format!("{bytes} B")
+}
+
+// ── Self-update unit tests ────────────────────────────────────────────
+
+#[test]
+fn is_newer_version_basic() {
+    assert!(is_newer_version("0.1.0", "0.2.0"));
+    assert!(is_newer_version("0.1.0", "1.0.0"));
+    assert!(is_newer_version("0.1.0", "0.1.1"));
+    assert!(!is_newer_version("0.2.0", "0.1.0"));
+    assert!(!is_newer_version("0.1.0", "0.1.0"));
+    assert!(!is_newer_version("1.0.0", "0.9.9"));
+}
+
+#[test]
+fn is_newer_version_with_v_prefix() {
+    assert!(is_newer_version("v0.1.0", "v0.2.0"));
+    assert!(is_newer_version("0.1.0", "v0.2.0"));
+    assert!(is_newer_version("v0.1.0", "0.2.0"));
+}
+
+#[test]
+fn detect_platform_target_returns_some() {
+    // We're running on a supported platform in CI/dev
+    let target = detect_platform_target();
+    assert!(target.is_some(), "detect_platform_target() should detect this host");
+    let t = target.unwrap();
+    assert!(
+        t.contains("linux") || t.contains("darwin") || t.contains("windows"),
+        "target should contain OS: {t}"
+    );
+}
+
+#[test]
+fn release_asset_url_linux() {
+    let (url, filename) = release_asset_url("0.2.0", "x86_64-unknown-linux-gnu");
+    assert_eq!(filename, "mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz");
+    assert!(url.contains("v0.2.0"));
+    assert!(url.ends_with(".tar.xz"));
+}
+
+#[test]
+fn release_asset_url_windows() {
+    let (url, filename) = release_asset_url("0.2.0", "x86_64-pc-windows-msvc");
+    assert_eq!(filename, "mcp-agent-mail-x86_64-pc-windows-msvc.zip");
+    assert!(url.contains("v0.2.0"));
+    assert!(url.ends_with(".zip"));
+}
+
+#[test]
+fn release_asset_url_macos() {
+    let (url, filename) = release_asset_url("1.0.0", "aarch64-apple-darwin");
+    assert_eq!(filename, "mcp-agent-mail-aarch64-apple-darwin.tar.xz");
+    assert!(url.contains("/releases/download/v1.0.0/"));
+}
+
+#[test]
+fn verify_sha256_correct() {
+    use sha2::{Digest, Sha256};
+    let data = b"hello world";
+    let hash = hex::encode(Sha256::digest(data));
+    assert!(verify_sha256(data, &hash));
+}
+
+#[test]
+fn verify_sha256_wrong() {
+    assert!(!verify_sha256(b"hello world", "0000000000000000000000000000000000000000000000000000000000000000"));
+}
+
+#[test]
+fn verify_sha256_with_filename_suffix() {
+    use sha2::{Digest, Sha256};
+    let data = b"test data";
+    let hash = hex::encode(Sha256::digest(data));
+    // Checksum files sometimes have "hash  filename" format
+    let checksum_line = format!("{hash}  mcp-agent-mail.tar.xz");
+    // verify_sha256 expects just the hash, so this would fail —
+    // but our download_and_verify_release splits on whitespace first
+    // Test that split_whitespace().next() works
+    let parsed = checksum_line.split_whitespace().next().unwrap();
+    assert!(verify_sha256(data, parsed));
+}
+
+#[test]
+fn find_binary_in_dir_flat() {
+    let tmp = std::env::temp_dir().join("am-test-find-flat");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("am"), b"binary").unwrap();
+    assert_eq!(find_binary_in_dir(&tmp, "am"), Some(tmp.join("am")));
+    assert_eq!(find_binary_in_dir(&tmp, "missing"), None);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn find_binary_in_dir_nested() {
+    let tmp = std::env::temp_dir().join("am-test-find-nested");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let sub = tmp.join("release");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("am"), b"binary").unwrap();
+    assert_eq!(find_binary_in_dir(&tmp, "am"), Some(sub.join("am")));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn clap_parses_self_update_check() {
+    let cli = Cli::try_parse_from(["am", "self-update", "--check"]).unwrap();
+    match cli.command {
+        Some(Commands::SelfUpdate { check, force, version }) => {
+            assert!(check);
+            assert!(!force);
+            assert!(version.is_none());
+        }
+        _ => panic!("expected SelfUpdate"),
+    }
+}
+
+#[test]
+fn clap_parses_self_update_default() {
+    let cli = Cli::try_parse_from(["am", "self-update"]).unwrap();
+    match cli.command {
+        Some(Commands::SelfUpdate { check, force, version }) => {
+            assert!(!check);
+            assert!(!force);
+            assert!(version.is_none());
+        }
+        _ => panic!("expected SelfUpdate"),
+    }
+}
+
+#[test]
+fn clap_parses_self_update_force() {
+    let cli = Cli::try_parse_from(["am", "self-update", "--force"]).unwrap();
+    match cli.command {
+        Some(Commands::SelfUpdate { check, force, version }) => {
+            assert!(!check);
+            assert!(force);
+            assert!(version.is_none());
+        }
+        _ => panic!("expected SelfUpdate"),
+    }
+}
+
+#[test]
+fn clap_parses_self_update_version() {
+    let cli = Cli::try_parse_from(["am", "self-update", "--version", "0.2.0"]).unwrap();
+    match cli.command {
+        Some(Commands::SelfUpdate { check, force, version }) => {
+            assert!(!check);
+            assert!(!force);
+            assert_eq!(version.as_deref(), Some("0.2.0"));
+        }
+        _ => panic!("expected SelfUpdate"),
+    }
+}
+
+#[test]
+fn find_install_dir_returns_existing_dir() {
+    let dir = find_install_dir().unwrap();
+    assert!(dir.is_dir(), "install dir should exist: {}", dir.display());
+}
+
+#[test]
+fn atomic_replace_binary_roundtrip() {
+    let tmp = std::env::temp_dir().join("am-test-atomic-replace");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Create "old" binary
+    let target = tmp.join("am");
+    std::fs::write(&target, b"old-binary-v1").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Create "new" binary in a staging dir
+    let staging = tmp.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let new_binary = staging.join("am");
+    std::fs::write(&new_binary, b"new-binary-v2").unwrap();
+
+    // Perform atomic replacement
+    atomic_replace_binary(&new_binary, &target).unwrap();
+
+    // Verify the target now has the new content
+    let content = std::fs::read(&target).unwrap();
+    assert_eq!(content, b"new-binary-v2");
+
+    // Verify old backup was cleaned up
+    let backup = tmp.join(".am.old.tmp");
+    assert!(!backup.exists(), "backup should be cleaned up");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn atomic_replace_binary_creates_new_file() {
+    let tmp = std::env::temp_dir().join("am-test-atomic-create");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Target doesn't exist yet
+    let target = tmp.join("am");
+    let staging = tmp.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let new_binary = staging.join("am");
+    std::fs::write(&new_binary, b"fresh-binary").unwrap();
+
+    atomic_replace_binary(&new_binary, &target).unwrap();
+
+    let content = std::fs::read(&target).unwrap();
+    assert_eq!(content, b"fresh-binary");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn atomic_replace_binary_rollback_on_failure() {
+    let tmp = std::env::temp_dir().join("am-test-atomic-rollback");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let target = tmp.join("am");
+    std::fs::write(&target, b"original").unwrap();
+
+    // Try to replace with a non-existent source
+    let result = atomic_replace_binary(Path::new("/nonexistent/path"), &target);
+    assert!(result.is_err());
+
+    // Original should still be intact
+    let content = std::fs::read(&target).unwrap();
+    assert_eq!(content, b"original");
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

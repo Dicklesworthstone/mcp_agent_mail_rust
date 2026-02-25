@@ -1343,8 +1343,14 @@ fn run_tui_main_thread(
 
     let model = tui_app::MailAppModel::with_config(Arc::clone(tui_state), config);
 
+    // Match the prior AM fallback behavior: unknown inactive screens refresh
+    // every ~1.2s at a 100ms global tick.
+    let screen_tick_strategy = ftui_runtime::tick_strategy::TickStrategyKind::Predictive {
+        config: ftui_runtime::tick_strategy::PredictiveConfig::new(12),
+    };
     let tui_config = ftui_runtime::program::ProgramConfig::fullscreen()
         .with_mouse()
+        .with_tick_strategy(screen_tick_strategy)
         .with_diff_config(stable_tui_diff_config());
 
     let mut program = Program::with_native_backend(model, tui_config)?;

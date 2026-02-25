@@ -996,10 +996,6 @@ impl ScreenManager {
         self.get_mut(self.active_screen)
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = (MailScreenId, &mut Box<dyn MailScreen>)> {
-        self.screens.iter_mut().map(|(&id, screen)| (id, screen))
-    }
-
     fn apply_deep_link(&mut self, target: &DeepLinkTarget) {
         let target_screen = target.target_screen();
         self.set_active_screen(target_screen);

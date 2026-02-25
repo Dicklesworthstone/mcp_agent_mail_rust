@@ -165,6 +165,7 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["robot", "--help"],
     &["legacy", "--help"],
     &["upgrade", "--help"],
+    &["self-update", "--help"],
 ];
 
 /// Commands that MCP binary should deny (exit code 2).
@@ -197,6 +198,7 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["robot"],
     &["legacy"],
     &["upgrade"],
+    &["self-update"],
 ];
 
 /// Commands that MCP binary should allow (not deny).
