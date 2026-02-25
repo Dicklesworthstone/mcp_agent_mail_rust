@@ -1351,7 +1351,20 @@ fn run_tui_main_thread(
     let tui_config = ftui_runtime::program::ProgramConfig::fullscreen()
         .with_mouse()
         .with_tick_strategy(screen_tick_strategy)
-        .with_diff_config(stable_tui_diff_config());
+        .with_diff_config(stable_tui_diff_config())
+        .with_budget(ftui_render::budget::FrameBudgetConfig {
+            total: Duration::from_millis(100), // Match TICK_INTERVAL
+            allow_frame_skip: false,           // Never blank frames
+            degradation_cooldown: 5,           // 500ms between level changes
+            upgrade_threshold: 0.5,
+            ..Default::default()
+        })
+        .with_conformal_config(ftui_runtime::conformal_predictor::ConformalConfig {
+            alpha: 0.10,      // 90% coverage
+            min_samples: 20,  // Calibrate after ~2s
+            window_size: 100, // ~10s sliding window
+            ..Default::default()
+        });
 
     let mut program = Program::with_native_backend(model, tui_config)?;
     program.run()

@@ -84,9 +84,10 @@ const REMOTE_EVENTS_PER_TICK: usize = 256;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
 const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
-/// Ambient effects only re-render every Nth frame. At 10 fps with N=4 the
-/// animation updates at ~2.5 fps, reducing terminal write churn and flicker.
-const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 4;
+/// Ambient effects re-render every Nth frame. At 10 fps with N=2 the
+/// animation updates at ~5 fps. The diff engine's dirty-span tracking
+/// ensures unchanged cells produce no terminal writes.
+const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 2;
 
 const fn screen_tick_key(id: MailScreenId) -> &'static str {
     match id {
@@ -1072,12 +1073,8 @@ pub struct MailAppModel {
     /// Last non-high-contrast theme to restore after toggling HC off.
     last_non_hc_theme: ThemeId,
     screen_transition: Option<ScreenTransition>,
-    /// Bayesian diff strategy for frame rendering decisions.
-    diff_strategy: RefCell<crate::tui_decision::BayesianDiffStrategy>,
     /// Whether a resize event was observed since the last `view()`.
     resize_detected: Cell<bool>,
-    /// Timestamp of last `view()` call for frame budget tracking.
-    last_view_instant: Cell<Option<Instant>>,
     /// Screens that have panicked. Key: screen id, Value: error message.
     /// When a screen is in this map, a fallback error UI is shown instead.
     /// Uses `RefCell` so that `view(&self)` can record panics.
@@ -1187,9 +1184,7 @@ impl MailAppModel {
             last_content_area: RefCell::new(Rect::new(0, 0, 1, 1)),
             last_non_hc_theme,
             screen_transition: None,
-            diff_strategy: RefCell::new(crate::tui_decision::BayesianDiffStrategy::new()),
             resize_detected: Cell::new(false),
-            last_view_instant: Cell::new(None),
             screen_panics: RefCell::new(HashMap::new()),
             mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher::new(),
             coach_hints: CoachHintManager::new(),
@@ -2477,24 +2472,6 @@ impl MailAppModel {
             return OverlayLayer::Toasts;
         }
         OverlayLayer::None
-    }
-
-    #[must_use]
-    fn adjust_diff_action_for_overlays(
-        diff_action: crate::tui_decision::DiffAction,
-        active_screen: MailScreenId,
-        active_overlay: OverlayLayer,
-    ) -> crate::tui_decision::DiffAction {
-        if diff_action != crate::tui_decision::DiffAction::Deferred {
-            return diff_action;
-        }
-        // The dashboard and focus-trapping overlays paint focus/caret highlights
-        // directly into cells. Deferring a frame there leaves stale highlight
-        // cells behind (purple cursor trails), so promote only those cases.
-        if active_screen == MailScreenId::Dashboard || active_overlay.traps_focus() {
-            return crate::tui_decision::DiffAction::Full;
-        }
-        diff_action
     }
 
     fn open_palette(&mut self) {
@@ -3868,58 +3845,12 @@ impl Model for MailAppModel {
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame) {
         use crate::tui_chrome;
-        use crate::tui_decision::{DiffAction, FrameState};
 
         // The app renders its own caret/highlight treatment in widgets. Keep the
         // terminal cursor hidden to prevent visible cursor trails during refresh.
         frame.cursor_visible = false;
 
-        // Compute frame budget: how much slack we have relative to the target
-        // tick cadence. Normal frames arrive near the scheduled tick;
-        // budget is positive when on schedule and drops toward 0 only when
-        // frames arrive significantly late (2× the expected interval or more).
-        //
-        // The Bayesian diff strategy uses this budget to decide whether to
-        // skip frames under load.
-        let tick_budget_ms = TICK_INTERVAL.as_secs_f64() * 1000.0;
-        let now = Instant::now();
-        let budget_remaining_ms = self.last_view_instant.get().map_or(tick_budget_ms, |prev| {
-            let elapsed_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
-            // Budget = tick_budget minus any overshoot beyond expected interval.
-            // On-schedule (elapsed ≈ tick): budget ≈ tick_budget (healthy).
-            // Behind (elapsed ≈ 2×tick): budget ≈ 0 (degraded).
-            (tick_budget_ms - (elapsed_ms - tick_budget_ms).max(0.0)).max(0.0)
-        });
-        self.last_view_instant.set(Some(now));
-
-        // Bayesian diff strategy: observe frame state and decide action.
-        // change_ratio is 0.0 for stable frames; ftui does not expose
-        // per-frame cell diff counts, so we default to "stable" and let
-        // the resize flag and budget drive the posterior.
-        let frame_state = FrameState {
-            change_ratio: 0.0,
-            is_resize: self.resize_detected.get(),
-            budget_remaining_ms,
-            error_count: 0,
-        };
-        let diff_action = Self::adjust_diff_action_for_overlays(
-            self.diff_strategy.borrow_mut().observe(&frame_state),
-            self.screen_manager.active_screen(),
-            self.topmost_overlay(),
-        );
         self.resize_detected.set(false);
-
-        // Act on the diff decision.
-        match diff_action {
-            DiffAction::Deferred => {
-                // Skip this frame entirely to allow recovery.
-                return;
-            }
-            DiffAction::Full | DiffAction::Incremental => {
-                // Both render fully; incremental is advisory for future
-                // differential rendering support in ftui.
-            }
-        }
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
         // Paint the theme background.  The buffer is already cleared by ftui's
@@ -6969,56 +6900,6 @@ mod tests {
         assert!(frame.cursor_visible);
         model.view(&mut frame);
         assert!(!frame.cursor_visible);
-    }
-
-    #[test]
-    fn deferred_diff_promotes_to_full_on_dashboard() {
-        let deferred = crate::tui_decision::DiffAction::Deferred;
-        let full = crate::tui_decision::DiffAction::Full;
-
-        assert_eq!(
-            MailAppModel::adjust_diff_action_for_overlays(
-                deferred,
-                MailScreenId::Dashboard,
-                OverlayLayer::None
-            ),
-            full
-        );
-        assert_eq!(
-            MailAppModel::adjust_diff_action_for_overlays(
-                full,
-                MailScreenId::Dashboard,
-                OverlayLayer::None
-            ),
-            full
-        );
-    }
-
-    #[test]
-    fn deferred_diff_promotes_to_full_with_focus_trapping_overlay() {
-        let deferred = crate::tui_decision::DiffAction::Deferred;
-
-        assert_eq!(
-            MailAppModel::adjust_diff_action_for_overlays(
-                deferred,
-                MailScreenId::Messages,
-                OverlayLayer::Modal
-            ),
-            crate::tui_decision::DiffAction::Full
-        );
-    }
-
-    #[test]
-    fn deferred_diff_stays_deferred_without_dashboard_or_focus_overlay() {
-        let deferred = crate::tui_decision::DiffAction::Deferred;
-        assert_eq!(
-            MailAppModel::adjust_diff_action_for_overlays(
-                deferred,
-                MailScreenId::Messages,
-                OverlayLayer::Toasts
-            ),
-            deferred
-        );
     }
 
     #[test]
