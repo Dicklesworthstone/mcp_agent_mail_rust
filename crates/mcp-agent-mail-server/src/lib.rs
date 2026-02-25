@@ -182,6 +182,9 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        // Keep cached health current; otherwise stale red can linger until an explicit
+        // health-check call refreshes the cache.
+        let _ = mcp_agent_mail_core::refresh_health_level();
         // Backpressure gate: reject shedable tools under Red (when enabled)
         if mcp_agent_mail_core::should_shed_tool(self.tool_name) {
             return Err(McpError::new(
@@ -257,6 +260,9 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         ctx: &'a McpContext,
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        // Keep cached health current; otherwise stale red can linger until an explicit
+        // health-check call refreshes the cache.
+        let _ = mcp_agent_mail_core::refresh_health_level();
         // Backpressure gate: reject shedable tools under Red (when enabled)
         if mcp_agent_mail_core::should_shed_tool(self.tool_name) {
             return Box::pin(std::future::ready(fastmcp_core::Outcome::Err(

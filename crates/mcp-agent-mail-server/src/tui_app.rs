@@ -64,6 +64,10 @@ use crate::tui_widgets::{
 /// Previous 33 ms (30 fps) caused excessive terminal writes and visible
 /// flashing, especially with ambient effects enabled.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// Idle cadence used after sustained quiescence to reduce render churn.
+const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(150);
+/// Number of consecutive quiet ticks required before entering idle cadence.
+const IDLE_TICK_STREAK_THRESHOLD: u16 = 6;
 
 const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
@@ -1037,6 +1041,10 @@ pub struct MailAppModel {
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
+    /// Currently scheduled tick interval (dynamic cadence).
+    current_tick_interval: Duration,
+    /// Consecutive ticks without interactive/activity signals.
+    idle_tick_streak: u16,
     /// Adaptive per-screen tick strategy from frankentui.
     screen_tick_strategy: Box<dyn TickStrategy>,
     accessibility: crate::tui_persist::AccessibilitySettings,
@@ -1169,6 +1177,8 @@ impl MailAppModel {
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
             tick_count: 0,
+            current_tick_interval: TICK_INTERVAL,
+            idle_tick_streak: 0,
             screen_tick_strategy: default_screen_tick_strategy(),
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
             macro_engine: MacroEngine::new(),
@@ -3174,6 +3184,35 @@ impl MailAppModel {
         }
         Cmd::batch(cmds)
     }
+
+    fn should_use_idle_tick_cadence(&self, had_new_events: bool, had_remote_events: bool) -> bool {
+        !had_new_events
+            && !had_remote_events
+            && self.screen_transition.is_none()
+            && !self.help_visible
+            && !self.command_palette.is_visible()
+            && !self.action_menu.is_active()
+            && !self.modal_manager.is_active()
+            && !self.export_menu_open
+            && self.compose_state.is_none()
+            && !self.inspector.is_active()
+            && self.notifications.visible_count() == 0
+    }
+
+    fn next_tick_interval(&mut self, had_new_events: bool, had_remote_events: bool) -> Duration {
+        if self.should_use_idle_tick_cadence(had_new_events, had_remote_events) {
+            self.idle_tick_streak = self.idle_tick_streak.saturating_add(1);
+        } else {
+            self.idle_tick_streak = 0;
+        }
+
+        self.current_tick_interval = if self.idle_tick_streak >= IDLE_TICK_STREAK_THRESHOLD {
+            IDLE_TICK_INTERVAL
+        } else {
+            TICK_INTERVAL
+        };
+        self.current_tick_interval
+    }
 }
 
 impl Model for MailAppModel {
@@ -3188,6 +3227,7 @@ impl Model for MailAppModel {
         match msg {
             // ── Tick ────────────────────────────────────────────────
             MailMsg::Terminal(Event::Tick) => {
+                let elapsed_tick = self.current_tick_interval;
                 self.tick_count += 1;
                 if let Some(mut transition) = self.screen_transition {
                     transition.ticks_remaining = transition.ticks_remaining.saturating_sub(1);
@@ -3233,6 +3273,7 @@ impl Model for MailAppModel {
 
                 // Generate toasts from new high-priority events and track reservations
                 let new_events = self.state.events_since(self.last_toast_seq);
+                let had_new_events = !new_events.is_empty();
                 for event in &new_events {
                     self.last_toast_seq = event.seq().max(self.last_toast_seq);
 
@@ -3301,7 +3342,7 @@ impl Model for MailAppModel {
                 }
 
                 // Advance notification timers
-                self.notifications.tick(TICK_INTERVAL);
+                self.notifications.tick(elapsed_tick);
                 self.tick_toast_animation_state();
 
                 // Drain deferred confirmed actions (from modal callbacks).
@@ -3315,6 +3356,7 @@ impl Model for MailAppModel {
                 let remote_events = self
                     .state
                     .drain_remote_terminal_events(REMOTE_EVENTS_PER_TICK);
+                let had_remote_events = !remote_events.is_empty();
                 for remote_event in remote_events {
                     if let Some(event) = remote_terminal_event_to_event(remote_event) {
                         let cmd = self.update(MailMsg::Terminal(event));
@@ -3325,7 +3367,8 @@ impl Model for MailAppModel {
                     }
                 }
 
-                let mut all_cmds = vec![Cmd::tick(TICK_INTERVAL), deferred_cmd];
+                let next_tick_interval = self.next_tick_interval(had_new_events, had_remote_events);
+                let mut all_cmds = vec![Cmd::tick(next_tick_interval), deferred_cmd];
                 all_cmds.extend(remote_cmds);
                 Cmd::batch(all_cmds)
             }
@@ -3891,15 +3934,14 @@ impl Model for MailAppModel {
         // terminal cursor hidden to prevent visible cursor trails during refresh.
         frame.cursor_visible = false;
 
-        // Compute frame budget: how much slack we have relative to the tick
-        // interval. Normal frames arrive ~every TICK_INTERVAL; budget is
-        // positive when on schedule and drops toward 0 only when frames are
-        // arriving significantly late (2× the expected interval or more).
+        // Compute frame budget: how much slack we have relative to the current
+        // adaptive tick cadence. Normal frames arrive near the scheduled tick;
+        // budget is positive when on schedule and drops toward 0 only when
+        // frames arrive significantly late (2× the expected interval or more).
         //
-        // TICK_INTERVAL is 100ms (~10fps) — adequate for a data-dashboard TUI.
         // The Bayesian diff strategy uses this budget to decide whether to
         // skip frames under load.
-        let tick_budget_ms = TICK_INTERVAL.as_secs_f64() * 1000.0;
+        let tick_budget_ms = self.current_tick_interval.as_secs_f64() * 1000.0;
         let now = Instant::now();
         let budget_remaining_ms = self.last_view_instant.get().map_or(tick_budget_ms, |prev| {
             let elapsed_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
@@ -6258,6 +6300,14 @@ mod tests {
         }
     }
 
+    fn first_tick_duration(cmd: &Cmd<MailMsg>) -> Option<Duration> {
+        match cmd {
+            Cmd::Tick(duration) => Some(*duration),
+            Cmd::Batch(cmds) | Cmd::Sequence(cmds) => cmds.iter().find_map(first_tick_duration),
+            _ => None,
+        }
+    }
+
     fn test_model_with_debug(debug: bool) -> MailAppModel {
         let config = Config {
             tui_debug: debug,
@@ -7060,6 +7110,37 @@ mod tests {
         );
         assert_eq!(state.remote_terminal_queue_len(), 0);
         assert_eq!(model.active_screen(), MailScreenId::Messages);
+    }
+
+    #[test]
+    fn quiet_streak_transitions_to_idle_tick_cadence() {
+        let mut model = test_model();
+        let mut last_cmd = Cmd::none();
+        for _ in 0..IDLE_TICK_STREAK_THRESHOLD {
+            last_cmd = model.update(MailMsg::Terminal(Event::Tick));
+        }
+        assert_eq!(first_tick_duration(&last_cmd), Some(IDLE_TICK_INTERVAL));
+        assert_eq!(model.current_tick_interval, IDLE_TICK_INTERVAL);
+    }
+
+    #[test]
+    fn activity_resets_idle_tick_cadence_back_to_base() {
+        let mut model = test_model();
+
+        for _ in 0..IDLE_TICK_STREAK_THRESHOLD {
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+        }
+        assert_eq!(model.current_tick_interval, IDLE_TICK_INTERVAL);
+
+        assert!(
+            model
+                .state
+                .push_event(MailEvent::server_started("http://127.0.0.1:8765", "test",))
+        );
+        let cmd = model.update(MailMsg::Terminal(Event::Tick));
+        assert_eq!(first_tick_duration(&cmd), Some(TICK_INTERVAL));
+        assert_eq!(model.current_tick_interval, TICK_INTERVAL);
+        assert_eq!(model.idle_tick_streak, 0);
     }
 
     // ── Reducer edge-case tests ──────────────────────────────────

@@ -47,6 +47,12 @@ NO_CHECKSUM=0
 FORCE_INSTALL=0
 OFFLINE="${AM_OFFLINE:-0}"
 
+# T2.1: Auto-enable easy-mode for pipe installs (stdin is not a terminal)
+# Also auto-enable in CI environments.
+if [ ! -t 0 ] || [ "${CI:-}" = "true" ] || [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${GITLAB_CI:-}" ] || [ -n "${JENKINS_URL:-}" ]; then
+  EASY=1
+fi
+
 # Binary names in this project
 BIN_SERVER="mcp-agent-mail"
 BIN_CLI="am"
@@ -301,6 +307,443 @@ check_network() {
   fi
 }
 
+# ── Python installation detection (T1.1, T1.2, T1.3) ──────────────────────
+
+# Result variables set by detect_python_*
+PYTHON_ALIAS_FOUND=0
+PYTHON_ALIAS_FILE=""
+PYTHON_ALIAS_LINE=0
+PYTHON_ALIAS_CONTENT=""
+PYTHON_ALIAS_HAS_MARKERS=0
+PYTHON_BINARY_FOUND=0
+PYTHON_BINARY_PATH=""
+PYTHON_CLONE_FOUND=0
+PYTHON_CLONE_PATH=""
+PYTHON_VENV_PATH=""
+PYTHON_PID=""
+PYTHON_DETECTED=0
+PYTHON_DB_FOUND=0
+PYTHON_DB_PATH=""
+PYTHON_DB_MIGRATED_PATH=""
+
+# T1.1: Detect Python am alias in shell rc files
+detect_python_alias() {
+  PYTHON_ALIAS_FOUND=0
+  PYTHON_ALIAS_FILE=""
+  PYTHON_ALIAS_LINE=0
+  PYTHON_ALIAS_CONTENT=""
+  PYTHON_ALIAS_HAS_MARKERS=0
+
+  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile")
+  # Fish uses different syntax; check config.fish too
+  local fish_config="$HOME/.config/fish/config.fish"
+  if [ -f "$fish_config" ]; then
+    rc_files+=("$fish_config")
+  fi
+
+  for rc in "${rc_files[@]}"; do
+    [ -f "$rc" ] || continue
+
+    # Check for marker block: "# >>> MCP Agent Mail alias" ... "# <<< MCP Agent Mail alias"
+    if grep -q '# >>> MCP Agent Mail' "$rc" 2>/dev/null; then
+      PYTHON_ALIAS_FOUND=1
+      PYTHON_ALIAS_FILE="$rc"
+      PYTHON_ALIAS_HAS_MARKERS=1
+      PYTHON_ALIAS_LINE=$(grep -n '# >>> MCP Agent Mail' "$rc" | head -1 | cut -d: -f1)
+      # Extract the alias content from within the marker block
+      PYTHON_ALIAS_CONTENT=$(sed -n '/# >>> MCP Agent Mail/,/# <<< MCP Agent Mail/p' "$rc" | grep -E "^alias am=|^alias am " | head -1)
+      return 0
+    fi
+
+    # Check for bare "alias am=" (bash/zsh) or "alias am " (fish) outside markers
+    local alias_line=""
+    alias_line=$(grep -n -E "^[[:space:]]*(alias am=|alias am )" "$rc" 2>/dev/null | grep -iv "disabled\|#.*alias am" | head -1)
+    if [ -n "$alias_line" ]; then
+      # Skip commented-out aliases
+      local line_content
+      line_content=$(echo "$alias_line" | cut -d: -f2-)
+      if echo "$line_content" | grep -q "^[[:space:]]*#"; then
+        continue
+      fi
+      PYTHON_ALIAS_FOUND=1
+      PYTHON_ALIAS_FILE="$rc"
+      PYTHON_ALIAS_LINE=$(echo "$alias_line" | cut -d: -f1)
+      PYTHON_ALIAS_CONTENT="$line_content"
+      PYTHON_ALIAS_HAS_MARKERS=0
+      return 0
+    fi
+
+    # Check for function definition: "function am()" or "am()" (bash/zsh)
+    # Or "function am" (fish)
+    local func_line=""
+    func_line=$(grep -n -E "^[[:space:]]*(function am[[:space:](]|am[[:space:]]*\(\))" "$rc" 2>/dev/null | grep -v "^[[:space:]]*#" | head -1)
+    if [ -n "$func_line" ]; then
+      local line_content
+      line_content=$(echo "$func_line" | cut -d: -f2-)
+      if ! echo "$line_content" | grep -q "^[[:space:]]*#"; then
+        PYTHON_ALIAS_FOUND=1
+        PYTHON_ALIAS_FILE="$rc"
+        PYTHON_ALIAS_LINE=$(echo "$func_line" | cut -d: -f1)
+        PYTHON_ALIAS_CONTENT="$line_content"
+        PYTHON_ALIAS_HAS_MARKERS=0
+        return 0
+      fi
+    fi
+  done
+}
+
+# T1.2: Detect Python am binary/script in PATH
+detect_python_binary() {
+  PYTHON_BINARY_FOUND=0
+  PYTHON_BINARY_PATH=""
+
+  # Check for am binaries/scripts in PATH that are NOT the Rust binary
+  local all_am
+  all_am=$(which -a am 2>/dev/null || true)
+  [ -z "$all_am" ] && return 0
+
+  while IFS= read -r am_path; do
+    [ -z "$am_path" ] && continue
+    # Skip our own install destination
+    [ "$am_path" = "$DEST/$BIN_CLI" ] && continue
+    [ "$am_path" = "$DEST/am" ] && continue
+
+    # Check if it's a Python-related am
+    if [ -L "$am_path" ]; then
+      local link_target
+      link_target=$(readlink -f "$am_path" 2>/dev/null || readlink "$am_path" 2>/dev/null || true)
+      if echo "$link_target" | grep -qiE "python|venv|site-packages|mcp.agent.mail"; then
+        PYTHON_BINARY_FOUND=1
+        PYTHON_BINARY_PATH="$am_path"
+        return 0
+      fi
+    fi
+
+    # Check shebang or content for Python references
+    if [ -f "$am_path" ] && [ -r "$am_path" ]; then
+      local first_lines
+      first_lines=$(head -5 "$am_path" 2>/dev/null || true)
+      if echo "$first_lines" | grep -qiE "python|#!/.*python"; then
+        PYTHON_BINARY_FOUND=1
+        PYTHON_BINARY_PATH="$am_path"
+        return 0
+      fi
+    fi
+
+    # Check if it's in a Python virtualenv or site-packages directory
+    if echo "$am_path" | grep -qiE "venv|virtualenv|site-packages|\.local/lib/python"; then
+      PYTHON_BINARY_FOUND=1
+      PYTHON_BINARY_PATH="$am_path"
+      return 0
+    fi
+  done <<< "$all_am"
+
+  # Also check for python -m mcp_agent_mail availability
+  if command -v python3 >/dev/null 2>&1 && python3 -c "import mcp_agent_mail" 2>/dev/null; then
+    PYTHON_BINARY_FOUND=1
+    PYTHON_BINARY_PATH="python3 -m mcp_agent_mail"
+  elif command -v python >/dev/null 2>&1 && python -c "import mcp_agent_mail" 2>/dev/null; then
+    PYTHON_BINARY_FOUND=1
+    PYTHON_BINARY_PATH="python -m mcp_agent_mail"
+  fi
+}
+
+# T1.3: Detect Python virtualenv and git clone
+detect_python_installation() {
+  PYTHON_CLONE_FOUND=0
+  PYTHON_CLONE_PATH=""
+  PYTHON_VENV_PATH=""
+  PYTHON_PID=""
+
+  # Check common clone locations
+  local candidates=(
+    "$HOME/mcp_agent_mail"
+    "$HOME/mcp-agent-mail"
+    "$HOME/projects/mcp_agent_mail"
+    "$HOME/code/mcp_agent_mail"
+  )
+
+  # If we found an alias, extract the path from it
+  if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && [ -n "$PYTHON_ALIAS_CONTENT" ]; then
+    local alias_path
+    # Extract path from patterns like: alias am='cd "/path/to/dir" && ...'
+    alias_path=$(echo "$PYTHON_ALIAS_CONTENT" | sed -n "s/.*cd [\"']*\([^\"'&]*\)[\"']*.*/\1/p")
+    [ -n "$alias_path" ] && candidates+=("$alias_path")
+    # Also try: alias am='cd /path/to/dir && ...'
+    alias_path=$(echo "$PYTHON_ALIAS_CONTENT" | sed -n 's/.*cd \([^ &"'"'"']*\).*/\1/p')
+    [ -n "$alias_path" ] && candidates+=("$alias_path")
+  fi
+
+  for dir in "${candidates[@]}"; do
+    # Expand ~ if present
+    dir="${dir/#\~/$HOME}"
+    [ -d "$dir" ] || continue
+
+    # Check for Python mcp_agent_mail markers
+    if [ -f "$dir/pyproject.toml" ] && grep -q "mcp.agent.mail\|mcp_agent_mail" "$dir/pyproject.toml" 2>/dev/null; then
+      PYTHON_CLONE_FOUND=1
+      PYTHON_CLONE_PATH="$dir"
+      # Check for virtualenv
+      if [ -d "$dir/.venv" ]; then
+        PYTHON_VENV_PATH="$dir/.venv"
+      elif [ -d "$dir/venv" ]; then
+        PYTHON_VENV_PATH="$dir/venv"
+      fi
+      break
+    fi
+
+    # Also check for src/mcp_agent_mail/ (source package layout)
+    if [ -d "$dir/src/mcp_agent_mail" ]; then
+      PYTHON_CLONE_FOUND=1
+      PYTHON_CLONE_PATH="$dir"
+      [ -d "$dir/.venv" ] && PYTHON_VENV_PATH="$dir/.venv"
+      [ -d "$dir/venv" ] && PYTHON_VENV_PATH="$dir/venv"
+      break
+    fi
+  done
+
+  # Check for running Python server processes
+  local pids
+  pids=$(pgrep -f "mcp_agent_mail\|mcp.agent.mail" 2>/dev/null | head -5 || true)
+  if [ -n "$pids" ]; then
+    # Filter to actual Python processes
+    while IFS= read -r pid; do
+      [ -z "$pid" ] && continue
+      local cmdline
+      cmdline=$(ps -p "$pid" -o command= 2>/dev/null || true)
+      if echo "$cmdline" | grep -qiE "python|uvicorn"; then
+        PYTHON_PID="$pid"
+        break
+      fi
+    done <<< "$pids"
+  fi
+
+  # Set overall detection flag
+  if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] || [ "$PYTHON_BINARY_FOUND" -eq 1 ] || [ "$PYTHON_CLONE_FOUND" -eq 1 ]; then
+    PYTHON_DETECTED=1
+  fi
+}
+
+# Run all Python detection in sequence
+detect_python() {
+  detect_python_alias
+  detect_python_binary
+  detect_python_installation
+
+  if [ "$PYTHON_DETECTED" -eq 1 ]; then
+    info "Existing Python mcp-agent-mail detected"
+    [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && info "  Alias: $PYTHON_ALIAS_FILE:$PYTHON_ALIAS_LINE"
+    [ "$PYTHON_BINARY_FOUND" -eq 1 ] && info "  Binary: $PYTHON_BINARY_PATH"
+    [ "$PYTHON_CLONE_FOUND" -eq 1 ] && info "  Clone: $PYTHON_CLONE_PATH"
+    [ -n "$PYTHON_VENV_PATH" ] && info "  Venv: $PYTHON_VENV_PATH"
+    [ -n "$PYTHON_PID" ] && info "  Running PID: $PYTHON_PID"
+  fi
+}
+
+# T1.4: Displace Python alias (comment out with backup)
+displace_python_alias() {
+  [ "$PYTHON_ALIAS_FOUND" -eq 0 ] && return 0
+
+  local rc="$PYTHON_ALIAS_FILE"
+  [ -z "$rc" ] && return 0
+  [ -f "$rc" ] || return 0
+
+  # Create timestamped backup
+  local timestamp
+  timestamp=$(date +%Y%m%d_%H%M%S)
+  local backup="${rc}.bak.mcp-agent-mail-${timestamp}"
+  cp -p "$rc" "$backup"
+  info "Backed up $rc -> $backup"
+
+  # Write to a temp file, then atomic rename
+  local tmpfile="${rc}.tmp.mcp-agent-mail.$$"
+
+  if [ "$PYTHON_ALIAS_HAS_MARKERS" -eq 1 ]; then
+    # Replace the marker block with a commented-out version
+    awk -v dest="$DEST" -v date="$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+      /# >>> MCP Agent Mail/ { in_block=1; print "# >>> MCP Agent Mail alias (DISABLED by Rust installer on " date ")"; next }
+      /# <<< MCP Agent Mail/ { in_block=0; print "# Rust binary installed at: " dest "/am"; print "# To restore Python version: uncomment the alias line(s) above"; print "# <<< MCP Agent Mail alias (DISABLED)"; next }
+      in_block && /^[^#]/ { print "# " $0; next }
+      { print }
+    ' "$rc" > "$tmpfile"
+  else
+    # Comment out the bare alias line
+    local line_num="$PYTHON_ALIAS_LINE"
+    awk -v line="$line_num" -v dest="$DEST" '
+      NR == line { print "# Disabled by mcp-agent-mail Rust installer: " $0; print "# Rust binary at: " dest "/am"; next }
+      { print }
+    ' "$rc" > "$tmpfile"
+  fi
+
+  # Verify the temp file is valid (non-empty, at least as many lines as original)
+  local orig_lines new_lines
+  orig_lines=$(wc -l < "$rc")
+  new_lines=$(wc -l < "$tmpfile")
+  if [ "$new_lines" -lt "$orig_lines" ]; then
+    warn "Displacement produced fewer lines ($new_lines < $orig_lines); aborting rc modification"
+    rm -f "$tmpfile"
+    return 1
+  fi
+
+  # Preserve original permissions
+  chmod --reference="$rc" "$tmpfile" 2>/dev/null || chmod "$(stat -f '%A' "$rc" 2>/dev/null || echo 644)" "$tmpfile" 2>/dev/null || true
+
+  # Atomic rename
+  mv "$tmpfile" "$rc"
+  ok "Python alias disabled in $rc"
+  ok "Backup at $backup"
+}
+
+# T1.5: Stop running Python server processes
+stop_python_server() {
+  [ -z "$PYTHON_PID" ] && return 0
+
+  info "Stopping Python mcp-agent-mail server (PID $PYTHON_PID)"
+  kill "$PYTHON_PID" 2>/dev/null || true
+
+  # Wait up to 5 seconds for graceful shutdown
+  local waited=0
+  while [ "$waited" -lt 5 ] && kill -0 "$PYTHON_PID" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  # Force-kill if still running
+  if kill -0 "$PYTHON_PID" 2>/dev/null; then
+    warn "Python server did not stop gracefully; sending SIGKILL"
+    kill -9 "$PYTHON_PID" 2>/dev/null || true
+    sleep 1
+  fi
+
+  if ! kill -0 "$PYTHON_PID" 2>/dev/null; then
+    ok "Python server stopped"
+  else
+    warn "Could not stop Python server (PID $PYTHON_PID)"
+  fi
+}
+
+# T5.2: Resolve database path differences between Python and Rust
+# Python stores DB at clone_dir/storage.sqlite3 (via cd in alias)
+# Rust resolves via DATABASE_URL (default: ./storage.sqlite3 relative to CWD)
+# or STORAGE_ROOT (default: ~/.mcp_agent_mail_git_mailbox_repo)
+resolve_database_path() {
+  PYTHON_DB_FOUND=0
+  PYTHON_DB_PATH=""
+  RUST_STORAGE_ROOT="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
+
+  # Candidate paths where Python might have stored the database
+  local candidates=()
+
+  # 1. Check the Python clone directory (most common)
+  if [ "$PYTHON_CLONE_FOUND" -eq 1 ] && [ -n "$PYTHON_CLONE_PATH" ]; then
+    candidates+=("$PYTHON_CLONE_PATH/storage.sqlite3")
+    candidates+=("$PYTHON_CLONE_PATH/db/storage.sqlite3")
+  fi
+
+  # 2. Common Python default locations
+  candidates+=(
+    "$HOME/mcp_agent_mail/storage.sqlite3"
+    "$HOME/mcp-agent-mail/storage.sqlite3"
+    "$HOME/projects/mcp_agent_mail/storage.sqlite3"
+    "$HOME/code/mcp_agent_mail/storage.sqlite3"
+  )
+
+  # 3. Check CWD (Python might have been started from a project dir)
+  candidates+=("./storage.sqlite3")
+
+  # 4. Extract path from DATABASE_URL env var if set
+  if [ -n "${DATABASE_URL:-}" ]; then
+    local url_path
+    # Strip protocol prefix: sqlite+aiosqlite:///./path -> ./path
+    url_path=$(echo "$DATABASE_URL" | sed -n 's|^sqlite[^:]*:///||p')
+    [ -n "$url_path" ] && candidates+=("$url_path")
+  fi
+
+  # 5. Check .env files in common locations for DATABASE_URL
+  local env_files=(
+    "$HOME/mcp_agent_mail/.env"
+    "$HOME/mcp-agent-mail/.env"
+    "$HOME/.env"
+  )
+  [ "$PYTHON_CLONE_FOUND" -eq 1 ] && [ -n "$PYTHON_CLONE_PATH" ] && env_files+=("$PYTHON_CLONE_PATH/.env")
+
+  for env_file in "${env_files[@]}"; do
+    if [ -f "$env_file" ]; then
+      local db_url
+      db_url=$(grep -E '^DATABASE_URL=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2-)
+      if [ -n "$db_url" ]; then
+        local env_path
+        env_path=$(echo "$db_url" | sed -n 's|^sqlite[^:]*:///||p')
+        [ -n "$env_path" ] && candidates+=("$env_path")
+      fi
+    fi
+  done
+
+  # Deduplicate and check each candidate
+  local seen=""
+  for candidate in "${candidates[@]}"; do
+    # Expand ~ if present
+    candidate="${candidate/#\~/$HOME}"
+    # Skip if already checked
+    case "$seen" in
+      *"|$candidate|"*) continue;;
+    esac
+    seen="${seen}|${candidate}|"
+
+    if [ -f "$candidate" ] && [ -s "$candidate" ]; then
+      # Verify it's actually a SQLite file
+      local magic
+      magic=$(head -c 16 "$candidate" 2>/dev/null | strings 2>/dev/null | head -1)
+      if echo "$magic" | grep -q "SQLite format"; then
+        PYTHON_DB_FOUND=1
+        PYTHON_DB_PATH="$candidate"
+        break
+      fi
+    fi
+  done
+
+  if [ "$PYTHON_DB_FOUND" -eq 0 ]; then
+    return 0
+  fi
+
+  info "Found Python database at: $PYTHON_DB_PATH"
+
+  # Determine if the DB is already in the Rust storage root
+  local rust_db="$RUST_STORAGE_ROOT/storage.sqlite3"
+  local abs_python_db
+  abs_python_db=$(cd "$(dirname "$PYTHON_DB_PATH")" 2>/dev/null && echo "$(pwd)/$(basename "$PYTHON_DB_PATH")")
+  local abs_rust_db
+  abs_rust_db=$(cd "$(dirname "$rust_db")" 2>/dev/null && echo "$(pwd)/$(basename "$rust_db")" 2>/dev/null || echo "$rust_db")
+
+  if [ "$abs_python_db" = "$abs_rust_db" ]; then
+    info "Python database is already at the Rust storage location"
+    return 0
+  fi
+
+  # Copy the Python DB to the Rust storage root (don't move — safer)
+  mkdir -p "$RUST_STORAGE_ROOT"
+
+  if [ -f "$rust_db" ] && [ -s "$rust_db" ]; then
+    # Rust DB already exists — don't overwrite
+    info "Rust database already exists at $rust_db"
+    info "Python database preserved at $PYTHON_DB_PATH"
+    info "To migrate manually: am migrate-python-db $PYTHON_DB_PATH"
+    return 0
+  fi
+
+  cp -p "$PYTHON_DB_PATH" "$rust_db"
+  # Also copy WAL/SHM files if present
+  [ -f "${PYTHON_DB_PATH}-wal" ] && cp -p "${PYTHON_DB_PATH}-wal" "${rust_db}-wal"
+  [ -f "${PYTHON_DB_PATH}-shm" ] && cp -p "${PYTHON_DB_PATH}-shm" "${rust_db}-shm"
+  ok "Copied Python database to $rust_db"
+
+  # Set DATABASE_URL so Rust binary finds it
+  export DATABASE_URL="sqlite+aiosqlite:///$rust_db"
+  PYTHON_DB_MIGRATED_PATH="$rust_db"
+}
+
+# ── End Python detection & displacement ────────────────────────────────────
+
 preflight_checks() {
   info "Running preflight checks"
   check_disk_space
@@ -333,6 +776,87 @@ maybe_add_path() {
       fi
     ;;
   esac
+}
+
+detect_mcp_configs() {
+  local project_dir="${1:-$PWD}"
+  local home_dir="${HOME:-}"
+  local app_data_dir="${APPDATA:-}"
+  local seen=""
+  local entry
+  local tool
+  local path
+  local key
+  local exists_flag
+  local -a candidates=()
+
+  if [ -n "$home_dir" ]; then
+    # Claude Code / Claude Desktop
+    candidates+=("claude|${home_dir}/.claude/settings.json")
+    candidates+=("claude|${home_dir}/.claude/settings.local.json")
+    candidates+=("claude|${home_dir}/.claude/claude_desktop_config.json")
+    candidates+=("claude|${home_dir}/.config/Claude/claude_desktop_config.json")
+    candidates+=("claude|${home_dir}/Library/Application Support/Claude/claude_desktop_config.json")
+
+    # Codex CLI
+    candidates+=("codex|${home_dir}/.codex/config.toml")
+    candidates+=("codex|${home_dir}/.codex/config.json")
+    candidates+=("codex|${home_dir}/.config/codex/config.toml")
+
+    # Cursor
+    candidates+=("cursor|${home_dir}/.cursor/mcp.json")
+    candidates+=("cursor|${home_dir}/.cursor/mcp_config.json")
+
+    # Gemini CLI
+    candidates+=("gemini|${home_dir}/.gemini/settings.json")
+    candidates+=("gemini|${home_dir}/.gemini/mcp.json")
+
+    # GitHub Copilot / VS Code settings
+    candidates+=("github-copilot|${home_dir}/.config/Code/User/settings.json")
+    candidates+=("github-copilot|${home_dir}/Library/Application Support/Code/User/settings.json")
+
+    # Other supported tools
+    candidates+=("windsurf|${home_dir}/.windsurf/mcp.json")
+    candidates+=("cline|${home_dir}/.cline/mcp.json")
+    candidates+=("opencode|${home_dir}/.opencode/opencode.json")
+    candidates+=("factory|${home_dir}/.factory/mcp.json")
+    candidates+=("factory|${home_dir}/.factory/settings.json")
+  fi
+
+  if [ -n "$app_data_dir" ]; then
+    candidates+=("claude|${app_data_dir}/Claude/claude_desktop_config.json")
+    candidates+=("github-copilot|${app_data_dir}/Code/User/settings.json")
+  fi
+
+  # Project-local config files.
+  candidates+=("claude|${project_dir}/.claude/settings.json")
+  candidates+=("claude|${project_dir}/.claude/settings.local.json")
+  candidates+=("codex|${project_dir}/.codex/config.toml")
+  candidates+=("codex|${project_dir}/codex.mcp.json")
+  candidates+=("cursor|${project_dir}/cursor.mcp.json")
+  candidates+=("gemini|${project_dir}/gemini.mcp.json")
+  candidates+=("github-copilot|${project_dir}/.vscode/mcp.json")
+  candidates+=("windsurf|${project_dir}/windsurf.mcp.json")
+  candidates+=("cline|${project_dir}/cline.mcp.json")
+  candidates+=("opencode|${project_dir}/opencode.json")
+  candidates+=("factory|${project_dir}/factory.mcp.json")
+
+  for entry in "${candidates[@]}"; do
+    tool="${entry%%|*}"
+    path="${entry#*|}"
+    key="${tool}|${path}"
+    case "|${seen}|" in
+      *"|${key}|"*) continue ;;
+    esac
+    seen="${seen}|${key}"
+
+    if [ -e "$path" ]; then
+      exists_flag=1
+    else
+      exists_flag=0
+    fi
+    printf '%s\t%s\t%s\n' "$tool" "$path" "$exists_flag"
+  done
 }
 
 ensure_rust() {
@@ -516,6 +1040,9 @@ mkdir -p "$DEST" 2>/dev/null || true
 
 preflight_checks
 
+# Detect existing Python installation (T1.1, T1.2, T1.3)
+detect_python
+
 # Check if already at target version (skip download if so, unless --force)
 if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
   ok "mcp-agent-mail $VERSION is already installed at $DEST"
@@ -660,6 +1187,43 @@ ok "Installed to $DEST"
 ok "  $DEST/$BIN_SERVER"
 ok "  $DEST/$BIN_CLI"
 maybe_add_path
+
+# Displace Python installation if detected
+if [ "$PYTHON_DETECTED" -eq 1 ]; then
+  stop_python_server
+  displace_python_alias
+  resolve_database_path
+fi
+
+MCP_CONFIG_SCAN="$(detect_mcp_configs "$PWD" || true)"
+if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
+  SHOWN_MCP_CONFIGS=0
+  while IFS=$'\t' read -r tool path exists_flag; do
+    [ -z "${tool:-}" ] && continue
+    if [ "${AM_INSTALL_LIST_ALL_MCP_CONFIGS:-0}" != "1" ] && [ "$exists_flag" != "1" ]; then
+      continue
+    fi
+    if [ "$SHOWN_MCP_CONFIGS" -eq 0 ]; then
+      info "Detected MCP config files"
+    fi
+    SHOWN_MCP_CONFIGS=$((SHOWN_MCP_CONFIGS + 1))
+    if [ "$exists_flag" = "1" ]; then
+      ok "[$tool] $path"
+    else
+      info "[$tool] $path (missing)"
+    fi
+  done <<< "$MCP_CONFIG_SCAN"
+fi
+
+# Run database migration if we copied a Python DB
+if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
+  info "Running database migration on copied Python database"
+  if DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate 2>&1; then
+    ok "Database schema migrated"
+  else
+    warn "Database migration had issues (you can retry with: am migrate)"
+  fi
+fi
 
 if [ "$VERIFY" -eq 1 ]; then
   "$DEST/$BIN_CLI" --version || true

@@ -22,6 +22,7 @@ pub mod identity;
 pub mod intern;
 pub mod kpi;
 pub mod lock_order;
+pub mod mcp_config;
 pub mod memory;
 pub mod metrics;
 pub mod models;
@@ -68,6 +69,10 @@ pub use kpi::{
 pub use lock_order::{
     LockContentionEntry, LockLevel, OrderedMutex, OrderedRwLock, lock_contention_reset,
     lock_contention_snapshot,
+};
+pub use mcp_config::{
+    McpConfigDetectParams, McpConfigLocation, McpConfigTool, detect_mcp_config_locations,
+    detect_mcp_config_locations_default,
 };
 pub use memory::{MemoryPressure, MemorySample};
 pub use metrics::{

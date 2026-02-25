@@ -69,6 +69,7 @@ mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 franken-agent-detection = "0.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+json5 = "0.4"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 comrak = { version = "0.50.0", default-features = false }

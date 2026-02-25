@@ -19,6 +19,7 @@ pub mod coalesce;
 pub mod error;
 pub mod integrity;
 pub mod mail_explorer;
+pub mod migrate;
 pub mod models;
 pub mod pool;
 pub mod queries;
@@ -41,6 +42,11 @@ pub use error::{DbError, DbResult, is_lock_error, is_pool_exhausted_error};
 pub use integrity::{
     CheckKind, IntegrityCheckResult, IntegrityMetrics, attempt_vacuum_recovery, full_check,
     incremental_check, integrity_metrics, is_full_check_due, quick_check,
+};
+pub use migrate::{
+    ColumnConversionResult, MigrationError, MigrationSummary, TIMESTAMP_COLUMNS, TimestampFormat,
+    convert_all_timestamps, convert_column, copy_python_database_to_rust, detect_column_format,
+    detect_timestamp_format, find_python_database, text_to_micros,
 };
 pub use models::*;
 pub use pool::{

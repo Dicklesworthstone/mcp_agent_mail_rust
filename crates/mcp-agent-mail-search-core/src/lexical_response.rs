@@ -58,23 +58,28 @@ pub fn generate_snippet(text: &str, query_terms: &[String]) -> Option<String> {
 
     // Find the first matching term position
     let mut best_pos: Option<usize> = None;
-    let mut best_term = "";
+    let mut best_term_len = 0usize;
 
     for term in query_terms {
         let lower_term = term.to_lowercase();
+        if lower_term.is_empty() {
+            continue;
+        }
         if let Some(pos) = lower_text.find(&lower_term)
             && (best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX))
         {
             best_pos = Some(pos);
-            best_term = term;
+            best_term_len = lower_term.len();
         }
     }
 
     let match_pos = best_pos?;
+    let match_start = floor_char_boundary(text, match_pos);
+    let match_end = ceil_char_boundary(text, match_start.saturating_add(best_term_len));
 
     // Calculate excerpt window
-    let start = match_pos.saturating_sub(SNIPPET_CONTEXT);
-    let end = (match_pos + best_term.len() + SNIPPET_CONTEXT).min(text.len());
+    let start = floor_char_boundary(text, match_start.saturating_sub(SNIPPET_CONTEXT));
+    let end = ceil_char_boundary(text, match_end.saturating_add(SNIPPET_CONTEXT));
 
     // Snap to word boundaries
     let start = snap_to_word_start(text, start);
@@ -87,7 +92,9 @@ pub fn generate_snippet(text: &str, query_terms: &[String]) -> Option<String> {
         snippet.push_str("...");
     }
 
-    let excerpt = &text[start..end.min(start + SNIPPET_MAX_CHARS)];
+    let max_end = ceil_char_boundary(text, start.saturating_add(SNIPPET_MAX_CHARS));
+    let excerpt_end = end.min(max_end).max(start);
+    let excerpt = &text[start..excerpt_end];
     snippet.push_str(excerpt);
 
     if end < text.len() {
@@ -104,19 +111,31 @@ pub fn find_highlights(
     field_name: &str,
     query_terms: &[String],
 ) -> Vec<HighlightRange> {
+    if text.is_empty() || query_terms.is_empty() {
+        return Vec::new();
+    }
     let lower_text = text.to_lowercase();
     let mut ranges = Vec::new();
 
     for term in query_terms {
         let lower_term = term.to_lowercase();
+        if lower_term.is_empty() {
+            continue;
+        }
         let mut search_from = 0;
 
         while let Some(pos) = lower_text[search_from..].find(&lower_term) {
             let abs_pos = search_from + pos;
+            let start = floor_char_boundary(text, abs_pos);
+            let end = ceil_char_boundary(text, abs_pos.saturating_add(lower_term.len()));
+            if end <= start {
+                search_from = abs_pos + lower_term.len();
+                continue;
+            }
             ranges.push(HighlightRange {
                 field: field_name.to_string(),
-                start: abs_pos,
-                end: abs_pos + lower_term.len(),
+                start,
+                end,
             });
             search_from = abs_pos + lower_term.len();
         }
@@ -129,27 +148,42 @@ pub fn find_highlights(
 
 /// Snap a byte position back to the start of the nearest word
 fn snap_to_word_start(text: &str, pos: usize) -> usize {
-    let pos = pos.min(text.len());
-    let pos = text.floor_char_boundary(pos);
-    if pos == 0 {
-        return 0;
+    let safe_pos = floor_char_boundary(text, pos);
+    if safe_pos == 0 || safe_pos >= text.len() {
+        return safe_pos.min(text.len());
     }
     // Walk backwards to find whitespace
-    text[..pos]
+    text[..safe_pos]
         .rfind(|c: char| c.is_whitespace())
         .map_or(0, |p| p + 1)
 }
 
 /// Snap a byte position forward to the end of the nearest word
 fn snap_to_word_end(text: &str, pos: usize) -> usize {
-    if pos >= text.len() {
+    let safe_pos = ceil_char_boundary(text, pos);
+    if safe_pos >= text.len() {
         return text.len();
     }
-    let pos = text.floor_char_boundary(pos);
     // Walk forward to find whitespace
-    text[pos..]
+    text[safe_pos..]
         .find(|c: char| c.is_whitespace())
-        .map_or(text.len(), |p| pos + p)
+        .map_or(text.len(), |p| safe_pos + p)
+}
+
+fn floor_char_boundary(text: &str, pos: usize) -> usize {
+    let mut idx = pos.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(text: &str, pos: usize) -> usize {
+    let mut idx = pos.min(text.len());
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
 }
 
 // ── Tantivy result assembler (behind feature gate) ──────────────────────────
@@ -479,6 +513,14 @@ mod tests {
     }
 
     #[test]
+    fn snippet_handles_unicode_safely_near_window_boundaries() {
+        let text = "``br`/`bv` show `bd-1j6n` as the top in-progress/ready item. I’m taking execution now and will work in `crates/ffs-alloc/src/lib.rs` to add the requested property tests. If either of you already owns `bd-1j6n`, reply in-thread and I’ll adjust immediate.";
+        let snippet =
+            generate_snippet(text, &["immediate".to_string()]).expect("snippet should be produced");
+        assert!(snippet.contains("immediate"));
+    }
+
+    #[test]
     fn snippet_truncates_long_text() {
         let long_text = "x ".repeat(500);
         let text = format!("{long_text}MATCH_HERE{long_text}");
@@ -550,6 +592,17 @@ mod tests {
     fn highlights_no_match() {
         let ranges = find_highlights("hello world", "body", &["xyz".to_string()]);
         assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn highlights_unicode_boundaries_are_valid_utf8_indices() {
+        let text = "Coordinate in-thread: I’m taking execution now; adjust if `bd-1j6n` is owned.";
+        let ranges = find_highlights(text, "body", &["taking".to_string(), "owned".to_string()]);
+        assert!(!ranges.is_empty(), "expected at least one highlight");
+        for range in ranges {
+            assert!(text.is_char_boundary(range.start));
+            assert!(text.is_char_boundary(range.end));
+        }
     }
 
     // ── Word boundary snapping tests ──

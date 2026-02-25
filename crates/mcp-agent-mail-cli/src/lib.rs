@@ -202,7 +202,17 @@ pub enum Commands {
         limit: i64,
     },
     #[command(name = "migrate")]
-    Migrate,
+    Migrate {
+        /// Only check the database format without modifying anything.
+        #[arg(long, default_value_t = false)]
+        check: bool,
+        /// Force migration even if the format is unclear or mixed.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Custom backup directory (default: same directory as the database).
+        #[arg(long)]
+        backup_dir: Option<PathBuf>,
+    },
     #[command(name = "list-projects")]
     ListProjects {
         #[arg(long, default_value_t = false)]
@@ -1967,7 +1977,11 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Lint => handle_lint(),
         Commands::Typecheck => handle_typecheck(),
         Commands::E2e { action } => handle_e2e(action),
-        Commands::Migrate => handle_migrate(),
+        Commands::Migrate {
+            check,
+            force,
+            backup_dir,
+        } => handle_migrate_cmd(check, force, backup_dir),
         Commands::ListProjects {
             include_agents,
             format,
@@ -6020,9 +6034,166 @@ fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
     }
 }
 
-fn handle_migrate() -> CliResult<()> {
+fn handle_migrate_cmd(check: bool, force: bool, backup_dir: Option<PathBuf>) -> CliResult<()> {
+    use mcp_agent_mail_db::migrate;
+
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    handle_migrate_with_database_url(&cfg.database_url)
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+
+    if path == ":memory:" {
+        ftui_runtime::ftui_println!("In-memory database — no migration needed.");
+        return Ok(());
+    }
+
+    let db_path = Path::new(&path);
+    if !db_path.exists() {
+        ftui_runtime::ftui_println!("Database file does not exist: {path}");
+        ftui_runtime::ftui_println!("Run the server once to create it, then migrate.");
+        return Ok(());
+    }
+
+    // Step 1: Run schema migration first (ensures tables exist)
+    handle_migrate_with_database_url(&cfg.database_url)?;
+
+    // Step 2: Detect timestamp format
+    let conn = open_db_sync_with_database_url(&cfg.database_url)?;
+    let format = migrate::detect_timestamp_format(&conn)
+        .map_err(|e| CliError::Other(format!("format detection failed: {e}")))?;
+
+    ftui_runtime::ftui_println!("Database format: {format}");
+
+    if check {
+        // --check mode: just report and exit
+        if format.needs_migration() {
+            ftui_runtime::ftui_println!("Migration needed: run `am migrate` to convert.");
+            return Ok(());
+        }
+        ftui_runtime::ftui_println!("No migration needed.");
+        return Ok(());
+    }
+
+    if !format.needs_migration() {
+        ftui_runtime::ftui_println!("Database is already in Rust format. No migration needed.");
+        return Ok(());
+    }
+
+    // For Unknown format, require --force
+    if matches!(format, migrate::TimestampFormat::Unknown(_)) && !force {
+        return Err(CliError::Other(
+            "unknown timestamp format detected; use --force to migrate anyway".to_string(),
+        ));
+    }
+
+    // Step 3: Create backup
+    let start = std::time::Instant::now();
+    let backup_path = create_db_backup(db_path, backup_dir.as_deref())?;
+    ftui_runtime::ftui_println!("Backup created: {}", backup_path.display());
+
+    // Step 4: Convert all TEXT timestamps to i64 microseconds
+    ftui_runtime::ftui_println!("Converting timestamps...");
+    let summary = migrate::convert_all_timestamps(&conn)
+        .map_err(|e| CliError::Other(format!("timestamp conversion failed: {e}")))?;
+
+    // Step 5: VACUUM to reclaim space
+    let _ = conn.execute_raw("VACUUM");
+
+    // Step 6: Verify
+    let after = migrate::detect_timestamp_format(&conn)
+        .map_err(|e| CliError::Other(format!("post-migration verification failed: {e}")))?;
+
+    let elapsed = start.elapsed();
+
+    // Print summary
+    ftui_runtime::ftui_println!("Migration complete in {:.1}s", elapsed.as_secs_f64());
+    ftui_runtime::ftui_println!(
+        "  Converted: {} rows",
+        summary.total_converted
+    );
+    if summary.total_skipped > 0 {
+        ftui_runtime::ftui_println!(
+            "  Skipped:   {} rows (parse errors)",
+            summary.total_skipped
+        );
+    }
+    if summary.total_nulls > 0 {
+        ftui_runtime::ftui_println!(
+            "  NULLs:     {} (left as-is)",
+            summary.total_nulls
+        );
+    }
+    ftui_runtime::ftui_println!("  Backup:    {}", backup_path.display());
+    ftui_runtime::ftui_println!("  Format:    {after}");
+
+    // Report per-column errors if any
+    for col_result in &summary.columns {
+        for err in &col_result.errors {
+            ftui_runtime::ftui_eprintln!("  Warning: {err}");
+        }
+    }
+
+    if !summary.success {
+        ftui_runtime::ftui_eprintln!(
+            "Warning: migration completed with errors. Review warnings above."
+        );
+        ftui_runtime::ftui_eprintln!(
+            "Original database preserved at: {}",
+            backup_path.display()
+        );
+    }
+
+    if after.needs_migration() {
+        ftui_runtime::ftui_eprintln!(
+            "Warning: database still contains TEXT timestamps after migration."
+        );
+        ftui_runtime::ftui_eprintln!("  Post-migration format: {after}");
+    }
+
+    Ok(())
+}
+
+/// Create a timestamped backup of the database file.
+fn create_db_backup(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<PathBuf> {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let backup_name = format!(
+        "{}.bak.{timestamp}",
+        db_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+
+    let backup_parent = backup_dir.unwrap_or_else(|| {
+        db_path.parent().unwrap_or_else(|| Path::new("."))
+    });
+
+    std::fs::create_dir_all(backup_parent).map_err(|e| {
+        CliError::Other(format!(
+            "cannot create backup directory {}: {e}",
+            backup_parent.display()
+        ))
+    })?;
+
+    let backup_path = backup_parent.join(&backup_name);
+    std::fs::copy(db_path, &backup_path).map_err(|e| {
+        CliError::Other(format!(
+            "cannot create backup at {}: {e}",
+            backup_path.display()
+        ))
+    })?;
+
+    // Also backup WAL/SHM if present
+    let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+    if wal.exists() {
+        let _ = std::fs::copy(&wal, backup_parent.join(format!("{backup_name}-wal")));
+    }
+    let shm = PathBuf::from(format!("{}-shm", db_path.display()));
+    if shm.exists() {
+        let _ = std::fs::copy(&shm, backup_parent.join(format!("{backup_name}-shm")));
+    }
+
+    Ok(backup_path)
 }
 
 #[derive(Debug)]
@@ -11603,7 +11774,33 @@ mod tests {
     #[test]
     fn clap_parses_migrate() {
         let m = Cli::try_parse_from(["am", "migrate"]).unwrap();
-        assert!(matches!(m.command, Some(Commands::Migrate)));
+        assert!(matches!(m.command, Some(Commands::Migrate { .. })));
+    }
+
+    #[test]
+    fn clap_parses_migrate_check() {
+        let m = Cli::try_parse_from(["am", "migrate", "--check"]).unwrap();
+        match m.command {
+            Some(Commands::Migrate { check, force, backup_dir }) => {
+                assert!(check);
+                assert!(!force);
+                assert!(backup_dir.is_none());
+            }
+            other => panic!("expected Migrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_migrate_force_with_backup() {
+        let m = Cli::try_parse_from(["am", "migrate", "--force", "--backup-dir", "/tmp/bak"]).unwrap();
+        match m.command {
+            Some(Commands::Migrate { check, force, backup_dir }) => {
+                assert!(!check);
+                assert!(force);
+                assert_eq!(backup_dir, Some(PathBuf::from("/tmp/bak")));
+            }
+            other => panic!("expected Migrate, got {other:?}"),
+        }
     }
 
     #[test]

@@ -147,6 +147,15 @@ impl HealthSignals {
         let pool_over_80_for_s = duration_since_s(snap.db.pool_over_80_since_us, now_us);
         let wbq_over_80_for_s = duration_since_s(snap.storage.wbq_over_80_since_us, now_us);
         let commit_over_80_for_s = duration_since_s(snap.storage.commit_over_80_since_us, now_us);
+        // Pool-acquire latency is a cumulative histogram. If the pool is currently
+        // idle, historical spikes should not keep health stuck in yellow/red.
+        let pool_is_idle =
+            snap.db.pool_active_connections == 0 && snap.db.pool_pending_requests == 0;
+        let pool_acquire_p95_us = if pool_is_idle {
+            0
+        } else {
+            snap.db.pool_acquire_latency_us.p95
+        };
 
         let wbq_depth_pct = pct(snap.storage.wbq_depth, snap.storage.wbq_capacity);
         let commit_depth_pct = pct(
@@ -155,7 +164,7 @@ impl HealthSignals {
         );
 
         Self {
-            pool_acquire_p95_us: snap.db.pool_acquire_latency_us.p95,
+            pool_acquire_p95_us,
             pool_utilization_pct: snap.db.pool_utilization_pct,
             pool_over_80_for_s,
             wbq_depth_pct,
@@ -780,6 +789,8 @@ mod tests {
             p95: 120_000,
             p99: 120_000,
         };
+        snap.db.pool_active_connections = 2;
+        snap.db.pool_pending_requests = 1;
         snap.db.pool_utilization_pct = 77;
         snap.db.pool_over_80_since_us = now_us - 42_000_000;
         snap.storage.wbq_depth = 75;
@@ -799,6 +810,28 @@ mod tests {
         assert_eq!(signals.commit_depth_pct, 50);
         assert_eq!(signals.commit_over_80_for_s, 8);
         assert_eq!(signals.classify(), HealthLevel::Yellow);
+    }
+
+    #[test]
+    fn health_signals_ignore_pool_latency_when_pool_idle() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.db.pool_acquire_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: 500_000,
+            min: 500_000,
+            max: 500_000,
+            p50: 500_000,
+            p95: 500_000,
+            p99: 500_000,
+        };
+        snap.db.pool_active_connections = 0;
+        snap.db.pool_pending_requests = 0;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+
+        assert_eq!(signals.pool_acquire_p95_us, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
     }
 
     #[test]

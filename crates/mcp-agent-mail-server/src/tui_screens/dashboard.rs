@@ -217,6 +217,8 @@ pub(crate) struct DetectedAnomaly {
 pub struct DashboardScreen {
     /// Cached event log lines (rendered from `MailEvent`s).
     event_log: VecDeque<EventEntry>,
+    /// Lower-cased searchable keys parallel to `event_log` for cheap query matching.
+    event_log_search_keys: VecDeque<String>,
     /// Last sequence number consumed from the ring buffer.
     last_seq: u64,
     /// Scroll offset from the bottom (0 = auto-follow).
@@ -402,6 +404,7 @@ impl DashboardScreen {
     pub fn new() -> Self {
         Self {
             event_log: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
+            event_log_search_keys: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
             last_seq: 0,
             scroll_offset: 0,
             auto_follow: true,
@@ -445,7 +448,7 @@ impl DashboardScreen {
             if let Some(preview) = RecentMessagePreview::from_event(event) {
                 self.recent_message_preview = Some(preview);
             }
-            self.event_log.push_back(format_event(event));
+            self.push_event_entry(format_event(event));
         }
         self.trim_event_log();
     }
@@ -481,7 +484,7 @@ impl DashboardScreen {
                     if let Some(preview) = RecentMessagePreview::from_event(&synthetic) {
                         self.recent_message_preview = Some(preview);
                     }
-                    self.event_log.push_back(format_event(&synthetic));
+                    self.push_event_entry(format_event(&synthetic));
                 }
                 if snapshot.file_reservations > 0 {
                     let mut path = if snapshot.file_reservations == 1 {
@@ -503,7 +506,7 @@ impl DashboardScreen {
                         0,
                         "all-projects",
                     );
-                    self.event_log.push_back(format_event(&synthetic));
+                    self.push_event_entry(format_event(&synthetic));
                 }
                 self.trim_event_log();
             }
@@ -531,7 +534,7 @@ impl DashboardScreen {
             if let Some(preview) = RecentMessagePreview::from_event(&synthetic) {
                 self.recent_message_preview = Some(preview);
             }
-            self.event_log.push_back(format_event(&synthetic));
+            self.push_event_entry(format_event(&synthetic));
         }
 
         if snapshot.file_reservations > self.last_db_reservations {
@@ -549,7 +552,7 @@ impl DashboardScreen {
             }
             let synthetic =
                 MailEvent::reservation_granted("db-poller", vec![path], false, 0, "all-projects");
-            self.event_log.push_back(format_event(&synthetic));
+            self.push_event_entry(format_event(&synthetic));
         } else if snapshot.file_reservations < self.last_db_reservations {
             let delta = self
                 .last_db_reservations
@@ -565,7 +568,7 @@ impl DashboardScreen {
             }
             let synthetic =
                 MailEvent::reservation_released("db-poller", vec![path], "all-projects");
-            self.event_log.push_back(format_event(&synthetic));
+            self.push_event_entry(format_event(&synthetic));
         }
 
         self.last_db_messages = snapshot.messages;
@@ -577,19 +580,41 @@ impl DashboardScreen {
     fn trim_event_log(&mut self) {
         while self.event_log.len() > EVENT_LOG_CAPACITY {
             self.event_log.pop_front();
+            self.event_log_search_keys.pop_front();
         }
+    }
+
+    fn push_event_entry(&mut self, entry: EventEntry) {
+        self.event_log_search_keys
+            .push_back(event_entry_search_key(&entry));
+        self.event_log.push_back(entry);
     }
 
     /// Visible entries after applying verbosity tier and type filter.
     fn visible_entries(&self) -> Vec<&EventEntry> {
         let query_terms = parse_query_terms(self.quick_query());
+        if self.event_log_search_keys.len() != self.event_log.len() {
+            // Safety fallback for tests or unexpected manual state edits.
+            return self
+                .event_log
+                .iter()
+                .filter(|e| {
+                    self.verbosity.includes(e.severity)
+                        && (self.type_filter.is_empty() || self.type_filter.contains(&e.kind))
+                        && event_entry_matches_query(e, &query_terms)
+                })
+                .collect();
+        }
+
         self.event_log
             .iter()
-            .filter(|e| {
-                self.verbosity.includes(e.severity)
-                    && (self.type_filter.is_empty() || self.type_filter.contains(&e.kind))
-                    && event_entry_matches_query(e, &query_terms)
+            .zip(self.event_log_search_keys.iter())
+            .filter(|(entry, searchable_key)| {
+                self.verbosity.includes(entry.severity)
+                    && (self.type_filter.is_empty() || self.type_filter.contains(&entry.kind))
+                    && text_matches_query_terms(searchable_key, &query_terms)
             })
+            .map(|(entry, _)| entry)
             .collect()
     }
 
@@ -1443,6 +1468,18 @@ fn event_entry_matches_query(entry: &EventEntry, query_terms: &[String]) -> bool
         entry.icon
     );
     text_matches_query_terms(&searchable, query_terms)
+}
+
+fn event_entry_search_key(entry: &EventEntry) -> String {
+    format!(
+        "{} {} {} {} {}",
+        entry.kind.compact_label(),
+        entry.summary,
+        entry.timestamp,
+        entry.severity.badge(),
+        entry.icon
+    )
+    .to_ascii_lowercase()
 }
 
 fn parse_tool_end_duration(summary: &str) -> Option<(String, u64)> {
@@ -6736,6 +6773,40 @@ mod tests {
         let visible = screen.visible_entries();
         assert_eq!(visible.len(), 1);
         assert!(visible[0].summary.contains("alpha"));
+    }
+
+    #[test]
+    fn visible_entries_cached_path_matches_fallback_path() {
+        let mut screen = DashboardScreen::new();
+        screen.verbosity = VerbosityTier::All;
+
+        screen.push_event_entry(EventEntry {
+            kind: MailEventKind::HttpRequest,
+            severity: EventSeverity::Debug,
+            seq: 1,
+            timestamp_micros: 0,
+            timestamp: "00:00:00.000".to_string(),
+            icon: '↔',
+            summary: "alpha endpoint".to_string(),
+        });
+        screen.push_event_entry(EventEntry {
+            kind: MailEventKind::ToolCallEnd,
+            severity: EventSeverity::Debug,
+            seq: 2,
+            timestamp_micros: 1_000,
+            timestamp: "00:00:00.001".to_string(),
+            icon: '⚙',
+            summary: "beta tool".to_string(),
+        });
+        screen.quick_query_input.set_value("alpha");
+
+        let cached_seq: Vec<u64> = screen.visible_entries().iter().map(|e| e.seq).collect();
+        assert_eq!(cached_seq, vec![1]);
+
+        // Desync cache to force fallback path; result must stay identical.
+        let _ = screen.event_log_search_keys.pop_back();
+        let fallback_seq: Vec<u64> = screen.visible_entries().iter().map(|e| e.seq).collect();
+        assert_eq!(fallback_seq, cached_seq);
     }
 
     #[test]
