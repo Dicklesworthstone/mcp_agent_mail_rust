@@ -26,6 +26,16 @@
       "status": "ok"
     },
     {
+      "check": "binary_resolution",
+      "detail": "'am' resolves to /home/ubuntu/.local/bin/am (zsh)",
+      "status": "ok"
+    },
+    {
+      "check": "timestamp_format",
+      "detail": "i64 microseconds (Rust native)",
+      "status": "ok"
+    },
+    {
       "check": "beads_issue_awareness",
       "detail": "<BEADS_ISSUE_AWARENESS_SUMMARY>",
       "status": "ok"

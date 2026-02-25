@@ -33,9 +33,8 @@ use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
-use ftui_runtime::tick_strategy::{
-    Predictive, PredictiveStrategyConfig, TickDecision, TickStrategy,
-};
+use ftui_runtime::subscription::{Every, Subscription};
+use ftui_runtime::tick_strategy::ScreenTickDispatch;
 use mcp_agent_mail_db::DbPoolConfig;
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
@@ -64,10 +63,8 @@ use crate::tui_widgets::{
 /// Previous 33 ms (30 fps) caused excessive terminal writes and visible
 /// flashing, especially with ambient effects enabled.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
-/// Idle cadence used after sustained quiescence to reduce render churn.
-const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(150);
-/// Number of consecutive quiet ticks required before entering idle cadence.
-const IDLE_TICK_STREAK_THRESHOLD: u16 = 6;
+/// Stable subscription id for app-level housekeeping ticks.
+const HOUSEKEEPING_TICK_SUBSCRIPTION_ID: u64 = 0x4D41_494C_5F54_494B; // "MAIL_TIK"
 
 const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
@@ -84,31 +81,12 @@ const SCREEN_TRANSITION_TICKS: u8 = 2;
 const TOAST_ENTRANCE_TICKS: u8 = 3;
 const TOAST_EXIT_TICKS: u8 = 2;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
-/// Fallback divisor before predictive transitions have enough observations.
-/// At 10fps (100ms tick), 12 means unknown inactive screens refresh ~1.2s.
-const SCREEN_TICK_FALLBACK_DIVISOR: u64 = 12;
-/// Predictive confidence warm-up threshold.
-const SCREEN_TICK_MIN_OBSERVATIONS: u64 = 8;
-/// Periodic predictive decay cadence.
-const SCREEN_TICK_DECAY_INTERVAL_TICKS: u64 = 600;
-/// Auto-save disabled in `am` (runtime persistence feature is not enabled).
-const SCREEN_TICK_AUTO_SAVE_INTERVAL_TICKS: u64 = 0;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
 const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
 /// Ambient effects only re-render every Nth frame. At 10 fps with N=4 the
 /// animation updates at ~2.5 fps, reducing terminal write churn and flicker.
 const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 4;
-
-fn default_screen_tick_strategy() -> Box<dyn TickStrategy> {
-    Box::new(Predictive::new(PredictiveStrategyConfig {
-        fallback_divisor: SCREEN_TICK_FALLBACK_DIVISOR,
-        min_observations: SCREEN_TICK_MIN_OBSERVATIONS,
-        decay_interval: SCREEN_TICK_DECAY_INTERVAL_TICKS,
-        auto_save_interval: SCREEN_TICK_AUTO_SAVE_INTERVAL_TICKS,
-        ..PredictiveStrategyConfig::default()
-    }))
-}
 
 const fn screen_tick_key(id: MailScreenId) -> &'static str {
     match id {
@@ -127,6 +105,27 @@ const fn screen_tick_key(id: MailScreenId) -> &'static str {
         MailScreenId::Analytics => "analytics",
         MailScreenId::Attachments => "attachments",
         MailScreenId::ArchiveBrowser => "archive_browser",
+    }
+}
+
+fn screen_id_from_tick_key(id: &str) -> Option<MailScreenId> {
+    match id {
+        "dashboard" => Some(MailScreenId::Dashboard),
+        "messages" => Some(MailScreenId::Messages),
+        "threads" => Some(MailScreenId::Threads),
+        "search" => Some(MailScreenId::Search),
+        "agents" => Some(MailScreenId::Agents),
+        "reservations" => Some(MailScreenId::Reservations),
+        "tool_metrics" => Some(MailScreenId::ToolMetrics),
+        "system_health" => Some(MailScreenId::SystemHealth),
+        "timeline" => Some(MailScreenId::Timeline),
+        "projects" => Some(MailScreenId::Projects),
+        "contacts" => Some(MailScreenId::Contacts),
+        "explorer" => Some(MailScreenId::Explorer),
+        "analytics" => Some(MailScreenId::Analytics),
+        "attachments" => Some(MailScreenId::Attachments),
+        "archive_browser" => Some(MailScreenId::ArchiveBrowser),
+        _ => None,
     }
 }
 
@@ -272,6 +271,8 @@ impl ScreenTransition {
 pub enum MailMsg {
     /// Terminal event (keyboard, mouse, resize, tick).
     Terminal(Event),
+    /// Internal housekeeping tick (toasts, remote ingress, deferred actions).
+    HousekeepingTick,
     /// Forwarded screen-level message.
     Screen(MailScreenMsg),
     /// Switch to a specific screen.
@@ -1041,12 +1042,6 @@ pub struct MailAppModel {
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
-    /// Currently scheduled tick interval (dynamic cadence).
-    current_tick_interval: Duration,
-    /// Consecutive ticks without interactive/activity signals.
-    idle_tick_streak: u16,
-    /// Adaptive per-screen tick strategy from frankentui.
-    screen_tick_strategy: Box<dyn TickStrategy>,
     accessibility: crate::tui_persist::AccessibilitySettings,
     macro_engine: MacroEngine,
     /// Tracks active reservations for expiry warnings.
@@ -1177,9 +1172,6 @@ impl MailAppModel {
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
             tick_count: 0,
-            current_tick_interval: TICK_INTERVAL,
-            idle_tick_streak: 0,
-            screen_tick_strategy: default_screen_tick_strategy(),
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
             macro_engine: MacroEngine::new(),
             reservation_tracker: HashMap::new(),
@@ -1390,10 +1382,6 @@ impl MailAppModel {
         self.remember_focus_for_screen(from);
         self.screen_manager.set_active_screen(id);
         let to = self.screen_manager.active_screen();
-        if from != to {
-            self.screen_tick_strategy
-                .on_screen_transition(screen_tick_key(from), screen_tick_key(to));
-        }
         self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
         self.show_coach_hint_if_eligible(id);
@@ -1434,10 +1422,6 @@ impl MailAppModel {
         self.remember_focus_for_screen(from);
         self.screen_manager.apply_deep_link(target);
         let to = self.screen_manager.active_screen();
-        if from != to {
-            self.screen_tick_strategy
-                .on_screen_transition(screen_tick_key(from), screen_tick_key(to));
-        }
         self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
     }
@@ -3185,33 +3169,130 @@ impl MailAppModel {
         Cmd::batch(cmds)
     }
 
-    fn should_use_idle_tick_cadence(&self, had_new_events: bool, had_remote_events: bool) -> bool {
-        !had_new_events
-            && !had_remote_events
-            && self.screen_transition.is_none()
-            && !self.help_visible
-            && !self.command_palette.is_visible()
-            && !self.action_menu.is_active()
-            && !self.modal_manager.is_active()
-            && !self.export_menu_open
-            && self.compose_state.is_none()
-            && !self.inspector.is_active()
-            && self.notifications.visible_count() == 0
+    fn tick_screen_with_panic_guard(&mut self, id: MailScreenId, tick_count: u64) {
+        let panicked = self.screen_panics.borrow().contains_key(&id);
+        if panicked {
+            return;
+        }
+        let tick_state = &self.state;
+        let result = self.screen_manager.get_mut(id).map(|screen| {
+            catch_unwind(AssertUnwindSafe(|| {
+                screen.tick(tick_count, tick_state);
+            }))
+        });
+        if let Some(Err(payload)) = result {
+            self.screen_panics
+                .borrow_mut()
+                .insert(id, panic_payload_to_string(&payload));
+        }
     }
 
-    fn next_tick_interval(&mut self, had_new_events: bool, had_remote_events: bool) -> Duration {
-        if self.should_use_idle_tick_cadence(had_new_events, had_remote_events) {
-            self.idle_tick_streak = self.idle_tick_streak.saturating_add(1);
-        } else {
-            self.idle_tick_streak = 0;
+    fn run_housekeeping_tick(&mut self, elapsed_tick: Duration) -> Cmd<MailMsg> {
+        if let Some(mut transition) = self.screen_transition {
+            transition.ticks_remaining = transition.ticks_remaining.saturating_sub(1);
+            self.screen_transition = if transition.ticks_remaining == 0 {
+                None
+            } else {
+                Some(transition)
+            };
         }
 
-        self.current_tick_interval = if self.idle_tick_streak >= IDLE_TICK_STREAK_THRESHOLD {
-            IDLE_TICK_INTERVAL
-        } else {
-            TICK_INTERVAL
-        };
-        self.current_tick_interval
+        // Generate toasts from new high-priority events and track reservations.
+        let new_events = self.state.events_since(self.last_toast_seq);
+        for event in &new_events {
+            self.last_toast_seq = event.seq().max(self.last_toast_seq);
+
+            // Track reservation lifecycle for expiry warnings.
+            match event {
+                MailEvent::ReservationGranted {
+                    agent,
+                    paths,
+                    ttl_s,
+                    project,
+                    ..
+                } => {
+                    let ttl_i64 = i64::try_from(*ttl_s).unwrap_or(i64::MAX);
+                    let expiry = now_micros().saturating_add(ttl_i64.saturating_mul(1_000_000));
+                    for path in paths {
+                        let key = format!("{project}:{agent}:{path}");
+                        let label = format!("{agent}:{path}");
+                        self.reservation_tracker.insert(key, (label, expiry));
+                    }
+                }
+                MailEvent::ReservationReleased {
+                    agent,
+                    paths,
+                    project,
+                    ..
+                } => {
+                    for path in paths {
+                        let key = format!("{project}:{agent}:{path}");
+                        self.reservation_tracker.remove(&key);
+                        self.warned_reservations.remove(&key);
+                    }
+                }
+                _ => {}
+            }
+
+            if !self.toast_muted
+                && let Some(toast) = safe_toast_for_event(event, self.toast_severity)
+            {
+                self.notifications.notify(self.apply_toast_policy(toast));
+            }
+        }
+
+        // Check for reservations expiring soon (within 5 minutes).
+        let now = now_micros();
+        let mut expiry_toasts = Vec::new();
+        for (key, (label, expiry)) in &self.reservation_tracker {
+            if *expiry > now
+                && *expiry - now < RESERVATION_EXPIRY_WARN_MICROS
+                && !self.warned_reservations.contains(key)
+            {
+                let minutes_left = (*expiry - now) / 60_000_000;
+                expiry_toasts.push((
+                    key.clone(),
+                    Toast::new(format!("{label} expires in ~{minutes_left}m"))
+                        .icon(ToastIcon::Warning)
+                        .duration(Duration::from_secs(10)),
+                ));
+            }
+        }
+        for (key, toast) in expiry_toasts {
+            if !self.toast_muted && self.toast_severity.allows(ToastIcon::Warning) {
+                self.warned_reservations.insert(key);
+                self.notifications.notify(self.apply_toast_policy(toast));
+            }
+        }
+
+        // Advance notification timers and toast animation.
+        self.notifications.tick(elapsed_tick);
+        self.tick_toast_animation_state();
+
+        // Drain deferred confirmed actions (from modal callbacks).
+        // Side-effects (toast, navigation) are applied inside
+        // `dispatch_execute_operation`.
+        let deferred_cmd = self.drain_deferred_confirmed_action();
+
+        // Drain browser-ingress events and process them through the
+        // same terminal handling path as local input.
+        let mut remote_cmds = Vec::new();
+        let remote_events = self
+            .state
+            .drain_remote_terminal_events(REMOTE_EVENTS_PER_TICK);
+        for remote_event in remote_events {
+            if let Some(event) = remote_terminal_event_to_event(remote_event) {
+                let cmd = self.update(MailMsg::Terminal(event));
+                if matches!(cmd, Cmd::Quit) {
+                    return Cmd::quit();
+                }
+                remote_cmds.push(cmd);
+            }
+        }
+
+        let mut all_cmds = vec![deferred_cmd];
+        all_cmds.extend(remote_cmds);
+        Cmd::batch(all_cmds)
     }
 }
 
@@ -3227,151 +3308,14 @@ impl Model for MailAppModel {
         match msg {
             // ── Tick ────────────────────────────────────────────────
             MailMsg::Terminal(Event::Tick) => {
-                let elapsed_tick = self.current_tick_interval;
-                self.tick_count += 1;
-                if let Some(mut transition) = self.screen_transition {
-                    transition.ticks_remaining = transition.ticks_remaining.saturating_sub(1);
-                    self.screen_transition = if transition.ticks_remaining == 0 {
-                        None
-                    } else {
-                        Some(transition)
-                    };
-                }
+                self.tick_count = self.tick_count.wrapping_add(1);
                 let tick_count = self.tick_count;
-                let tick_state = &self.state;
-                let active_id = self.screen_manager.active_screen();
-                let active_tick_key = screen_tick_key(active_id);
-                let panics = self.screen_panics.get_mut();
-                let mut tick_panics: Vec<(MailScreenId, String)> = Vec::new();
-                for (id, screen) in self.screen_manager.iter_mut() {
-                    if panics.contains_key(&id) {
-                        continue;
-                    }
-                    let should_tick = if id == active_id {
-                        true
-                    } else {
-                        self.screen_tick_strategy.should_tick(
-                            screen_tick_key(id),
-                            tick_count,
-                            active_tick_key,
-                        ) == TickDecision::Tick
-                    };
-                    if !should_tick {
-                        continue;
-                    }
-                    let result = catch_unwind(AssertUnwindSafe(|| {
-                        screen.tick(tick_count, tick_state);
-                    }));
-                    if let Err(payload) = result {
-                        tick_panics.push((id, panic_payload_to_string(&payload)));
-                    }
+                for &id in ALL_SCREEN_IDS {
+                    self.tick_screen_with_panic_guard(id, tick_count);
                 }
-                for (id, msg) in tick_panics {
-                    panics.insert(id, msg);
-                }
-                self.screen_tick_strategy.maintenance_tick(tick_count);
-
-                // Generate toasts from new high-priority events and track reservations
-                let new_events = self.state.events_since(self.last_toast_seq);
-                let had_new_events = !new_events.is_empty();
-                for event in &new_events {
-                    self.last_toast_seq = event.seq().max(self.last_toast_seq);
-
-                    // Track reservation lifecycle for expiry warnings
-                    match event {
-                        MailEvent::ReservationGranted {
-                            agent,
-                            paths,
-                            ttl_s,
-                            project,
-                            ..
-                        } => {
-                            let ttl_i64 = i64::try_from(*ttl_s).unwrap_or(i64::MAX);
-                            let expiry =
-                                now_micros().saturating_add(ttl_i64.saturating_mul(1_000_000));
-                            for path in paths {
-                                let key = format!("{project}:{agent}:{path}");
-                                let label = format!("{agent}:{path}");
-                                self.reservation_tracker.insert(key, (label, expiry));
-                            }
-                        }
-                        MailEvent::ReservationReleased {
-                            agent,
-                            paths,
-                            project,
-                            ..
-                        } => {
-                            for path in paths {
-                                let key = format!("{project}:{agent}:{path}");
-                                self.reservation_tracker.remove(&key);
-                                self.warned_reservations.remove(&key);
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    if !self.toast_muted
-                        && let Some(toast) = safe_toast_for_event(event, self.toast_severity)
-                    {
-                        self.notifications.notify(self.apply_toast_policy(toast));
-                    }
-                }
-
-                // Check for reservations expiring soon (within 5 minutes)
-                let now = now_micros();
-                let mut expiry_toasts = Vec::new();
-                for (key, (label, expiry)) in &self.reservation_tracker {
-                    if *expiry > now
-                        && *expiry - now < RESERVATION_EXPIRY_WARN_MICROS
-                        && !self.warned_reservations.contains(key)
-                    {
-                        let minutes_left = (*expiry - now) / 60_000_000;
-                        expiry_toasts.push((
-                            key.clone(),
-                            Toast::new(format!("{label} expires in ~{minutes_left}m"))
-                                .icon(ToastIcon::Warning)
-                                .duration(Duration::from_secs(10)),
-                        ));
-                    }
-                }
-                for (key, toast) in expiry_toasts {
-                    if !self.toast_muted && self.toast_severity.allows(ToastIcon::Warning) {
-                        self.warned_reservations.insert(key);
-                        self.notifications.notify(self.apply_toast_policy(toast));
-                    }
-                }
-
-                // Advance notification timers
-                self.notifications.tick(elapsed_tick);
-                self.tick_toast_animation_state();
-
-                // Drain deferred confirmed actions (from modal callbacks).
-                // Side-effects (toast, navigation) are applied inside
-                // `dispatch_execute_operation`.
-                let deferred_cmd = self.drain_deferred_confirmed_action();
-
-                // Drain browser-ingress events and process them through the
-                // same terminal handling path as local input.
-                let mut remote_cmds = Vec::new();
-                let remote_events = self
-                    .state
-                    .drain_remote_terminal_events(REMOTE_EVENTS_PER_TICK);
-                let had_remote_events = !remote_events.is_empty();
-                for remote_event in remote_events {
-                    if let Some(event) = remote_terminal_event_to_event(remote_event) {
-                        let cmd = self.update(MailMsg::Terminal(event));
-                        if matches!(cmd, Cmd::Quit) {
-                            return Cmd::quit();
-                        }
-                        remote_cmds.push(cmd);
-                    }
-                }
-
-                let next_tick_interval = self.next_tick_interval(had_new_events, had_remote_events);
-                let mut all_cmds = vec![Cmd::tick(next_tick_interval), deferred_cmd];
-                all_cmds.extend(remote_cmds);
-                Cmd::batch(all_cmds)
+                self.run_housekeeping_tick(TICK_INTERVAL)
             }
+            MailMsg::HousekeepingTick => self.run_housekeeping_tick(TICK_INTERVAL),
 
             // ── Terminal events (key, mouse, resize, etc.) ─────────
             MailMsg::Terminal(ref event) => {
@@ -3934,14 +3878,14 @@ impl Model for MailAppModel {
         // terminal cursor hidden to prevent visible cursor trails during refresh.
         frame.cursor_visible = false;
 
-        // Compute frame budget: how much slack we have relative to the current
-        // adaptive tick cadence. Normal frames arrive near the scheduled tick;
+        // Compute frame budget: how much slack we have relative to the target
+        // tick cadence. Normal frames arrive near the scheduled tick;
         // budget is positive when on schedule and drops toward 0 only when
         // frames arrive significantly late (2× the expected interval or more).
         //
         // The Bayesian diff strategy uses this budget to decide whether to
         // skip frames under load.
-        let tick_budget_ms = self.current_tick_interval.as_secs_f64() * 1000.0;
+        let tick_budget_ms = TICK_INTERVAL.as_secs_f64() * 1000.0;
         let now = Instant::now();
         let budget_remaining_ms = self.last_view_instant.get().map_or(tick_budget_ms, |prev| {
             let elapsed_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
@@ -4285,6 +4229,39 @@ impl Model for MailAppModel {
                 buffer: frame.buffer.clone(),
                 pool: frame.pool.clone(),
             });
+    }
+
+    fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
+        vec![Box::new(Every::with_id(
+            HOUSEKEEPING_TICK_SUBSCRIPTION_ID,
+            TICK_INTERVAL,
+            || MailMsg::HousekeepingTick,
+        ))]
+    }
+
+    fn as_screen_tick_dispatch(&mut self) -> Option<&mut dyn ScreenTickDispatch> {
+        Some(self)
+    }
+}
+
+impl ScreenTickDispatch for MailAppModel {
+    fn screen_ids(&self) -> Vec<String> {
+        ALL_SCREEN_IDS
+            .iter()
+            .map(|&id| screen_tick_key(id).to_string())
+            .collect()
+    }
+
+    fn active_screen_id(&self) -> String {
+        screen_tick_key(self.screen_manager.active_screen()).to_string()
+    }
+
+    fn tick_screen(&mut self, screen_id: &str, tick_count: u64) {
+        let Some(id) = screen_id_from_tick_key(screen_id) else {
+            return;
+        };
+        self.tick_count = tick_count;
+        self.tick_screen_with_panic_guard(id, tick_count);
     }
 }
 
@@ -6291,23 +6268,6 @@ mod tests {
         MailAppModel::new(state)
     }
 
-    /// Check whether a `Cmd` contains a `Cmd::Tick` (at any nesting level).
-    fn cmd_contains_tick(cmd: &Cmd<MailMsg>) -> bool {
-        match cmd {
-            Cmd::Tick(_) => true,
-            Cmd::Batch(cmds) | Cmd::Sequence(cmds) => cmds.iter().any(cmd_contains_tick),
-            _ => false,
-        }
-    }
-
-    fn first_tick_duration(cmd: &Cmd<MailMsg>) -> Option<Duration> {
-        match cmd {
-            Cmd::Tick(duration) => Some(*duration),
-            Cmd::Batch(cmds) | Cmd::Sequence(cmds) => cmds.iter().find_map(first_tick_duration),
-            _ => None,
-        }
-    }
-
     fn test_model_with_debug(debug: bool) -> MailAppModel {
         let config = Config {
             tui_debug: debug,
@@ -7103,44 +7063,9 @@ mod tests {
         assert_eq!(state.remote_terminal_queue_len(), 2);
 
         let cmd = model.update(MailMsg::Terminal(Event::Tick));
-        // Tick handler batches Tick + deferred_cmd + remote_cmds
-        assert!(
-            cmd_contains_tick(&cmd),
-            "tick handler should return a cmd containing Cmd::Tick"
-        );
+        assert!(!matches!(cmd, Cmd::Quit));
         assert_eq!(state.remote_terminal_queue_len(), 0);
         assert_eq!(model.active_screen(), MailScreenId::Messages);
-    }
-
-    #[test]
-    fn quiet_streak_transitions_to_idle_tick_cadence() {
-        let mut model = test_model();
-        let mut last_cmd = Cmd::none();
-        for _ in 0..IDLE_TICK_STREAK_THRESHOLD {
-            last_cmd = model.update(MailMsg::Terminal(Event::Tick));
-        }
-        assert_eq!(first_tick_duration(&last_cmd), Some(IDLE_TICK_INTERVAL));
-        assert_eq!(model.current_tick_interval, IDLE_TICK_INTERVAL);
-    }
-
-    #[test]
-    fn activity_resets_idle_tick_cadence_back_to_base() {
-        let mut model = test_model();
-
-        for _ in 0..IDLE_TICK_STREAK_THRESHOLD {
-            let _ = model.update(MailMsg::Terminal(Event::Tick));
-        }
-        assert_eq!(model.current_tick_interval, IDLE_TICK_INTERVAL);
-
-        assert!(
-            model
-                .state
-                .push_event(MailEvent::server_started("http://127.0.0.1:8765", "test",))
-        );
-        let cmd = model.update(MailMsg::Terminal(Event::Tick));
-        assert_eq!(first_tick_duration(&cmd), Some(TICK_INTERVAL));
-        assert_eq!(model.current_tick_interval, TICK_INTERVAL);
-        assert_eq!(model.idle_tick_streak, 0);
     }
 
     // ── Reducer edge-case tests ──────────────────────────────────
@@ -7606,15 +7531,11 @@ mod tests {
     }
 
     #[test]
-    fn tick_increments_and_returns_tick_cmd() {
+    fn tick_increments_and_returns_non_quit_cmd() {
         let mut model = test_model();
         let cmd = model.update(MailMsg::Terminal(Event::Tick));
         assert_eq!(model.tick_count, 1);
-        // Tick handler returns Cmd::batch([Tick, deferred_cmd, ...remote_cmds])
-        assert!(
-            cmd_contains_tick(&cmd),
-            "tick handler should return a cmd containing Cmd::Tick"
-        );
+        assert!(!matches!(cmd, Cmd::Quit));
     }
 
     #[test]
@@ -10491,27 +10412,42 @@ mod tests {
     }
 
     #[test]
-    fn inactive_screen_tick_is_throttled_then_periodically_refreshed() {
+    fn event_tick_fallback_ticks_inactive_screen_immediately() {
         let mut model = test_model();
         let mut screen = PanickingScreen::new();
         screen.panic_on_tick = true;
         model.set_screen(MailScreenId::Messages, Box::new(screen));
 
-        // Active screen is Dashboard by default. Inactive screens should not
-        // tick immediately under the predictive fallback divisor.
         let _ = model.update(MailMsg::Terminal(Event::Tick));
         assert!(
-            !model
+            model
                 .screen_panics
                 .borrow()
                 .contains_key(&MailScreenId::Messages)
         );
+    }
 
-        // Inactive screens are still refreshed periodically at the fallback
-        // divisor boundary.
-        for _ in 1..SCREEN_TICK_FALLBACK_DIVISOR {
-            let _ = model.update(MailMsg::Terminal(Event::Tick));
-        }
+    #[test]
+    fn screen_tick_dispatch_ignores_unknown_screen_id() {
+        let mut model = test_model();
+        ftui_runtime::tick_strategy::ScreenTickDispatch::tick_screen(&mut model, "unknown", 7);
+        assert!(model.screen_panics.borrow().is_empty());
+    }
+
+    #[test]
+    fn screen_tick_dispatch_ticks_target_screen_and_updates_tick_count() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_tick = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+
+        ftui_runtime::tick_strategy::ScreenTickDispatch::tick_screen(
+            &mut model,
+            screen_tick_key(MailScreenId::Messages),
+            11,
+        );
+
+        assert_eq!(model.tick_count, 11);
         assert!(
             model
                 .screen_panics

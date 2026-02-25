@@ -337,6 +337,13 @@ pub enum Commands {
     /// Upgrade helper: detect legacy install, import data, refresh setup.
     #[command(name = "upgrade")]
     Upgrade(legacy::UpgradeArgs),
+    /// Check for updates or self-update the binary.
+    #[command(name = "self-update")]
+    SelfUpdate {
+        /// Only check for updates without installing.
+        #[arg(long, default_value_t = false)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2010,6 +2017,14 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Robot(args) => robot::handle_robot(args),
         Commands::Legacy(args) => legacy::handle_legacy(args),
         Commands::Upgrade(args) => legacy::handle_upgrade(args),
+        Commands::SelfUpdate { check } => {
+            if check {
+                handle_self_update_check()
+            } else {
+                // For now, just check. Full download+replace is T6.2+T6.3.
+                handle_self_update_check()
+            }
+        }
     }
 }
 
@@ -6196,6 +6211,209 @@ fn create_db_backup(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Path
     Ok(backup_path)
 }
 
+// ── Self-update check (T6.1) ─────────────────────────────────────────────
+
+/// Result of checking for updates against the GitHub releases API.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum UpdateCheckResult {
+    /// A newer version is available.
+    UpdateAvailable {
+        current: String,
+        latest: String,
+        url: String,
+    },
+    /// The current version is up to date.
+    UpToDate {
+        current: String,
+    },
+    /// The check failed (network error, rate limit, etc.).
+    CheckFailed {
+        reason: String,
+    },
+}
+
+/// Cache file path for update check results.
+fn update_check_cache_path() -> PathBuf {
+    let cache_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache/mcp-agent-mail");
+    cache_dir.join("update-check.json")
+}
+
+/// Read cached update check if it's less than 24 hours old.
+fn read_update_cache() -> Option<UpdateCheckResult> {
+    let path = update_check_cache_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let cached: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // Check age
+    let checked_at = cached.get("checked_at")?.as_str()?;
+    let checked_ts = chrono::DateTime::parse_from_rfc3339(checked_at).ok()?;
+    let age = chrono::Utc::now().signed_duration_since(checked_ts);
+    if age.num_hours() >= 24 {
+        return None; // Cache expired
+    }
+
+    serde_json::from_value(cached.get("result")?.clone()).ok()
+}
+
+/// Write update check result to cache.
+fn write_update_cache(result: &UpdateCheckResult) {
+    let path = update_check_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let cached = serde_json::json!({
+        "checked_at": chrono::Utc::now().to_rfc3339(),
+        "result": result,
+    });
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&cached).unwrap_or_default());
+}
+
+/// Compare two semver-like version strings (e.g., "0.1.0" vs "0.2.0").
+/// Returns true if `latest` is newer than `current`.
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.trim_start_matches('v')
+            .split('.')
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect()
+    };
+    let c = parse(current);
+    let l = parse(latest);
+    l > c
+}
+
+/// Check for updates against the GitHub releases API.
+fn check_for_update() -> UpdateCheckResult {
+    let current = env!("CARGO_PKG_VERSION");
+
+    // Respect NO_UPDATE_CHECK
+    if std::env::var("NO_UPDATE_CHECK").is_ok() {
+        return UpdateCheckResult::UpToDate {
+            current: current.to_string(),
+        };
+    }
+
+    // Check cache first
+    if let Some(cached) = read_update_cache() {
+        return cached;
+    }
+
+    // Fetch from GitHub API
+    let result = check_for_update_from_github(current);
+    write_update_cache(&result);
+    result
+}
+
+fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
+    use asupersync::runtime::RuntimeBuilder;
+
+    let rt = match RuntimeBuilder::current_thread().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            return UpdateCheckResult::CheckFailed {
+                reason: format!("runtime error: {e}"),
+            }
+        }
+    };
+
+    let response = match rt.block_on(async {
+        let client = asupersync::http::h1::HttpClient::new();
+        let url = "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/releases/latest";
+        let headers = vec![
+            ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
+            ("Accept".to_string(), "application/vnd.github+json".to_string()),
+        ];
+        client
+            .request(asupersync::http::h1::Method::Get, url, headers, vec![])
+            .await
+    }) {
+        Ok(resp) => resp,
+        Err(e) => {
+            return UpdateCheckResult::CheckFailed {
+                reason: format!("HTTP error: {e}"),
+            }
+        }
+    };
+
+    if response.status == 403 {
+        return UpdateCheckResult::CheckFailed {
+            reason: "GitHub API rate limit exceeded".to_string(),
+        };
+    }
+    if response.status != 200 {
+        return UpdateCheckResult::CheckFailed {
+            reason: format!("GitHub API returned status {}", response.status),
+        };
+    }
+
+    let body: serde_json::Value = match serde_json::from_slice(&response.body) {
+        Ok(v) => v,
+        Err(e) => {
+            return UpdateCheckResult::CheckFailed {
+                reason: format!("JSON parse error: {e}"),
+            }
+        }
+    };
+
+    let tag = match body.get("tag_name").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => {
+            return UpdateCheckResult::CheckFailed {
+                reason: "no tag_name in release".to_string(),
+            }
+        }
+    };
+
+    let html_url = body
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases")
+        .to_string();
+
+    let latest_version = tag.trim_start_matches('v');
+
+    if is_newer_version(current, latest_version) {
+        UpdateCheckResult::UpdateAvailable {
+            current: current.to_string(),
+            latest: latest_version.to_string(),
+            url: html_url,
+        }
+    } else {
+        UpdateCheckResult::UpToDate {
+            current: current.to_string(),
+        }
+    }
+}
+
+fn handle_self_update_check() -> CliResult<()> {
+    let result = check_for_update();
+    match &result {
+        UpdateCheckResult::UpdateAvailable {
+            current,
+            latest,
+            url,
+        } => {
+            ftui_runtime::ftui_println!("Update available: {current} -> {latest}");
+            ftui_runtime::ftui_println!("Download: {url}");
+            ftui_runtime::ftui_println!(
+                "Run: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh | bash"
+            );
+        }
+        UpdateCheckResult::UpToDate { current } => {
+            ftui_runtime::ftui_println!("Up to date (v{current})");
+        }
+        UpdateCheckResult::CheckFailed { reason } => {
+            ftui_runtime::ftui_eprintln!("Update check failed: {reason}");
+        }
+    }
+    Ok(())
+}
+
+// ── End self-update ──────────────────────────────────────────────────────
+
 #[derive(Debug)]
 #[allow(dead_code)]
 struct ClearAndResetOutcome {
@@ -7826,7 +8044,128 @@ fn handle_doctor_check_with(
         }
     }
 
-    // Check 4: Beads issue awareness (ready/open/in-progress)
+    // Check 4: Binary resolution — does `am` resolve to the Rust binary?
+    {
+        let expected_path = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".local/bin/am");
+        let expected_str = expected_path.to_string_lossy().to_string();
+
+        // Try both login and non-login shell contexts
+        let shells: &[(&str, &str, &str)] = &[
+            ("zsh", "zsh", "-lc"),
+            ("bash", "bash", "-lc"),
+        ];
+
+        let mut resolution_detail = String::new();
+        let mut resolution_status = "ok";
+
+        for &(label, shell_bin, flag) in shells {
+            // Check if this shell exists
+            let shell_exists = std::process::Command::new("which")
+                .arg(shell_bin)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !shell_exists {
+                continue;
+            }
+
+            // Check for alias
+            let alias_out = std::process::Command::new(shell_bin)
+                .arg(flag)
+                .arg("alias am 2>/dev/null; true")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+
+            if !alias_out.is_empty() && alias_out.contains("alias") {
+                resolution_status = "fail";
+                resolution_detail = format!(
+                    "'am' is aliased in {label}: {alias_out}. \
+                     Fix: remove the alias or run `unalias am`. \
+                     Rust binary at: {expected_str}"
+                );
+                break;
+            }
+
+            // Check binary path
+            let which_out = std::process::Command::new(shell_bin)
+                .arg(flag)
+                .arg("which am 2>/dev/null || echo NOT_FOUND")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "NOT_FOUND".to_string());
+
+            if which_out == "NOT_FOUND" || which_out.is_empty() {
+                if resolution_detail.is_empty() {
+                    resolution_status = "warn";
+                    resolution_detail = format!(
+                        "'am' not found in {label} PATH. Expected: {expected_str}"
+                    );
+                }
+            } else if which_out != expected_str {
+                resolution_detail = format!(
+                    "'am' resolves to {which_out} in {label} (expected {expected_str})"
+                );
+                // Not necessarily a failure — could be a different install path
+                if resolution_status != "fail" {
+                    resolution_status = "warn";
+                }
+            } else {
+                resolution_status = "ok";
+                resolution_detail = format!("'am' resolves to {expected_str} ({label})");
+                break;
+            }
+        }
+
+        if resolution_detail.is_empty() {
+            resolution_detail = "binary resolution check skipped (no suitable shell)".to_string();
+            resolution_status = "warn";
+        }
+
+        checks.push(serde_json::json!({
+            "check": "binary_resolution",
+            "status": resolution_status,
+            "detail": resolution_detail,
+        }));
+    }
+
+    // Check 4b: Database timestamp format
+    {
+        use mcp_agent_mail_db::migrate;
+        let ts_check = open_db_sync_with_database_url(database_url)
+            .ok()
+            .and_then(|conn| migrate::detect_timestamp_format(&conn).ok());
+        match ts_check {
+            Some(fmt) if fmt.needs_migration() => {
+                checks.push(serde_json::json!({
+                    "check": "timestamp_format",
+                    "status": "warn",
+                    "detail": format!("{fmt} — run `am migrate` to convert"),
+                }));
+            }
+            Some(fmt) => {
+                checks.push(serde_json::json!({
+                    "check": "timestamp_format",
+                    "status": "ok",
+                    "detail": format!("{fmt}"),
+                }));
+            }
+            None => {
+                checks.push(serde_json::json!({
+                    "check": "timestamp_format",
+                    "status": "warn",
+                    "detail": "Could not detect timestamp format",
+                }));
+            }
+        }
+    }
+
+    // Check 5: Beads issue awareness (ready/open/in-progress)
     match beads_issue_awareness_counts() {
         Ok((ready, open, in_progress)) => {
             checks.push(serde_json::json!({

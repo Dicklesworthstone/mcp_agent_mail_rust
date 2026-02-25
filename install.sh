@@ -742,6 +742,118 @@ resolve_database_path() {
   PYTHON_DB_MIGRATED_PATH="$rust_db"
 }
 
+# T5.3: Migrate .env configuration from Python to Rust
+# Python .env may live in clone dir or storage root. Rust reads the same
+# env vars but DATABASE_URL format differs (no aiosqlite prefix).
+migrate_env_config() {
+  # Find Python .env file
+  local env_file=""
+  local candidates=()
+  [ "$PYTHON_CLONE_FOUND" -eq 1 ] && [ -n "$PYTHON_CLONE_PATH" ] && candidates+=("$PYTHON_CLONE_PATH/.env")
+  candidates+=(
+    "$HOME/mcp_agent_mail/.env"
+    "$HOME/mcp-agent-mail/.env"
+    "$HOME/.mcp_agent_mail/.env"
+  )
+
+  for f in "${candidates[@]}"; do
+    if [ -f "$f" ]; then
+      env_file="$f"
+      break
+    fi
+  done
+
+  if [ -z "$env_file" ]; then
+    return 0  # No .env found, nothing to migrate
+  fi
+
+  info "Found Python .env at: $env_file"
+
+  # Rust config location
+  local rust_config_dir="$HOME/.config/mcp-agent-mail"
+  local rust_env="$rust_config_dir/config.env"
+
+  # Don't overwrite if Rust config already exists
+  if [ -f "$rust_env" ]; then
+    info "Rust config already exists at $rust_env — preserving"
+    return 0
+  fi
+
+  mkdir -p "$rust_config_dir"
+
+  # Vars that are compatible between Python and Rust
+  local compat_vars="HTTP_HOST HTTP_PORT HTTP_PATH HTTP_BEARER_TOKEN STORAGE_ROOT DATABASE_URL TUI_ENABLED LLM_ENABLED LLM_DEFAULT_MODEL WORKTREES_ENABLED"
+  # Python-only vars to skip
+  local skip_pattern="^(SQLALCHEMY_|ALEMBIC_|UVICORN_|ASYNC_)"
+
+  local tmpfile="${rust_env}.tmp.$$"
+  {
+    echo "# Migrated from Python .env: $env_file"
+    echo "# Migration date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo ""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+      # Skip comments and empty lines
+      case "$line" in
+        \#*|"") echo "$line"; continue;;
+      esac
+
+      local key val
+      key="${line%%=*}"
+      val="${line#*=}"
+
+      # Skip Python-specific vars
+      if echo "$key" | grep -qE "$skip_pattern"; then
+        echo "# Skipped (Python-only): $line"
+        continue
+      fi
+
+      # Transform DATABASE_URL: strip aiosqlite prefix, resolve path
+      if [ "$key" = "DATABASE_URL" ]; then
+        # Strip sqlite+aiosqlite:/// prefix → just the file path
+        local db_path
+        db_path=$(echo "$val" | sed 's|^sqlite[+a-z]*:///||')
+        # If relative path, make it relative to storage root
+        case "$db_path" in
+          /*) echo "DATABASE_URL=sqlite:///$db_path";;
+          *)  echo "DATABASE_URL=sqlite:///$RUST_STORAGE_ROOT/$db_path";;
+        esac
+        continue
+      fi
+
+      # Pass through compatible vars as-is
+      echo "$line"
+    done < "$env_file"
+  } > "$tmpfile"
+
+  mv "$tmpfile" "$rust_env"
+  chmod 600 "$rust_env"  # Restrict access (may contain tokens)
+  ok "Migrated .env config to $rust_env"
+}
+
+# T2.3: Atomic binary installation (crash-safe)
+# Writes to a temp file, syncs, then renames atomically.
+# Cleans up stale tmp files from previous failed installs.
+atomic_install() {
+  local src="$1"
+  local dest="$2"
+  local tmp_dest="${dest}.tmp.$$"
+
+  # Clean up stale tmp files from previous failed installs
+  for stale in "${dest}".tmp.*; do
+    [ -f "$stale" ] && rm -f "$stale" 2>/dev/null
+  done
+
+  # Write to temp file
+  install -m 0755 "$src" "$tmp_dest"
+
+  # Sync to disk if available
+  sync "$tmp_dest" 2>/dev/null || sync 2>/dev/null || true
+
+  # Atomic rename
+  mv -f "$tmp_dest" "$dest"
+}
+
 # ── End Python detection & displacement ────────────────────────────────────
 
 preflight_checks() {
@@ -1116,8 +1228,8 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   local_cli="$TMP/src/target/release/$BIN_CLI"
   [ -x "$local_server" ] || { err "Build failed: $BIN_SERVER not found"; exit 1; }
   [ -x "$local_cli" ] || { err "Build failed: $BIN_CLI not found"; exit 1; }
-  install -m 0755 "$local_server" "$DEST/$BIN_SERVER"
-  install -m 0755 "$local_cli" "$DEST/$BIN_CLI"
+  atomic_install "$local_server" "$DEST/$BIN_SERVER"
+  atomic_install "$local_cli" "$DEST/$BIN_CLI"
   ok "Installed to $DEST (source build)"
   ok "  $DEST/$BIN_SERVER"
   ok "  $DEST/$BIN_CLI"
@@ -1181,18 +1293,45 @@ find_bin() {
 SERVER_BIN=$(find_bin "$BIN_SERVER") || { err "Binary $BIN_SERVER not found in archive"; exit 1; }
 CLI_BIN=$(find_bin "$BIN_CLI") || { err "Binary $BIN_CLI not found in archive"; exit 1; }
 
-install -m 0755 "$SERVER_BIN" "$DEST/$BIN_SERVER"
-install -m 0755 "$CLI_BIN" "$DEST/$BIN_CLI"
+atomic_install "$SERVER_BIN" "$DEST/$BIN_SERVER"
+atomic_install "$CLI_BIN" "$DEST/$BIN_CLI"
 ok "Installed to $DEST"
 ok "  $DEST/$BIN_SERVER"
 ok "  $DEST/$BIN_CLI"
 maybe_add_path
 
-# Displace Python installation if detected
+# Displace Python installation if detected (T2.2)
 if [ "$PYTHON_DETECTED" -eq 1 ]; then
-  stop_python_server
-  displace_python_alias
-  resolve_database_path
+  MIGRATE_PYTHON=1
+  if [ "$EASY" -eq 0 ] && [ -t 0 ]; then
+    # Interactive mode: ask the user
+    echo ""
+    info "An existing Python mcp-agent-mail installation was detected."
+    info "The Rust binary has been installed. To ensure 'am' resolves to the"
+    info "new Rust version, the Python alias/binary should be displaced."
+    echo ""
+    printf "%s" "Migrate from Python to Rust? [Y/n] "
+    read -r answer </dev/tty 2>/dev/null || answer="y"
+    case "$answer" in
+      [nN]*)
+        MIGRATE_PYTHON=0
+        warn "Skipping Python displacement."
+        if [ "$PYTHON_ALIAS_FOUND" -eq 1 ]; then
+          warn "The shell alias 'am' still points to the Python version."
+          warn "The Rust binary is available as: $DEST/$BIN_CLI"
+          warn "To use Rust: remove the alias from $PYTHON_ALIAS_FILE or run:"
+          warn "  $DEST/$BIN_CLI <command>"
+        fi
+        ;;
+    esac
+  fi
+
+  if [ "$MIGRATE_PYTHON" -eq 1 ]; then
+    stop_python_server
+    displace_python_alias
+    resolve_database_path
+    migrate_env_config
+  fi
 fi
 
 MCP_CONFIG_SCAN="$(detect_mcp_configs "$PWD" || true)"
@@ -1225,9 +1364,85 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   fi
 fi
 
+# T2.4: Post-install verification
+verify_installation() {
+  local issues=0
+
+  # 1. Check binaries exist and are executable
+  if [ ! -x "$DEST/$BIN_SERVER" ]; then
+    warn "VERIFY: $DEST/$BIN_SERVER is missing or not executable"
+    issues=$((issues + 1))
+  fi
+  if [ ! -x "$DEST/$BIN_CLI" ]; then
+    warn "VERIFY: $DEST/$BIN_CLI is missing or not executable"
+    issues=$((issues + 1))
+  fi
+
+  # 2. Check version output
+  local version_out
+  version_out=$("$DEST/$BIN_CLI" --version 2>&1 || true)
+  if [ -z "$version_out" ]; then
+    warn "VERIFY: 'am --version' produced no output"
+    issues=$((issues + 1))
+  else
+    ok "VERIFY: $version_out"
+  fi
+
+  # 3. Check that 'am' resolves to the Rust binary in a login shell
+  local shell_name
+  shell_name=$(basename "${SHELL:-/bin/sh}")
+  local resolve_cmd
+  case "$shell_name" in
+    zsh)  resolve_cmd="zsh -l -c 'whence -p am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND'" ;;
+    bash) resolve_cmd="bash -l -c 'type -P am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND'" ;;
+    *)    resolve_cmd="sh -l -c 'which am 2>/dev/null || echo NOT_FOUND'" ;;
+  esac
+  local resolved_path
+  resolved_path=$(eval "$resolve_cmd" 2>/dev/null || echo "NOT_FOUND")
+
+  if [ "$resolved_path" = "NOT_FOUND" ] || [ -z "$resolved_path" ]; then
+    warn "VERIFY: 'am' not found in login shell PATH"
+    warn "  You may need to restart your shell or run: export PATH=\"$DEST:\$PATH\""
+    issues=$((issues + 1))
+  elif [ "$resolved_path" != "$DEST/$BIN_CLI" ]; then
+    # Check if it's an alias shadowing the binary
+    local alias_check
+    alias_check=$(eval "$shell_name -l -c 'alias am 2>/dev/null || true'" 2>/dev/null || true)
+    if [ -n "$alias_check" ]; then
+      warn "VERIFY: 'am' is still aliased in your shell!"
+      warn "  Alias: $alias_check"
+      warn "  Expected: $DEST/$BIN_CLI"
+      warn "  Fix: restart your shell or run: unalias am"
+      issues=$((issues + 1))
+    else
+      info "VERIFY: 'am' resolves to $resolved_path (expected $DEST/$BIN_CLI)"
+    fi
+  else
+    ok "VERIFY: 'am' resolves to $DEST/$BIN_CLI"
+  fi
+
+  # 4. If Python was displaced, verify the alias is gone
+  if [ "$PYTHON_DETECTED" -eq 1 ] && [ "${MIGRATE_PYTHON:-0}" -eq 1 ]; then
+    if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && [ -n "$PYTHON_ALIAS_FILE" ]; then
+      if grep -qE "^alias am=" "$PYTHON_ALIAS_FILE" 2>/dev/null; then
+        warn "VERIFY: Python 'am' alias still active in $PYTHON_ALIAS_FILE"
+        issues=$((issues + 1))
+      else
+        ok "VERIFY: Python alias displaced in $PYTHON_ALIAS_FILE"
+      fi
+    fi
+  fi
+
+  # 5. Summary
+  if [ "$issues" -gt 0 ]; then
+    warn "Verification found $issues issue(s). See warnings above."
+  else
+    ok "All verification checks passed"
+  fi
+}
+
 if [ "$VERIFY" -eq 1 ]; then
-  "$DEST/$BIN_CLI" --version || true
-  ok "Self-test complete"
+  verify_installation
 fi
 
 # Final summary
