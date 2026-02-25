@@ -1739,6 +1739,15 @@ fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig 
         .with_tile_diff_config(tiles)
 }
 
+const DASHBOARD_RENDER_COALESCE_WINDOW: Duration = Duration::from_millis(72);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DashboardRenderStamp {
+    at: Instant,
+    width: u16,
+    ui_height: u16,
+}
+
 struct StartupDashboard {
     writer: Mutex<ftui::TerminalWriter<std::io::Stdout>>,
     stop: AtomicBool,
@@ -1771,6 +1780,7 @@ struct StartupDashboard {
     event_buffer: Mutex<console::ConsoleEventBuffer>,
     timeline_pane: Mutex<console::TimelinePane>,
     right_pane_view: Mutex<console::RightPaneView>,
+    last_render_stamp: Mutex<Option<DashboardRenderStamp>>,
 }
 
 impl StartupDashboard {
@@ -1856,6 +1866,7 @@ impl StartupDashboard {
             event_buffer: Mutex::new(console::ConsoleEventBuffer::new()),
             timeline_pane: Mutex::new(console::TimelinePane::new()),
             right_pane_view: Mutex::new(console::RightPaneView::Log),
+            last_render_stamp: Mutex::new(None),
         });
 
         // Wire capabilities addendum into the LogPane help overlay (br-1m6a.23).
@@ -2523,7 +2534,22 @@ impl StartupDashboard {
         }
     }
 
+    fn should_coalesce_render(&self, width: u16, ui_height: u16, now: Instant) -> bool {
+        let mut stamp = lock_mutex(&self.last_render_stamp);
+        let (skip, next_stamp) = dashboard_render_gate_decision(*stamp, width, ui_height, now);
+        *stamp = next_stamp;
+        skip
+    }
+
     fn render_now(&self) {
+        let mut writer = lock_mutex(&self.writer);
+        let width = writer.width().max(80);
+        let ui_height = writer.ui_height().max(8);
+
+        if self.should_coalesce_render(width, ui_height, Instant::now()) {
+            return;
+        }
+
         let tick = self.tick_count.fetch_add(1, Ordering::Relaxed);
         let snapshot = self.snapshot();
 
@@ -2539,9 +2565,6 @@ impl StartupDashboard {
         let phase = tick as f32 * 0.08; // ~0.08 per 1200ms tick ≈ one full cycle every ~15s
         let is_split = lock_mutex(&self.console_layout).is_split_mode();
         let split_ratio = lock_mutex(&self.console_layout).split_ratio_percent;
-        let mut writer = lock_mutex(&self.writer);
-        let width = writer.width().max(80);
-        let ui_height = writer.ui_height().max(8);
         let rendered = {
             let buffer = writer.take_render_buffer(width, ui_height);
             let (pool, links) = writer.pool_and_links_mut();
@@ -2591,6 +2614,30 @@ impl StartupDashboard {
         };
         let _ = writer.present_ui_owned(rendered, None, false);
     }
+}
+
+fn dashboard_render_gate_decision(
+    previous: Option<DashboardRenderStamp>,
+    width: u16,
+    ui_height: u16,
+    now: Instant,
+) -> (bool, Option<DashboardRenderStamp>) {
+    if let Some(stamp) = previous
+        && stamp.width == width
+        && stamp.ui_height == ui_height
+        && now.saturating_duration_since(stamp.at) < DASHBOARD_RENDER_COALESCE_WINDOW
+    {
+        return (true, previous);
+    }
+
+    (
+        false,
+        Some(DashboardRenderStamp {
+            at: now,
+            width,
+            ui_height,
+        }),
+    )
 }
 
 /// Compute a bitmask of DB stat rows that changed since the previous snapshot.
@@ -12878,6 +12925,68 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(db_changed_rows(&base, &changed), 0b10_0101);
+    }
+
+    #[test]
+    fn dashboard_render_gate_first_frame_always_renders() {
+        let now = Instant::now();
+        let (skip, stamp) = dashboard_render_gate_decision(None, 120, 32, now);
+        assert!(!skip);
+        assert_eq!(
+            stamp,
+            Some(DashboardRenderStamp {
+                at: now,
+                width: 120,
+                ui_height: 32
+            })
+        );
+    }
+
+    #[test]
+    fn dashboard_render_gate_skips_same_geometry_within_window() {
+        let now = Instant::now();
+        let (_, stamp) = dashboard_render_gate_decision(None, 120, 32, now);
+        let (skip, next) = dashboard_render_gate_decision(
+            stamp,
+            120,
+            32,
+            now + std::time::Duration::from_millis(10),
+        );
+        assert!(skip);
+        assert_eq!(next, stamp);
+    }
+
+    #[test]
+    fn dashboard_render_gate_renders_after_window_elapses() {
+        let now = Instant::now();
+        let (_, stamp) = dashboard_render_gate_decision(None, 120, 32, now);
+        let (skip, next) = dashboard_render_gate_decision(
+            stamp,
+            120,
+            32,
+            now + DASHBOARD_RENDER_COALESCE_WINDOW + std::time::Duration::from_millis(1),
+        );
+        assert!(!skip);
+        assert_ne!(next, stamp);
+        let next = next.expect("updated render stamp");
+        assert_eq!(next.width, 120);
+        assert_eq!(next.ui_height, 32);
+    }
+
+    #[test]
+    fn dashboard_render_gate_renders_immediately_on_geometry_change() {
+        let now = Instant::now();
+        let (_, stamp) = dashboard_render_gate_decision(None, 120, 32, now);
+        let (skip, next) = dashboard_render_gate_decision(
+            stamp,
+            140,
+            32,
+            now + std::time::Duration::from_millis(5),
+        );
+        assert!(!skip);
+        let next = next.expect("updated render stamp");
+        assert_eq!(next.width, 140);
+        assert_eq!(next.ui_height, 32);
     }
 
     #[test]

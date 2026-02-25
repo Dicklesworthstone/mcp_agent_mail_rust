@@ -1089,6 +1089,8 @@ pub struct MailAppModel {
     internal_clipboard: Option<String>,
     /// Last fully rendered frame snapshot used for screen export.
     last_export_snapshot: RefCell<Option<FrameExportSnapshot>>,
+    /// One-shot flag requesting export snapshot refresh on next render.
+    export_snapshot_refresh_pending: Cell<bool>,
     /// Last armed quit confirmation timestamp.
     quit_confirm_armed_at: Option<Instant>,
     /// Input source that armed quit confirmation.
@@ -1189,6 +1191,7 @@ impl MailAppModel {
             clipboard: Clipboard::auto(ftui::TerminalCapabilities::detect()),
             internal_clipboard: None,
             last_export_snapshot: RefCell::new(None),
+            export_snapshot_refresh_pending: Cell::new(false),
             quit_confirm_armed_at: None,
             quit_confirm_source: None,
             compose_state: None,
@@ -1624,6 +1627,7 @@ impl MailAppModel {
         self.help_visible = false;
         self.help_scroll = 0;
         self.export_menu_open = true;
+        self.export_snapshot_refresh_pending.set(true);
     }
 
     fn handle_export_menu_key(&mut self, key: &ftui::KeyEvent) {
@@ -4140,12 +4144,21 @@ impl Model for MailAppModel {
         apply_frame_contrast_guard(frame, &tp);
 
         // Keep an exportable snapshot of the last fully rendered frame.
-        self.last_export_snapshot
-            .borrow_mut()
-            .replace(FrameExportSnapshot {
-                buffer: frame.buffer.clone(),
-                pool: frame.pool.clone(),
-            });
+        //
+        // This is intentionally lazy: cloning the entire frame/pool every tick
+        // is expensive, so we only refresh when needed for export flows.
+        let snapshot_missing = self.last_export_snapshot.borrow().is_none();
+        let should_refresh_export_snapshot =
+            snapshot_missing || self.export_menu_open || self.export_snapshot_refresh_pending.get();
+        if should_refresh_export_snapshot {
+            self.last_export_snapshot
+                .borrow_mut()
+                .replace(FrameExportSnapshot {
+                    buffer: frame.buffer.clone(),
+                    pool: frame.pool.clone(),
+                });
+            self.export_snapshot_refresh_pending.set(false);
+        }
     }
 
     fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
@@ -6194,6 +6207,15 @@ mod tests {
         text
     }
 
+    fn snapshot_with_size(width: u16, height: u16) -> FrameExportSnapshot {
+        let mut pool = ftui::GraphemePool::new();
+        let frame = ftui::Frame::new(width, height, &mut pool);
+        FrameExportSnapshot {
+            buffer: frame.buffer.clone(),
+            pool: frame.pool.clone(),
+        }
+    }
+
     #[test]
     fn ambient_mode_off_disables_renderer_in_view() {
         let config = Config {
@@ -6652,11 +6674,13 @@ mod tests {
     fn ctrl_e_opens_export_menu() {
         let mut model = test_model();
         assert!(!model.export_menu_open);
+        assert!(!model.export_snapshot_refresh_pending.get());
         let event = Event::Key(
             ftui::KeyEvent::new(KeyCode::Char('e')).with_modifiers(ftui::Modifiers::CTRL),
         );
         let _ = model.update(MailMsg::Terminal(event));
         assert!(model.export_menu_open);
+        assert!(model.export_snapshot_refresh_pending.get());
     }
 
     #[test]
@@ -6715,6 +6739,47 @@ mod tests {
             !text_body.contains('\u{001b}'),
             "plain text export should not include ANSI escapes"
         );
+    }
+
+    #[test]
+    fn view_skips_snapshot_refresh_when_export_not_requested() {
+        let mut model = test_model();
+        model
+            .last_export_snapshot
+            .borrow_mut()
+            .replace(snapshot_with_size(6, 2));
+        model.export_snapshot_refresh_pending.set(false);
+        model.export_menu_open = false;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+
+        let snapshot = model.last_export_snapshot.borrow();
+        let snapshot = snapshot.as_ref().expect("snapshot should remain available");
+        assert_eq!(snapshot.buffer.width(), 6);
+        assert_eq!(snapshot.buffer.height(), 2);
+    }
+
+    #[test]
+    fn view_refreshes_snapshot_when_export_is_armed() {
+        let mut model = test_model();
+        model
+            .last_export_snapshot
+            .borrow_mut()
+            .replace(snapshot_with_size(6, 2));
+        model.export_snapshot_refresh_pending.set(true);
+        model.export_menu_open = false;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+
+        let snapshot = model.last_export_snapshot.borrow();
+        let snapshot = snapshot.as_ref().expect("snapshot should be refreshed");
+        assert_eq!(snapshot.buffer.width(), 80);
+        assert_eq!(snapshot.buffer.height(), 24);
+        assert!(!model.export_snapshot_refresh_pending.get());
     }
 
     #[test]
