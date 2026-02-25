@@ -129,8 +129,10 @@ pub fn find_highlights(
 
 /// Snap a byte position back to the start of the nearest word
 fn snap_to_word_start(text: &str, pos: usize) -> usize {
-    if pos == 0 || pos >= text.len() {
-        return pos.min(text.len());
+    let pos = pos.min(text.len());
+    let pos = text.floor_char_boundary(pos);
+    if pos == 0 {
+        return 0;
     }
     // Walk backwards to find whitespace
     text[..pos]
@@ -143,6 +145,7 @@ fn snap_to_word_end(text: &str, pos: usize) -> usize {
     if pos >= text.len() {
         return text.len();
     }
+    let pos = text.floor_char_boundary(pos);
     // Walk forward to find whitespace
     text[pos..]
         .find(|c: char| c.is_whitespace())
