@@ -452,7 +452,16 @@ pub(crate) fn row_first_i64(row: &SqlRow) -> Option<i64> {
 /// `SQLite` default `SQLITE_MAX_VARIABLE_NUMBER` is 999 (32766 in newer builds).
 /// We cap IN-clause item counts well below that to prevent excessively large
 /// SQL strings and parameter arrays from untrusted input.
+const SQLITE_MAX_BIND_PARAMS: usize = 999;
 const MAX_IN_CLAUSE_ITEMS: usize = 500;
+// release_reservations executes both:
+// - SELECT ... WHERE project_id, agent_id, filters...
+// - UPDATE ... SET released_ts = ? WHERE project_id, agent_id, filters...
+// The UPDATE has one extra bind (released_ts), so total binds are:
+// 3 + reservation_ids.len() + paths.len()
+const RELEASE_RESERVATION_BASE_BIND_PARAMS: usize = 3;
+const MAX_RELEASE_RESERVATION_FILTER_ITEMS: usize =
+    SQLITE_MAX_BIND_PARAMS - RELEASE_RESERVATION_BASE_BIND_PARAMS;
 
 static PLACEHOLDER_CACHE: OnceLock<Vec<String>> = OnceLock::new();
 static APPROVED_CONTACT_SQL_CACHE: OnceLock<Vec<String>> = OnceLock::new();
@@ -3905,6 +3914,43 @@ pub async fn get_active_reservations(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseReservationChunkTarget {
+    ReservationIds,
+    Paths,
+}
+
+fn release_reservation_chunk_plan(
+    path_count: usize,
+    reservation_id_count: usize,
+) -> Option<(ReleaseReservationChunkTarget, usize)> {
+    let ids_limit = MAX_IN_CLAUSE_ITEMS.min(
+        MAX_RELEASE_RESERVATION_FILTER_ITEMS
+            .saturating_sub(path_count)
+            .max(1),
+    );
+    let paths_limit = MAX_IN_CLAUSE_ITEMS.min(
+        MAX_RELEASE_RESERVATION_FILTER_ITEMS
+            .saturating_sub(reservation_id_count)
+            .max(1),
+    );
+
+    let chunk_ids = reservation_id_count > ids_limit;
+    let chunk_paths = path_count > paths_limit;
+    match (chunk_ids, chunk_paths) {
+        (false, false) => None,
+        (true, false) => Some((ReleaseReservationChunkTarget::ReservationIds, ids_limit)),
+        (false, true) => Some((ReleaseReservationChunkTarget::Paths, paths_limit)),
+        (true, true) => {
+            if reservation_id_count >= path_count {
+                Some((ReleaseReservationChunkTarget::ReservationIds, ids_limit))
+            } else {
+                Some((ReleaseReservationChunkTarget::Paths, paths_limit))
+            }
+        }
+    }
+}
+
 fn append_release_reservation_filters(
     sql: &mut String,
     params: &mut Vec<Value>,
@@ -3955,46 +4001,57 @@ pub fn release_reservations<'a>(
     Box::pin(async move {
         // Avoid exceeding SQLite bind parameter limits by chunking very large filters.
         // Each chunk call uses the same logic below and commits independently.
-        if let Some(ids) = reservation_ids
-            && ids.len() > MAX_IN_CLAUSE_ITEMS
+        let path_count = paths.map_or(0, <[&str]>::len);
+        let reservation_id_count = reservation_ids.map_or(0, <[i64]>::len);
+        if let Some((target, chunk_size)) =
+            release_reservation_chunk_plan(path_count, reservation_id_count)
         {
             let mut released = Vec::new();
-            for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-                let rows =
-                    match release_reservations(cx, pool, project_id, agent_id, paths, Some(chunk))
-                        .await
-                    {
-                        Outcome::Ok(rows) => rows,
-                        Outcome::Err(e) => return Outcome::Err(e),
-                        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                        Outcome::Panicked(p) => return Outcome::Panicked(p),
-                    };
-                released.extend(rows);
-            }
-            return Outcome::Ok(released);
-        }
-
-        if let Some(pats) = paths
-            && pats.len() > MAX_IN_CLAUSE_ITEMS
-        {
-            let mut released = Vec::new();
-            for chunk in pats.chunks(MAX_IN_CLAUSE_ITEMS) {
-                let rows = match release_reservations(
-                    cx,
-                    pool,
-                    project_id,
-                    agent_id,
-                    Some(chunk),
-                    reservation_ids,
-                )
-                .await
-                {
-                    Outcome::Ok(rows) => rows,
-                    Outcome::Err(e) => return Outcome::Err(e),
-                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => return Outcome::Panicked(p),
-                };
-                released.extend(rows);
+            match target {
+                ReleaseReservationChunkTarget::ReservationIds => {
+                    if let Some(ids) = reservation_ids {
+                        for chunk in ids.chunks(chunk_size) {
+                            let rows = match release_reservations(
+                                cx,
+                                pool,
+                                project_id,
+                                agent_id,
+                                paths,
+                                Some(chunk),
+                            )
+                            .await
+                            {
+                                Outcome::Ok(rows) => rows,
+                                Outcome::Err(e) => return Outcome::Err(e),
+                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                                Outcome::Panicked(p) => return Outcome::Panicked(p),
+                            };
+                            released.extend(rows);
+                        }
+                    }
+                }
+                ReleaseReservationChunkTarget::Paths => {
+                    if let Some(pats) = paths {
+                        for chunk in pats.chunks(chunk_size) {
+                            let rows = match release_reservations(
+                                cx,
+                                pool,
+                                project_id,
+                                agent_id,
+                                Some(chunk),
+                                reservation_ids,
+                            )
+                            .await
+                            {
+                                Outcome::Ok(rows) => rows,
+                                Outcome::Err(e) => return Outcome::Err(e),
+                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                                Outcome::Panicked(p) => return Outcome::Panicked(p),
+                            };
+                            released.extend(rows);
+                        }
+                    }
+                }
             }
             return Outcome::Ok(released);
         }
@@ -5803,6 +5860,50 @@ mod tests {
         for n in 1..=64 {
             assert_eq!(placeholders(n), build_placeholders(n), "arity={n}");
         }
+    }
+
+    #[test]
+    fn release_reservation_chunk_plan_none_within_bind_limits() {
+        assert_eq!(release_reservation_chunk_plan(100, 100), None);
+        assert_eq!(
+            release_reservation_chunk_plan(
+                MAX_RELEASE_RESERVATION_FILTER_ITEMS / 2,
+                MAX_RELEASE_RESERVATION_FILTER_ITEMS / 2
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn release_reservation_chunk_plan_chunks_ids_when_combined_filters_exceed_limit() {
+        let path_count = 400;
+        let id_count = 700;
+        let Some((target, chunk_size)) = release_reservation_chunk_plan(path_count, id_count)
+        else {
+            panic!("expected chunking plan");
+        };
+        assert_eq!(target, ReleaseReservationChunkTarget::ReservationIds);
+        assert_eq!(chunk_size, 500);
+        assert!(
+            path_count + chunk_size <= MAX_RELEASE_RESERVATION_FILTER_ITEMS,
+            "chunked ids must fit SQLite bind limit"
+        );
+    }
+
+    #[test]
+    fn release_reservation_chunk_plan_chunks_paths_when_ids_consume_budget() {
+        let path_count = 600;
+        let id_count = 500;
+        let Some((target, chunk_size)) = release_reservation_chunk_plan(path_count, id_count)
+        else {
+            panic!("expected chunking plan");
+        };
+        assert_eq!(target, ReleaseReservationChunkTarget::Paths);
+        assert_eq!(chunk_size, 496);
+        assert!(
+            id_count + chunk_size <= MAX_RELEASE_RESERVATION_FILTER_ITEMS,
+            "chunked paths must fit SQLite bind limit"
+        );
     }
 
     #[test]

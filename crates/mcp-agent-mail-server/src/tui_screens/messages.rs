@@ -1132,6 +1132,10 @@ impl MessageBrowserScreen {
             return Some(entry.project_slug.clone());
         }
 
+        self.latest_project_slug()
+    }
+
+    fn latest_project_slug(&self) -> Option<String> {
         let conn = self.db_conn.as_ref()?;
         let sql = "SELECT slug FROM projects ORDER BY created_at DESC LIMIT 1";
         conn.query_sync(sql, &[])
@@ -1603,6 +1607,7 @@ impl MessageBrowserScreen {
     /// currently focused message's project. When switching Local -> Global,
     /// remembers the current project for later restoration.
     fn toggle_inbox_mode(&mut self) {
+        let mut changed = false;
         match &self.inbox_mode {
             InboxMode::Global => {
                 // Switch to Local mode
@@ -1610,24 +1615,31 @@ impl MessageBrowserScreen {
                 let project_slug = self
                     .last_local_project
                     .clone()
+                    .filter(|s| !s.is_empty() && s != "default")
                     .or_else(|| {
                         self.results
                             .get(self.cursor)
                             .map(|m| m.project_slug.clone())
                             .filter(|s| !s.is_empty())
                     })
-                    .unwrap_or_else(|| "default".to_string());
-                self.inbox_mode = InboxMode::Local(project_slug);
+                    .or_else(|| self.latest_project_slug());
+                if let Some(project_slug) = project_slug {
+                    self.inbox_mode = InboxMode::Local(project_slug);
+                    changed = true;
+                }
             }
             InboxMode::Local(slug) => {
                 // Remember current project before switching to Global
                 self.last_local_project = Some(slug.clone());
                 self.inbox_mode = InboxMode::Global;
+                changed = true;
             }
         }
-        // Trigger a re-query with the new mode
-        self.search_dirty = true;
-        self.debounce_remaining = 0;
+        if changed {
+            // Trigger a re-query with the new mode.
+            self.search_dirty = true;
+            self.debounce_remaining = 0;
+        }
     }
 
     /// Sync the `VirtualizedListState` with our cursor position.
@@ -1747,10 +1759,14 @@ impl MessageBrowserScreen {
                     .get("local_project")
                     .cloned()
                     .or_else(|| self.last_local_project.clone())
-                    .filter(|slug| !slug.is_empty())
-                    .unwrap_or_else(|| "default".to_string());
-                self.last_local_project = Some(local.clone());
-                self.inbox_mode = InboxMode::Local(local);
+                    .filter(|slug| !slug.is_empty() && slug != "default")
+                    .or_else(|| self.latest_project_slug());
+                if let Some(local) = local {
+                    self.last_local_project = Some(local.clone());
+                    self.inbox_mode = InboxMode::Local(local);
+                } else {
+                    self.inbox_mode = InboxMode::Global;
+                }
             }
             _ => {
                 self.inbox_mode = InboxMode::Global;
@@ -6429,6 +6445,18 @@ mod tests {
     }
 
     #[test]
+    fn apply_preset_values_local_without_project_uses_global_mode() {
+        let mut screen = MessageBrowserScreen::new();
+        let mut values = BTreeMap::new();
+        values.insert("inbox_mode".to_string(), "local".to_string());
+        values.insert("query".to_string(), "urgent".to_string());
+
+        screen.apply_preset_values(&values);
+
+        assert!(matches!(screen.inbox_mode, InboxMode::Global));
+    }
+
+    #[test]
     fn ctrl_shortcuts_drive_message_preset_dialog_flow() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6652,6 +6680,10 @@ mod tests {
     fn g_key_toggles_inbox_mode() {
         let mut screen = MessageBrowserScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen
+            .results
+            .push(test_message_entry(1, "thread-a", "One"));
+        screen.cursor = 0;
 
         // Start in Global mode
         assert!(matches!(screen.inbox_mode, InboxMode::Global));
@@ -6667,6 +6699,17 @@ mod tests {
         screen.update(&g, &state);
         assert!(matches!(screen.inbox_mode, InboxMode::Global));
         assert!(screen.search_dirty);
+    }
+
+    #[test]
+    fn toggle_inbox_mode_stays_global_without_project_context() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+
+        screen.toggle_inbox_mode();
+
+        assert!(matches!(screen.inbox_mode, InboxMode::Global));
+        assert!(!screen.search_dirty);
     }
 
     #[test]

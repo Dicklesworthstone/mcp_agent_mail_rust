@@ -1893,11 +1893,15 @@ impl StartupDashboard {
             .name("mcp-agent-mail-dashboard-input".to_string())
             .spawn(move || {
                 use ftui_runtime::BackendEventSource;
-                let Ok(mut backend) = ftui_tty::TtyBackend::open(
+                #[cfg(unix)]
+                let backend_result = ftui_tty::TtyBackend::open(
                     0,
                     0,
                     ftui_tty::TtySessionOptions::default(),
-                ) else {
+                );
+                #[cfg(not(unix))]
+                let backend_result = Ok::<_, std::io::Error>(ftui_tty::TtyBackend::new(0, 0));
+                let Ok(mut backend) = backend_result else {
                     this.log_line("Console interactive mode: failed to enter raw mode");
                     return;
                 };
@@ -2436,8 +2440,8 @@ impl StartupDashboard {
             ],
             None,
         );
-
-        self.render_now();
+        // Rendering is paced by the refresh worker (~1.2s) to avoid request-rate
+        // driven redraw storms that can spike CPU and cause visible flicker.
     }
 
     fn refresh_db_stats(&self) {

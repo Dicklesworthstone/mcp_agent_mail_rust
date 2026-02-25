@@ -3,7 +3,7 @@
 //! Uses `sqlmodel_pool` for efficient connection management.
 
 use crate::DbConn;
-use crate::error::{DbError, DbResult};
+use crate::error::{DbError, DbResult, is_lock_error};
 use crate::integrity;
 use crate::schema;
 use asupersync::sync::OnceCell;
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Default pool configuration values — sized for 1000+ concurrent agents.
 ///
@@ -507,7 +507,7 @@ impl DbPool {
             });
         }
 
-        let conn = match DbConn::open_file(&self.sqlite_path) {
+        let conn = match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
             Ok(conn) => conn,
             Err(e) => {
                 if !is_corruption_error_message(&e.to_string()) {
@@ -522,7 +522,7 @@ impl DbPool {
                 );
                 recover_sqlite_file(Path::new(&self.sqlite_path))
                     .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
-                DbConn::open_file(&self.sqlite_path).map_err(|reopen| {
+                open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                     DbError::Sqlite(format!(
                         "startup integrity check: open failed after recovery: {reopen}"
                     ))
@@ -545,7 +545,7 @@ impl DbPool {
                 }
 
                 // Re-open and re-verify
-                let conn = DbConn::open_file(&self.sqlite_path).map_err(|e| {
+                let conn = open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
                     DbError::Sqlite(format!(
                         "startup integrity check (post-recovery): open failed: {e}"
                     ))
@@ -579,7 +579,7 @@ impl DbPool {
             });
         }
 
-        let conn = match DbConn::open_file(&self.sqlite_path) {
+        let conn = match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
             Ok(conn) => conn,
             Err(e) => {
                 if !is_corruption_error_message(&e.to_string()) {
@@ -595,7 +595,7 @@ impl DbPool {
                 recover_sqlite_file(Path::new(&self.sqlite_path)).map_err(|re| {
                     DbError::Sqlite(format!("full integrity recovery failed: {re}"))
                 })?;
-                DbConn::open_file(&self.sqlite_path).map_err(|reopen| {
+                open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                     DbError::Sqlite(format!(
                         "full integrity check: open failed after recovery: {reopen}"
                     ))
@@ -619,7 +619,7 @@ impl DbPool {
             return Ok(Vec::new());
         }
 
-        let conn = DbConn::open_file(&self.sqlite_path)
+        let conn = open_sqlite_file_with_lock_retry(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
 
         // Query recent messages joined with projects and agents to get
@@ -687,7 +687,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
         }
-        let conn = DbConn::open_file(&self.sqlite_path)
+        let conn = open_sqlite_file_with_lock_retry(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
 
         // Apply busy_timeout so the checkpoint waits for active readers/writers.
@@ -803,7 +803,7 @@ async fn run_sqlite_init_once(
     sqlite_path: &str,
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
-    let mig_conn = match DbConn::open_file(sqlite_path) {
+    let mig_conn = match open_sqlite_file_with_lock_retry(sqlite_path) {
         Ok(conn) => conn,
         Err(err) => return Outcome::Err(err),
     };
@@ -834,7 +834,16 @@ async fn run_sqlite_init_once(
 
 #[must_use]
 fn should_retry_sqlite_init_error(error: &SqlError) -> bool {
-    is_sqlite_recovery_error_message(&error.to_string())
+    let msg = error.to_string();
+    is_sqlite_recovery_error_message(&msg) || is_lock_error(&msg)
+}
+
+const SQLITE_OPEN_LOCK_MAX_RETRIES: usize = 3;
+
+#[must_use]
+fn sqlite_open_lock_retry_delay(retry_index: usize) -> Duration {
+    let exponent = u32::try_from(retry_index.min(3)).unwrap_or(3);
+    Duration::from_millis(25_u64.saturating_mul(1_u64 << exponent))
 }
 
 #[must_use]
@@ -880,6 +889,51 @@ fn ensure_sqlite_parent_dir_exists(path: &str) -> Result<(), SqlError> {
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlError> {
+    open_sqlite_file_with_lock_retry_impl(
+        sqlite_path,
+        |path| DbConn::open_file(path),
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_with_lock_retry_impl<F, S>(
+    sqlite_path: &str,
+    mut open_file: F,
+    mut sleep_fn: S,
+) -> Result<DbConn, SqlError>
+where
+    F: FnMut(&str) -> Result<DbConn, SqlError>,
+    S: FnMut(Duration),
+{
+    let mut retries = 0usize;
+    loop {
+        match open_file(sqlite_path) {
+            Ok(conn) => return Ok(conn),
+            Err(err) => {
+                let message = err.to_string();
+                if !is_lock_error(&message) || retries >= SQLITE_OPEN_LOCK_MAX_RETRIES {
+                    return Err(err);
+                }
+                let delay = sqlite_open_lock_retry_delay(retries);
+                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                tracing::warn!(
+                    path = %sqlite_path,
+                    error = %err,
+                    retry = retries + 1,
+                    max_retries = SQLITE_OPEN_LOCK_MAX_RETRIES,
+                    delay_ms,
+                    "sqlite open hit lock/busy error; retrying"
+                );
+                sleep_fn(delay);
+                retries += 1;
+            }
+        }
+    }
+}
+
 /// Open a file-backed sqlite connection and automatically recover from
 /// corruption-like open failures when possible.
 #[allow(clippy::result_large_err)]
@@ -889,13 +943,13 @@ pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlEr
     }
     ensure_sqlite_parent_dir_exists(sqlite_path)?;
 
-    match DbConn::open_file(sqlite_path) {
+    match open_sqlite_file_with_lock_retry(sqlite_path) {
         Ok(conn) => Ok(conn),
         Err(primary_err) => {
             let primary_msg = primary_err.to_string();
 
             if let Some(fallback_path) = sqlite_absolute_fallback_path(sqlite_path, &primary_msg) {
-                match DbConn::open_file(&fallback_path) {
+                match open_sqlite_file_with_lock_retry(&fallback_path) {
                     Ok(conn) => return Ok(conn),
                     Err(fallback_err) => {
                         return Err(SqlError::Custom(format!(
@@ -910,7 +964,7 @@ pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlEr
             }
 
             recover_sqlite_file(Path::new(sqlite_path))?;
-            DbConn::open_file(sqlite_path).map_err(|reopen_err| {
+            open_sqlite_file_with_lock_retry(sqlite_path).map_err(|reopen_err| {
                 SqlError::Custom(format!(
                     "cannot open sqlite at {sqlite_path}: {primary_err}; reopen after recovery failed: {reopen_err}"
                 ))
@@ -927,7 +981,14 @@ async fn initialize_sqlite_file_once(
 ) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
     if let Err(err) = recover_sqlite_file(path) {
-        return Outcome::Err(err);
+        if !should_retry_sqlite_init_error(&err) {
+            return Outcome::Err(err);
+        }
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "sqlite pre-init recovery probe hit retryable error; continuing with init retry path"
+        );
     }
 
     match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
@@ -938,25 +999,51 @@ async fn initialize_sqlite_file_once(
                 return Outcome::Err(first_err);
             }
 
-            match sqlite_file_is_healthy(path) {
-                Ok(false) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %first_err,
-                        "sqlite init failed and health probes detected corruption; attempting automatic recovery"
-                    );
-                    if let Err(recover_err) = recover_sqlite_file(path) {
-                        return Outcome::Err(recover_err);
+            if is_sqlite_recovery_error_message(&first_err.to_string()) {
+                match sqlite_file_is_healthy(path) {
+                    Ok(false) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %first_err,
+                            "sqlite init failed and health probes detected corruption; attempting automatic recovery"
+                        );
+                        if let Err(recover_err) = recover_sqlite_file(path) {
+                            if !should_retry_sqlite_init_error(&recover_err) {
+                                return Outcome::Err(recover_err);
+                            }
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %recover_err,
+                                "sqlite recovery attempt failed with retryable error; retrying init once"
+                            );
+                        }
+                    }
+                    Ok(true) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %first_err,
+                            "sqlite init failed but file-level health probes passed; retrying initialization once"
+                        );
+                    }
+                    Err(health_err) => {
+                        if !should_retry_sqlite_init_error(&health_err) {
+                            return Outcome::Err(health_err);
+                        }
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %health_err,
+                            "sqlite health probe failed with retryable error; retrying initialization once"
+                        );
                     }
                 }
-                Ok(true) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %first_err,
-                        "sqlite init failed but file-level health probes passed; retrying initialization once"
-                    );
-                }
-                Err(health_err) => return Outcome::Err(health_err),
+            } else {
+                // Lock/busy class errors are often transient under concurrent startup.
+                // Skip corruption probes and retry initialization once.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %first_err,
+                    "sqlite init failed with retryable lock/busy error; retrying initialization once"
+                );
             }
 
             run_sqlite_init_once(cx, sqlite_path, run_migrations).await
@@ -1045,7 +1132,7 @@ fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
         return Ok(true);
     }
     let path_str = path.to_string_lossy();
-    let conn = match DbConn::open_file(path_str.as_ref()) {
+    let conn = match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
         Ok(conn) => conn,
         Err(e) => {
             if is_corruption_error_message(&e.to_string()) {
@@ -1313,7 +1400,7 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
     }
 
     let path_str = primary_path.to_string_lossy();
-    let conn = DbConn::open_file(path_str.as_ref()).map_err(|e| {
+    let conn = open_sqlite_file_with_lock_retry(path_str.as_ref()).map_err(|e| {
         SqlError::Custom(format!(
             "failed to initialize fresh sqlite file {}: {e}",
             primary_path.display()
@@ -2919,6 +3006,90 @@ mod tests {
         assert!(!is_sqlite_recovery_error_message("timeout"));
         assert!(!is_sqlite_recovery_error_message("no such table"));
         assert!(!is_sqlite_recovery_error_message(""));
+    }
+
+    #[test]
+    fn sqlite_init_retry_treats_locked_db_as_retryable() {
+        let err = SqlError::Custom("database is locked".to_string());
+        assert!(
+            should_retry_sqlite_init_error(&err),
+            "database lock contention should retry during sqlite init"
+        );
+    }
+
+    #[test]
+    fn sqlite_init_retry_rejects_non_retryable_errors() {
+        let err = SqlError::Custom("syntax error near SELECT".to_string());
+        assert!(
+            !should_retry_sqlite_init_error(&err),
+            "non-retryable SQL errors must fail fast during sqlite init"
+        );
+    }
+
+    #[test]
+    fn sqlite_open_lock_retry_delay_exponential_and_capped() {
+        assert_eq!(sqlite_open_lock_retry_delay(0), Duration::from_millis(25));
+        assert_eq!(sqlite_open_lock_retry_delay(1), Duration::from_millis(50));
+        assert_eq!(sqlite_open_lock_retry_delay(2), Duration::from_millis(100));
+        assert_eq!(sqlite_open_lock_retry_delay(3), Duration::from_millis(200));
+        assert_eq!(
+            sqlite_open_lock_retry_delay(999),
+            Duration::from_millis(200),
+            "backoff should cap to avoid unbounded startup delay"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn open_sqlite_file_with_lock_retry_retries_then_succeeds() {
+        let open_calls = std::cell::Cell::new(0usize);
+        let sleep_calls = std::cell::RefCell::new(Vec::new());
+        let result = open_sqlite_file_with_lock_retry_impl(
+            "ignored",
+            |_| {
+                let next = open_calls.get() + 1;
+                open_calls.set(next);
+                if next <= 2 {
+                    Err(SqlError::Custom("database is locked".to_string()))
+                } else {
+                    DbConn::open_memory()
+                }
+            },
+            |delay| sleep_calls.borrow_mut().push(delay),
+        );
+        assert!(result.is_ok(), "expected success after lock retries");
+        assert_eq!(open_calls.get(), 3);
+        assert_eq!(
+            sleep_calls.borrow().as_slice(),
+            &[
+                sqlite_open_lock_retry_delay(0),
+                sqlite_open_lock_retry_delay(1)
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn open_sqlite_file_with_lock_retry_does_not_retry_non_lock_errors() {
+        let open_calls = std::cell::Cell::new(0usize);
+        let sleep_calls = std::cell::RefCell::new(Vec::new());
+        let result = open_sqlite_file_with_lock_retry_impl(
+            "ignored",
+            |_| {
+                open_calls.set(open_calls.get() + 1);
+                Err(SqlError::Custom("malformed database schema".to_string()))
+            },
+            |delay| sleep_calls.borrow_mut().push(delay),
+        );
+        assert!(
+            result.is_err(),
+            "expected immediate failure on non-lock error"
+        );
+        assert_eq!(open_calls.get(), 1, "non-lock errors should not be retried");
+        assert!(
+            sleep_calls.borrow().is_empty(),
+            "non-lock errors should not trigger backoff sleeps"
+        );
     }
 
     // ── sqlite_absolute_fallback_path ──────────────────────────────────

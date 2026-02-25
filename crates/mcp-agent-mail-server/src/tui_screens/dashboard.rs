@@ -1080,8 +1080,19 @@ impl MailScreen for DashboardScreen {
             let mut pane = self.console_log.borrow_mut();
             for (seq, line) in &new_entries {
                 self.console_log_last_seq = *seq;
-                for l in line.split('\n') {
-                    pane.push(crate::console::ansi_to_line(l));
+                // Ignore entries that are only newline delimiters. These can
+                // otherwise make `len() > 0` and incorrectly force an empty
+                // auto-dense console panel.
+                if line.trim_matches(&['\n', '\r'][..]).is_empty() {
+                    continue;
+                }
+                // `split_terminator` avoids a trailing empty segment for
+                // newline-terminated lines while preserving intentional
+                // interior blank lines (e.g. panel spacing).
+                for l in line.split_terminator('\n') {
+                    pane.push(crate::console::ansi_to_line(
+                        l.strip_suffix('\r').unwrap_or(l),
+                    ));
                 }
             }
         }
@@ -6458,6 +6469,28 @@ mod tests {
             }),
             "expected synthetic ReservationReleased delta entry"
         );
+    }
+
+    #[test]
+    fn dashboard_console_log_ingest_ignores_blank_only_entries() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        // Pure newline payload should not create a visible console row.
+        state.push_console_log("\n".to_string());
+        screen.tick(1, &state);
+        assert_eq!(screen.console_log.borrow().len(), 0);
+
+        // Newline-terminated payload should not append an extra trailing blank row.
+        state.push_console_log("line-1\n".to_string());
+        screen.tick(2, &state);
+        assert_eq!(screen.console_log.borrow().len(), 1);
+
+        // Preserve intentional interior blank lines.
+        state.push_console_log("line-2\n\nline-3\n".to_string());
+        screen.tick(3, &state);
+        assert_eq!(screen.console_log.borrow().len(), 4);
     }
 
     #[test]

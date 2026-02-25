@@ -278,7 +278,7 @@ pub async fn request_contact(
         mcp_agent_mail_db::queries::create_message_with_recipients(
             ctx.cx(),
             &pool,
-            project_id,
+            target_project_id,
             from_row.id.unwrap_or(0),
             &subject,
             &body_md,
@@ -291,7 +291,7 @@ pub async fn request_contact(
         .await,
     )?;
     enqueue_message_semantic_index(
-        project_id,
+        target_project_id,
         message.id.unwrap_or(0),
         &message.subject,
         &message.body_md,
@@ -311,8 +311,8 @@ pub async fn request_contact(
         "subject": &message.subject,
         "created": micros_to_iso(message.created_ts),
         "thread_id": &message.thread_id,
-        "project": &project.human_key,
-        "project_slug": &project.slug,
+        "project": &target_project_row.human_key,
+        "project_slug": &target_project_row.slug,
         "importance": &message.importance,
         "ack_required": message.ack_required != 0,
         "attachments": [],
@@ -320,7 +320,7 @@ pub async fn request_contact(
 
     try_write_message_archive(
         &config,
-        &project.slug,
+        &target_project_row.slug,
         &msg_json,
         &message.body_md,
         &from_agent,

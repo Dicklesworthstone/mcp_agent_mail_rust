@@ -63,7 +63,6 @@ fn scope_fingerprint(scope: &str) -> u64 {
 #[derive(Clone)]
 struct CacheEntry<T> {
     value: T,
-    inserted: Instant,
     last_accessed: Instant,
     access_count: u32,
 }
@@ -73,7 +72,6 @@ impl<T> CacheEntry<T> {
         let now = Instant::now();
         Self {
             value,
-            inserted: now,
             last_accessed: now,
             access_count: 0,
         }
@@ -89,7 +87,7 @@ impl<T> CacheEntry<T> {
     }
 
     fn is_expired(&self, base_ttl: Duration) -> bool {
-        self.inserted.elapsed() > self.effective_ttl(base_ttl)
+        self.last_accessed.elapsed() > self.effective_ttl(base_ttl)
     }
 
     /// Record an access, updating `last_accessed` and bumping the access counter.
@@ -845,13 +843,11 @@ mod tests {
         // Entries accessed >= ADAPTIVE_TTL_THRESHOLD times get 2x TTL.
         let entry_cold = CacheEntry {
             value: 42_i32,
-            inserted: Instant::now(),
             last_accessed: Instant::now(),
             access_count: 0,
         };
         let entry_hot = CacheEntry {
             value: 42_i32,
-            inserted: Instant::now(),
             last_accessed: Instant::now(),
             access_count: ADAPTIVE_TTL_THRESHOLD,
         };
@@ -863,11 +859,53 @@ mod tests {
         // Just below threshold stays at base
         let entry_warm = CacheEntry {
             value: 42_i32,
-            inserted: Instant::now(),
             last_accessed: Instant::now(),
             access_count: ADAPTIVE_TTL_THRESHOLD - 1,
         };
         assert_eq!(entry_warm.effective_ttl(base), base);
+    }
+
+    #[test]
+    fn expiration_uses_last_accessed_time() {
+        let base = Duration::from_mins(1);
+        let one_hour_ago = Instant::now()
+            .checked_sub(Duration::from_hours(1))
+            .expect("one hour subtraction should be representable");
+        let entry_hot = CacheEntry {
+            value: 42_i32,
+            last_accessed: one_hour_ago,
+            access_count: ADAPTIVE_TTL_THRESHOLD,
+        };
+        assert!(
+            entry_hot.is_expired(base),
+            "stale last_accessed should expire even for hot entries"
+        );
+
+        let just_touched = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .expect("30 second subtraction should be representable");
+        let entry_stale = CacheEntry {
+            value: 42_i32,
+            last_accessed: just_touched,
+            access_count: ADAPTIVE_TTL_THRESHOLD,
+        };
+        assert!(
+            !entry_stale.is_expired(base),
+            "recent last_accessed should not expire with 2x adaptive TTL"
+        );
+
+        let older_than_hot_ttl = Instant::now()
+            .checked_sub(Duration::from_mins(2) + Duration::from_secs(1))
+            .expect("2m1s subtraction should be representable");
+        let entry_expired = CacheEntry {
+            value: 42_i32,
+            last_accessed: older_than_hot_ttl,
+            access_count: ADAPTIVE_TTL_THRESHOLD,
+        };
+        assert!(
+            entry_expired.is_expired(base),
+            "entries older than adaptive TTL should expire"
+        );
     }
 
     #[test]

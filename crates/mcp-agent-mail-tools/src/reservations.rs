@@ -125,36 +125,33 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
 }
 
 fn relativize_path(project_root: &str, path: &str) -> Option<String> {
-    let normalized_slash = path.replace('\\', "/");
-    let path_path = std::path::Path::new(&normalized_slash);
-
-    let rel_path = if path_path.is_absolute() {
-        if let Ok(rel) = path_path.strip_prefix(project_root) {
-            rel
-        } else {
-            // Absolute path outside project root
-            return None;
-        }
-    } else {
-        path_path
-    };
-
-    let mut parts = Vec::new();
-    for component in rel_path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                // Traversal above root: reject path.
-                parts.pop()?;
+    fn normalize_parts(input: &str) -> Option<Vec<String>> {
+        let mut parts = Vec::new();
+        for piece in input.replace('\\', "/").split('/') {
+            match piece {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                other => parts.push(other.to_string()),
             }
-            std::path::Component::Normal(c) => {
-                parts.push(c.to_string_lossy().into_owned());
-            }
-            _ => {}
         }
+        Some(parts)
     }
 
-    // Return the relativized and safe path
-    Some(parts.join("/"))
+    let normalized_slash = path.replace('\\', "/");
+    let path_is_absolute = std::path::Path::new(&normalized_slash).is_absolute();
+
+    let path_parts = normalize_parts(&normalized_slash)?;
+    if path_is_absolute {
+        let root_parts = normalize_parts(project_root)?;
+        if path_parts.len() < root_parts.len() || path_parts[..root_parts.len()] != root_parts[..] {
+            return None;
+        }
+        return Some(path_parts[root_parts.len()..].join("/"));
+    }
+
+    Some(path_parts.join("/"))
 }
 
 fn normalize_filter_paths(
@@ -183,10 +180,10 @@ fn normalize_filter_paths(
                 return Err(legacy_tool_error(
                     "INVALID_PATH",
                     format!(
-                        "Path '{path}' is outside the project root '{project_root}'. File reservations must be within the project directory.",
+                        "Path '{path}' is outside the project root. File reservations must be within the project directory.",
                     ),
                     true,
-                    json!({ "path": path, "project_root": project_root }),
+                    json!({ "path": path }),
                 ));
             }
         }
@@ -333,11 +330,10 @@ pub async fn file_reservation_paths(
                 return Err(legacy_tool_error(
                     "INVALID_PATH",
                     format!(
-                        "Path '{p}' is outside the project root '{}'. File reservations must be within the project directory.",
-                        project.human_key
+                        "Path '{p}' is outside the project root. File reservations must be within the project directory.",
                     ),
                     true,
-                    json!({ "path": p, "project_root": project.human_key }),
+                    json!({ "path": p }),
                 ));
             }
         }
@@ -1589,6 +1585,10 @@ mod tests {
             relativize_path(root, "/project/src/../internal"),
             Some("internal".to_string())
         );
+        assert_eq!(
+            relativize_path(root, "/project/../project/src/main.rs"),
+            Some("src/main.rs".to_string())
+        );
     }
 
     #[test]
@@ -1617,7 +1617,11 @@ mod tests {
     fn normalize_filter_paths_rejects_absolute_outside_root() {
         let root = "/project";
         let err = normalize_filter_paths(root, Some(vec!["/other/main.rs".to_string()]));
-        assert!(err.is_err());
+        let rendered = err.expect_err("expected invalid path").to_string();
+        assert!(
+            !rendered.contains(root),
+            "error details must not leak absolute project root"
+        );
     }
 
     #[test]

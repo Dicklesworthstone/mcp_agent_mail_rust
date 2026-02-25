@@ -2200,6 +2200,7 @@ dependencies = [
  "fsqlite-vfs",
  "fsqlite-wal 0.1.1",
  "serde",
+ "serde_json",
  "tracing",
  "xxhash-rust",
 ]
@@ -2524,6 +2525,7 @@ dependencies = [
  "bitflags",
  "crossterm 0.29.0",
  "signal-hook 0.4.3",
+ "tracing",
  "unicode-display-width",
  "unicode-segmentation",
  "unicode-width",
@@ -2590,6 +2592,7 @@ dependencies = [
  "ftui-core",
  "memchr",
  "smallvec",
+ "tracing",
  "unicode-segmentation",
  "web-time",
 ]

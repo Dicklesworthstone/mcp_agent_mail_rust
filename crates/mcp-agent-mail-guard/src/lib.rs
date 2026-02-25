@@ -456,17 +456,53 @@ def get_active_reservations():
     except Exception:
         return []
 
+def core_ignorecase_enabled():
+    """Detect git core.ignorecase for path comparison parity with Rust guard."""
+    try:
+        res = subprocess.run(
+            ["git", "config", "--bool", "core.ignorecase"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            value = (res.stdout or "").strip().lower()
+            return value in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+    # Windows repositories are usually case-insensitive by default.
+    return os.name == "nt"
+
+CASE_INSENSITIVE_REPO = core_ignorecase_enabled()
+
+def normalize_match_input(value):
+    return value.lower() if CASE_INSENSITIVE_REPO else value
+
+def glob_to_regex(pattern):
+    """Convert shell-style glob to regex without corrupting '**' tokens."""
+    out = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "*":
+            if i + 1 < len(pattern) and pattern[i + 1] == "*":
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif ch == "?":
+            out.append(".")
+            i += 1
+        else:
+            out.append(re.escape(ch))
+            i += 1
+    return "".join(out)
+
 def glob_match(path, pattern):
     """Simple shell-style glob matching (similar to Rust implementation)."""
-    # Escape regex specials, then replace shell wildcards.
-    # *  -> [^/]* (non-recursive match)
-    # ** -> .*    (recursive match)
-    # ?  -> .     (single char)
-    regex = re.escape(pattern)
-    regex = regex.replace(r'\*\*', '.*')
-    regex = regex.replace(r'\*', '[^/]*')
-    regex = regex.replace(r'\?', '.')
-    return re.fullmatch(regex, path) is not None
+    path = normalize_match_input(path)
+    pattern = normalize_match_input(pattern)
+    return re.fullmatch(glob_to_regex(pattern), path) is not None
 
 def check_conflicts(paths, reservations):
     """Check if any paths conflict with active reservations."""
@@ -477,6 +513,9 @@ def check_conflicts(paths, reservations):
             holder = res.get("agent_name", "unknown")
             if holder == AGENT_NAME:
                 continue  # Skip our own reservations
+
+            normalized_f = normalize_match_input(f)
+            normalized_pattern = normalize_match_input(pattern)
             
             # Symmetric glob matching
             if glob_match(f, pattern) or glob_match(pattern, f):
@@ -484,14 +523,14 @@ def check_conflicts(paths, reservations):
                 break
             
             # Directory prefix matching for non-glob patterns
-            has_glob = any(c in pattern for c in "*?[{{")
+            has_glob = any(c in normalized_pattern for c in "*?[{{")
             if not has_glob:
                 # Normal prefix check: file is inside reserved dir
-                if f.startswith(pattern + "/"):
+                if normalized_f.startswith(normalized_pattern + "/"):
                     conflicts.append((f, pattern, holder))
                     break
                 # Reverse check: pattern is inside touched file (e.g. dir replaced by file)
-                if pattern.startswith(f + "/"):
+                if normalized_pattern.startswith(normalized_f + "/"):
                     conflicts.append((f, pattern, holder))
                     break
     return conflicts
@@ -2750,5 +2789,7 @@ mod tests {
         assert!(script.contains("PROJECT = \"/my/project\""));
         assert!(script.contains("get_staged_files"));
         assert!(script.contains("check_conflicts"));
+        assert!(script.contains("def glob_to_regex"));
+        assert!(script.contains("core.ignorecase"));
     }
 }

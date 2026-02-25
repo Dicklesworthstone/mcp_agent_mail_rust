@@ -2696,6 +2696,7 @@ fn handle_check_inbox(
 
         let config = CheckInboxRpcConfig {
             server_url,
+            server_urls: server_urls.clone(),
             bearer_token,
             project_key,
             agent_name: agent_name.clone(),
@@ -2825,7 +2826,19 @@ fn build_http_config(
     path: Option<String>,
     no_auth: bool,
 ) -> Config {
-    let mut config = Config::from_env();
+    let config = Config::from_env();
+    apply_http_config_overrides(config, host, port, path, no_auth)
+}
+
+fn apply_http_config_overrides(
+    mut config: Config,
+    host: Option<String>,
+    port: Option<u16>,
+    path: Option<String>,
+    no_auth: bool,
+) -> Config {
+    // Keep env and CLI semantics aligned (`HTTP_PATH=mcp` == `--path mcp`).
+    config.http_path = normalize_http_path(&config.http_path);
     if let Some(host) = host {
         config.http_host = host;
     }
@@ -9372,6 +9385,13 @@ mod tests {
         assert_eq!(cfg.project_key, "/tmp/proj");
         assert_eq!(cfg.agent_name, "BlueLake");
         assert_eq!(cfg.server_url, "http://127.0.0.1:8765/mcp/");
+        assert_eq!(
+            cfg.server_urls,
+            vec![
+                "http://127.0.0.1:8765/mcp/".to_string(),
+                "http://127.0.0.1:8765/api/".to_string(),
+            ]
+        );
         assert_eq!(cfg.bearer_token.as_deref(), Some("token-123"));
         assert_eq!(cfg.limit, 10);
         assert!(!cfg.include_bodies);
@@ -9390,6 +9410,50 @@ mod tests {
         let cfg = check_inbox_rpc_config_from_env_reader(|key| env.get(key).cloned())
             .expect("config should parse");
         assert_eq!(cfg.server_url, "http://127.0.0.1:8765/api/");
+        assert_eq!(
+            cfg.server_urls,
+            vec![
+                "http://127.0.0.1:8765/api/".to_string(),
+                "http://127.0.0.1:8765/mcp/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_inbox_rpc_config_does_not_alias_explicit_url_path() {
+        let env: HashMap<String, String> = HashMap::from_iter([
+            ("AGENT_MAIL_PROJECT".to_string(), "/tmp/proj".to_string()),
+            ("AGENT_MAIL_AGENT".to_string(), "BlueLake".to_string()),
+            (
+                "AGENT_MAIL_URL".to_string(),
+                "http://127.0.0.1:8765/custom/path".to_string(),
+            ),
+            ("HTTP_PATH".to_string(), "api".to_string()),
+        ]);
+
+        let cfg = check_inbox_rpc_config_from_env_reader(|key| env.get(key).cloned())
+            .expect("config should parse");
+        assert_eq!(cfg.server_url, "http://127.0.0.1:8765/custom/path/");
+        assert_eq!(
+            cfg.server_urls,
+            vec!["http://127.0.0.1:8765/custom/path/".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_agent_mail_url_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_agent_mail_url("http://127.0.0.1:8765/mcp?x=1#frag", "/api/"),
+            "http://127.0.0.1:8765/mcp/?x=1#frag"
+        );
+        assert_eq!(
+            normalize_agent_mail_url("127.0.0.1:8765?x=1#frag", "api"),
+            "http://127.0.0.1:8765/api/?x=1#frag"
+        );
+        assert_eq!(
+            normalize_agent_mail_url("https://host.local/path#anchor", "/api/"),
+            "https://host.local/path/#anchor"
+        );
     }
 
     #[test]
@@ -9406,6 +9470,7 @@ mod tests {
     fn build_fetch_inbox_request_uses_jsonrpc_tools_call_shape() {
         let cfg = CheckInboxRpcConfig {
             server_url: "http://127.0.0.1:8765/api/".to_string(),
+            server_urls: vec!["http://127.0.0.1:8765/api/".to_string()],
             bearer_token: Some("secret".to_string()),
             project_key: "/tmp/proj".to_string(),
             agent_name: "BlueLake".to_string(),
@@ -9616,6 +9681,16 @@ mod tests {
     fn serve_http_relative_path_is_normalized() {
         let config = build_http_config(None, None, Some("custom/path".to_string()), false);
         assert_eq!(config.http_path, "/custom/path/");
+    }
+
+    #[test]
+    fn apply_http_config_overrides_normalizes_env_path_when_no_cli_path() {
+        let config = Config {
+            http_path: "api".to_string(),
+            ..Config::default()
+        };
+        let normalized = apply_http_config_overrides(config, None, None, None, false);
+        assert_eq!(normalized.http_path, "/api/");
     }
 
     #[test]
@@ -21320,6 +21395,7 @@ fn products_http_client() -> &'static asupersync::http::h1::HttpClient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckInboxRpcConfig {
     pub server_url: String,
+    pub server_urls: Vec<String>,
     pub bearer_token: Option<String>,
     pub project_key: String,
     pub agent_name: String,
@@ -21482,17 +21558,70 @@ fn normalize_agent_mail_url(raw: &str, http_path: &str) -> String {
         format!("http://{base}")
     };
 
-    if let Some((scheme, rest)) = with_scheme.split_once("://")
-        && rest.contains('/')
-    {
-        let mut full = format!("{scheme}://{rest}");
-        if !full.ends_with('/') {
-            full.push('/');
+    let boundary = with_scheme
+        .find('?')
+        .into_iter()
+        .chain(with_scheme.find('#'))
+        .min()
+        .unwrap_or(with_scheme.len());
+    let (prefix, suffix) = with_scheme.split_at(boundary);
+
+    let has_path = prefix
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.contains('/'));
+    if has_path {
+        let mut normalized = prefix.to_string();
+        if !normalized.ends_with('/') {
+            normalized.push('/');
         }
-        return full;
+        normalized.push_str(suffix);
+        return normalized;
     }
+
     let normalized_path = normalize_http_path(http_path);
-    format!("{with_scheme}{normalized_path}")
+    format!("{prefix}{normalized_path}{suffix}")
+}
+
+fn check_inbox_server_urls_for_agent_mail_url(raw_url: &str, http_path: &str) -> Vec<String> {
+    let primary = normalize_agent_mail_url(raw_url, http_path);
+    let normalized_path = normalize_http_path(http_path);
+    let Some(alias_path) = mcp_base_alias_path(&normalized_path) else {
+        return vec![primary];
+    };
+
+    // Only alias host[:port] style URLs. If AGENT_MAIL_URL already has a path,
+    // respect that explicit path and do not synthesize /api <-> /mcp aliases.
+    let trimmed = raw_url.trim();
+    let base = if trimmed.is_empty() {
+        DEFAULT_AGENT_MAIL_URL.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let with_scheme = if base.starts_with("http://") || base.starts_with("https://") {
+        base
+    } else {
+        format!("http://{base}")
+    };
+    let boundary = with_scheme
+        .find('?')
+        .into_iter()
+        .chain(with_scheme.find('#'))
+        .min()
+        .unwrap_or(with_scheme.len());
+    let prefix = &with_scheme[..boundary];
+    let has_explicit_path = prefix
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.contains('/'));
+    if has_explicit_path {
+        return vec![primary];
+    }
+
+    let alias = normalize_agent_mail_url(raw_url, alias_path);
+    if alias == primary {
+        vec![primary]
+    } else {
+        vec![primary, alias]
+    }
 }
 
 fn check_inbox_rpc_config_from_env_reader<F>(read_env: F) -> Option<CheckInboxRpcConfig>
@@ -21507,13 +21636,18 @@ where
 
     let raw_url = read_env("AGENT_MAIL_URL").unwrap_or_else(|| DEFAULT_AGENT_MAIL_URL.to_string());
     let http_path = read_env("HTTP_PATH").unwrap_or_else(|| "/mcp/".to_string());
-    let server_url = normalize_agent_mail_url(&raw_url, &http_path);
+    let server_urls = check_inbox_server_urls_for_agent_mail_url(&raw_url, &http_path);
+    let server_url = server_urls
+        .first()
+        .cloned()
+        .unwrap_or_else(|| normalize_agent_mail_url(&raw_url, &http_path));
     let bearer_token = read_env("AGENT_MAIL_TOKEN")
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && !value_looks_like_template(v));
 
     Some(CheckInboxRpcConfig {
         server_url,
+        server_urls,
         bearer_token,
         project_key: project_key.trim().to_string(),
         agent_name: agent_name.trim().to_string(),
@@ -21681,38 +21815,49 @@ fn parse_fetch_inbox_rows(result_payload: serde_json::Value) -> CliResult<CheckI
 pub async fn fetch_inbox_via_jsonrpc(
     config: &CheckInboxRpcConfig,
 ) -> CliResult<CheckInboxRpcResult> {
-    let request = build_fetch_inbox_jsonrpc_request(config);
-    let payload = post_jsonrpc_request(
-        &config.server_url,
-        config.bearer_token.as_deref(),
-        &request,
-        config.timeout_seconds,
-    )
-    .await?;
-
-    if let Some(error_text) = parse_jsonrpc_error(&payload) {
-        return Err(CliError::Other(error_text));
+    let mut urls = Vec::with_capacity(config.server_urls.len() + 1);
+    urls.push(config.server_url.clone());
+    for url in &config.server_urls {
+        if !urls.iter().any(|existing| existing == url) {
+            urls.push(url.clone());
+        }
     }
 
-    let result = payload
-        .get("result")
-        .cloned()
-        .ok_or_else(|| CliError::Other("missing JSON-RPC result payload".to_string()))?;
-
-    parse_fetch_inbox_rows(result)
-}
-
-async fn fetch_inbox_via_jsonrpc_with_fallback(
-    config: &CheckInboxRpcConfig,
-    server_urls: &[String],
-) -> CliResult<CheckInboxRpcResult> {
     let mut last_error: Option<CliError> = None;
-    let mut attempt_config = config.clone();
+    for server_url in urls {
+        let request = build_fetch_inbox_jsonrpc_request(config);
+        let payload = match post_jsonrpc_request(
+            &server_url,
+            config.bearer_token.as_deref(),
+            &request,
+            config.timeout_seconds,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
 
-    for server_url in server_urls {
-        attempt_config.server_url = server_url.clone();
-        match fetch_inbox_via_jsonrpc(&attempt_config).await {
-            Ok(result) => return Ok(result),
+        if let Some(error_text) = parse_jsonrpc_error(&payload) {
+            last_error = Some(CliError::Other(error_text));
+            continue;
+        }
+
+        let result = match payload.get("result").cloned() {
+            Some(result) => result,
+            None => {
+                last_error = Some(CliError::Other(
+                    "missing JSON-RPC result payload".to_string(),
+                ));
+                continue;
+            }
+        };
+
+        match parse_fetch_inbox_rows(result) {
+            Ok(parsed) => return Ok(parsed),
             Err(error) => {
                 last_error = Some(error);
             }
@@ -21722,6 +21867,30 @@ async fn fetch_inbox_via_jsonrpc_with_fallback(
     Err(last_error.unwrap_or_else(|| {
         CliError::Other("no server URLs configured for check-inbox HTTP mode".to_string())
     }))
+}
+
+async fn fetch_inbox_via_jsonrpc_with_fallback(
+    config: &CheckInboxRpcConfig,
+    server_urls: &[String],
+) -> CliResult<CheckInboxRpcResult> {
+    let mut attempt_config = config.clone();
+    let mut merged = Vec::with_capacity(server_urls.len() + config.server_urls.len() + 1);
+    merged.push(config.server_url.clone());
+    for server_url in server_urls {
+        if !merged.iter().any(|existing| existing == server_url) {
+            merged.push(server_url.clone());
+        }
+    }
+    for server_url in &config.server_urls {
+        if !merged.iter().any(|existing| existing == server_url) {
+            merged.push(server_url.clone());
+        }
+    }
+    if let Some(primary) = merged.first() {
+        attempt_config.server_url = primary.clone();
+    }
+    attempt_config.server_urls = merged;
+    fetch_inbox_via_jsonrpc(&attempt_config).await
 }
 
 /// Configuration for direct DB inbox check (bypasses HTTP).

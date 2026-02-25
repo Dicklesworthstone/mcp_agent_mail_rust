@@ -714,10 +714,10 @@ pub enum OverlayLayer {
     ActionMenu = 3,
     /// Macro playback paused (z=4.4). Traps Enter/Esc.
     MacroPlayback = 4,
-    /// Modal dialog (z=4.5). Traps all events.
-    Modal = 5,
-    /// Compose message overlay (z=4.7). Traps all events.
-    Compose = 6,
+    /// Compose message overlay (z=4.5). Traps all events.
+    Compose = 5,
+    /// Modal dialog (z=4.7). Traps all events.
+    Modal = 6,
     /// Command palette (z=5). Traps all events.
     Palette = 7,
     /// Help overlay (z=6, topmost render). Traps Esc/j/k only.
@@ -2462,11 +2462,11 @@ impl MailAppModel {
         if self.command_palette.is_visible() {
             return OverlayLayer::Palette;
         }
-        if self.compose_state.is_some() {
-            return OverlayLayer::Compose;
-        }
         if self.modal_manager.is_active() {
             return OverlayLayer::Modal;
+        }
+        if self.compose_state.is_some() {
+            return OverlayLayer::Compose;
         }
         if self.action_menu.is_active() {
             return OverlayLayer::ActionMenu;
@@ -2492,11 +2492,16 @@ impl MailAppModel {
     #[must_use]
     fn adjust_diff_action_for_overlays(
         diff_action: crate::tui_decision::DiffAction,
+        active_screen: MailScreenId,
+        active_overlay: OverlayLayer,
     ) -> crate::tui_decision::DiffAction {
-        if diff_action == crate::tui_decision::DiffAction::Deferred {
-            // The dashboard and overlays paint focus/caret highlights directly
-            // into cells. Deferring a frame leaves stale highlight cells behind
-            // (visible as purple cursor trails), so promote to a real render.
+        if diff_action != crate::tui_decision::DiffAction::Deferred {
+            return diff_action;
+        }
+        // The dashboard and focus-trapping overlays paint focus/caret highlights
+        // directly into cells. Deferring a frame there leaves stale highlight
+        // cells behind (purple cursor trails), so promote only those cases.
+        if active_screen == MailScreenId::Dashboard || active_overlay.traps_focus() {
             return crate::tui_decision::DiffAction::Full;
         }
         diff_action
@@ -3368,7 +3373,13 @@ impl Model for MailAppModel {
                     return Cmd::none();
                 }
 
-                // Compose overlay (z=6, traps all)
+                // Modal (z=6, traps all) — intentionally above compose so
+                // compose-triggered confirmations remain interactive.
+                if self.modal_manager.handle_event(event) {
+                    return Cmd::none();
+                }
+
+                // Compose overlay (z=5, traps all)
                 if let Some(ref mut compose) = self.compose_state {
                     if let Event::Key(key) = event
                         && key.kind == KeyEventKind::Press
@@ -3414,11 +3425,6 @@ impl Model for MailAppModel {
                             }
                         }
                     }
-                    return Cmd::none();
-                }
-
-                // Modal (z=5, traps all)
-                if self.modal_manager.handle_event(event) {
                     return Cmd::none();
                 }
 
@@ -3916,6 +3922,8 @@ impl Model for MailAppModel {
         };
         let diff_action = Self::adjust_diff_action_for_overlays(
             self.diff_strategy.borrow_mut().observe(&frame_state),
+            self.screen_manager.active_screen(),
+            self.topmost_overlay(),
         );
         self.resize_detected.set(false);
 
@@ -4116,7 +4124,12 @@ impl Model for MailAppModel {
             render_export_format_menu(area, frame);
         }
 
-        // 4d. Modal dialogs (z=4.5, between toasts and command palette)
+        // 4d. Compose overlay (z=4.5, below modal and above action menu).
+        if let Some(ref compose) = self.compose_state {
+            ComposePanel::new(compose).render(area, frame, &self.state);
+        }
+
+        // 4e. Modal dialogs (z=4.7, above compose and below command palette)
         if self.modal_manager.is_active() {
             let modal_started = Instant::now();
             self.modal_manager.render(area, frame);
@@ -4125,11 +4138,6 @@ impl Model for MailAppModel {
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX);
-        }
-
-        // 4e. Compose overlay (z=4.7, between modal and palette)
-        if let Some(ref compose) = self.compose_state {
-            ComposePanel::new(compose).render(area, frame, &self.state);
         }
 
         // 5. Command palette (z=5, modal)
@@ -6888,8 +6896,31 @@ mod tests {
 
     #[test]
     fn compose_overlay_z_order_between_palette_and_modal() {
-        assert!(OverlayLayer::Compose > OverlayLayer::Modal);
+        assert!(OverlayLayer::Compose < OverlayLayer::Modal);
         assert!(OverlayLayer::Compose < OverlayLayer::Palette);
+    }
+
+    #[test]
+    fn compose_modal_takes_focus_and_escape_dismisses_modal_first() {
+        let mut model = test_model();
+        let open =
+            Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::CTRL));
+        let _ = model.update(MailMsg::Terminal(open));
+        assert!(model.compose_state.is_some());
+
+        model.modal_manager.show_confirmation(
+            "Discard Message",
+            "Discard?",
+            ModalSeverity::Warning,
+            |_| {},
+        );
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Modal);
+
+        // Escape should close the topmost modal, not the compose panel.
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        let _ = model.update(MailMsg::Terminal(esc));
+        assert!(!model.modal_manager.is_active());
+        assert!(model.compose_state.is_some());
     }
 
     #[test]
@@ -6935,15 +6966,53 @@ mod tests {
     }
 
     #[test]
-    fn deferred_diff_always_promotes_to_full_to_avoid_cursor_trails() {
+    fn deferred_diff_promotes_to_full_on_dashboard() {
         let deferred = crate::tui_decision::DiffAction::Deferred;
         let full = crate::tui_decision::DiffAction::Full;
 
         assert_eq!(
-            MailAppModel::adjust_diff_action_for_overlays(deferred),
+            MailAppModel::adjust_diff_action_for_overlays(
+                deferred,
+                MailScreenId::Dashboard,
+                OverlayLayer::None
+            ),
             full
         );
-        assert_eq!(MailAppModel::adjust_diff_action_for_overlays(full), full);
+        assert_eq!(
+            MailAppModel::adjust_diff_action_for_overlays(
+                full,
+                MailScreenId::Dashboard,
+                OverlayLayer::None
+            ),
+            full
+        );
+    }
+
+    #[test]
+    fn deferred_diff_promotes_to_full_with_focus_trapping_overlay() {
+        let deferred = crate::tui_decision::DiffAction::Deferred;
+
+        assert_eq!(
+            MailAppModel::adjust_diff_action_for_overlays(
+                deferred,
+                MailScreenId::Messages,
+                OverlayLayer::Modal
+            ),
+            crate::tui_decision::DiffAction::Full
+        );
+    }
+
+    #[test]
+    fn deferred_diff_stays_deferred_without_dashboard_or_focus_overlay() {
+        let deferred = crate::tui_decision::DiffAction::Deferred;
+        assert_eq!(
+            MailAppModel::adjust_diff_action_for_overlays(
+                deferred,
+                MailScreenId::Messages,
+                OverlayLayer::Toasts
+            ),
+            deferred
+        );
     }
 
     #[test]
@@ -10582,7 +10651,9 @@ mod tests {
         // higher value = higher z-order in event routing.
         assert!(OverlayLayer::Inspector > OverlayLayer::Palette);
         assert!(OverlayLayer::Palette > OverlayLayer::Modal);
-        assert!(OverlayLayer::Modal > OverlayLayer::ActionMenu);
+        assert!(OverlayLayer::Modal > OverlayLayer::Compose);
+        assert!(OverlayLayer::Compose > OverlayLayer::MacroPlayback);
+        assert!(OverlayLayer::MacroPlayback > OverlayLayer::ActionMenu);
         assert!(OverlayLayer::ActionMenu > OverlayLayer::ToastFocus);
         assert!(OverlayLayer::ToastFocus > OverlayLayer::Toasts);
         assert!(OverlayLayer::Toasts > OverlayLayer::None);
@@ -11353,11 +11424,12 @@ mod tests {
     #[test]
     fn palette_above_modal_above_action_menu() {
         // Verify full z-order chain:
-        // Inspector > Help > Palette > Modal > MacroPlayback > ActionMenu > ToastFocus > Toasts > None
+        // Inspector > Help > Palette > Modal > Compose > MacroPlayback > ActionMenu > ToastFocus > Toasts > None
         assert!(OverlayLayer::Inspector > OverlayLayer::Help);
         assert!(OverlayLayer::Help > OverlayLayer::Palette);
         assert!(OverlayLayer::Palette > OverlayLayer::Modal);
-        assert!(OverlayLayer::Modal > OverlayLayer::MacroPlayback);
+        assert!(OverlayLayer::Modal > OverlayLayer::Compose);
+        assert!(OverlayLayer::Compose > OverlayLayer::MacroPlayback);
         assert!(OverlayLayer::MacroPlayback > OverlayLayer::ActionMenu);
         assert!(OverlayLayer::ActionMenu > OverlayLayer::ToastFocus);
         assert!(OverlayLayer::ToastFocus > OverlayLayer::Toasts);
