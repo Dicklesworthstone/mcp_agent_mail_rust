@@ -101,6 +101,13 @@ target-rch-release/
 target-rch*/
 .rch-release-bin/
 .rch-release-root/
+.rch-target/
+.rch-deploy-root/
+rch-bin/
+rch-install/
+
+# Agent mail project identity
+.agent-mail-project-id
 
 # Vendored dependencies (local overrides)
 vendor/
