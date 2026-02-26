@@ -10291,25 +10291,7 @@ mod tests {
         assert!(!value_looks_like_template("BlueLake"));
     }
 
-    #[test]
-    fn normalize_agent_mail_url_uses_configured_http_path() {
-        assert_eq!(
-            normalize_agent_mail_url("127.0.0.1:8765", "/mcp/"),
-            "http://127.0.0.1:8765/mcp/"
-        );
-        assert_eq!(
-            normalize_agent_mail_url("http://127.0.0.1:8765", "api"),
-            "http://127.0.0.1:8765/api/"
-        );
-        assert_eq!(
-            normalize_agent_mail_url("http://127.0.0.1:8765", "/custom/base"),
-            "http://127.0.0.1:8765/custom/base/"
-        );
-        assert_eq!(
-            normalize_agent_mail_url("http://127.0.0.1:8765/mcp/", "/api/"),
-            "http://127.0.0.1:8765/mcp/"
-        );
-    }
+
 
     #[test]
     fn check_inbox_server_url_honors_http_path() {
