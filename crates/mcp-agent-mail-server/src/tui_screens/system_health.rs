@@ -506,29 +506,7 @@ impl SystemHealthScreen {
         }
 
         // ── Remote access banner (Tailscale) ──
-        let content_area = if let Some(ref url) = snap.remote_url {
-            let tp = crate::tui_theme::TuiThemePalette::current();
-            let remote_style = crate::tui_theme::text_accent(&tp).bold();
-            let label_style = crate::tui_theme::text_meta(&tp);
-            let hint_style = crate::tui_theme::text_hint(&tp);
-            let line = Line::from_spans([
-                Span::styled(" Remote: ", label_style),
-                Span::styled(url.clone(), remote_style),
-                Span::styled("  (Tailscale)", hint_style),
-            ]);
-            Paragraph::new(line).render(
-                Rect::new(content_area.x, content_area.y, content_area.width, 1),
-                frame,
-            );
-            Rect::new(
-                content_area.x,
-                content_area.y.saturating_add(1),
-                content_area.width,
-                content_area.height.saturating_sub(1),
-            )
-        } else {
-            content_area
-        };
+        let content_area = render_remote_url_banner(frame, content_area, &snap);
 
         // Adaptive width-class layout policy:
         //   Wide  (>= 80 cols): tiles (3h) + gauge (3h) + anomaly cards (rest)
@@ -1235,6 +1213,38 @@ fn render_probing_indicator(
             .style(crate::tui_theme::text_warning(&tp))
             .render(render_area, frame);
     }
+}
+
+/// Render a prominent Tailscale remote-access URL banner at the top of the
+/// area, returning the remaining area below. Returns `area` unchanged when
+/// no Tailscale URL is available.
+fn render_remote_url_banner(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snap: &DiagnosticsSnapshot,
+) -> Rect {
+    let Some(ref url) = snap.remote_url else {
+        return area;
+    };
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let remote_style = crate::tui_theme::text_accent(&tp).bold();
+    let label_style = crate::tui_theme::text_meta(&tp);
+    let hint_style = crate::tui_theme::text_hint(&tp);
+    let line = Line::from_spans([
+        Span::styled(" Remote: ", label_style),
+        Span::styled(url.clone(), remote_style),
+        Span::styled("  (Tailscale)", hint_style),
+    ]);
+    Paragraph::new(line).render(
+        Rect::new(area.x, area.y, area.width, 1),
+        frame,
+    );
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    )
 }
 
 fn diagnostics_worker_loop(
