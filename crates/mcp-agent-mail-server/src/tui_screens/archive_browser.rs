@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ftui::layout::{Constraint, Flex, Rect};
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -235,6 +235,8 @@ pub struct ArchiveBrowserScreen {
     selected_project: Option<String>,
     /// Last tick when entries were refreshed.
     last_refresh_tick: u64,
+    /// Whether the preview panel is visible on wide screens (user toggle).
+    detail_visible: bool,
 }
 
 impl ArchiveBrowserScreen {
@@ -253,6 +255,7 @@ impl ArchiveBrowserScreen {
             filter_active: false,
             selected_project: None,
             last_refresh_tick: 0,
+            detail_visible: true,
         }
     }
 
@@ -808,6 +811,9 @@ impl ArchiveBrowserScreen {
 
     fn handle_tree_key(&mut self, key_code: KeyCode, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         match key_code {
+            KeyCode::Char('i') => {
+                self.detail_visible = !self.detail_visible;
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
                 self.load_preview();
@@ -947,88 +953,77 @@ impl MailScreen for ArchiveBrowserScreen {
         let content_h = area.height.saturating_sub(footer_h);
         let content_area = Rect::new(area.x, area.y, area.width, content_h);
 
-        // Responsive tree/preview split
-        let wide = area.width >= 120;
-        let narrow = area.width < 60;
-
-        let (tree_pct, preview_pct) = if narrow {
-            // Very narrow: tree only, no preview
-            (100.0, 0.0)
-        } else if wide {
-            // Wide: tree 35%, preview 65%
-            (35.0, 65.0)
+        // Responsive tree/preview split using ResponsiveLayout breakpoints.
+        // Xs–Sm (< 90): tree only. Md (90–119): 45/55. Lg (120–159): 40/60. Xl (160+): 35/65.
+        let layout = if self.detail_visible {
+            ResponsiveLayout::new(
+                Flex::vertical().constraints([Constraint::Fill]),
+            )
+            .at(
+                Breakpoint::Md,
+                Flex::horizontal().constraints([
+                    Constraint::Percentage(45.0),
+                    Constraint::Percentage(55.0),
+                ]),
+            )
+            .at(
+                Breakpoint::Lg,
+                Flex::horizontal().constraints([
+                    Constraint::Percentage(40.0),
+                    Constraint::Percentage(60.0),
+                ]),
+            )
+            .at(
+                Breakpoint::Xl,
+                Flex::horizontal().constraints([
+                    Constraint::Percentage(35.0),
+                    Constraint::Percentage(65.0),
+                ]),
+            )
         } else {
-            // Medium: tree 40%, preview 60% (original)
-            (40.0, 60.0)
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
         };
 
-        if narrow {
-            // Tree only mode
-            if self.filter_active {
-                let tree_chunks = Flex::vertical()
-                    .constraints([Constraint::Min(3), Constraint::Fixed(3)])
-                    .split(content_area);
+        let split = layout.split(content_area);
+        let tree_area = split.rects[0];
+        let has_preview = split.rects.len() >= 2;
 
-                self.render_tree(frame, tree_chunks[0], state);
+        // Render tree pane (with optional filter bar)
+        if self.filter_active {
+            let tree_chunks = Flex::vertical()
+                .constraints([Constraint::Min(3), Constraint::Fixed(3)])
+                .split(tree_area);
 
-                // Filter bar
-                let tp = TuiThemePalette::current();
-                let filter_block = Block::bordered()
-                    .title(" Filter: ")
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(tp.metric_reservations));
-                let inner = filter_block.inner(tree_chunks[1]);
-                filter_block.render(tree_chunks[1], frame);
-                let filter_text = Paragraph::new(format!("{}\u{258e}", self.filter));
-                filter_text.render(inner, frame);
-            } else {
-                self.render_tree(frame, content_area, state);
-            }
+            self.render_tree(frame, tree_chunks[0], state);
+
+            let tp = TuiThemePalette::current();
+            let filter_block = Block::bordered()
+                .title(" Filter: ")
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(tp.metric_reservations));
+            let inner = filter_block.inner(tree_chunks[1]);
+            filter_block.render(tree_chunks[1], frame);
+            let filter_text = Paragraph::new(format!("{}\u{258e}", self.filter));
+            filter_text.render(inner, frame);
         } else {
-            // Two-pane layout
-            let chunks = Flex::horizontal()
-                .constraints([
-                    Constraint::Percentage(tree_pct),
-                    Constraint::Percentage(preview_pct),
-                ])
-                .split(content_area);
+            self.render_tree(frame, tree_area, state);
+        }
 
-            let tree_area = chunks[0];
-            let mut preview_area = chunks[1];
+        // Render preview pane (Md+)
+        if has_preview {
+            let mut preview_area = split.rects[1];
             let split_gap = u16::from(content_area.width >= ARCHIVE_SPLIT_GAP_THRESHOLD);
             if split_gap > 0 && preview_area.width > split_gap {
                 preview_area.x = preview_area.x.saturating_add(split_gap);
                 preview_area.width = preview_area.width.saturating_sub(split_gap);
                 let splitter_area = Rect::new(
-                    chunks[0].x.saturating_add(chunks[0].width),
+                    tree_area.x.saturating_add(tree_area.width),
                     content_area.y,
                     split_gap,
                     content_area.height,
                 );
                 render_splitter_handle(frame, splitter_area, false);
             }
-
-            if self.filter_active {
-                let tree_chunks = Flex::vertical()
-                    .constraints([Constraint::Min(3), Constraint::Fixed(3)])
-                    .split(tree_area);
-
-                self.render_tree(frame, tree_chunks[0], state);
-
-                // Filter bar
-                let tp = TuiThemePalette::current();
-                let filter_block = Block::bordered()
-                    .title(" Filter: ")
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(tp.metric_reservations));
-                let inner = filter_block.inner(tree_chunks[1]);
-                filter_block.render(tree_chunks[1], frame);
-                let filter_text = Paragraph::new(format!("{}\u{258e}", self.filter));
-                filter_text.render(inner, frame);
-            } else {
-                self.render_tree(frame, tree_area, state);
-            }
-
             self.render_preview(frame, preview_area);
         }
 
@@ -1098,6 +1093,10 @@ impl MailScreen for ArchiveBrowserScreen {
             HelpEntry {
                 key: "Ctrl+D/U",
                 action: "Page down/up (preview)",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle preview panel",
             },
         ]
     }

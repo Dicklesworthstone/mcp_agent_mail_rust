@@ -6,7 +6,7 @@
 
 use core::cell::Cell;
 
-use ftui::layout::{Constraint, Rect};
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -29,6 +29,7 @@ use crate::tui_widgets::fancy::SummaryFooter;
 const REFRESH_INTERVAL_TICKS: u64 = 50;
 const PERSISTED_TOOL_METRIC_LIMIT: usize = 128;
 const ANALYTICS_SUMMARY_MIN_HEIGHT: u16 = 8;
+#[allow(dead_code)]
 const ANALYTICS_WIDE_SPLIT_MIN_WIDTH: u16 = 110;
 const ANALYTICS_WIDE_SPLIT_MIN_HEIGHT: u16 = 10;
 const ANALYTICS_STACKED_MIN_HEIGHT: u16 = 14;
@@ -38,8 +39,11 @@ const ANALYTICS_COMPACT_META_MIN_WIDTH: u16 = 36;
 const ANALYTICS_DETAIL_LENS_MIN_HEIGHT: u16 = 20;
 const ANALYTICS_DETAIL_LENS_MIN_WIDTH: u16 = 52;
 const ANALYTICS_DETAIL_LENS_RATIO_PERCENT: u16 = 34;
+#[allow(dead_code)]
 const ANALYTICS_WIDE_LIST_RATIO_PERCENT: u16 = 38;
+#[allow(dead_code)]
 const ANALYTICS_WIDE_LIST_MIN_WIDTH: u16 = 34;
+#[allow(dead_code)]
 const ANALYTICS_WIDE_DETAIL_MIN_WIDTH: u16 = 42;
 const ANALYTICS_STATUS_STRIP_MIN_HEIGHT: u16 = 7;
 const ANALYTICS_VIZ_TOP_TOOLS: usize = 8;
@@ -162,6 +166,8 @@ pub struct AnalyticsScreen {
     /// Cached viz snapshot — rebuilt in `tick()`, read in `view()`.
     /// Prevents `view()` from doing I/O (DB queries, connection opens) every frame.
     cached_viz: AnalyticsVizSnapshot,
+    /// Whether the user has toggled the detail panel visible (`i` key).
+    detail_visible: bool,
 }
 
 impl AnalyticsScreen {
@@ -186,6 +192,7 @@ impl AnalyticsScreen {
             focus: AnalyticsFocus::List,
             detail_focus_available: Cell::new(false),
             cached_viz: AnalyticsVizSnapshot::default(),
+            detail_visible: true,
         }
     }
 
@@ -1993,6 +2000,10 @@ impl MailScreen for AnalyticsScreen {
         }
 
         match key.code {
+            KeyCode::Char('i') => {
+                self.detail_visible = !self.detail_visible;
+                Cmd::None
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.focus == AnalyticsFocus::List || !self.detail_focus_available.get() {
                     self.focus = AnalyticsFocus::List;
@@ -2221,210 +2232,212 @@ impl MailScreen for AnalyticsScreen {
         let mut table_state = self.table_state.clone();
         let selected_card = active_cards[selected];
 
-        let wide_split = content.width >= ANALYTICS_WIDE_SPLIT_MIN_WIDTH
+        // ── Wide split via ResponsiveLayout ──
+        let rl_layout = if self.detail_visible {
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                .at(
+                    Breakpoint::Lg,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(35.0), Constraint::Fill]),
+                )
+                .at(
+                    Breakpoint::Xl,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(28.0), Constraint::Fill]),
+                )
+        } else {
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+        };
+        let rl_split = rl_layout.split(content);
+        let wide_split = rl_split.rects.len() >= 2
+            && self.detail_visible
             && content.height >= ANALYTICS_WIDE_SPLIT_MIN_HEIGHT;
         if wide_split {
-            let list_ratio_percent = if active_cards.len() <= 2 {
-                28
-            } else if active_cards.len() <= 4 {
-                33
-            } else {
-                ANALYTICS_WIDE_LIST_RATIO_PERCENT
-            };
+            self.detail_focus_available.set(true);
+            let list_area = rl_split.rects[0];
+            let raw_detail = rl_split.rects[1];
             let gap = u16::from(content.width >= 96);
-            let mut list_w = content.width.saturating_mul(list_ratio_percent) / 100;
-            list_w = list_w.max(ANALYTICS_WIDE_LIST_MIN_WIDTH);
-            let max_list_w = content
-                .width
-                .saturating_sub(ANALYTICS_WIDE_DETAIL_MIN_WIDTH.saturating_add(gap));
-            list_w = list_w.min(max_list_w);
-            if list_w > 0 && list_w < content.width {
-                let detail_w = content.width.saturating_sub(list_w.saturating_add(gap));
-                if detail_w >= ANALYTICS_WIDE_DETAIL_MIN_WIDTH {
-                    self.detail_focus_available.set(true);
-                    let list_area = Rect::new(content.x, content.y, list_w, content.height);
-                    let detail_area = Rect::new(
-                        content.x.saturating_add(list_w).saturating_add(gap),
-                        content.y,
-                        detail_w,
-                        content.height,
-                    );
-                    if gap > 0 {
-                        let splitter_area = Rect::new(
-                            content.x.saturating_add(list_w),
-                            content.y,
-                            gap,
-                            content.height,
-                        );
-                        render_splitter_handle(
-                            frame,
-                            splitter_area,
-                            true,
-                            self.focus == AnalyticsFocus::List,
-                        );
-                    }
-                    render_card_list(
-                        frame,
-                        list_area,
-                        &active_cards,
-                        selected,
-                        &mut table_state,
-                        self.severity_filter,
-                        self.sort_mode,
-                        self.feed.alerts_processed,
-                        true,
-                        self.focus,
-                    );
-                    let embed_detail_viz =
-                        viz_band_h == 0 && detail_area.height >= 18 && detail_area.width >= 52;
-                    let embed_context_lens = viz_band_h > 0
-                        && detail_area.height >= ANALYTICS_DETAIL_LENS_MIN_HEIGHT
-                        && detail_area.width >= ANALYTICS_DETAIL_LENS_MIN_WIDTH;
-                    if embed_detail_viz {
-                        let detail_gap = u16::from(detail_area.height >= 24);
-                        let detail_main_h = detail_area
-                            .height
-                            .saturating_mul(62)
-                            .saturating_div(100)
-                            .clamp(
-                                10,
-                                detail_area
-                                    .height
-                                    .saturating_sub(7)
-                                    .saturating_sub(detail_gap),
-                            );
-                        let detail_main = Rect::new(
-                            detail_area.x,
-                            detail_area.y,
-                            detail_area.width,
-                            detail_main_h,
-                        );
-                        if detail_gap > 0 {
-                            let splitter_area = Rect::new(
-                                detail_area.x,
-                                detail_area.y.saturating_add(detail_main_h),
-                                detail_area.width,
-                                detail_gap,
-                            );
-                            render_splitter_handle(
-                                frame,
-                                splitter_area,
-                                false,
-                                self.focus == AnalyticsFocus::Detail,
-                            );
-                        }
-                        let detail_viz = Rect::new(
-                            detail_area.x,
-                            detail_area
-                                .y
-                                .saturating_add(detail_main_h)
-                                .saturating_add(detail_gap),
-                            detail_area.width,
-                            detail_area
-                                .height
-                                .saturating_sub(detail_main_h)
-                                .saturating_sub(detail_gap),
-                        );
-                        render_card_detail(
-                            frame,
-                            detail_main,
-                            selected_card,
-                            self.detail_scroll,
-                            self.focus,
-                        );
-                        render_runtime_viz_fallback(
-                            frame,
-                            detail_viz,
-                            runtime_snapshot,
-                            self.focus,
-                            self.severity_filter,
-                            self.sort_mode,
-                        );
-                    } else if embed_context_lens {
-                        let detail_gap = u16::from(detail_area.height >= 24);
-                        let mut lens_h = detail_area
-                            .height
-                            .saturating_mul(ANALYTICS_DETAIL_LENS_RATIO_PERCENT)
-                            / 100;
-                        lens_h = lens_h.max(6);
-                        let max_lens_h = detail_area
-                            .height
-                            .saturating_sub(8)
-                            .saturating_sub(detail_gap)
-                            .max(1);
-                        lens_h = lens_h.min(max_lens_h);
-                        let detail_main_h = detail_area
-                            .height
-                            .saturating_sub(lens_h)
-                            .saturating_sub(detail_gap)
-                            .max(1);
-                        let detail_main = Rect::new(
-                            detail_area.x,
-                            detail_area.y,
-                            detail_area.width,
-                            detail_main_h,
-                        );
-                        if detail_gap > 0 {
-                            let splitter_area = Rect::new(
-                                detail_area.x,
-                                detail_area.y.saturating_add(detail_main_h),
-                                detail_area.width,
-                                detail_gap,
-                            );
-                            render_splitter_handle(
-                                frame,
-                                splitter_area,
-                                false,
-                                self.focus == AnalyticsFocus::Detail,
-                            );
-                        }
-                        let lens_area = Rect::new(
-                            detail_area.x,
-                            detail_area
-                                .y
-                                .saturating_add(detail_main_h)
-                                .saturating_add(detail_gap),
-                            detail_area.width,
-                            detail_area
-                                .height
-                                .saturating_sub(detail_main_h)
-                                .saturating_sub(detail_gap),
-                        );
-                        render_card_detail(
-                            frame,
-                            detail_main,
-                            selected_card,
-                            self.detail_scroll,
-                            self.focus,
-                        );
-                        render_context_lens(frame, lens_area, selected_card, runtime_snapshot);
-                    } else {
-                        render_card_detail(
-                            frame,
-                            detail_area,
-                            selected_card,
-                            self.detail_scroll,
-                            self.focus,
-                        );
-                    }
-                    if status_h > 0 {
-                        render_status_strip(
-                            frame,
-                            status_area,
-                            self.focus,
-                            self.severity_filter,
-                            self.sort_mode,
-                            active_cards.len(),
-                            self.feed.cards.len(),
-                            true,
-                        );
-                    }
-                    return;
-                }
+            let detail_area = Rect::new(
+                raw_detail.x.saturating_add(gap),
+                raw_detail.y,
+                raw_detail.width.saturating_sub(gap),
+                raw_detail.height,
+            );
+            if gap > 0 {
+                let splitter_area = Rect::new(
+                    raw_detail.x,
+                    raw_detail.y,
+                    gap,
+                    content.height,
+                );
+                render_splitter_handle(
+                    frame,
+                    splitter_area,
+                    true,
+                    self.focus == AnalyticsFocus::List,
+                );
             }
+            render_card_list(
+                frame,
+                list_area,
+                &active_cards,
+                selected,
+                &mut table_state,
+                self.severity_filter,
+                self.sort_mode,
+                self.feed.alerts_processed,
+                true,
+                self.focus,
+            );
+            let embed_detail_viz =
+                viz_band_h == 0 && detail_area.height >= 18 && detail_area.width >= 52;
+            let embed_context_lens = viz_band_h > 0
+                && detail_area.height >= ANALYTICS_DETAIL_LENS_MIN_HEIGHT
+                && detail_area.width >= ANALYTICS_DETAIL_LENS_MIN_WIDTH;
+            if embed_detail_viz {
+                let detail_gap = u16::from(detail_area.height >= 24);
+                let detail_main_h = detail_area
+                    .height
+                    .saturating_mul(62)
+                    .saturating_div(100)
+                    .clamp(
+                        10,
+                        detail_area
+                            .height
+                            .saturating_sub(7)
+                            .saturating_sub(detail_gap),
+                    );
+                let detail_main = Rect::new(
+                    detail_area.x,
+                    detail_area.y,
+                    detail_area.width,
+                    detail_main_h,
+                );
+                if detail_gap > 0 {
+                    let splitter_area = Rect::new(
+                        detail_area.x,
+                        detail_area.y.saturating_add(detail_main_h),
+                        detail_area.width,
+                        detail_gap,
+                    );
+                    render_splitter_handle(
+                        frame,
+                        splitter_area,
+                        false,
+                        self.focus == AnalyticsFocus::Detail,
+                    );
+                }
+                let detail_viz = Rect::new(
+                    detail_area.x,
+                    detail_area
+                        .y
+                        .saturating_add(detail_main_h)
+                        .saturating_add(detail_gap),
+                    detail_area.width,
+                    detail_area
+                        .height
+                        .saturating_sub(detail_main_h)
+                        .saturating_sub(detail_gap),
+                );
+                render_card_detail(
+                    frame,
+                    detail_main,
+                    selected_card,
+                    self.detail_scroll,
+                    self.focus,
+                );
+                render_runtime_viz_fallback(
+                    frame,
+                    detail_viz,
+                    runtime_snapshot,
+                    self.focus,
+                    self.severity_filter,
+                    self.sort_mode,
+                );
+            } else if embed_context_lens {
+                let detail_gap = u16::from(detail_area.height >= 24);
+                let mut lens_h = detail_area
+                    .height
+                    .saturating_mul(ANALYTICS_DETAIL_LENS_RATIO_PERCENT)
+                    / 100;
+                lens_h = lens_h.max(6);
+                let max_lens_h = detail_area
+                    .height
+                    .saturating_sub(8)
+                    .saturating_sub(detail_gap)
+                    .max(1);
+                lens_h = lens_h.min(max_lens_h);
+                let detail_main_h = detail_area
+                    .height
+                    .saturating_sub(lens_h)
+                    .saturating_sub(detail_gap)
+                    .max(1);
+                let detail_main = Rect::new(
+                    detail_area.x,
+                    detail_area.y,
+                    detail_area.width,
+                    detail_main_h,
+                );
+                if detail_gap > 0 {
+                    let splitter_area = Rect::new(
+                        detail_area.x,
+                        detail_area.y.saturating_add(detail_main_h),
+                        detail_area.width,
+                        detail_gap,
+                    );
+                    render_splitter_handle(
+                        frame,
+                        splitter_area,
+                        false,
+                        self.focus == AnalyticsFocus::Detail,
+                    );
+                }
+                let lens_area = Rect::new(
+                    detail_area.x,
+                    detail_area
+                        .y
+                        .saturating_add(detail_main_h)
+                        .saturating_add(detail_gap),
+                    detail_area.width,
+                    detail_area
+                        .height
+                        .saturating_sub(detail_main_h)
+                        .saturating_sub(detail_gap),
+                );
+                render_card_detail(
+                    frame,
+                    detail_main,
+                    selected_card,
+                    self.detail_scroll,
+                    self.focus,
+                );
+                render_context_lens(frame, lens_area, selected_card, runtime_snapshot);
+            } else {
+                render_card_detail(
+                    frame,
+                    detail_area,
+                    selected_card,
+                    self.detail_scroll,
+                    self.focus,
+                );
+            }
+            if status_h > 0 {
+                render_status_strip(
+                    frame,
+                    status_area,
+                    self.focus,
+                    self.severity_filter,
+                    self.sort_mode,
+                    active_cards.len(),
+                    self.feed.cards.len(),
+                    true,
+                );
+            }
+            return;
         }
 
-        let stacked_detail = content.height >= ANALYTICS_STACKED_MIN_HEIGHT
+        let stacked_detail = self.detail_visible
+            && content.height >= ANALYTICS_STACKED_MIN_HEIGHT
             && content.height
                 >= ANALYTICS_STACKED_LIST_MIN_HEIGHT
                     .saturating_add(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT);
@@ -2617,6 +2630,10 @@ impl MailScreen for AnalyticsScreen {
 
     fn keybindings(&self) -> Vec<HelpEntry> {
         vec![
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
+            },
             HelpEntry {
                 key: "j/k",
                 action: "Move focused panel",

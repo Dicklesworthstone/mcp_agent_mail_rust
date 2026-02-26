@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use ftui::layout::Constraint;
-use ftui::layout::Rect;
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -128,6 +127,7 @@ impl StatusFilter {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct ContactsScreen {
     table_state: TableState,
     contacts: Vec<ContactSummary>,
@@ -145,6 +145,8 @@ pub struct ContactsScreen {
     mermaid_last_render_at: RefCell<Option<Instant>>,
     /// Previous contact counts for `MetricTrend` computation.
     prev_contact_counts: (u64, u64, u64, u64),
+    detail_visible: bool,
+    detail_scroll: usize,
 }
 
 impl ContactsScreen {
@@ -165,6 +167,8 @@ impl ContactsScreen {
             mermaid_cache: RefCell::new(None),
             mermaid_last_render_at: RefCell::new(None),
             prev_contact_counts: (0, 0, 0, 0),
+            detail_visible: true,
+            detail_scroll: 0,
         }
     }
 
@@ -270,6 +274,7 @@ impl ContactsScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
+        self.detail_scroll = 0;
     }
 
     fn move_graph_selection(&mut self, delta: isize) {
@@ -388,6 +393,15 @@ impl ContactsScreen {
                 self.sort_asc = !self.sort_asc;
                 self.rebuild_from_state(state);
             }
+            KeyCode::Char('i') => {
+                self.detail_visible = !self.detail_visible;
+            }
+            KeyCode::Char('J') => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1);
+            }
+            KeyCode::Char('K') => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            }
             KeyCode::Escape => {
                 if self.show_mermaid_panel {
                     self.show_mermaid_panel = false;
@@ -432,7 +446,7 @@ impl MailScreen for ContactsScreen {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 3 || area.width < 20 {
             return;
@@ -446,31 +460,52 @@ impl MailScreen for ContactsScreen {
 
         let is_table_mode = self.view_mode == ViewMode::Table && !self.show_mermaid_panel;
 
+        // ── Responsive split for table mode ────────────────────────────
+        // On Lg+: table + side detail panel; on Xl: table + graph visualization
+        let split = if is_table_mode && self.detail_visible {
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                .at(
+                    Breakpoint::Lg,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(55.0), Constraint::Fill]),
+                )
+                .at(
+                    Breakpoint::Xl,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(45.0), Constraint::Fill]),
+                )
+                .split(area)
+        } else {
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill])).split(area)
+        };
+
+        let main_area = split.rects[0];
+
         // Layout depends on mode: Table gets summary band + footer, Graph/Mermaid maximize canvas
-        let summary_h: u16 = if is_table_mode && area.height >= 10 {
+        let summary_h: u16 = if is_table_mode && main_area.height >= 10 {
             2
         } else {
             0
         };
         let header_h: u16 = 1;
-        let footer_h: u16 = u16::from(is_table_mode && area.height >= 6);
-        let table_h = area
+        let footer_h: u16 = u16::from(is_table_mode && main_area.height >= 6);
+        let table_h = main_area
             .height
             .saturating_sub(summary_h)
             .saturating_sub(header_h)
             .saturating_sub(footer_h);
 
-        let mut y = area.y;
+        let mut y = main_area.y;
 
         // ── Summary band (Table view only) ─────────────────────────────
         if summary_h > 0 {
-            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            let summary_area = Rect::new(main_area.x, y, main_area.width, summary_h);
             self.render_summary_band(frame, summary_area);
             y += summary_h;
         }
 
         // ── Info header ────────────────────────────────────────────────
-        let header_area = Rect::new(area.x, y, area.width, header_h);
+        let header_area = Rect::new(main_area.x, y, main_area.width, header_h);
         y += header_h;
 
         let sort_indicator = if self.sort_asc {
@@ -498,7 +533,7 @@ impl MailScreen for ContactsScreen {
         p.render(header_area, frame);
 
         // ── Main content area ──────────────────────────────────────────
-        let content_area = Rect::new(area.x, y, area.width, table_h);
+        let content_area = Rect::new(main_area.x, y, main_area.width, table_h);
         y += table_h;
 
         let graph_mode_active = self.view_mode == ViewMode::Graph || self.show_mermaid_panel;
@@ -522,8 +557,29 @@ impl MailScreen for ContactsScreen {
 
         // ── Footer summary (Table view only) ───────────────────────────
         if footer_h > 0 {
-            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            let footer_area = Rect::new(main_area.x, y, main_area.width, footer_h);
             self.render_footer(frame, footer_area);
+        }
+
+        // ── Side detail panel (Lg+) ────────────────────────────────────
+        if split.rects.len() >= 2 && is_table_mode && self.detail_visible {
+            let detail_area = split.rects[1];
+            if split.breakpoint >= Breakpoint::Xl {
+                // On Xl: show graph visualization in the side panel
+                let graph_events = state.recent_events(GRAPH_EVENTS_WINDOW);
+                let graph_metrics =
+                    build_graph_flow_metrics(&self.contacts, &graph_events);
+                if detail_area.width >= GRAPH_MIN_WIDTH
+                    && detail_area.height >= GRAPH_MIN_HEIGHT
+                {
+                    self.render_graph(frame, detail_area, &graph_metrics);
+                } else {
+                    self.render_contact_detail_panel(frame, detail_area);
+                }
+            } else {
+                // On Lg: show text detail panel
+                self.render_contact_detail_panel(frame, detail_area);
+            }
         }
     }
 
@@ -560,6 +616,14 @@ impl MailScreen for ContactsScreen {
             HelpEntry {
                 key: "S",
                 action: "Toggle sort order",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
+            },
+            HelpEntry {
+                key: "J/K",
+                action: "Scroll detail panel",
             },
             HelpEntry {
                 key: "Esc",
@@ -899,6 +963,94 @@ impl ContactsScreen {
         ];
 
         SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+    }
+
+    fn render_contact_detail_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Contact Detail ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let Some(selected_idx) = self.table_state.selected else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f517}",
+                "No Contact Selected",
+                "Select a contact from the table to view details.",
+            );
+            return;
+        };
+
+        let Some(contact) = self.contacts.get(selected_idx) else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f517}",
+                "No Contact Selected",
+                "Select a contact from the table to view details.",
+            );
+            return;
+        };
+
+        let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
+        lines.push(("From".into(), contact.from_agent.clone(), None));
+        lines.push(("To".into(), contact.to_agent.clone(), None));
+
+        let status_color_val = match contact.status.as_str() {
+            "approved" => tp.contact_approved,
+            "blocked" => tp.contact_blocked,
+            _ => tp.contact_pending,
+        };
+        lines.push((
+            "Status".into(),
+            contact.status.clone(),
+            Some(status_color_val),
+        ));
+
+        if !contact.reason.is_empty() {
+            lines.push(("Reason".into(), contact.reason.clone(), None));
+        }
+
+        if !contact.from_project_slug.is_empty() {
+            lines.push((
+                "From Project".into(),
+                contact.from_project_slug.clone(),
+                None,
+            ));
+        }
+        if !contact.to_project_slug.is_empty() {
+            lines.push((
+                "To Project".into(),
+                contact.to_project_slug.clone(),
+                None,
+            ));
+        }
+
+        let updated_str = if contact.updated_ts == 0 {
+            "never".to_string()
+        } else {
+            let iso = mcp_agent_mail_db::timestamps::micros_to_iso(contact.updated_ts);
+            let rel = format_relative_ts(contact.updated_ts);
+            format!("{iso} ({rel})")
+        };
+        lines.push(("Updated".into(), updated_str, None));
+
+        let expires_str = contact.expires_ts.map_or_else(
+            || "never".to_string(),
+            |ts| {
+                if ts == 0 {
+                    "never".to_string()
+                } else {
+                    let iso = mcp_agent_mail_db::timestamps::micros_to_iso(ts);
+                    let rel = format_relative_ts(ts);
+                    format!("{iso} ({rel})")
+                }
+            },
+        );
+        lines.push(("Expires".into(), expires_str, None));
+
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
     }
 
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1280,6 +1432,62 @@ const fn trend_for(current: u64, previous: u64) -> MetricTrend {
         MetricTrend::Down
     } else {
         MetricTrend::Flat
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn render_kv_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: &[(String, String, Option<PackedRgba>)],
+    scroll: usize,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    let label_w: u16 = 14;
+    let visible = area.height as usize;
+    let total = lines.len();
+    let offset = scroll.min(total.saturating_sub(visible));
+
+    for (i, (label, value, color)) in lines.iter().skip(offset).enumerate() {
+        let row_y = area.y + i as u16;
+        if row_y >= area.bottom() {
+            break;
+        }
+        // Label column
+        let label_display: String = if label.len() > label_w as usize {
+            label.chars().take(label_w as usize).collect()
+        } else {
+            format!("{:<w$}", label, w = label_w as usize)
+        };
+        let label_span = Paragraph::new(label_display)
+            .style(Style::default().fg(tp.text_muted).bold());
+        let label_rect = Rect::new(area.x, row_y, label_w.min(area.width), 1);
+        label_span.render(label_rect, frame);
+
+        // Value column
+        let val_x = area.x + label_w;
+        if val_x < area.right() {
+            let val_w = area.right() - val_x;
+            let val_style = color.map_or_else(
+                || Style::default().fg(tp.text_primary),
+                |c| Style::default().fg(c),
+            );
+            let val_span = Paragraph::new(value.as_str()).style(val_style);
+            val_span.render(Rect::new(val_x, row_y, val_w, 1), frame);
+        }
+    }
+
+    // Scroll indicator
+    if total > visible && area.width > 2 {
+        let indicator = format!("[{}/{}]", offset + 1, total.saturating_sub(visible) + 1);
+        let iw = indicator.len().min(area.width as usize) as u16;
+        let ix = area.right().saturating_sub(iw);
+        let iy = area.bottom().saturating_sub(1);
+        if iy >= area.y {
+            Paragraph::new(indicator)
+                .style(Style::default().fg(tp.text_muted))
+                .render(Rect::new(ix, iy, iw, 1), frame);
+        }
     }
 }
 

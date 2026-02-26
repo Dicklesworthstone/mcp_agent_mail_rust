@@ -19,13 +19,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use ftui::layout::Rect;
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::Config;
@@ -210,6 +210,12 @@ pub struct SystemHealthScreen {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     view_mode: ViewMode,
+    /// Whether the detail/findings panel is visible on wide screens.
+    detail_visible: bool,
+    /// Scroll offset inside the detail panel.
+    detail_scroll: usize,
+    /// Selected anomaly/finding index for detail panel focus.
+    anomaly_cursor: usize,
 }
 
 impl SystemHealthScreen {
@@ -247,6 +253,9 @@ impl SystemHealthScreen {
             stop,
             worker,
             view_mode: ViewMode::Text,
+            detail_visible: true,
+            detail_scroll: 0,
+            anomaly_cursor: 0,
         }
     }
 
@@ -790,6 +799,201 @@ impl SystemHealthScreen {
             y_offset = y_offset.saturating_add(current_h);
         }
     }
+
+    /// Render the anomaly detail panel for the currently selected finding (Dashboard mode).
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_anomaly_detail_panel(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        snap: &DiagnosticsSnapshot,
+    ) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Anomaly Detail ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let mut findings: Vec<(&str, AnomalySeverity, &str, Option<&str>)> = Vec::new();
+        if let Some(err) = &snap.tcp_error {
+            findings.push(("TCP connection", AnomalySeverity::Critical, err.as_str(), None));
+        }
+        for line in &snap.lines {
+            let severity = match line.level {
+                Level::Ok => AnomalySeverity::Low,
+                Level::Warn => AnomalySeverity::Medium,
+                Level::Fail => AnomalySeverity::High,
+            };
+            findings.push((
+                line.name,
+                severity,
+                line.detail.as_str(),
+                line.remediation.as_deref(),
+            ));
+        }
+
+        if findings.is_empty() {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{2714}",
+                "All Diagnostics Passed",
+                "No anomalies detected.",
+            );
+            return;
+        }
+
+        let cursor = self.anomaly_cursor.min(findings.len().saturating_sub(1));
+        let (name, severity, detail, remediation) = findings[cursor];
+
+        let sev_color = match severity {
+            AnomalySeverity::Critical => tp.severity_critical,
+            AnomalySeverity::High => tp.severity_error,
+            AnomalySeverity::Medium => tp.severity_warn,
+            AnomalySeverity::Low => tp.severity_ok,
+        };
+
+        let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
+        lines.push((
+            "Finding".into(),
+            format!("{}/{}", cursor + 1, findings.len()),
+            None,
+        ));
+        lines.push(("Name".into(), name.to_string(), None));
+        lines.push((
+            "Severity".into(),
+            format!("{severity:?}"),
+            Some(sev_color),
+        ));
+        lines.push(("Detail".into(), detail.to_string(), None));
+        if let Some(fix) = remediation {
+            lines.push(("Remediation".into(), fix.to_string(), None));
+        }
+
+        // Related probes
+        for probe in &snap.path_probes {
+            let status_str = probe
+                .status
+                .map_or_else(|| "?".into(), format_http_status);
+            let latency_str = probe
+                .latency_ms
+                .map_or_else(|| "?".to_string(), |ms| format!("{ms}ms"));
+            lines.push((
+                format!("Probe {}", probe.path),
+                format!("{status_str} {latency_str}"),
+                None,
+            ));
+        }
+
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+    }
+
+    /// Render the findings summary panel (Text mode).
+    fn render_findings_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Findings ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let snap = self.snapshot();
+        if snap.lines.is_empty() && snap.tcp_error.is_none() {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{2714}",
+                "All Checks Passed",
+                "No findings to display.",
+            );
+            return;
+        }
+
+        let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
+        if let Some(err) = &snap.tcp_error {
+            lines.push((
+                "[CRIT] TCP".into(),
+                err.clone(),
+                Some(tp.severity_critical),
+            ));
+        }
+        for probe_line in &snap.lines {
+            let color = match probe_line.level {
+                Level::Ok => tp.severity_ok,
+                Level::Warn => tp.severity_warn,
+                Level::Fail => tp.severity_error,
+            };
+            let badge = match probe_line.level {
+                Level::Ok => "[OK]",
+                Level::Warn => "[WARN]",
+                Level::Fail => "[FAIL]",
+            };
+            lines.push((
+                format!("{badge} {}", probe_line.name),
+                probe_line.detail.clone(),
+                Some(color),
+            ));
+            if let Some(fix) = &probe_line.remediation {
+                lines.push(("  Fix".into(), fix.clone(), None));
+            }
+        }
+
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+    }
+}
+
+/// Render key-value lines with a label column and a value column, supporting scroll.
+#[allow(clippy::cast_possible_truncation)]
+fn render_kv_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: &[(String, String, Option<PackedRgba>)],
+    scroll: usize,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    let label_w: u16 = 14;
+    let visible = usize::from(area.height);
+    let total = lines.len();
+    let offset = scroll.min(total.saturating_sub(visible));
+
+    for (i, (label, value, color)) in lines.iter().skip(offset).enumerate() {
+        let row_y = area.y + i as u16;
+        if row_y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        // Label column
+        let label_display: String = if label.len() > label_w as usize {
+            label.chars().take(label_w as usize).collect()
+        } else {
+            format!("{:<w$}", label, w = label_w as usize)
+        };
+        Paragraph::new(label_display)
+            .style(Style::default().fg(tp.text_muted).bold())
+            .render(Rect::new(area.x, row_y, label_w.min(area.width), 1), frame);
+
+        // Value column
+        let val_x = area.x + label_w;
+        if val_x < area.x.saturating_add(area.width) {
+            let val_w = area.x.saturating_add(area.width).saturating_sub(val_x);
+            let val_style = color.map_or_else(
+                || Style::default().fg(tp.text_primary),
+                |c| Style::default().fg(c),
+            );
+            Paragraph::new(value.as_str())
+                .style(val_style)
+                .render(Rect::new(val_x, row_y, val_w, 1), frame);
+        }
+    }
+
+    // Scroll indicator
+    if total > visible && area.width > 2 {
+        let indicator = format!("[{}/{}]", offset + 1, total.saturating_sub(visible) + 1);
+        let iw = indicator.len().min(area.width as usize) as u16;
+        let ix = area.x.saturating_add(area.width).saturating_sub(iw);
+        let iy = area.y.saturating_add(area.height.saturating_sub(1));
+        if iy >= area.y {
+            Paragraph::new(indicator)
+                .style(Style::default().fg(tp.text_muted))
+                .render(Rect::new(ix, iy, iw, 1), frame);
+        }
+    }
 }
 
 impl Drop for SystemHealthScreen {
@@ -814,6 +1018,23 @@ impl MailScreen for SystemHealthScreen {
                         ViewMode::Dashboard => ViewMode::Text,
                     };
                 }
+                KeyCode::Char('i') => {
+                    self.detail_visible = !self.detail_visible;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.anomaly_cursor = self.anomaly_cursor.saturating_add(1);
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.anomaly_cursor = self.anomaly_cursor.saturating_sub(1);
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Char('J') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                }
+                KeyCode::Char('K') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
                 _ => {}
             }
         }
@@ -826,9 +1047,49 @@ impl MailScreen for SystemHealthScreen {
         let inner = outer_block.inner(area);
         outer_block.render(area, frame);
 
+        // Responsive layout: at Lg+ split into main content + detail panel
+        let layout = ResponsiveLayout::new(
+            Flex::vertical().constraints([Constraint::Fill]),
+        )
+        .at(
+            Breakpoint::Lg,
+            Flex::horizontal().constraints([
+                Constraint::Percentage(55.0),
+                Constraint::Fill,
+            ]),
+        )
+        .at(
+            Breakpoint::Xl,
+            Flex::horizontal().constraints([
+                Constraint::Percentage(50.0),
+                Constraint::Fill,
+            ]),
+        );
+
+        let split = if self.detail_visible {
+            layout.split(inner)
+        } else {
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                .split(inner)
+        };
+        let main_area = split.rects[0];
+
         match self.view_mode {
-            ViewMode::Text => self.render_text_view(frame, inner, state),
-            ViewMode::Dashboard => self.render_dashboard_view(frame, inner, state),
+            ViewMode::Text => self.render_text_view(frame, main_area, state),
+            ViewMode::Dashboard => self.render_dashboard_view(frame, main_area, state),
+        }
+
+        // Render detail panel if visible (Lg+)
+        if split.rects.len() >= 2 && self.detail_visible {
+            match self.view_mode {
+                ViewMode::Dashboard => {
+                    let snap = self.snapshot();
+                    self.render_anomaly_detail_panel(frame, split.rects[1], &snap);
+                }
+                ViewMode::Text => {
+                    self.render_findings_panel(frame, split.rects[1]);
+                }
+            }
         }
     }
 
@@ -841,6 +1102,18 @@ impl MailScreen for SystemHealthScreen {
             HelpEntry {
                 key: "v",
                 action: "Toggle text/dashboard view",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
+            },
+            HelpEntry {
+                key: "j/k",
+                action: "Navigate findings",
+            },
+            HelpEntry {
+                key: "J/K",
+                action: "Scroll detail panel",
             },
         ]
     }
@@ -1368,6 +1641,9 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
             view_mode: ViewMode::Dashboard,
+            detail_visible: true,
+            detail_scroll: 0,
+            anomaly_cursor: 0,
         }
     }
 

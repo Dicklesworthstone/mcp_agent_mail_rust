@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use ftui::layout::Rect;
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -58,6 +58,7 @@ const THREAD_SPLIT_WIDTH_THRESHOLD: u16 = 80;
 // Keep a dedicated blank separator whenever split mode is active so adjacent
 // rounded panel borders never visually merge into a heavy "random" line.
 const THREAD_MAIN_PANE_GAP_THRESHOLD: u16 = THREAD_SPLIT_WIDTH_THRESHOLD;
+#[allow(dead_code)]
 const THREAD_WIDE_LIST_PERCENT: u16 = 34;
 const THREAD_STACKED_MIN_HEIGHT: u16 = 14;
 const THREAD_STACKED_LIST_PERCENT: u16 = 42;
@@ -75,6 +76,7 @@ const THREAD_SUBJECT_LINE_MIN_WIDTH: usize = 40;
 const THREAD_LIST_SIDE_PADDING_MIN_WIDTH: u16 = 42;
 const THREAD_DETAIL_SIDE_PADDING_MIN_WIDTH: u16 = 52;
 
+#[allow(dead_code)]
 const fn thread_list_width_percent(total_width: u16) -> u16 {
     if total_width >= 280 {
         22
@@ -489,6 +491,8 @@ pub struct ThreadExplorerScreen {
     last_list_area: Cell<Rect>,
     /// Last rendered thread detail panel area (for mouse hit testing).
     last_detail_area: Cell<Rect>,
+    /// Whether the detail panel is visible on wide screens (user toggle).
+    detail_visible: bool,
 }
 
 impl ThreadExplorerScreen {
@@ -526,6 +530,7 @@ impl ThreadExplorerScreen {
             message_drag: MessageDragState::Idle,
             last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            detail_visible: true,
         }
     }
 
@@ -1146,6 +1151,9 @@ impl MailScreen for ThreadExplorerScreen {
             match self.focus {
                 Focus::ThreadList => {
                     match key.code {
+                        KeyCode::Char('i') => {
+                            self.detail_visible = !self.detail_visible;
+                        }
                         // Cursor navigation
                         KeyCode::Char('j') | KeyCode::Down => {
                             if !self.threads.is_empty() {
@@ -1454,35 +1462,53 @@ impl MailScreen for ThreadExplorerScreen {
         };
         let keyboard_move = state.keyboard_move_snapshot();
 
-        // Wide: split content (list left, detail right).
-        if content_area.width >= THREAD_SPLIT_WIDTH_THRESHOLD {
+        // ResponsiveLayout: Md+ uses side-by-side split with breakpoint-based ratios.
+        // Below Md (< 90): fall through to height-based stacked/compact fallback.
+        let rl_layout = if self.detail_visible {
+            ResponsiveLayout::new(
+                Flex::vertical().constraints([Constraint::Fill]),
+            )
+            .at(
+                Breakpoint::Md,
+                Flex::horizontal().constraints([
+                    Constraint::Percentage(40.0),
+                    Constraint::Percentage(60.0),
+                ]),
+            )
+            .at(
+                Breakpoint::Lg,
+                Flex::horizontal().constraints([
+                    Constraint::Percentage(34.0),
+                    Constraint::Percentage(66.0),
+                ]),
+            )
+            .at(
+                Breakpoint::Xl,
+                Flex::horizontal().constraints([
+                    Constraint::Percentage(25.0),
+                    Constraint::Percentage(75.0),
+                ]),
+            )
+        } else {
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+        };
+        let rl_split = rl_layout.split(content_area);
+
+        if rl_split.rects.len() >= 2 && self.detail_visible {
+            // Wide: side-by-side list + detail
+            let list_area = rl_split.rects[0];
+            let mut detail_area = rl_split.rects[1];
             let pane_gap = u16::from(content_area.width >= THREAD_MAIN_PANE_GAP_THRESHOLD);
-            let available_width = content_area.width.saturating_sub(pane_gap);
-            let list_width = available_width * thread_list_width_percent(content_area.width) / 100;
-            let detail_width = available_width.saturating_sub(list_width);
-            let list_area = Rect::new(
-                content_area.x,
-                content_area.y,
-                list_width,
-                content_area.height,
-            );
-            let detail_area = Rect::new(
-                content_area
-                    .x
-                    .saturating_add(list_width)
-                    .saturating_add(pane_gap),
-                content_area.y,
-                detail_width,
-                content_area.height,
-            );
-            if pane_gap > 0 {
+            if pane_gap > 0 && detail_area.width > pane_gap {
                 let splitter_area = Rect::new(
-                    content_area.x.saturating_add(list_width),
+                    list_area.x.saturating_add(list_area.width),
                     content_area.y,
                     pane_gap,
                     content_area.height,
                 );
                 render_splitter_handle(frame, splitter_area, true, false);
+                detail_area.x = detail_area.x.saturating_add(pane_gap);
+                detail_area.width = detail_area.width.saturating_sub(pane_gap);
             }
             self.last_list_area.set(list_area);
             self.last_detail_area.set(detail_area);
@@ -1523,7 +1549,7 @@ impl MailScreen for ThreadExplorerScreen {
                     self.detail_tree_focus,
                 );
             }
-        } else if content_area.height >= THREAD_STACKED_MIN_HEIGHT {
+        } else if content_area.height >= THREAD_STACKED_MIN_HEIGHT && self.detail_visible {
             // Narrow but tall: stacked fallback preserves both list and detail.
             let min_list_h: u16 = 4;
             let min_detail_h: u16 = 6;
@@ -1755,6 +1781,10 @@ impl MailScreen for ThreadExplorerScreen {
             HelpEntry {
                 key: "v",
                 action: "Lens: Activity/Participants/Escalation",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
             },
         ]
     }

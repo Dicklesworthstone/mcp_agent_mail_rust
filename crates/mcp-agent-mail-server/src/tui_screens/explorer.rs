@@ -5,7 +5,7 @@
 //! definitions from [`mcp_agent_mail_db::mail_explorer`] for consistency
 //! with the MCP tool surface.
 
-use ftui::layout::Rect;
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::{Line, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -360,6 +360,8 @@ pub struct MailExplorerScreen {
 
     /// `VirtualizedList` state for O(1) scrolling.
     list_state: RefCell<VirtualizedListState>,
+    /// Whether the detail panel is visible on wide screens (user toggle).
+    detail_visible: bool,
 }
 
 impl MailExplorerScreen {
@@ -393,6 +395,7 @@ impl MailExplorerScreen {
 
             focused_synthetic: None,
             list_state: RefCell::new(VirtualizedListState::default()),
+            detail_visible: true,
         }
     }
 
@@ -858,6 +861,9 @@ impl MailScreen for MailExplorerScreen {
                 },
 
                 Focus::ResultList => match key.code {
+                    KeyCode::Char('i') => {
+                        self.detail_visible = !self.detail_visible;
+                    }
                     KeyCode::Char('/') => {
                         self.focus = Focus::SearchBar;
                         self.search_input.set_focused(true);
@@ -1004,58 +1010,58 @@ impl MailScreen for MailExplorerScreen {
         } else {
             // Normal mode: filter rail (left) + results + detail (right)
             let filter_w: u16 = if area.width >= 100 { 18 } else { 14 };
-            let remaining_w = body_area.width.saturating_sub(filter_w);
-
             let filter_area = Rect::new(body_area.x, body_area.y, filter_w, body_area.height);
 
-            if remaining_w >= 60 {
-                let results_w = remaining_w * 45 / 100;
-                let detail_w = remaining_w - results_w;
-                let results_area = Rect::new(
-                    body_area.x + filter_w,
-                    body_area.y,
-                    results_w,
-                    body_area.height,
-                );
-                let detail_area = Rect::new(
-                    body_area.x + filter_w + results_w,
-                    body_area.y,
-                    detail_w,
-                    body_area.height,
-                );
+            // ResponsiveLayout controls results + detail split in the remaining space
+            let remaining_area = Rect::new(
+                body_area.x + filter_w,
+                body_area.y,
+                body_area.width.saturating_sub(filter_w),
+                body_area.height,
+            );
 
-                let filter_focused = matches!(self.focus, Focus::FilterRail);
-                let results_focused = matches!(self.focus, Focus::ResultList);
-                render_filter_rail(frame, filter_area, self, filter_focused);
-                render_results(
-                    frame,
-                    results_area,
-                    &self.entries,
-                    &mut self.list_state.borrow_mut(),
-                    results_focused,
-                );
+            let rl_layout = if self.detail_visible {
+                ResponsiveLayout::new(
+                    Flex::vertical().constraints([Constraint::Fill]),
+                )
+                .at(
+                    Breakpoint::Lg,
+                    Flex::horizontal().constraints([
+                        Constraint::Percentage(50.0),
+                        Constraint::Percentage(50.0),
+                    ]),
+                )
+                .at(
+                    Breakpoint::Xl,
+                    Flex::horizontal().constraints([
+                        Constraint::Percentage(45.0),
+                        Constraint::Percentage(55.0),
+                    ]),
+                )
+            } else {
+                ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+            };
+
+            let rl_split = rl_layout.split(remaining_area);
+            let results_area = rl_split.rects[0];
+
+            let filter_focused = matches!(self.focus, Focus::FilterRail);
+            let results_focused = matches!(self.focus, Focus::ResultList);
+            render_filter_rail(frame, filter_area, self, filter_focused);
+            render_results(
+                frame,
+                results_area,
+                &self.entries,
+                &mut self.list_state.borrow_mut(),
+                results_focused,
+            );
+
+            if rl_split.rects.len() >= 2 && self.detail_visible {
                 render_detail(
                     frame,
-                    detail_area,
+                    rl_split.rects[1],
                     self.entries.get(self.cursor),
                     self.detail_scroll,
-                    results_focused,
-                );
-            } else {
-                let results_area = Rect::new(
-                    body_area.x + filter_w,
-                    body_area.y,
-                    remaining_w,
-                    body_area.height,
-                );
-                let filter_focused = matches!(self.focus, Focus::FilterRail);
-                let results_focused = matches!(self.focus, Focus::ResultList);
-                render_filter_rail(frame, filter_area, self, filter_focused);
-                render_results(
-                    frame,
-                    results_area,
-                    &self.entries,
-                    &mut self.list_state.borrow_mut(),
                     results_focused,
                 );
             }
@@ -1119,6 +1125,10 @@ impl MailScreen for MailExplorerScreen {
             HelpEntry {
                 key: "Mouse",
                 action: "Wheel scroll results",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
             },
         ]
     }

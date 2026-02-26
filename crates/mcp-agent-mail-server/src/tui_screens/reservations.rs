@@ -7,8 +7,7 @@ use std::path::PathBuf;
 use asupersync::Cx;
 use fastmcp::prelude::McpContext;
 use fastmcp_core::block_on;
-use ftui::layout::Constraint;
-use ftui::layout::Rect;
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::display_width;
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
@@ -327,6 +326,10 @@ pub struct ReservationsScreen {
     save_preset_description: String,
     /// Load dialog selected preset row.
     load_preset_cursor: usize,
+    /// Whether the detail panel is visible on wide screens.
+    detail_visible: bool,
+    /// Scroll offset inside the detail panel.
+    detail_scroll: usize,
 }
 
 impl ReservationsScreen {
@@ -361,6 +364,8 @@ impl ReservationsScreen {
             save_preset_name: String::new(),
             save_preset_description: String::new(),
             load_preset_cursor: 0,
+            detail_visible: true,
+            detail_scroll: 0,
         }
     }
 
@@ -681,6 +686,7 @@ impl ReservationsScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
+        self.detail_scroll = 0;
     }
 
     fn selected_reservation_keys_sorted(&self) -> Vec<String> {
@@ -766,6 +772,82 @@ impl ReservationsScreen {
     }
 
     #[allow(clippy::cast_possible_truncation)]
+    /// Render the detail panel for the selected reservation.
+    fn render_reservation_detail_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Reservation Detail ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let Some(selected_idx) = self.table_state.selected else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f512}",
+                "No Reservation Selected",
+                "Select a reservation from the table to view details.",
+            );
+            return;
+        };
+
+        let Some(key) = self.sorted_keys.get(selected_idx) else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f512}",
+                "No Reservation Selected",
+                "Select a reservation from the table to view details.",
+            );
+            return;
+        };
+
+        let Some(res) = self.reservations.get(key) else {
+            return;
+        };
+
+        let remaining = res.remaining_secs();
+        let ratio = res.ttl_ratio();
+
+        let mut lines: Vec<(String, String, Option<PackedRgba>)> = vec![
+            ("Agent".into(), res.agent.clone(), None),
+            ("Pattern".into(), res.path_pattern.clone(), None),
+            ("Project".into(), res.project.clone(), None),
+            (
+                "Exclusive".into(),
+                if res.exclusive { "\u{2713} Yes" } else { "\u{2717} No" }.into(),
+                Some(if res.exclusive { tp.severity_warn } else { tp.text_primary }),
+            ),
+        ];
+
+        let ttl_str = format_ttl(remaining);
+        let ttl_color = if remaining == 0 {
+            tp.severity_error
+        } else if ratio < 0.2 {
+            tp.ttl_warning
+        } else {
+            tp.text_primary
+        };
+        lines.push(("TTL Left".into(), ttl_str, Some(ttl_color)));
+        lines.push(("TTL Total".into(), format!("{}s", res.ttl_s), None));
+
+        #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+        let pct = (ratio * 100.0) as u64;
+        lines.push(("TTL Ratio".into(), format!("{pct}%"), None));
+
+        let granted_str = mcp_agent_mail_db::timestamps::micros_to_iso(res.granted_ts);
+        lines.push(("Granted At".into(), granted_str, None));
+
+        if res.released {
+            lines.push(("Status".into(), "Released".into(), Some(tp.text_muted)));
+        } else if remaining == 0 {
+            lines.push(("Status".into(), "Expired".into(), Some(tp.severity_error)));
+        } else {
+            lines.push(("Status".into(), "Active".into(), Some(tp.activity_active)));
+        }
+
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+    }
+
     fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let (active, exclusive, shared, expired) = self.summary_counts();
@@ -807,9 +889,11 @@ impl ReservationsScreen {
         if tile_count == 0 || area.width == 0 || area.height == 0 {
             return;
         }
-        let tile_w = area.width / tile_count as u16;
+        #[allow(clippy::cast_possible_truncation)]
+        let tile_w = area.width / (tile_count as u16);
 
         for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
             let x = area.x + (i as u16) * tile_w;
             let w = if i == tile_count - 1 {
                 area.width.saturating_sub(x - area.x)
@@ -1327,6 +1411,7 @@ impl Default for ReservationsScreen {
 }
 
 impl MailScreen for ReservationsScreen {
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         if self.create_form.is_some() {
             return self.handle_create_form_event(event);
@@ -1401,6 +1486,15 @@ impl MailScreen for ReservationsScreen {
                     self.rebuild_sorted();
                 }
                 KeyCode::Char('n') => self.open_create_form(),
+                KeyCode::Char('i') => {
+                    self.detail_visible = !self.detail_visible;
+                }
+                KeyCode::Char('J') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                }
+                KeyCode::Char('K') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
                 _ => {}
             }
         }
@@ -1511,6 +1605,39 @@ impl MailScreen for ReservationsScreen {
         let inner = outer_block.inner(area);
         outer_block.render(area, frame);
         let area = inner;
+
+        // Detail panel hidden when modal forms are active
+        let modal_active =
+            self.create_form.is_some() || self.preset_dialog_mode != PresetDialogMode::None;
+
+        // Responsive layout: table+detail on wide screens (unless modal is active)
+        let show_side_detail = self.detail_visible && !modal_active;
+        let layout = if show_side_detail {
+            ResponsiveLayout::new(
+                Flex::vertical().constraints([Constraint::Fill]),
+            )
+            .at(
+                Breakpoint::Lg,
+                Flex::horizontal().constraints([
+                    Constraint::Percentage(55.0),
+                    Constraint::Fill,
+                ]),
+            )
+            .at(
+                Breakpoint::Xl,
+                Flex::horizontal().constraints([
+                    Constraint::Percentage(50.0),
+                    Constraint::Fill,
+                ]),
+            )
+        } else {
+            ResponsiveLayout::new(
+                Flex::vertical().constraints([Constraint::Fill]),
+            )
+        };
+
+        let split = layout.split(area);
+        let area = split.rects[0];
 
         let effects_enabled = state.config_snapshot().tui_effects;
         let animation_time = state.uptime().as_secs_f64();
@@ -1787,6 +1914,11 @@ impl MailScreen for ReservationsScreen {
             self.render_footer(frame, footer_area);
         }
 
+        // ── Side detail panel (Lg+, not when modal active) ────────────
+        if split.rects.len() >= 2 && show_side_detail {
+            self.render_reservation_detail_panel(frame, split.rects[1]);
+        }
+
         if let Some(form) = &self.create_form {
             render_reservation_create_modal(frame, area, form);
         }
@@ -1852,6 +1984,14 @@ impl MailScreen for ReservationsScreen {
             HelpEntry {
                 key: ".",
                 action: "Open actions (single or batch)",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
+            },
+            HelpEntry {
+                key: "J/K",
+                action: "Scroll detail panel",
             },
             HelpEntry {
                 key: "Mouse",
@@ -2363,6 +2503,68 @@ const fn trend_for(current: u64, previous: u64) -> MetricTrend {
         MetricTrend::Down
     } else {
         MetricTrend::Flat
+    }
+}
+
+/// Render key-value lines with a label column and a value column, supporting scroll.
+#[allow(clippy::cast_possible_truncation)]
+fn render_kv_lines(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: &[(String, String, Option<PackedRgba>)],
+    scroll: usize,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    let visible_height = usize::from(inner.height);
+    let total_lines = lines.len();
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = scroll.min(max_scroll);
+    let label_w = 12u16;
+
+    for (i, (label, value, color)) in lines.iter().skip(scroll).take(visible_height).enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+
+        let label_area = Rect::new(inner.x, y, label_w.min(inner.width), 1);
+        let label_text = format!("{label}:");
+        Paragraph::new(label_text)
+            .style(Style::default().fg(tp.text_muted).bold())
+            .render(label_area, frame);
+
+        let val_x = inner.x + label_w + 1;
+        if val_x < inner.x + inner.width {
+            let val_w = (inner.x + inner.width).saturating_sub(val_x);
+            let val_area = Rect::new(val_x, y, val_w, 1);
+            let val_style = color.map_or_else(
+                || Style::default().fg(tp.text_primary),
+                |c| Style::default().fg(c),
+            );
+            Paragraph::new(value.as_str())
+                .style(val_style)
+                .render(val_area, frame);
+        }
+    }
+
+    if total_lines > visible_height {
+        let indicator = format!(
+            " {}/{} ",
+            scroll + 1,
+            total_lines.saturating_sub(visible_height) + 1
+        );
+        let ind_w = indicator.len() as u16;
+        if ind_w < inner.width {
+            let ind_area = Rect::new(
+                inner.x + inner.width - ind_w,
+                inner.y + inner.height.saturating_sub(1),
+                ind_w,
+                1,
+            );
+            Paragraph::new(indicator)
+                .style(Style::default().fg(tp.text_muted))
+                .render(ind_area, frame);
+        }
     }
 }
 

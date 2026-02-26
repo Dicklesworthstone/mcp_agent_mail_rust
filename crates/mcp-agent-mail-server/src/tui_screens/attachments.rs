@@ -1,6 +1,6 @@
 //! Attachments screen — browse attachments across messages with provenance trails.
 
-use ftui::layout::{Constraint, Rect};
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -535,6 +535,179 @@ impl AttachmentExplorerScreen {
         p.render(area, frame);
     }
 
+    /// Render the full table content column: summary + header + table + optional bottom detail + footer.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    fn render_table_content(&self, frame: &mut Frame<'_>, area: Rect, show_bottom_detail: bool) {
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
+
+        let summary_h: u16 = if area.height >= 10 { 2 } else { 0 };
+        let header_h: u16 = 1;
+        let footer_h: u16 = u16::from(area.height >= 6);
+        let has_detail = show_bottom_detail && self.selected_entry().is_some();
+        let remaining_for_content = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
+        let detail_h = if has_detail && remaining_for_content > 12 {
+            remaining_for_content.min(40) / 3
+        } else {
+            0
+        };
+        let section_gap =
+            u16::from(detail_h > 0 && remaining_for_content >= ATTACHMENTS_DETAIL_GAP_THRESHOLD);
+        let table_h = remaining_for_content
+            .saturating_sub(detail_h)
+            .saturating_sub(section_gap);
+
+        let mut y = area.y;
+
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
+        self.render_header(frame, header_area);
+
+        let table_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
+
+        if let Some(err) = &self.last_error {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let err_p = Paragraph::new(format!(" Error: {err}"))
+                .style(Style::default().fg(tp.severity_error));
+            err_p.render(table_area, frame);
+            return;
+        }
+
+        let (header_cells, col_widths): (Vec<&str>, Vec<Constraint>) = if narrow {
+            (
+                vec!["Type", "Size", "Sender", "Subject"],
+                vec![
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(26.0),
+                    Constraint::Percentage(50.0),
+                ],
+            )
+        } else if wide {
+            (
+                vec!["Type", "Size", "Sender", "Subject", "Date", "Project"],
+                vec![
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(15.0),
+                    Constraint::Percentage(30.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(15.0),
+                ],
+            )
+        } else {
+            (
+                vec!["Type", "Size", "Sender", "Subject", "Date"],
+                vec![
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(37.0),
+                    Constraint::Percentage(25.0),
+                ],
+            )
+        };
+
+        let header_row = Row::new(header_cells).style(Style::default().bold());
+        let rows = self.build_table_rows_responsive(wide, narrow);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = Block::default()
+            .title("Attachments")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+
+        let table = Table::new(rows, col_widths)
+            .header(header_row)
+            .block(block)
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
+
+        let mut ts = self.table_state.clone();
+        StatefulWidget::render(&table, table_area, frame, &mut ts);
+
+        if section_gap > 0 {
+            let gap_area = Rect::new(area.x, y, area.width, section_gap);
+            for gy in gap_area.y..gap_area.y.saturating_add(gap_area.height) {
+                for gx in gap_area.x..gap_area.x.saturating_add(gap_area.width) {
+                    if let Some(cell) = frame.buffer.get_mut(gx, gy) {
+                        cell.bg = tp.panel_bg;
+                    }
+                }
+            }
+            y += section_gap;
+        }
+
+        if detail_h > 0 {
+            let detail_area = Rect::new(area.x, y, area.width, detail_h);
+            y += detail_h;
+            if let Some(entry) = self.selected_entry() {
+                let entry_clone = entry.clone();
+                self.render_detail(frame, detail_area, &entry_clone);
+            }
+        }
+
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
+        }
+    }
+
+    /// Render the right-side detail panel using structured key-value layout.
+    fn render_side_detail(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Attachment Detail ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let Some(entry) = self.selected_entry() else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f4ce}",
+                "No Attachment Selected",
+                "Select an attachment from the table to view details.",
+            );
+            return;
+        };
+
+        let mut lines: Vec<(String, String, Option<PackedRgba>)> = vec![
+            ("Type".into(), entry.media_type.clone(), None),
+            ("Size".into(), entry.size_display(), None),
+            ("Mode".into(), entry.mode.clone(), None),
+            ("SHA-1".into(), entry.sha1.clone(), None),
+        ];
+        let dims = entry.dims_display();
+        if !dims.is_empty() {
+            lines.push(("Dimensions".into(), dims, None));
+        }
+        if let Some(p) = &entry.path {
+            lines.push(("Path".into(), p.clone(), None));
+        }
+        lines.push((String::new(), String::new(), None));
+        lines.push(("Provenance".into(), String::new(), Some(tp.text_muted)));
+        lines.push(("Message ID".into(), entry.message_id.to_string(), None));
+        lines.push(("Sender".into(), entry.sender_name.clone(), None));
+        lines.push(("Subject".into(), entry.subject.clone(), None));
+        if let Some(tid) = &entry.thread_id {
+            lines.push(("Thread".into(), tid.clone(), None));
+        }
+        lines.push(("Date".into(), micros_to_iso(entry.created_ts), None));
+        lines.push(("Project".into(), entry.project_slug.clone(), None));
+
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+    }
+
     /// Render the detail panel for the selected attachment.
     fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, entry: &AttachmentEntry) {
         if area.height < 2 || area.width < 20 {
@@ -807,7 +980,6 @@ impl MailScreen for AttachmentExplorerScreen {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         if area.height < 3 || area.width < 40 {
             return;
@@ -819,139 +991,35 @@ impl MailScreen for AttachmentExplorerScreen {
         outer_block.render(area, frame);
         let area = inner;
 
-        let wide = area.width >= 120;
-        let narrow = area.width < 80;
+        // Responsive layout: Lg+ puts detail on the right side
+        let layout = ResponsiveLayout::new(
+            Flex::vertical().constraints([Constraint::Fill]),
+        )
+        .at(
+            Breakpoint::Lg,
+            Flex::horizontal().constraints([
+                Constraint::Percentage(55.0),
+                Constraint::Fill,
+            ]),
+        )
+        .at(
+            Breakpoint::Xl,
+            Flex::horizontal().constraints([
+                Constraint::Percentage(50.0),
+                Constraint::Fill,
+            ]),
+        );
 
-        // Layout: summary_band(2) + header(1) + table(dynamic) + detail(1/3) + footer(1)
-        let summary_h: u16 = if area.height >= 10 { 2 } else { 0 };
-        let header_h: u16 = 1;
-        let footer_h: u16 = u16::from(area.height >= 6);
-        let has_detail = self.selected_entry().is_some();
-        let remaining_for_content = area
-            .height
-            .saturating_sub(summary_h)
-            .saturating_sub(header_h)
-            .saturating_sub(footer_h);
-        let detail_h = if has_detail && remaining_for_content > 12 {
-            remaining_for_content.min(40) / 3
-        } else {
-            0
-        };
-        let section_gap =
-            u16::from(detail_h > 0 && remaining_for_content >= ATTACHMENTS_DETAIL_GAP_THRESHOLD);
-        let table_h = remaining_for_content
-            .saturating_sub(detail_h)
-            .saturating_sub(section_gap);
+        let split = layout.split(area);
+        let main_area = split.rects[0];
+        let side_detail = split.rects.len() >= 2;
 
-        let mut y = area.y;
+        // Render table content into main area (with bottom detail fallback on narrow)
+        self.render_table_content(frame, main_area, !side_detail);
 
-        // ── Summary band ───────────────────────────────────────────────
-        if summary_h > 0 {
-            let summary_area = Rect::new(area.x, y, area.width, summary_h);
-            self.render_summary_band(frame, summary_area);
-            y += summary_h;
-        }
-
-        // ── Info header ────────────────────────────────────────────────
-        let header_area = Rect::new(area.x, y, area.width, header_h);
-        y += header_h;
-        self.render_header(frame, header_area);
-
-        // ── Table ──────────────────────────────────────────────────────
-        let table_area = Rect::new(area.x, y, area.width, table_h);
-        y += table_h;
-
-        if let Some(err) = &self.last_error {
-            let tp = crate::tui_theme::TuiThemePalette::current();
-            let err_p = Paragraph::new(format!(" Error: {err}"))
-                .style(Style::default().fg(tp.severity_error));
-            err_p.render(table_area, frame);
-            return;
-        }
-
-        // Responsive column headers and widths
-        let (header_cells, col_widths): (Vec<&str>, Vec<Constraint>) = if narrow {
-            // < 80: Type, Size, Sender, Subject only
-            (
-                vec!["Type", "Size", "Sender", "Subject"],
-                vec![
-                    Constraint::Percentage(12.0),
-                    Constraint::Percentage(12.0),
-                    Constraint::Percentage(26.0),
-                    Constraint::Percentage(50.0),
-                ],
-            )
-        } else if wide {
-            // >= 120: all 6 columns
-            (
-                vec!["Type", "Size", "Sender", "Subject", "Date", "Project"],
-                vec![
-                    Constraint::Percentage(10.0),
-                    Constraint::Percentage(10.0),
-                    Constraint::Percentage(15.0),
-                    Constraint::Percentage(30.0),
-                    Constraint::Percentage(20.0),
-                    Constraint::Percentage(15.0),
-                ],
-            )
-        } else {
-            // 80–119: hide Project column
-            (
-                vec!["Type", "Size", "Sender", "Subject", "Date"],
-                vec![
-                    Constraint::Percentage(10.0),
-                    Constraint::Percentage(10.0),
-                    Constraint::Percentage(18.0),
-                    Constraint::Percentage(37.0),
-                    Constraint::Percentage(25.0),
-                ],
-            )
-        };
-
-        let header_row = Row::new(header_cells).style(Style::default().bold());
-        let rows = self.build_table_rows_responsive(wide, narrow);
-
-        let tp = crate::tui_theme::TuiThemePalette::current();
-        let block = Block::default()
-            .title("Attachments")
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
-
-        let table = Table::new(rows, col_widths)
-            .header(header_row)
-            .block(block)
-            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
-
-        let mut ts = self.table_state.clone();
-        StatefulWidget::render(&table, table_area, frame, &mut ts);
-
-        if section_gap > 0 {
-            let tp = crate::tui_theme::TuiThemePalette::current();
-            let gap_area = Rect::new(area.x, y, area.width, section_gap);
-            for gy in gap_area.y..gap_area.y.saturating_add(gap_area.height) {
-                for gx in gap_area.x..gap_area.x.saturating_add(gap_area.width) {
-                    if let Some(cell) = frame.buffer.get_mut(gx, gy) {
-                        cell.bg = tp.panel_bg;
-                    }
-                }
-            }
-            y += section_gap;
-        }
-
-        // ── Detail panel ──────────────────────────────────────────
-        if detail_h > 0 {
-            let detail_area = Rect::new(area.x, y, area.width, detail_h);
-            y += detail_h;
-            if let Some(entry) = self.selected_entry() {
-                let entry_clone = entry.clone();
-                self.render_detail(frame, detail_area, &entry_clone);
-            }
-        }
-
-        // ── Footer summary ─────────────────────────────────────────────
-        if footer_h > 0 {
-            let footer_area = Rect::new(area.x, y, area.width, footer_h);
-            self.render_footer(frame, footer_area);
+        // Render right-side detail panel on wide screens
+        if side_detail {
+            self.render_side_detail(frame, split.rects[1]);
         }
     }
 
@@ -1041,6 +1109,69 @@ const fn trend_for(current: u64, previous: u64) -> MetricTrend {
         MetricTrend::Down
     } else {
         MetricTrend::Flat
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+/// Render key-value lines with a label column and a value column, supporting scroll.
+#[allow(clippy::cast_possible_truncation)]
+fn render_kv_lines(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: &[(String, String, Option<PackedRgba>)],
+    scroll: usize,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    let visible_height = usize::from(inner.height);
+    let total_lines = lines.len();
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = scroll.min(max_scroll);
+    let label_w = 12u16;
+
+    for (i, (label, value, color)) in lines.iter().skip(scroll).take(visible_height).enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+
+        let label_area = Rect::new(inner.x, y, label_w.min(inner.width), 1);
+        let label_text = format!("{label}:");
+        Paragraph::new(label_text)
+            .style(Style::default().fg(tp.text_muted).bold())
+            .render(label_area, frame);
+
+        let val_x = inner.x + label_w + 1;
+        if val_x < inner.x + inner.width {
+            let val_w = (inner.x + inner.width).saturating_sub(val_x);
+            let val_area = Rect::new(val_x, y, val_w, 1);
+            let val_style = color.map_or_else(
+                || Style::default().fg(tp.text_primary),
+                |c| Style::default().fg(c),
+            );
+            Paragraph::new(value.as_str())
+                .style(val_style)
+                .render(val_area, frame);
+        }
+    }
+
+    if total_lines > visible_height {
+        let indicator = format!(
+            " {}/{} ",
+            scroll + 1,
+            total_lines.saturating_sub(visible_height) + 1
+        );
+        let ind_w = indicator.len() as u16;
+        if ind_w < inner.width {
+            let ind_area = Rect::new(
+                inner.x + inner.width - ind_w,
+                inner.y + inner.height.saturating_sub(1),
+                ind_w,
+                1,
+            );
+            Paragraph::new(indicator)
+                .style(Style::default().fg(tp.text_muted))
+                .render(ind_area, frame);
+        }
     }
 }
 

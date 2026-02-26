@@ -3,8 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use ftui::layout::Constraint;
-use ftui::layout::Rect;
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -149,6 +148,7 @@ const fn trend_for(current: u64, previous: u64) -> MetricTrend {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct AgentsScreen {
     table_state: TableState,
     agents: Vec<AgentRow>,
@@ -181,6 +181,10 @@ pub struct AgentsScreen {
     prev_total_msgs: u64,
     /// Messages accumulated this tick interval.
     total_msgs_this_tick: u64,
+    /// Whether the detail panel is visible on wide screens (user toggle).
+    detail_visible: bool,
+    /// Scroll offset inside the detail panel.
+    detail_scroll: usize,
 }
 
 impl AgentsScreen {
@@ -206,6 +210,8 @@ impl AgentsScreen {
             msg_rate_history: VecDeque::with_capacity(SPARKLINE_CAP),
             prev_total_msgs: 0,
             total_msgs_this_tick: 0,
+            detail_visible: true,
+            detail_scroll: 0,
         }
     }
 
@@ -323,6 +329,7 @@ impl AgentsScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
+        self.detail_scroll = 0;
     }
 
     fn rebuild_status_transitions(&mut self, rows: &[AgentRow]) {
@@ -521,6 +528,15 @@ impl MailScreen for AgentsScreen {
                     self.sort_asc = !self.sort_asc;
                     self.rebuild_from_state(state);
                 }
+                KeyCode::Char('i') => {
+                    self.detail_visible = !self.detail_visible;
+                }
+                KeyCode::Char('J') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                }
+                KeyCode::Char('K') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
                 KeyCode::Escape => {
                     if !self.filter.is_empty() {
                         self.filter.clear();
@@ -567,75 +583,33 @@ impl MailScreen for AgentsScreen {
         outer_block.render(area, frame);
         let area = inner;
 
-        let wide = area.width >= 120;
-        let narrow = area.width < 80;
-
-        // Layout: summary(2) + header(1) + table(remainder) + footer(1)
-        let summary_h: u16 = if area.height >= 8 { 2 } else { 0 };
-        let header_h: u16 = 1;
-        let footer_h = u16::from(area.height >= 6);
-        let table_h = area
-            .height
-            .saturating_sub(summary_h)
-            .saturating_sub(header_h)
-            .saturating_sub(footer_h);
-
-        let mut y = area.y;
-
-        // ── Summary band ───────────────────────────────────────────────
-        if summary_h > 0 {
-            let summary_area = Rect::new(area.x, y, area.width, summary_h);
-            self.render_summary_band(frame, summary_area);
-            y += summary_h;
-        }
-
-        // ── Info header ────────────────────────────────────────────────
-        let header_area = Rect::new(area.x, y, area.width, header_h);
-        y += header_h;
-
-        // Clear stale glyphs before writing header/status text.
-        Paragraph::new("")
-            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
-            .render(header_area, frame);
-
-        // Render header info line
-        let sort_indicator = if self.sort_asc {
-            " \u{25b2}"
-        } else {
-            " \u{25bc}"
-        };
-        let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
-        let filter_display = if self.filter_active {
-            format!(" [/] Search: {}_ ", self.filter)
-        } else if !self.filter.is_empty() {
-            format!(" [/] Filter: {} ", self.filter)
-        } else {
-            String::new()
-        };
-        let info = format!(
-            "{} agents | Sort: {}{} {}",
-            self.agents.len(),
-            sort_label,
-            sort_indicator,
-            filter_display,
+        // Responsive layout: single-col on narrow, table+detail on wide
+        let layout = ResponsiveLayout::new(
+            Flex::vertical().constraints([Constraint::Fill]),
+        )
+        .at(
+            Breakpoint::Lg,
+            Flex::horizontal().constraints([
+                Constraint::Percentage(60.0),
+                Constraint::Fill,
+            ]),
+        )
+        .at(
+            Breakpoint::Xl,
+            Flex::horizontal().constraints([
+                Constraint::Percentage(50.0),
+                Constraint::Fill,
+            ]),
         );
-        Paragraph::new(info).render(header_area, frame);
 
-        // ── Table ──────────────────────────────────────────────────────
-        let table_area = Rect::new(area.x, y, area.width, table_h);
-        y += table_h;
+        let split = layout.split(area);
+        let table_area = split.rects[0];
 
-        // Clear table region each frame to prevent ghost separators from prior layouts.
-        Paragraph::new("")
-            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
-            .render(table_area, frame);
+        self.render_table_content(frame, table_area, &tp);
 
-        self.render_table(frame, table_area, wide, narrow);
-
-        // ── Footer ─────────────────────────────────────────────────────
-        if footer_h > 0 {
-            let footer_area = Rect::new(area.x, y, area.width, footer_h);
-            self.render_footer(frame, footer_area);
+        // Render detail panel if visible (Lg+)
+        if split.rects.len() >= 2 && self.detail_visible {
+            self.render_detail_panel(frame, split.rects[1]);
         }
     }
 
@@ -656,6 +630,14 @@ impl MailScreen for AgentsScreen {
             HelpEntry {
                 key: "S",
                 action: "Toggle sort order",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
+            },
+            HelpEntry {
+                key: "J/K",
+                action: "Scroll detail",
             },
             HelpEntry {
                 key: "Esc",
@@ -700,6 +682,170 @@ impl MailScreen for AgentsScreen {
 // ── Rendering helpers ──────────────────────────────────────────────────
 
 impl AgentsScreen {
+    /// Render summary band + header + table + footer into a single column area.
+    fn render_table_content(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        tp: &crate::tui_theme::TuiThemePalette,
+    ) {
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
+
+        // Layout: summary(2) + header(1) + table(remainder) + footer(1)
+        let summary_h: u16 = if area.height >= 8 { 2 } else { 0 };
+        let header_h: u16 = 1;
+        let footer_h = u16::from(area.height >= 6);
+        let table_h = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
+
+        let mut y = area.y;
+
+        // ── Summary band ───────────────────────────────────────────────
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        // ── Info header ────────────────────────────────────────────────
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
+
+        Paragraph::new("")
+            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
+            .render(header_area, frame);
+
+        let sort_indicator = if self.sort_asc {
+            " \u{25b2}"
+        } else {
+            " \u{25bc}"
+        };
+        let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
+        let filter_display = if self.filter_active {
+            format!(" [/] Search: {}_ ", self.filter)
+        } else if !self.filter.is_empty() {
+            format!(" [/] Filter: {} ", self.filter)
+        } else {
+            String::new()
+        };
+        let info = format!(
+            "{} agents | Sort: {}{} {}",
+            self.agents.len(),
+            sort_label,
+            sort_indicator,
+            filter_display,
+        );
+        Paragraph::new(info).render(header_area, frame);
+
+        // ── Table ──────────────────────────────────────────────────────
+        let table_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
+
+        Paragraph::new("")
+            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
+            .render(table_area, frame);
+
+        self.render_table(frame, table_area, wide, narrow);
+
+        // ── Footer ─────────────────────────────────────────────────────
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
+        }
+    }
+
+    /// Render the detail panel for the currently selected agent.
+    fn render_detail_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Agent Detail ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let Some(selected_idx) = self.table_state.selected else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f464}",
+                "No Agent Selected",
+                "Select an agent from the table to view details.",
+            );
+            return;
+        };
+
+        let Some(agent) = self.agents.get(selected_idx) else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f464}",
+                "No Agent Selected",
+                "Select an agent from the table to view details.",
+            );
+            return;
+        };
+
+        let lines = self.build_detail_lines(agent, &tp);
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+    }
+
+    /// Build key-value lines for agent detail.
+    fn build_detail_lines(
+        &self,
+        agent: &AgentRow,
+        tp: &crate::tui_theme::TuiThemePalette,
+    ) -> Vec<(String, String, Option<PackedRgba>)> {
+        let now_ts = chrono::Utc::now().timestamp_micros();
+        let status = AgentStatus::from_last_active(agent.last_active_ts, now_ts);
+        let status_color = self.status_color(agent, now_ts);
+
+        let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
+
+        lines.push(("Name".into(), agent.name.clone(), None));
+        lines.push((
+            "Status".into(),
+            format!(
+                "{} {}",
+                status.icon(),
+                match status {
+                    AgentStatus::Active => "Active",
+                    AgentStatus::Idle => "Idle",
+                    AgentStatus::Inactive => "Inactive",
+                }
+            ),
+            Some(status_color),
+        ));
+        lines.push(("Program".into(), agent.program.clone(), None));
+        if !agent.model.is_empty() {
+            lines.push(("Model".into(), agent.model.clone(), None));
+        }
+        lines.push((
+            "Last Active".into(),
+            if agent.last_active_ts == 0 {
+                "never".into()
+            } else {
+                let relative = format_relative_time(agent.last_active_ts);
+                let iso = mcp_agent_mail_db::timestamps::micros_to_iso(agent.last_active_ts);
+                format!("{relative}  ({iso})")
+            },
+            None,
+        ));
+        lines.push(("Messages".into(), agent.message_count.to_string(), None));
+
+        // Sparkline as text bar
+        if !self.msg_rate_history.is_empty() {
+            lines.push((
+                "Msg Rate".into(),
+                sparkline_bar(&self.msg_rate_history),
+                Some(tp.metric_messages),
+            ));
+        }
+
+        lines
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
@@ -881,6 +1027,93 @@ fn format_relative_time(ts_micros: i64) -> String {
         format!("{}h ago", delta / 3600)
     } else {
         format!("{}d ago", delta / 86400)
+    }
+}
+
+const SPARKLINE_BLOCKS: &[char] = &[
+    ' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+];
+
+/// Build a text-mode sparkline bar from rate history.
+fn sparkline_bar(history: &VecDeque<f64>) -> String {
+    let max_val = history
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(1.0);
+    history
+        .iter()
+        .map(|v| {
+            let frac = v / max_val;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let idx = (frac * 7.0).round() as usize;
+            SPARKLINE_BLOCKS[idx.min(7)]
+        })
+        .collect()
+}
+
+/// Render key-value lines with a label column and a value column, supporting scroll.
+#[allow(clippy::cast_possible_truncation)]
+fn render_kv_lines(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: &[(String, String, Option<PackedRgba>)],
+    scroll: usize,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    let visible_height = usize::from(inner.height);
+    let total_lines = lines.len();
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = scroll.min(max_scroll);
+    let label_w = 12u16;
+
+    for (i, (label, value, color)) in lines.iter().skip(scroll).take(visible_height).enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+
+        // Label
+        let label_area = Rect::new(inner.x, y, label_w.min(inner.width), 1);
+        let label_text = format!("{label}:");
+        Paragraph::new(label_text)
+            .style(Style::default().fg(tp.text_muted).bold())
+            .render(label_area, frame);
+
+        // Value
+        let val_x = inner.x + label_w + 1;
+        if val_x < inner.x + inner.width {
+            let val_w = (inner.x + inner.width).saturating_sub(val_x);
+            let val_area = Rect::new(val_x, y, val_w, 1);
+            let val_style = color.map_or_else(
+                || Style::default().fg(tp.text_primary),
+                |c| Style::default().fg(c),
+            );
+            Paragraph::new(value.as_str())
+                .style(val_style)
+                .render(val_area, frame);
+        }
+    }
+
+    // Scroll indicator
+    if total_lines > visible_height {
+        let indicator = format!(
+            " {}/{} ",
+            scroll + 1,
+            total_lines.saturating_sub(visible_height) + 1
+        );
+        let ind_w = indicator.len() as u16;
+        if ind_w < inner.width {
+            let ind_area = Rect::new(
+                inner.x + inner.width - ind_w,
+                inner.y + inner.height.saturating_sub(1),
+                ind_w,
+                1,
+            );
+            Paragraph::new(indicator)
+                .style(Style::default().fg(tp.text_muted))
+                .render(ind_area, frame);
+        }
     }
 }
 

@@ -3,8 +3,7 @@
 
 use std::collections::HashMap;
 
-use ftui::layout::Constraint;
-use ftui::layout::Rect;
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::display_width;
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
@@ -48,6 +47,10 @@ pub struct ProjectsScreen {
     project_activity: HashMap<String, i64>,
     /// Previous totals for `MetricTrend` computation.
     prev_totals: (u64, u64, u64, u64),
+    /// Whether the detail panel is visible on wide screens.
+    detail_visible: bool,
+    /// Scroll offset inside the detail panel.
+    detail_scroll: usize,
 }
 
 impl ProjectsScreen {
@@ -63,6 +66,8 @@ impl ProjectsScreen {
             last_seq: 0,
             project_activity: HashMap::new(),
             prev_totals: (0, 0, 0, 0),
+            detail_visible: true,
+            detail_scroll: 0,
         }
     }
 
@@ -134,6 +139,7 @@ impl ProjectsScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
+        self.detail_scroll = 0;
     }
 
     /// Compute totals for the summary band.
@@ -248,6 +254,15 @@ impl MailScreen for ProjectsScreen {
                     self.sort_asc = !self.sort_asc;
                     self.rebuild_from_state(state);
                 }
+                KeyCode::Char('i') => {
+                    self.detail_visible = !self.detail_visible;
+                }
+                KeyCode::Char('J') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                }
+                KeyCode::Char('K') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
                 KeyCode::Escape => {
                     if !self.filter.is_empty() {
                         self.filter.clear();
@@ -284,74 +299,32 @@ impl MailScreen for ProjectsScreen {
         outer_block.render(area, frame);
         let area = inner;
 
-        let wide = area.width >= 120;
-        let narrow = area.width < 80;
-
-        // Layout: summary_band(2) + header(1) + table(remainder) + footer(1)
-        let summary_h: u16 = if area.height >= 8 { 2 } else { 0 };
-        let header_h: u16 = 1;
-        let footer_h = u16::from(area.height >= 6);
-        let table_h = area
-            .height
-            .saturating_sub(summary_h)
-            .saturating_sub(header_h)
-            .saturating_sub(footer_h);
-
-        let mut y = area.y;
-
-        // ── Summary band (MetricTile row) ──────────────────────────────
-        if summary_h > 0 {
-            let summary_area = Rect::new(area.x, y, area.width, summary_h);
-            self.render_summary_band(frame, summary_area);
-            y += summary_h;
-        }
-
-        // ── Info header ────────────────────────────────────────────────
-        let header_area = Rect::new(area.x, y, area.width, header_h);
-        y += header_h;
-
-        // Clear header area
-        Paragraph::new("")
-            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
-            .render(header_area, frame);
-
-        let sort_indicator = if self.sort_asc {
-            " \u{25b2}"
-        } else {
-            " \u{25bc}"
-        };
-        let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
-        let filter_display = if self.filter_active {
-            format!(" [/] Search: {}_ ", self.filter)
-        } else if !self.filter.is_empty() {
-            format!(" [/] Filter: {} ", self.filter)
-        } else {
-            String::new()
-        };
-        let info = format!(
-            "{} projects   Sort: {}{} {}",
-            self.projects.len(),
-            sort_label,
-            sort_indicator,
-            filter_display,
+        // Responsive layout: single-col on narrow, table+detail on wide
+        let layout = ResponsiveLayout::new(
+            Flex::vertical().constraints([Constraint::Fill]),
+        )
+        .at(
+            Breakpoint::Lg,
+            Flex::horizontal().constraints([
+                Constraint::Percentage(60.0),
+                Constraint::Fill,
+            ]),
+        )
+        .at(
+            Breakpoint::Xl,
+            Flex::horizontal().constraints([
+                Constraint::Percentage(50.0),
+                Constraint::Fill,
+            ]),
         );
-        Paragraph::new(info).render(header_area, frame);
 
-        // ── Table ──────────────────────────────────────────────────────
-        let table_area = Rect::new(area.x, y, area.width, table_h);
-        y += table_h;
+        let split = layout.split(area);
+        let table_area = split.rects[0];
 
-        // Clear table region
-        Paragraph::new("")
-            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
-            .render(table_area, frame);
+        self.render_table_content(frame, table_area, &tp);
 
-        self.render_table(frame, table_area, wide, narrow);
-
-        // ── Footer summary ─────────────────────────────────────────────
-        if footer_h > 0 {
-            let footer_area = Rect::new(area.x, y, area.width, footer_h);
-            self.render_footer(frame, footer_area);
+        if split.rects.len() >= 2 && self.detail_visible {
+            self.render_detail_panel(frame, split.rects[1]);
         }
     }
 
@@ -372,6 +345,14 @@ impl MailScreen for ProjectsScreen {
             HelpEntry {
                 key: "S",
                 action: "Toggle sort order",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
+            },
+            HelpEntry {
+                key: "J/K",
+                action: "Scroll detail",
             },
             HelpEntry {
                 key: "Esc",
@@ -416,6 +397,136 @@ impl MailScreen for ProjectsScreen {
 // ── Rendering helpers ──────────────────────────────────────────────────
 
 impl ProjectsScreen {
+    /// Render summary band + header + table + footer into a single column area.
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_table_content(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        tp: &crate::tui_theme::TuiThemePalette,
+    ) {
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
+
+        let summary_h: u16 = if area.height >= 8 { 2 } else { 0 };
+        let header_h: u16 = 1;
+        let footer_h = u16::from(area.height >= 6);
+        let table_h = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
+
+        let mut y = area.y;
+
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
+
+        Paragraph::new("")
+            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
+            .render(header_area, frame);
+
+        let sort_indicator = if self.sort_asc {
+            " \u{25b2}"
+        } else {
+            " \u{25bc}"
+        };
+        let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
+        let filter_display = if self.filter_active {
+            format!(" [/] Search: {}_ ", self.filter)
+        } else if !self.filter.is_empty() {
+            format!(" [/] Filter: {} ", self.filter)
+        } else {
+            String::new()
+        };
+        let info = format!(
+            "{} projects   Sort: {}{} {}",
+            self.projects.len(),
+            sort_label,
+            sort_indicator,
+            filter_display,
+        );
+        Paragraph::new(info).render(header_area, frame);
+
+        let table_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
+
+        Paragraph::new("")
+            .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
+            .render(table_area, frame);
+
+        self.render_table(frame, table_area, wide, narrow);
+
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
+        }
+    }
+
+    /// Render the detail panel for the currently selected project.
+    fn render_detail_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Project Detail ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let Some(selected_idx) = self.table_state.selected else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f4c1}",
+                "No Project Selected",
+                "Select a project from the table to view details.",
+            );
+            return;
+        };
+
+        let Some(proj) = self.projects.get(selected_idx) else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f4c1}",
+                "No Project Selected",
+                "Select a project from the table to view details.",
+            );
+            return;
+        };
+
+        let mut lines: Vec<(String, String, Option<ftui::PackedRgba>)> = Vec::new();
+
+        let activity_color = self.activity_color(proj);
+        let icon = self.activity_icon(proj);
+
+        lines.push(("Slug".into(), proj.slug.clone(), None));
+        lines.push(("Path".into(), proj.human_key.clone(), None));
+        lines.push((
+            "Status".into(),
+            format!("{icon} {}",
+                if icon == "\u{25CF}" { "Active" }
+                else if icon == "\u{25D0}" { "Idle" }
+                else { "Inactive" }
+            ),
+            Some(activity_color),
+        ));
+        lines.push(("Agents".into(), proj.agent_count.to_string(), Some(tp.metric_agents)));
+        lines.push(("Messages".into(), proj.message_count.to_string(), Some(tp.metric_messages)));
+        lines.push(("Reservations".into(), proj.reservation_count.to_string(), Some(tp.metric_reservations)));
+        lines.push(("Created".into(), format_created_time(proj.created_at), None));
+
+        if let Some(last_ts) = self.project_activity.get(&proj.slug) {
+            let relative = format_relative_time(*last_ts);
+            lines.push(("Last Activity".into(), relative, None));
+        }
+
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
@@ -602,6 +713,92 @@ impl ProjectsScreen {
         ];
 
         SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+    }
+}
+
+/// Format a timestamp as relative time from now.
+fn format_relative_time(ts_micros: i64) -> String {
+    if ts_micros == 0 {
+        return "never".to_string();
+    }
+    let now = chrono::Utc::now().timestamp_micros();
+    let delta_secs = (now - ts_micros) / 1_000_000;
+    if delta_secs < 0 {
+        return "future".to_string();
+    }
+    let delta = delta_secs.unsigned_abs();
+    if delta < 60 {
+        format!("{delta}s ago")
+    } else if delta < 3600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86400 {
+        format!("{}h ago", delta / 3600)
+    } else {
+        format!("{}d ago", delta / 86400)
+    }
+}
+
+/// Render key-value lines with a label column and a value column, supporting scroll.
+#[allow(clippy::cast_possible_truncation)]
+fn render_kv_lines(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: &[(String, String, Option<ftui::PackedRgba>)],
+    scroll: usize,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    use ftui::widgets::Widget;
+
+    let visible_height = usize::from(inner.height);
+    let total_lines = lines.len();
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = scroll.min(max_scroll);
+    let label_w = 14u16;
+
+    for (i, (label, value, color)) in lines.iter().skip(scroll).take(visible_height).enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+
+        let label_area = Rect::new(inner.x, y, label_w.min(inner.width), 1);
+        let label_text = format!("{label}:");
+        Paragraph::new(label_text)
+            .style(Style::default().fg(tp.text_muted).bold())
+            .render(label_area, frame);
+
+        let val_x = inner.x + label_w + 1;
+        if val_x < inner.x + inner.width {
+            let val_w = (inner.x + inner.width).saturating_sub(val_x);
+            let val_area = Rect::new(val_x, y, val_w, 1);
+            let val_style = color.map_or_else(
+                || Style::default().fg(tp.text_primary),
+                |c| Style::default().fg(c),
+            );
+            Paragraph::new(value.as_str())
+                .style(val_style)
+                .render(val_area, frame);
+        }
+    }
+
+    if total_lines > visible_height {
+        let indicator = format!(
+            " {}/{} ",
+            scroll + 1,
+            total_lines.saturating_sub(visible_height) + 1
+        );
+        let ind_w = indicator.len() as u16;
+        if ind_w < inner.width {
+            let ind_area = Rect::new(
+                inner.x + inner.width - ind_w,
+                inner.y + inner.height.saturating_sub(1),
+                ind_w,
+                1,
+            );
+            Paragraph::new(indicator)
+                .style(Style::default().fg(tp.text_muted))
+                .render(ind_area, frame);
+        }
     }
 }
 
