@@ -2495,6 +2495,8 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-types",
  "fsqlite-vfs",
+ "parking_lot",
+ "serde",
  "tracing",
  "xxhash-rust",
 ]

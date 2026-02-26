@@ -186,6 +186,8 @@ struct DiagnosticsSnapshot {
     tcp_error: Option<String>,
     path_probes: Vec<PathProbe>,
     lines: Vec<ProbeLine>,
+    /// Tailscale remote-access URL with token, if Tailscale is active.
+    remote_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +303,20 @@ impl SystemHealthScreen {
             Span::styled("Web UI:    ", label_style),
             Span::styled(snap.web_ui_url.clone(), value_style),
         ]));
+        if let Some(ref url) = snap.remote_url {
+            let remote_style = crate::tui_theme::text_accent(&tp).bold();
+            lines.push(Line::from_spans([
+                Span::styled("Remote:    ", label_style),
+                Span::styled(url.clone(), remote_style),
+            ]));
+            lines.push(Line::from_spans([
+                Span::styled("           ", label_style),
+                Span::styled(
+                    "(Tailscale — click to open web app from remote machine)".to_string(),
+                    hint_style,
+                ),
+            ]));
+        }
 
         let auth_text = if snap.auth_enabled {
             "enabled"
@@ -488,6 +504,31 @@ impl SystemHealthScreen {
             widget.render(content_area, frame);
             return;
         }
+
+        // ── Remote access banner (Tailscale) ──
+        let content_area = if let Some(ref url) = snap.remote_url {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let remote_style = crate::tui_theme::text_accent(&tp).bold();
+            let label_style = crate::tui_theme::text_meta(&tp);
+            let hint_style = crate::tui_theme::text_hint(&tp);
+            let line = Line::from_spans([
+                Span::styled(" Remote: ", label_style),
+                Span::styled(url.clone(), remote_style),
+                Span::styled("  (Tailscale)", hint_style),
+            ]);
+            Paragraph::new(line).render(
+                Rect::new(content_area.x, content_area.y, content_area.width, 1),
+                frame,
+            );
+            Rect::new(
+                content_area.x,
+                content_area.y.saturating_add(1),
+                content_area.width,
+                content_area.height.saturating_sub(1),
+            )
+        } else {
+            content_area
+        };
 
         // Adaptive width-class layout policy:
         //   Wide  (>= 80 cols): tiles (3h) + gauge (3h) + anomaly cards (rest)
@@ -1221,6 +1262,10 @@ fn run_diagnostics(state: &TuiSharedState) -> DiagnosticsSnapshot {
     let cfg = state.config_snapshot();
     let env_cfg = Config::from_env();
 
+    let remote_url = crate::detect_tailscale_ip().map(|ip| {
+        crate::build_remote_url(&ip, env_cfg.http_port, env_cfg.http_bearer_token.as_deref())
+    });
+
     let mut out = DiagnosticsSnapshot {
         checked_at: Some(Utc::now()),
         endpoint: cfg.endpoint.clone(),
@@ -1229,6 +1274,7 @@ fn run_diagnostics(state: &TuiSharedState) -> DiagnosticsSnapshot {
         localhost_unauth_allowed: env_cfg.http_allow_localhost_unauthenticated,
         token_present: env_cfg.http_bearer_token.is_some(),
         token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
+        remote_url,
         ..Default::default()
     };
 

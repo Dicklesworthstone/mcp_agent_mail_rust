@@ -23,6 +23,7 @@ fn startup_banner_sections_present_after_normalization() {
         messages: 42,
         file_reservations: 2,
         contact_links: 1,
+        remote_url: None,
     };
     let lines = render_startup_banner(&params);
     let joined = common::normalize_console_text(&lines.join("\n"));

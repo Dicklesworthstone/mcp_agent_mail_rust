@@ -642,7 +642,7 @@ impl Default for Config {
             memory_fatal_mb: 8192,    // 8 GB
 
             // HTTP
-            http_host: "127.0.0.1".to_string(),
+            http_host: "0.0.0.0".to_string(),
             http_port: 8765,
             http_path: "/api/".to_string(),
             http_bearer_token: None,

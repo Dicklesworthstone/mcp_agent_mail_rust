@@ -1681,6 +1681,8 @@ struct DashboardLastRequest {
 struct DashboardSnapshot {
     endpoint: String,
     web_ui: String,
+    /// Tailscale remote-access URL with auth token (if Tailscale detected).
+    remote_url: Option<String>,
     transport_mode: String,
     app_environment: String,
     auth_enabled: bool,
@@ -1957,6 +1959,8 @@ struct StartupDashboard {
     started_at: Instant,
     endpoint: String,
     web_ui: String,
+    /// Tailscale remote-access URL with auth token (computed once at startup).
+    remote_url: Option<String>,
     transport_mode: String,
     app_environment: String,
     auth_enabled: bool,
@@ -2033,6 +2037,9 @@ impl StartupDashboard {
             config.http_host, config.http_port, config.http_path
         );
         let web_ui = format!("http://{}:{}/mail", config.http_host, config.http_port);
+        let remote_url = detect_tailscale_ip().map(|ip| {
+            build_remote_url(&ip, config.http_port, config.http_bearer_token.as_deref())
+        });
         let transport_mode = detect_transport_mode(&config.http_path).to_string();
 
         let dashboard = Arc::new(Self {
@@ -2043,6 +2050,7 @@ impl StartupDashboard {
             started_at: Instant::now(),
             endpoint,
             web_ui,
+            remote_url,
             transport_mode,
             app_environment: config.app_environment.to_string(),
             auth_enabled: config.http_bearer_token.is_some(),
@@ -2100,6 +2108,7 @@ impl StartupDashboard {
             tool_calls_log_enabled: config.log_tool_calls_enabled,
             console_theme: theme::current_theme_display_name(),
             web_ui_url: &self.web_ui,
+            remote_url: self.remote_url.as_deref(),
             projects: stats.projects,
             agents: stats.agents,
             messages: stats.messages,
@@ -2718,6 +2727,7 @@ impl StartupDashboard {
         DashboardSnapshot {
             endpoint: self.endpoint.clone(),
             web_ui: self.web_ui.clone(),
+            remote_url: self.remote_url.clone(),
             transport_mode: self.transport_mode.clone(),
             app_environment: self.app_environment.clone(),
             auth_enabled: self.auth_enabled,
@@ -2940,11 +2950,18 @@ fn render_dashboard_frame(
             .split(rows[1])
     };
 
+    let remote_line = snapshot
+        .remote_url
+        .as_ref()
+        .map_or_else(String::new, |url| {
+            format!("\nRemote:   {}", compact_path(url, 52))
+        });
     let left = format!(
-        "Endpoint: {}\nMode: {}\nWeb UI: {}\nAuth: {}\nStorage: {}\nDatabase: {}",
+        "Endpoint: {}\nMode: {}\nWeb UI: {}{}\nAuth: {}\nStorage: {}\nDatabase: {}",
         compact_path(&snapshot.endpoint, 52),
         snapshot.transport_mode,
         compact_path(&snapshot.web_ui, 52),
+        remote_line,
         if snapshot.auth_enabled {
             "ENABLED"
         } else {
@@ -5801,6 +5818,38 @@ fn normalize_base_path(path: &str) -> String {
     // Trim trailing slashes, but ensure we never return empty string
     let result = out.trim_end_matches('/');
     if result.is_empty() { "/" } else { result }.to_string()
+}
+
+/// Try to detect the Tailscale IPv4 address by running `tailscale ip -4`.
+/// Returns `None` if Tailscale is not installed or not running.
+pub(crate) fn detect_tailscale_ip() -> Option<String> {
+    let output = std::process::Command::new("tailscale")
+        .args(["ip", "-4"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if ip.is_empty() {
+        return None;
+    }
+    Some(ip)
+}
+
+/// Build a remote-access URL with the Tailscale IP and optional auth token.
+pub(crate) fn build_remote_url(
+    tailscale_ip: &str,
+    port: u16,
+    token: Option<&str>,
+) -> String {
+    let base = format!("http://{tailscale_ip}:{port}/mail");
+    match token {
+        Some(t) => format!("{base}?token={t}"),
+        None => base,
+    }
 }
 
 fn detect_transport_mode(path: &str) -> &'static str {
@@ -12971,6 +13020,7 @@ mod tests {
             },
             last_request: None,
             sparkline_data: vec![0.0; 10],
+            remote_url: None,
         }
     }
 

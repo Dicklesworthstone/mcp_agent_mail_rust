@@ -179,6 +179,7 @@ pub struct BannerParams<'a> {
     pub tool_calls_log_enabled: bool,
     pub console_theme: &'a str,
     pub web_ui_url: &'a str,
+    pub remote_url: Option<&'a str>,
     pub projects: u64,
     pub agents: u64,
     pub messages: u64,
@@ -221,6 +222,9 @@ pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
     ));
     lines.push(format!("  {accent}Endpoint:{RESET} {}", params.endpoint));
     lines.push(format!("  {accent}Web UI:{RESET} {}", params.web_ui_url));
+    if let Some(remote) = params.remote_url {
+        lines.push(format!("  {success}Remote:{RESET} {remote}"));
+    }
     lines.push(format!(
         "  {accent}Database:{RESET} {}",
         compact_path(&database_url, 60)
@@ -2714,6 +2718,7 @@ mod tests {
             tool_calls_log_enabled: true,
             console_theme: "Cyberpunk Aurora",
             web_ui_url: "http://localhost:8765/mail",
+            remote_url: Some("http://100.91.120.17:8765/mail?token=abc123"),
             projects: 3,
             agents: 5,
             messages: 42,
@@ -2762,6 +2767,7 @@ mod tests {
             tool_calls_log_enabled: false,
             console_theme: "Darcula",
             web_ui_url: "http://localhost:8765/mail",
+            remote_url: None,
             projects: 0,
             agents: 0,
             messages: 0,
