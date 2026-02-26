@@ -1247,18 +1247,30 @@ fn render_remote_url_banner(
     )
 }
 
+/// How often to re-probe Tailscale IP (avoid subprocess spam on every 3s cycle).
+const TAILSCALE_CACHE_TTL: Duration = Duration::from_mins(2);
+
 fn diagnostics_worker_loop(
     state: &TuiSharedState,
     snapshot: &Mutex<DiagnosticsSnapshot>,
     refresh_requested: &AtomicBool,
     stop: &AtomicBool,
 ) {
+    // Cache Tailscale IP to avoid spawning a subprocess every diagnostics cycle.
+    let mut cached_tailscale_ip: Option<String> = crate::detect_tailscale_ip();
+    let mut tailscale_checked_at = Instant::now();
+
     let mut next_due = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         let refresh = refresh_requested.swap(false, Ordering::Relaxed);
         if refresh || now >= next_due {
-            let snap = run_diagnostics(state);
+            // Refresh Tailscale IP periodically (not every cycle).
+            if now.duration_since(tailscale_checked_at) >= TAILSCALE_CACHE_TTL {
+                cached_tailscale_ip = crate::detect_tailscale_ip();
+                tailscale_checked_at = now;
+            }
+            let snap = run_diagnostics(state, cached_tailscale_ip.as_deref());
             if let Ok(mut guard) = snapshot.lock() {
                 *guard = snap;
             }
@@ -1268,12 +1280,12 @@ fn diagnostics_worker_loop(
     }
 }
 
-fn run_diagnostics(state: &TuiSharedState) -> DiagnosticsSnapshot {
+fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> DiagnosticsSnapshot {
     let cfg = state.config_snapshot();
     let env_cfg = Config::from_env();
 
-    let remote_url = crate::detect_tailscale_ip().map(|ip| {
-        crate::build_remote_url(&ip, env_cfg.http_port, env_cfg.http_bearer_token.as_deref())
+    let remote_url = tailscale_ip.map(|ip| {
+        crate::build_remote_url(ip, env_cfg.http_port, env_cfg.http_bearer_token.as_deref())
     });
 
     let mut out = DiagnosticsSnapshot {
