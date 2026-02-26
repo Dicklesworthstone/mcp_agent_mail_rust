@@ -6513,13 +6513,21 @@ fn verify_sha256(data: &[u8], expected_hex: &str) -> bool {
 /// Returns the directory path containing extracted files.
 fn extract_tar_xz(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
     let status = std::process::Command::new("tar")
-        .args(["xJf", &archive_path.to_string_lossy(), "-C", &dest_dir.to_string_lossy()])
+        .args([
+            "xJf",
+            &archive_path.to_string_lossy(),
+            "-C",
+            &dest_dir.to_string_lossy(),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status()
         .map_err(|e| format!("failed to run tar: {e}"))?;
     if !status.success() {
-        return Err(format!("tar extraction failed with exit code {:?}", status.code()));
+        return Err(format!(
+            "tar extraction failed with exit code {:?}",
+            status.code()
+        ));
     }
     Ok(())
 }
@@ -6564,8 +6572,13 @@ fn extract_zip(archive_data: &[u8], dest_dir: &Path) -> Result<(), String> {
 
 /// Download, verify, and extract a release. Returns paths to the extracted binaries.
 fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, String> {
-    let target = detect_platform_target()
-        .ok_or_else(|| format!("unsupported platform: {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
+    let target = detect_platform_target().ok_or_else(|| {
+        format!(
+            "unsupported platform: {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
 
     let (asset_url, filename) = release_asset_url(version, &target);
     let checksum_url = format!("{asset_url}.sha256");
@@ -6596,18 +6609,15 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
     // Create temp directory for extraction
     let tmp_dir = std::env::temp_dir().join(format!("am-update-{version}"));
     if tmp_dir.exists() {
-        std::fs::remove_dir_all(&tmp_dir)
-            .map_err(|e| format!("clean temp dir: {e}"))?;
+        std::fs::remove_dir_all(&tmp_dir).map_err(|e| format!("clean temp dir: {e}"))?;
     }
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("create temp dir: {e}"))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
 
     // Extract
     if filename.ends_with(".tar.xz") {
         // Write to file first (tar reads from file)
         let archive_path = tmp_dir.join(&filename);
-        std::fs::write(&archive_path, &archive_data)
-            .map_err(|e| format!("write archive: {e}"))?;
+        std::fs::write(&archive_path, &archive_data).map_err(|e| format!("write archive: {e}"))?;
         extract_tar_xz(&archive_path, &tmp_dir)?;
         // Clean up the archive file
         let _ = std::fs::remove_file(&archive_path);
@@ -6661,8 +6671,8 @@ fn find_binary_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
 /// Find the install directory for the current `am` binary.
 fn find_install_dir() -> Result<PathBuf, String> {
     // First try: the binary that's currently running
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("cannot determine current executable: {e}"))?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("cannot determine current executable: {e}"))?;
     let dir = current_exe
         .parent()
         .ok_or_else(|| "current executable has no parent directory".to_string())?;
@@ -6673,10 +6683,7 @@ fn find_install_dir() -> Result<PathBuf, String> {
 ///
 /// Strategy: write new → rename old to .old.tmp → rename new to target (atomic).
 #[cfg(unix)]
-fn atomic_replace_binary(
-    new_binary: &Path,
-    target_path: &Path,
-) -> Result<(), String> {
+fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = target_path.parent().ok_or("no parent directory")?;
@@ -6689,8 +6696,7 @@ fn atomic_replace_binary(
     let tmp_old = dir.join(format!(".{name}.old.tmp"));
 
     // 1. Copy new binary to staging location
-    std::fs::copy(new_binary, &tmp_new)
-        .map_err(|e| format!("stage new binary: {e}"))?;
+    std::fs::copy(new_binary, &tmp_new).map_err(|e| format!("stage new binary: {e}"))?;
 
     // 2. Set executable permissions
     std::fs::set_permissions(&tmp_new, std::fs::Permissions::from_mode(0o755))
@@ -6712,8 +6718,7 @@ fn atomic_replace_binary(
     if target_path.exists() {
         // Remove any leftover old backup
         let _ = std::fs::remove_file(&tmp_old);
-        std::fs::rename(target_path, &tmp_old)
-            .map_err(|e| format!("backup old binary: {e}"))?;
+        std::fs::rename(target_path, &tmp_old).map_err(|e| format!("backup old binary: {e}"))?;
     }
 
     // 5. Rename new binary to target (atomic on same filesystem)
@@ -6737,10 +6742,7 @@ fn atomic_replace_binary(
 /// out of the way (Windows allows renaming locked files), then move the
 /// new binary into place.
 #[cfg(windows)]
-fn atomic_replace_binary(
-    new_binary: &Path,
-    target_path: &Path,
-) -> Result<(), String> {
+fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), String> {
     let dir = target_path.parent().ok_or("no parent directory")?;
     let name = target_path
         .file_name()
@@ -6751,14 +6753,12 @@ fn atomic_replace_binary(
     let tmp_old = dir.join(format!("{name}.old.tmp"));
 
     // 1. Copy new binary to staging location
-    std::fs::copy(new_binary, &tmp_new)
-        .map_err(|e| format!("stage new binary: {e}"))?;
+    std::fs::copy(new_binary, &tmp_new).map_err(|e| format!("stage new binary: {e}"))?;
 
     // 2. Rename old binary out of the way (Windows allows this even if locked)
     if target_path.exists() {
         let _ = std::fs::remove_file(&tmp_old);
-        std::fs::rename(target_path, &tmp_old)
-            .map_err(|e| format!("backup old binary: {e}"))?;
+        std::fs::rename(target_path, &tmp_old).map_err(|e| format!("backup old binary: {e}"))?;
     }
 
     // 3. Rename new binary to target
@@ -6875,9 +6875,12 @@ fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliRe
         Err(e) => {
             ftui_runtime::ftui_eprintln!("Binary replacement failed: {e}");
             ftui_runtime::ftui_eprintln!(
-                "New binaries are staged at: {}", release.extract_dir.display()
+                "New binaries are staged at: {}",
+                release.extract_dir.display()
             );
-            Err(CliError::Other(format!("self-update replacement failed: {e}")))
+            Err(CliError::Other(format!(
+                "self-update replacement failed: {e}"
+            )))
         }
     }
 }
@@ -25497,7 +25500,10 @@ fn is_newer_version_with_v_prefix() {
 fn detect_platform_target_returns_some() {
     // We're running on a supported platform in CI/dev
     let target = detect_platform_target();
-    assert!(target.is_some(), "detect_platform_target() should detect this host");
+    assert!(
+        target.is_some(),
+        "detect_platform_target() should detect this host"
+    );
     let t = target.unwrap();
     assert!(
         t.contains("linux") || t.contains("darwin") || t.contains("windows"),
@@ -25538,7 +25544,10 @@ fn verify_sha256_correct() {
 
 #[test]
 fn verify_sha256_wrong() {
-    assert!(!verify_sha256(b"hello world", "0000000000000000000000000000000000000000000000000000000000000000"));
+    assert!(!verify_sha256(
+        b"hello world",
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ));
 }
 
 #[test]
@@ -25581,7 +25590,11 @@ fn find_binary_in_dir_nested() {
 fn clap_parses_self_update_check() {
     let cli = Cli::try_parse_from(["am", "self-update", "--check"]).unwrap();
     match cli.command {
-        Some(Commands::SelfUpdate { check, force, version }) => {
+        Some(Commands::SelfUpdate {
+            check,
+            force,
+            version,
+        }) => {
             assert!(check);
             assert!(!force);
             assert!(version.is_none());
@@ -25594,7 +25607,11 @@ fn clap_parses_self_update_check() {
 fn clap_parses_self_update_default() {
     let cli = Cli::try_parse_from(["am", "self-update"]).unwrap();
     match cli.command {
-        Some(Commands::SelfUpdate { check, force, version }) => {
+        Some(Commands::SelfUpdate {
+            check,
+            force,
+            version,
+        }) => {
             assert!(!check);
             assert!(!force);
             assert!(version.is_none());
@@ -25607,7 +25624,11 @@ fn clap_parses_self_update_default() {
 fn clap_parses_self_update_force() {
     let cli = Cli::try_parse_from(["am", "self-update", "--force"]).unwrap();
     match cli.command {
-        Some(Commands::SelfUpdate { check, force, version }) => {
+        Some(Commands::SelfUpdate {
+            check,
+            force,
+            version,
+        }) => {
             assert!(!check);
             assert!(force);
             assert!(version.is_none());
@@ -25620,7 +25641,11 @@ fn clap_parses_self_update_force() {
 fn clap_parses_self_update_version() {
     let cli = Cli::try_parse_from(["am", "self-update", "--version", "0.2.0"]).unwrap();
     match cli.command {
-        Some(Commands::SelfUpdate { check, force, version }) => {
+        Some(Commands::SelfUpdate {
+            check,
+            force,
+            version,
+        }) => {
             assert!(!check);
             assert!(!force);
             assert_eq!(version.as_deref(), Some("0.2.0"));

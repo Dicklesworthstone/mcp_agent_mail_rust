@@ -438,6 +438,12 @@ impl MailScreen for ContactsScreen {
             return;
         }
 
+        // Outer bordered panel
+        let outer_block = crate::tui_panel_helpers::panel_block(" Contact Graph ");
+        let inner = outer_block.inner(area);
+        outer_block.render(area, frame);
+        let area = inner;
+
         let is_table_mode = self.view_mode == ViewMode::Table && !self.show_mermaid_panel;
 
         // Layout depends on mode: Table gets summary band + footer, Graph/Mermaid maximize canvas

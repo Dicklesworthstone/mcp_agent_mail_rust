@@ -560,6 +560,13 @@ impl MailScreen for AgentsScreen {
         }
 
         let tp = crate::tui_theme::TuiThemePalette::current();
+
+        // Outer bordered panel wrapping entire screen content
+        let outer_block = crate::tui_panel_helpers::panel_block(" Registered Agents ");
+        let inner = outer_block.inner(area);
+        outer_block.render(area, frame);
+        let area = inner;
+
         let wide = area.width >= 120;
         let narrow = area.width < 80;
 

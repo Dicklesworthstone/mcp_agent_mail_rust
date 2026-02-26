@@ -64,6 +64,7 @@ pub mod tui_keymap;
 pub mod tui_layout;
 pub mod tui_macro;
 pub mod tui_markdown;
+pub mod tui_panel_helpers;
 pub mod tui_persist;
 pub mod tui_poller;
 pub mod tui_preset;

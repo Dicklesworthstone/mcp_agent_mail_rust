@@ -1228,9 +1228,14 @@ impl MailScreen for ToolMetricsScreen {
             return;
         }
 
+        // Outer bordered panel
+        let outer_block = crate::tui_panel_helpers::panel_block(" Tool Metrics ");
+        let inner = outer_block.inner(area);
+        outer_block.render(area, frame);
+
         match self.view_mode {
-            ViewMode::Table => self.render_table_view(frame, area),
-            ViewMode::Dashboard => self.render_dashboard_view(frame, area, state),
+            ViewMode::Table => self.render_table_view(frame, inner),
+            ViewMode::Dashboard => self.render_dashboard_view(frame, inner, state),
         }
     }
 

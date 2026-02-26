@@ -968,6 +968,12 @@ impl MailScreen for MailExplorerScreen {
             return;
         }
 
+        // Outer bordered panel
+        let outer_block = crate::tui_panel_helpers::panel_block(" Mail Explorer ");
+        let inner = outer_block.inner(area);
+        outer_block.render(area, frame);
+        let area = inner;
+
         // Sync list state with cursor before rendering
         self.sync_list_state();
 

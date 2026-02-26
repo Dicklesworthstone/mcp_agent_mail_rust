@@ -4,6 +4,8 @@
 //! badges, confidence scores, rationale, actionable next steps, severity
 //! summary band, colored left borders, and deep link visual affordances.
 
+use core::cell::Cell;
+
 use ftui::layout::{Constraint, Rect};
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
@@ -32,6 +34,10 @@ const ANALYTICS_WIDE_SPLIT_MIN_HEIGHT: u16 = 10;
 const ANALYTICS_STACKED_MIN_HEIGHT: u16 = 14;
 const ANALYTICS_STACKED_LIST_MIN_HEIGHT: u16 = 6;
 const ANALYTICS_STACKED_DETAIL_MIN_HEIGHT: u16 = 8;
+const ANALYTICS_COMPACT_META_MIN_WIDTH: u16 = 36;
+const ANALYTICS_DETAIL_LENS_MIN_HEIGHT: u16 = 20;
+const ANALYTICS_DETAIL_LENS_MIN_WIDTH: u16 = 52;
+const ANALYTICS_DETAIL_LENS_RATIO_PERCENT: u16 = 34;
 const ANALYTICS_WIDE_LIST_RATIO_PERCENT: u16 = 38;
 const ANALYTICS_WIDE_LIST_MIN_WIDTH: u16 = 34;
 const ANALYTICS_WIDE_DETAIL_MIN_WIDTH: u16 = 42;
@@ -151,6 +157,8 @@ pub struct AnalyticsScreen {
     severity_filter: AnalyticsSeverityFilter,
     sort_mode: AnalyticsSortMode,
     focus: AnalyticsFocus,
+    /// Whether the currently rendered layout includes an interactive detail pane.
+    detail_focus_available: Cell<bool>,
     /// Cached viz snapshot — rebuilt in `tick()`, read in `view()`.
     /// Prevents `view()` from doing I/O (DB queries, connection opens) every frame.
     cached_viz: AnalyticsVizSnapshot,
@@ -176,6 +184,7 @@ impl AnalyticsScreen {
             severity_filter: AnalyticsSeverityFilter::All,
             sort_mode: AnalyticsSortMode::Priority,
             focus: AnalyticsFocus::List,
+            detail_focus_available: Cell::new(false),
             cached_viz: AnalyticsVizSnapshot::default(),
         }
     }
@@ -982,10 +991,28 @@ fn render_card_list(
     focus: AnalyticsFocus,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let compact_meta_panel =
+        cards.len() <= 2 && area.height >= 14 && area.width >= ANALYTICS_COMPACT_META_MIN_WIDTH;
+    let (table_area, meta_area) = if compact_meta_panel {
+        let table_h = (area.height.saturating_mul(52) / 100)
+            .max(6)
+            .min(area.height.saturating_sub(4));
+        (
+            Rect::new(area.x, area.y, area.width, table_h),
+            Rect::new(
+                area.x,
+                area.y.saturating_add(table_h),
+                area.width,
+                area.height.saturating_sub(table_h),
+            ),
+        )
+    } else {
+        (area, Rect::new(0, 0, 0, 0))
+    };
     let (table_base_bg, header_bg, even_row_bg, odd_row_bg) = analytics_table_backgrounds(&tp);
     fill_rect(frame, area, table_base_bg);
-    let compact_columns = area.width < 62;
-    let narrow_columns = area.width < 84;
+    let compact_columns = table_area.width < 62;
+    let narrow_columns = table_area.width < 84;
     let header = if compact_columns {
         Row::new(vec!["Sev", "Headline"]).style(crate::tui_theme::text_title(&tp).bg(header_bg))
     } else {
@@ -1072,7 +1099,32 @@ fn render_card_list(
         .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
     table_state.select(Some(selected));
-    StatefulWidget::render(&table, area, frame, table_state);
+    StatefulWidget::render(&table, table_area, frame, table_state);
+
+    if compact_meta_panel && meta_area.height >= 3 && meta_area.width >= 12 {
+        let guide_title = format!(" Navigator · {} ", focus.label());
+        let guide_block = Block::new()
+            .title(guide_title.as_str())
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let guide_inner = guide_block.inner(meta_area);
+        guide_block.render(meta_area, frame);
+        if guide_inner.width > 0 && guide_inner.height > 0 {
+            let detail_state = if detail_visible {
+                "detail:visible"
+            } else {
+                "detail:hidden"
+            };
+            let guide_text = format!(
+                "Tab switch focus · Enter open deep link\ns severity filter · o sort mode · {detail_state}\n{} cards visible · alerts {}",
+                cards.len(),
+                alerts_processed
+            );
+            Paragraph::new(guide_text)
+                .style(crate::tui_theme::text_hint(&tp))
+                .render(guide_inner, frame);
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1209,13 +1261,23 @@ fn render_card_detail(
         }
     }
 
+    let severity_accent =
+        crate::tui_theme::lerp_color(tp.panel_border, severity_color(card.severity), 0.44);
+    let border_focused =
+        crate::tui_theme::lerp_color(tp.panel_border_focused, severity_accent, 0.42);
+    let border_dim = crate::tui_theme::lerp_color(tp.panel_border_dim, severity_accent, 0.38);
+    let title = format!(
+        " Card Detail · {} · {:3.0}% ",
+        severity_badge(card.severity).trim(),
+        card.confidence.clamp(0.0, 1.0) * 100.0
+    );
     let block = Block::new()
-        .title(" Card Detail ")
+        .title(title.as_str())
         .border_type(BorderType::Rounded)
         .border_style(if focus == AnalyticsFocus::Detail {
-            Style::default().fg(tp.panel_border_focused)
+            Style::default().fg(border_focused)
         } else {
-            Style::default().fg(tp.panel_border_dim)
+            Style::default().fg(border_dim)
         });
     let inner = block.inner(area);
     block.render(area, frame);
@@ -1247,6 +1309,131 @@ fn render_card_detail(
         .style(crate::tui_theme::text_primary(&tp).bg(tp.panel_bg))
         .scroll((scroll, 0))
         .render(content, frame);
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_context_lens(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    card: &InsightCard,
+    snapshot: &AnalyticsVizSnapshot,
+) {
+    use ftui::text::{Line, Span, Text};
+
+    if area.is_empty() {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let severity_accent =
+        crate::tui_theme::lerp_color(tp.panel_border, severity_color(card.severity), 0.44);
+    let lens_bg = crate::tui_theme::lerp_color(tp.panel_bg, severity_accent, 0.08);
+    let border = crate::tui_theme::lerp_color(tp.panel_border, severity_accent, 0.35);
+    let block = Block::new()
+        .title(" Context Lens ")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.is_empty() {
+        return;
+    }
+    fill_rect(frame, inner, lens_bg);
+
+    if inner.height < 4 {
+        Paragraph::new(format!(
+            "{} {:.0}% • {} calls • p95 {:.1}ms",
+            severity_badge(card.severity).trim(),
+            card.confidence.clamp(0.0, 1.0) * 100.0,
+            snapshot.total_calls,
+            snapshot.p95_latency_ms
+        ))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(inner, frame);
+        return;
+    }
+
+    let baseline = card
+        .primary_alert
+        .baseline_value
+        .map_or_else(String::new, |value| format!(" · baseline {value:.1}"));
+    let mut lines = vec![
+        Line::from_spans(vec![
+            Span::styled(
+                format!(" {} ", severity_badge(card.severity)),
+                severity_style(card.severity),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(
+                    "{:3.0}% confidence",
+                    card.confidence.clamp(0.0, 1.0) * 100.0
+                ),
+                crate::tui_theme::text_primary(&tp).bold(),
+            ),
+        ]),
+        confidence_bar_colored(card.confidence, card.severity),
+        Line::styled(
+            format!(
+                "runtime: calls {} · errors {} · p95 {:.1}ms · {} active / {} slow",
+                snapshot.total_calls,
+                snapshot.total_errors,
+                snapshot.p95_latency_ms,
+                snapshot.active_tools,
+                snapshot.slow_tools
+            ),
+            crate::tui_theme::text_hint(&tp),
+        ),
+        Line::styled(
+            format!(
+                "alert: {:?} · score {:.2} · current {:.1} · threshold {:.1}{}",
+                card.primary_alert.kind,
+                card.primary_alert.score,
+                card.primary_alert.current_value,
+                card.primary_alert.threshold,
+                baseline
+            ),
+            crate::tui_theme::text_meta(&tp),
+        ),
+    ];
+
+    if let Some(step) = card.next_steps.first() {
+        lines.push(Line::styled(
+            format!("next-step: {step}"),
+            crate::tui_theme::text_success(&tp),
+        ));
+    }
+    if let Some(link) = card.deep_links.first() {
+        lines.push(Line::styled(
+            format!("deep-link: {link} (Enter)"),
+            crate::tui_theme::text_accent(&tp).underline(),
+        ));
+    }
+    if let Some((tool, value)) = snapshot.top_latency_tools.first() {
+        lines.push(Line::styled(
+            format!("hottest tool: {tool} @ {value:.1}ms p95"),
+            crate::tui_theme::text_warning(&tp),
+        ));
+    }
+    if let Some((tool, value)) = snapshot.top_call_tools.first() {
+        lines.push(Line::styled(
+            format!("busiest tool: {tool} @ {:.0} calls", *value),
+            crate::tui_theme::text_hint(&tp),
+        ));
+    }
+
+    let max_lines = usize::from(inner.height);
+    if lines.len() > max_lines {
+        if max_lines <= 1 {
+            lines = vec![Line::styled("…", crate::tui_theme::text_hint(&tp))];
+        } else {
+            lines.truncate(max_lines - 1);
+            lines.push(Line::styled("…", crate::tui_theme::text_hint(&tp)));
+        }
+    }
+
+    Paragraph::new(Text::from_lines(lines))
+        .style(crate::tui_theme::text_primary(&tp).bg(lens_bg))
+        .render(inner, frame);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1439,6 +1626,8 @@ fn render_viz_metric_tile(
     value: &str,
     color: PackedRgba,
 ) {
+    use ftui::text::{Line, Span};
+
     if area.is_empty() || area.width < 6 || area.height < 3 {
         return;
     }
@@ -1452,9 +1641,17 @@ fn render_viz_metric_tile(
     if inner.is_empty() {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
-    Paragraph::new(value.to_string())
-        .style(crate::tui_theme::text_primary(&tp).bold())
+    let tile_bg = crate::tui_theme::lerp_color(tp.panel_bg, color, 0.08);
+    fill_rect(frame, inner, tile_bg);
+    let line = Line::from_spans(vec![
+        Span::styled("● ", Style::default().fg(color)),
+        Span::styled(
+            value.to_string(),
+            crate::tui_theme::text_primary(&tp).bold(),
+        ),
+    ]);
+    Paragraph::new(line)
+        .style(crate::tui_theme::text_primary(&tp).bg(tile_bg))
         .render(inner, frame);
 }
 
@@ -1473,6 +1670,7 @@ fn render_runtime_viz_fallback(
     sort_mode: AnalyticsSortMode,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let shell_border = crate::tui_theme::lerp_color(tp.panel_border, tp.panel_border_dim, 0.28);
     let title = format!(
         " Analytics Data Viz · {} · {} · {} ",
         focus.label(),
@@ -1482,7 +1680,7 @@ fn render_runtime_viz_fallback(
     let shell = Block::new()
         .title(title.as_str())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border_focused));
+        .border_style(Style::default().fg(shell_border));
     let inner = shell.inner(area);
     shell.render(area, frame);
     if inner.width < 8 || inner.height < 3 {
@@ -1638,6 +1836,11 @@ fn render_runtime_viz_fallback(
         let spark_inner = spark_block.inner(spark_area);
         spark_block.render(spark_area, frame);
         if spark_inner.height > 0 && spark_inner.width > 0 {
+            fill_rect(
+                frame,
+                spark_inner,
+                crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[1], 0.06),
+            );
             let rows = spark_inner.height;
             if rows >= 2 {
                 let label_area = Rect::new(spark_inner.x, spark_inner.y, spark_inner.width, 1);
@@ -1674,6 +1877,11 @@ fn render_runtime_viz_fallback(
         let calls_inner = calls_block.inner(calls_area);
         calls_block.render(calls_area, frame);
         if calls_inner.height > 0 && calls_inner.width > 0 {
+            fill_rect(
+                frame,
+                calls_inner,
+                crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[0], 0.05),
+            );
             if snapshot.top_call_tools.is_empty() {
                 Paragraph::new("Collecting tool call samples…")
                     .style(crate::tui_theme::text_hint(&tp))
@@ -1714,6 +1922,11 @@ fn render_runtime_viz_fallback(
         let lat_inner = lat_block.inner(lat_area);
         lat_block.render(lat_area, frame);
         if lat_inner.height > 0 && lat_inner.width > 0 {
+            fill_rect(
+                frame,
+                lat_inner,
+                crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[2], 0.06),
+            );
             if snapshot.top_latency_tools.is_empty() {
                 Paragraph::new("Collecting latency samples…")
                     .style(crate::tui_theme::text_hint(&tp))
@@ -1741,6 +1954,11 @@ fn render_runtime_viz_fallback(
         let summary_inner = summary_block.inner(summary_area);
         summary_block.render(summary_area, frame);
         if summary_inner.height > 0 && summary_inner.width > 0 {
+            fill_rect(
+                frame,
+                summary_inner,
+                crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border, 0.05),
+            );
             let mut lines = Vec::new();
             lines.push("feed: no anomaly cards; showing live telemetry instead".to_string());
             lines.push(format!(
@@ -1776,7 +1994,8 @@ impl MailScreen for AnalyticsScreen {
 
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.focus == AnalyticsFocus::List {
+                if self.focus == AnalyticsFocus::List || !self.detail_focus_available.get() {
+                    self.focus = AnalyticsFocus::List;
                     self.move_down();
                 } else {
                     self.scroll_detail_down();
@@ -1784,7 +2003,8 @@ impl MailScreen for AnalyticsScreen {
                 Cmd::None
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.focus == AnalyticsFocus::List {
+                if self.focus == AnalyticsFocus::List || !self.detail_focus_available.get() {
+                    self.focus = AnalyticsFocus::List;
                     self.move_up();
                 } else {
                     self.scroll_detail_up();
@@ -1792,7 +2012,8 @@ impl MailScreen for AnalyticsScreen {
                 Cmd::None
             }
             KeyCode::Char('J') | KeyCode::PageDown => {
-                if self.focus == AnalyticsFocus::List {
+                if self.focus == AnalyticsFocus::List || !self.detail_focus_available.get() {
+                    self.focus = AnalyticsFocus::List;
                     for _ in 0..5 {
                         self.move_down();
                     }
@@ -1802,7 +2023,8 @@ impl MailScreen for AnalyticsScreen {
                 Cmd::None
             }
             KeyCode::Char('K') | KeyCode::PageUp => {
-                if self.focus == AnalyticsFocus::List {
+                if self.focus == AnalyticsFocus::List || !self.detail_focus_available.get() {
+                    self.focus = AnalyticsFocus::List;
                     for _ in 0..5 {
                         self.move_up();
                     }
@@ -1812,7 +2034,11 @@ impl MailScreen for AnalyticsScreen {
                 Cmd::None
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                self.toggle_focus();
+                if self.detail_focus_available.get() {
+                    self.toggle_focus();
+                } else {
+                    self.focus = AnalyticsFocus::List;
+                }
                 Cmd::None
             }
             KeyCode::Enter => self.navigate_deep_link(),
@@ -1848,9 +2074,23 @@ impl MailScreen for AnalyticsScreen {
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         if area.width == 0 || area.height == 0 {
+            self.detail_focus_available.set(false);
             return;
         }
+        self.detail_focus_available.set(false);
+
         let tp = crate::tui_theme::TuiThemePalette::current();
+
+        // Outer bordered panel (only when enough space)
+        let area = if area.height >= 14 && area.width >= 60 {
+            let outer_block = crate::tui_panel_helpers::panel_block(" Analytics ");
+            let inner = outer_block.inner(area);
+            outer_block.render(area, frame);
+            inner
+        } else {
+            area
+        };
+
         fill_rect(frame, area, tp.bg_deep);
         // Use the cached viz snapshot (rebuilt in tick()) — no I/O in the render path.
         let runtime_snapshot = &self.cached_viz;
@@ -1984,11 +2224,15 @@ impl MailScreen for AnalyticsScreen {
         let wide_split = content.width >= ANALYTICS_WIDE_SPLIT_MIN_WIDTH
             && content.height >= ANALYTICS_WIDE_SPLIT_MIN_HEIGHT;
         if wide_split {
+            let list_ratio_percent = if active_cards.len() <= 2 {
+                28
+            } else if active_cards.len() <= 4 {
+                33
+            } else {
+                ANALYTICS_WIDE_LIST_RATIO_PERCENT
+            };
             let gap = u16::from(content.width >= 96);
-            let mut list_w = content
-                .width
-                .saturating_mul(ANALYTICS_WIDE_LIST_RATIO_PERCENT)
-                / 100;
+            let mut list_w = content.width.saturating_mul(list_ratio_percent) / 100;
             list_w = list_w.max(ANALYTICS_WIDE_LIST_MIN_WIDTH);
             let max_list_w = content
                 .width
@@ -1997,6 +2241,7 @@ impl MailScreen for AnalyticsScreen {
             if list_w > 0 && list_w < content.width {
                 let detail_w = content.width.saturating_sub(list_w.saturating_add(gap));
                 if detail_w >= ANALYTICS_WIDE_DETAIL_MIN_WIDTH {
+                    self.detail_focus_available.set(true);
                     let list_area = Rect::new(content.x, content.y, list_w, content.height);
                     let detail_area = Rect::new(
                         content.x.saturating_add(list_w).saturating_add(gap),
@@ -2011,7 +2256,12 @@ impl MailScreen for AnalyticsScreen {
                             gap,
                             content.height,
                         );
-                        render_splitter_handle(frame, splitter_area, true, false);
+                        render_splitter_handle(
+                            frame,
+                            splitter_area,
+                            true,
+                            self.focus == AnalyticsFocus::List,
+                        );
                     }
                     render_card_list(
                         frame,
@@ -2025,7 +2275,12 @@ impl MailScreen for AnalyticsScreen {
                         true,
                         self.focus,
                     );
-                    if detail_area.height >= 18 && detail_area.width >= 52 {
+                    let embed_detail_viz =
+                        viz_band_h == 0 && detail_area.height >= 18 && detail_area.width >= 52;
+                    let embed_context_lens = viz_band_h > 0
+                        && detail_area.height >= ANALYTICS_DETAIL_LENS_MIN_HEIGHT
+                        && detail_area.width >= ANALYTICS_DETAIL_LENS_MIN_WIDTH;
+                    if embed_detail_viz {
                         let detail_gap = u16::from(detail_area.height >= 24);
                         let detail_main_h = detail_area
                             .height
@@ -2051,7 +2306,12 @@ impl MailScreen for AnalyticsScreen {
                                 detail_area.width,
                                 detail_gap,
                             );
-                            render_splitter_handle(frame, splitter_area, false, false);
+                            render_splitter_handle(
+                                frame,
+                                splitter_area,
+                                false,
+                                self.focus == AnalyticsFocus::Detail,
+                            );
                         }
                         let detail_viz = Rect::new(
                             detail_area.x,
@@ -2080,6 +2340,64 @@ impl MailScreen for AnalyticsScreen {
                             self.severity_filter,
                             self.sort_mode,
                         );
+                    } else if embed_context_lens {
+                        let detail_gap = u16::from(detail_area.height >= 24);
+                        let mut lens_h = detail_area
+                            .height
+                            .saturating_mul(ANALYTICS_DETAIL_LENS_RATIO_PERCENT)
+                            / 100;
+                        lens_h = lens_h.max(6);
+                        let max_lens_h = detail_area
+                            .height
+                            .saturating_sub(8)
+                            .saturating_sub(detail_gap)
+                            .max(1);
+                        lens_h = lens_h.min(max_lens_h);
+                        let detail_main_h = detail_area
+                            .height
+                            .saturating_sub(lens_h)
+                            .saturating_sub(detail_gap)
+                            .max(1);
+                        let detail_main = Rect::new(
+                            detail_area.x,
+                            detail_area.y,
+                            detail_area.width,
+                            detail_main_h,
+                        );
+                        if detail_gap > 0 {
+                            let splitter_area = Rect::new(
+                                detail_area.x,
+                                detail_area.y.saturating_add(detail_main_h),
+                                detail_area.width,
+                                detail_gap,
+                            );
+                            render_splitter_handle(
+                                frame,
+                                splitter_area,
+                                false,
+                                self.focus == AnalyticsFocus::Detail,
+                            );
+                        }
+                        let lens_area = Rect::new(
+                            detail_area.x,
+                            detail_area
+                                .y
+                                .saturating_add(detail_main_h)
+                                .saturating_add(detail_gap),
+                            detail_area.width,
+                            detail_area
+                                .height
+                                .saturating_sub(detail_main_h)
+                                .saturating_sub(detail_gap),
+                        );
+                        render_card_detail(
+                            frame,
+                            detail_main,
+                            selected_card,
+                            self.detail_scroll,
+                            self.focus,
+                        );
+                        render_context_lens(frame, lens_area, selected_card, runtime_snapshot);
                     } else {
                         render_card_detail(
                             frame,
@@ -2111,6 +2429,7 @@ impl MailScreen for AnalyticsScreen {
                 >= ANALYTICS_STACKED_LIST_MIN_HEIGHT
                     .saturating_add(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT);
         if stacked_detail {
+            self.detail_focus_available.set(true);
             let stack_gap = u16::from(
                 content.height
                     >= ANALYTICS_STACKED_LIST_MIN_HEIGHT
@@ -2142,7 +2461,12 @@ impl MailScreen for AnalyticsScreen {
                     content.width,
                     stack_gap,
                 );
-                render_splitter_handle(frame, splitter_area, false, false);
+                render_splitter_handle(
+                    frame,
+                    splitter_area,
+                    false,
+                    self.focus == AnalyticsFocus::Detail,
+                );
             }
             render_card_list(
                 frame,
@@ -2156,13 +2480,76 @@ impl MailScreen for AnalyticsScreen {
                 true,
                 self.focus,
             );
-            render_card_detail(
-                frame,
-                detail_area,
-                selected_card,
-                self.detail_scroll,
-                self.focus,
-            );
+            let embed_context_lens = viz_band_h > 0
+                && detail_area.height >= ANALYTICS_DETAIL_LENS_MIN_HEIGHT
+                && detail_area.width >= ANALYTICS_DETAIL_LENS_MIN_WIDTH;
+            if embed_context_lens {
+                let detail_gap = u16::from(detail_area.height >= 24);
+                let mut lens_h = detail_area
+                    .height
+                    .saturating_mul(ANALYTICS_DETAIL_LENS_RATIO_PERCENT)
+                    / 100;
+                lens_h = lens_h.max(6);
+                let max_lens_h = detail_area
+                    .height
+                    .saturating_sub(8)
+                    .saturating_sub(detail_gap)
+                    .max(1);
+                lens_h = lens_h.min(max_lens_h);
+                let detail_main_h = detail_area
+                    .height
+                    .saturating_sub(lens_h)
+                    .saturating_sub(detail_gap)
+                    .max(1);
+                let detail_main = Rect::new(
+                    detail_area.x,
+                    detail_area.y,
+                    detail_area.width,
+                    detail_main_h,
+                );
+                if detail_gap > 0 {
+                    let splitter_area = Rect::new(
+                        detail_area.x,
+                        detail_area.y.saturating_add(detail_main_h),
+                        detail_area.width,
+                        detail_gap,
+                    );
+                    render_splitter_handle(
+                        frame,
+                        splitter_area,
+                        false,
+                        self.focus == AnalyticsFocus::Detail,
+                    );
+                }
+                let lens_area = Rect::new(
+                    detail_area.x,
+                    detail_area
+                        .y
+                        .saturating_add(detail_main_h)
+                        .saturating_add(detail_gap),
+                    detail_area.width,
+                    detail_area
+                        .height
+                        .saturating_sub(detail_main_h)
+                        .saturating_sub(detail_gap),
+                );
+                render_card_detail(
+                    frame,
+                    detail_main,
+                    selected_card,
+                    self.detail_scroll,
+                    self.focus,
+                );
+                render_context_lens(frame, lens_area, selected_card, runtime_snapshot);
+            } else {
+                render_card_detail(
+                    frame,
+                    detail_area,
+                    selected_card,
+                    self.detail_scroll,
+                    self.focus,
+                );
+            }
             if status_h > 0 {
                 render_status_strip(
                     frame,
@@ -2448,6 +2835,7 @@ mod tests {
         let state = crate::tui_bridge::TuiSharedState::new(&config);
         let mut screen = AnalyticsScreen::new();
         assert_eq!(screen.focus, AnalyticsFocus::List);
+        screen.detail_focus_available.set(true);
 
         let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
         screen.update(&tab, &state);
@@ -2469,12 +2857,49 @@ mod tests {
             cards_produced: 1,
         };
         screen.focus = AnalyticsFocus::Detail;
+        screen.detail_focus_available.set(true);
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('j'))), &state);
         assert_eq!(screen.selected, 0);
         assert_eq!(screen.detail_scroll, 1);
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('k'))), &state);
+        assert_eq!(screen.detail_scroll, 0);
+    }
+
+    #[test]
+    fn tab_keeps_list_focus_when_detail_is_not_available() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = AnalyticsScreen::new();
+        screen.focus = AnalyticsFocus::List;
+        screen.detail_focus_available.set(false);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Tab)), &state);
+        assert_eq!(screen.focus, AnalyticsFocus::List);
+    }
+
+    #[test]
+    fn detail_focus_falls_back_to_list_navigation_when_detail_hidden() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![
+                sample_card("card-a", AnomalySeverity::High, 0.88),
+                sample_card("card-b", AnomalySeverity::Medium, 0.61),
+            ],
+            alerts_processed: 2,
+            cards_produced: 2,
+        };
+        screen.focus = AnalyticsFocus::Detail;
+        screen.selected = 0;
+        screen.detail_scroll = 0;
+        screen.detail_focus_available.set(false);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('j'))), &state);
+        assert_eq!(screen.focus, AnalyticsFocus::List);
+        assert_eq!(screen.selected, 1);
         assert_eq!(screen.detail_scroll, 0);
     }
 
@@ -2619,6 +3044,63 @@ mod tests {
         let text = frame_text(&frame);
         assert!(text.contains("card headline"));
         assert!(text.contains("card rationale"));
+    }
+
+    #[test]
+    fn wide_layout_with_top_viz_band_does_not_duplicate_latency_track() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![sample_card("card", AnomalySeverity::High, 0.88)],
+            alerts_processed: 1,
+            cards_produced: 1,
+        };
+        screen.cached_viz = AnalyticsVizSnapshot {
+            total_calls: 320,
+            total_errors: 0,
+            active_tools: 5,
+            slow_tools: 1,
+            avg_latency_ms: 18.2,
+            p95_latency_ms: 41.7,
+            p99_latency_ms: 53.9,
+            persisted_samples: 14,
+            top_call_tools: vec![
+                ("dispatch".to_string(), 120.0),
+                ("search".to_string(), 82.0),
+            ],
+            top_latency_tools: vec![("dispatch".to_string(), 41.7), ("sqlite".to_string(), 28.4)],
+            sparkline: vec![5.0, 8.0, 13.0, 21.0, 34.0],
+        };
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(180, 40, &mut pool);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.view(&mut frame, Rect::new(0, 0, 180, 40), &state);
+        let text = frame_text(&frame);
+        let occurrences = text.match_indices("real-time latency track").count();
+        assert_eq!(
+            occurrences, 1,
+            "runtime viz latency track should render once per frame when top viz band is visible"
+        );
+    }
+
+    #[test]
+    fn low_card_wide_layout_surfaces_navigator_panel() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![sample_card("card", AnomalySeverity::High, 0.88)],
+            alerts_processed: 1,
+            cards_produced: 1,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        // Extra rows/cols to account for outer bordered panel chrome (2 rows, 2 cols)
+        let mut frame = Frame::new(144, 28, &mut pool);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.view(&mut frame, Rect::new(0, 0, 144, 28), &state);
+        let text = frame_text(&frame);
+        assert!(text.contains("Enter open deep link"));
+        assert!(text.contains("detail:visible"));
     }
 
     #[test]
@@ -3006,6 +3488,10 @@ mod tests {
         };
         screen.focus = AnalyticsFocus::Detail;
         screen.detail_scroll = 0;
+        // Render once so detail_focus_available is set from the layout.
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(140, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
         assert_eq!(screen.detail_scroll, 5);

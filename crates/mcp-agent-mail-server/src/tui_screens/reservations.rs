@@ -1503,7 +1503,15 @@ impl MailScreen for ReservationsScreen {
             self.last_render_offset.set(0);
             return;
         }
+
         let tp = crate::tui_theme::TuiThemePalette::current();
+
+        // Outer bordered panel wrapping entire screen
+        let outer_block = crate::tui_panel_helpers::panel_block(" File Reservations ");
+        let inner = outer_block.inner(area);
+        outer_block.render(area, frame);
+        let area = inner;
+
         let effects_enabled = state.config_snapshot().tui_effects;
         let animation_time = state.uptime().as_secs_f64();
         let wide = area.width >= 120;
@@ -1721,7 +1729,7 @@ impl MailScreen for ReservationsScreen {
             render_ttl_overlays(frame, table_area, &ttl_overlay_rows, ts.offset, &tp);
         }
         if rows_empty && inner.height > 1 && inner.width > 4 {
-            let text = if row_mismatch {
+            if row_mismatch {
                 let mut message = format!(
                     "DB reports {db_active_total} active reservations, but detail rows are unavailable. Poller snapshot is stale or failing."
                 );
@@ -1729,28 +1737,48 @@ impl MailScreen for ReservationsScreen {
                     message.push(' ');
                     message.push_str(issue);
                 }
-                message
+                Paragraph::new(message)
+                    .style(crate::tui_theme::text_warning(&tp))
+                    .render(
+                        Rect::new(
+                            inner.x,
+                            inner.y.saturating_add(1),
+                            inner.width,
+                            inner.height.saturating_sub(1),
+                        ),
+                        frame,
+                    );
             } else if let Some(issue) = &self.fallback_issue {
-                issue.clone()
-            } else if self.show_released {
-                "No reservations match current filters.".to_string()
+                Paragraph::new(issue.as_str())
+                    .style(crate::tui_theme::text_warning(&tp))
+                    .render(
+                        Rect::new(
+                            inner.x,
+                            inner.y.saturating_add(1),
+                            inner.width,
+                            inner.height.saturating_sub(1),
+                        ),
+                        frame,
+                    );
             } else {
-                "No active reservations.".to_string()
-            };
-            let style = if row_mismatch || self.fallback_issue.is_some() {
-                crate::tui_theme::text_warning(&tp)
-            } else {
-                crate::tui_theme::text_meta(&tp)
-            };
-            Paragraph::new(text).style(style).render(
-                Rect::new(
-                    inner.x,
-                    inner.y.saturating_add(1),
-                    inner.width,
-                    inner.height.saturating_sub(1),
-                ),
-                frame,
-            );
+                let hint = if self.show_released {
+                    "No reservations match current filters. Press 'x' to toggle released."
+                } else {
+                    "Use `file_reservation_paths` to reserve files. Press 'r' to refresh."
+                };
+                crate::tui_panel_helpers::render_empty_state(
+                    frame,
+                    Rect::new(
+                        inner.x,
+                        inner.y.saturating_add(1),
+                        inner.width,
+                        inner.height.saturating_sub(1),
+                    ),
+                    "\u{1f512}",
+                    "No Active Reservations",
+                    hint,
+                );
+            }
         }
 
         // ── Footer summary ─────────────────────────────────────────────
@@ -2469,7 +2497,7 @@ mod tests {
         screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
         let text = buffer_to_text(&frame.buffer);
         assert!(
-            text.contains("No active reservations."),
+            text.contains("No Active Reservations"),
             "missing empty-state text: {text}"
         );
     }

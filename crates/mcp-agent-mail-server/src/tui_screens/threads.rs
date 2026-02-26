@@ -1421,6 +1421,7 @@ impl MailScreen for ThreadExplorerScreen {
         if area.height < 4 || area.width < 20 {
             return;
         }
+
         let tp = crate::tui_theme::TuiThemePalette::current();
         // Hard-clear the full screen area before drawing filter/list/detail panes.
         // This prevents stale border glyphs from previous layouts leaking through.

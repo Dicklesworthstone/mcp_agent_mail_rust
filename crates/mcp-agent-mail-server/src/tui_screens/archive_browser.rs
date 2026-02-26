@@ -612,15 +612,20 @@ impl ArchiveBrowserScreen {
         block.render(area, frame);
 
         if self.entries.is_empty() {
-            let empty_msg = if self.archive_root.is_none() {
-                "No archive found. Ensure STORAGE_ROOT is configured and a project exists."
+            let (title, hint) = if self.archive_root.is_none() {
+                (
+                    "No Archive Found",
+                    "The Git archive is created when the first message is sent. Check `am doctor` for diagnostics.",
+                )
             } else if !self.filter.is_empty() {
-                "No files match the current filter."
+                (
+                    "No Matches",
+                    "No files match the current filter. Press Esc to clear.",
+                )
             } else {
-                "Archive directory is empty."
+                ("Empty Archive", "Archive directory contains no files.")
             };
-            let p = Paragraph::new(empty_msg).style(Style::default().fg(tp.text_muted));
-            p.render(inner, frame);
+            crate::tui_panel_helpers::render_empty_state(frame, inner, "\u{1f4c1}", title, hint);
             return;
         }
 

@@ -821,9 +821,14 @@ impl MailScreen for SystemHealthScreen {
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        // Outer bordered panel
+        let outer_block = crate::tui_panel_helpers::panel_block(" System Health ");
+        let inner = outer_block.inner(area);
+        outer_block.render(area, frame);
+
         match self.view_mode {
-            ViewMode::Text => self.render_text_view(frame, area, state),
-            ViewMode::Dashboard => self.render_dashboard_view(frame, area, state),
+            ViewMode::Text => self.render_text_view(frame, inner, state),
+            ViewMode::Dashboard => self.render_dashboard_view(frame, inner, state),
         }
     }
 
