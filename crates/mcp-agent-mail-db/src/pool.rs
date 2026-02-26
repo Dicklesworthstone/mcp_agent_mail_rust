@@ -854,6 +854,7 @@ pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
         || lower.contains("cursor stack is empty")
         || lower.contains("called `option::unwrap()` on a `none` value")
         || lower.contains("internal error")
+        || lower.contains("cursor must be on a leaf")
 }
 
 #[must_use]
