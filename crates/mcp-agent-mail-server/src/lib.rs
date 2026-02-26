@@ -75,7 +75,8 @@ mod tui_ws_input;
 mod tui_ws_state;
 
 use asupersync::http::h1::HttpClient;
-use asupersync::http::h1::listener::Http1Listener;
+use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig};
+use asupersync::http::h1::server::Http1Config;
 use asupersync::http::h1::types::{
     Method as Http1Method, Request as Http1Request, Response as Http1Response, default_reason,
 };
@@ -123,8 +124,8 @@ use mcp_agent_mail_tools::{
     ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
-use std::net::{IpAddr, SocketAddr};
+use std::io::{IsTerminal, Read, Write};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -804,6 +805,192 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // run_stdio() does not return; WBQ drain thread exits with the process.
 }
 
+const HTTP_RUNTIME_MIN_WORKERS: usize = 2;
+const HTTP_RUNTIME_MAX_WORKERS: usize = 16;
+const HTTP_LISTENER_MAX_CONNECTIONS: usize = 4096;
+const HTTP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD: u32 = 3;
+const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
+const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS: u64 = 200;
+const HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
+
+fn resolve_http_runtime_worker_threads() -> usize {
+    let default = std::thread::available_parallelism()
+        .map_or(HTTP_RUNTIME_MIN_WORKERS, std::num::NonZeroUsize::get)
+        .clamp(HTTP_RUNTIME_MIN_WORKERS, 8);
+    std::env::var("AM_HTTP_WORKER_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(HTTP_RUNTIME_MIN_WORKERS, HTTP_RUNTIME_MAX_WORKERS)
+}
+
+fn hardened_http_listener_config() -> Http1ListenerConfig {
+    let http_config = Http1Config::default()
+        // Close each connection after one request to isolate clients and avoid
+        // long-lived connection pathologies (slowloris/half-closed keepalive).
+        .keep_alive(false)
+        .max_requests(Some(1))
+        .idle_timeout(Some(HTTP_IDLE_TIMEOUT))
+        .max_headers_size(64 * 1024)
+        .max_body_size(16 * 1024 * 1024);
+
+    Http1ListenerConfig::default()
+        .http_config(http_config)
+        .max_connections(Some(HTTP_LISTENER_MAX_CONNECTIONS))
+        .drain_timeout(HTTP_LISTENER_DRAIN_TIMEOUT)
+}
+
+fn normalized_probe_host(http_host: &str) -> &str {
+    match http_host.trim() {
+        "" | "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "::1",
+        host => host,
+    }
+}
+
+fn probe_http_healthz(config: &mcp_agent_mail_core::Config) -> bool {
+    let probe_host = normalized_probe_host(&config.http_host);
+    let addr = format!("{probe_host}:{}", config.http_port);
+    let Ok(addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+
+    for socket_addr in addrs {
+        let Ok(mut stream) =
+            std::net::TcpStream::connect_timeout(&socket_addr, HTTP_SUPERVISOR_PROBE_TIMEOUT)
+        else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(HTTP_SUPERVISOR_PROBE_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(HTTP_SUPERVISOR_PROBE_TIMEOUT));
+
+        let request = format!(
+            "GET /healthz HTTP/1.1\r\nHost: {probe_host}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            continue;
+        }
+        let mut buf = [0_u8; 64];
+        let Ok(n) = stream.read(&mut buf) else {
+            continue;
+        };
+        if n == 0 {
+            continue;
+        }
+        if buf[..n].starts_with(b"HTTP/1.1 200") || buf[..n].starts_with(b"HTTP/1.0 200") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn restart_backoff_ms(previous_ms: u64) -> u64 {
+    if previous_ms == 0 {
+        HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS
+    } else {
+        (previous_ms.saturating_mul(2)).min(HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS)
+    }
+}
+
+fn reset_probe_state() -> (u32, Instant, Instant) {
+    (
+        0,
+        Instant::now() + HTTP_SUPERVISOR_PROBE_INTERVAL,
+        Instant::now() + HTTP_SUPERVISOR_PROBE_STARTUP_GRACE,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_http_headless_supervisor(mut config: mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    let (updated_config, mut instance) = spawn_http_server_instance(config.clone())?;
+    config = updated_config;
+
+    tracing::info!(
+        host = %config.http_host,
+        port = config.http_port,
+        workers = resolve_http_runtime_worker_threads(),
+        "HTTP server supervisor started"
+    );
+
+    let mut last_restart_sleep_ms: u64 = 0;
+    let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) = reset_probe_state();
+
+    loop {
+        if instance.join.is_finished() {
+            tracing::warn!("HTTP server instance exited unexpectedly; restarting");
+            if let Err(err) = stop_http_server_instance(instance) {
+                tracing::warn!("failed to stop exited HTTP server instance cleanly: {err}");
+            }
+
+            last_restart_sleep_ms = restart_backoff_ms(last_restart_sleep_ms);
+            std::thread::sleep(Duration::from_millis(last_restart_sleep_ms));
+
+            let (new_cfg, new_instance) = spawn_http_server_instance(config.clone())?;
+            config = new_cfg;
+            instance = new_instance;
+            tracing::info!(
+                host = %config.http_host,
+                port = config.http_port,
+                backoff_ms = last_restart_sleep_ms,
+                "HTTP server auto-restarted after unexpected exit"
+            );
+            (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+            continue;
+        }
+
+        std::thread::sleep(Duration::from_millis(200));
+        let now = Instant::now();
+        if now < next_probe_at {
+            continue;
+        }
+        next_probe_at = now + HTTP_SUPERVISOR_PROBE_INTERVAL;
+
+        if probe_http_healthz(&config) {
+            liveness_failures = 0;
+            continue;
+        }
+        if now < probe_grace_until {
+            continue;
+        }
+
+        liveness_failures = liveness_failures.saturating_add(1);
+        tracing::warn!(
+            failures = liveness_failures,
+            threshold = HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD,
+            host = %config.http_host,
+            port = config.http_port,
+            "HTTP liveness probe failed"
+        );
+        if liveness_failures < HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD {
+            continue;
+        }
+
+        tracing::warn!("HTTP server unresponsive; forcing supervised restart");
+        if let Err(err) = stop_http_server_instance(instance) {
+            tracing::warn!("failed to stop unresponsive HTTP server instance cleanly: {err}");
+        }
+
+        last_restart_sleep_ms = restart_backoff_ms(last_restart_sleep_ms);
+        std::thread::sleep(Duration::from_millis(last_restart_sleep_ms));
+
+        let (new_cfg, new_instance) = spawn_http_server_instance(config.clone())?;
+        config = new_cfg;
+        instance = new_instance;
+        tracing::info!(
+            host = %config.http_host,
+            port = config.http_port,
+            backoff_ms = last_restart_sleep_ms,
+            "HTTP server auto-restarted after liveness probe failures"
+        );
+        (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+    }
+}
+
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -836,49 +1023,10 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     let dashboard = StartupDashboard::maybe_start(config);
     set_dashboard_handle(dashboard.clone());
 
-    let server = build_server(config);
-    let server_info = server.info().clone();
-    let server_capabilities = server.capabilities().clone();
-    let router = Arc::new(server.into_router());
-
-    let addr = format!("{}:{}", config.http_host, config.http_port);
-    let state = Arc::new(HttpState::new(
-        router,
-        server_info,
-        server_capabilities,
-        config.clone(),
-    ));
-
-    let reactor = create_reactor()?;
-    let runtime = RuntimeBuilder::new()
-        .with_reactor(reactor)
-        // Keep the HTTP runtime single-threaded to avoid asupersync worker
-        // wake storms that can peg CPU in idle local-dev/TUI sessions.
-        .worker_threads(1)
-        .build()
-        .map_err(|e| map_asupersync_err(&e))?;
-
-    let handle = runtime.handle();
-    let result = runtime.block_on(async move {
-        let handler_state = Arc::clone(&state);
-        let listener = Http1Listener::bind(addr, move |req| {
-            let inner = Arc::clone(&handler_state);
-            async move { inner.handle(req).await }
-        })
-        .await?;
-
-        // Run listener on a runtime task so async I/O sees an attached Cx/driver.
-        // Running `listener.run` directly in root `block_on` can spin on accept().
-        let run_handle = handle
-            .clone()
-            .try_spawn(async move { listener.run(&handle).await })
-            .map_err(|err| {
-                std::io::Error::other(format!("failed to spawn HTTP listener: {err}"))
-            })?;
-
-        let _stats = run_handle.await?;
-        Ok::<(), std::io::Error>(())
-    });
+    // Keep headless HTTP (`serve --no-tui`) under the same supervised restart
+    // policy as the TUI path so long-lived operator sessions self-heal from
+    // transport starvation or listener crashes.
+    let result = run_http_headless_supervisor(config.clone());
 
     retention::shutdown();
     tool_metrics::shutdown();
@@ -1049,18 +1197,23 @@ fn run_http_server_thread(
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::new()
         .with_reactor(reactor)
-        // Match `run_http`: single worker avoids idle spin storms.
-        .worker_threads(1)
+        // Match `run_http`: isolate requests so one bad connection cannot
+        // starve the entire HTTP surface.
+        .worker_threads(resolve_http_runtime_worker_threads())
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 
     let handle = runtime.handle();
     runtime.block_on(async move {
         let handler_state = Arc::clone(&state);
-        let listener = Http1Listener::bind(addr, move |req| {
-            let inner = Arc::clone(&handler_state);
-            async move { inner.handle(req).await }
-        })
+        let listener = Http1Listener::bind_with_config(
+            addr,
+            move |req| {
+                let inner = Arc::clone(&handler_state);
+                async move { inner.handle(req).await }
+            },
+            hardened_http_listener_config(),
+        )
         .await;
 
         let listener = match listener {
@@ -1139,6 +1292,7 @@ fn stop_http_server_instance(instance: HttpServerInstance) -> std::io::Result<()
         .map_err(|_| std::io::Error::other("server thread panicked"))?
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_http_server_supervisor_thread(
     mut config: mcp_agent_mail_core::Config,
     tui_state: &tui_bridge::TuiSharedState,
@@ -1163,6 +1317,7 @@ fn run_http_server_supervisor_thread(
     ));
 
     let mut last_restart_sleep_ms: u64 = 0;
+    let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) = reset_probe_state();
 
     loop {
         if tui_state.is_shutdown_requested() {
@@ -1175,11 +1330,7 @@ fn run_http_server_supervisor_thread(
             let _ = stop_http_server_instance(instance);
 
             // Backoff on crash loops (bounded).
-            last_restart_sleep_ms = if last_restart_sleep_ms == 0 {
-                200
-            } else {
-                (last_restart_sleep_ms * 2).min(5_000)
-            };
+            last_restart_sleep_ms = restart_backoff_ms(last_restart_sleep_ms);
             std::thread::sleep(Duration::from_millis(last_restart_sleep_ms));
 
             let (new_cfg, new_instance) = spawn_http_server_instance(config.clone())?;
@@ -1193,6 +1344,7 @@ fn run_http_server_supervisor_thread(
                 ),
                 "auto-restarted after unexpected exit".to_string(),
             ));
+            (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
             continue;
         }
 
@@ -1203,10 +1355,12 @@ fn run_http_server_supervisor_thread(
                 let desired = current.toggle();
                 instance = handle_transport_switch(&mut config, tui_state, instance, desired)?;
                 last_restart_sleep_ms = 0;
+                (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
             }
             Ok(tui_bridge::ServerControlMsg::SetTransportBase(desired)) => {
                 instance = handle_transport_switch(&mut config, tui_state, instance, desired)?;
                 last_restart_sleep_ms = 0;
+                (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
             }
             Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(envelope)) => {
                 dispatch_compose_envelope(&config.database_url, tui_state, &envelope);
@@ -1216,7 +1370,53 @@ fn run_http_server_supervisor_thread(
                 let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
                 return stop_http_server_instance(instance);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                if now < next_probe_at {
+                    continue;
+                }
+                next_probe_at = now + HTTP_SUPERVISOR_PROBE_INTERVAL;
+
+                if probe_http_healthz(&config) {
+                    liveness_failures = 0;
+                    continue;
+                }
+                if now < probe_grace_until {
+                    continue;
+                }
+
+                liveness_failures = liveness_failures.saturating_add(1);
+                tracing::warn!(
+                    failures = liveness_failures,
+                    threshold = HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD,
+                    host = %config.http_host,
+                    port = config.http_port,
+                    "HTTP liveness probe failed"
+                );
+
+                if liveness_failures < HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD {
+                    continue;
+                }
+
+                let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+                let _ = stop_http_server_instance(instance);
+
+                last_restart_sleep_ms = restart_backoff_ms(last_restart_sleep_ms);
+                std::thread::sleep(Duration::from_millis(last_restart_sleep_ms));
+
+                let (new_cfg, new_instance) = spawn_http_server_instance(config.clone())?;
+                config = new_cfg;
+                instance = new_instance;
+                tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(&config));
+                let _ = tui_state.push_event(tui_events::MailEvent::server_started(
+                    format!(
+                        "http://{}:{}{}",
+                        config.http_host, config.http_port, config.http_path
+                    ),
+                    "auto-restarted after liveness probe failures".to_string(),
+                ));
+                (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+            }
         }
     }
 }
@@ -6170,6 +6370,16 @@ mod tests {
              wall_now()={now:?} is always > 0 (the absolute deadline). \
              This demonstrates why with_deadline_secs is WRONG for relative timeouts.",
         );
+    }
+
+    #[test]
+    fn normalized_probe_host_maps_wildcards_to_loopback() {
+        assert_eq!(normalized_probe_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(normalized_probe_host("::"), "::1");
+        assert_eq!(normalized_probe_host("[::]"), "::1");
+        assert_eq!(normalized_probe_host(""), "127.0.0.1");
+        assert_eq!(normalized_probe_host("  "), "127.0.0.1");
+        assert_eq!(normalized_probe_host("127.0.0.1"), "127.0.0.1");
     }
 
     #[test]

@@ -3339,9 +3339,12 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(events.len(), 1_000);
+        // Debug test runs can be noisy on shared/dev hosts. Keep strict release
+        // budget while allowing a wider (still bounded) debug envelope.
+        let budget_ms = if cfg!(debug_assertions) { 30 } else { 10 };
         assert!(
-            elapsed.as_millis() < 10,
-            "iter_recent regression: 1000 from 10k took {elapsed:?}"
+            elapsed.as_millis() < budget_ms,
+            "iter_recent regression: 1000 from 10k took {elapsed:?} (budget: {budget_ms}ms)"
         );
     }
 
@@ -4237,10 +4240,12 @@ mod tests {
         let refresh_elapsed = refresh_start.elapsed();
 
         assert_eq!(provider.total_count(), 10_000);
-        // Initial refresh converts all events - budget 50ms for 10K items
+        // Initial refresh converts all events. Keep strict release budget while
+        // allowing headroom for debug runs under shared CPU contention.
+        let refresh_budget_ms = if cfg!(debug_assertions) { 200 } else { 50 };
         assert!(
-            refresh_elapsed.as_millis() < 50,
-            "Initial refresh took too long: {refresh_elapsed:?} (budget: 50ms)",
+            refresh_elapsed.as_millis() < refresh_budget_ms,
+            "Initial refresh took too long: {refresh_elapsed:?} (budget: {refresh_budget_ms}ms)",
         );
 
         // Benchmark: measure 100 window() calls at different positions
