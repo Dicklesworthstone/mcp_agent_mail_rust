@@ -805,11 +805,13 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // run_stdio() does not return; WBQ drain thread exits with the process.
 }
 
-const HTTP_RUNTIME_MAX_WORKERS: usize = 16;
+const HTTP_RUNTIME_MIN_WORKERS: usize = 4;
+const HTTP_RUNTIME_DEFAULT_WORKERS_CAP: usize = 32;
+const HTTP_RUNTIME_MAX_WORKERS: usize = 64;
 const HTTP_LISTENER_MAX_CONNECTIONS: usize = 4096;
 const HTTP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD: u32 = 3;
 const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
 const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -817,27 +819,28 @@ const HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS: u64 = 200;
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
 
 fn resolve_http_runtime_worker_threads() -> usize {
-    // Default to 1 worker thread.  Multi-worker asupersync runtimes trigger
-    // idle wake storms that peg CPU and starve the TUI render loop, causing
-    // visible flashing.  Operators can override via AM_HTTP_WORKER_THREADS
-    // for high-throughput headless deployments.
-    let default = 1_usize;
+    // Use a real worker pool by default so partial/incomplete client sockets
+    // cannot monopolize a single worker and starve all MCP traffic.
+    let default = std::thread::available_parallelism()
+        .map_or(HTTP_RUNTIME_MIN_WORKERS, std::num::NonZeroUsize::get)
+        .clamp(HTTP_RUNTIME_MIN_WORKERS, HTTP_RUNTIME_DEFAULT_WORKERS_CAP);
     std::env::var("AM_HTTP_WORKER_THREADS")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(default)
-        .clamp(1, HTTP_RUNTIME_MAX_WORKERS)
+        .clamp(HTTP_RUNTIME_MIN_WORKERS, HTTP_RUNTIME_MAX_WORKERS)
 }
 
 fn hardened_http_listener_config() -> Http1ListenerConfig {
     let http_config = Http1Config::default()
-        // Keep-alive ON: the web UI polls /mail/ws-state frequently and
-        // disabling keep-alive forced per-request TCP churn that created
-        // measurable CPU load and TUI render stalls.
+        // Keep-alive is allowed for polling clients, but with bounded reuse.
+        // This limits long-lived connection pathologies while avoiding pure
+        // per-request TCP churn in the web UI.
         .keep_alive(true)
+        .max_requests(Some(8))
         .idle_timeout(Some(HTTP_IDLE_TIMEOUT))
-        .max_headers_size(64 * 1024)
-        .max_body_size(16 * 1024 * 1024);
+        .max_headers_size(32 * 1024)
+        .max_body_size(1024 * 1024);
 
     Http1ListenerConfig::default()
         .http_config(http_config)
@@ -1915,18 +1918,32 @@ fn should_force_mux_left_split(
 }
 
 fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
-    // Use the well-calibrated ftui defaults for Bayesian diff strategy.
-    // The default c_emit=6.0 reflects real I/O cost (emit ~6× more expensive
-    // than scan), so the optimizer naturally prefers incremental diffs over
-    // full redraws.  dirty_spans + tile_skip further reduce terminal writes
-    // for sparse updates.  hysteresis_ratio=0.05 prevents strategy thrashing,
-    // and uncertainty_guard keeps incremental updates when change-rate is
-    // uncertain.
-    //
-    // Previous explicit overrides (c_emit=8.0, min_observation_cells=8,
-    // hysteresis_ratio=0.08) caused strategy-switch thrashing and visible
-    // flashing at overlay/modal boundaries.
-    ftui_runtime::terminal_writer::RuntimeDiffConfig::default()
+    // Explicitly tune the runtime diff path so sparse TUI updates remain
+    // incremental and strategy switches do not thrash at overlay boundaries.
+    let strategy = ftui_render::diff_strategy::DiffStrategyConfig {
+        // Model terminal emit cost higher than scan to bias away from redraw.
+        c_emit: 8.0,
+        // Ignore tiny micro-noise updates when adapting the posterior.
+        min_observation_cells: 8,
+        // Add extra switch friction so command-palette/modal edges do not flap.
+        hysteresis_ratio: 0.08,
+        // Keep uncertainty guard active a bit earlier under bursty churn.
+        uncertainty_guard_variance: 0.0015,
+        ..Default::default()
+    };
+    let dirty_spans = ftui_render::buffer::DirtySpanConfig::default()
+        .with_guard_band(1)
+        .with_max_spans_per_row(96);
+    let tiles = ftui_render::diff::TileDiffConfig::default()
+        // Enable tile skipping on medium terminals (not only very large grids).
+        .with_min_cells_for_tiles(2_000)
+        .with_dense_cell_ratio(0.22)
+        .with_dense_tile_ratio(0.55);
+
+    ftui_runtime::terminal_writer::RuntimeDiffConfig::new()
+        .with_strategy_config(strategy)
+        .with_dirty_span_config(dirty_spans)
+        .with_tile_diff_config(tiles)
 }
 
 const DASHBOARD_RENDER_COALESCE_WINDOW: Duration = Duration::from_millis(72);
