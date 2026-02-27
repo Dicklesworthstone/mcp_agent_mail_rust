@@ -2665,6 +2665,85 @@ fn print_verify_check(check: &share::deploy::VerifyLiveCheck) {
     ftui_runtime::ftui_println!("  [{tag}] {:<20} {}", check.id, check.message);
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct PreflightBannerStats {
+    projects: u64,
+    agents: u64,
+    messages: u64,
+    file_reservations: u64,
+    contact_links: u64,
+}
+
+fn query_table_count(conn: &mcp_agent_mail_db::DbConn, table: &str) -> u64 {
+    let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
+    conn.query_sync(&sql, &[])
+        .ok()
+        .and_then(|rows| {
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("cnt").ok())
+        })
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0)
+}
+
+fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
+    let Ok(conn) = open_db_sync_with_database_url(database_url) else {
+        return PreflightBannerStats::default();
+    };
+    PreflightBannerStats {
+        projects: query_table_count(&conn, "projects"),
+        agents: query_table_count(&conn, "agents"),
+        messages: query_table_count(&conn, "messages"),
+        file_reservations: query_table_count(&conn, "file_reservations"),
+        contact_links: query_table_count(&conn, "agent_links"),
+    }
+}
+
+fn emit_pre_tui_startup_banner(config: &Config) {
+    if !output::is_tty() {
+        return;
+    }
+
+    let _ = mcp_agent_mail_server::theme::init_console_theme_from_config(config.console_theme);
+    let stats = preflight_banner_stats(&config.database_url);
+
+    let endpoint = format!(
+        "http://{}:{}{}",
+        config.http_host, config.http_port, config.http_path
+    );
+    let ui_host = if matches!(config.http_host.as_str(), "0.0.0.0" | "::") {
+        "localhost"
+    } else {
+        config.http_host.as_str()
+    };
+    let web_ui = format!("http://{}:{}/mail", ui_host, config.http_port);
+    let storage_root = config.storage_root.to_string_lossy();
+    let app_env_str = config.app_environment.to_string();
+    let banner_lines = mcp_agent_mail_server::console::render_startup_banner(
+        &mcp_agent_mail_server::console::BannerParams {
+            app_environment: &app_env_str,
+            endpoint: endpoint.as_str(),
+            database_url: config.database_url.as_str(),
+            storage_root: storage_root.as_ref(),
+            auth_enabled: config.http_bearer_token.is_some(),
+            tools_log_enabled: config.tools_log_enabled,
+            tool_calls_log_enabled: config.log_tool_calls_enabled,
+            console_theme: mcp_agent_mail_server::theme::current_theme_display_name(),
+            web_ui_url: web_ui.as_str(),
+            remote_url: None,
+            projects: stats.projects,
+            agents: stats.agents,
+            messages: stats.messages,
+            file_reservations: stats.file_reservations,
+            contact_links: stats.contact_links,
+        },
+    );
+
+    for line in banner_lines {
+        ftui_runtime::ftui_println!("{line}");
+    }
+}
+
 fn handle_serve_http(
     host: Option<String>,
     port: Option<u16>,
@@ -2684,6 +2763,9 @@ fn handle_serve_http(
         ));
     }
     auto_clear_port(&config.http_host, config.http_port)?;
+    if !no_tui {
+        emit_pre_tui_startup_banner(&config);
+    }
     mcp_agent_mail_server::run_http_with_tui(&config)?;
     Ok(())
 }

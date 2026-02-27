@@ -2045,7 +2045,13 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let limit = query
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
-        .map_or(20, |v| if v == 0 { usize::try_from(i64::MAX).unwrap_or(usize::MAX) } else { v });
+        .map_or(20, |v| {
+            if v == 0 {
+                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            } else {
+                v
+            }
+        });
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2254,7 +2260,13 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| if v == 0 { usize::try_from(i64::MAX).unwrap_or(usize::MAX) } else { v });
+        .map_or(20, |v: usize| {
+            if v == 0 {
+                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            } else {
+                v
+            }
+        });
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2347,7 +2359,13 @@ pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<
     let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| if v == 0 { usize::try_from(i64::MAX).unwrap_or(usize::MAX) } else { v });
+        .map_or(20, |v: usize| {
+            if v == 0 {
+                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            } else {
+                v
+            }
+        });
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2483,7 +2501,13 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| if v == 0 { usize::try_from(i64::MAX).unwrap_or(usize::MAX) } else { v });
+        .map_or(20, |v: usize| {
+            if v == 0 {
+                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            } else {
+                v
+            }
+        });
     let include_bodies = query
         .get("include_bodies")
         .is_some_and(|v| parse_bool_param(v));
@@ -2700,7 +2724,13 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
     let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| if v == 0 { usize::try_from(i64::MAX).unwrap_or(usize::MAX) } else { v });
+        .map_or(20, |v: usize| {
+            if v == 0 {
+                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            } else {
+                v
+            }
+        });
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2789,7 +2819,13 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
     let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| if v == 0 { usize::try_from(i64::MAX).unwrap_or(usize::MAX) } else { v });
+        .map_or(20, |v: usize| {
+            if v == 0 {
+                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            } else {
+                v
+            }
+        });
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2916,7 +2952,13 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
     let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| if v == 0 { usize::try_from(i64::MAX).unwrap_or(usize::MAX) } else { v });
+        .map_or(20, |v: usize| {
+            if v == 0 {
+                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            } else {
+                v
+            }
+        });
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -3017,7 +3059,13 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
     let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| if v == 0 { usize::try_from(i64::MAX).unwrap_or(usize::MAX) } else { v });
+        .map_or(20, |v: usize| {
+            if v == 0 {
+                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            } else {
+                v
+            }
+        });
     let ttl_minutes: u64 = query
         .get("ttl_minutes")
         .and_then(|v| v.parse().ok())

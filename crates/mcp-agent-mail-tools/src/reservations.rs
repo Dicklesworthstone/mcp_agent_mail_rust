@@ -98,25 +98,27 @@ pub struct RenewedReservation {
 
 /// Detect suspicious file reservation patterns (matching Python's `_detect_suspicious_file_reservation`).
 fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
-    let p = pattern.trim();
+    let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::new(pattern);
+    let p = compiled.normalized();
+
     // 1. Too-broad patterns
     if matches!(p, "" | "*" | "**" | "**/*" | "**/**" | ".") {
         return Some(format!(
-            "Pattern '{p}' is too broad and would reserve the entire project. \
+            "Pattern '{pattern}' (normalized to '{p}') is too broad and would reserve the entire project. \
              Use more specific patterns like 'src/api/*.py' or 'lib/auth/**'."
         ));
     }
     // 2. Very short patterns with wildcards
     if p.len() <= 2 && p.contains('*') {
         return Some(format!(
-            "Pattern '{p}' is very short and may match more files than intended. \
+            "Pattern '{pattern}' (normalized to '{p}') is very short and may match more files than intended. \
              Consider using a more specific pattern."
         ));
     }
-    // 3. Absolute paths
-    if (p.starts_with('/') && !p.starts_with("//")) || std::path::Path::new(p).is_absolute() {
+    // 3. Absolute paths (check original pattern for this one, as normalize_pattern strips leading slash)
+    if (pattern.trim().starts_with('/') && !pattern.trim().starts_with("//")) || std::path::Path::new(pattern.trim()).is_absolute() {
         return Some(format!(
-            "Pattern '{p}' looks like an absolute path. \
+            "Pattern '{pattern}' looks like an absolute path. \
              Reservations should use project-relative paths like 'src/module.py'."
         ));
     }
@@ -290,7 +292,7 @@ pub async fn file_reservation_paths(
     }
 
     let ttl = match ttl_seconds {
-        Some(t) if t > 0 => t.max(60).min(31_536_000),
+        Some(t) if t > 0 => t.clamp(60, 31_536_000),
         _ => 3600, // 1 hour default
     };
     if ttl_seconds.is_some_and(|t| t > 0 && t < 60) {
@@ -683,7 +685,7 @@ pub async fn renew_file_reservations(
 ) -> McpResult<String> {
     // Legacy parity: clamp too-small values up to 60 seconds.
     let extend = match extend_seconds {
-        Some(t) if t > 0 => t.max(60).min(31_536_000),
+        Some(t) if t > 0 => t.clamp(60, 31_536_000),
         _ => 1800, // 30 minutes default
     };
 
