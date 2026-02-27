@@ -531,9 +531,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
             sender_name: row.get_as::<String>(3).unwrap_or_default(),
             subject: row.get_as::<String>(4).unwrap_or_default(),
             body_md: row.get_as::<String>(5).unwrap_or_default(),
-            thread_id: row
-                .get_as::<Option<String>>(6)
-                .unwrap_or_default(),
+            thread_id: row.get_as::<Option<String>>(6).unwrap_or_default(),
             importance: row
                 .get_as::<String>(7)
                 .unwrap_or_else(|_| "normal".to_string()),

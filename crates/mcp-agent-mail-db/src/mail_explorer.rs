@@ -621,9 +621,7 @@ fn map_inbound_row(row: &SqlRow) -> Option<ExplorerEntry> {
         subject: row.get_as(4).unwrap_or_default(),
         body_md: row.get_as(5).unwrap_or_default(),
         thread_id: row.get_as(3).ok(),
-        importance: row
-            .get_as(6)
-            .unwrap_or_else(|_| "normal".to_string()),
+        importance: row.get_as(6).unwrap_or_else(|_| "normal".to_string()),
         ack_required: row.get_as::<i64>(7).unwrap_or(0) != 0,
         created_ts: row.get_as(8).ok()?,
         kind: row.get_as(9).ok(),
@@ -644,9 +642,7 @@ fn map_outbound_row(row: &SqlRow) -> Option<ExplorerEntry> {
         subject: row.get_as(4).unwrap_or_default(),
         body_md: row.get_as(5).unwrap_or_default(),
         thread_id: row.get_as(3).ok(),
-        importance: row
-            .get_as(6)
-            .unwrap_or_else(|_| "normal".to_string()),
+        importance: row.get_as(6).unwrap_or_else(|_| "normal".to_string()),
         ack_required: row.get_as::<i64>(7).unwrap_or(0) != 0,
         created_ts: row.get_as(8).ok()?,
         kind: None,

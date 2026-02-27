@@ -1020,6 +1020,13 @@ Hello Bob, this is a test message.
         let storage_root = tmp.path().join("storage");
 
         let project_dir = storage_root.join("projects").join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-project","human_key":"/test-project","created_at":0}"#,
+        )
+        .unwrap();
+
         let messages_dir = project_dir.join("messages").join("2026").join("02");
         std::fs::create_dir_all(&messages_dir).unwrap();
 

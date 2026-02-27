@@ -22,6 +22,7 @@
 
 use crate::DbConn;
 use chrono::NaiveDateTime;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 // ── Error types ────────────────────────────────────────────────────────────
@@ -94,21 +95,6 @@ impl std::fmt::Display for TimestampFormat {
     }
 }
 
-/// Tables and their primary timestamp column to probe for format detection.
-///
-/// We check the primary timestamp column of each table. If the column stores
-/// a TEXT value, the table is in Python format.
-const TIMESTAMP_PROBE_COLUMNS: &[(&str, &str)] = &[
-    ("projects", "created_at"),
-    ("agents", "inception_ts"),
-    ("messages", "created_ts"),
-    ("message_recipients", "read_ts"),
-    ("file_reservations", "created_ts"),
-    ("agent_links", "created_ts"),
-    ("product_project_links", "created_at"),
-    ("products", "created_at"),
-];
-
 /// All tables and ALL of their timestamp columns (for migration).
 /// Each entry is `(table, column, is_nullable)`.
 pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
@@ -143,17 +129,20 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
 pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, MigrationError> {
     let mut saw_integer = false;
     let mut saw_text = false;
-    let mut text_tables = Vec::new();
+    let mut text_tables = BTreeSet::new();
+    let mut table_exists_cache: HashMap<&'static str, bool> = HashMap::new();
 
-    for &(table, column) in TIMESTAMP_PROBE_COLUMNS {
+    for &(table, column, _nullable) in TIMESTAMP_COLUMNS {
         // Check if table exists first (the table might not exist in older schemas).
-        let table_check = conn.query_sync(
-            &format!("SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"),
-            &[],
-        );
-        // FrankenSQLite may not support sqlite_master — assume table exists and
-        // let the typeof query below fail gracefully instead.
-        let table_exists = table_check.as_ref().map_or(true, |rows| !rows.is_empty());
+        let table_exists = *table_exists_cache.entry(table).or_insert_with(|| {
+            let table_check = conn.query_sync(
+                &format!("SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"),
+                &[],
+            );
+            // FrankenSQLite may not support sqlite_master — assume table exists and
+            // let the typeof query below fail gracefully instead.
+            table_check.as_ref().map_or(true, |rows| !rows.is_empty())
+        });
         if !table_exists {
             continue;
         }
@@ -174,7 +163,7 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
             "integer" => saw_integer = true,
             "text" => {
                 saw_text = true;
-                text_tables.push(table.to_string());
+                text_tables.insert(table.to_string());
             }
             "real" => {
                 // REAL timestamps are unusual but could appear — treat like integer
@@ -197,7 +186,9 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
         return Ok(TimestampFormat::RustMicros);
     }
     // Both TEXT and INTEGER found — partially migrated
-    Ok(TimestampFormat::Mixed { text_tables })
+    Ok(TimestampFormat::Mixed {
+        text_tables: text_tables.into_iter().collect(),
+    })
 }
 
 /// Detect format for a specific table and column.
@@ -447,6 +438,81 @@ pub struct MigrationSummary {
     pub success: bool,
 }
 
+const MIGRATION_STATE_TABLE_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS migration_state (\
+    table_name TEXT PRIMARY KEY,\
+    completed_ts INTEGER NOT NULL\
+)";
+
+fn ensure_migration_state_table(conn: &DbConn) -> Result<(), MigrationError> {
+    conn.execute_raw(MIGRATION_STATE_TABLE_SQL)
+        .map_err(|e| MigrationError::Query(format!("failed to ensure migration_state: {e}")))
+}
+
+fn load_completed_tables(conn: &DbConn) -> Result<HashSet<String>, MigrationError> {
+    let rows = conn
+        .query_sync("SELECT table_name FROM migration_state", &[])
+        .map_err(|e| MigrationError::Query(format!("failed to read migration_state: {e}")))?;
+    let mut out = HashSet::new();
+    for row in rows {
+        if let Ok(table_name) = row.get_named::<String>("table_name") {
+            out.insert(table_name);
+        }
+    }
+    Ok(out)
+}
+
+fn mark_table_completed(conn: &DbConn, table: &str) -> Result<(), MigrationError> {
+    use sqlmodel_core::Value;
+    let now_us = crate::timestamps::now_micros();
+    conn.query_sync(
+        "INSERT INTO migration_state (table_name, completed_ts) VALUES (?, ?) \
+         ON CONFLICT(table_name) DO UPDATE SET completed_ts = excluded.completed_ts",
+        &[Value::Text(table.to_string()), Value::BigInt(now_us)],
+    )
+    .map_err(|e| {
+        MigrationError::Query(format!(
+            "failed to persist migration_state for {table}: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn clear_table_completed(conn: &DbConn, table: &str) -> Result<(), MigrationError> {
+    use sqlmodel_core::Value;
+    conn.query_sync(
+        "DELETE FROM migration_state WHERE table_name = ?",
+        &[Value::Text(table.to_string())],
+    )
+    .map_err(|e| {
+        MigrationError::Query(format!("failed to clear migration_state for {table}: {e}"))
+    })?;
+    Ok(())
+}
+
+fn timestamp_columns_by_table() -> BTreeMap<&'static str, Vec<&'static str>> {
+    let mut map: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
+    for &(table, column, _nullable) in TIMESTAMP_COLUMNS {
+        map.entry(table).or_default().push(column);
+    }
+    map
+}
+
+fn table_has_text_timestamps(
+    conn: &DbConn,
+    table: &str,
+    columns: &[&str],
+) -> Result<bool, MigrationError> {
+    for &column in columns {
+        if let Some(fmt) = detect_column_format(conn, table, column)?
+            && fmt == "text"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Convert all TEXT timestamp columns in the database to i64 microseconds.
 ///
 /// Iterates over all known timestamp columns and converts each one.
@@ -465,37 +531,97 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
         success: true,
     };
 
-    for &(table, column, _nullable) in TIMESTAMP_COLUMNS {
-        // Skip tables that don't exist or have no TEXT timestamps.
-        if let Some(fmt) = detect_column_format(conn, table, column)? {
-            if fmt != "text" {
-                continue; // Already integer, skip
+    ensure_migration_state_table(conn)?;
+    let mut completed_tables = load_completed_tables(conn)?;
+
+    for (table, columns) in timestamp_columns_by_table() {
+        let has_text = table_has_text_timestamps(conn, table, &columns)?;
+
+        // Keep migration_state synced with what we observe, but do not blindly
+        // trust it when TEXT values still exist.
+        if !has_text {
+            if !completed_tables.contains(table) {
+                mark_table_completed(conn, table)?;
+                completed_tables.insert(table.to_string());
             }
-        } else {
-            continue; // Table empty or doesn't exist
+            continue;
+        }
+        if completed_tables.contains(table) {
+            clear_table_completed(conn, table)?;
+            completed_tables.remove(table);
         }
 
-        match convert_column(conn, table, column) {
-            Ok(result) => {
-                summary.total_converted += result.converted;
-                summary.total_skipped += result.skipped;
-                summary.total_nulls += result.nulls;
-                if result.skipped > 0 {
-                    summary.success = false;
+        conn.execute_raw("BEGIN IMMEDIATE").map_err(|e| {
+            MigrationError::Query(format!("failed to begin transaction for {table}: {e}"))
+        })?;
+
+        let mut table_failed = false;
+        let mut table_results: Vec<ColumnConversionResult> = Vec::new();
+
+        for column in columns {
+            if let Some(fmt) = detect_column_format(conn, table, column)? {
+                if fmt != "text" {
+                    continue;
                 }
+            } else {
+                continue;
+            }
+
+            match convert_column(conn, table, column) {
+                Ok(result) => {
+                    if result.skipped > 0 {
+                        table_failed = true;
+                    }
+                    table_results.push(result);
+                }
+                Err(e) => {
+                    table_failed = true;
+                    table_results.push(ColumnConversionResult {
+                        table: table.to_string(),
+                        column: column.to_string(),
+                        converted: 0,
+                        skipped: 0,
+                        nulls: 0,
+                        errors: vec![e.to_string()],
+                    });
+                }
+            }
+        }
+
+        if table_failed {
+            let _ = conn.execute_raw("ROLLBACK");
+            summary.success = false;
+
+            for mut result in table_results {
+                // Rollback reverted this table; do not count converted/null metrics.
+                result.converted = 0;
+                result.nulls = 0;
+                if result.errors.is_empty() {
+                    result.errors.push(format!(
+                        "{table}.{} migration rolled back due to another column failure",
+                        result.column
+                    ));
+                } else {
+                    result
+                        .errors
+                        .push(format!("{table}.{} migration rolled back", result.column));
+                }
+                summary.total_skipped += result.skipped;
                 summary.columns.push(result);
             }
-            Err(e) => {
-                summary.success = false;
-                summary.columns.push(ColumnConversionResult {
-                    table: table.to_string(),
-                    column: column.to_string(),
-                    converted: 0,
-                    skipped: 0,
-                    nulls: 0,
-                    errors: vec![e.to_string()],
-                });
-            }
+            continue;
+        }
+
+        conn.execute_raw("COMMIT").map_err(|e| {
+            MigrationError::Query(format!("failed to commit transaction for {table}: {e}"))
+        })?;
+        mark_table_completed(conn, table)?;
+
+        for result in table_results {
+            summary.total_converted += result.converted;
+            summary.total_skipped += result.skipped;
+            summary.total_nulls += result.nulls;
+            summary.columns.push(result);
         }
     }
 
@@ -852,6 +978,31 @@ mod tests {
     }
 
     #[test]
+    fn detect_mixed_format_within_single_table() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
+            .expect("create tables");
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('test', '/tmp', 1740000000000000)",
+            &[],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 'A', 'p', 'm', 1740000000000000, '2026-02-24 16:00:00')",
+            &[],
+        )
+        .expect("insert mixed-format agent");
+
+        let format = detect_timestamp_format(&conn).expect("detect format");
+        match format {
+            TimestampFormat::Mixed { text_tables } => {
+                assert!(text_tables.contains(&"agents".to_string()));
+            }
+            other => panic!("expected Mixed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn needs_migration_variants() {
         assert!(!TimestampFormat::RustMicros.needs_migration());
         assert!(!TimestampFormat::Empty.needs_migration());
@@ -986,6 +1137,44 @@ mod tests {
         let s2 = convert_all_timestamps(&conn).expect("migrate 2");
         assert_eq!(s2.total_converted, 0);
         assert!(s2.success);
+    }
+
+    #[test]
+    fn convert_rebuilds_stale_migration_state() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
+            .expect("create tables");
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('test', '/tmp', '2026-02-24 15:30:00.123456')",
+            &[],
+        )
+        .expect("insert");
+
+        let first = convert_all_timestamps(&conn).expect("first migrate");
+        assert!(first.total_converted > 0);
+
+        // Simulate stale state by re-introducing a TEXT timestamp in a table already
+        // marked complete.
+        conn.query_sync(
+            "UPDATE projects SET created_at = '2026-03-01 12:00:00.000000' WHERE id = 1",
+            &[],
+        )
+        .expect("reintroduce text timestamp");
+
+        let second = convert_all_timestamps(&conn).expect("second migrate");
+        assert!(
+            second.total_converted > 0,
+            "stale migration_state should not block reconversion"
+        );
+        assert!(second.success);
+
+        let rows = conn
+            .query_sync(
+                "SELECT table_name FROM migration_state WHERE table_name = 'projects'",
+                &[],
+            )
+            .expect("read migration_state");
+        assert_eq!(rows.len(), 1, "projects should remain tracked as migrated");
     }
 
     #[test]

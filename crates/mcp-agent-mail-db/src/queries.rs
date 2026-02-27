@@ -365,10 +365,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
             _ => None,
         })
         .ok_or_else(|| DbError::Internal("missing name in product row".to_string()))?;
-    let created_at = row
-        .get(3)
-        .and_then(value_as_i64)
-        .unwrap_or(0);
+    let created_at = row.get(3).and_then(value_as_i64).unwrap_or(0);
 
     Ok(ProductRow {
         id,
@@ -383,9 +380,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
 /// `inception_ts`, `last_active_ts`, `attachments_policy`, `contact_policy`.
 fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     fn get_i64(row: &SqlRow, idx: usize) -> i64 {
-        row.get(idx)
-            .and_then(value_as_i64)
-            .unwrap_or(0)
+        row.get(idx).and_then(value_as_i64).unwrap_or(0)
     }
     fn get_string(row: &SqlRow, idx: usize) -> String {
         row.get(idx)
@@ -1494,16 +1489,12 @@ pub async fn set_agent_contact_policy(
         Value::BigInt(now),
         Value::BigInt(agent_id),
     ];
-    let rows_affected = try_in_tx!(
+
+    let _rows_affected = try_in_tx!(
         cx,
         &tracked,
         map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
     );
-
-    if rows_affected == 0 {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
-    }
 
     // Fetch updated agent using raw SQL with explicit column order.
     let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
@@ -4170,7 +4161,11 @@ pub async fn renew_reservations(
          FROM file_reservations \
          WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
     );
-    let mut params: Vec<Value> = vec![Value::BigInt(project_id), Value::BigInt(agent_id), Value::BigInt(now)];
+    let mut params: Vec<Value> = vec![
+        Value::BigInt(project_id),
+        Value::BigInt(agent_id),
+        Value::BigInt(now),
+    ];
 
     if let Some(ids) = reservation_ids
         && !ids.is_empty()
