@@ -992,23 +992,15 @@ impl MailScreen for AttachmentExplorerScreen {
         let area = inner;
 
         // Responsive layout: Lg+ puts detail on the right side
-        let layout = ResponsiveLayout::new(
-            Flex::vertical().constraints([Constraint::Fill]),
-        )
-        .at(
-            Breakpoint::Lg,
-            Flex::horizontal().constraints([
-                Constraint::Percentage(55.0),
-                Constraint::Fill,
-            ]),
-        )
-        .at(
-            Breakpoint::Xl,
-            Flex::horizontal().constraints([
-                Constraint::Percentage(50.0),
-                Constraint::Fill,
-            ]),
-        );
+        let layout = ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+            .at(
+                Breakpoint::Lg,
+                Flex::horizontal().constraints([Constraint::Percentage(55.0), Constraint::Fill]),
+            )
+            .at(
+                Breakpoint::Xl,
+                Flex::horizontal().constraints([Constraint::Percentage(50.0), Constraint::Fill]),
+            );
 
         let split = layout.split(area);
         let main_area = split.rects[0];

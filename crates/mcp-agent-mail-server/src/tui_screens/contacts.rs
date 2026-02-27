@@ -567,11 +567,8 @@ impl MailScreen for ContactsScreen {
             if split.breakpoint >= Breakpoint::Xl {
                 // On Xl: show graph visualization in the side panel
                 let graph_events = state.recent_events(GRAPH_EVENTS_WINDOW);
-                let graph_metrics =
-                    build_graph_flow_metrics(&self.contacts, &graph_events);
-                if detail_area.width >= GRAPH_MIN_WIDTH
-                    && detail_area.height >= GRAPH_MIN_HEIGHT
-                {
+                let graph_metrics = build_graph_flow_metrics(&self.contacts, &graph_events);
+                if detail_area.width >= GRAPH_MIN_WIDTH && detail_area.height >= GRAPH_MIN_HEIGHT {
                     self.render_graph(frame, detail_area, &graph_metrics);
                 } else {
                     self.render_contact_detail_panel(frame, detail_area);
@@ -1020,11 +1017,7 @@ impl ContactsScreen {
             ));
         }
         if !contact.to_project_slug.is_empty() {
-            lines.push((
-                "To Project".into(),
-                contact.to_project_slug.clone(),
-                None,
-            ));
+            lines.push(("To Project".into(), contact.to_project_slug.clone(), None));
         }
 
         let updated_str = if contact.updated_ts == 0 {
@@ -1459,8 +1452,8 @@ fn render_kv_lines(
         } else {
             format!("{:<w$}", label, w = label_w as usize)
         };
-        let label_span = Paragraph::new(label_display)
-            .style(Style::default().fg(tp.text_muted).bold());
+        let label_span =
+            Paragraph::new(label_display).style(Style::default().fg(tp.text_muted).bold());
         let label_rect = Rect::new(area.x, row_y, label_w.min(area.width), 1);
         label_span.render(label_rect, frame);
 

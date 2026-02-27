@@ -300,23 +300,15 @@ impl MailScreen for ProjectsScreen {
         let area = inner;
 
         // Responsive layout: single-col on narrow, table+detail on wide
-        let layout = ResponsiveLayout::new(
-            Flex::vertical().constraints([Constraint::Fill]),
-        )
-        .at(
-            Breakpoint::Lg,
-            Flex::horizontal().constraints([
-                Constraint::Percentage(60.0),
-                Constraint::Fill,
-            ]),
-        )
-        .at(
-            Breakpoint::Xl,
-            Flex::horizontal().constraints([
-                Constraint::Percentage(50.0),
-                Constraint::Fill,
-            ]),
-        );
+        let layout = ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+            .at(
+                Breakpoint::Lg,
+                Flex::horizontal().constraints([Constraint::Percentage(60.0), Constraint::Fill]),
+            )
+            .at(
+                Breakpoint::Xl,
+                Flex::horizontal().constraints([Constraint::Percentage(50.0), Constraint::Fill]),
+            );
 
         let split = layout.split(area);
         let table_area = split.rects[0];
@@ -507,16 +499,33 @@ impl ProjectsScreen {
         lines.push(("Path".into(), proj.human_key.clone(), None));
         lines.push((
             "Status".into(),
-            format!("{icon} {}",
-                if icon == "\u{25CF}" { "Active" }
-                else if icon == "\u{25D0}" { "Idle" }
-                else { "Inactive" }
+            format!(
+                "{icon} {}",
+                if icon == "\u{25CF}" {
+                    "Active"
+                } else if icon == "\u{25D0}" {
+                    "Idle"
+                } else {
+                    "Inactive"
+                }
             ),
             Some(activity_color),
         ));
-        lines.push(("Agents".into(), proj.agent_count.to_string(), Some(tp.metric_agents)));
-        lines.push(("Messages".into(), proj.message_count.to_string(), Some(tp.metric_messages)));
-        lines.push(("Reservations".into(), proj.reservation_count.to_string(), Some(tp.metric_reservations)));
+        lines.push((
+            "Agents".into(),
+            proj.agent_count.to_string(),
+            Some(tp.metric_agents),
+        ));
+        lines.push((
+            "Messages".into(),
+            proj.message_count.to_string(),
+            Some(tp.metric_messages),
+        ));
+        lines.push((
+            "Reservations".into(),
+            proj.reservation_count.to_string(),
+            Some(tp.metric_reservations),
+        ));
         lines.push(("Created".into(), format_created_time(proj.created_at), None));
 
         if let Some(last_ts) = self.project_activity.get(&proj.slug) {

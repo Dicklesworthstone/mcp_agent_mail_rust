@@ -814,8 +814,17 @@ impl ReservationsScreen {
             ("Project".into(), res.project.clone(), None),
             (
                 "Exclusive".into(),
-                if res.exclusive { "\u{2713} Yes" } else { "\u{2717} No" }.into(),
-                Some(if res.exclusive { tp.severity_warn } else { tp.text_primary }),
+                if res.exclusive {
+                    "\u{2713} Yes"
+                } else {
+                    "\u{2717} No"
+                }
+                .into(),
+                Some(if res.exclusive {
+                    tp.severity_warn
+                } else {
+                    tp.text_primary
+                }),
             ),
         ];
 
@@ -1613,27 +1622,19 @@ impl MailScreen for ReservationsScreen {
         // Responsive layout: table+detail on wide screens (unless modal is active)
         let show_side_detail = self.detail_visible && !modal_active;
         let layout = if show_side_detail {
-            ResponsiveLayout::new(
-                Flex::vertical().constraints([Constraint::Fill]),
-            )
-            .at(
-                Breakpoint::Lg,
-                Flex::horizontal().constraints([
-                    Constraint::Percentage(55.0),
-                    Constraint::Fill,
-                ]),
-            )
-            .at(
-                Breakpoint::Xl,
-                Flex::horizontal().constraints([
-                    Constraint::Percentage(50.0),
-                    Constraint::Fill,
-                ]),
-            )
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                .at(
+                    Breakpoint::Lg,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(55.0), Constraint::Fill]),
+                )
+                .at(
+                    Breakpoint::Xl,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(50.0), Constraint::Fill]),
+                )
         } else {
-            ResponsiveLayout::new(
-                Flex::vertical().constraints([Constraint::Fill]),
-            )
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
         };
 
         let split = layout.split(area);

@@ -956,30 +956,22 @@ impl MailScreen for ArchiveBrowserScreen {
         // Responsive tree/preview split using ResponsiveLayout breakpoints.
         // Xs–Sm (< 90): tree only. Md (90–119): 45/55. Lg (120–159): 40/60. Xl (160+): 35/65.
         let layout = if self.detail_visible {
-            ResponsiveLayout::new(
-                Flex::vertical().constraints([Constraint::Fill]),
-            )
-            .at(
-                Breakpoint::Md,
-                Flex::horizontal().constraints([
-                    Constraint::Percentage(45.0),
-                    Constraint::Percentage(55.0),
-                ]),
-            )
-            .at(
-                Breakpoint::Lg,
-                Flex::horizontal().constraints([
-                    Constraint::Percentage(40.0),
-                    Constraint::Percentage(60.0),
-                ]),
-            )
-            .at(
-                Breakpoint::Xl,
-                Flex::horizontal().constraints([
-                    Constraint::Percentage(35.0),
-                    Constraint::Percentage(65.0),
-                ]),
-            )
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                .at(
+                    Breakpoint::Md,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(45.0), Constraint::Percentage(55.0)]),
+                )
+                .at(
+                    Breakpoint::Lg,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(40.0), Constraint::Percentage(60.0)]),
+                )
+                .at(
+                    Breakpoint::Xl,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(35.0), Constraint::Percentage(65.0)]),
+                )
         } else {
             ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
         };

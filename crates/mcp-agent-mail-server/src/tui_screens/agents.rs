@@ -584,23 +584,15 @@ impl MailScreen for AgentsScreen {
         let area = inner;
 
         // Responsive layout: single-col on narrow, table+detail on wide
-        let layout = ResponsiveLayout::new(
-            Flex::vertical().constraints([Constraint::Fill]),
-        )
-        .at(
-            Breakpoint::Lg,
-            Flex::horizontal().constraints([
-                Constraint::Percentage(60.0),
-                Constraint::Fill,
-            ]),
-        )
-        .at(
-            Breakpoint::Xl,
-            Flex::horizontal().constraints([
-                Constraint::Percentage(50.0),
-                Constraint::Fill,
-            ]),
-        );
+        let layout = ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+            .at(
+                Breakpoint::Lg,
+                Flex::horizontal().constraints([Constraint::Percentage(60.0), Constraint::Fill]),
+            )
+            .at(
+                Breakpoint::Xl,
+                Flex::horizontal().constraints([Constraint::Percentage(50.0), Constraint::Fill]),
+            );
 
         let split = layout.split(area);
         let table_area = split.rects[0];

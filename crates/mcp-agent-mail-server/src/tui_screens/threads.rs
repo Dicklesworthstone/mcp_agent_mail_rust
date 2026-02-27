@@ -1465,30 +1465,22 @@ impl MailScreen for ThreadExplorerScreen {
         // ResponsiveLayout: Md+ uses side-by-side split with breakpoint-based ratios.
         // Below Md (< 90): fall through to height-based stacked/compact fallback.
         let rl_layout = if self.detail_visible {
-            ResponsiveLayout::new(
-                Flex::vertical().constraints([Constraint::Fill]),
-            )
-            .at(
-                Breakpoint::Md,
-                Flex::horizontal().constraints([
-                    Constraint::Percentage(40.0),
-                    Constraint::Percentage(60.0),
-                ]),
-            )
-            .at(
-                Breakpoint::Lg,
-                Flex::horizontal().constraints([
-                    Constraint::Percentage(34.0),
-                    Constraint::Percentage(66.0),
-                ]),
-            )
-            .at(
-                Breakpoint::Xl,
-                Flex::horizontal().constraints([
-                    Constraint::Percentage(25.0),
-                    Constraint::Percentage(75.0),
-                ]),
-            )
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                .at(
+                    Breakpoint::Md,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(40.0), Constraint::Percentage(60.0)]),
+                )
+                .at(
+                    Breakpoint::Lg,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(34.0), Constraint::Percentage(66.0)]),
+                )
+                .at(
+                    Breakpoint::Xl,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(25.0), Constraint::Percentage(75.0)]),
+                )
         } else {
             ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
         };
@@ -1868,7 +1860,7 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
             // Precision loss acceptable: microsecond timestamps and message counts
             // don't need f64's full mantissa for display purposes.
             #[allow(clippy::cast_precision_loss)]
-            let duration_hours = (last_ts - first_ts).max(1) as f64 / (3_600_000_000.0);
+            let duration_hours = last_ts.saturating_sub(first_ts).max(1) as f64 / (3_600_000_000.0);
             #[allow(clippy::cast_precision_loss)]
             let velocity = if duration_hours > 0.001 {
                 msg_count as f64 / duration_hours

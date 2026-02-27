@@ -5431,7 +5431,7 @@ fn shimmer_progress_for_timestamp(now_micros: i64, timestamp_micros: i64) -> Opt
     if timestamp_micros <= 0 {
         return None;
     }
-    let age = now_micros - timestamp_micros;
+    let age = now_micros.saturating_sub(timestamp_micros);
     if !(0..=SHIMMER_WINDOW_MICROS).contains(&age) {
         return None;
     }

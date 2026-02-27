@@ -834,7 +834,12 @@ impl SystemHealthScreen {
 
         let mut findings: Vec<(&str, AnomalySeverity, &str, Option<&str>)> = Vec::new();
         if let Some(err) = &snap.tcp_error {
-            findings.push(("TCP connection", AnomalySeverity::Critical, err.as_str(), None));
+            findings.push((
+                "TCP connection",
+                AnomalySeverity::Critical,
+                err.as_str(),
+                None,
+            ));
         }
         for line in &snap.lines {
             let severity = match line.level {
@@ -878,11 +883,7 @@ impl SystemHealthScreen {
             None,
         ));
         lines.push(("Name".into(), name.to_string(), None));
-        lines.push((
-            "Severity".into(),
-            format!("{severity:?}"),
-            Some(sev_color),
-        ));
+        lines.push(("Severity".into(), format!("{severity:?}"), Some(sev_color)));
         lines.push(("Detail".into(), detail.to_string(), None));
         if let Some(fix) = remediation {
             lines.push(("Remediation".into(), fix.to_string(), None));
@@ -890,9 +891,7 @@ impl SystemHealthScreen {
 
         // Related probes
         for probe in &snap.path_probes {
-            let status_str = probe
-                .status
-                .map_or_else(|| "?".into(), format_http_status);
+            let status_str = probe.status.map_or_else(|| "?".into(), format_http_status);
             let latency_str = probe
                 .latency_ms
                 .map_or_else(|| "?".to_string(), |ms| format!("{ms}ms"));
@@ -927,11 +926,7 @@ impl SystemHealthScreen {
 
         let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
         if let Some(err) = &snap.tcp_error {
-            lines.push((
-                "[CRIT] TCP".into(),
-                err.clone(),
-                Some(tp.severity_critical),
-            ));
+            lines.push(("[CRIT] TCP".into(), err.clone(), Some(tp.severity_critical)));
         }
         for probe_line in &snap.lines {
             let color = match probe_line.level {
@@ -1067,29 +1062,20 @@ impl MailScreen for SystemHealthScreen {
         outer_block.render(area, frame);
 
         // Responsive layout: at Lg+ split into main content + detail panel
-        let layout = ResponsiveLayout::new(
-            Flex::vertical().constraints([Constraint::Fill]),
-        )
-        .at(
-            Breakpoint::Lg,
-            Flex::horizontal().constraints([
-                Constraint::Percentage(55.0),
-                Constraint::Fill,
-            ]),
-        )
-        .at(
-            Breakpoint::Xl,
-            Flex::horizontal().constraints([
-                Constraint::Percentage(50.0),
-                Constraint::Fill,
-            ]),
-        );
+        let layout = ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+            .at(
+                Breakpoint::Lg,
+                Flex::horizontal().constraints([Constraint::Percentage(55.0), Constraint::Fill]),
+            )
+            .at(
+                Breakpoint::Xl,
+                Flex::horizontal().constraints([Constraint::Percentage(50.0), Constraint::Fill]),
+            );
 
         let split = if self.detail_visible {
             layout.split(inner)
         } else {
-            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
-                .split(inner)
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill])).split(inner)
         };
         let main_area = split.rects[0];
 
@@ -1218,11 +1204,7 @@ fn render_probing_indicator(
 /// Render a prominent Tailscale remote-access URL banner at the top of the
 /// area, returning the remaining area below. Returns `area` unchanged when
 /// no Tailscale URL is available.
-fn render_remote_url_banner(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snap: &DiagnosticsSnapshot,
-) -> Rect {
+fn render_remote_url_banner(frame: &mut Frame<'_>, area: Rect, snap: &DiagnosticsSnapshot) -> Rect {
     let Some(ref url) = snap.remote_url else {
         return area;
     };
@@ -1235,10 +1217,7 @@ fn render_remote_url_banner(
         Span::styled(url.clone(), remote_style),
         Span::styled("  (Tailscale)", hint_style),
     ]);
-    Paragraph::new(line).render(
-        Rect::new(area.x, area.y, area.width, 1),
-        frame,
-    );
+    Paragraph::new(line).render(Rect::new(area.x, area.y, area.width, 1), frame);
     Rect::new(
         area.x,
         area.y.saturating_add(1),

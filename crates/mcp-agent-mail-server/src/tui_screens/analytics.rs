@@ -2264,12 +2264,7 @@ impl MailScreen for AnalyticsScreen {
                 raw_detail.height,
             );
             if gap > 0 {
-                let splitter_area = Rect::new(
-                    raw_detail.x,
-                    raw_detail.y,
-                    gap,
-                    content.height,
-                );
+                let splitter_area = Rect::new(raw_detail.x, raw_detail.y, gap, content.height);
                 render_splitter_handle(
                     frame,
                     splitter_area,

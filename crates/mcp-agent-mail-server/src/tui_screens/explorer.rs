@@ -1021,23 +1021,21 @@ impl MailScreen for MailExplorerScreen {
             );
 
             let rl_layout = if self.detail_visible {
-                ResponsiveLayout::new(
-                    Flex::vertical().constraints([Constraint::Fill]),
-                )
-                .at(
-                    Breakpoint::Lg,
-                    Flex::horizontal().constraints([
-                        Constraint::Percentage(50.0),
-                        Constraint::Percentage(50.0),
-                    ]),
-                )
-                .at(
-                    Breakpoint::Xl,
-                    Flex::horizontal().constraints([
-                        Constraint::Percentage(45.0),
-                        Constraint::Percentage(55.0),
-                    ]),
-                )
+                ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                    .at(
+                        Breakpoint::Lg,
+                        Flex::horizontal().constraints([
+                            Constraint::Percentage(50.0),
+                            Constraint::Percentage(50.0),
+                        ]),
+                    )
+                    .at(
+                        Breakpoint::Xl,
+                        Flex::horizontal().constraints([
+                            Constraint::Percentage(45.0),
+                            Constraint::Percentage(55.0),
+                        ]),
+                    )
             } else {
                 ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
             };

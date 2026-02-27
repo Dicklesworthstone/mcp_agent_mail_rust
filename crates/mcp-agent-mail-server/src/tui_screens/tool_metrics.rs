@@ -1163,20 +1163,46 @@ impl ToolMetricsScreen {
 
         lines.push(("Tool".into(), stats.name.clone(), None));
         lines.push(("Calls".into(), stats.calls.to_string(), None));
-        lines.push(("Errors".into(), stats.errors.to_string(),
-            if stats.errors > 0 { Some(tp.severity_error) } else { None }));
+        lines.push((
+            "Errors".into(),
+            stats.errors.to_string(),
+            if stats.errors > 0 {
+                Some(tp.severity_error)
+            } else {
+                None
+            },
+        ));
 
         let err_pct = stats.err_pct();
-        lines.push(("Error %".into(), format!("{err_pct:.1}%"),
-            if err_pct > 5.0 { Some(tp.severity_error) } else { None }));
+        lines.push((
+            "Error %".into(),
+            format!("{err_pct:.1}%"),
+            if err_pct > 5.0 {
+                Some(tp.severity_error)
+            } else {
+                None
+            },
+        ));
 
         lines.push(("Avg Latency".into(), format!("{}ms", stats.avg_ms()), None));
 
         // Percentiles from recent latencies
         if !stats.recent_latencies.is_empty() {
-            lines.push(("P50".into(), format!("{:.0}ms", stats.percentile(50.0)), None));
-            lines.push(("P95".into(), format!("{:.0}ms", stats.percentile(95.0)), None));
-            lines.push(("P99".into(), format!("{:.0}ms", stats.percentile(99.0)), None));
+            lines.push((
+                "P50".into(),
+                format!("{:.0}ms", stats.percentile(50.0)),
+                None,
+            ));
+            lines.push((
+                "P95".into(),
+                format!("{:.0}ms", stats.percentile(95.0)),
+                None,
+            ));
+            lines.push((
+                "P99".into(),
+                format!("{:.0}ms", stats.percentile(99.0)),
+                None,
+            ));
         }
 
         // Change points
@@ -1414,23 +1440,18 @@ impl MailScreen for ToolMetricsScreen {
         match self.view_mode {
             ViewMode::Table => {
                 // Responsive layout: table + detail on wide screens
-                let layout = ResponsiveLayout::new(
-                    Flex::vertical().constraints([Constraint::Fill]),
-                )
-                .at(
-                    Breakpoint::Lg,
-                    Flex::horizontal().constraints([
-                        Constraint::Percentage(55.0),
-                        Constraint::Fill,
-                    ]),
-                )
-                .at(
-                    Breakpoint::Xl,
-                    Flex::horizontal().constraints([
-                        Constraint::Percentage(50.0),
-                        Constraint::Fill,
-                    ]),
-                );
+                let layout =
+                    ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                        .at(
+                            Breakpoint::Lg,
+                            Flex::horizontal()
+                                .constraints([Constraint::Percentage(55.0), Constraint::Fill]),
+                        )
+                        .at(
+                            Breakpoint::Xl,
+                            Flex::horizontal()
+                                .constraints([Constraint::Percentage(50.0), Constraint::Fill]),
+                        );
 
                 let split = layout.split(inner);
                 self.render_table_view(frame, split.rects[0]);
