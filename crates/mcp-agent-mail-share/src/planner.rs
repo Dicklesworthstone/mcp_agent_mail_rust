@@ -31,7 +31,34 @@ fn quote_str(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    if !s.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\\' | '\'' | '"' | '$' | '&' | '|' | ';' | '<' | '>' | '`' | '*' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '~' | '^' | '#')) {
+    if !s.chars().any(|c| {
+        matches!(
+            c,
+            ' ' | '\t'
+                | '\n'
+                | '\\'
+                | '\''
+                | '"'
+                | '$'
+                | '&'
+                | '|'
+                | ';'
+                | '<'
+                | '>'
+                | '`'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '~'
+                | '^'
+                | '#'
+        )
+    }) {
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len() + 2);
@@ -533,7 +560,7 @@ fn generate_s3_plan(
              --exclude '*' --include '*.sqlite3' \
              --content-type 'application/x-sqlite3' \
              --metadata-directive REPLACE",
-             quote_str(&bucket)
+            quote_str(&bucket)
         )),
         optional: false,
         requires_confirm: false,

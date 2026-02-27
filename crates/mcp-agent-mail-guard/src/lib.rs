@@ -479,7 +479,7 @@ def normalize_match_input(value):
     return value.lower() if CASE_INSENSITIVE_REPO else value
 
 def glob_to_regex(pattern):
-    """Convert shell-style glob to regex supporting **, [], and {} syntax."""
+    """Convert shell-style glob to regex supporting **, [], and {{}} syntax."""
     # Hide ** so fnmatch does not convert it to .*
     pattern = pattern.replace("**", "\0")
     regex = fnmatch.translate(pattern)
@@ -498,8 +498,8 @@ def glob_to_regex(pattern):
     regex = regex.replace(".*", "[^/]*")
     # Restore ** as .*
     regex = regex.replace("\0", ".*")
-    # Handle {a,b} bash-style brace expansion
-    regex = re.sub(r"\\{([^}]+)\\}", lambda m: "(" + m.group(1).replace(",", "|") + ")", regex)
+    # Handle {{a,b}} bash-style brace expansion
+    regex = re.sub(r"\\{{([^}}]+)\\}}", lambda m: "(" + m.group(1).replace(",", "|") + ")", regex)
     return regex
 
 def glob_match(path, pattern):

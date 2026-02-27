@@ -39,8 +39,9 @@ pub use frankensearch::core::types::{
 };
 pub use frankensearch::{
     EmbedderStack as FsEmbedderStack, IndexBuilder as FsIndexBuilder, RrfConfig as FsRrfConfig,
-    TwoTierAvailability as FsTwoTierAvailability, TwoTierIndex as FsTwoTierIndex,
-    TwoTierSearcher as FsTwoTierSearcher, VectorIndex as FsVectorIndex, rrf_fuse as fs_rrf_fuse,
+    TantivyIndex as FsTantivyIndex, TwoTierAvailability as FsTwoTierAvailability,
+    TwoTierIndex as FsTwoTierIndex, TwoTierSearcher as FsTwoTierSearcher,
+    VectorIndex as FsVectorIndex, rrf_fuse as fs_rrf_fuse,
 };
 
 // ─── Doc ID Conversion ──────────────────────────────────────────────────────

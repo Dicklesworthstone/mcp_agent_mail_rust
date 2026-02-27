@@ -984,7 +984,7 @@ fn check_threshold(
 
     // Map ratio [0.5, 2.0] to score [0.0, 1.0]
     let score = ((ratio - 0.5) / 1.5).clamp(0.0, 1.0);
-    
+
     let severity = if ratio >= 2.0 {
         AnomalySeverity::Critical
     } else if ratio >= 1.0 {

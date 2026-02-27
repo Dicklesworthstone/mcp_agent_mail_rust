@@ -273,11 +273,12 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                 // We are the leader. Insert our slot.
                 let slot = Arc::new(Slot::new());
                 if map.len() >= self.max_entries_per_shard {
-                    // Eviction strategy: try to find an entry with no active joiners (strong_count == 1).
+                    // Eviction strategy: try to find an entry with no active joiners (strong_count == 2).
+                    // (1 reference in the map, 1 held by the currently executing leader).
                     // If none found, fall back to arbitrary eviction (best-effort).
                     let key_to_evict = map
                         .iter()
-                        .find(|(_, slot)| Arc::strong_count(slot) == 1)
+                        .find(|(_, slot)| Arc::strong_count(slot) == 2)
                         .map(|(k, _)| k.clone())
                         .or_else(|| map.keys().next().cloned());
                     if let Some(k) = key_to_evict {

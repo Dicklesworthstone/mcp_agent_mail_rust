@@ -47,34 +47,20 @@ impl PatternCache {
 }
 
 fn normalize_pattern(pattern: &str) -> String {
-    let trimmed = pattern.trim();
-    let mut normalized = String::with_capacity(trimmed.len());
-    let mut prev_slash = false;
-    for ch in trimmed.chars() {
-        let mapped = if ch == '\\' { '/' } else { ch };
-        if mapped == '/' {
-            if !prev_slash {
-                normalized.push('/');
+    let slashed = pattern.trim().replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for component in slashed.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if !parts.is_empty() {
+                    parts.pop();
+                }
             }
-            prev_slash = true;
-        } else {
-            normalized.push(mapped);
-            prev_slash = false;
+            other => parts.push(other),
         }
     }
-
-    while let Some(pos) = normalized.find("/./") {
-        normalized.replace_range(pos..pos + 3, "/");
-    }
-
-    let mut slice = normalized.as_str();
-    while let Some(rest) = slice.strip_prefix("./") {
-        slice = rest;
-    }
-    if let Some(rest) = slice.strip_suffix("/.") {
-        slice = rest;
-    }
-    slice.trim_matches('/').to_string()
+    parts.join("/")
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +338,14 @@ mod tests {
         assert_eq!(normalize_pattern("src/"), "src");
         assert_eq!(normalize_pattern("src/api/"), "src/api");
         assert_eq!(normalize_pattern("/"), "");
+    }
+
+    #[test]
+    fn normalize_collapses_dot_dot() {
+        assert_eq!(normalize_pattern("src/../docs/readme.md"), "docs/readme.md");
+        assert_eq!(normalize_pattern("app/models/../../api/users.py"), "api/users.py");
+        assert_eq!(normalize_pattern("../evil"), "evil");
+        assert_eq!(normalize_pattern("../../evil"), "evil");
     }
 
     // ── has_glob_meta tests ──────────────────────────────────────────
