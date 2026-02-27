@@ -872,20 +872,16 @@ fn probe_http_healthz(config: &mcp_agent_mail_core::Config) -> bool {
         let _ = stream.set_read_timeout(Some(HTTP_SUPERVISOR_PROBE_TIMEOUT));
         let _ = stream.set_write_timeout(Some(HTTP_SUPERVISOR_PROBE_TIMEOUT));
 
-        let request = format!(
-            "GET /healthz HTTP/1.1\r\nHost: {probe_host}\r\nConnection: close\r\n\r\n"
-        );
+        let request =
+            format!("GET /healthz HTTP/1.1\r\nHost: {probe_host}\r\nConnection: close\r\n\r\n");
         if stream.write_all(request.as_bytes()).is_err() {
             continue;
         }
-        let mut buf = [0_u8; 64];
-        let Ok(n) = stream.read(&mut buf) else {
-            continue;
-        };
-        if n == 0 {
+        let mut buf = [0_u8; 12];
+        if stream.read_exact(&mut buf).is_err() {
             continue;
         }
-        if buf[..n].starts_with(b"HTTP/1.1 200") || buf[..n].starts_with(b"HTTP/1.0 200") {
+        if buf.starts_with(b"HTTP/1.1 200") || buf.starts_with(b"HTTP/1.0 200") {
             return true;
         }
     }
@@ -2041,9 +2037,8 @@ impl StartupDashboard {
             config.http_host, config.http_port, config.http_path
         );
         let web_ui = format!("http://{}:{}/mail", config.http_host, config.http_port);
-        let remote_url = detect_tailscale_ip().map(|ip| {
-            build_remote_url(&ip, config.http_port, config.http_bearer_token.as_deref())
-        });
+        let remote_url = detect_tailscale_ip()
+            .map(|ip| build_remote_url(&ip, config.http_port, config.http_bearer_token.as_deref()));
         let transport_mode = detect_transport_mode(&config.http_path).to_string();
 
         let dashboard = Arc::new(Self {
@@ -5844,11 +5839,7 @@ pub(crate) fn detect_tailscale_ip() -> Option<String> {
 }
 
 /// Build a remote-access URL with the Tailscale IP and optional auth token.
-pub(crate) fn build_remote_url(
-    tailscale_ip: &str,
-    port: u16,
-    token: Option<&str>,
-) -> String {
+pub(crate) fn build_remote_url(tailscale_ip: &str, port: u16, token: Option<&str>) -> String {
     let base = format!("http://{tailscale_ip}:{port}/mail");
     match token {
         Some(t) => format!("{base}?token={t}"),

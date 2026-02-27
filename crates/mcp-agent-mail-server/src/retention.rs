@@ -32,7 +32,7 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let mut worker = WORKER.lock().unwrap();
+    let mut worker = WORKER.lock().unwrap_or_else(|e| e.into_inner());
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
@@ -40,11 +40,7 @@ pub fn start(config: &Config) {
             std::thread::Builder::new()
                 .name("retention-quota".into())
                 .spawn(move || {
-                    let rt = asupersync::runtime::RuntimeBuilder::new()
-                        .worker_threads(1)
-                        .build()
-                        .expect("build retention runtime");
-                    rt.block_on(async move { retention_loop(&config) });
+                    retention_loop(&config);
                 })
                 .expect("failed to spawn retention/quota worker"),
         );
@@ -253,20 +249,24 @@ fn dir_size(path: &Path) -> u64 {
     }
 
     let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
-                continue;
-            }
+    let mut stack = vec![path.to_path_buf()];
 
-            let p = entry.path();
-            if ft.is_file() {
-                total += p.metadata().map_or(0, |m| m.len());
-            } else if ft.is_dir() {
-                total += dir_size(&p);
+    while let Some(current) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(current) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+
+                let p = entry.path();
+                if ft.is_file() {
+                    total += p.metadata().map_or(0, |m| m.len());
+                } else if ft.is_dir() {
+                    stack.push(p);
+                }
             }
         }
     }
@@ -294,20 +294,24 @@ fn count_inbox_files(agents_dir: &Path) -> u64 {
 /// Recursively count .md files in a directory.
 fn count_md_files_recursive(dir: &Path) -> u64 {
     let mut count = 0u64;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
-                continue;
-            }
+    let mut stack = vec![dir.to_path_buf()];
 
-            let p = entry.path();
-            if ft.is_file() && p.extension().is_some_and(|e| e == "md") {
-                count += 1;
-            } else if ft.is_dir() {
-                count += count_md_files_recursive(&p);
+    while let Some(current) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(current) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+
+                let p = entry.path();
+                if ft.is_file() && p.extension().is_some_and(|e| e == "md") {
+                    count += 1;
+                } else if ft.is_dir() {
+                    stack.push(p);
+                }
             }
         }
     }
@@ -341,25 +345,29 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> u64 {
 /// Count files older than cutoff in a directory tree.
 fn count_old_files_recursive(dir: &Path, cutoff: std::time::SystemTime) -> u64 {
     let mut count = 0u64;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
-                continue;
-            }
+    let mut stack = vec![dir.to_path_buf()];
 
-            let p = entry.path();
-            if ft.is_file() && p.extension().is_some_and(|e| e == "md") {
-                if let Ok(metadata) = p.metadata()
-                    && let Ok(modified) = metadata.modified()
-                    && modified < cutoff
-                {
-                    count += 1;
+    while let Some(current) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(current) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
                 }
-            } else if ft.is_dir() {
-                count += count_old_files_recursive(&p, cutoff);
+
+                let p = entry.path();
+                if ft.is_file() && p.extension().is_some_and(|e| e == "md") {
+                    if let Ok(metadata) = p.metadata()
+                        && let Ok(modified) = metadata.modified()
+                        && modified < cutoff
+                    {
+                        count += 1;
+                    }
+                } else if ft.is_dir() {
+                    stack.push(p);
+                }
             }
         }
     }

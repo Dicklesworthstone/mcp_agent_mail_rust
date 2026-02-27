@@ -36,7 +36,7 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let mut worker = WORKER.lock().unwrap();
+    let mut worker = WORKER.lock().unwrap_or_else(|e| e.into_inner());
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
@@ -44,11 +44,7 @@ pub fn start(config: &Config) {
             std::thread::Builder::new()
                 .name("ack-ttl-scan".into())
                 .spawn(move || {
-                    let rt = asupersync::runtime::RuntimeBuilder::new()
-                        .worker_threads(1)
-                        .build()
-                        .expect("build ack-ttl runtime");
-                    rt.block_on(async move { ack_ttl_loop(&config) });
+                    ack_ttl_loop(&config);
                 })
                 .expect("failed to spawn ACK TTL scan worker"),
         );
@@ -819,7 +815,7 @@ mod tests {
         assert_eq!(reservations.len(), 1);
 
         let r = &reservations[0];
-        let ttl_us = r.expires_ts - r.created_ts;
+        let ttl_us = r.expires_ts.saturating_sub(r.created_ts);
         assert!(
             (110_000_000..=130_000_000).contains(&ttl_us),
             "reservation TTL should be close to configured 120 seconds, got {ttl_us}us"

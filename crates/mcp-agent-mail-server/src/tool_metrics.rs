@@ -57,7 +57,7 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let mut worker = WORKER.lock().unwrap();
+    let mut worker = WORKER.lock().unwrap_or_else(|e| e.into_inner());
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
@@ -65,11 +65,7 @@ pub fn start(config: &Config) {
             std::thread::Builder::new()
                 .name("tool-metrics-emit".into())
                 .spawn(move || {
-                    let rt = asupersync::runtime::RuntimeBuilder::new()
-                        .worker_threads(1)
-                        .build()
-                        .expect("build tool-metrics runtime");
-                    rt.block_on(async move { metrics_loop(&config) });
+                    metrics_loop(&config);
                 })
                 .expect("failed to spawn tool metrics emit worker"),
         );

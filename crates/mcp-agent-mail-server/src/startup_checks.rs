@@ -171,13 +171,18 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
 
     // Read headers and body to look for Agent Mail signature
     let mut headers = String::new();
+    let mut header_bytes_read = 0;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
-            Ok(_) => {
+            Ok(n) => {
                 if line.trim().is_empty() {
                     break; // End of headers
+                }
+                header_bytes_read += n;
+                if header_bytes_read > 8192 {
+                    break;
                 }
                 headers.push_str(&line);
             }

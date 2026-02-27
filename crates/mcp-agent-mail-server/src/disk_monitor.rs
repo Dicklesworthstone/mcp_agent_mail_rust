@@ -40,7 +40,7 @@ pub fn start(config: &Config) {
     // immediately after startup.
     let _ = mcp_agent_mail_core::disk::sample_and_record(config);
 
-    let mut worker = WORKER.lock().unwrap();
+    let mut worker = WORKER.lock().unwrap_or_else(|e| e.into_inner());
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);

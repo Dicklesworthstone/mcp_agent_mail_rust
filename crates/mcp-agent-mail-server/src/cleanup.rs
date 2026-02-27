@@ -41,7 +41,7 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let mut worker = WORKER.lock().unwrap();
+    let mut worker = WORKER.lock().unwrap_or_else(|e| e.into_inner());
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
@@ -49,11 +49,7 @@ pub fn start(config: &Config) {
             std::thread::Builder::new()
                 .name("file-res-cleanup".into())
                 .spawn(move || {
-                    let rt = asupersync::runtime::RuntimeBuilder::new()
-                        .worker_threads(1)
-                        .build()
-                        .expect("build cleanup runtime");
-                    rt.block_on(async move { cleanup_loop(&config) });
+                    cleanup_loop(&config);
                 })
                 .expect("failed to spawn file reservation cleanup worker"),
         );
@@ -303,7 +299,7 @@ fn check_filesystem_activity(
                     let mtime_us = modified
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-                    if (now_us - mtime_us) <= grace_us {
+                    if now_us.saturating_sub(mtime_us) <= grace_us {
                         return true;
                     }
                 }
@@ -318,7 +314,7 @@ fn check_filesystem_activity(
             let mtime_us = modified
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-            if (now_us - mtime_us) <= grace_us {
+            if now_us.saturating_sub(mtime_us) <= grace_us {
                 return true;
             }
         }
@@ -354,7 +350,7 @@ fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_u
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Ok(commit_epoch) = stdout.trim().parse::<i64>() {
             let commit_us = commit_epoch * 1_000_000;
-            if (now_us - commit_us) <= grace_us {
+            if now_us.saturating_sub(commit_us) <= grace_us {
                 return true;
             }
         }
