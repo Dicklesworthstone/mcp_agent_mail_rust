@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
+#[allow(unused_imports)]
 use std::io::IsTerminal;
 
 // ── Output format enum ────────────────────────────────────────────────────
@@ -73,7 +74,27 @@ impl CliOutputFormat {
 /// Detect whether stdout is a TTY.
 #[must_use]
 pub fn is_tty() -> bool {
-    std::io::stdout().is_terminal()
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        std::io::stdout().is_terminal()
+    }
+}
+
+/// Detect whether stdin is a TTY.
+#[must_use]
+pub fn is_stdin_tty() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        std::io::stdin().is_terminal()
+    }
 }
 
 // ── Simple table renderer ────────────────────────────────────────────────

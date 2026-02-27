@@ -9,7 +9,7 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use sqlmodel_core::Value;
-use std::io::IsTerminal;
+
 
 use crate::CliError;
 
@@ -61,7 +61,7 @@ impl OutputFormat {
     pub fn auto_detect(prose_hint: bool) -> Self {
         if prose_hint {
             Self::Markdown
-        } else if std::io::stdout().is_terminal() {
+        } else if crate::output::is_tty() {
             Self::Toon
         } else {
             Self::Json
@@ -236,7 +236,7 @@ pub fn resolve_format(explicit: Option<OutputFormat>, subcmd: &str) -> OutputFor
 
 /// Resolve format based on terminal detection only (no command context).
 pub fn resolve_format_for_terminal() -> OutputFormat {
-    if std::io::stdout().is_terminal() {
+    if crate::output::is_tty() {
         OutputFormat::Toon
     } else {
         OutputFormat::Json
@@ -1008,7 +1008,7 @@ fn build_status(
                 .ok()
                 .and_then(|rows| rows.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
                 .unwrap_or(1) as usize;
-            let age_seconds = (now_us - last_ts) / 1_000_000;
+            let age_seconds = now_us.saturating_sub(last_ts) / 1_000_000;
             ThreadSummary {
                 id: thread_id,
                 subject,
@@ -1203,7 +1203,7 @@ fn build_inbox(
             "required".to_string()
         };
 
-        let age_seconds = (now_us - created_ts) / 1_000_000;
+        let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
 
         if bucket == 1 {
             overdue_ids.push(id);
@@ -1368,7 +1368,7 @@ fn build_outbox_entries(
             None
         };
 
-        let age_seconds = (now_us - created_ts) / 1_000_000;
+        let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
         entries.push(InboxEntry {
             id,
             priority: "sent".to_string(),
@@ -1531,7 +1531,7 @@ fn build_thread(
             }
         };
 
-        let age_seconds = (now_us - created_ts) / 1_000_000;
+        let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
 
         messages.push(ThreadMessage {
             position: idx + 1,
@@ -1546,7 +1546,7 @@ fn build_thread(
     }
 
     let last_activity = if last_ts > 0 {
-        format_age((now_us - last_ts) / 1_000_000)
+        format_age(now_us.saturating_sub(last_ts) / 1_000_000)
     } else {
         "unknown".to_string()
     };
@@ -1760,7 +1760,7 @@ fn build_message(
             })
             .unwrap_or_default();
 
-    let age_seconds = (now_us - created_ts) / 1_000_000;
+    let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
     let created_iso = mcp_agent_mail_db::micros_to_iso(created_ts);
 
     Ok(MessageContext {
@@ -1960,7 +1960,7 @@ fn build_search(
         *agent_counts.entry(sender.clone()).or_insert(0) += 1;
         *importance_counts.entry(importance.clone()).or_insert(0) += 1;
 
-        let age_seconds = (now_us - created_ts) / 1_000_000;
+        let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
         results.push(SearchResult {
             id: msg_id,
             relevance: 0.0, // bm25 returns negative scores; normalize later if needed
@@ -2074,8 +2074,8 @@ fn build_reservations(
         let agent_name: String = row.get_named("agent_name").unwrap_or_default();
         let agent_id_row: i64 = row.get_named("agent_id").unwrap_or(0);
 
-        let remaining_seconds = (expires_ts - now_us) / 1_000_000;
-        let created_age = (now_us - created_ts) / 1_000_000;
+        let remaining_seconds = expires_ts.saturating_sub(now_us) / 1_000_000;
+        let created_age = now_us.saturating_sub(created_ts) / 1_000_000;
 
         let entry = ReservationEntry {
             agent: Some(agent_name.clone()),
@@ -2632,7 +2632,7 @@ fn build_agents(
             continue;
         }
 
-        let age_seconds = (now_us - last_active_ts) / 1_000_000;
+        let age_seconds = now_us.saturating_sub(last_active_ts) / 1_000_000;
 
         agents.push(AgentRow {
             name,
@@ -2682,7 +2682,7 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
         let reason: String = row.get_named("reason").unwrap_or_default();
         let updated_ts: i64 = row.get_named("updated_ts").unwrap_or(0);
 
-        let age = (now_us - updated_ts) / 1_000_000;
+        let age = now_us.saturating_sub(updated_ts) / 1_000_000;
 
         contacts.push(ContactRow {
             from,
@@ -2724,7 +2724,7 @@ fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
         let res_count: i64 = row.get_named("res_count").unwrap_or(0);
         let created_at: i64 = row.get_named("created_at").unwrap_or(0);
 
-        let age = (now_us - created_at) / 1_000_000;
+        let age = now_us.saturating_sub(created_at) / 1_000_000;
 
         projects.push(ProjectRow {
             slug,

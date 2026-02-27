@@ -20,7 +20,7 @@ use mcp_agent_mail_db::schema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Args, Debug)]
@@ -379,7 +379,7 @@ pub fn handle_upgrade(args: UpgradeArgs) -> CliResult<()> {
     }
 
     if !import_opts.yes {
-        if !std::io::stdin().is_terminal() {
+        if !crate::output::is_stdin_tty() {
             return Err(CliError::Other(
                 "refusing to run non-interactively without --yes".to_string(),
             ));
@@ -591,7 +591,7 @@ fn run_legacy_import(opts: ImportOptions, fmt: output::CliOutputFormat) -> CliRe
     }
 
     if !opts.yes {
-        if !std::io::stdin().is_terminal() {
+        if !crate::output::is_stdin_tty() {
             return Err(CliError::Other(
                 "refusing to run non-interactively without --yes".to_string(),
             ));

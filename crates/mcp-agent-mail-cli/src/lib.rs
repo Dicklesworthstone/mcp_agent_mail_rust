@@ -2063,8 +2063,8 @@ fn execute(cli: Cli) -> CliResult<()> {
 /// so agents get useful output without launching a TUI that blocks them.
 fn handle_default_launch() -> CliResult<()> {
     // Detect calling context: if stdin/stdout are not a TTY, this is a coding agent
-    use std::io::IsTerminal;
-    let is_interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    
+    let is_interactive = crate::output::is_tty() && crate::output::is_stdin_tty();
 
     if !is_interactive {
         // Non-interactive: emit robot status as JSON so coding agents get useful output
@@ -6945,10 +6945,10 @@ fn clear_and_reset_everything(
     database_files: &[PathBuf],
     storage_root: &Path,
 ) -> CliResult<ClearAndResetOutcome> {
-    use std::io::IsTerminal;
+    
 
     if !force {
-        if !std::io::stdin().is_terminal() {
+        if !crate::output::is_stdin_tty() {
             return Err(CliError::Other(
                 "refusing to prompt on non-interactive stdin; pass --force / -f to apply"
                     .to_string(),
@@ -7015,7 +7015,7 @@ fn clear_and_reset_everything(
                 if archive_mandatory {
                     return Err(CliError::ExitCode(1));
                 }
-                if !std::io::stdin().is_terminal() {
+                if !crate::output::is_stdin_tty() {
                     return Err(CliError::ExitCode(1));
                 }
                 if !confirm("Archive failed. Continue without a backup?", false)? {
@@ -7721,7 +7721,7 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
 
     // Execute the deployment plan
     let exec_config = share::ExecutorConfig {
-        interactive: !args.non_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        interactive: !args.non_interactive && crate::output::is_stdin_tty(),
         skip_confirm: args.yes,
         dry_run: args.dry_run,
         verbose: matches!(fmt, output::CliOutputFormat::Table),
@@ -12941,12 +12941,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
         let _cwd = CwdGuard::chdir(root.path());
+        println!(">>> _cwd acquired");
 
         let storage_root = root.path().join("storage_repo");
         seed_storage_root(&storage_root);
+        println!(">>> seed_storage_root done");
 
         let source_db = root.path().join("mailbox.sqlite3");
         seed_mailbox_db(&source_db);
+        println!(">>> seed_mailbox_db done");
 
         // Save archive for a single project to exercise scoping.
         let archive_path = archive_save_state(
@@ -12958,10 +12961,12 @@ mod tests {
         )
         .expect("archive save");
         assert!(archive_path.exists());
+        println!(">>> archive_save_state done");
 
         // Validate zip layout + metadata content.
         let file = std::fs::File::open(&archive_path).unwrap();
         let mut zip = zip::ZipArchive::new(file).unwrap();
+        println!(">>> zip file opened");
         assert!(zip.by_name(ARCHIVE_METADATA_FILENAME).is_ok());
         assert!(zip.by_name(ARCHIVE_SNAPSHOT_RELATIVE).is_ok());
         assert!(zip.by_name("storage_repo/nested/dir/file.txt").is_ok());
@@ -12973,6 +12978,7 @@ mod tests {
             .read_to_string(&mut meta_contents)
             .unwrap();
         let meta: serde_json::Value = serde_json::from_str(&meta_contents).unwrap();
+        println!(">>> zip meta verified");
         assert_eq!(meta["scrub_preset"].as_str(), Some("archive"));
         assert_eq!(meta["label"].as_str(), Some("nightly"));
         assert_eq!(
@@ -12995,15 +13001,19 @@ mod tests {
             let _capture_lock = stdio_capture_lock()
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
+            println!(">>> _capture_lock acquired");
             let capture = StdioCapture::install().unwrap();
+            println!(">>> StdioCapture::install done");
             handle_archive(ArchiveCommand::List {
                 limit: 0,
                 format: None,
                 json: true,
             })
             .unwrap();
+            println!(">>> handle_archive done");
             let mut sink = Vec::new();
             capture.drain(&mut sink).unwrap();
+            println!(">>> capture.drain done");
             drop(capture);
 
             let output = String::from_utf8_lossy(&sink).trim().to_string();
@@ -21531,7 +21541,7 @@ fn archive_restore_state(
     force: bool,
     dry_run: bool,
 ) -> CliResult<()> {
-    use std::io::IsTerminal;
+    
 
     let archive_path = resolve_archive_path(&archive_file)?;
     let (meta, meta_error) = load_archive_metadata(&archive_path);
@@ -21616,7 +21626,7 @@ fn archive_restore_state(
     }
 
     if !force {
-        if !std::io::stdin().is_terminal() {
+        if !crate::output::is_stdin_tty() {
             return Err(CliError::Other(
                 "refusing to prompt on non-interactive stdin; pass --force / -f to apply"
                     .to_string(),
@@ -24555,7 +24565,7 @@ fn run_share_preview_with_control(
     ready_addr_tx: Option<std::sync::mpsc::Sender<std::net::SocketAddr>>,
     artifacts_dir: Option<PathBuf>,
 ) -> CliResult<()> {
-    use std::io::IsTerminal;
+    
 
     // Prefer shipping the built-in assets in dev/preview mode; ignore errors (matches legacy).
     let _ = share::copy_viewer_assets(&bundle);
@@ -24622,7 +24632,7 @@ fn run_share_preview_with_control(
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-    } else if std::io::stdin().is_terminal() {
+    } else if crate::output::is_stdin_tty() {
         use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
 
         struct RawModeGuard;
