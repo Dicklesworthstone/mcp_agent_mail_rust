@@ -1190,16 +1190,7 @@ impl EventRingBuffer {
             return Vec::new();
         }
         let inner = self.lock_inner();
-        inner
-            .events
-            .iter()
-            .rev()
-            .take(limit)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect()
+        Self::collect_recent_from_back(&inner.events, limit)
     }
 
     #[must_use]
@@ -1208,18 +1199,20 @@ impl EventRingBuffer {
             return Some(Vec::new());
         }
         let inner = self.inner.try_lock().ok()?;
-        Some(
-            inner
-                .events
-                .iter()
-                .rev()
-                .take(limit)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect(),
-        )
+        Some(Self::collect_recent_from_back(&inner.events, limit))
+    }
+
+    /// Return `(timestamp_micros, severity)` tuples for recent events.
+    ///
+    /// This avoids cloning full event payloads when only timing/severity
+    /// signals are needed for heuristics (ambient health, lightweight stats).
+    #[must_use]
+    pub fn recent_signals(&self, limit: usize) -> Vec<(i64, EventSeverity)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let inner = self.lock_inner();
+        Self::collect_recent_signals_from_back(&inner.events, limit)
     }
 
     #[must_use]
@@ -1264,25 +1257,50 @@ impl EventRingBuffer {
     #[must_use]
     pub fn events_since_seq(&self, seq: u64) -> Vec<MailEvent> {
         let inner = self.lock_inner();
-        inner
-            .events
-            .iter()
-            .filter(|event| event.seq() > seq)
-            .cloned()
-            .collect()
+        Self::collect_events_since_seq(&inner.events, seq)
     }
 
     #[must_use]
     pub fn try_events_since_seq(&self, seq: u64) -> Option<Vec<MailEvent>> {
         let inner = self.inner.try_lock().ok()?;
-        Some(
-            inner
-                .events
-                .iter()
-                .filter(|event| event.seq() > seq)
-                .cloned()
-                .collect(),
-        )
+        Some(Self::collect_events_since_seq(&inner.events, seq))
+    }
+
+    #[inline]
+    fn collect_recent_from_back(events: &VecDeque<MailEvent>, limit: usize) -> Vec<MailEvent> {
+        let mut out = Vec::with_capacity(limit.min(events.len()));
+        out.extend(events.iter().rev().take(limit).cloned());
+        out.reverse();
+        out
+    }
+
+    #[inline]
+    fn collect_recent_signals_from_back(
+        events: &VecDeque<MailEvent>,
+        limit: usize,
+    ) -> Vec<(i64, EventSeverity)> {
+        let mut out = Vec::with_capacity(limit.min(events.len()));
+        for event in events.iter().rev().take(limit) {
+            out.push((event.timestamp_micros(), event.severity()));
+        }
+        out.reverse();
+        out
+    }
+
+    #[inline]
+    fn collect_events_since_seq(events: &VecDeque<MailEvent>, seq: u64) -> Vec<MailEvent> {
+        // Events are appended with monotonic sequence numbers and kept in order.
+        // Scan from the newest event backwards so steady-state polling
+        // (`seq` already at tail) becomes O(1) instead of O(capacity).
+        let mut out = Vec::new();
+        for event in events.iter().rev() {
+            if event.seq() <= seq {
+                break;
+            }
+            out.push(event.clone());
+        }
+        out.reverse();
+        out
     }
 
     #[must_use]
@@ -2114,6 +2132,22 @@ mod tests {
         let recent = ring.iter_recent(3);
         let seqs: Vec<u64> = recent.iter().map(MailEvent::seq).collect();
         assert_eq!(seqs, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn recent_signals_preserve_selected_order() {
+        let ring = EventRingBuffer::with_capacity(4);
+        let mut a = sample_http("/ok", 200);
+        a.set_timestamp_if_unset(1_000_000);
+        let _ = ring.push(a);
+        let mut b = sample_http("/err", 500);
+        b.set_timestamp_if_unset(2_000_000);
+        let _ = ring.push(b);
+
+        let signals = ring.recent_signals(2);
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0], (1_000_000, EventSeverity::Debug));
+        assert_eq!(signals[1], (2_000_000, EventSeverity::Error));
     }
 
     #[test]

@@ -1992,8 +1992,8 @@ impl MailAppModel {
         decayed_palette_usage_weight(usage_count, last_used_micros, ranking_now_micros)
     }
 
-    fn ambient_mode_for_frame(&self) -> AmbientMode {
-        if self.state.config_snapshot().tui_effects {
+    const fn ambient_mode_for_frame(&self, effects_enabled: bool) -> AmbientMode {
+        if effects_enabled {
             self.ambient_mode
         } else {
             AmbientMode::Off
@@ -2003,14 +2003,16 @@ impl MailAppModel {
     fn ambient_health_input(&self, now_micros: i64) -> AmbientHealthInput {
         let ring_stats = self.state.event_ring_stats();
         let event_buffer_utilization = f64::from(ring_stats.fill_pct()) / 100.0;
-        let recent_events = self.state.recent_events(AMBIENT_HEALTH_LOOKBACK_EVENTS);
+        let recent_signals = self
+            .state
+            .recent_event_signals(AMBIENT_HEALTH_LOOKBACK_EVENTS);
 
         let mut critical_alerts_active = false;
         let mut warning_events = 0_u32;
         let mut last_event_ts = 0_i64;
-        for event in recent_events {
-            last_event_ts = last_event_ts.max(event.timestamp_micros());
-            match event.severity() {
+        for (timestamp_micros, severity) in recent_signals {
+            last_event_ts = last_event_ts.max(timestamp_micros);
+            match severity {
                 EventSeverity::Error => critical_alerts_active = true,
                 EventSeverity::Warn => warning_events = warning_events.saturating_add(1),
                 _ => {}
@@ -3217,10 +3219,14 @@ impl MailAppModel {
 
         // Check for reservations expiring soon (within 5 minutes).
         let now = now_micros();
+        let mut expired_keys = Vec::new();
         let mut expiry_toasts = Vec::new();
         for (key, (label, expiry)) in &self.reservation_tracker {
-            if *expiry > now
-                && *expiry - now < RESERVATION_EXPIRY_WARN_MICROS
+            if *expiry <= now {
+                expired_keys.push(key.clone());
+                continue;
+            }
+            if *expiry - now < RESERVATION_EXPIRY_WARN_MICROS
                 && !self.warned_reservations.contains(key)
             {
                 let minutes_left = (*expiry - now) / 60_000_000;
@@ -3231,6 +3237,10 @@ impl MailAppModel {
                         .duration(Duration::from_secs(10)),
                 ));
             }
+        }
+        for key in expired_keys {
+            self.reservation_tracker.remove(&key);
+            self.warned_reservations.remove(&key);
         }
         for (key, toast) in expiry_toasts {
             if !self.toast_muted && self.toast_severity.allows(ToastIcon::Warning) {
@@ -3856,6 +3866,7 @@ impl Model for MailAppModel {
         Paragraph::new("")
             .style(Style::default().bg(tp.bg_deep))
             .render(area, frame);
+        let effects_enabled = self.state.config_snapshot().tui_effects;
         // Throttle ambient effects to every Nth frame.  At 10fps with N=2
         // the animation updates at ~5 fps.  On intervening frames,
         // render_cached replays the previous buffer so the diff engine only
@@ -3868,7 +3879,7 @@ impl Model for MailAppModel {
             let ambient_telemetry = self.ambient_renderer.borrow_mut().render(
                 area,
                 frame,
-                self.ambient_mode_for_frame(),
+                self.ambient_mode_for_frame(effects_enabled),
                 self.ambient_health_input(now_micros()),
                 self.state.uptime().as_secs_f64(),
             );
@@ -3880,7 +3891,7 @@ impl Model for MailAppModel {
             self.ambient_renderer.borrow().render_cached(
                 area,
                 frame,
-                self.ambient_mode_for_frame(),
+                self.ambient_mode_for_frame(effects_enabled),
             );
         }
         let chrome = tui_chrome::chrome_layout(area);
@@ -3897,7 +3908,6 @@ impl Model for MailAppModel {
         let mut help_render_us = 0_u64;
 
         // 1. Tab bar (z=1)
-        let effects_enabled = self.state.config_snapshot().tui_effects;
         let tab_started = Instant::now();
         tui_chrome::render_tab_bar(active_screen, effects_enabled, frame, chrome.tab_bar);
         let tab_render_us = tab_started
@@ -5748,10 +5758,91 @@ const MIN_DECORATIVE_CONTRAST_RATIO: f64 = 1.35;
 /// Slightly higher decorative floor on bright surfaces for visibility.
 const MIN_DECORATIVE_CONTRAST_RATIO_LIGHT_SURFACE: f64 = 1.55;
 
+#[derive(Default)]
+struct ContrastGuardCache {
+    readable_fg_by_bg: HashMap<PackedRgba, PackedRgba>,
+    decorative_fg_by_bg: HashMap<PackedRgba, PackedRgba>,
+    min_text_ratio_by_bg: HashMap<PackedRgba, f64>,
+    min_decorative_ratio_by_bg: HashMap<PackedRgba, f64>,
+    ratio_by_colors: HashMap<(PackedRgba, PackedRgba), f64>,
+}
+
+impl ContrastGuardCache {
+    fn with_frame_capacity(width: u16, height: u16) -> Self {
+        let estimated_cells = usize::from(width).saturating_mul(usize::from(height));
+        let color_cap = estimated_cells.min(4096);
+        Self {
+            readable_fg_by_bg: HashMap::with_capacity(color_cap),
+            decorative_fg_by_bg: HashMap::with_capacity(color_cap),
+            min_text_ratio_by_bg: HashMap::with_capacity(color_cap),
+            min_decorative_ratio_by_bg: HashMap::with_capacity(color_cap),
+            ratio_by_colors: HashMap::with_capacity(color_cap.saturating_mul(2)),
+        }
+    }
+
+    fn best_readable_fg(
+        &mut self,
+        bg: PackedRgba,
+        tp: &crate::tui_theme::TuiThemePalette,
+    ) -> PackedRgba {
+        if let Some(color) = self.readable_fg_by_bg.get(&bg).copied() {
+            return color;
+        }
+        let color = best_readable_fg(bg, tp);
+        self.readable_fg_by_bg.insert(bg, color);
+        color
+    }
+
+    fn best_readable_decorative_fg(
+        &mut self,
+        bg: PackedRgba,
+        tp: &crate::tui_theme::TuiThemePalette,
+    ) -> PackedRgba {
+        if let Some(color) = self.decorative_fg_by_bg.get(&bg).copied() {
+            return color;
+        }
+        let color = best_readable_decorative_fg(bg, tp);
+        self.decorative_fg_by_bg.insert(bg, color);
+        color
+    }
+
+    fn minimum_text_ratio(&mut self, bg: PackedRgba) -> f64 {
+        if let Some(ratio) = self.min_text_ratio_by_bg.get(&bg).copied() {
+            return ratio;
+        }
+        let ratio = minimum_text_contrast_for_bg(bg);
+        self.min_text_ratio_by_bg.insert(bg, ratio);
+        ratio
+    }
+
+    fn minimum_decorative_ratio(&mut self, bg: PackedRgba) -> f64 {
+        if let Some(ratio) = self.min_decorative_ratio_by_bg.get(&bg).copied() {
+            return ratio;
+        }
+        let ratio = if perceived_luma(bg) >= 150 {
+            MIN_DECORATIVE_CONTRAST_RATIO_LIGHT_SURFACE
+        } else {
+            MIN_DECORATIVE_CONTRAST_RATIO
+        };
+        self.min_decorative_ratio_by_bg.insert(bg, ratio);
+        ratio
+    }
+
+    fn contrast_ratio(&mut self, fg: PackedRgba, bg: PackedRgba) -> f64 {
+        if let Some(ratio) = self.ratio_by_colors.get(&(fg, bg)).copied() {
+            return ratio;
+        }
+        let ratio = contrast_ratio(fg, bg);
+        self.ratio_by_colors.insert((fg, bg), ratio);
+        ratio
+    }
+}
+
 /// Normalize low-contrast rendered cells to readable theme-safe foreground colors.
 fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiThemePalette) {
     let height = frame.buffer.height();
     let width = frame.buffer.width();
+    let mut cache = ContrastGuardCache::with_frame_capacity(width, height);
     let fallback_surface = contrast_guard_surface(tp);
 
     for y in 0..height {
@@ -5775,7 +5866,7 @@ fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiTheme
             let needs_text_materialization = fg_color.a() == 0;
             let effective_bg = materialize_effective_background(bg_color, fallback_surface);
             let materialized_fg = if needs_text_materialization {
-                best_readable_fg(effective_bg, tp)
+                cache.best_readable_fg(effective_bg, tp)
             } else {
                 fg_color
             };
@@ -5795,16 +5886,23 @@ fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiTheme
             if symbol_opt.is_none() && !is_grapheme {
                 continue;
             }
-            let min_ratio = minimum_text_contrast_for_cell(symbol, effective_bg);
+            let is_decorative = !is_grapheme && is_decorative_glyph(symbol);
+            let min_ratio = if symbol.is_whitespace() {
+                0.0
+            } else if is_decorative {
+                cache.minimum_decorative_ratio(effective_bg)
+            } else {
+                cache.minimum_text_ratio(effective_bg)
+            };
             if min_ratio <= 0.0 {
                 continue;
             }
 
-            if contrast_ratio(materialized_fg, effective_bg) < min_ratio {
-                let replacement = if !is_grapheme && is_decorative_glyph(symbol) {
-                    best_readable_decorative_fg(effective_bg, tp)
+            if cache.contrast_ratio(materialized_fg, effective_bg) < min_ratio {
+                let replacement = if is_decorative {
+                    cache.best_readable_decorative_fg(effective_bg, tp)
                 } else {
-                    best_readable_fg(effective_bg, tp)
+                    cache.best_readable_fg(effective_bg, tp)
                 };
                 if replacement != materialized_fg
                     && let Some(cell) = frame.buffer.get_mut(x, y)
@@ -5842,6 +5940,7 @@ fn minimum_text_contrast_for_bg(bg: PackedRgba) -> f64 {
     }
 }
 
+#[allow(dead_code)]
 fn minimum_text_contrast_for_cell(symbol: char, bg: PackedRgba) -> f64 {
     if symbol.is_whitespace() {
         0.0

@@ -6,7 +6,8 @@
 //! snapshot, refreshes shared stats every cycle, and emits health pulses
 //! on data changes plus periodic heartbeat intervals.
 
-use std::collections::HashMap;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
-#[cfg(test)]
 use mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE;
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
@@ -32,6 +32,8 @@ use crate::tui_events::{
 
 /// Default polling interval (2 seconds).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Prevent accidental zero/near-zero env values from creating a busy-loop.
+const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Maximum agents to fetch per poll cycle.
 const MAX_AGENTS: usize = 50;
@@ -48,7 +50,12 @@ const MAX_RESERVATIONS: usize = 1000;
 const HEALTH_PULSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Minimum interval between poller-triggered sqlite recovery attempts per path.
 const POLLER_RECOVERY_MIN_INTERVAL: Duration = Duration::from_secs(15);
+/// Re-evaluate legacy reservation scan mode periodically (per DB path).
+#[allow(clippy::duration_suboptimal_units)]
+const RESERVATION_SCAN_MODE_CACHE_TTL: Duration = Duration::from_secs(300);
 static POLLER_RECOVERY_GATES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+static RESERVATION_SCAN_MODE_CACHE: OnceLock<Mutex<HashMap<String, ReservationScanCacheEntry>>> =
+    OnceLock::new();
 
 /// Batched aggregate counters used to populate [`DbStatSnapshot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -59,6 +66,54 @@ struct DbSnapshotCounts {
     file_reservations: u64,
     contact_links: u64,
     ack_pending: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReservationSnapshotBundle {
+    active_count: u64,
+    active_counts_by_project: HashMap<i64, u64>,
+    snapshots: Vec<ReservationSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotHeapEntry {
+    sort_key: (i64, i64),
+    snapshot: ReservationSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationScanMode {
+    /// Legacy mode: decode/filter all rows in Rust to preserve TEXT timestamp
+    /// compatibility from very old schemas.
+    FullLegacy,
+    /// Fast path: rely on SQL predicates for active reservations.
+    ActiveFast,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReservationScanCacheEntry {
+    mode: ReservationScanMode,
+    checked_at: Instant,
+}
+
+impl PartialEq for SnapshotHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort_key == other.sort_key
+    }
+}
+
+impl Eq for SnapshotHeapEntry {}
+
+impl PartialOrd for SnapshotHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SnapshotHeapEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.sort_key.cmp(&other.sort_key)
+    }
 }
 
 /// Groups DB queries used by the TUI poller so related reads can be fetched
@@ -95,7 +150,10 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn fetch_snapshot(&self) -> DbStatSnapshot {
-        let counts = self.fetch_counts();
+        let now = now_micros();
+        let reservation_bundle =
+            fetch_reservation_snapshot_bundle(self.conn, now, self.sqlite_path);
+        let counts = self.fetch_counts_with_reservation_count(reservation_bundle.active_count);
         DbStatSnapshot {
             projects: counts.projects,
             agents: counts.agents,
@@ -104,14 +162,24 @@ impl<'a> DbStatQueryBatcher<'a> {
             contact_links: counts.contact_links,
             ack_pending: counts.ack_pending,
             agents_list: fetch_agents_list(self.conn),
-            projects_list: fetch_projects_list(self.conn),
+            projects_list: fetch_projects_list_with_reservation_counts(
+                self.conn,
+                Some(&reservation_bundle.active_counts_by_project),
+            ),
             contacts_list: fetch_contacts_list(self.conn),
-            reservation_snapshots: fetch_reservation_snapshots(self.conn),
-            timestamp_micros: now_micros(),
+            reservation_snapshots: reservation_bundle.snapshots,
+            timestamp_micros: now,
         }
     }
 
+    #[cfg(test)]
     fn fetch_counts(&self) -> DbSnapshotCounts {
+        let now = now_micros();
+        let reservation_count = self.count_active_reservations(now);
+        self.fetch_counts_with_reservation_count(reservation_count)
+    }
+
+    fn fetch_counts_with_reservation_count(&self, reservation_count: u64) -> DbSnapshotCounts {
         let reservation_count_sql = "SELECT \
              (SELECT COUNT(*) FROM projects) AS projects_count, \
              (SELECT COUNT(*) FROM agents) AS agents_count, \
@@ -120,8 +188,6 @@ impl<'a> DbStatQueryBatcher<'a> {
              (SELECT COUNT(*) FROM message_recipients \
                WHERE ack_ts IS NULL \
                  AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)) AS ack_pending_count";
-        let now = now_micros();
-        let reservation_count = self.count_active_reservations(now);
         let batched_rows = match self.conn.query_sync(reservation_count_sql, &[]) {
             Ok(rows) => Some(rows),
             Err(err) => {
@@ -153,11 +219,13 @@ impl<'a> DbStatQueryBatcher<'a> {
             return counts;
         }
 
-        self.fetch_counts_fallback()
+        self.fetch_counts_fallback_with_reservation_count(reservation_count)
     }
 
-    fn fetch_counts_fallback(&self) -> DbSnapshotCounts {
-        let now = now_micros();
+    fn fetch_counts_fallback_with_reservation_count(
+        &self,
+        reservation_count: u64,
+    ) -> DbSnapshotCounts {
         DbSnapshotCounts {
             projects: self
                 .run_count_query("SELECT COUNT(*) AS c FROM projects", &[])
@@ -168,7 +236,7 @@ impl<'a> DbStatQueryBatcher<'a> {
             messages: self
                 .run_count_query("SELECT COUNT(*) AS c FROM messages", &[])
                 .unwrap_or(0),
-            file_reservations: self.count_active_reservations(now),
+            file_reservations: reservation_count,
             contact_links: self
                 .run_count_query("SELECT COUNT(*) AS c FROM agent_links", &[])
                 .unwrap_or(0),
@@ -197,6 +265,7 @@ impl<'a> DbStatQueryBatcher<'a> {
         }
     }
 
+    #[cfg(test)]
     fn count_active_reservations(&self, now: i64) -> u64 {
         // Keep count semantics in lock-step with `is_active_reservation_row`.
         // Legacy databases may store active sentinels in `released_ts` as text
@@ -205,6 +274,7 @@ impl<'a> DbStatQueryBatcher<'a> {
         self.count_active_reservations_fallback_scan(now)
     }
 
+    #[cfg(test)]
     fn count_active_reservations_fallback_scan(&self, now: i64) -> u64 {
         let rows = match self.conn.query_sync(
             "SELECT expires_ts AS raw_expires_ts, released_ts AS raw_released_ts FROM file_reservations",
@@ -278,11 +348,7 @@ impl DbPoller {
         let join = thread::Builder::new()
             .name("tui-db-poller".into())
             .spawn(move || {
-                let rt = asupersync::runtime::RuntimeBuilder::new()
-                    .worker_threads(1)
-                    .build()
-                    .expect("build db poller runtime");
-                rt.block_on(async move { self.run() });
+                self.run();
             })
             .expect("spawn tui-db-poller thread");
         DbPollerHandle {
@@ -505,7 +571,7 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
     conn.query_sync(
         &format!(
             "SELECT name, program, last_active_ts FROM agents \
-             ORDER BY last_active_ts DESC LIMIT {MAX_AGENTS}"
+             ORDER BY last_active_ts DESC, id DESC LIMIT {MAX_AGENTS}"
         ),
         &[],
     )
@@ -525,21 +591,50 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
 }
 
 /// Fetch the project list with per-project agent/message/reservation counts.
+#[cfg(test)]
 fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
-    let now = now_micros();
+    fetch_projects_list_with_reservation_counts(conn, None)
+}
+
+fn fetch_projects_list_with_reservation_counts(
+    conn: &DbConn,
+    reservation_counts_override: Option<&HashMap<i64, u64>>,
+) -> Vec<ProjectSummary> {
     let sql = format!(
-        "SELECT p.id, p.slug, p.human_key, p.created_at, \
-         COALESCE(ac.cnt, 0) AS agent_count, \
-         COALESCE(mc.cnt, 0) AS message_count \
-         FROM projects p \
-         LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM agents GROUP BY project_id) ac \
-           ON ac.project_id = p.id \
-         LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM messages GROUP BY project_id) mc \
-           ON mc.project_id = p.id \
-         ORDER BY p.created_at DESC \
-         LIMIT {MAX_PROJECTS}"
+        "WITH recent_projects AS ( \
+           SELECT id, slug, human_key, created_at \
+           FROM projects \
+           ORDER BY created_at DESC, id DESC \
+           LIMIT {MAX_PROJECTS} \
+         ), \
+         agent_counts AS ( \
+           SELECT project_id, COUNT(*) AS cnt \
+           FROM agents \
+           WHERE project_id IN (SELECT id FROM recent_projects) \
+           GROUP BY project_id \
+         ), \
+         message_counts AS ( \
+           SELECT project_id, COUNT(*) AS cnt \
+           FROM messages \
+           WHERE project_id IN (SELECT id FROM recent_projects) \
+           GROUP BY project_id \
+         ) \
+         SELECT p.id, p.slug, p.human_key, p.created_at, \
+                COALESCE(ac.cnt, 0) AS agent_count, \
+                COALESCE(mc.cnt, 0) AS message_count \
+         FROM recent_projects p \
+         LEFT JOIN agent_counts ac ON ac.project_id = p.id \
+         LEFT JOIN message_counts mc ON mc.project_id = p.id \
+         ORDER BY p.created_at DESC, p.id DESC"
     );
-    let reservation_counts = fetch_active_reservation_counts_by_project(conn, now);
+    let fallback_reservation_counts = reservation_counts_override
+        .is_none()
+        .then(|| fetch_active_reservation_counts_by_project(conn, now_micros()));
+    let reservation_counts = reservation_counts_override.unwrap_or_else(|| {
+        fallback_reservation_counts
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("fallback reservation counts should exist"))
+    });
     conn.query_sync(&sql, &[])
         .ok()
         .map(|rows| {
@@ -609,7 +704,7 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
              JOIN agents a2 ON a2.id = al.b_agent_id \
              JOIN projects p1 ON p1.id = al.a_project_id \
              JOIN projects p2 ON p2.id = al.b_project_id \
-             ORDER BY al.updated_ts DESC \
+             ORDER BY al.updated_ts DESC, al.id DESC \
              LIMIT {MAX_CONTACTS}"
         ),
         &[],
@@ -804,35 +899,150 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Fetch active file reservations with project and agent names.
-///
-/// This is reused by the reservations screen as a direct fallback when the
-/// background poller snapshot is unavailable or stale.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
-    let now = now_micros();
-    let sql = "SELECT \
-       fr.id, \
-       COALESCE(p.slug, '[unknown-project]') AS project_slug, \
-       COALESCE(a.name, '[unknown-agent]') AS agent_name, \
-       fr.path_pattern, \
-       fr.\"exclusive\", \
-       fr.created_ts AS raw_created_ts, \
-       fr.expires_ts AS raw_expires_ts, \
-       fr.released_ts AS raw_released_ts \
-     FROM file_reservations fr \
-     LEFT JOIN projects p ON p.id = fr.project_id \
-     LEFT JOIN agents a ON a.id = fr.agent_id \
-     ORDER BY fr.id ASC";
+const RESERVATION_LEGACY_SCAN_SQL: &str = "SELECT \
+   fr.id, \
+   fr.project_id AS raw_project_id, \
+   COALESCE(p.slug, '[unknown-project]') AS project_slug, \
+   COALESCE(a.name, '[unknown-agent]') AS agent_name, \
+   fr.path_pattern, \
+   fr.\"exclusive\", \
+   fr.created_ts AS raw_created_ts, \
+   fr.expires_ts AS raw_expires_ts, \
+   fr.released_ts AS raw_released_ts \
+ FROM file_reservations fr \
+ LEFT JOIN projects p ON p.id = fr.project_id \
+ LEFT JOIN agents a ON a.id = fr.agent_id \
+ ORDER BY fr.id ASC";
 
-    let rows = match conn.query_sync(sql, &[]) {
+static RESERVATION_ACTIVE_FAST_SQL: OnceLock<String> = OnceLock::new();
+
+fn reservation_active_fast_sql() -> &'static str {
+    RESERVATION_ACTIVE_FAST_SQL
+        .get_or_init(|| {
+            format!(
+                "SELECT \
+                   fr.id, \
+                   fr.project_id AS raw_project_id, \
+                   COALESCE(p.slug, '[unknown-project]') AS project_slug, \
+                   COALESCE(a.name, '[unknown-agent]') AS agent_name, \
+                   fr.path_pattern, \
+                   fr.\"exclusive\", \
+                   fr.created_ts AS raw_created_ts, \
+                   fr.expires_ts AS raw_expires_ts, \
+                   fr.released_ts AS raw_released_ts \
+                 FROM file_reservations fr \
+                 LEFT JOIN projects p ON p.id = fr.project_id \
+                 LEFT JOIN agents a ON a.id = fr.agent_id \
+                 WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
+                 ORDER BY fr.id ASC"
+            )
+        })
+        .as_str()
+}
+
+fn reservation_scan_mode(conn: &DbConn, sqlite_path: Option<&str>) -> ReservationScanMode {
+    let now = Instant::now();
+    if let Some(path) = sqlite_path {
+        let cache = RESERVATION_SCAN_MODE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = guard.get(path)
+                && now.duration_since(entry.checked_at) < RESERVATION_SCAN_MODE_CACHE_TTL
+            {
+                return entry.mode;
+            }
+        }
+        let mode = detect_reservation_scan_mode(conn);
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                path.to_string(),
+                ReservationScanCacheEntry {
+                    mode,
+                    checked_at: now,
+                },
+            );
+        return mode;
+    }
+
+    detect_reservation_scan_mode(conn)
+}
+
+fn detect_reservation_scan_mode(conn: &DbConn) -> ReservationScanMode {
+    // Conservative policy: if detection is uncertain, keep legacy full-scan
+    // semantics so we never drop active reservations from the UI.
+    let Some(declared_text) = file_reservations_expires_declared_text(conn) else {
+        return ReservationScanMode::FullLegacy;
+    };
+    if declared_text {
+        return ReservationScanMode::FullLegacy;
+    }
+
+    let Some(has_text_values) = file_reservations_contains_text_expires_values(conn) else {
+        return ReservationScanMode::FullLegacy;
+    };
+    if has_text_values {
+        ReservationScanMode::FullLegacy
+    } else {
+        ReservationScanMode::ActiveFast
+    }
+}
+
+fn file_reservations_expires_declared_text(conn: &DbConn) -> Option<bool> {
+    let rows = conn
+        .query_sync("PRAGMA table_info(file_reservations)", &[])
+        .ok()?;
+    for row in rows {
+        let Ok(name) = row.get_named::<String>("name") else {
+            continue;
+        };
+        if name != "expires_ts" {
+            continue;
+        }
+        let declared = row.get_named::<String>("type").ok().unwrap_or_default();
+        let upper = declared.to_ascii_uppercase();
+        return Some(upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB"));
+    }
+    None
+}
+
+fn file_reservations_contains_text_expires_values(conn: &DbConn) -> Option<bool> {
+    conn.query_sync(
+        "SELECT 1 AS has_text \
+         FROM file_reservations \
+         WHERE typeof(expires_ts) = 'text' \
+         LIMIT 1",
+        &[],
+    )
+    .ok()
+    .map(|rows| !rows.is_empty())
+}
+
+#[allow(clippy::too_many_lines)]
+fn fetch_reservation_snapshot_bundle(
+    conn: &DbConn,
+    now: i64,
+    sqlite_path: Option<&str>,
+) -> ReservationSnapshotBundle {
+    let scan_mode = reservation_scan_mode(conn, sqlite_path);
+    let rows = match scan_mode {
+        ReservationScanMode::ActiveFast => {
+            conn.query_sync(reservation_active_fast_sql(), &[Value::BigInt(now)])
+        }
+        ReservationScanMode::FullLegacy => conn.query_sync(RESERVATION_LEGACY_SCAN_SQL, &[]),
+    };
+    let rows = match rows {
         Ok(rows) => rows,
         Err(err) => {
             tracing::debug!(
+                mode = ?scan_mode,
                 error = ?err,
                 "tui_poller.fetch_reservation_snapshots query failed"
             );
-            return Vec::new();
+            return ReservationSnapshotBundle::default();
         }
     };
     #[cfg(test)]
@@ -840,46 +1050,94 @@ pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnaps
         debug_row_shape("fetch_reservation_snapshots", first);
     }
 
-    let mut snapshots: Vec<_> = rows
-        .into_iter()
-        .filter_map(|row| {
-            if !is_active_reservation_row(&row, now, "raw_expires_ts", "raw_released_ts") {
-                return None;
-            }
-            Some(ReservationSnapshot {
-                id: row.get_named::<i64>("id").ok()?,
-                project_slug: row
-                    .get_named::<String>("project_slug")
-                    .ok()
-                    .unwrap_or_else(|| "[unknown-project]".to_string()),
-                agent_name: row
-                    .get_named::<String>("agent_name")
-                    .ok()
-                    .unwrap_or_else(|| "[unknown-agent]".to_string()),
-                path_pattern: row.get_named::<String>("path_pattern").ok()?,
-                exclusive: row
-                    .get_named::<i64>("exclusive")
-                    .ok()
-                    .is_none_or(|value| value != 0),
-                granted_ts: parse_raw_ts(&row, "raw_created_ts"),
-                expires_ts: parse_raw_ts(&row, "raw_expires_ts"),
-                released_ts: None,
-            })
-        })
-        .collect();
-    snapshots.sort_by_key(|snapshot| (snapshot.expires_ts, snapshot.id));
-    if snapshots.len() > MAX_RESERVATIONS {
-        snapshots.truncate(MAX_RESERVATIONS);
+    let mut active_count = 0_u64;
+    let mut active_counts_by_project: HashMap<i64, u64> = HashMap::new();
+    let mut snapshots = BinaryHeap::new();
+
+    for row in rows {
+        if !is_active_reservation_row(&row, now, "raw_expires_ts", "raw_released_ts") {
+            continue;
+        }
+
+        active_count = active_count.saturating_add(1);
+        if let Some(project_id) = parse_raw_i64(&row, "raw_project_id") {
+            let count = active_counts_by_project.entry(project_id).or_insert(0_u64);
+            *count = (*count).saturating_add(1_u64);
+        }
+
+        if MAX_RESERVATIONS == 0 {
+            continue;
+        }
+
+        let Some(id) = parse_raw_i64(&row, "id") else {
+            continue;
+        };
+        let Some(path_pattern) = row.get_named::<String>("path_pattern").ok() else {
+            continue;
+        };
+        let snapshot = ReservationSnapshot {
+            id,
+            project_slug: row
+                .get_named::<String>("project_slug")
+                .ok()
+                .unwrap_or_else(|| "[unknown-project]".to_string()),
+            agent_name: row
+                .get_named::<String>("agent_name")
+                .ok()
+                .unwrap_or_else(|| "[unknown-agent]".to_string()),
+            path_pattern,
+            exclusive: row
+                .get_named::<i64>("exclusive")
+                .ok()
+                .is_none_or(|value| value != 0),
+            granted_ts: parse_raw_ts(&row, "raw_created_ts"),
+            expires_ts: parse_raw_ts(&row, "raw_expires_ts"),
+            released_ts: None,
+        };
+        let entry = SnapshotHeapEntry {
+            sort_key: (snapshot.expires_ts, snapshot.id),
+            snapshot,
+        };
+        if snapshots.len() < MAX_RESERVATIONS {
+            snapshots.push(entry);
+            continue;
+        }
+        if snapshots
+            .peek()
+            .is_some_and(|worst| entry.sort_key < worst.sort_key)
+        {
+            let _ = snapshots.pop();
+            snapshots.push(entry);
+        }
     }
-    snapshots
+
+    let mut snapshots: Vec<_> = snapshots.into_iter().map(|entry| entry.snapshot).collect();
+    snapshots.sort_by_key(|snapshot| (snapshot.expires_ts, snapshot.id));
+    ReservationSnapshotBundle {
+        active_count,
+        active_counts_by_project,
+        snapshots,
+    }
+}
+
+/// Fetch active file reservations with project and agent names.
+///
+/// This is reused by the reservations screen as a direct fallback when the
+/// background poller snapshot is unavailable or stale.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
+    fetch_reservation_snapshot_bundle(conn, now_micros(), None).snapshots
 }
 
 /// Read `CONSOLE_POLL_INTERVAL_MS` from environment, default 2000ms.
+/// Values below [`MIN_POLL_INTERVAL`] are clamped to avoid tight spin loops.
 fn poll_interval_from_env() -> Duration {
     std::env::var("CONSOLE_POLL_INTERVAL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map_or(DEFAULT_POLL_INTERVAL, Duration::from_millis)
+        .map_or(DEFAULT_POLL_INTERVAL, |ms| {
+            Duration::from_millis(ms).max(MIN_POLL_INTERVAL)
+        })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2054,6 +2312,31 @@ mod tests {
     }
 
     #[test]
+    fn fetch_agents_list_uses_id_tiebreak_for_stable_ordering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_agents_order_tie.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts) VALUES
+             (41, 'Alpha', 'codex', 500),
+             (42, 'Beta', 'claude', 500)",
+            &[],
+        )
+        .expect("insert");
+
+        let agents = fetch_agents_list(&conn);
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name, "Beta");
+        assert_eq!(agents[1].name, "Alpha");
+    }
+
+    #[test]
     fn fetch_projects_list_includes_aggregate_counts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_projects_aggregates.db");
@@ -2107,6 +2390,47 @@ mod tests {
         assert_eq!(projects[0].agent_count, 2);
         assert_eq!(projects[0].message_count, 3);
         assert_eq!(projects[0].reservation_count, 1);
+    }
+
+    #[test]
+    fn fetch_projects_list_uses_id_tiebreak_for_stable_ordering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_projects_order_tie.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, released_ts INTEGER, expires_ts INTEGER)",
+            &[],
+        )
+        .expect("create reservations");
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+             (11, 'alpha', '/p/a', 1000),
+             (12, 'beta', '/p/b', 1000)",
+            &[],
+        )
+        .expect("insert projects");
+
+        let projects = fetch_projects_list(&conn);
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].slug, "beta");
+        assert_eq!(projects[1].slug, "alpha");
     }
 
     #[test]

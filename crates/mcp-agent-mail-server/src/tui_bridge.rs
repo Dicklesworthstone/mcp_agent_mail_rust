@@ -282,6 +282,11 @@ impl TuiSharedState {
     }
 
     #[must_use]
+    pub fn recent_event_signals(&self, limit: usize) -> Vec<(i64, EventSeverity)> {
+        self.events.recent_signals(limit)
+    }
+
+    #[must_use]
     pub fn events_since(&self, seq: u64) -> Vec<MailEvent> {
         self.events.events_since_seq(seq)
     }
