@@ -122,6 +122,9 @@ vendor/
 # Beads backup/conflict files
 .beads/*.bak_*
 
+# One-off test scripts at repo root
+/test_*.rs
+
 # Agent session ephemeral files
 SESSION_TODO.md
 SESSION_REPORT.md
