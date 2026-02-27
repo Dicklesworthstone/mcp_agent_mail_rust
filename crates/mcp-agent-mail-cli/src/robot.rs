@@ -10,7 +10,6 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use sqlmodel_core::Value;
 
-
 use crate::CliError;
 
 // ── Output format ────────────────────────────────────────────────────────────

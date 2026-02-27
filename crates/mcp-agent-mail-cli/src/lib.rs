@@ -92,6 +92,9 @@ pub enum Commands {
         /// Disable bearer token authentication for this run (for local development).
         #[arg(long)]
         no_auth: bool,
+        /// Disable the interactive TUI and run headless.
+        #[arg(long)]
+        no_tui: bool,
     },
     #[command(name = "serve-stdio")]
     ServeStdio,
@@ -220,6 +223,9 @@ pub enum Commands {
         /// Only check the database format without modifying anything.
         #[arg(long, default_value_t = false)]
         check: bool,
+        /// Restore the database from the latest available backup and exit.
+        #[arg(long, default_value_t = false)]
+        rollback: bool,
         /// Force migration even if the format is unclear or mixed.
         #[arg(long, default_value_t = false)]
         force: bool,
@@ -1961,7 +1967,8 @@ fn execute(cli: Cli) -> CliResult<()> {
             port,
             path,
             no_auth,
-        } => handle_serve_http(host, port, path, no_auth),
+            no_tui,
+        } => handle_serve_http(host, port, path, no_auth, no_tui),
         Commands::ServeStdio => handle_serve_stdio(),
         Commands::CheckInbox {
             agent,
@@ -2006,9 +2013,10 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::E2e { action } => handle_e2e(action),
         Commands::Migrate {
             check,
+            rollback,
             force,
             backup_dir,
-        } => handle_migrate_cmd(check, force, backup_dir),
+        } => handle_migrate_cmd(check, rollback, force, backup_dir),
         Commands::ListProjects {
             include_agents,
             format,
@@ -2063,7 +2071,7 @@ fn execute(cli: Cli) -> CliResult<()> {
 /// so agents get useful output without launching a TUI that blocks them.
 fn handle_default_launch() -> CliResult<()> {
     // Detect calling context: if stdin/stdout are not a TTY, this is a coding agent
-    
+
     let is_interactive = crate::output::is_tty() && crate::output::is_stdin_tty();
 
     if !is_interactive {
@@ -2076,39 +2084,40 @@ fn handle_default_launch() -> CliResult<()> {
         });
     }
 
-    // Interactive: full server launch experience
-    let config = Config::from_env();
-    let host = &config.http_host;
-    let port = config.http_port;
+    apply_release_logging_defaults();
 
-    // Step 1: Run setup (auto-detect agents, configure connections)
-    // Non-fatal: if setup fails we still start the server
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let setup_result = handle_setup(SetupCommand::Run {
-        agent: None,
-        dry_run: false,
-        yes: true,
-        token: None,
-        port,
-        host: host.clone(),
-        path: "/mcp/".to_string(),
-        project_dir: Some(cwd),
-        format: None,
-        json: false,
-        no_user_config: false,
-        no_hooks: false,
+    // Interactive: full server launch experience (setup self-heal + port check + serve)
+    handle_serve_http(None, None, None, false, false)
+}
+
+fn apply_release_logging_defaults() {
+    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+
+    TRACING_INIT.call_once(|| {
+        let filter = if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        } else {
+            tracing_subscriber::EnvFilter::new("info")
+        };
+
+        // Ignore double-init errors when tests or host processes already set a subscriber.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(crate::output::is_tty())
+            .compact()
+            .try_init();
     });
-    if let Err(e) = &setup_result {
-        output::warn(&format!(
-            "Agent setup encountered an issue (non-fatal): {e}"
-        ));
-    }
+}
 
-    // Step 2: Clear the port only if an existing Agent Mail server is listening
-    auto_clear_port(host, port)?;
-
-    // Step 3: Start HTTP server with TUI (default settings)
-    handle_serve_http(None, None, None, false)
+fn env_var_is_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
@@ -2661,11 +2670,44 @@ fn handle_serve_http(
     port: Option<u16>,
     path: Option<String>,
     no_auth: bool,
+    no_tui: bool,
 ) -> CliResult<()> {
-    let config = build_http_config(host, port, path, no_auth);
+    apply_release_logging_defaults();
+
+    let mut config = build_http_config(host, port, path, no_auth);
+    if no_tui {
+        config.tui_enabled = false;
+    }
+    if let Err(e) = run_setup_self_heal_for_server(&config) {
+        output::warn(&format!(
+            "Agent setup self-heal encountered an issue (non-fatal): {e}"
+        ));
+    }
     auto_clear_port(&config.http_host, config.http_port)?;
     mcp_agent_mail_server::run_http_with_tui(&config)?;
     Ok(())
+}
+
+fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
+    handle_setup(build_setup_run_command_for_http_server(config))
+}
+
+fn build_setup_run_command_for_http_server(config: &Config) -> SetupCommand {
+    let project_dir = std::env::current_dir().unwrap_or_default();
+    SetupCommand::Run {
+        agent: None,
+        dry_run: false,
+        yes: true,
+        token: None,
+        port: config.http_port,
+        host: config.http_host.clone(),
+        path: config.http_path.clone(),
+        project_dir: Some(project_dir),
+        format: None,
+        json: false,
+        no_user_config: false,
+        no_hooks: false,
+    }
 }
 
 fn handle_serve_stdio() -> CliResult<()> {
@@ -3622,17 +3664,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let agent_name_val = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
 
             // Auto-skip hooks if agent_name is empty (hooks generate malformed commands without it)
-            let no_hooks = if agent_name_val.is_empty() && !no_hooks {
-                if matches!(fmt, output::CliOutputFormat::Table) {
-                    output::warn(
-                        "AGENT_MAIL_AGENT not set — skipping Claude Code hook installation. \
-                         Set the env var or use --no-hooks to suppress this warning.",
-                    );
-                }
-                true
-            } else {
-                no_hooks
-            };
+            let no_hooks = no_hooks || agent_name_val.is_empty();
 
             // Filter agents: if explicit --agent provided, use that; otherwise use detected
             let target_agents = match agents {
@@ -6072,7 +6104,12 @@ fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
     }
 }
 
-fn handle_migrate_cmd(check: bool, force: bool, backup_dir: Option<PathBuf>) -> CliResult<()> {
+fn handle_migrate_cmd(
+    check: bool,
+    rollback: bool,
+    force: bool,
+    backup_dir: Option<PathBuf>,
+) -> CliResult<()> {
     use mcp_agent_mail_db::migrate;
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -6092,11 +6129,21 @@ fn handle_migrate_cmd(check: bool, force: bool, backup_dir: Option<PathBuf>) -> 
         return Ok(());
     }
 
+    if check && rollback {
+        return Err(CliError::InvalidArgument(
+            "--check and --rollback are mutually exclusive".to_string(),
+        ));
+    }
+    if rollback {
+        return handle_migrate_rollback(db_path, backup_dir.as_deref(), force);
+    }
+
     // Step 1: Run schema migration first (ensures tables exist)
     handle_migrate_with_database_url(&cfg.database_url)?;
 
     // Step 2: Detect timestamp format
     let conn = open_db_sync_with_database_url(&cfg.database_url)?;
+    let before_counts = collect_table_row_counts(&conn);
     let format = migrate::detect_timestamp_format(&conn)
         .map_err(|e| CliError::Other(format!("format detection failed: {e}")))?;
 
@@ -6140,6 +6187,7 @@ fn handle_migrate_cmd(check: bool, force: bool, backup_dir: Option<PathBuf>) -> 
     // Step 6: Verify
     let after = migrate::detect_timestamp_format(&conn)
         .map_err(|e| CliError::Other(format!("post-migration verification failed: {e}")))?;
+    let verification = verify_migration_integrity(&conn, &before_counts);
 
     let elapsed = start.elapsed();
 
@@ -6154,12 +6202,20 @@ fn handle_migrate_cmd(check: bool, force: bool, backup_dir: Option<PathBuf>) -> 
     }
     ftui_runtime::ftui_println!("  Backup:    {}", backup_path.display());
     ftui_runtime::ftui_println!("  Format:    {after}");
+    if verification.row_counts_match {
+        ftui_runtime::ftui_println!("  Row count: verified");
+    } else {
+        ftui_runtime::ftui_eprintln!("  Row count: mismatch detected");
+    }
 
     // Report per-column errors if any
     for col_result in &summary.columns {
         for err in &col_result.errors {
             ftui_runtime::ftui_eprintln!("  Warning: {err}");
         }
+    }
+    for warning in &verification.warnings {
+        ftui_runtime::ftui_eprintln!("  Warning: {warning}");
     }
 
     if !summary.success {
@@ -6174,6 +6230,238 @@ fn handle_migrate_cmd(check: bool, force: bool, backup_dir: Option<PathBuf>) -> 
             "Warning: database still contains TEXT timestamps after migration."
         );
         ftui_runtime::ftui_eprintln!("  Post-migration format: {after}");
+    }
+    if !verification.row_counts_match {
+        ftui_runtime::ftui_eprintln!(
+            "Warning: one or more table row counts changed during migration."
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct MigrationVerification {
+    row_counts_match: bool,
+    warnings: Vec<String>,
+}
+
+fn collect_table_row_counts(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> std::collections::BTreeMap<String, i64> {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for &(table, _column, _nullable) in mcp_agent_mail_db::migrate::TIMESTAMP_COLUMNS {
+        if !seen.insert(table) {
+            continue;
+        }
+        let sql = format!("SELECT COUNT(*) AS c FROM {table}");
+        if let Ok(rows) = conn.query_sync(&sql, &[])
+            && let Some(row) = rows.first()
+            && let Ok(count) = row.get_named::<i64>("c")
+        {
+            counts.insert(table.to_string(), count);
+        }
+    }
+    counts
+}
+
+fn verify_migration_integrity(
+    conn: &mcp_agent_mail_db::DbConn,
+    before_counts: &std::collections::BTreeMap<String, i64>,
+) -> MigrationVerification {
+    const MIN_REASONABLE_TS: i64 = 1_577_836_800_000_000; // 2020-01-01T00:00:00Z
+    const MAX_REASONABLE_TS: i64 = 1_893_456_000_000_000; // 2030-01-01T00:00:00Z
+
+    let mut verification = MigrationVerification {
+        row_counts_match: true,
+        warnings: Vec::new(),
+    };
+
+    // Row-count invariants: conversion should never add/drop rows.
+    for (table, before) in before_counts {
+        let sql = format!("SELECT COUNT(*) AS c FROM {table}");
+        match conn.query_sync(&sql, &[]) {
+            Ok(rows) => {
+                let after = rows
+                    .first()
+                    .and_then(|row| row.get_named::<i64>("c").ok())
+                    .unwrap_or(*before);
+                if after != *before {
+                    verification.row_counts_match = false;
+                    verification.warnings.push(format!(
+                        "row-count mismatch in {table}: before={before}, after={after}"
+                    ));
+                }
+            }
+            Err(err) => {
+                verification.row_counts_match = false;
+                verification
+                    .warnings
+                    .push(format!("row-count verification failed for {table}: {err}"));
+            }
+        }
+    }
+
+    // Spot-check timestamps after migration for plausibility.
+    for &(table, column, _nullable) in mcp_agent_mail_db::migrate::TIMESTAMP_COLUMNS {
+        let sql = format!(
+            "SELECT {column} AS v FROM {table} WHERE {column} IS NOT NULL ORDER BY RANDOM() LIMIT 5"
+        );
+        let Ok(rows) = conn.query_sync(&sql, &[]) else {
+            continue;
+        };
+        for row in rows {
+            if let Ok(value) = row.get_named::<i64>("v") {
+                if !(MIN_REASONABLE_TS..=MAX_REASONABLE_TS).contains(&value) {
+                    verification.warnings.push(format!(
+                        "{table}.{column} has out-of-range timestamp sample: {value}"
+                    ));
+                }
+                continue;
+            }
+            if row.get_named::<String>("v").is_ok() {
+                verification.warnings.push(format!(
+                    "{table}.{column} still contains TEXT after migration"
+                ));
+            }
+        }
+    }
+
+    verification
+}
+
+fn handle_migrate_rollback(
+    db_path: &Path,
+    backup_dir: Option<&Path>,
+    force: bool,
+) -> CliResult<()> {
+    let backups = list_db_backups(db_path, backup_dir)?;
+    if backups.is_empty() {
+        return Err(CliError::Other(format!(
+            "no backups found for {}",
+            db_path.display()
+        )));
+    }
+
+    ftui_runtime::ftui_println!("Available backups:");
+    for backup in &backups {
+        let modified = std::fs::metadata(backup)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|ts| chrono::DateTime::<chrono::Utc>::from(ts).to_rfc3339())
+            .unwrap_or_else(|| "unknown-time".to_string());
+        ftui_runtime::ftui_println!("  - {} ({modified})", backup.display());
+    }
+
+    let selected = backups[0].clone();
+    if !force {
+        if !crate::output::is_stdin_tty() {
+            return Err(CliError::Other(
+                "--rollback requires --force in non-interactive mode".to_string(),
+            ));
+        }
+        print!(
+            "Restore latest backup {} to {}? [y/N]: ",
+            selected.display(),
+            db_path.display()
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| CliError::Other(format!("failed to read confirmation input: {e}")))?;
+        let answer = input.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            ftui_runtime::ftui_println!("Rollback cancelled.");
+            return Ok(());
+        }
+    }
+
+    restore_db_from_backup(db_path, &selected)?;
+    ftui_runtime::ftui_println!("Rollback complete.");
+    ftui_runtime::ftui_println!("  Restored: {}", selected.display());
+    ftui_runtime::ftui_println!("  Target:   {}", db_path.display());
+    Ok(())
+}
+
+fn list_db_backups(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Vec<PathBuf>> {
+    let backup_parent =
+        backup_dir.unwrap_or_else(|| db_path.parent().unwrap_or_else(|| Path::new(".")));
+    let db_name = db_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let prefix = format!("{db_name}.bak.");
+
+    let mut backups: Vec<PathBuf> = Vec::new();
+    let entries = std::fs::read_dir(backup_parent).map_err(|e| {
+        CliError::Other(format!(
+            "cannot list backup directory {}: {e}",
+            backup_parent.display()
+        ))
+    })?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && !name.ends_with("-wal") && !name.ends_with("-shm") {
+            backups.push(path);
+        }
+    }
+
+    backups.sort_by(|a, b| b.cmp(a)); // newest first because timestamp is embedded in filename
+    Ok(backups)
+}
+
+fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
+    let rollback_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let rollback_backup = db_path.with_file_name(format!(
+        "{}.pre_rollback.{rollback_ts}",
+        db_path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::copy(db_path, &rollback_backup).map_err(|e| {
+        CliError::Other(format!(
+            "failed to create pre-rollback backup {}: {e}",
+            rollback_backup.display()
+        ))
+    })?;
+
+    let db_wal = PathBuf::from(format!("{}-wal", db_path.display()));
+    let db_shm = PathBuf::from(format!("{}-shm", db_path.display()));
+    if db_wal.exists() {
+        let _ = std::fs::remove_file(&db_wal);
+    }
+    if db_shm.exists() {
+        let _ = std::fs::remove_file(&db_shm);
+    }
+
+    std::fs::copy(backup_path, db_path).map_err(|e| {
+        CliError::Other(format!(
+            "failed to restore {} -> {}: {e}",
+            backup_path.display(),
+            db_path.display()
+        ))
+    })?;
+
+    let backup_name = backup_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let wal_backup = backup_path.with_file_name(format!("{backup_name}-wal"));
+    if wal_backup.exists() {
+        let _ = std::fs::copy(&wal_backup, &db_wal);
+    }
+    let shm_backup = backup_path.with_file_name(format!("{backup_name}-shm"));
+    if shm_backup.exists() {
+        let _ = std::fs::copy(&shm_backup, &db_shm);
     }
 
     Ok(())
@@ -6945,8 +7233,6 @@ fn clear_and_reset_everything(
     database_files: &[PathBuf],
     storage_root: &Path,
 ) -> CliResult<ClearAndResetOutcome> {
-    
-
     if !force {
         if !crate::output::is_stdin_tty() {
             return Err(CliError::Other(
@@ -8335,6 +8621,72 @@ fn beads_issue_awareness_counts() -> Result<(usize, usize, usize), String> {
     beads_issue_awareness_counts_from(None)
 }
 
+const STORAGE_ROOT_LOW_DISK_WARN_BYTES: u64 = 100 * 1024 * 1024;
+
+fn format_bytes_human(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+
+    if bytes >= TB {
+        format!("{:.1} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn storage_root_permissions_hint(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| format!("{:04o}", meta.permissions().mode() & 0o7777))
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        "unknown".to_string()
+    }
+}
+
+fn storage_root_write_probe(storage_root: &Path) -> Result<(), std::io::Error> {
+    let probe_name = format!(
+        ".am-doctor-write-probe-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_micros()
+    );
+    let probe_path = storage_root.join(probe_name);
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe_path)?;
+    drop(file);
+    let _ = std::fs::remove_file(&probe_path);
+    Ok(())
+}
+
+fn discover_archive_git_repos(storage_root: &Path) -> Vec<PathBuf> {
+    let projects_root = storage_root.join("projects");
+    let mut repos = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&projects_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join(".git").exists() {
+                repos.push(path);
+            }
+        }
+    }
+    repos.sort();
+    repos
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -8483,6 +8835,195 @@ fn handle_doctor_check_with(
         "detail": format!("{}", storage_root.display()),
     }));
 
+    // Check 2b: Storage root write permissions
+    if storage_ok {
+        match storage_root_write_probe(storage_root) {
+            Ok(()) => checks.push(serde_json::json!({
+                "check": "storage_root_writable",
+                "status": "ok",
+                "detail": "Storage root is writable",
+            })),
+            Err(err) => checks.push(serde_json::json!({
+                "check": "storage_root_writable",
+                "status": "fail",
+                "detail": format!(
+                    "Storage root not writable ({err}); permissions: {}",
+                    storage_root_permissions_hint(storage_root)
+                ),
+            })),
+        }
+    } else {
+        checks.push(serde_json::json!({
+            "check": "storage_root_writable",
+            "status": "warn",
+            "detail": "Skipped: storage root missing",
+        }));
+    }
+
+    // Check 2c: Storage root disk space
+    if storage_ok {
+        match mcp_agent_mail_core::disk::disk_free_bytes(storage_root) {
+            Ok(bytes) => {
+                let status = if bytes < STORAGE_ROOT_LOW_DISK_WARN_BYTES {
+                    "warn"
+                } else {
+                    "ok"
+                };
+                let detail = if bytes < STORAGE_ROOT_LOW_DISK_WARN_BYTES {
+                    format!(
+                        "Low disk space: {} free (recommend >= 100 MB)",
+                        format_bytes_human(bytes)
+                    )
+                } else {
+                    format!("{} free", format_bytes_human(bytes))
+                };
+                checks.push(serde_json::json!({
+                    "check": "storage_root_disk_space",
+                    "status": status,
+                    "detail": detail,
+                }));
+            }
+            Err(err) => checks.push(serde_json::json!({
+                "check": "storage_root_disk_space",
+                "status": "warn",
+                "detail": format!("Unable to measure free space: {err}"),
+            })),
+        }
+    } else {
+        checks.push(serde_json::json!({
+            "check": "storage_root_disk_space",
+            "status": "warn",
+            "detail": "Skipped: storage root missing",
+        }));
+    }
+
+    // Check 2d: Archive git repos are valid
+    let archive_repos = if storage_ok {
+        discover_archive_git_repos(storage_root)
+    } else {
+        Vec::new()
+    };
+    if !storage_ok {
+        checks.push(serde_json::json!({
+            "check": "storage_root_git_repo",
+            "status": "warn",
+            "detail": "Skipped: storage root missing",
+        }));
+    } else if archive_repos.is_empty() {
+        checks.push(serde_json::json!({
+            "check": "storage_root_git_repo",
+            "status": "warn",
+            "detail": format!(
+                "No archive git repos found under {}",
+                storage_root.join("projects").display()
+            ),
+        }));
+    } else {
+        let mut invalid_repos = Vec::new();
+        for repo in &archive_repos {
+            if mcp_agent_mail_guard::resolve_hooks_dir(repo).is_err() {
+                invalid_repos.push(repo.display().to_string());
+            }
+        }
+        if invalid_repos.is_empty() {
+            checks.push(serde_json::json!({
+                "check": "storage_root_git_repo",
+                "status": "ok",
+                "detail": format!("{} archive git repo(s) valid", archive_repos.len()),
+            }));
+        } else {
+            checks.push(serde_json::json!({
+                "check": "storage_root_git_repo",
+                "status": "fail",
+                "detail": format!(
+                    "Invalid archive git repos: {}",
+                    invalid_repos.join(", ")
+                ),
+            }));
+        }
+    }
+
+    // Check 2e: No stale index.lock files in archive repos
+    if !storage_ok {
+        checks.push(serde_json::json!({
+            "check": "storage_root_git_index_lock",
+            "status": "warn",
+            "detail": "Skipped: storage root missing",
+        }));
+    } else if archive_repos.is_empty() {
+        checks.push(serde_json::json!({
+            "check": "storage_root_git_index_lock",
+            "status": "warn",
+            "detail": "No archive repos to inspect for index.lock",
+        }));
+    } else {
+        let mut lock_paths: Vec<PathBuf> = archive_repos
+            .iter()
+            .map(|repo| repo.join(".git").join("index.lock"))
+            .filter(|path| path.exists())
+            .collect();
+        lock_paths.sort();
+        if lock_paths.is_empty() {
+            checks.push(serde_json::json!({
+                "check": "storage_root_git_index_lock",
+                "status": "ok",
+                "detail": "No archive index.lock files detected",
+            }));
+        } else {
+            let listed = lock_paths
+                .iter()
+                .take(5)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let suffix = if lock_paths.len() > 5 {
+                format!(" (+{} more)", lock_paths.len() - 5)
+            } else {
+                String::new()
+            };
+            checks.push(serde_json::json!({
+                "check": "storage_root_git_index_lock",
+                "status": "warn",
+                "detail": format!(
+                    "Detected {} index.lock file(s): {listed}{suffix}",
+                    lock_paths.len()
+                ),
+            }));
+        }
+    }
+
+    // Check 2f: Guard hooks integrity in current repository
+    match std::env::current_dir() {
+        Ok(cwd) => match mcp_agent_mail_guard::guard_status(&cwd) {
+            Ok(status) => {
+                let hooks_ok = status.pre_commit_present && status.pre_push_present;
+                let detail = if hooks_ok {
+                    format!("pre-commit and pre-push installed in {}", status.hooks_dir)
+                } else {
+                    format!(
+                        "Missing hooks (pre-commit={}, pre-push={}) in {}",
+                        status.pre_commit_present, status.pre_push_present, status.hooks_dir
+                    )
+                };
+                checks.push(serde_json::json!({
+                    "check": "guard_hooks",
+                    "status": if hooks_ok { "ok" } else { "warn" },
+                    "detail": detail,
+                }));
+            }
+            Err(err) => checks.push(serde_json::json!({
+                "check": "guard_hooks",
+                "status": "warn",
+                "detail": format!("Guard status unavailable: {err}"),
+            })),
+        },
+        Err(err) => checks.push(serde_json::json!({
+            "check": "guard_hooks",
+            "status": "warn",
+            "detail": format!("Current directory unavailable: {err}"),
+        })),
+    }
+
     // Check 3: Installed coding-agent connectors
     let detect_opts = AgentDetectOptions {
         only_connectors: None,
@@ -8602,12 +9143,181 @@ fn handle_doctor_check_with(
         }));
     }
 
-    // Check 4b: Database timestamp format
+    // Check 4b: PATH order — verify ~/.local/bin is in PATH and positioned correctly
+    {
+        let install_dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".local/bin");
+        let install_dir_str = install_dir.to_string_lossy().to_string();
+
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let path_dirs: Vec<&str> = path_var.split(':').collect();
+
+        if let Some(pos) = path_dirs.iter().position(|d| {
+            let p = Path::new(d);
+            p == install_dir.as_path()
+                || p.canonicalize()
+                    .ok()
+                    .map(|c| {
+                        c == install_dir
+                            .canonicalize()
+                            .unwrap_or_else(|_| install_dir.clone())
+                    })
+                    .unwrap_or(false)
+        }) {
+            // Check if any earlier PATH entry also contains an `am` binary
+            let mut shadow_detail = String::new();
+            for earlier_dir in &path_dirs[..pos] {
+                let candidate = Path::new(earlier_dir).join("am");
+                if candidate.exists() && Path::new(earlier_dir) != install_dir.as_path() {
+                    shadow_detail = format!(
+                        " (shadowed by {} at PATH position {})",
+                        candidate.display(),
+                        path_dirs
+                            .iter()
+                            .position(|d| *d == *earlier_dir)
+                            .unwrap_or(0)
+                            + 1
+                    );
+                    break;
+                }
+            }
+            if shadow_detail.is_empty() {
+                checks.push(serde_json::json!({
+                    "check": "path_order",
+                    "status": "ok",
+                    "detail": format!(
+                        "{install_dir_str} in PATH at position {} of {}",
+                        pos + 1,
+                        path_dirs.len()
+                    ),
+                }));
+            } else {
+                checks.push(serde_json::json!({
+                    "check": "path_order",
+                    "status": "warn",
+                    "detail": format!(
+                        "{install_dir_str} in PATH at position {} of {}{shadow_detail}. \
+                         Fix: move {install_dir_str} earlier in PATH",
+                        pos + 1,
+                        path_dirs.len()
+                    ),
+                }));
+            }
+        } else {
+            checks.push(serde_json::json!({
+                "check": "path_order",
+                "status": "warn",
+                "detail": format!(
+                    "{install_dir_str} is NOT in PATH. \
+                     Fix: add to shell config: export PATH=\"{install_dir_str}:$PATH\""
+                ),
+            }));
+        }
+    }
+
+    // Check 4c: MCP config health — verify config files exist and reference Rust binary
+    {
+        use mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default;
+
+        let rust_binary = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".local/bin/mcp-agent-mail");
+
+        let locations = detect_mcp_config_locations_default();
+        let existing: Vec<_> = locations.iter().filter(|l| l.exists).collect();
+
+        if existing.is_empty() {
+            checks.push(serde_json::json!({
+                "check": "mcp_config",
+                "status": "warn",
+                "detail": "No MCP config files found. Run `am setup` to configure agent tools",
+            }));
+        } else {
+            let mut pointing_to_rust = 0u32;
+            let mut pointing_to_python = 0u32;
+            let mut missing_entry = 0u32;
+            let mut parse_errors = 0u32;
+            let mut detail_parts: Vec<String> = Vec::new();
+
+            for loc in &existing {
+                match std::fs::read_to_string(&loc.config_path) {
+                    Ok(content) => {
+                        let has_rust = content.contains("mcp-agent-mail")
+                            && (content.contains(".local/bin/mcp-agent-mail")
+                                || content.contains(&rust_binary.to_string_lossy().to_string()));
+                        let has_python = content.contains("mcp_agent_mail")
+                            && (content.contains("python")
+                                || content.contains("run_server")
+                                || content.contains("uvx")
+                                || content.contains("uv run"));
+
+                        if has_rust {
+                            pointing_to_rust += 1;
+                        } else if has_python {
+                            pointing_to_python += 1;
+                            detail_parts.push(format!(
+                                "{} ({}) → Python",
+                                loc.tool.slug(),
+                                loc.config_path.display()
+                            ));
+                        } else {
+                            missing_entry += 1;
+                        }
+                    }
+                    Err(_) => {
+                        parse_errors += 1;
+                    }
+                }
+            }
+
+            let mcp_status = if pointing_to_python > 0 {
+                "warn"
+            } else if pointing_to_rust > 0 {
+                "ok"
+            } else {
+                "warn"
+            };
+
+            let summary = format!(
+                "{} config(s) found: {} Rust, {} Python, {} no entry, {} unreadable",
+                existing.len(),
+                pointing_to_rust,
+                pointing_to_python,
+                missing_entry,
+                parse_errors
+            );
+
+            let detail = if pointing_to_python > 0 {
+                format!(
+                    "{}. Fix: run `am setup` to update: {}",
+                    summary,
+                    detail_parts.join(", ")
+                )
+            } else {
+                summary
+            };
+
+            checks.push(serde_json::json!({
+                "check": "mcp_config",
+                "status": mcp_status,
+                "detail": detail,
+            }));
+        }
+    }
+
+    // Check 4d: Database format and health (br-28mgh.7.4)
     {
         use mcp_agent_mail_db::migrate;
-        let ts_check = open_db_sync_with_database_url(database_url)
+        let conn_result = open_db_sync_with_database_url(database_url);
+
+        // 4d-i: Timestamp format
+        let ts_check = conn_result
+            .as_ref()
             .ok()
-            .and_then(|conn| migrate::detect_timestamp_format(&conn).ok());
+            .and_then(|conn| migrate::detect_timestamp_format(conn).ok());
         match ts_check {
             Some(fmt) if fmt.needs_migration() => {
                 checks.push(serde_json::json!({
@@ -8630,6 +9340,100 @@ fn handle_doctor_check_with(
                     "detail": "Could not detect timestamp format",
                 }));
             }
+        }
+
+        // 4d-ii: WAL mode
+        if let Ok(ref conn) = conn_result {
+            let wal_ok = conn
+                .query_sync("PRAGMA journal_mode", &[])
+                .ok()
+                .and_then(|rows| {
+                    rows.first()
+                        .and_then(|r| r.get_named::<String>("journal_mode").ok())
+                })
+                .map(|m| m.eq_ignore_ascii_case("wal"))
+                .unwrap_or(false);
+            checks.push(serde_json::json!({
+                "check": "wal_mode",
+                "status": if wal_ok { "ok" } else { "warn" },
+                "detail": if wal_ok {
+                    "WAL mode enabled"
+                } else {
+                    "WAL mode not enabled. Fix: run `am migrate` or restart the server"
+                },
+            }));
+        }
+
+        // 4d-iii: Schema version (user_version PRAGMA)
+        if let Ok(ref conn) = conn_result {
+            let version = conn
+                .query_sync("PRAGMA user_version", &[])
+                .ok()
+                .and_then(|rows| {
+                    rows.first()
+                        .and_then(|r| r.get_named::<i64>("user_version").ok())
+                })
+                .unwrap_or(0);
+            checks.push(serde_json::json!({
+                "check": "schema_version",
+                "status": if version > 0 { "ok" } else { "warn" },
+                "detail": format!("user_version = {version}"),
+            }));
+        }
+
+        // 4d-iv: FTS5 virtual tables
+        if let Ok(ref conn) = conn_result {
+            let fts_ok = conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts%'",
+                    &[],
+                )
+                .ok()
+                .map(|rows| !rows.is_empty())
+                .unwrap_or(false);
+            let fts_query_ok = if fts_ok {
+                conn.query_sync(
+                    "SELECT COUNT(*) AS cnt FROM messages_fts WHERE messages_fts MATCH 'test' LIMIT 1",
+                    &[],
+                )
+                .is_ok()
+            } else {
+                false
+            };
+            let (fts_status, fts_detail) = if fts_ok && fts_query_ok {
+                (
+                    "ok",
+                    "FTS5 virtual tables present and queryable".to_string(),
+                )
+            } else if fts_ok {
+                ("warn", "FTS5 tables exist but query failed".to_string())
+            } else {
+                ("warn", "No FTS5 virtual tables found".to_string())
+            };
+            checks.push(serde_json::json!({
+                "check": "fts5",
+                "status": fts_status,
+                "detail": fts_detail,
+            }));
+        }
+
+        // 4d-v: Row counts (sanity check)
+        if verbose && let Ok(ref conn) = conn_result {
+            let tables = ["projects", "agents", "messages", "file_reservations"];
+            let mut counts: Vec<String> = Vec::new();
+            for table in &tables {
+                let count: i64 = conn
+                    .query_sync(&format!("SELECT COUNT(*) AS cnt FROM {table}"), &[])
+                    .ok()
+                    .and_then(|rows| rows.first().and_then(|r| r.get_named("cnt").ok()))
+                    .unwrap_or(0);
+                counts.push(format!("{table}={count}"));
+            }
+            checks.push(serde_json::json!({
+                "check": "row_counts",
+                "status": "ok",
+                "detail": counts.join(", "),
+            }));
         }
     }
 
@@ -10291,8 +11095,6 @@ mod tests {
         assert!(!value_looks_like_template("BlueLake"));
     }
 
-
-
     #[test]
     fn check_inbox_server_url_honors_http_path() {
         assert_eq!(
@@ -10664,6 +11466,55 @@ mod tests {
     }
 
     #[test]
+    fn setup_self_heal_command_uses_runtime_http_values() {
+        let config = Config {
+            http_host: "0.0.0.0".to_string(),
+            http_port: 9001,
+            http_path: "/api/v2/".to_string(),
+            ..Config::default()
+        };
+
+        match build_setup_run_command_for_http_server(&config) {
+            SetupCommand::Run {
+                host,
+                port,
+                path,
+                project_dir,
+                yes,
+                dry_run,
+                no_user_config,
+                no_hooks,
+                ..
+            } => {
+                assert_eq!(host, "0.0.0.0");
+                assert_eq!(port, 9001);
+                assert_eq!(path, "/api/v2/");
+                assert!(yes);
+                assert!(!dry_run);
+                assert!(!no_user_config);
+                assert!(!no_hooks);
+                assert!(project_dir.is_some());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_self_heal_command_uses_normalized_http_path() {
+        let config = build_http_config(
+            Some("127.0.0.1".to_string()),
+            Some(8765),
+            Some("mcp".to_string()),
+            false,
+        );
+
+        match build_setup_run_command_for_http_server(&config) {
+            SetupCommand::Run { path, .. } => assert_eq!(path, "/mcp/"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_parses_serve_http_flags() {
         let cli = Cli::try_parse_from([
             "am",
@@ -10682,11 +11533,13 @@ mod tests {
                 port,
                 path,
                 no_auth,
+                no_tui,
             } => {
                 assert_eq!(host.as_deref(), Some("0.0.0.0"));
                 assert_eq!(port, Some(9999));
                 assert_eq!(path.as_deref(), Some("/api/x/"));
                 assert!(!no_auth);
+                assert!(!no_tui);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -10697,8 +11550,26 @@ mod tests {
         let cli = Cli::try_parse_from(["am", "serve-http", "--no-auth"])
             .expect("failed to parse serve-http --no-auth");
         match cli.command.expect("expected command") {
-            Commands::ServeHttp { no_auth, .. } => {
+            Commands::ServeHttp {
+                no_auth, no_tui, ..
+            } => {
                 assert!(no_auth, "--no-auth flag should be true");
+                assert!(!no_tui, "--no-tui should default to false");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_serve_http_no_tui() {
+        let cli = Cli::try_parse_from(["am", "serve-http", "--no-tui"])
+            .expect("failed to parse serve-http --no-tui");
+        match cli.command.expect("expected command") {
+            Commands::ServeHttp {
+                no_tui, no_auth, ..
+            } => {
+                assert!(no_tui, "--no-tui flag should be true");
+                assert!(!no_auth, "--no-auth should default to false");
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -12572,10 +13443,12 @@ mod tests {
         match m.command {
             Some(Commands::Migrate {
                 check,
+                rollback,
                 force,
                 backup_dir,
             }) => {
                 assert!(check);
+                assert!(!rollback);
                 assert!(!force);
                 assert!(backup_dir.is_none());
             }
@@ -12590,15 +13463,84 @@ mod tests {
         match m.command {
             Some(Commands::Migrate {
                 check,
+                rollback,
                 force,
                 backup_dir,
             }) => {
                 assert!(!check);
+                assert!(!rollback);
                 assert!(force);
                 assert_eq!(backup_dir, Some(PathBuf::from("/tmp/bak")));
             }
             other => panic!("expected Migrate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_migrate_rollback() {
+        let m = Cli::try_parse_from(["am", "migrate", "--rollback", "--force"]).unwrap();
+        match m.command {
+            Some(Commands::Migrate {
+                check,
+                rollback,
+                force,
+                backup_dir,
+            }) => {
+                assert!(!check);
+                assert!(rollback);
+                assert!(force);
+                assert!(backup_dir.is_none());
+            }
+            other => panic!("expected Migrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_db_backups_returns_latest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"db").expect("write db");
+
+        let older = dir.path().join("storage.sqlite3.bak.20260101_000000");
+        let newer = dir.path().join("storage.sqlite3.bak.20260102_000000");
+        std::fs::write(&older, b"old").expect("write old backup");
+        std::fs::write(&newer, b"new").expect("write new backup");
+
+        let backups = list_db_backups(&db_path, Some(dir.path())).expect("list backups");
+        assert_eq!(backups.len(), 2);
+        assert_eq!(backups[0], newer);
+        assert_eq!(backups[1], older);
+    }
+
+    #[test]
+    fn restore_db_from_backup_replaces_contents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let backup_path = dir.path().join("storage.sqlite3.bak.20260102_000000");
+
+        std::fs::write(&db_path, b"live-db").expect("write live db");
+        std::fs::write(&backup_path, b"backup-db").expect("write backup db");
+
+        restore_db_from_backup(&db_path, &backup_path).expect("restore");
+        let restored = std::fs::read(&db_path).expect("read restored db");
+        assert_eq!(restored, b"backup-db");
+
+        let backup_prefix = "storage.sqlite3.pre_rollback.";
+        let rollback_artifacts: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(backup_prefix))
+            })
+            .collect();
+        assert_eq!(
+            rollback_artifacts.len(),
+            1,
+            "expected one pre-rollback backup artifact"
+        );
     }
 
     #[test]
@@ -19443,6 +20385,76 @@ mod tests {
     }
 
     #[test]
+    fn doctor_check_includes_storage_root_health_probes() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let parsed = run_doctor_check_json(&db_url, dir.path());
+        let checks = parsed["checks"].as_array().expect("checks array");
+
+        let expected = [
+            "storage_root",
+            "storage_root_writable",
+            "storage_root_disk_space",
+            "storage_root_git_repo",
+            "storage_root_git_index_lock",
+            "guard_hooks",
+        ];
+        for check in expected {
+            assert!(
+                checks.iter().any(|c| c["check"].as_str() == Some(check)),
+                "missing check '{check}' in doctor output"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_check_storage_root_writable_fails_for_read_only_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let storage_dir = tempfile::tempdir().unwrap();
+        let original_mode = std::fs::metadata(storage_dir.path())
+            .expect("metadata")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(storage_dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("set read-only dir");
+
+        let parsed = run_doctor_check_json(&db_url, storage_dir.path());
+        let checks = parsed["checks"].as_array().expect("checks array");
+        let writable = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("storage_root_writable"))
+            .expect("storage_root_writable check");
+        assert_eq!(writable["status"], "fail");
+        let detail = writable["detail"].as_str().unwrap_or("");
+        assert!(
+            detail.contains("not writable") || detail.contains("permissions"),
+            "unexpected writable failure detail: {detail}"
+        );
+
+        std::fs::set_permissions(
+            storage_dir.path(),
+            std::fs::Permissions::from_mode(original_mode),
+        )
+        .expect("restore permissions");
+    }
+
+    #[test]
     fn open_db_sync_with_database_url_recovers_malformed_relative_with_absolute_fallback() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("storage.sqlite3");
@@ -21541,8 +22553,6 @@ fn archive_restore_state(
     force: bool,
     dry_run: bool,
 ) -> CliResult<()> {
-    
-
     let archive_path = resolve_archive_path(&archive_file)?;
     let (meta, meta_error) = load_archive_metadata(&archive_path);
     if let Some(err) = meta_error {
@@ -24565,8 +25575,6 @@ fn run_share_preview_with_control(
     ready_addr_tx: Option<std::sync::mpsc::Sender<std::net::SocketAddr>>,
     artifacts_dir: Option<PathBuf>,
 ) -> CliResult<()> {
-    
-
     // Prefer shipping the built-in assets in dev/preview mode; ignore errors (matches legacy).
     let _ = share::copy_viewer_assets(&bundle);
 
