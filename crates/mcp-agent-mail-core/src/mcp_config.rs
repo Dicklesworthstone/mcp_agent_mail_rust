@@ -767,28 +767,23 @@ pub fn insert_server_entry_text(
 
     // Check if the entry already exists under any server container key.
     for key in SERVER_CONTAINER_KEYS {
-        if let Some(servers) = root_obj.get(*key) {
-            if let Some(servers_obj) = servers.as_object() {
-                if servers_obj.contains_key(TARGET_SERVER_NAME) {
-                    return Ok(McpConfigTextUpdate {
-                        updated_text: text.to_string(),
-                        changed: false,
-                        target_found: true,
-                        used_json5_fallback,
-                    });
-                }
-            }
+        if let Some(servers) = root_obj.get(*key)
+            && let Some(servers_obj) = servers.as_object()
+            && servers_obj.contains_key(TARGET_SERVER_NAME)
+        {
+            return Ok(McpConfigTextUpdate {
+                updated_text: text.to_string(),
+                changed: false,
+                target_found: true,
+                used_json5_fallback,
+            });
         }
     }
 
     // Find an existing container to insert into, or create `mcpServers`.
     let container_key = SERVER_CONTAINER_KEYS
         .iter()
-        .find(|key| {
-            root_obj
-                .get(**key)
-                .is_some_and(|value| value.is_object())
-        })
+        .find(|key| root_obj.get(**key).is_some_and(Value::is_object))
         .copied()
         .unwrap_or("mcpServers");
 
@@ -1453,11 +1448,12 @@ mod tests {
 
         let doc: Value =
             serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
-        assert!(doc
-            .get("mcpServers")
-            .and_then(Value::as_object)
-            .unwrap()
-            .contains_key("mcp-agent-mail"));
+        assert!(
+            doc.get("mcpServers")
+                .and_then(Value::as_object)
+                .unwrap()
+                .contains_key("mcp-agent-mail")
+        );
     }
 
     #[test]
@@ -1485,10 +1481,7 @@ mod tests {
 
         let doc: Value =
             serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
-        let servers = doc
-            .get("mcpServers")
-            .and_then(Value::as_object)
-            .unwrap();
+        let servers = doc.get("mcpServers").and_then(Value::as_object).unwrap();
         assert!(servers.contains_key("mcp-agent-mail"));
         assert!(servers.contains_key("other"));
     }
@@ -1527,6 +1520,426 @@ mod tests {
         assert_eq!(
             preferred_config_path(McpConfigTool::Gemini, home),
             PathBuf::from("/home/user/.gemini/settings.json")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests for MCP config update pipeline (br-28mgh.8.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_config_text_malformed_json_returns_parse_error() {
+        let rust_bin = Path::new("/usr/local/bin/mcp-agent-mail");
+        let malformed = r#"{ "mcpServers": { NOT VALID JSON "#;
+        let result = update_mcp_config_text(malformed, rust_bin);
+        assert!(result.is_err(), "malformed JSON should produce an error");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, McpConfigUpdateError::ParseFailed { .. }),
+            "expected ParseFailed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_config_text_completely_invalid_returns_parse_error() {
+        let rust_bin = Path::new("/usr/local/bin/mcp-agent-mail");
+        let invalid = "this is not json at all";
+        let result = update_mcp_config_text(invalid, rust_bin);
+        assert!(result.is_err(), "completely invalid input should fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, McpConfigUpdateError::ParseFailed { .. }),
+            "expected ParseFailed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_config_text_top_level_array_returns_error() {
+        let rust_bin = Path::new("/usr/local/bin/mcp-agent-mail");
+        let array_input = r#"[{"mcpServers": {}}]"#;
+        let result = update_mcp_config_text(array_input, rust_bin);
+        assert!(result.is_err(), "top-level array should fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, McpConfigUpdateError::TopLevelNotObject),
+            "expected TopLevelNotObject, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_config_text_empty_mcp_servers_object() {
+        let rust_bin = Path::new("/usr/local/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {}
+}
+"#;
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(
+            !update.changed,
+            "empty mcpServers means no target to update"
+        );
+        assert!(
+            !update.target_found,
+            "no mcp-agent-mail entry in empty servers"
+        );
+        assert_eq!(
+            update.updated_text, original,
+            "text should round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn update_config_text_uvx_command_updated_to_rust() {
+        let rust_bin = Path::new("/home/user/.local/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "command": "uvx",
+      "args": ["mcp_agent_mail", "serve-http", "--port", "8765"],
+      "env": {
+        "HTTP_BEARER_TOKEN": "uvx-token"
+      }
+    }
+  }
+}
+"#;
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(update.changed, "uvx command should be replaced");
+        assert!(update.target_found, "target found");
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        let target = mcp_entry(&doc);
+        assert_eq!(
+            target.get("command").and_then(Value::as_str),
+            Some("/home/user/.local/bin/mcp-agent-mail"),
+            "command must be updated to rust binary"
+        );
+        assert_eq!(
+            target.get("args"),
+            Some(&json!(["serve", "--port", "8765"])),
+            "uvx module name removed, serve-http -> serve"
+        );
+        assert_eq!(
+            target
+                .get("env")
+                .and_then(|e| e.get("HTTP_BEARER_TOKEN"))
+                .and_then(Value::as_str),
+            Some("uvx-token"),
+            "bearer token must be preserved"
+        );
+    }
+
+    #[test]
+    fn update_config_text_python3_command_updated_to_rust() {
+        let rust_bin = Path::new("/home/user/.local/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "command": "python3",
+      "args": ["-m", "mcp_agent_mail"]
+    }
+  }
+}
+"#;
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(update.changed, "python3 command should be replaced");
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        let target = mcp_entry(&doc);
+        assert_eq!(
+            target.get("command").and_then(Value::as_str),
+            Some("/home/user/.local/bin/mcp-agent-mail")
+        );
+        assert_eq!(
+            target.get("args"),
+            Some(&json!([])),
+            "-m mcp_agent_mail stripped, no remaining args"
+        );
+    }
+
+    #[test]
+    fn update_config_text_preserves_multiple_custom_env_vars() {
+        let rust_bin = Path::new("/opt/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "command": "python",
+      "args": ["-m", "mcp_agent_mail"],
+      "env": {
+        "HTTP_BEARER_TOKEN": "secret123",
+        "STORAGE_ROOT": "/data/archive",
+        "TUI_ENABLED": "false",
+        "DATABASE_URL": "sqlite:///data/mail.db",
+        "CUSTOM_VAR": "custom_value"
+      }
+    }
+  }
+}
+"#;
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(update.changed);
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        let env = mcp_entry(&doc)
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("env object");
+        assert_eq!(env.len(), 5, "all 5 env vars must be preserved");
+        assert_eq!(
+            env.get("HTTP_BEARER_TOKEN").and_then(Value::as_str),
+            Some("secret123")
+        );
+        assert_eq!(
+            env.get("STORAGE_ROOT").and_then(Value::as_str),
+            Some("/data/archive")
+        );
+        assert_eq!(
+            env.get("TUI_ENABLED").and_then(Value::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            env.get("DATABASE_URL").and_then(Value::as_str),
+            Some("sqlite:///data/mail.db")
+        );
+        assert_eq!(
+            env.get("CUSTOM_VAR").and_then(Value::as_str),
+            Some("custom_value")
+        );
+    }
+
+    #[test]
+    fn update_config_file_malformed_json_leaves_file_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("mcp.json");
+        let rust_bin = Path::new("/home/test/.local/bin/mcp-agent-mail");
+        let malformed = r"{ NOT VALID JSON }";
+        std::fs::write(&config_path, malformed).expect("write config");
+
+        let result = update_mcp_config_file(&config_path, rust_bin);
+        assert!(result.is_err(), "malformed JSON should produce error");
+
+        let post_content = std::fs::read_to_string(&config_path).expect("read file");
+        assert_eq!(
+            post_content, malformed,
+            "file must not be modified on parse error"
+        );
+    }
+
+    #[test]
+    fn update_config_text_uses_servers_container_key() {
+        let rust_bin = Path::new("/usr/local/bin/mcp-agent-mail");
+        let original = r#"{
+  "servers": {
+    "mcp-agent-mail": {
+      "command": "python",
+      "args": ["-m", "mcp_agent_mail", "serve-http", "--host", "0.0.0.0"]
+    },
+    "another-server": {
+      "command": "node",
+      "args": ["index.js"]
+    }
+  }
+}
+"#;
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(update.changed, "entry in 'servers' should be updated");
+        assert!(update.target_found);
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        let servers = doc
+            .get("servers")
+            .and_then(Value::as_object)
+            .expect("servers key preserved");
+        let target = servers.get("mcp-agent-mail").expect("target present");
+        assert_eq!(
+            target.get("command").and_then(Value::as_str),
+            Some("/usr/local/bin/mcp-agent-mail")
+        );
+        assert_eq!(
+            target.get("args"),
+            Some(&json!(["serve", "--host", "0.0.0.0"]))
+        );
+        assert!(
+            servers.contains_key("another-server"),
+            "sibling server must be preserved"
+        );
+    }
+
+    #[test]
+    fn update_config_text_idempotent_when_already_rust() {
+        let rust_bin = Path::new("/home/user/.local/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "command": "/home/user/.local/bin/mcp-agent-mail",
+      "args": ["serve", "--port", "8765"],
+      "env": {
+        "HTTP_BEARER_TOKEN": "tok123"
+      }
+    },
+    "other": {
+      "command": "node",
+      "args": ["server.js"]
+    }
+  }
+}
+"#;
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(
+            !update.changed,
+            "already-correct config should be idempotent no-op"
+        );
+        assert!(update.target_found);
+        assert_eq!(update.updated_text, original, "text must be identical");
+    }
+
+    #[test]
+    fn update_config_file_backup_has_timestamp_suffix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("claude_desktop_config.json");
+        let rust_bin = Path::new("/opt/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "command": "python",
+      "args": ["-m", "mcp_agent_mail"]
+    }
+  }
+}
+"#;
+        std::fs::write(&config_path, original).expect("write config");
+
+        let update = update_mcp_config_file(&config_path, rust_bin).expect("file update succeeds");
+        assert!(update.changed);
+        let backup = update.backup_path.expect("backup created");
+        let backup_name = backup
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("backup name");
+        assert!(
+            backup_name.starts_with("claude_desktop_config.json."),
+            "backup name should start with original filename: {backup_name}"
+        );
+        assert!(
+            std::path::Path::new(backup_name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("bak")),
+            "backup name should end with .bak: {backup_name}"
+        );
+        // Check timestamp pattern: YYYYMMDD_HHMMSS
+        let middle =
+            &backup_name["claude_desktop_config.json.".len()..backup_name.len() - ".bak".len()];
+        assert_eq!(
+            middle.len(),
+            15,
+            "timestamp should be 15 chars (YYYYMMDD_HHMMSS): {middle}"
+        );
+        assert!(
+            middle.chars().nth(8) == Some('_'),
+            "separator at position 8: {middle}"
+        );
+    }
+
+    #[test]
+    fn update_config_text_serve_stdio_arg_stripped() {
+        let rust_bin = Path::new("/usr/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "command": "python",
+      "args": ["-m", "mcp_agent_mail", "serve-stdio"]
+    }
+  }
+}
+"#;
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(update.changed);
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        let target = mcp_entry(&doc);
+        assert_eq!(
+            target.get("args"),
+            Some(&json!([])),
+            "serve-stdio stripped since Rust defaults to stdio"
+        );
+    }
+
+    #[test]
+    fn translate_python_args_handles_cli_module_path() {
+        let args: Vec<String> = vec![
+            "-m".into(),
+            "mcp_agent_mail.cli".into(),
+            "serve-http".into(),
+            "--port".into(),
+            "9000".into(),
+        ];
+        let result = translate_python_args_to_rust(&args);
+        assert_eq!(
+            result,
+            vec!["serve", "--port", "9000"],
+            "module path mcp_agent_mail.cli should be stripped"
+        );
+    }
+
+    #[test]
+    fn translate_python_args_adds_serve_when_http_flags_present() {
+        let args: Vec<String> = vec!["--port".into(), "8765".into(), "--no-tui".into()];
+        let result = translate_python_args_to_rust(&args);
+        assert_eq!(
+            result,
+            vec!["serve", "--port", "8765", "--no-tui"],
+            "serve subcommand should be prepended when HTTP flags present"
+        );
+    }
+
+    #[test]
+    fn translate_python_args_no_duplicate_serve() {
+        let args: Vec<String> = vec!["serve-http".into(), "--port".into(), "8765".into()];
+        let result = translate_python_args_to_rust(&args);
+        assert_eq!(
+            result,
+            vec!["serve", "--port", "8765"],
+            "serve-http becomes serve, no duplicate serve added"
+        );
+    }
+
+    #[test]
+    fn update_config_text_with_crlf_line_endings() {
+        let rust_bin = Path::new("/usr/bin/mcp-agent-mail");
+        let original = "{\r\n  \"mcpServers\": {\r\n    \"mcp-agent-mail\": {\r\n      \"command\": \"python\",\r\n      \"args\": [\"-m\", \"mcp_agent_mail\"]\r\n    }\r\n  }\r\n}\r\n";
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(update.changed);
+        assert!(
+            update.updated_text.contains("\r\n"),
+            "CRLF line endings should be preserved"
+        );
+        assert!(
+            !update.updated_text.contains("\r\n\n"),
+            "no double newlines from CRLF handling"
+        );
+    }
+
+    #[test]
+    fn setup_mcp_config_file_creates_parent_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = tmp
+            .path()
+            .join("deeply")
+            .join("nested")
+            .join("dir")
+            .join("mcp.json");
+        let result = setup_mcp_config_file(&config, &default_params()).expect("setup");
+        assert!(result.created_new);
+        assert!(result.changed);
+        assert!(config.exists(), "config file must exist after setup");
+
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        assert!(
+            doc.get("mcpServers")
+                .and_then(Value::as_object)
+                .unwrap()
+                .contains_key("mcp-agent-mail")
         );
     }
 }
