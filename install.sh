@@ -51,6 +51,7 @@ OFFLINE="${AM_OFFLINE:-0}"
 VERBOSE_DUMP_LINES=20
 LOG_FILE="${LOG_FILE:-/tmp/am-install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log}"
 LOG_INITIALIZED=0
+ERROR_TAIL_EMITTED=0
 ORIGINAL_ARGS=("$@")
 
 # T2.1: Auto-enable easy-mode for pipe installs (stdin is not a terminal)
@@ -137,6 +138,8 @@ verbose() {
 }
 
 dump_verbose_tail() {
+  [ "$ERROR_TAIL_EMITTED" -eq 1 ] && return 0
+  ERROR_TAIL_EMITTED=1
   [ "$LOG_INITIALIZED" -eq 1 ] || return 0
   [ -f "$LOG_FILE" ] || return 0
   err "Verbose log: $LOG_FILE"
@@ -155,6 +158,13 @@ on_error() {
     dump_verbose_tail
   fi
   exit "$exit_code"
+}
+
+early_exit_dump() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    dump_verbose_tail
+  fi
 }
 
 download_to_file() {
@@ -1296,16 +1306,51 @@ Options:
 EOFU
 }
 
+trap 'on_error $LINENO' ERR
+trap early_exit_dump EXIT
+init_verbose_log
+verbose "argv=${ORIGINAL_ARGS[*]:-(none)}"
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VERSION="$2"; shift 2;;
-    --dest) DEST="$2"; shift 2;;
+    --version)
+      if [ $# -lt 2 ]; then
+        err "Option --version requires a value"
+        dump_verbose_tail
+        exit 2
+      fi
+      VERSION="$2"; shift 2;;
+    --dest)
+      if [ $# -lt 2 ]; then
+        err "Option --dest requires a value"
+        dump_verbose_tail
+        exit 2
+      fi
+      DEST="$2"; shift 2;;
     --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
     --easy-mode) EASY=1; shift;;
     --verify) VERIFY=1; shift;;
-    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-    --checksum) CHECKSUM="$2"; shift 2;;
-    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
+    --artifact-url)
+      if [ $# -lt 2 ]; then
+        err "Option --artifact-url requires a value"
+        dump_verbose_tail
+        exit 2
+      fi
+      ARTIFACT_URL="$2"; shift 2;;
+    --checksum)
+      if [ $# -lt 2 ]; then
+        err "Option --checksum requires a value"
+        dump_verbose_tail
+        exit 2
+      fi
+      CHECKSUM="$2"; shift 2;;
+    --checksum-url)
+      if [ $# -lt 2 ]; then
+        err "Option --checksum-url requires a value"
+        dump_verbose_tail
+        exit 2
+      fi
+      CHECKSUM_URL="$2"; shift 2;;
     --from-source) FROM_SOURCE=1; shift;;
     --quiet|-q) QUIET=1; shift;;
     --verbose) VERBOSE=1; shift;;
@@ -1318,9 +1363,6 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-trap 'on_error $LINENO' ERR
-init_verbose_log
-verbose "argv=${ORIGINAL_ARGS[*]:-(none)}"
 verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL}"
 
 # Show fancy header
@@ -1384,8 +1426,15 @@ else
 fi
 
 cleanup() {
-  rm -rf "$TMP"
-  if [ "$LOCKED" -eq 1 ]; then rm -rf "$LOCK_DIR"; fi
+  local rc=$?
+  [ -n "${TMP:-}" ] && rm -rf "$TMP"
+  if [ "${LOCKED:-0}" -eq 1 ]; then
+    rm -rf "${LOCK_DIR:-}"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    dump_verbose_tail
+  fi
+  return "$rc"
 }
 
 TMP=$(mktemp -d)
