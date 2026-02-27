@@ -21,6 +21,9 @@
 #   --no-verify        Skip checksum + signature verification (for testing only)
 #   --offline          Skip network preflight checks
 #   --force            Force reinstall even if already at version
+#   --uninstall        Remove installed binaries/configuration helpers
+#   --yes              Non-interactive mode for uninstall confirmations
+#   --purge            With --uninstall, also delete data directories/database
 #
 set -Eeuo pipefail
 umask 022
@@ -47,12 +50,16 @@ SYSTEM=0
 NO_GUM=0
 NO_CHECKSUM=0
 FORCE_INSTALL=0
+UNINSTALL=0
+ASSUME_YES=0
+PURGE=0
 OFFLINE="${AM_OFFLINE:-0}"
 VERBOSE_DUMP_LINES=20
 LOG_FILE="${LOG_FILE:-/tmp/am-install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log}"
 LOG_INITIALIZED=0
 ERROR_TAIL_EMITTED=0
 ORIGINAL_ARGS=("$@")
+UNINSTALL_SUMMARY=()
 
 # T2.1: Auto-enable easy-mode for pipe installs (stdin is not a terminal)
 # Also auto-enable in CI environments.
@@ -1165,6 +1172,766 @@ detect_mcp_configs() {
   done
 }
 
+generate_bearer_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  elif [ -r /dev/urandom ]; then
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+  else
+    # Fallback: use date-based hash (weak but functional)
+    printf '%s' "$(date +%s%N)$$" | sha256sum 2>/dev/null | cut -d' ' -f1 || echo "placeholder-token-replace-me"
+  fi
+}
+
+# Insert or create an mcp-agent-mail entry in a JSON config file.
+# Uses python3/jq for JSON manipulation if available, otherwise sed-based.
+setup_single_mcp_config() {
+  local tool="$1"
+  local config_path="$2"
+  local binary_path="$3"
+  local bearer_token="$4"
+  local storage_root="${5:-}"
+
+  verbose "setup_mcp_config:start tool=${tool} path=${config_path}"
+
+  # Skip TOML configs — they need different handling and are secondary to JSON
+  case "$config_path" in
+    *.toml)
+      verbose "setup_mcp_config:skip_toml tool=${tool} path=${config_path}"
+      return 2
+      ;;
+  esac
+
+  # Build the server entry JSON
+  local env_block=""
+  if [ -n "$bearer_token" ] && [ -n "$storage_root" ]; then
+    env_block="\"env\": {\"HTTP_BEARER_TOKEN\": \"${bearer_token}\", \"STORAGE_ROOT\": \"${storage_root}\"}"
+  elif [ -n "$bearer_token" ]; then
+    env_block="\"env\": {\"HTTP_BEARER_TOKEN\": \"${bearer_token}\"}"
+  elif [ -n "$storage_root" ]; then
+    env_block="\"env\": {\"STORAGE_ROOT\": \"${storage_root}\"}"
+  fi
+
+  local entry_json
+  if [ -n "$env_block" ]; then
+    entry_json="{\"command\": \"${binary_path}\", \"args\": [], ${env_block}}"
+  else
+    entry_json="{\"command\": \"${binary_path}\", \"args\": []}"
+  fi
+
+  if [ ! -f "$config_path" ]; then
+    # Create a new config file
+    local parent_dir
+    parent_dir=$(dirname "$config_path")
+    mkdir -p "$parent_dir" 2>/dev/null || true
+
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c "
+import json, sys
+entry = json.loads(sys.argv[1])
+doc = {'mcpServers': {'mcp-agent-mail': entry}}
+print(json.dumps(doc, indent=2))
+" "$entry_json" > "$config_path"
+    else
+      cat > "$config_path" <<MCPEOF
+{
+  "mcpServers": {
+    "mcp-agent-mail": ${entry_json}
+  }
+}
+MCPEOF
+    fi
+    verbose "setup_mcp_config:created tool=${tool} path=${config_path}"
+    return 0
+  fi
+
+  # File exists — check if mcp-agent-mail entry already present
+  if command -v python3 >/dev/null 2>&1; then
+    local result
+    result=$(python3 -c "
+import json, sys, os
+
+config_path = sys.argv[1]
+entry_json = sys.argv[2]
+
+with open(config_path, 'r') as f:
+    text = f.read()
+
+# Strip BOM
+if text.startswith('\ufeff'):
+    text = text[1:]
+
+try:
+    doc = json.loads(text)
+except json.JSONDecodeError:
+    # Try stripping comments and trailing commas (basic JSON5 compat)
+    import re
+    cleaned = re.sub(r'//.*?\n', '\n', text)
+    cleaned = re.sub(r'/\*.*?\*/', '', cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+    doc = json.loads(cleaned)
+
+if not isinstance(doc, dict):
+    print('ERROR:not_object')
+    sys.exit(0)
+
+# Find existing server container
+container_key = None
+for key in ['mcpServers', 'servers', 'mcp', 'mcp_servers']:
+    if key in doc and isinstance(doc[key], dict):
+        container_key = key
+        break
+
+if container_key and 'mcp-agent-mail' in doc[container_key]:
+    print('SKIP:already_present')
+    sys.exit(0)
+
+# Backup
+import shutil
+from datetime import datetime
+stamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+backup = config_path + '.' + stamp + '.bak'
+shutil.copy2(config_path, backup)
+
+# Insert entry
+entry = json.loads(entry_json)
+if container_key is None:
+    container_key = 'mcpServers'
+    doc[container_key] = {}
+doc[container_key]['mcp-agent-mail'] = entry
+
+with open(config_path, 'w') as f:
+    json.dump(doc, f, indent=2)
+    f.write('\n')
+
+print('OK:inserted backup=' + backup)
+" "$config_path" "$entry_json" 2>&1) || true
+
+    case "$result" in
+      SKIP:already_present)
+        verbose "setup_mcp_config:skip_existing tool=${tool} path=${config_path}"
+        return 1
+        ;;
+      OK:inserted*)
+        verbose "setup_mcp_config:inserted tool=${tool} path=${config_path} ${result}"
+        return 0
+        ;;
+      ERROR:*)
+        verbose "setup_mcp_config:error tool=${tool} path=${config_path} ${result}"
+        return 2
+        ;;
+      *)
+        verbose "setup_mcp_config:unknown_result tool=${tool} result=${result}"
+        return 2
+        ;;
+    esac
+  else
+    # No python3 — skip JSON manipulation to avoid corruption
+    verbose "setup_mcp_config:skip_no_python3 tool=${tool} path=${config_path}"
+    return 2
+  fi
+}
+
+# Set up MCP configs for all detected tools.
+# For fresh installs: create configs where missing, insert entries where absent.
+setup_mcp_configs() {
+  local binary_path="$1"
+  local scan
+  scan=$(detect_mcp_configs "$PWD" || true)
+  [ -z "$scan" ] && return 0
+
+  local bearer_token
+  bearer_token=$(generate_bearer_token)
+  verbose "setup_mcp_configs:generated_token len=${#bearer_token}"
+
+  local storage_root="${STORAGE_ROOT:-}"
+  local configured=0
+  local skipped=0
+  local failed=0
+  local tool path exists_flag
+
+  # Track which tools we've already configured (prefer existing configs)
+  local configured_tools=""
+
+  # First pass: handle existing configs
+  while IFS=$'\t' read -r tool path exists_flag; do
+    [ -z "${tool:-}" ] && continue
+    [ "$exists_flag" != "1" ] && continue
+
+    # Skip if we already configured this tool
+    case "|${configured_tools}|" in
+      *"|${tool}|"*) continue ;;
+    esac
+
+    if setup_single_mcp_config "$tool" "$path" "$binary_path" "$bearer_token" "$storage_root"; then
+      ok "[$tool] Configured MCP entry in $path"
+      configured=$((configured + 1))
+      configured_tools="${configured_tools}|${tool}"
+    else
+      local rc=$?
+      if [ "$rc" -eq 1 ]; then
+        verbose "setup_mcp_configs:skip tool=${tool} path=${path} reason=already_present"
+        skipped=$((skipped + 1))
+        configured_tools="${configured_tools}|${tool}"
+      else
+        verbose "setup_mcp_configs:fail tool=${tool} path=${path}"
+        failed=$((failed + 1))
+      fi
+    fi
+  done <<< "$scan"
+
+  # Second pass: create configs for detected tools without existing configs
+  # Only create for tools that have their config directory parent present
+  # (indicating the tool is likely installed)
+  while IFS=$'\t' read -r tool path exists_flag; do
+    [ -z "${tool:-}" ] && continue
+    [ "$exists_flag" = "1" ] && continue
+
+    # Skip if already configured
+    case "|${configured_tools}|" in
+      *"|${tool}|"*) continue ;;
+    esac
+
+    # Only create if the tool's config parent directory exists
+    # (indicates the tool is likely installed)
+    local parent_dir
+    parent_dir=$(dirname "$path")
+    local grandparent_dir
+    grandparent_dir=$(dirname "$parent_dir")
+    if [ -d "$parent_dir" ] || [ -d "$grandparent_dir" ]; then
+      if setup_single_mcp_config "$tool" "$path" "$binary_path" "$bearer_token" "$storage_root"; then
+        ok "[$tool] Created fresh MCP config at $path"
+        configured=$((configured + 1))
+        configured_tools="${configured_tools}|${tool}"
+      fi
+    fi
+  done <<< "$scan"
+
+  if [ "$configured" -gt 0 ]; then
+    ok "Configured $configured MCP config(s) (bearer token shared across all)"
+  fi
+  if [ "$skipped" -gt 0 ]; then
+    info "$skipped MCP config(s) already had mcp-agent-mail entry"
+  fi
+  verbose "setup_mcp_configs:done configured=${configured} skipped=${skipped} failed=${failed}"
+}
+
+# Update existing MCP configs that point to Python to use the Rust binary.
+# Called after binary installation + migration, using the newly-installed am CLI.
+update_mcp_configs() {
+  local binary_path="$1"
+  local am_cli="${2:-}"
+
+  # Resolve am CLI path: prefer explicit, then adjacent, then PATH
+  if [ -z "$am_cli" ]; then
+    local dest_dir
+    dest_dir="$(dirname "$binary_path")"
+    if [ -x "${dest_dir}/am" ]; then
+      am_cli="${dest_dir}/am"
+    elif command -v am >/dev/null 2>&1; then
+      am_cli="am"
+    else
+      verbose "update_mcp_configs:skip reason=no_am_cli"
+      warn "Could not find 'am' CLI to update MCP configs."
+      warn "Run 'am setup run' manually after installation."
+      return 0
+    fi
+  fi
+
+  verbose "update_mcp_configs:start binary=${binary_path} cli=${am_cli}"
+
+  # Check that setup subcommand exists (graceful degradation for older builds)
+  if ! "$am_cli" setup --help >/dev/null 2>&1; then
+    verbose "update_mcp_configs:skip reason=no_setup_subcommand"
+    return 0
+  fi
+
+  set +e
+  local setup_out
+  setup_out=$("$am_cli" setup run --yes --no-hooks 2>&1)
+  local setup_rc=$?
+  set -e
+
+  verbose "update_mcp_configs:result rc=${setup_rc}"
+  if [ -n "$setup_out" ]; then
+    verbose "update_mcp_configs:output ${setup_out}"
+  fi
+
+  if [ "$setup_rc" -eq 0 ]; then
+    # Parse counts from output (e.g., "7 config files processed: 2 created, 1 updated, 4 unchanged")
+    local counts_line created updated
+    counts_line=$(echo "$setup_out" | command grep "config files processed" 2>/dev/null || true)
+    created="0"
+    updated="0"
+    if [ -n "$counts_line" ]; then
+      # Extract numbers portably: "N created" and "N updated"
+      created=$(echo "$counts_line" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) created.*/\1/p' 2>/dev/null || echo "0")
+      updated=$(echo "$counts_line" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) updated.*/\1/p' 2>/dev/null || echo "0")
+      [ -z "$created" ] && created="0"
+      [ -z "$updated" ] && updated="0"
+    fi
+    if [ "$created" -gt 0 ] || [ "$updated" -gt 0 ]; then
+      ok "MCP configs updated: ${created} created, ${updated} updated"
+    else
+      verbose "update_mcp_configs:no_changes"
+    fi
+  else
+    warn "MCP config update returned exit code $setup_rc"
+    warn "Run 'am setup run' manually to configure MCP integrations."
+  fi
+}
+
+record_uninstall_summary() {
+  UNINSTALL_SUMMARY+=("$1")
+  verbose "uninstall:summary $1"
+}
+
+confirm_uninstall_step() {
+  local prompt="$1"
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    verbose "uninstall:confirm auto_yes prompt=${prompt}"
+    return 0
+  fi
+
+  if [ ! -t 0 ]; then
+    return 1
+  fi
+
+  printf "%s [y/N] " "$prompt"
+  local answer=""
+  read -r answer </dev/tty 2>/dev/null || answer="n"
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+backup_file_for_uninstall() {
+  local path="$1"
+  local ts backup
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  backup="${path}.bak.mcp-agent-mail-uninstall-${ts}"
+  cp -p "$path" "$backup"
+  echo "$backup"
+}
+
+remove_path_exports_from_rc() {
+  local rc="$1"
+  [ -f "$rc" ] || return 1
+
+  local tmp
+  tmp="${rc}.tmp.mcp-agent-mail-uninstall.$$"
+
+  awk -v dest="$DEST" '
+    function trim(line) {
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      return line
+    }
+    {
+      line = trim($0)
+      expected_double = "export PATH=\"" dest ":$PATH\""
+      expected_single = "export PATH='\''" dest ":$PATH'\''"
+      expected_bare = "export PATH=" dest ":$PATH"
+      if (line == expected_double || line == expected_single || line == expected_bare) {
+        next
+      }
+      print
+    }
+  ' "$rc" > "$tmp"
+
+  if cmp -s "$rc" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  local backup
+  backup=$(backup_file_for_uninstall "$rc")
+  mv "$tmp" "$rc"
+  record_uninstall_summary "Removed PATH export from ${rc} (backup: ${backup})"
+  return 0
+}
+
+remove_mcp_entries_from_toml() {
+  local input="$1"
+  local output="$2"
+  awk '
+    BEGIN { skip = 0 }
+    {
+      if (skip && $0 ~ /^[[:space:]]*\[/) {
+        skip = 0
+      }
+      if (skip) {
+        next
+      }
+
+      if ($0 ~ /^[[:space:]]*\[(mcpServers|mcp_servers)\.(mcp-agent-mail|mcp_agent_mail|mcp_agent_mail_rust)(\..*)?\][[:space:]]*$/) {
+        skip = 1
+        next
+      }
+
+      if ($0 ~ /(mcp-agent-mail|mcp_agent_mail|mcp_agent_mail_rust)/) {
+        next
+      }
+
+      print
+    }
+  ' "$input" > "$output"
+}
+
+remove_mcp_entries_from_json_like() {
+  local input="$1"
+  local output="$2"
+  awk '
+    function brace_delta(str, tmp, opens, closes) {
+      tmp = str
+      opens = gsub(/\{/, "{", tmp)
+      tmp = str
+      closes = gsub(/\}/, "}", tmp)
+      return opens - closes
+    }
+    BEGIN {
+      skip = 0
+      depth = 0
+    }
+    {
+      line = $0
+      if (skip) {
+        depth += brace_delta(line)
+        if (depth <= 0) {
+          skip = 0
+          next
+        }
+        next
+      }
+
+      if (line ~ /"(mcp-agent-mail|mcp_agent_mail|mcp_agent_mail_rust)"[[:space:]]*:[[:space:]]*\{/) {
+        skip = 1
+        depth = brace_delta(line)
+        if (depth <= 0) {
+          skip = 0
+        }
+        next
+      }
+
+      if (line ~ /(mcp-agent-mail|mcp_agent_mail|mcp_agent_mail_rust)/) {
+        next
+      }
+
+      print
+    }
+  ' "$input" \
+    | sed -E 's/,[[:space:]]*([}\]])/\1/g' \
+    > "$output"
+}
+
+cleanup_mcp_config_file() {
+  local tool="$1"
+  local config_path="$2"
+  [ -f "$config_path" ] || return 1
+
+  if ! grep -Eq 'mcp-agent-mail|mcp_agent_mail|mcp_agent_mail_rust' "$config_path"; then
+    return 1
+  fi
+
+  local backup tmp
+  backup=$(backup_file_for_uninstall "$config_path")
+  tmp="${config_path}.tmp.mcp-agent-mail-uninstall.$$"
+
+  case "$config_path" in
+    *.toml)
+      remove_mcp_entries_from_toml "$config_path" "$tmp"
+      ;;
+    *)
+      remove_mcp_entries_from_json_like "$config_path" "$tmp"
+      ;;
+  esac
+
+  if cmp -s "$config_path" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  mv "$tmp" "$config_path"
+  record_uninstall_summary "Removed MCP config entries from ${config_path} (backup: ${backup})"
+  return 0
+}
+
+cleanup_mcp_configs() {
+  local scan tool path exists_flag
+  local cleaned=0
+  scan=$(detect_mcp_configs "$PWD" || true)
+  if [ -z "$scan" ]; then
+    record_uninstall_summary "No MCP config candidates found"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r tool path exists_flag; do
+    [ -z "${tool:-}" ] && continue
+    [ "$exists_flag" = "1" ] || continue
+    if cleanup_mcp_config_file "$tool" "$path"; then
+      cleaned=$((cleaned + 1))
+    fi
+  done <<< "$scan"
+
+  if [ "$cleaned" -eq 0 ]; then
+    record_uninstall_summary "No MCP config entries referencing mcp-agent-mail were found"
+  fi
+}
+
+remove_update_cache_and_logs() {
+  local removed=0
+  local cache_file="${HOME}/.cache/mcp-agent-mail/update-check.json"
+  if [ -f "$cache_file" ]; then
+    rm -f "$cache_file"
+    record_uninstall_summary "Removed update cache ${cache_file}"
+    removed=$((removed + 1))
+  fi
+
+  local log_count=0
+  while IFS= read -r log_path; do
+    [ -z "$log_path" ] && continue
+    [ "$log_path" = "$LOG_FILE" ] && continue
+    rm -f "$log_path"
+    log_count=$((log_count + 1))
+  done < <(find /tmp -maxdepth 1 -type f -name 'am-install-*' 2>/dev/null || true)
+
+  if [ "$log_count" -gt 0 ]; then
+    record_uninstall_summary "Removed ${log_count} installer log file(s) from /tmp"
+    removed=$((removed + log_count))
+  fi
+
+  if [ "$removed" -eq 0 ]; then
+    record_uninstall_summary "No update cache or installer log files were found"
+  fi
+}
+
+path_size_bytes() {
+  local path="$1"
+  if [ -d "$path" ]; then
+    du -sk "$path" 2>/dev/null | awk '{print $1 * 1024}'
+    return 0
+  fi
+  if [ -f "$path" ]; then
+    wc -c < "$path" 2>/dev/null | awk '{print $1}'
+    return 0
+  fi
+  echo 0
+}
+
+human_size_bytes() {
+  local bytes="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec --suffix=B "$bytes"
+  else
+    echo "${bytes}B"
+  fi
+}
+
+collect_uninstall_data_paths() {
+  local configured_storage="${STORAGE_ROOT:-$HOME/.mcp_agent_mail}"
+  local legacy_storage="$HOME/.mcp_agent_mail_git_mailbox_repo"
+  local default_storage="$HOME/.mcp_agent_mail"
+  local db_from_env=""
+  local seen=""
+  local candidate
+
+  if [ -n "${DATABASE_URL:-}" ]; then
+    db_from_env=$(printf '%s' "$DATABASE_URL" | sed -n 's|^sqlite[^:]*:///||p')
+  fi
+
+  local -a candidates=(
+    "$configured_storage"
+    "$default_storage"
+    "$legacy_storage"
+  )
+  [ -n "$db_from_env" ] && candidates+=("$db_from_env")
+
+  for candidate in "${candidates[@]}"; do
+    candidate="${candidate/#\~/$HOME}"
+    [ -n "$candidate" ] || continue
+    case "|$seen|" in
+      *"|${candidate}|"*) continue ;;
+    esac
+    seen="${seen}|${candidate}"
+    if [ -e "$candidate" ]; then
+      printf '%s\n' "$candidate"
+    fi
+  done
+}
+
+purge_data_paths() {
+  local -a purge_paths=()
+  mapfile -t purge_paths < <(collect_uninstall_data_paths)
+
+  if [ "${#purge_paths[@]}" -eq 0 ]; then
+    record_uninstall_summary "No storage/database paths were found to purge"
+    return 0
+  fi
+
+  local total_bytes=0
+  local path bytes
+  info "Data purge candidates:"
+  for path in "${purge_paths[@]}"; do
+    bytes=$(path_size_bytes "$path")
+    total_bytes=$((total_bytes + bytes))
+    info "  - ${path} ($(human_size_bytes "$bytes"))"
+  done
+  info "Total purge size: $(human_size_bytes "$total_bytes")"
+
+  if [ "$ASSUME_YES" -eq 0 ]; then
+    if ! confirm_uninstall_step "Delete the data paths listed above?"; then
+      record_uninstall_summary "Skipped --purge data deletion"
+      return 0
+    fi
+  fi
+
+  for path in "${purge_paths[@]}"; do
+    case "$path" in
+      ""|"/"|"$HOME")
+        warn "Skipping dangerous purge path: ${path}"
+        continue
+        ;;
+    esac
+    rm -rf "$path"
+    record_uninstall_summary "Purged ${path}"
+  done
+}
+
+find_latest_python_alias_backup() {
+  local rc="$1"
+  ls -1t "${rc}.bak.mcp-agent-mail-"* 2>/dev/null | head -1 || true
+}
+
+restore_python_alias_backups() {
+  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.config/fish/config.fish")
+  local restored=0
+  local rc backup pre_restore ts
+
+  for rc in "${rc_files[@]}"; do
+    backup=$(find_latest_python_alias_backup "$rc")
+    [ -n "$backup" ] || continue
+
+    if [ -f "$rc" ]; then
+      ts=$(date -u +%Y%m%dT%H%M%SZ)
+      pre_restore="${rc}.bak.before-python-restore-${ts}"
+      cp -p "$rc" "$pre_restore"
+    else
+      pre_restore="none"
+    fi
+
+    cp -p "$backup" "$rc"
+    record_uninstall_summary "Restored Python alias backup ${backup} -> ${rc} (previous backup: ${pre_restore})"
+    restored=$((restored + 1))
+  done
+
+  if [ "$restored" -eq 0 ]; then
+    record_uninstall_summary "No Python alias backups were found to restore"
+  fi
+}
+
+remove_installed_binaries() {
+  local removed=0
+  local target
+  for target in "$DEST/$BIN_CLI" "$DEST/$BIN_SERVER"; do
+    if [ -e "$target" ]; then
+      rm -f "$target"
+      record_uninstall_summary "Removed binary ${target}"
+      removed=$((removed + 1))
+    fi
+  done
+
+  if [ "$removed" -eq 0 ]; then
+    record_uninstall_summary "No binaries were found in ${DEST}"
+  fi
+}
+
+remove_path_exports() {
+  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.config/fish/config.fish")
+  local removed=0
+  local rc
+  for rc in "${rc_files[@]}"; do
+    if remove_path_exports_from_rc "$rc"; then
+      removed=$((removed + 1))
+    fi
+  done
+
+  if [ "$removed" -eq 0 ]; then
+    record_uninstall_summary "No PATH entries for ${DEST} were found in shell rc files"
+  fi
+}
+
+print_uninstall_summary() {
+  echo ""
+  echo "Uninstall summary:"
+  if [ "${#UNINSTALL_SUMMARY[@]}" -eq 0 ]; then
+    echo "  - No changes were applied"
+    return 0
+  fi
+
+  local item
+  for item in "${UNINSTALL_SUMMARY[@]}"; do
+    echo "  - ${item}"
+  done
+}
+
+uninstall() {
+  verbose "uninstall:start dest=${DEST} yes=${ASSUME_YES} purge=${PURGE}"
+
+  if [ "$ASSUME_YES" -eq 0 ] && [ ! -t 0 ]; then
+    err "--uninstall without --yes requires an interactive terminal"
+    err "Re-run with --yes for non-interactive uninstall"
+    exit 2
+  fi
+
+  if [ "$QUIET" -eq 0 ]; then
+    echo ""
+    info "Running uninstall mode"
+    info "Target binary directory: ${DEST}"
+    [ "$PURGE" -eq 1 ] && info "Data purge is enabled (--purge)"
+  fi
+
+  if confirm_uninstall_step "Remove installed binaries from ${DEST}?"; then
+    remove_installed_binaries
+  else
+    record_uninstall_summary "Skipped binary removal"
+  fi
+
+  if confirm_uninstall_step "Remove installer PATH entries from shell rc files?"; then
+    remove_path_exports
+  else
+    record_uninstall_summary "Skipped PATH cleanup"
+  fi
+
+  if confirm_uninstall_step "Remove MCP config entries for mcp-agent-mail?"; then
+    cleanup_mcp_configs
+  else
+    record_uninstall_summary "Skipped MCP config cleanup"
+  fi
+
+  if confirm_uninstall_step "Remove updater cache and /tmp installer logs?"; then
+    remove_update_cache_and_logs
+  else
+    record_uninstall_summary "Skipped cache/log cleanup"
+  fi
+
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    record_uninstall_summary "Skipped Python alias restore in --yes mode"
+  elif confirm_uninstall_step "Restore Python alias backups (if available)?"; then
+    restore_python_alias_backups
+  else
+    record_uninstall_summary "Skipped Python alias restore"
+  fi
+
+  if [ "$PURGE" -eq 1 ]; then
+    purge_data_paths
+  else
+    record_uninstall_summary "Skipped data purge (pass --purge to remove storage/database data)"
+  fi
+
+  print_uninstall_summary
+}
+
 ensure_rust() {
   if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
     info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
@@ -1286,7 +2053,8 @@ usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] \\
-                  [--offline] [--no-gum] [--no-verify] [--force] [--from-source] [--verbose]
+                  [--offline] [--no-gum] [--no-verify] [--force] [--from-source] [--verbose] \\
+                  [--uninstall] [--yes] [--purge]
 
 Installs mcp-agent-mail and am (CLI) binaries.
 
@@ -1303,6 +2071,9 @@ Options:
   --no-gum           Disable gum formatting even if available
   --no-verify        Skip checksum + signature verification (for testing only)
   --force            Force reinstall even if same version is installed
+  --uninstall        Remove installed binaries/configuration helpers
+  --yes              Non-interactive uninstall confirmations
+  --purge            With --uninstall, also delete storage/database data
 EOFU
 }
 
@@ -1358,12 +2129,20 @@ while [ $# -gt 0 ]; do
     --no-gum) NO_GUM=1; shift;;
     --no-verify) NO_CHECKSUM=1; shift;;
     --force) FORCE_INSTALL=1; shift;;
+    --uninstall) UNINSTALL=1; shift;;
+    --yes|-y) ASSUME_YES=1; shift;;
+    --purge) PURGE=1; shift;;
     -h|--help) usage; exit 0;;
     *) shift;;
   esac
 done
 
-verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL}"
+verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE}"
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  uninstall
+  exit 0
+fi
 
 # Show fancy header
 if [ "$QUIET" -eq 0 ]; then
@@ -1602,6 +2381,21 @@ if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
   done <<< "$MCP_CONFIG_SCAN"
 fi
 
+# Set up MCP configs for fresh installs (non-interactive, auto-detect)
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
+  setup_mcp_configs "$DEST/$BIN_SERVER"
+fi
+
+# Update existing MCP configs to point to the Rust binary.
+# Uses the newly-installed `am setup run` which handles:
+#   - Python→Rust command rewriting
+#   - env var preservation (bearer token, storage root)
+#   - BOM/JSONC/trailing-comma tolerance
+#   - Backup before modification
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
+  update_mcp_configs "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"
+fi
+
 collect_migration_counts() {
   local db_path="$1"
   if ! command -v sqlite3 >/dev/null 2>&1 || [ ! -f "$db_path" ]; then
@@ -1779,8 +2573,8 @@ if [ "$QUIET" -eq 0 ]; then
 
   echo ""
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 245 --italic "To uninstall: rm $DEST/$BIN_SERVER $DEST/$BIN_CLI"
+    gum style --foreground 245 --italic "To uninstall: ./install.sh --uninstall --dest $DEST"
   else
-    echo -e "\033[0;90mTo uninstall: rm $DEST/$BIN_SERVER $DEST/$BIN_CLI\033[0m"
+    echo -e "\033[0;90mTo uninstall: ./install.sh --uninstall --dest $DEST\033[0m"
   fi
 fi
