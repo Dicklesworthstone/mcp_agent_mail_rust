@@ -65,7 +65,9 @@ pub fn start(config: &Config) {
         return;
     };
 
-    let mut worker = WORKER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);

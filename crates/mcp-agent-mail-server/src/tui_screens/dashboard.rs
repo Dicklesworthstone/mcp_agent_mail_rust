@@ -280,6 +280,8 @@ pub struct DashboardScreen {
     last_db_reservations: u64,
     /// Whether DB-delta baseline has been initialized.
     db_delta_baseline_ready: bool,
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
 }
 
 /// A pre-formatted event log entry.
@@ -437,6 +439,7 @@ impl DashboardScreen {
             last_db_messages: 0,
             last_db_reservations: 0,
             db_delta_baseline_ready: false,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -1078,7 +1081,7 @@ impl MailScreen for DashboardScreen {
 
     #[allow(clippy::cast_precision_loss)]
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        // Update animation phase
+        // Update animation phase (always — visual, no data dependency).
         if self.reduced_motion {
             self.pulse_phase = 0.0;
         } else {
@@ -1088,45 +1091,47 @@ impl MailScreen for DashboardScreen {
             }
         }
 
-        // Ingest new events every tick
-        self.ingest_events(state);
-        // Synthesize dashboard-friendly deltas from polled DB counters so
-        // message/reservation movement remains visible even when no matching
-        // domain events were emitted into the ring buffer.
-        self.ingest_db_delta_events(state);
-        // Keep scroll offset in-bounds so the log view never goes empty due
-        // stale offsets after trims/filter changes.
-        self.clamp_scroll_offset();
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
 
-        // Keep the local console log cache warm even when the panel is hidden so
-        // auto-dense layouts can render meaningful content immediately.
-        let new_entries = state.console_log_since(self.console_log_last_seq);
-        if !new_entries.is_empty() {
-            let mut pane = self.console_log.borrow_mut();
-            for (seq, line) in &new_entries {
-                self.console_log_last_seq = *seq;
-                // Ignore entries that are only newline delimiters. These can
-                // otherwise make `len() > 0` and incorrectly force an empty
-                // auto-dense console panel.
-                if line.trim_matches(&['\n', '\r'][..]).is_empty() {
-                    continue;
-                }
-                // `split_terminator` avoids a trailing empty segment for
-                // newline-terminated lines while preserving intentional
-                // interior blank lines (e.g. panel spacing).
-                for l in line.split_terminator('\n') {
-                    pane.push(crate::console::ansi_to_line(
-                        l.strip_suffix('\r').unwrap_or(l),
-                    ));
+        if dirty.events {
+            // Ingest new events from ring buffer.
+            self.ingest_events(state);
+            // Synthesize dashboard-friendly deltas from polled DB counters so
+            // message/reservation movement remains visible even when no matching
+            // domain events were emitted into the ring buffer.
+            self.ingest_db_delta_events(state);
+            // Keep scroll offset in-bounds.
+            self.clamp_scroll_offset();
+        }
+
+        if dirty.console_log {
+            // Keep the local console log cache warm.
+            let new_entries = state.console_log_since(self.console_log_last_seq);
+            if !new_entries.is_empty() {
+                let mut pane = self.console_log.borrow_mut();
+                for (seq, line) in &new_entries {
+                    self.console_log_last_seq = *seq;
+                    if line.trim_matches(&['\n', '\r'][..]).is_empty() {
+                        continue;
+                    }
+                    for l in line.split_terminator('\n') {
+                        pane.push(crate::console::ansi_to_line(
+                            l.strip_suffix('\r').unwrap_or(l),
+                        ));
+                    }
                 }
             }
         }
 
-        // Refresh sparkline from per-request latency samples
-        self.sparkline_data = state.sparkline_snapshot();
+        if dirty.requests {
+            // Refresh sparkline from per-request latency samples.
+            self.sparkline_data = state.sparkline_snapshot();
+        }
 
-        // Refresh stats and compute trends on stat interval
-        if tick_count.is_multiple_of(STAT_REFRESH_TICKS) {
+        // Refresh stats and compute trends on stat interval.
+        if tick_count.is_multiple_of(STAT_REFRESH_TICKS) && (dirty.db_stats || dirty.requests) {
             if let Some(stats) = state.db_stats_snapshot() {
                 if self.current_db_stats.timestamp_micros == 0 {
                     self.current_db_stats = stats.clone();
@@ -1160,12 +1165,15 @@ impl MailScreen for DashboardScreen {
             self.prev_req_total = counters.total;
         }
 
+        // Advance chart transition (always — animation, no data dependency).
         let now = Instant::now();
         self.throughput_transition
             .set_target(&self.throughput_history, now);
         self.animated_throughput_history = self
             .throughput_transition
             .sample_values(now, self.reduced_motion || !self.chart_animations_enabled);
+
+        self.last_data_gen = current_gen;
     }
 
     #[allow(clippy::too_many_lines)]

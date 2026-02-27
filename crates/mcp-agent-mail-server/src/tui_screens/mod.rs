@@ -411,6 +411,70 @@ pub trait MailScreen {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Dirty-state / invalidation contract
+// ──────────────────────────────────────────────────────────────────────
+
+/// Snapshot of all data-channel generation counters.
+///
+/// Screens store this after each tick and later compare against a fresh
+/// snapshot via [`dirty_since`] to determine which channels have new data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DataGeneration {
+    /// Event ring buffer `total_pushed` counter.
+    pub event_total_pushed: u64,
+    /// Console log sequence counter.
+    pub console_log_seq: u64,
+    /// DB stats mutation generation.
+    pub db_stats_gen: u64,
+    /// HTTP request recording generation.
+    pub request_gen: u64,
+}
+
+/// Bit-flags indicating which data channels have changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct DirtyFlags {
+    /// New events were pushed to the event ring buffer.
+    pub events: bool,
+    /// New entries were added to the console log.
+    pub console_log: bool,
+    /// DB stats were updated.
+    pub db_stats: bool,
+    /// New HTTP requests were recorded.
+    pub requests: bool,
+}
+
+impl DirtyFlags {
+    /// Returns `true` if any flag is set.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.events || self.console_log || self.db_stats || self.requests
+    }
+
+    /// Returns flags with everything dirty (for backward compatibility).
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            events: true,
+            console_log: true,
+            db_stats: true,
+            requests: true,
+        }
+    }
+}
+
+/// Compare two generation snapshots and return which channels changed.
+#[must_use]
+pub const fn dirty_since(prev: &DataGeneration, current: &DataGeneration) -> DirtyFlags {
+    DirtyFlags {
+        events: current.event_total_pushed != prev.event_total_pushed,
+        console_log: current.console_log_seq != prev.console_log_seq,
+        db_stats: current.db_stats_gen != prev.db_stats_gen,
+        requests: current.request_gen != prev.request_gen,
+    }
+}
+
 /// Messages produced by individual screens, wrapped by `MailMsg`.
 #[derive(Debug, Clone)]
 pub enum MailScreenMsg {
@@ -1101,5 +1165,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Dirty-state / invalidation contract tests ────────────────
+
+    #[test]
+    fn dirty_since_identical_generations_produces_no_flags() {
+        let gen = DataGeneration {
+            event_total_pushed: 42,
+            console_log_seq: 10,
+            db_stats_gen: 3,
+            request_gen: 99,
+        };
+        let flags = dirty_since(&gen, &gen);
+        assert!(!flags.any(), "identical generations must produce zero dirty flags");
+        assert!(!flags.events);
+        assert!(!flags.console_log);
+        assert!(!flags.db_stats);
+        assert!(!flags.requests);
+    }
+
+    #[test]
+    fn dirty_since_detects_event_change() {
+        let prev = DataGeneration::default();
+        let current = DataGeneration {
+            event_total_pushed: 1,
+            ..prev
+        };
+        let flags = dirty_since(&prev, &current);
+        assert!(flags.events, "events flag must be set");
+        assert!(!flags.console_log);
+        assert!(!flags.db_stats);
+        assert!(!flags.requests);
+    }
+
+    #[test]
+    fn dirty_since_detects_console_log_change() {
+        let prev = DataGeneration::default();
+        let current = DataGeneration {
+            console_log_seq: 5,
+            ..prev
+        };
+        let flags = dirty_since(&prev, &current);
+        assert!(!flags.events);
+        assert!(flags.console_log);
+        assert!(!flags.db_stats);
+        assert!(!flags.requests);
+    }
+
+    #[test]
+    fn dirty_since_detects_db_stats_change() {
+        let prev = DataGeneration::default();
+        let current = DataGeneration {
+            db_stats_gen: 1,
+            ..prev
+        };
+        let flags = dirty_since(&prev, &current);
+        assert!(!flags.events);
+        assert!(!flags.console_log);
+        assert!(flags.db_stats);
+        assert!(!flags.requests);
+    }
+
+    #[test]
+    fn dirty_since_detects_request_change() {
+        let prev = DataGeneration::default();
+        let current = DataGeneration {
+            request_gen: 7,
+            ..prev
+        };
+        let flags = dirty_since(&prev, &current);
+        assert!(!flags.events);
+        assert!(!flags.console_log);
+        assert!(!flags.db_stats);
+        assert!(flags.requests);
+    }
+
+    #[test]
+    fn dirty_since_detects_multiple_changes() {
+        let prev = DataGeneration {
+            event_total_pushed: 10,
+            console_log_seq: 5,
+            db_stats_gen: 2,
+            request_gen: 100,
+        };
+        let current = DataGeneration {
+            event_total_pushed: 15,
+            console_log_seq: 5,  // unchanged
+            db_stats_gen: 3,
+            request_gen: 100,    // unchanged
+        };
+        let flags = dirty_since(&prev, &current);
+        assert!(flags.events);
+        assert!(!flags.console_log);
+        assert!(flags.db_stats);
+        assert!(!flags.requests);
+        assert!(flags.any());
+    }
+
+    #[test]
+    fn dirty_flags_all_sets_every_flag() {
+        let flags = DirtyFlags::all();
+        assert!(flags.events);
+        assert!(flags.console_log);
+        assert!(flags.db_stats);
+        assert!(flags.requests);
+        assert!(flags.any());
+    }
+
+    #[test]
+    fn dirty_flags_default_is_clean() {
+        let flags = DirtyFlags::default();
+        assert!(!flags.any());
+    }
+
+    #[test]
+    fn data_generation_default_is_zero() {
+        let gen = DataGeneration::default();
+        assert_eq!(gen.event_total_pushed, 0);
+        assert_eq!(gen.console_log_seq, 0);
+        assert_eq!(gen.db_stats_gen, 0);
+        assert_eq!(gen.request_gen, 0);
     }
 }

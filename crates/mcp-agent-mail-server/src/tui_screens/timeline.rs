@@ -718,6 +718,8 @@ pub struct TimelineScreen {
     save_preset_description: String,
     /// Load dialog selected preset row.
     load_preset_cursor: usize,
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
 }
 
 impl TimelineScreen {
@@ -754,6 +756,7 @@ impl TimelineScreen {
             save_preset_name: String::new(),
             save_preset_description: String::new(),
             load_preset_cursor: 0,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -1512,12 +1515,17 @@ impl MailScreen for TimelineScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        self.pane.ingest(state);
-        self.refresh_commit_entries(tick_count, state);
-        self.prune_selection_to_visible();
-        // Sync list state after ingesting new events.
-        self.sync_list_state();
-        // Flush debounced preference save.
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
+        if dirty.events {
+            self.pane.ingest(state);
+            self.refresh_commit_entries(tick_count, state);
+            self.prune_selection_to_visible();
+            self.sync_list_state();
+        }
+
+        // Flush debounced preference save (always — time-based).
         if let Some(ref mut p) = self.persister {
             let prefs = TuiPreferences {
                 dock: self.dock,
@@ -1525,6 +1533,8 @@ impl MailScreen for TimelineScreen {
             };
             p.flush_if_due(&prefs);
         }
+
+        self.last_data_gen = current_gen;
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {

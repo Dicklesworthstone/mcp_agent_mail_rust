@@ -32,7 +32,9 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let mut worker = WORKER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
@@ -231,8 +233,21 @@ fn should_ignore(name: &str, patterns: &[String]) -> bool {
         if pat.is_empty() {
             continue;
         }
-        if let Some(prefix) = pat.strip_suffix('*') {
-            if name.starts_with(prefix) {
+        
+        let starts_with_star = pat.starts_with('*');
+        let ends_with_star = pat.ends_with('*');
+        let core = pat.trim_matches('*');
+
+        if starts_with_star && ends_with_star {
+            if name.contains(core) {
+                return true;
+            }
+        } else if starts_with_star {
+            if name.ends_with(core) {
+                return true;
+            }
+        } else if ends_with_star {
+            if name.starts_with(core) {
                 return true;
             }
         } else if name == pat {
@@ -391,6 +406,23 @@ mod tests {
         assert!(should_ignore("testing", &patterns));
         assert!(should_ignore("testproject-1", &patterns));
         assert!(!should_ignore("mytest", &patterns));
+    }
+
+    #[test]
+    fn should_ignore_glob_suffix() {
+        let patterns = vec!["*-test".to_string()];
+        assert!(should_ignore("my-test", &patterns));
+        assert!(should_ignore("integration-test", &patterns));
+        assert!(!should_ignore("test-my", &patterns));
+    }
+
+    #[test]
+    fn should_ignore_glob_contains() {
+        let patterns = vec!["*ignore*".to_string()];
+        assert!(should_ignore("do-ignore-this", &patterns));
+        assert!(should_ignore("ignore-this", &patterns));
+        assert!(should_ignore("this-ignore", &patterns));
+        assert!(!should_ignore("keep-this", &patterns));
     }
 
     #[test]

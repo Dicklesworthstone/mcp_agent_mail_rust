@@ -753,6 +753,26 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
                 Ok(_) => {} // nothing to backfill or already up-to-date
                 Err(err) => {
                     tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
+                    if recover_startup_search_backfill_db(config, &err) {
+                        match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
+                            Ok((indexed, _)) if indexed > 0 => {
+                                tracing::warn!(
+                                    indexed,
+                                    "[startup-search] backfill succeeded after sqlite auto-recovery"
+                                );
+                            }
+                            Ok(_) => {
+                                tracing::warn!(
+                                    "[startup-search] backfill completed after sqlite auto-recovery"
+                                );
+                            }
+                            Err(retry_err) => {
+                                tracing::warn!(
+                                    "[startup-search] backfill retry failed after sqlite auto-recovery: {retry_err}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -761,6 +781,54 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
                 "[startup-search] failed to initialize search v3 bridge: {}",
                 err
             );
+        }
+    }
+}
+
+fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, error: &str) -> bool {
+    let recoverable = mcp_agent_mail_db::is_sqlite_recovery_error_message(error)
+        || mcp_agent_mail_db::is_corruption_error_message(error);
+    if !recoverable {
+        return false;
+    }
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return false;
+    }
+
+    let Some(sqlite_path) =
+        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
+    else {
+        tracing::warn!(
+            database_url = %config.database_url,
+            "[startup-search] cannot recover sqlite for backfill retry: unresolved sqlite path"
+        );
+        return false;
+    };
+
+    let recovery = if config.storage_root.is_dir() {
+        mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
+            &sqlite_path,
+            &config.storage_root,
+        )
+    } else {
+        mcp_agent_mail_db::ensure_sqlite_file_healthy(&sqlite_path)
+    };
+
+    match recovery {
+        Ok(()) => {
+            tracing::warn!(
+                sqlite = %sqlite_path.display(),
+                "[startup-search] sqlite auto-recovery succeeded; retrying backfill once"
+            );
+            true
+        }
+        Err(recovery_err) => {
+            tracing::warn!(
+                sqlite = %sqlite_path.display(),
+                error = %recovery_err,
+                "[startup-search] sqlite auto-recovery failed; skipping backfill retry"
+            );
+            false
         }
     }
 }
@@ -817,6 +885,251 @@ const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
 const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS: u64 = 200;
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
+
+const TUI_SPIN_WATCHDOG_SAMPLE_SECS_DEFAULT: u64 = 2;
+const TUI_SPIN_WATCHDOG_WINDOW_SECS_DEFAULT: u64 = 20;
+const TUI_SPIN_WATCHDOG_STARTUP_SECS_DEFAULT: u64 = 180;
+const TUI_SPIN_WATCHDOG_CPU_PCT_DEFAULT: u64 = 250;
+
+#[derive(Debug, Clone, Copy)]
+struct TuiSpinWatchdogConfig {
+    sample_interval: Duration,
+    sustained_window: Duration,
+    startup_window: Duration,
+    cpu_threshold_pct_x100: u64,
+}
+
+struct TuiSpinWatchdog {
+    shutdown: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TuiSpinWatchdog {
+    fn start(tui_state: &Arc<tui_bridge::TuiSharedState>) -> Option<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = tui_state;
+            None
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let config = read_tui_spin_watchdog_config()?;
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_signal = Arc::clone(&shutdown);
+            let state = Arc::clone(tui_state);
+            let join = std::thread::Builder::new()
+                .name("tui-spin-watchdog".into())
+                .spawn(move || run_tui_spin_watchdog_loop(&state, &shutdown_signal, config))
+                .ok()?;
+            Some(Self {
+                shutdown,
+                join: Some(join),
+            })
+        }
+    }
+
+    fn shutdown(mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn read_tui_spin_watchdog_config() -> Option<TuiSpinWatchdogConfig> {
+    if !env_truthy_default_true("AM_TUI_SPIN_WATCHDOG_ENABLED") {
+        return None;
+    }
+
+    let sample_secs = env_u64_or_default(
+        "AM_TUI_SPIN_WATCHDOG_SAMPLE_SECS",
+        TUI_SPIN_WATCHDOG_SAMPLE_SECS_DEFAULT,
+    )
+    .max(1);
+    let window_secs = env_u64_or_default(
+        "AM_TUI_SPIN_WATCHDOG_WINDOW_SECS",
+        TUI_SPIN_WATCHDOG_WINDOW_SECS_DEFAULT,
+    )
+    .max(sample_secs);
+    let startup_secs = env_u64_or_default(
+        "AM_TUI_SPIN_WATCHDOG_STARTUP_SECS",
+        TUI_SPIN_WATCHDOG_STARTUP_SECS_DEFAULT,
+    )
+    .max(window_secs);
+    let cpu_threshold_pct = env_u64_or_default(
+        "AM_TUI_SPIN_WATCHDOG_CPU_PCT",
+        TUI_SPIN_WATCHDOG_CPU_PCT_DEFAULT,
+    )
+    .max(50);
+
+    Some(TuiSpinWatchdogConfig {
+        sample_interval: Duration::from_secs(sample_secs),
+        sustained_window: Duration::from_secs(window_secs),
+        startup_window: Duration::from_secs(startup_secs),
+        cpu_threshold_pct_x100: cpu_threshold_pct.saturating_mul(100),
+    })
+}
+
+fn env_truthy_default_true(key: &str) -> bool {
+    std::env::var(key).map_or(true, |value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn env_u64_or_default(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct ProcCpuSample {
+    process_jiffies: u64,
+    total_jiffies: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn run_tui_spin_watchdog_loop(
+    tui_state: &Arc<tui_bridge::TuiSharedState>,
+    shutdown: &Arc<AtomicBool>,
+    config: TuiSpinWatchdogConfig,
+) {
+    let Some(mut previous) = read_proc_cpu_sample() else {
+        tracing::warn!("[startup-watchdog] disabled: unable to read /proc CPU counters");
+        return;
+    };
+
+    let cpu_count = std::thread::available_parallelism()
+        .map_or(1_u64, |count| u64::try_from(count.get()).unwrap_or(1))
+        .max(1);
+    let mut over_threshold_since: Option<Instant> = None;
+    let start = Instant::now();
+
+    while !shutdown.load(Ordering::Acquire) && start.elapsed() < config.startup_window {
+        if sleep_with_shutdown(shutdown, config.sample_interval) {
+            return;
+        }
+
+        let Some(next) = read_proc_cpu_sample() else {
+            continue;
+        };
+
+        let Some(cpu_pct_x100) = process_cpu_pct_x100(previous, next, cpu_count) else {
+            previous = next;
+            continue;
+        };
+        previous = next;
+
+        mcp_agent_mail_core::metrics::global_metrics()
+            .system
+            .tui_spin_watchdog_last_cpu_pct_x100
+            .set(cpu_pct_x100);
+
+        if cpu_pct_x100 < config.cpu_threshold_pct_x100 {
+            over_threshold_since = None;
+            continue;
+        }
+
+        let now = Instant::now();
+        let since = over_threshold_since.get_or_insert(now);
+        if now.duration_since(*since) < config.sustained_window {
+            continue;
+        }
+
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let metrics = mcp_agent_mail_core::metrics::global_metrics();
+        metrics.system.tui_spin_watchdog_trips_total.inc();
+        metrics
+            .system
+            .tui_spin_watchdog_last_trip_us
+            .set(u64::try_from(now_us.max(0)).unwrap_or(u64::MAX).max(1));
+
+        tracing::error!(
+            cpu_pct_x100,
+            threshold_pct_x100 = config.cpu_threshold_pct_x100,
+            sustained_secs = config.sustained_window.as_secs(),
+            startup_uptime_secs = start.elapsed().as_secs(),
+            "[startup-watchdog] sustained TUI CPU spin detected; detaching TUI and continuing headless HTTP"
+        );
+
+        tui_state.request_headless_detach();
+        return;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        let chunk = remaining.min(Duration::from_millis(250));
+        std::thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    shutdown.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cpu_sample() -> Option<ProcCpuSample> {
+    let proc_self = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let proc_total = std::fs::read_to_string("/proc/stat").ok()?;
+    let process_jiffies = parse_proc_self_jiffies(&proc_self)?;
+    let total_jiffies = parse_proc_total_jiffies(&proc_total)?;
+    Some(ProcCpuSample {
+        process_jiffies,
+        total_jiffies,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_self_jiffies(contents: &str) -> Option<u64> {
+    let closing_paren = contents.rfind(')')?;
+    let rest = contents.get(closing_paren + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    Some(utime.saturating_add(stime))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_total_jiffies(contents: &str) -> Option<u64> {
+    let line = contents.lines().find(|line| line.starts_with("cpu "))?;
+    line.split_whitespace()
+        .skip(1)
+        .try_fold(0_u64, |acc, token| {
+            token
+                .parse::<u64>()
+                .ok()
+                .map(|value| acc.saturating_add(value))
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_pct_x100(
+    previous: ProcCpuSample,
+    next: ProcCpuSample,
+    cpu_count: u64,
+) -> Option<u64> {
+    let process_delta = next.process_jiffies.checked_sub(previous.process_jiffies)?;
+    let total_delta = next.total_jiffies.checked_sub(previous.total_jiffies)?;
+    if total_delta == 0 {
+        return None;
+    }
+
+    let scaled = u128::from(process_delta)
+        .saturating_mul(u128::from(cpu_count))
+        .saturating_mul(10_000)
+        .saturating_div(u128::from(total_delta));
+    Some(u64::try_from(scaled).unwrap_or(u64::MAX))
+}
 
 fn resolve_http_runtime_worker_threads() -> usize {
     // Use a real worker pool by default so partial/incomplete client sockets
@@ -1116,8 +1429,13 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         })
         .expect("spawn HTTP supervisor thread");
 
+    let startup_watchdog = TuiSpinWatchdog::start(&tui_state);
+
     // ── 6. TUI on main thread ───────────────────────────────────────
     let tui_result = run_tui_main_thread(&tui_state, config);
+    if let Some(watchdog) = startup_watchdog {
+        watchdog.shutdown();
+    }
     let detach_headless = tui_result.is_ok() && tui_state.take_headless_detach_requested();
 
     if detach_headless {
@@ -1544,11 +1862,9 @@ fn run_tui_main_thread(
 
     let model = tui_app::MailAppModel::with_config(Arc::clone(tui_state), config);
 
-    // Match the prior AM fallback behavior: unknown inactive screens refresh
-    // every ~1.2s at a 100ms global tick.
-    let screen_tick_strategy = ftui_runtime::tick_strategy::TickStrategyKind::Predictive {
-        config: ftui_runtime::tick_strategy::PredictiveConfig::new(12),
-    };
+    // Bootstrap with ActiveOnly; MailAppModel::init installs the project-level
+    // tiered cadence strategy immediately via `Cmd::set_tick_strategy`.
+    let screen_tick_strategy = ftui_runtime::tick_strategy::TickStrategyKind::ActiveOnly;
     // Explicit resize coalescer wiring keeps bursty terminal resize streams
     // (mux panes, split toggles, drag-resize) from forcing repeated redraws.
     let resize_coalescer = ftui_runtime::resize_coalescer::CoalescerConfig {
@@ -2190,13 +2506,21 @@ impl StartupDashboard {
                         continue;
                     }
 
+                    let mut drained_events = 0usize;
                     while let Ok(Some(event)) = backend.read_event() {
                         let term_size = backend.size().unwrap_or((80, 24));
                         if this.handle_console_event(term_size, &event) {
                             break;
                         }
+                        drained_events += 1;
+                        if drained_events >= 128 {
+                            // Bound one drain cycle so a hot terminal event stream cannot
+                            // monopolize CPU and starve HTTP/tool work.
+                            std::thread::yield_now();
+                            break;
+                        }
                         if !backend
-                            .poll_event(std::time::Duration::from_millis(0))
+                            .poll_event(std::time::Duration::from_millis(1))
                             .unwrap_or(false)
                         {
                             break;
@@ -6424,6 +6748,59 @@ mod tests {
         assert_eq!(normalized_probe_host(""), "127.0.0.1");
         assert_eq!(normalized_probe_host("  "), "127.0.0.1");
         assert_eq!(normalized_probe_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn startup_search_recovery_skips_nonrecoverable_errors() {
+        let config = mcp_agent_mail_core::Config::default();
+        assert!(!recover_startup_search_backfill_db(
+            &config,
+            "permission denied"
+        ));
+    }
+
+    #[test]
+    fn startup_search_recovery_skips_memory_database() {
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        assert!(!recover_startup_search_backfill_db(
+            &config,
+            "database disk image is malformed"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_total_jiffies_extracts_cpu_sum() {
+        let sample = "cpu  10 20 30 40 50 60 70 80 90 100\ncpu0 1 2 3 4\n";
+        assert_eq!(parse_proc_total_jiffies(sample), Some(550));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_self_jiffies_extracts_utime_plus_stime() {
+        let sample = "12345 (am) S 1 2 3 4 5 6 7 8 9 10 111 222 13 14 15 16";
+        // fields[11]=111, fields[12]=222 from the post-`)` split
+        assert_eq!(parse_proc_self_jiffies(sample), Some(333));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cpu_pct_x100_scales_by_cpu_count() {
+        let prev = ProcCpuSample {
+            process_jiffies: 1_000,
+            total_jiffies: 100_000,
+        };
+        let next = ProcCpuSample {
+            process_jiffies: 1_500,
+            total_jiffies: 102_000,
+        };
+        // process_delta=500, total_delta=2000, cpu_count=8
+        // => 500/2000 * 8 * 100 = 200%
+        let pct_x100 = process_cpu_pct_x100(prev, next, 8).expect("cpu pct");
+        assert_eq!(pct_x100, 20_000);
     }
 
     #[test]

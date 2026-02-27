@@ -34,7 +34,7 @@ use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
 use ftui_runtime::subscription::{Every, Subscription};
-use ftui_runtime::tick_strategy::ScreenTickDispatch;
+use ftui_runtime::tick_strategy::{ScreenTickDispatch, TickDecision, TickStrategy};
 use mcp_agent_mail_db::DbPoolConfig;
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
@@ -89,6 +89,17 @@ const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
 /// ensures unchanged cells produce no terminal writes.
 const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 2;
 
+/// Nearby (adjacent) inactive screens tick every Nth frame.
+const NEARBY_SCREEN_TICK_DIVISOR: u64 = 3;
+/// High-priority inactive screens tick every Nth frame.
+const HIGH_PRIORITY_SCREEN_TICK_DIVISOR: u64 = 4;
+/// Inactive screens tick only every Nth frame in the fallback path.
+const INACTIVE_SCREEN_TICK_DIVISOR: u64 = 12;
+/// Low-priority/background screens tick at the slowest cadence.
+const BACKGROUND_SCREEN_TICK_DIVISOR: u64 = 24;
+/// Urgent paths can bypass slower cadences when mailbox pressure is high.
+const URGENT_BYPASS_SCREEN_TICK_DIVISOR: u64 = 2;
+
 const fn screen_tick_key(id: MailScreenId) -> &'static str {
     match id {
         MailScreenId::Dashboard => "dashboard",
@@ -127,6 +138,189 @@ fn screen_id_from_tick_key(id: &str) -> Option<MailScreenId> {
         "attachments" => Some(MailScreenId::Attachments),
         "archive_browser" => Some(MailScreenId::ArchiveBrowser),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenCadenceTier {
+    Active,
+    Nearby,
+    Inactive,
+    Background,
+}
+
+fn screen_cadence_tier(screen: MailScreenId, active: MailScreenId) -> ScreenCadenceTier {
+    if screen == active {
+        return ScreenCadenceTier::Active;
+    }
+    if are_adjacent_screens(screen, active) {
+        return ScreenCadenceTier::Nearby;
+    }
+    if is_background_screen(screen) {
+        return ScreenCadenceTier::Background;
+    }
+    ScreenCadenceTier::Inactive
+}
+
+fn are_adjacent_screens(a: MailScreenId, b: MailScreenId) -> bool {
+    let len = ALL_SCREEN_IDS.len();
+    if len <= 1 {
+        return false;
+    }
+    let Some(a_idx) = ALL_SCREEN_IDS.iter().position(|&id| id == a) else {
+        return false;
+    };
+    let Some(b_idx) = ALL_SCREEN_IDS.iter().position(|&id| id == b) else {
+        return false;
+    };
+    let prev = (a_idx + len - 1) % len;
+    let next = (a_idx + 1) % len;
+    b_idx == prev || b_idx == next
+}
+
+const fn is_background_screen(id: MailScreenId) -> bool {
+    matches!(
+        id,
+        MailScreenId::Analytics | MailScreenId::Attachments | MailScreenId::ArchiveBrowser
+    )
+}
+
+const fn is_high_priority_screen(id: MailScreenId) -> bool {
+    matches!(
+        id,
+        MailScreenId::Dashboard
+            | MailScreenId::Messages
+            | MailScreenId::Reservations
+            | MailScreenId::Timeline
+            | MailScreenId::SystemHealth
+            | MailScreenId::ToolMetrics
+            | MailScreenId::Explorer
+    )
+}
+
+const fn is_urgent_path_screen(id: MailScreenId) -> bool {
+    matches!(
+        id,
+        MailScreenId::Messages | MailScreenId::Reservations | MailScreenId::Explorer
+    )
+}
+
+const fn screen_cadence_base_divisor(tier: ScreenCadenceTier) -> u64 {
+    match tier {
+        ScreenCadenceTier::Active => 1,
+        ScreenCadenceTier::Nearby => NEARBY_SCREEN_TICK_DIVISOR,
+        ScreenCadenceTier::Inactive => INACTIVE_SCREEN_TICK_DIVISOR,
+        ScreenCadenceTier::Background => BACKGROUND_SCREEN_TICK_DIVISOR,
+    }
+}
+
+fn urgent_poller_bypass_active(state: &TuiSharedState) -> bool {
+    let Some(snapshot) = state.db_stats_snapshot() else {
+        return false;
+    };
+    if snapshot.ack_pending > 0 {
+        return true;
+    }
+    let now = now_micros();
+    snapshot.reservation_snapshots.iter().any(|reservation| {
+        reservation.released_ts.is_none()
+            && reservation.expires_ts > now
+            && reservation.expires_ts.saturating_sub(now) <= RESERVATION_EXPIRY_WARN_MICROS
+    })
+}
+
+fn screen_tick_divisor(
+    screen: MailScreenId,
+    active: MailScreenId,
+    urgent_bypass: bool,
+) -> u64 {
+    let tier = screen_cadence_tier(screen, active);
+    let mut divisor = screen_cadence_base_divisor(tier);
+    if is_high_priority_screen(screen) {
+        divisor = divisor.min(HIGH_PRIORITY_SCREEN_TICK_DIVISOR);
+    }
+    if urgent_bypass && is_urgent_path_screen(screen) {
+        divisor = divisor.min(URGENT_BYPASS_SCREEN_TICK_DIVISOR);
+    }
+    divisor.max(1)
+}
+
+#[derive(Debug)]
+struct TieredCadenceTickStrategy {
+    state: Arc<TuiSharedState>,
+    last_urgent_probe_tick: u64,
+    cached_urgent: bool,
+}
+
+impl TieredCadenceTickStrategy {
+    const fn new(state: Arc<TuiSharedState>) -> Self {
+        Self {
+            state,
+            last_urgent_probe_tick: u64::MAX,
+            cached_urgent: false,
+        }
+    }
+
+    fn urgent_for_tick(&mut self, tick_count: u64) -> bool {
+        if self.last_urgent_probe_tick != tick_count {
+            self.cached_urgent = urgent_poller_bypass_active(&self.state);
+            self.last_urgent_probe_tick = tick_count;
+        }
+        self.cached_urgent
+    }
+}
+
+impl TickStrategy for TieredCadenceTickStrategy {
+    fn should_tick(
+        &mut self,
+        screen_id: &str,
+        tick_count: u64,
+        active_screen: &str,
+    ) -> TickDecision {
+        let Some(screen) = screen_id_from_tick_key(screen_id) else {
+            return TickDecision::Skip;
+        };
+        let Some(active) = screen_id_from_tick_key(active_screen) else {
+            return if tick_count.is_multiple_of(INACTIVE_SCREEN_TICK_DIVISOR) {
+                TickDecision::Tick
+            } else {
+                TickDecision::Skip
+            };
+        };
+        let urgent_bypass = self.urgent_for_tick(tick_count);
+        let divisor = screen_tick_divisor(screen, active, urgent_bypass);
+        if tick_count.is_multiple_of(divisor) {
+            TickDecision::Tick
+        } else {
+            TickDecision::Skip
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "TieredCadence"
+    }
+
+    fn debug_stats(&self) -> Vec<(String, String)> {
+        vec![
+            ("strategy".into(), "TieredCadence".into()),
+            (
+                "nearby_divisor".into(),
+                NEARBY_SCREEN_TICK_DIVISOR.to_string(),
+            ),
+            (
+                "inactive_divisor".into(),
+                INACTIVE_SCREEN_TICK_DIVISOR.to_string(),
+            ),
+            (
+                "background_divisor".into(),
+                BACKGROUND_SCREEN_TICK_DIVISOR.to_string(),
+            ),
+            (
+                "urgent_bypass_divisor".into(),
+                URGENT_BYPASS_SCREEN_TICK_DIVISOR.to_string(),
+            ),
+            ("urgent_bypass_active".into(), self.cached_urgent.to_string()),
+        ]
     }
 }
 
@@ -3284,18 +3478,42 @@ impl Model for MailAppModel {
     type Message = MailMsg;
 
     fn init(&mut self) -> Cmd<Self::Message> {
-        Cmd::batch(vec![Cmd::tick(TICK_INTERVAL), Cmd::set_mouse_capture(true)])
+        Cmd::batch(vec![
+            Cmd::set_tick_strategy(TieredCadenceTickStrategy::new(Arc::clone(&self.state))),
+            Cmd::tick(TICK_INTERVAL),
+            Cmd::set_mouse_capture(true),
+        ])
     }
 
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, msg: Self::Message) -> Cmd<Self::Message> {
+        if self.state.is_headless_detach_requested() {
+            return self.detach_tui_headless();
+        }
+        if self.state.is_shutdown_requested() {
+            self.flush_before_shutdown();
+            return Cmd::quit();
+        }
+
         match msg {
             // ── Tick ────────────────────────────────────────────────
             MailMsg::Terminal(Event::Tick) => {
                 self.tick_count = self.tick_count.wrapping_add(1);
                 let tick_count = self.tick_count;
+                let active = self.screen_manager.active_screen();
+                let urgent_bypass = urgent_poller_bypass_active(&self.state);
+                // Always tick the active screen.
+                self.tick_screen_with_panic_guard(active, tick_count);
+                // Inactive screens use tiered cadence classes so nearby and
+                // high-priority paths stay fresh without forcing all-screen churn.
                 for &id in ALL_SCREEN_IDS {
-                    self.tick_screen_with_panic_guard(id, tick_count);
+                    if id == active {
+                        continue;
+                    }
+                    let divisor = screen_tick_divisor(id, active, urgent_bypass);
+                    if tick_count.is_multiple_of(divisor) {
+                        self.tick_screen_with_panic_guard(id, tick_count);
+                    }
                 }
                 self.run_housekeeping_tick(TICK_INTERVAL)
             }
@@ -10426,18 +10644,99 @@ mod tests {
     }
 
     #[test]
-    fn event_tick_fallback_ticks_inactive_screen_immediately() {
+    fn event_tick_fallback_skips_nearby_screen_between_divisor() {
         let mut model = test_model();
         let mut screen = PanickingScreen::new();
         screen.panic_on_tick = true;
         model.set_screen(MailScreenId::Messages, Box::new(screen));
+
+        // Messages is adjacent to Dashboard, so it follows nearby cadence.
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert!(
+            !model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages),
+            "nearby screen should NOT be ticked before nearby divisor"
+        );
+    }
+
+    #[test]
+    fn event_tick_fallback_ticks_nearby_screen_at_divisor() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_tick = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+
+        // Advance to the nearby divisor boundary.
+        for _ in 0..NEARBY_SCREEN_TICK_DIVISOR {
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+        }
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages),
+            "nearby screen should be ticked at divisor boundary"
+        );
+    }
+
+    #[test]
+    fn event_tick_fallback_background_screen_uses_slowest_divisor() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_tick = true;
+        model.set_screen(MailScreenId::ArchiveBrowser, Box::new(screen));
+
+        for _ in 0..(BACKGROUND_SCREEN_TICK_DIVISOR - 1) {
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+        }
+        assert!(
+            !model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::ArchiveBrowser),
+            "background screen should not tick before background divisor"
+        );
 
         let _ = model.update(MailMsg::Terminal(Event::Tick));
         assert!(
             model
                 .screen_panics
                 .borrow()
-                .contains_key(&MailScreenId::Messages)
+                .contains_key(&MailScreenId::ArchiveBrowser),
+            "background screen should tick at background divisor"
+        );
+    }
+
+    #[test]
+    fn event_tick_fallback_urgent_bypass_accelerates_message_screen() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_tick = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+
+        model.state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            ack_pending: 1,
+            ..Default::default()
+        });
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert!(
+            !model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages),
+            "urgent bypass still should not tick before its divisor"
+        );
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert!(
+            model
+                .screen_panics
+                .borrow()
+                .contains_key(&MailScreenId::Messages),
+            "message screen should be accelerated by urgent bypass cadence"
         );
     }
 

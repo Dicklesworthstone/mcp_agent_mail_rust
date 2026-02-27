@@ -217,6 +217,10 @@ pub struct TuiSharedState {
     /// Console log ring buffer: `(seq, text)` pairs for tool call cards etc.
     console_log: Mutex<VecDeque<(u64, String)>>,
     console_log_seq: AtomicU64,
+    /// Generation counter bumped on each `update_db_stats` call.
+    db_stats_gen: AtomicU64,
+    /// Generation counter bumped on each `record_request` call.
+    request_gen: AtomicU64,
 }
 
 impl TuiSharedState {
@@ -248,6 +252,8 @@ impl TuiSharedState {
             server_control_tx: Mutex::new(None),
             console_log: Mutex::new(VecDeque::with_capacity(CONSOLE_LOG_CAPACITY)),
             console_log_seq: AtomicU64::new(0),
+            db_stats_gen: AtomicU64::new(0),
+            request_gen: AtomicU64::new(0),
         })
     }
 
@@ -298,6 +304,7 @@ impl TuiSharedState {
 
     pub fn record_request(&self, status: u16, duration_ms: u64) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.request_gen.fetch_add(1, Ordering::Relaxed);
         self.latency_total_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
         match status {
@@ -323,6 +330,8 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *current = stats;
+        drop(current);
+        self.db_stats_gen.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn request_shutdown(&self) {
@@ -510,6 +519,21 @@ impl TuiSharedState {
             let _ = log.pop_front();
         }
         log.push_back((seq, text));
+    }
+
+    /// Snapshot all data generation counters for dirty-state tracking.
+    ///
+    /// Screens store the returned value and later compare it against a fresh
+    /// snapshot via [`DataGeneration::dirty_since`] to determine which data
+    /// channels have changed.
+    #[must_use]
+    pub fn data_generation(&self) -> crate::tui_screens::DataGeneration {
+        crate::tui_screens::DataGeneration {
+            event_total_pushed: self.events.stats().total_pushed,
+            console_log_seq: self.console_log_seq.load(Ordering::Relaxed),
+            db_stats_gen: self.db_stats_gen.load(Ordering::Relaxed),
+            request_gen: self.request_gen.load(Ordering::Relaxed),
+        }
     }
 
     /// Return console log entries with sequence > `since_seq`.
@@ -1132,5 +1156,86 @@ mod tests {
 
         let future = state.console_log_since(999);
         assert!(future.is_empty());
+    }
+
+    // ── Data generation / dirty-state tests ──────────────────────
+
+    #[test]
+    fn data_generation_starts_at_zero() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let gen = state.data_generation();
+        assert_eq!(gen.event_total_pushed, 0);
+        assert_eq!(gen.console_log_seq, 0);
+        assert_eq!(gen.db_stats_gen, 0);
+        assert_eq!(gen.request_gen, 0);
+    }
+
+    #[test]
+    fn data_generation_event_push_bumps_counter() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let gen_before = state.data_generation();
+        state.push_event(crate::tui_events::MailEvent::ServerStarted {
+            timestamp_micros: 1,
+            project: "test".into(),
+        });
+        let gen_after = state.data_generation();
+        assert!(gen_after.event_total_pushed > gen_before.event_total_pushed);
+    }
+
+    #[test]
+    fn data_generation_console_log_bumps_counter() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let gen_before = state.data_generation();
+        state.push_console_log("hello".into());
+        let gen_after = state.data_generation();
+        assert!(gen_after.console_log_seq > gen_before.console_log_seq);
+    }
+
+    #[test]
+    fn data_generation_db_stats_bumps_counter() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let gen_before = state.data_generation();
+        state.update_db_stats(crate::tui_bridge::DbStatSnapshot::default());
+        let gen_after = state.data_generation();
+        assert!(gen_after.db_stats_gen > gen_before.db_stats_gen);
+    }
+
+    #[test]
+    fn data_generation_record_request_bumps_counter() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let gen_before = state.data_generation();
+        state.record_request(200, 5);
+        let gen_after = state.data_generation();
+        assert!(gen_after.request_gen > gen_before.request_gen);
+    }
+
+    #[test]
+    fn dirty_since_no_change_returns_clean() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let gen = state.data_generation();
+        let flags = crate::tui_screens::dirty_since(&gen, &state.data_generation());
+        assert!(!flags.any());
+    }
+
+    #[test]
+    fn dirty_since_selective_channel_detection() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let gen = state.data_generation();
+
+        // Only bump console log
+        state.push_console_log("test".into());
+
+        let flags = crate::tui_screens::dirty_since(&gen, &state.data_generation());
+        assert!(!flags.events, "events should be clean");
+        assert!(flags.console_log, "console_log should be dirty");
+        assert!(!flags.db_stats, "db_stats should be clean");
+        assert!(!flags.requests, "requests should be clean");
     }
 }

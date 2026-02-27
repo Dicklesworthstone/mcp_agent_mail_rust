@@ -184,8 +184,12 @@ impl ActionMenuState {
     /// Jump to the first entry starting with the given character.
     pub fn jump_to_char(&mut self, c: char) -> bool {
         let lower = c.to_ascii_lowercase();
-        for (i, entry) in self.entries.iter().enumerate() {
-            if entry.first_char() == Some(lower) {
+        let start = self.selected;
+        let len = self.entries.len();
+
+        for offset in 1..=len {
+            let i = (start + offset) % len;
+            if self.entries[i].first_char() == Some(lower) {
                 self.selected = i;
                 return true;
             }

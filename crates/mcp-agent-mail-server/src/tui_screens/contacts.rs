@@ -147,6 +147,8 @@ pub struct ContactsScreen {
     prev_contact_counts: (u64, u64, u64, u64),
     detail_visible: bool,
     detail_scroll: usize,
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
 }
 
 impl ContactsScreen {
@@ -169,6 +171,7 @@ impl ContactsScreen {
             prev_contact_counts: (0, 0, 0, 0),
             detail_visible: true,
             detail_scroll: 0,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -438,11 +441,15 @@ impl MailScreen for ContactsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        // Rebuild every 5 seconds (contacts change infrequently)
+        // Rebuild every 5 seconds, but only when DB stats actually changed.
         if tick_count.is_multiple_of(50) {
-            // Save previous counts for trend computation before rebuild
-            self.prev_contact_counts = self.contact_counts();
-            self.rebuild_from_state(state);
+            let current_gen = state.data_generation();
+            let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+            if dirty.db_stats {
+                self.prev_contact_counts = self.contact_counts();
+                self.rebuild_from_state(state);
+            }
+            self.last_data_gen = current_gen;
         }
     }
 

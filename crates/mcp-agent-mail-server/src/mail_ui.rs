@@ -377,6 +377,24 @@ mod utility_tests {
         assert!(!is_valid_time_travel_timestamp("2026/02/11T05:43"));
         assert!(!is_valid_time_travel_timestamp("2026-02-11 05:43"));
     }
+
+    #[test]
+    fn highlight_snippet_safely_escapes_and_matches() {
+        // "mark" shouldn't match inside the inserted <mark> tag.
+        let body = "This is a mark and another mark.";
+        let html = highlight_snippet(body, "mark", 100);
+        assert_eq!(html, "This is a <mark>mark</mark> and another <mark>mark</mark>.");
+
+        // "amp" shouldn't match inside the &amp; entity.
+        let body_with_amp = "amp & voltage";
+        let html_amp = highlight_snippet(body_with_amp, "amp", 100);
+        assert_eq!(html_amp, "<mark>amp</mark> &amp; voltage");
+
+        // Overlapping terms are merged cleanly.
+        let body_overlap = "authenticate";
+        let html_overlap = highlight_snippet(body_overlap, "auth thenticate", 100);
+        assert_eq!(html_overlap, "<mark>authenticate</mark>");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,33 +1061,50 @@ fn highlight_snippet(body: &str, query: &str, max_len: usize) -> String {
     let prefix = if s_start > 0 { "…" } else { "" };
     let suffix = if end < body.len() { "…" } else { "" };
 
-    // HTML-escape the window first, then insert <mark> tags.
-    let escaped = html_escape(&format!("{prefix}{window}{suffix}"));
-
-    // Apply highlighting (case-insensitive replace on the escaped text).
-    let mut result = escaped;
+    // Find intervals in UNESCAPED window to avoid corrupting HTML entities or <mark> tags.
+    let mut intervals = Vec::new();
+    let lower_window = window.to_ascii_lowercase();
     for term in &terms {
-        let escaped_term = html_escape(term);
-        if escaped_term.is_empty() {
-            continue;
+        let pattern = term.to_ascii_lowercase();
+        for (idx, _) in lower_window.match_indices(&pattern) {
+            intervals.push((idx, idx + pattern.len()));
         }
-        // Case-insensitive replacement.
-        let lower = result.to_ascii_lowercase();
-        let pattern = escaped_term.to_ascii_lowercase();
-        let mut out = String::with_capacity(result.len() + 30);
-        let mut last = 0;
-        for (idx, _) in lower.match_indices(&pattern) {
-            out.push_str(&result[last..idx]);
-            out.push_str("<mark>");
-            out.push_str(&result[idx..idx + pattern.len()]);
-            out.push_str("</mark>");
-            last = idx + pattern.len();
-        }
-        out.push_str(&result[last..]);
-        result = out;
     }
 
-    result
+    // Merge overlapping intervals
+    intervals.sort_unstable_by_key(|&(start, _)| start);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for interval in intervals {
+        if let Some(last) = merged.last_mut()
+            && interval.0 <= last.1
+        {
+            last.1 = last.1.max(interval.1);
+            continue;
+        }
+        merged.push(interval);
+    }
+
+    // Build the final escaped HTML string
+    let mut out = String::with_capacity(window.len() + merged.len() * 13 + 6);
+    if !prefix.is_empty() {
+        out.push_str(prefix); // "…" is safe to not escape
+    }
+
+    let mut last = 0;
+    for (start, end) in merged {
+        out.push_str(&html_escape(&window[last..start]));
+        out.push_str("<mark>");
+        out.push_str(&html_escape(&window[start..end]));
+        out.push_str("</mark>");
+        last = end;
+    }
+    out.push_str(&html_escape(&window[last..]));
+
+    if !suffix.is_empty() {
+        out.push_str(suffix);
+    }
+
+    out
 }
 
 /// Minimal HTML escaping for untrusted text (before inserting <mark> tags).
