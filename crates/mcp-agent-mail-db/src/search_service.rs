@@ -2923,16 +2923,16 @@ fn map_rows_to_results(rows: &[SqlRow], doc_kind: DocKind) -> Vec<SearchResult> 
 }
 
 fn map_message_row(row: &SqlRow) -> Option<SearchResult> {
-    let id: i64 = row.get_named("id").ok()?;
-    let subject: String = row.get_named("subject").unwrap_or_default();
-    let body: String = row.get_named("body_md").unwrap_or_default();
-    let importance: Option<String> = row.get_named("importance").ok();
-    let ack_required: Option<bool> = row.get_named::<i64>("ack_required").ok().map(|v| v != 0);
-    let created_ts: Option<i64> = row.get_named("created_ts").ok();
-    let thread_id: Option<String> = row.get_named("thread_id").ok();
-    let from_agent: Option<String> = row.get_named("from_name").ok();
-    let project_id: Option<i64> = row.get_named("project_id").ok();
-    let score: Option<f64> = row.get_named("score").ok();
+    let id: i64 = row.get_as(0).ok()?;
+    let subject: String = row.get_as(1).unwrap_or_default();
+    let importance: Option<String> = row.get_as(2).ok();
+    let ack_required: Option<bool> = row.get_as::<i64>(3).ok().map(|v| v != 0);
+    let created_ts: Option<i64> = row.get_as(4).ok();
+    let thread_id: Option<String> = row.get_as(5).ok();
+    let from_agent: Option<String> = row.get_as(6).ok();
+    let body: String = row.get_as(7).unwrap_or_default();
+    let project_id: Option<i64> = row.get_as(8).ok();
+    let score: Option<f64> = row.get_as(9).ok();
 
     Some(SearchResult {
         doc_kind: DocKind::Message,
@@ -2954,11 +2954,11 @@ fn map_message_row(row: &SqlRow) -> Option<SearchResult> {
 }
 
 fn map_agent_row(row: &SqlRow) -> Option<SearchResult> {
-    let id: i64 = row.get_named("id").ok()?;
-    let name: String = row.get_named("name").unwrap_or_default();
-    let task_desc: String = row.get_named("task_description").unwrap_or_default();
-    let project_id: Option<i64> = row.get_named("project_id").ok();
-    let score: Option<f64> = row.get_named("score").ok();
+    let id: i64 = row.get_as(0).ok()?;
+    let name: String = row.get_as(1).unwrap_or_default();
+    let task_desc: String = row.get_as(2).unwrap_or_default();
+    let project_id: Option<i64> = row.get_as(3).ok();
+    let score: Option<f64> = row.get_as(4).ok();
 
     Some(SearchResult {
         doc_kind: DocKind::Agent,
@@ -2980,10 +2980,10 @@ fn map_agent_row(row: &SqlRow) -> Option<SearchResult> {
 }
 
 fn map_project_row(row: &SqlRow) -> Option<SearchResult> {
-    let id: i64 = row.get_named("id").ok()?;
-    let slug: String = row.get_named("slug").unwrap_or_default();
-    let human_key: String = row.get_named("human_key").unwrap_or_default();
-    let score: Option<f64> = row.get_named("score").ok();
+    let id: i64 = row.get_as(0).ok()?;
+    let slug: String = row.get_as(1).unwrap_or_default();
+    let human_key: String = row.get_as(2).unwrap_or_default();
+    let score: Option<f64> = row.get_as(3).ok();
 
     Some(SearchResult {
         doc_kind: DocKind::Project,

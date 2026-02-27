@@ -611,44 +611,44 @@ fn apply_filters(conditions: &mut Vec<String>, params: &mut Vec<Value>, query: &
 // ────────────────────────────────────────────────────────────────────
 
 fn map_inbound_row(row: &SqlRow) -> Option<ExplorerEntry> {
-    let message_id: i64 = row.get_named("id").ok()?;
+    let message_id: i64 = row.get_as(0).ok()?;
     Some(ExplorerEntry {
         message_id,
-        project_id: row.get_named("project_id").ok()?,
-        project_slug: row.get_named("project_slug").unwrap_or_default(),
-        sender_name: row.get_named("sender_name").unwrap_or_default(),
-        to_agents: row.get_named("to_agents").unwrap_or_default(),
-        subject: row.get_named("subject").unwrap_or_default(),
-        body_md: row.get_named("body_md").unwrap_or_default(),
-        thread_id: row.get_named("thread_id").ok(),
+        project_id: row.get_as(1).ok()?,
+        project_slug: row.get_as(13).unwrap_or_default(),
+        sender_name: row.get_as(12).unwrap_or_default(),
+        to_agents: row.get_as(14).unwrap_or_default(),
+        subject: row.get_as(4).unwrap_or_default(),
+        body_md: row.get_as(5).unwrap_or_default(),
+        thread_id: row.get_as(3).ok(),
         importance: row
-            .get_named("importance")
+            .get_as(6)
             .unwrap_or_else(|_| "normal".to_string()),
-        ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
-        created_ts: row.get_named("created_ts").ok()?,
-        kind: row.get_named("kind").ok(),
-        read_ts: row.get_named("read_ts").ok(),
-        ack_ts: row.get_named("ack_ts").ok(),
+        ack_required: row.get_as::<i64>(7).unwrap_or(0) != 0,
+        created_ts: row.get_as(8).ok()?,
+        kind: row.get_as(9).ok(),
+        read_ts: row.get_as(10).ok(),
+        ack_ts: row.get_as(11).ok(),
         direction: Direction::Inbound,
     })
 }
 
 fn map_outbound_row(row: &SqlRow) -> Option<ExplorerEntry> {
-    let message_id: i64 = row.get_named("id").ok()?;
+    let message_id: i64 = row.get_as(0).ok()?;
     Some(ExplorerEntry {
         message_id,
-        project_id: row.get_named("project_id").ok()?,
-        project_slug: row.get_named("project_slug").unwrap_or_default(),
-        sender_name: row.get_named("sender_name").unwrap_or_default(),
-        to_agents: row.get_named("to_agents").unwrap_or_default(),
-        subject: row.get_named("subject").unwrap_or_default(),
-        body_md: row.get_named("body_md").unwrap_or_default(),
-        thread_id: row.get_named("thread_id").ok(),
+        project_id: row.get_as(1).ok()?,
+        project_slug: row.get_as(10).unwrap_or_default(),
+        sender_name: row.get_as(9).unwrap_or_default(),
+        to_agents: row.get_as(11).unwrap_or_default(),
+        subject: row.get_as(4).unwrap_or_default(),
+        body_md: row.get_as(5).unwrap_or_default(),
+        thread_id: row.get_as(3).ok(),
         importance: row
-            .get_named("importance")
+            .get_as(6)
             .unwrap_or_else(|_| "normal".to_string()),
-        ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
-        created_ts: row.get_named("created_ts").ok()?,
+        ack_required: row.get_as::<i64>(7).unwrap_or(0) != 0,
+        created_ts: row.get_as(8).ok()?,
         kind: None,
         read_ts: None,
         ack_ts: None,

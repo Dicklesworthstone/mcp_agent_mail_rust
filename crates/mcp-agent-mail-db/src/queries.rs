@@ -350,11 +350,7 @@ pub const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
 /// Decode `ProductRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `product_uid`, `name`, `created_at`.
 fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, DbError> {
-    let id = row.get(0).and_then(|v| match v {
-        Value::BigInt(n) => Some(*n),
-        Value::Int(n) => Some(i64::from(*n)),
-        _ => None,
-    });
+    let id = row.get(0).and_then(value_as_i64);
     let product_uid = row
         .get(1)
         .and_then(|v| match v {
@@ -371,11 +367,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
         .ok_or_else(|| DbError::Internal("missing name in product row".to_string()))?;
     let created_at = row
         .get(3)
-        .and_then(|v| match v {
-            Value::BigInt(n) => Some(*n),
-            Value::Int(n) => Some(i64::from(*n)),
-            _ => None,
-        })
+        .and_then(value_as_i64)
         .unwrap_or(0);
 
     Ok(ProductRow {
@@ -392,11 +384,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
 fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     fn get_i64(row: &SqlRow, idx: usize) -> i64 {
         row.get(idx)
-            .and_then(|v| match v {
-                Value::BigInt(n) => Some(*n),
-                Value::Int(n) => Some(i64::from(*n)),
-                _ => None,
-            })
+            .and_then(value_as_i64)
             .unwrap_or(0)
     }
     fn get_string(row: &SqlRow, idx: usize) -> String {
@@ -408,11 +396,7 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
             .unwrap_or_default()
     }
     fn get_opt_i64(row: &SqlRow, idx: usize) -> Option<i64> {
-        row.get(idx).and_then(|v| match v {
-            Value::BigInt(n) => Some(*n),
-            Value::Int(n) => Some(i64::from(*n)),
-            _ => None,
-        })
+        row.get(idx).and_then(value_as_i64)
     }
 
     AgentRow {
@@ -435,12 +419,16 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn value_as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::BigInt(n) => Some(*n),
         Value::Int(n) => Some(i64::from(*n)),
         Value::SmallInt(n) => Some(i64::from(*n)),
         Value::TinyInt(n) => Some(i64::from(*n)),
+        Value::Float(f) => Some(*f as i64),
+        Value::Double(d) => Some(*d as i64),
+        Value::Text(s) => s.parse::<i64>().ok(),
         _ => None,
     }
 }
@@ -2106,47 +2094,47 @@ pub async fn get_messages_details_by_ids(
         match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
             Outcome::Ok(rows) => {
                 for row in rows {
-                    let id: i64 = match row.get_named("id") {
+                    let id: i64 = match row.get_as(0) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let project_id: i64 = match row.get_named("project_id") {
+                    let project_id: i64 = match row.get_as(1) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let sender_id: i64 = match row.get_named("sender_id") {
+                    let sender_id: i64 = match row.get_as(2) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let thread_id: Option<String> = match row.get_named("thread_id") {
+                    let thread_id: Option<String> = match row.get_as(3) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let subject: String = match row.get_named("subject") {
+                    let subject: String = match row.get_as(4) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let body_md: String = match row.get_named("body_md") {
+                    let body_md: String = match row.get_as(5) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let importance: String = match row.get_named("importance") {
+                    let importance: String = match row.get_as(6) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let ack_required: i64 = match row.get_named("ack_required") {
+                    let ack_required: i64 = match row.get_as(7) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let created_ts: i64 = match row.get_named("created_ts") {
+                    let created_ts: i64 = match row.get_as(8) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let attachments: String = match row.get_named("attachments") {
+                    let attachments: String = match row.get_as(9) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let from: String = match row.get_named("from_name") {
+                    let from: String = match row.get_as(10) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
@@ -2238,47 +2226,47 @@ pub async fn list_thread_messages(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let id: i64 = match row.get_named("id") {
+                let id: i64 = match row.get_as(0) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let project_id: i64 = match row.get_named("project_id") {
+                let project_id: i64 = match row.get_as(1) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_id: i64 = match row.get_named("sender_id") {
+                let sender_id: i64 = match row.get_as(2) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let thread_id: Option<String> = match row.get_named("thread_id") {
+                let thread_id: Option<String> = match row.get_as(3) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_named("subject") {
+                let subject: String = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_named("body_md") {
+                let body_md: String = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_named("importance") {
+                let importance: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_named("ack_required") {
+                let ack_required: i64 = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_named("created_ts") {
+                let created_ts: i64 = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_named("attachments") {
+                let attachments: String = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let from: String = match row.get_named("from_name") {
+                let from: String = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -2508,55 +2496,55 @@ pub async fn fetch_inbox(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let id: i64 = match row.get_named("id") {
+                let id: i64 = match row.get_as(0) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let project_id: i64 = match row.get_named("project_id") {
+                let project_id: i64 = match row.get_as(1) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_id: i64 = match row.get_named("sender_id") {
+                let sender_id: i64 = match row.get_as(2) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let thread_id: Option<String> = match row.get_named("thread_id") {
+                let thread_id: Option<String> = match row.get_as(3) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_named("subject") {
+                let subject: String = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_named("body_md") {
+                let body_md: String = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_named("importance") {
+                let importance: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_named("ack_required") {
+                let ack_required: i64 = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_named("created_ts") {
+                let created_ts: i64 = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_named("attachments") {
+                let attachments: String = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_named("kind") {
+                let kind: String = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_name: String = match row.get_named("sender_name") {
+                let sender_name: String = match row.get_as(11) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_ts: Option<i64> = match row.get_named("ack_ts") {
+                let ack_ts: Option<i64> = match row.get_as(12) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -2972,35 +2960,35 @@ pub async fn search_messages(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let id: i64 = match row.get_named("id") {
+                let id: i64 = match row.get_as(0) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_named("subject") {
+                let subject: String = match row.get_as(1) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_named("importance") {
+                let importance: String = match row.get_as(2) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_named("ack_required") {
+                let ack_required: i64 = match row.get_as(3) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_named("created_ts") {
+                let created_ts: i64 = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let thread_id: Option<String> = match row.get_named("thread_id") {
+                let thread_id: Option<String> = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let from: String = match row.get_named("from_name") {
+                let from: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = row.get_named("body_md").unwrap_or_default();
+                let body_md: String = row.get_as(7).unwrap_or_default();
 
                 out.push(SearchRow {
                     id,
@@ -3215,20 +3203,20 @@ pub async fn fetch_inbox_global(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let id: i64 = row.get_named("id").unwrap_or(0);
-                let project_id: i64 = row.get_named("project_id").unwrap_or(0);
-                let sender_id: i64 = row.get_named("sender_id").unwrap_or(0);
-                let thread_id: Option<String> = row.get_named("thread_id").unwrap_or(None);
-                let subject: String = row.get_named("subject").unwrap_or_default();
-                let body_md: String = row.get_named("body_md").unwrap_or_default();
-                let importance: String = row.get_named("importance").unwrap_or_default();
-                let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
-                let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
-                let attachments: String = row.get_named("attachments").unwrap_or_default();
-                let kind: String = row.get_named("kind").unwrap_or_default();
-                let sender_name: String = row.get_named("sender_name").unwrap_or_default();
-                let ack_ts: Option<i64> = row.get_named("ack_ts").unwrap_or(None);
-                let project_slug: String = row.get_named("project_slug").unwrap_or_default();
+                let id: i64 = row.get_as(0).unwrap_or(0);
+                let project_id: i64 = row.get_as(1).unwrap_or(0);
+                let sender_id: i64 = row.get_as(2).unwrap_or(0);
+                let thread_id: Option<String> = row.get_as(3).unwrap_or(None);
+                let subject: String = row.get_as(4).unwrap_or_default();
+                let body_md: String = row.get_as(5).unwrap_or_default();
+                let importance: String = row.get_as(6).unwrap_or_default();
+                let ack_required: i64 = row.get_as(7).unwrap_or(0);
+                let created_ts: i64 = row.get_as(8).unwrap_or(0);
+                let attachments: String = row.get_as(9).unwrap_or_default();
+                let kind: String = row.get_as(10).unwrap_or_default();
+                let sender_name: String = row.get_as(11).unwrap_or_default();
+                let ack_ts: Option<i64> = row.get_as(12).unwrap_or(None);
+                let project_slug: String = row.get_as(13).unwrap_or_default();
 
                 out.push(GlobalInboxRow {
                     message: MessageRow {
@@ -3395,16 +3383,16 @@ pub async fn search_messages_global(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let id: i64 = row.get_named("id").unwrap_or(0);
-                let subject: String = row.get_named("subject").unwrap_or_default();
-                let importance: String = row.get_named("importance").unwrap_or_default();
-                let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
-                let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
-                let thread_id: Option<String> = row.get_named("thread_id").unwrap_or(None);
-                let from: String = row.get_named("from_name").unwrap_or_default();
-                let body_md: String = row.get_named("body_md").unwrap_or_default();
-                let project_id: i64 = row.get_named("project_id").unwrap_or(0);
-                let project_slug: String = row.get_named("project_slug").unwrap_or_default();
+                let id: i64 = row.get_as(0).unwrap_or_default();
+                let subject: String = row.get_as(1).unwrap_or_default();
+                let importance: String = row.get_as(2).unwrap_or_default();
+                let ack_required: i64 = row.get_as(3).unwrap_or_default();
+                let created_ts: i64 = row.get_as(4).unwrap_or_default();
+                let thread_id: Option<String> = row.get_as(5).ok();
+                let from: String = row.get_as(6).unwrap_or_default();
+                let body_md: String = row.get_as(7).unwrap_or_default();
+                let project_id: i64 = row.get_as(8).unwrap_or_default();
+                let project_slug: String = row.get_as(9).unwrap_or_default();
 
                 out.push(GlobalSearchRow {
                     id,
@@ -4180,9 +4168,9 @@ pub async fn renew_reservations(
     let mut sql = format!(
         "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
          FROM file_reservations \
-         WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+         WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
     );
-    let mut params: Vec<Value> = vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
+    let mut params: Vec<Value> = vec![Value::BigInt(project_id), Value::BigInt(agent_id), Value::BigInt(now)];
 
     if let Some(ids) = reservation_ids
         && !ids.is_empty()

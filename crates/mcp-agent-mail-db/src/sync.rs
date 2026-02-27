@@ -26,19 +26,15 @@ pub fn update_message_thread_id(
         .query_sync(lookup_sql, &[Value::BigInt(message_id)])
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-    let current_thread_id = rows
-        .into_iter()
-        .next()
-        .and_then(|row| row.get_named::<String>("thread_id").ok());
+    let mut row_iter = rows.into_iter();
+    let row = row_iter.next().ok_or_else(|| DbError::NotFound {
+        entity: "Message",
+        identifier: message_id.to_string(),
+    })?;
 
-    let Some(current_thread_id) = current_thread_id else {
-        return Err(DbError::NotFound {
-            entity: "Message",
-            identifier: message_id.to_string(),
-        });
-    };
+    let current_thread_id = row.get_named::<String>("thread_id").ok();
 
-    if current_thread_id == target_thread_id {
+    if current_thread_id.as_deref() == Some(target_thread_id) {
         return Ok(false);
     }
 

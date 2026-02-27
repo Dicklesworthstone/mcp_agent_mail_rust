@@ -63,11 +63,18 @@ fn normalize_pattern(pattern: &str) -> String {
         }
     }
 
+    while let Some(pos) = normalized.find("/./") {
+        normalized.replace_range(pos..pos + 3, "/");
+    }
+
     let mut slice = normalized.as_str();
     while let Some(rest) = slice.strip_prefix("./") {
         slice = rest;
     }
-    slice.trim_start_matches('/').to_string()
+    if let Some(rest) = slice.strip_suffix("/.") {
+        slice = rest;
+    }
+    slice.trim_matches('/').to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +347,13 @@ mod tests {
         assert_eq!(normalize_pattern("Cargo.toml"), "Cargo.toml");
     }
 
+    #[test]
+    fn normalize_strips_trailing_slash() {
+        assert_eq!(normalize_pattern("src/"), "src");
+        assert_eq!(normalize_pattern("src/api/"), "src/api");
+        assert_eq!(normalize_pattern("/"), "");
+    }
+
     // ── has_glob_meta tests ──────────────────────────────────────────
 
     #[test]
@@ -457,6 +471,10 @@ mod tests {
         let b = CompiledPattern::new("src/main.rs");
         assert!(a.overlaps(&b));
         assert!(b.overlaps(&a));
+
+        let c = CompiledPattern::new("src/");
+        assert!(c.overlaps(&b));
+        assert!(b.overlaps(&c));
     }
 
     #[test]

@@ -525,19 +525,19 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
 
     for row in &rows {
         let msg = IndexableMessage {
-            id: row.get_named::<i64>("id").unwrap_or(0),
-            project_id: row.get_named::<i64>("project_id").unwrap_or(0),
-            project_slug: row.get_named::<String>("slug").unwrap_or_default(),
-            sender_name: row.get_named::<String>("sender_name").unwrap_or_default(),
-            subject: row.get_named::<String>("subject").unwrap_or_default(),
-            body_md: row.get_named::<String>("body_md").unwrap_or_default(),
+            id: row.get_as::<i64>(0).unwrap_or(0),
+            project_id: row.get_as::<i64>(1).unwrap_or(0),
+            project_slug: row.get_as::<String>(2).unwrap_or_default(),
+            sender_name: row.get_as::<String>(3).unwrap_or_default(),
+            subject: row.get_as::<String>(4).unwrap_or_default(),
+            body_md: row.get_as::<String>(5).unwrap_or_default(),
             thread_id: row
-                .get_named::<Option<String>>("thread_id")
+                .get_as::<Option<String>>(6)
                 .unwrap_or_default(),
             importance: row
-                .get_named::<String>("importance")
+                .get_as::<String>(7)
                 .unwrap_or_else(|_| "normal".to_string()),
-            created_ts: row.get_named::<i64>("created_ts").unwrap_or(0),
+            created_ts: row.get_as::<i64>(8).unwrap_or(0),
         };
         batch.push(msg);
 
