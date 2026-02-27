@@ -756,7 +756,7 @@ impl TimelineScreen {
             save_preset_name: String::new(),
             save_preset_description: String::new(),
             load_preset_cursor: 0,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

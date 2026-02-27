@@ -261,7 +261,7 @@ impl SystemHealthScreen {
             detail_visible: true,
             detail_scroll: 0,
             anomaly_cursor: 0,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

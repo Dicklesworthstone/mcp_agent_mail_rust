@@ -398,7 +398,7 @@ impl MailExplorerScreen {
             focused_synthetic: None,
             list_state: RefCell::new(VirtualizedListState::default()),
             detail_visible: true,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

@@ -439,7 +439,7 @@ impl DashboardScreen {
             last_db_messages: 0,
             last_db_reservations: 0,
             db_delta_baseline_ready: false,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

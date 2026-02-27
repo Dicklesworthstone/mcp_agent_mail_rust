@@ -205,7 +205,7 @@ impl AttachmentExplorerScreen {
             last_error: None,
             data_dirty: true,
             last_reload_tick: 0,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
             focused_synthetic: None,
             prev_attachment_counts: (0, 0, 0, 0),
         }

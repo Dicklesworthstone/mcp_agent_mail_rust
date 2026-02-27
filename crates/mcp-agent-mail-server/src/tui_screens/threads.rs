@@ -533,7 +533,7 @@ impl ThreadExplorerScreen {
             last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
             detail_visible: true,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

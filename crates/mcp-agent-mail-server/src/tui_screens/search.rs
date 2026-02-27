@@ -1220,7 +1220,7 @@ impl SearchCockpitScreen {
             ui_phase: 0,
             rendered_markdown_cache: RefCell::new(HashMap::new()),
             rendered_detail_cache: RefCell::new(HashMap::new()),
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

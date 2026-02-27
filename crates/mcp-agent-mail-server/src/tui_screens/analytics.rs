@@ -195,7 +195,7 @@ impl AnalyticsScreen {
             detail_focus_available: Cell::new(false),
             cached_viz: AnalyticsVizSnapshot::default(),
             detail_visible: true,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

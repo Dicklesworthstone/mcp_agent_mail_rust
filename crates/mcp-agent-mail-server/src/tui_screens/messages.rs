@@ -1088,7 +1088,7 @@ impl MessageBrowserScreen {
             last_search_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
             quick_reply_form: None,
             compose_form: None,
             detail_cache: RefCell::new(None),
