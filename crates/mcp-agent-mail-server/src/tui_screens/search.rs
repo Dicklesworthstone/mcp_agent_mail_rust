@@ -1163,6 +1163,8 @@ pub struct SearchCockpitScreen {
     rendered_markdown_cache: RefCell<HashMap<(i64, &'static str), Arc<Text<'static>>>>,
     /// Cached detail panel text for selected entries, keyed by (id, kind, theme).
     rendered_detail_cache: RefCell<HashMap<DetailCacheKey, Arc<Text<'static>>>>,
+    /// Last-seen data generation snapshot for dirty-state gating.
+    last_data_gen: super::DataGeneration,
 }
 
 impl SearchCockpitScreen {
@@ -1218,6 +1220,7 @@ impl SearchCockpitScreen {
             ui_phase: 0,
             rendered_markdown_cache: RefCell::new(HashMap::new()),
             rendered_detail_cache: RefCell::new(HashMap::new()),
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -2404,6 +2407,10 @@ impl MailScreen for SearchCockpitScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let _dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
         self.ui_phase = (tick_count % 16) as u8;
         if self.search_dirty {
             if self.debounce_remaining > 0 {
@@ -2413,6 +2420,8 @@ impl MailScreen for SearchCockpitScreen {
             }
         }
         self.sync_focused_event();
+
+        self.last_data_gen = current_gen;
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {

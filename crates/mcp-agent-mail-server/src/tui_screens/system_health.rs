@@ -218,6 +218,9 @@ pub struct SystemHealthScreen {
     detail_scroll: usize,
     /// Selected anomaly/finding index for detail panel focus.
     anomaly_cursor: usize,
+    /// Generation snapshot from last tick (for dirty-state gating).
+    #[allow(dead_code)] // reserved for future tick() gating
+    last_data_gen: super::DataGeneration,
 }
 
 impl SystemHealthScreen {
@@ -258,6 +261,7 @@ impl SystemHealthScreen {
             detail_visible: true,
             detail_scroll: 0,
             anomaly_cursor: 0,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -1691,6 +1695,7 @@ mod tests {
             detail_visible: true,
             detail_scroll: 0,
             anomaly_cursor: 0,
+            last_data_gen: crate::tui_screens::DataGeneration::default(),
         }
     }
 

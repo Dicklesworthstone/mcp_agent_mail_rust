@@ -185,6 +185,8 @@ pub struct AgentsScreen {
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
     detail_scroll: usize,
+    /// Last observed data-channel generation for dirty-state gating.
+    last_data_gen: super::DataGeneration,
 }
 
 impl AgentsScreen {
@@ -212,6 +214,7 @@ impl AgentsScreen {
             total_msgs_this_tick: 0,
             detail_visible: true,
             detail_scroll: 0,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -550,20 +553,28 @@ impl MailScreen for AgentsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        self.ingest_events(state);
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
+        if dirty.events {
+            self.ingest_events(state);
+        }
         if !self.reduced_motion {
             self.advance_status_fades();
             self.advance_message_flashes();
             self.advance_stagger_reveals();
         }
-        // Rebuild every second (10 ticks)
-        if tick_count.is_multiple_of(10) {
+        // Rebuild every second (10 ticks), but only when data changed.
+        if tick_count.is_multiple_of(10) && (dirty.db_stats || dirty.events) {
             let total: u64 = self.msg_counts.values().sum();
             self.prev_total_msgs = total;
             self.record_sparkline_sample();
             self.rebuild_from_state(state);
         }
         self.sync_focused_event();
+
+        self.last_data_gen = current_gen;
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {

@@ -1025,6 +1025,8 @@ pub struct MessageBrowserScreen {
     last_results_area: Cell<Rect>,
     /// Last rendered detail area.
     last_detail_area: Cell<Rect>,
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
     /// Quick reply modal state (when active).
     quick_reply_form: Option<QuickReplyFormState>,
     /// Message compose modal state (when active).
@@ -1086,6 +1088,7 @@ impl MessageBrowserScreen {
             last_search_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_data_gen: super::DataGeneration::default(),
             quick_reply_form: None,
             compose_form: None,
             detail_cache: RefCell::new(None),
@@ -2662,12 +2665,18 @@ impl MailScreen for MessageBrowserScreen {
             }
         }
 
-        // Periodic refresh for empty-query mode (every 5 seconds)
+        // Periodic refresh for empty-query mode (every 5 seconds),
+        // but only when underlying data has actually changed.
         if self.search_input.value().is_empty() {
             let should_refresh = self.last_refresh.is_none_or(|t| t.elapsed().as_secs() >= 5);
             if should_refresh {
-                self.search_dirty = true;
-                self.debounce_remaining = 0;
+                let current_gen = state.data_generation();
+                let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+                if dirty.any() {
+                    self.search_dirty = true;
+                    self.debounce_remaining = 0;
+                }
+                self.last_data_gen = current_gen;
             }
         }
         self.sync_focused_event();

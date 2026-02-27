@@ -51,6 +51,8 @@ pub struct ProjectsScreen {
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
     detail_scroll: usize,
+    /// Last observed data-channel generation for dirty-state gating.
+    last_data_gen: super::DataGeneration,
 }
 
 impl ProjectsScreen {
@@ -68,6 +70,7 @@ impl ProjectsScreen {
             prev_totals: (0, 0, 0, 0),
             detail_visible: true,
             detail_scroll: 0,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -276,13 +279,20 @@ impl MailScreen for ProjectsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        self.ingest_events(state);
-        // Rebuild every second
-        if tick_count.is_multiple_of(10) {
-            // Save previous totals for trend computation
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
+        if dirty.events {
+            self.ingest_events(state);
+        }
+        // Rebuild every second, but only when data changed.
+        if tick_count.is_multiple_of(10) && (dirty.db_stats || dirty.events) {
             self.prev_totals = self.compute_totals();
             self.rebuild_from_state(state);
         }
+
+        self.last_data_gen = current_gen;
     }
 
     #[allow(clippy::cast_possible_truncation)]

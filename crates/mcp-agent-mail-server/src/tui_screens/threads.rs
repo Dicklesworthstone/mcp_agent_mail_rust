@@ -493,6 +493,8 @@ pub struct ThreadExplorerScreen {
     last_detail_area: Cell<Rect>,
     /// Whether the detail panel is visible on wide screens (user toggle).
     detail_visible: bool,
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
 }
 
 impl ThreadExplorerScreen {
@@ -531,6 +533,7 @@ impl ThreadExplorerScreen {
             last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
             detail_visible: true,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -1382,20 +1385,29 @@ impl MailScreen for ThreadExplorerScreen {
         self.urgent_pulse_on =
             self.reduced_motion || (tick_count / URGENT_PULSE_HALF_PERIOD_TICKS).is_multiple_of(2);
         self.promote_pending_message_drag_if_due(state);
-        // Initial load or dirty flag
+
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
+        // Initial load or user-driven dirty flag — always honored.
         if self.list_dirty {
             self.refresh_thread_list(state);
+            self.last_data_gen = current_gen;
             return;
         }
 
-        // Periodic refresh
+        // Periodic refresh: only set list_dirty when data actually changed
+        // (new events or DB stats mutation), avoiding redundant re-queries.
         let should_refresh = self
             .last_refresh
             .is_none_or(|t| t.elapsed().as_secs() >= REFRESH_INTERVAL_SECS);
-        if should_refresh {
+        if should_refresh && (dirty.events || dirty.db_stats) {
             self.list_dirty = true;
         }
+
         self.sync_focused_event();
+        self.last_data_gen = current_gen;
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {

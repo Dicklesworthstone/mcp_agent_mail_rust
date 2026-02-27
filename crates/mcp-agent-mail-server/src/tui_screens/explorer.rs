@@ -362,6 +362,8 @@ pub struct MailExplorerScreen {
     list_state: RefCell<VirtualizedListState>,
     /// Whether the detail panel is visible on wide screens (user toggle).
     detail_visible: bool,
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
 }
 
 impl MailExplorerScreen {
@@ -396,6 +398,7 @@ impl MailExplorerScreen {
             focused_synthetic: None,
             list_state: RefCell::new(VirtualizedListState::default()),
             detail_visible: true,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -951,6 +954,13 @@ impl MailScreen for MailExplorerScreen {
     }
 
     fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
+        // User-driven search (debounce) — NOT gated on data generation
+        // because the user may be typing a new query with no server-side
+        // data change.
         if self.search_dirty {
             if self.debounce_remaining > 0 {
                 self.debounce_remaining -= 1;
@@ -959,10 +969,13 @@ impl MailScreen for MailExplorerScreen {
             }
         }
 
-        if self.pressure_mode && self.pressure_dirty {
+        // Pressure board refresh: user-driven flag AND db_stats change.
+        if self.pressure_mode && self.pressure_dirty && dirty.db_stats {
             self.refresh_pressure_board(state);
         }
+
         self.sync_focused_event();
+        self.last_data_gen = current_gen;
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {

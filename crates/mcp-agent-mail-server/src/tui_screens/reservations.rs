@@ -330,6 +330,8 @@ pub struct ReservationsScreen {
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
     detail_scroll: usize,
+    /// Last observed data-channel generation for dirty-state gating.
+    last_data_gen: super::DataGeneration,
 }
 
 impl ReservationsScreen {
@@ -366,6 +368,7 @@ impl ReservationsScreen {
             load_preset_cursor: 0,
             detail_visible: true,
             detail_scroll: 0,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -1530,31 +1533,41 @@ impl MailScreen for ReservationsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
         let mut changed = false;
-        let snapshot = state.db_stats_snapshot();
-        if let Some(snapshot) = snapshot.clone() {
-            changed |= self.apply_db_snapshot(&snapshot);
-            if !snapshot.reservation_snapshots.is_empty() || snapshot.file_reservations == 0 {
-                self.fallback_issue = None;
+        if dirty.db_stats {
+            let snapshot = state.db_stats_snapshot();
+            if let Some(snapshot) = snapshot.clone() {
+                changed |= self.apply_db_snapshot(&snapshot);
+                if !snapshot.reservation_snapshots.is_empty() || snapshot.file_reservations == 0 {
+                    self.fallback_issue = None;
+                }
+            }
+            let needs_fallback = snapshot.as_ref().is_some_and(|snap| {
+                snap.reservation_snapshots.is_empty() && snap.file_reservations > 0
+            });
+            if needs_fallback
+                && tick_count.saturating_sub(self.last_fallback_probe_tick)
+                    >= FALLBACK_DB_REFRESH_TICKS
+            {
+                self.last_fallback_probe_tick = tick_count;
+                changed |= self.refresh_from_db_fallback(state);
             }
         }
-        changed |= self.ingest_events(state);
-        let needs_fallback = snapshot.as_ref().is_some_and(|snap| {
-            snap.reservation_snapshots.is_empty() && snap.file_reservations > 0
-        });
-        if needs_fallback
-            && tick_count.saturating_sub(self.last_fallback_probe_tick) >= FALLBACK_DB_REFRESH_TICKS
-        {
-            self.last_fallback_probe_tick = tick_count;
-            changed |= self.refresh_from_db_fallback(state);
+        if dirty.events {
+            changed |= self.ingest_events(state);
         }
-        if changed || tick_count.is_multiple_of(10) {
-            // Save previous counts for trend computation before rebuild
+        if changed || (tick_count.is_multiple_of(10) && dirty.any()) {
             let (a, e, s, x) = self.summary_counts();
             self.prev_counts = (a as u64, e as u64, s as u64, x as u64);
             self.rebuild_sorted();
         }
         self.sync_focused_event();
+
+        self.last_data_gen = current_gen;
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {

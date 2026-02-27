@@ -237,6 +237,8 @@ pub struct ArchiveBrowserScreen {
     last_refresh_tick: u64,
     /// Whether the preview panel is visible on wide screens (user toggle).
     detail_visible: bool,
+    /// Generation snapshot from last tick (for dirty-state gating).
+    last_data_gen: super::DataGeneration,
 }
 
 impl ArchiveBrowserScreen {
@@ -256,6 +258,7 @@ impl ArchiveBrowserScreen {
             selected_project: None,
             last_refresh_tick: 0,
             detail_visible: true,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -1027,8 +1030,15 @@ impl MailScreen for ArchiveBrowserScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        // Refresh every 50 ticks (~5 seconds) or on first tick
-        if self.last_refresh_tick == 0 || tick_count.saturating_sub(self.last_refresh_tick) > 50 {
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
+        // First tick: always initialize (ungated).
+        let is_first = self.last_refresh_tick == 0;
+        // Periodic refresh every 50 ticks (~5 s), but only when data changed.
+        let is_periodic = tick_count.saturating_sub(self.last_refresh_tick) > 50 && dirty.any();
+
+        if is_first || is_periodic {
             self.last_refresh_tick = tick_count;
             // Preserve expansion state across refreshes
             let expanded_state: Vec<(PathBuf, bool)> = self
@@ -1050,6 +1060,8 @@ impl MailScreen for ArchiveBrowserScreen {
                 }
             }
         }
+
+        self.last_data_gen = current_gen;
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {

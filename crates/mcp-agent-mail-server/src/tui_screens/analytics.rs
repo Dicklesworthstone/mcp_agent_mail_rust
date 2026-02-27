@@ -168,6 +168,8 @@ pub struct AnalyticsScreen {
     cached_viz: AnalyticsVizSnapshot,
     /// Whether the user has toggled the detail panel visible (`i` key).
     detail_visible: bool,
+    /// Last-seen data generation snapshot for dirty-state gating.
+    last_data_gen: super::DataGeneration,
 }
 
 impl AnalyticsScreen {
@@ -193,6 +195,7 @@ impl AnalyticsScreen {
             detail_focus_available: Cell::new(false),
             cached_viz: AnalyticsVizSnapshot::default(),
             detail_visible: true,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -2612,15 +2615,21 @@ impl MailScreen for AnalyticsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
         let should_refresh = self
             .last_refresh_tick
             .is_none_or(|last| tick_count.wrapping_sub(last) >= REFRESH_INTERVAL_TICKS);
-        if should_refresh {
+        if should_refresh && dirty.any() {
             self.refresh_feed(Some(state));
             // Rebuild viz snapshot here (in tick) so view() never does I/O.
             self.cached_viz = build_runtime_viz_snapshot(state);
             self.last_refresh_tick = Some(tick_count);
         }
+
+        self.last_data_gen = current_gen;
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {

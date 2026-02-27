@@ -178,6 +178,9 @@ pub struct AttachmentExplorerScreen {
     data_dirty: bool,
     last_reload_tick: u64,
 
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
+
     /// Synthetic event for the focused attachment's source message.
     focused_synthetic: Option<crate::tui_events::MailEvent>,
     /// Previous attachment counts for `MetricTrend` computation.
@@ -202,6 +205,7 @@ impl AttachmentExplorerScreen {
             last_error: None,
             data_dirty: true,
             last_reload_tick: 0,
+            last_data_gen: super::DataGeneration::default(),
             focused_synthetic: None,
             prev_attachment_counts: (0, 0, 0, 0),
         }
@@ -964,9 +968,23 @@ impl MailScreen for AttachmentExplorerScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        if self.data_dirty
-            || tick_count.saturating_sub(self.last_reload_tick) >= RELOAD_INTERVAL_TICKS
-        {
+        let interval_elapsed =
+            tick_count.saturating_sub(self.last_reload_tick) >= RELOAD_INTERVAL_TICKS;
+
+        // User-driven dirty flag always triggers a reload immediately.
+        // Interval-based reload only fires when data actually changed.
+        let should_reload = if self.data_dirty {
+            true
+        } else if interval_elapsed {
+            let current_gen = state.data_generation();
+            let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+            self.last_data_gen = current_gen;
+            dirty.db_stats || dirty.events
+        } else {
+            false
+        };
+
+        if should_reload {
             // Save previous counts for trend computation before reload
             self.prev_attachment_counts = self.type_counts();
             self.load_attachments(state);

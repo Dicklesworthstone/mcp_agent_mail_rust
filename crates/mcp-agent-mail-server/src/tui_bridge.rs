@@ -1177,8 +1177,12 @@ mod tests {
         let state = TuiSharedState::new(&config);
         let gen_before = state.data_generation();
         state.push_event(crate::tui_events::MailEvent::ServerStarted {
+            seq: 0,
             timestamp_micros: 1,
-            project: "test".into(),
+            source: crate::tui_events::EventSource::Lifecycle,
+            redacted: false,
+            endpoint: "http://127.0.0.1:8765/mcp/".to_string(),
+            config_summary: "test".to_string(),
         });
         let gen_after = state.data_generation();
         assert!(gen_after.event_total_pushed > gen_before.event_total_pushed);

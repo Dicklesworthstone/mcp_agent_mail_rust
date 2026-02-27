@@ -370,6 +370,8 @@ pub struct ToolMetricsScreen {
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
     detail_scroll: usize,
+    /// Last observed data-channel generation for dirty-state gating.
+    last_data_gen: super::DataGeneration,
 }
 
 impl ToolMetricsScreen {
@@ -397,6 +399,7 @@ impl ToolMetricsScreen {
             drilldown_index: 0,
             detail_visible: true,
             detail_scroll: 0,
+            last_data_gen: super::DataGeneration::default(),
         }
     }
 
@@ -1397,18 +1400,25 @@ impl MailScreen for ToolMetricsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        // ── Dirty-state gated data ingestion ────────────────────────
+        let current_gen = state.data_generation();
+        let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+
         if self.tool_map.is_empty()
-            || tick_count.wrapping_sub(self.last_persisted_hydrate_tick)
-                >= PERSISTED_HYDRATE_INTERVAL_TICKS
+            || (dirty.db_stats
+                && tick_count.wrapping_sub(self.last_persisted_hydrate_tick)
+                    >= PERSISTED_HYDRATE_INTERVAL_TICKS)
         {
             self.hydrate_from_persisted_metrics(state);
             self.last_persisted_hydrate_tick = tick_count;
         }
-        self.ingest_events(state);
-        if self.tool_map.is_empty() || tick_count.is_multiple_of(20) {
+        if dirty.events {
+            self.ingest_events(state);
+        }
+        if self.tool_map.is_empty() || (dirty.requests && tick_count.is_multiple_of(20)) {
             self.hydrate_from_runtime_snapshot();
         }
-        if tick_count.is_multiple_of(10) {
+        if tick_count.is_multiple_of(10) && (dirty.events || dirty.requests || dirty.db_stats) {
             self.rebuild_sorted();
             self.snapshot_percentiles();
             self.snapshot_tick += 1;
@@ -1421,6 +1431,8 @@ impl MailScreen for ToolMetricsScreen {
         }
         self.refresh_latency_ribbon_animation();
         self.sync_focused_event();
+
+        self.last_data_gen = current_gen;
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
