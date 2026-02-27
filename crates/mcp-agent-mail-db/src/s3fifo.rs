@@ -254,7 +254,7 @@ where
 
             if freq >= 1 {
                 self.main.push_back(key.clone());
-                self.index.insert(key, Node::Main { value, freq: 0 });
+                self.index.insert(key, Node::Main { value, freq: freq - 1 });
             }
         }
     }
