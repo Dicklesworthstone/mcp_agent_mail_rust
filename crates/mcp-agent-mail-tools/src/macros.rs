@@ -125,7 +125,10 @@ pub async fn macro_start_session(
                 conflicts: Vec::new(),
             }
         } else {
-            let ttl = file_reservation_ttl_seconds.unwrap_or(3600);
+            let ttl = match file_reservation_ttl_seconds {
+                Some(t) if t > 0 => t,
+                _ => 3600,
+            };
             let reason = file_reservation_reason.unwrap_or_else(|| "macro-session".to_string());
             let reservation_json = crate::reservations::file_reservation_paths(
                 ctx,
@@ -389,7 +392,10 @@ pub async fn macro_file_reservation_cycle(
     reason: Option<String>,
     auto_release: Option<bool>,
 ) -> McpResult<String> {
-    let ttl = ttl_seconds.unwrap_or(3600);
+    let ttl = match ttl_seconds {
+        Some(t) if t > 0 => t,
+        _ => 3600,
+    };
     let is_exclusive = exclusive.unwrap_or(true);
     let should_release = auto_release.unwrap_or(false);
 
@@ -528,7 +534,10 @@ pub async fn macro_contact_handshake(
     })?;
 
     let should_auto_accept = auto_accept.unwrap_or(false);
-    let ttl = ttl_seconds.unwrap_or(604_800); // 7 days
+    let ttl = match ttl_seconds {
+        Some(t) if t > 0 => t,
+        _ => 604_800, // 7 days
+    };
     let target_project_key = to_project.clone().unwrap_or_else(|| project_key.clone());
 
     // Fast path: auto-accept same-project without welcome message.
