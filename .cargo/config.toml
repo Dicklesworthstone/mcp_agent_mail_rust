@@ -57,3 +57,6 @@ git-fetch-with-cli = false
 
 [registries.crates-io]
 protocol = "sparse"
+
+[env]
+RUST_TEST_THREADS = "1"
