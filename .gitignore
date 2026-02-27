@@ -85,7 +85,12 @@ SilverFox:
 
 # Beads history snapshots
 .beads/.br_history/
-.claude/settings.local.json
+
+# Claude Code / AI agent ephemeral files
+.claude/
+
+# MCP config backup files (auto-generated during config updates)
+*.mcp.json.*.bak
 
 # CASS session mining output
 LIST_OF_INPUT_MESSAGES.md
