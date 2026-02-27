@@ -287,7 +287,15 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 
 Downloads the right binary for your platform, installs to `~/.local/bin`, and optionally updates your `PATH`. Supports `--verify` for checksum + Sigstore cosign verification.
 
-Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify`, `--easy-mode` (auto-update PATH), `--force`.
+Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify`, `--easy-mode` (auto-update PATH), `--force`, `--uninstall`, `--yes`, `--purge`.
+
+### Windows One-Liner (PowerShell)
+
+```powershell
+iwr -useb "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.ps1?$(Get-Random)" | iex
+```
+
+PowerShell options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`.
 
 ### From Source
 
@@ -308,6 +316,7 @@ Requires Rust nightly (see `rust-toolchain.toml`). Also requires sibling workspa
 | Linux | aarch64 | `mcp-agent-mail-aarch64-unknown-linux-gnu` |
 | macOS | x86_64 | `mcp-agent-mail-x86_64-apple-darwin` |
 | macOS | Apple Silicon | `mcp-agent-mail-aarch64-apple-darwin` |
+| Windows | x86_64 | `mcp-agent-mail-x86_64-pc-windows-msvc.zip` |
 
 ---
 
@@ -830,7 +839,8 @@ mcp_agent_mail_rust/
 ├── tests/e2e/                              # End-to-end test scripts
 ├── scripts/                                # CLI integration tests, utilities
 ├── docs/                                   # ADRs, specs, runbooks, migration guides
-├── install.sh                              # Multi-platform installer
+├── install.sh                              # Unix installer
+├── install.ps1                             # Windows PowerShell installer
 └── rust-toolchain.toml                     # Nightly toolchain requirement
 ```
 
