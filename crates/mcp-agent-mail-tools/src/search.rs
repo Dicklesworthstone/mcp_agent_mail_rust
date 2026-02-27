@@ -663,7 +663,10 @@ pub async fn search_messages(
     until: Option<String>,
     explain: Option<bool>,
 ) -> McpResult<String> {
-    let max_results_raw = limit.unwrap_or(20).clamp(1, 1000);
+    let max_results_raw = match limit {
+        Some(l) if l > 0 => l.clamp(1, 1000),
+        _ => 20,
+    };
     let max_results = max_results_raw.unsigned_abs() as usize;
     let offset_val = if cursor.is_some() {
         0

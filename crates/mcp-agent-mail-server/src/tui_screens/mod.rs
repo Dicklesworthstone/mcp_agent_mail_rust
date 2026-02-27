@@ -1171,13 +1171,13 @@ mod tests {
 
     #[test]
     fn dirty_since_identical_generations_produces_no_flags() {
-        let gen = DataGeneration {
+        let data_gen = DataGeneration {
             event_total_pushed: 42,
             console_log_seq: 10,
             db_stats_gen: 3,
             request_gen: 99,
         };
-        let flags = dirty_since(&gen, &gen);
+        let flags = dirty_since(&data_gen, &data_gen);
         assert!(!flags.any(), "identical generations must produce zero dirty flags");
         assert!(!flags.events);
         assert!(!flags.console_log);
@@ -1281,10 +1281,10 @@ mod tests {
 
     #[test]
     fn data_generation_default_is_zero() {
-        let gen = DataGeneration::default();
-        assert_eq!(gen.event_total_pushed, 0);
-        assert_eq!(gen.console_log_seq, 0);
-        assert_eq!(gen.db_stats_gen, 0);
-        assert_eq!(gen.request_gen, 0);
+        let data_gen = DataGeneration::default();
+        assert_eq!(data_gen.event_total_pushed, 0);
+        assert_eq!(data_gen.console_log_seq, 0);
+        assert_eq!(data_gen.db_stats_gen, 0);
+        assert_eq!(data_gen.request_gen, 0);
     }
 }

@@ -1164,11 +1164,11 @@ mod tests {
     fn data_generation_starts_at_zero() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
-        let gen = state.data_generation();
-        assert_eq!(gen.event_total_pushed, 0);
-        assert_eq!(gen.console_log_seq, 0);
-        assert_eq!(gen.db_stats_gen, 0);
-        assert_eq!(gen.request_gen, 0);
+        let data_gen = state.data_generation();
+        assert_eq!(data_gen.event_total_pushed, 0);
+        assert_eq!(data_gen.console_log_seq, 0);
+        assert_eq!(data_gen.db_stats_gen, 0);
+        assert_eq!(data_gen.request_gen, 0);
     }
 
     #[test]
@@ -1218,8 +1218,8 @@ mod tests {
     fn dirty_since_no_change_returns_clean() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
-        let gen = state.data_generation();
-        let flags = crate::tui_screens::dirty_since(&gen, &state.data_generation());
+        let data_gen = state.data_generation();
+        let flags = crate::tui_screens::dirty_since(&data_gen, &state.data_generation());
         assert!(!flags.any());
     }
 
@@ -1227,12 +1227,12 @@ mod tests {
     fn dirty_since_selective_channel_detection() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
-        let gen = state.data_generation();
+        let data_gen = state.data_generation();
 
         // Only bump console log
         state.push_console_log("test".into());
 
-        let flags = crate::tui_screens::dirty_since(&gen, &state.data_generation());
+        let flags = crate::tui_screens::dirty_since(&data_gen, &state.data_generation());
         assert!(!flags.events, "events should be clean");
         assert!(flags.console_log, "console_log should be dirty");
         assert!(!flags.db_stats, "db_stats should be clean");

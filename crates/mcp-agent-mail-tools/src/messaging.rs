@@ -2580,7 +2580,10 @@ pub async fn fetch_inbox(
     include_bodies: Option<bool>,
     topic: Option<String>,
 ) -> McpResult<String> {
-    let mut msg_limit = limit.unwrap_or(20);
+    let mut msg_limit = match limit {
+        Some(l) if l > 0 => l,
+        _ => 20,
+    };
     if msg_limit < 1 {
         return Err(legacy_tool_error(
             "INVALID_LIMIT",

@@ -229,11 +229,7 @@ fn urgent_poller_bypass_active(state: &TuiSharedState) -> bool {
     })
 }
 
-fn screen_tick_divisor(
-    screen: MailScreenId,
-    active: MailScreenId,
-    urgent_bypass: bool,
-) -> u64 {
+fn screen_tick_divisor(screen: MailScreenId, active: MailScreenId, urgent_bypass: bool) -> u64 {
     let tier = screen_cadence_tier(screen, active);
     let mut divisor = screen_cadence_base_divisor(tier);
     if is_high_priority_screen(screen) {
@@ -319,7 +315,10 @@ impl TickStrategy for TieredCadenceTickStrategy {
                 "urgent_bypass_divisor".into(),
                 URGENT_BYPASS_SCREEN_TICK_DIVISOR.to_string(),
             ),
-            ("urgent_bypass_active".into(), self.cached_urgent.to_string()),
+            (
+                "urgent_bypass_active".into(),
+                self.cached_urgent.to_string(),
+            ),
         ]
     }
 }
@@ -10716,10 +10715,12 @@ mod tests {
         screen.panic_on_tick = true;
         model.set_screen(MailScreenId::Messages, Box::new(screen));
 
-        model.state.update_db_stats(crate::tui_events::DbStatSnapshot {
-            ack_pending: 1,
-            ..Default::default()
-        });
+        model
+            .state
+            .update_db_stats(crate::tui_events::DbStatSnapshot {
+                ack_pending: 1,
+                ..Default::default()
+            });
 
         let _ = model.update(MailMsg::Terminal(Event::Tick));
         assert!(

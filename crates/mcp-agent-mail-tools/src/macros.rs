@@ -155,7 +155,10 @@ pub async fn macro_start_session(
         agent.name.clone(),
         Some(false),
         None,
-        Some(inbox_limit.unwrap_or(10)),
+        Some(match inbox_limit {
+            Some(l) if l > 0 => l,
+            _ => 10,
+        }),
         Some(false),
         None,
     )
@@ -331,7 +334,10 @@ pub async fn macro_prepare_thread(
         agent.name.clone(),
         Some(false),
         None,
-        Some(inbox_limit.unwrap_or(10)),
+        Some(match inbox_limit {
+            Some(l) if l > 0 => l,
+            _ => 10,
+        }),
         Some(include_inbox_bodies.unwrap_or(false)),
         None,
     )
