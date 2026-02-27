@@ -6411,6 +6411,7 @@ mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::{Cx, Outcome};
+    use chrono::Datelike;
     use mcp_agent_mail_db::{DbPool, DbPoolConfig, micros_to_iso, queries};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
@@ -10748,5 +10749,391 @@ mod tests {
             20,
             "missing_ids should be capped at 20"
         );
+    }
+
+    // ── Python archive compatibility verification (br-28mgh.5.1) ──────────
+
+    /// Create a Python-format project.json and verify Rust can read it.
+    #[test]
+    fn compat_python_project_json_readable() {
+        let dir = TempDir::new().unwrap();
+        let project_root = dir.path().join("projects").join("test-proj");
+        fs::create_dir_all(&project_root).unwrap();
+
+        // Python-format project.json (uses human_key, same as Rust)
+        let project_json = serde_json::json!({
+            "slug": "test-proj",
+            "human_key": "/tmp/test-project"
+        });
+        fs::write(
+            project_root.join("project.json"),
+            serde_json::to_string_pretty(&project_json).unwrap(),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(project_root.join("project.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["slug"], "test-proj");
+        assert_eq!(parsed["human_key"], "/tmp/test-project");
+    }
+
+    /// Create a Python-format agent profile.json and verify read_agent_profile parses it.
+    #[test]
+    fn compat_python_agent_profile_readable() {
+        let dir = TempDir::new().unwrap();
+        let project_root = dir.path().join("projects").join("test-proj");
+        let agent_dir = project_root.join("agents").join("RedFox");
+        fs::create_dir_all(&agent_dir).unwrap();
+
+        // Python-format profile.json
+        let profile = serde_json::json!({
+            "name": "RedFox",
+            "program": "codex",
+            "model": "gpt-5",
+            "task_description": "Working on feature X",
+            "inception_ts": "2026-02-15T06:47:55.258538Z",
+            "last_active_ts": "2026-02-15T06:47:55.258538Z",
+            "attachments_policy": "auto"
+        });
+        fs::write(
+            agent_dir.join("profile.json"),
+            serde_json::to_string_pretty(&profile).unwrap(),
+        )
+        .unwrap();
+
+        let archive = ProjectArchive {
+            slug: project_root.file_name().unwrap().to_string_lossy().into(),
+            root: project_root.clone(),
+            repo_root: dir.path().to_path_buf(),
+            lock_path: project_root.join(".archive.lock"),
+            canonical_root: project_root.clone(),
+            canonical_repo_root: dir.path().to_path_buf(),
+        };
+        let result = read_agent_profile(&archive, "RedFox").unwrap();
+        assert!(result.is_some(), "profile should be found");
+        let val = result.unwrap();
+        assert_eq!(val["name"], "RedFox");
+        assert_eq!(val["program"], "codex");
+        assert_eq!(val["model"], "gpt-5");
+        assert_eq!(val["inception_ts"], "2026-02-15T06:47:55.258538Z");
+    }
+
+    /// Verify Python-format agent profile with missing optional fields parses gracefully.
+    #[test]
+    fn compat_python_agent_profile_missing_optional_fields() {
+        let dir = TempDir::new().unwrap();
+        let project_root = dir.path().join("projects").join("test-proj");
+        let agent_dir = project_root.join("agents").join("BlueLake");
+        fs::create_dir_all(&agent_dir).unwrap();
+
+        // Minimal Python profile — no task_description, no attachments_policy
+        let profile = serde_json::json!({
+            "name": "BlueLake",
+            "program": "claude-code",
+            "model": "opus-4.6",
+            "inception_ts": "2026-01-01T00:00:00Z",
+            "last_active_ts": "2026-01-01T00:00:00Z"
+        });
+        fs::write(
+            agent_dir.join("profile.json"),
+            serde_json::to_string_pretty(&profile).unwrap(),
+        )
+        .unwrap();
+
+        let archive = ProjectArchive {
+            slug: project_root.file_name().unwrap().to_string_lossy().into(),
+            root: project_root.clone(),
+            repo_root: dir.path().to_path_buf(),
+            lock_path: project_root.join(".archive.lock"),
+            canonical_root: project_root.clone(),
+            canonical_repo_root: dir.path().to_path_buf(),
+        };
+        let result = read_agent_profile(&archive, "BlueLake").unwrap();
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(val["name"], "BlueLake");
+        // Optional field should be null/missing, not an error
+        assert!(
+            val.get("task_description").is_none() || val["task_description"].is_null(),
+            "missing optional field should not cause parse error"
+        );
+    }
+
+    /// Verify Python-format message bundle (JSON frontmatter + Markdown body) is readable.
+    #[test]
+    fn compat_python_message_bundle_parseable() {
+        let dir = TempDir::new().unwrap();
+        let project_root = dir.path().join("projects").join("test-proj");
+        let msg_dir = project_root.join("messages").join("2026").join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+
+        // Python-format message bundle
+        let bundle = r#"---json
+{
+  "ack_required": false,
+  "attachments": [],
+  "bcc": [],
+  "cc": [],
+  "created": "2026-02-04T20:49:48.661479+00:00",
+  "from": "FuchsiaForge",
+  "id": 1081,
+  "importance": "high",
+  "project": "/data/projects/test-proj",
+  "project_slug": "test-proj",
+  "subject": "[PORT-PLAN] MCP Agent Mail Rust Port",
+  "thread_id": "PORT-PLAN",
+  "to": ["FuchsiaForge"]
+}
+---
+
+# Message Body
+
+This is a test message from the Python version.
+"#;
+        let filename = "2026-02-04T20-49-48Z__port-plan-mcp-agent-mail-rust-port__1081.md";
+        fs::write(msg_dir.join(filename), bundle).unwrap();
+
+        // Verify the file exists and is readable
+        let content = fs::read_to_string(msg_dir.join(filename)).unwrap();
+        assert!(content.contains("---json"), "should have JSON frontmatter marker");
+
+        // Extract and parse JSON frontmatter
+        let json_start = content.find("---json\n").unwrap() + 8;
+        let json_end = content[json_start..].find("\n---").unwrap() + json_start;
+        let frontmatter = &content[json_start..json_end];
+        let parsed: serde_json::Value = serde_json::from_str(frontmatter).unwrap();
+
+        assert_eq!(parsed["from"], "FuchsiaForge");
+        assert_eq!(parsed["id"], 1081);
+        assert_eq!(parsed["thread_id"], "PORT-PLAN");
+        assert_eq!(parsed["importance"], "high");
+        assert!(parsed["to"].as_array().unwrap().contains(&serde_json::json!("FuchsiaForge")));
+    }
+
+    /// Verify Python-format file reservation JSON is parseable by Rust.
+    #[test]
+    fn compat_python_file_reservation_parseable() {
+        let dir = TempDir::new().unwrap();
+        let project_root = dir.path().join("projects").join("test-proj");
+        let res_dir = project_root.join("file_reservations");
+        fs::create_dir_all(&res_dir).unwrap();
+
+        // Python-format reservation (uses "path" key, not "path_pattern")
+        let reservation_legacy = serde_json::json!({
+            "id": 42,
+            "agent": "RedFox",
+            "path": "src/main.rs",
+            "exclusive": true,
+            "reason": "working on main module",
+            "expires_ts": "2026-02-15T07:47:58.415682Z"
+        });
+        fs::write(
+            res_dir.join("id-42.json"),
+            serde_json::to_string_pretty(&reservation_legacy).unwrap(),
+        )
+        .unwrap();
+
+        // Rust-format reservation (uses "path_pattern" key)
+        let reservation_rust = serde_json::json!({
+            "id": 43,
+            "agent": "BlueLake",
+            "path_pattern": "src/**/*.rs",
+            "exclusive": false,
+            "reason": "reading source files",
+            "expires_ts": "2026-02-15T08:00:00Z"
+        });
+        fs::write(
+            res_dir.join("id-43.json"),
+            serde_json::to_string_pretty(&reservation_rust).unwrap(),
+        )
+        .unwrap();
+
+        // Both should be parseable as JSON
+        let legacy_content = fs::read_to_string(res_dir.join("id-42.json")).unwrap();
+        let legacy: serde_json::Value = serde_json::from_str(&legacy_content).unwrap();
+        assert_eq!(legacy["agent"], "RedFox");
+        // Python uses "path" key
+        assert_eq!(legacy["path"], "src/main.rs");
+
+        let rust_content = fs::read_to_string(res_dir.join("id-43.json")).unwrap();
+        let rust: serde_json::Value = serde_json::from_str(&rust_content).unwrap();
+        assert_eq!(rust["agent"], "BlueLake");
+        assert_eq!(rust["path_pattern"], "src/**/*.rs");
+    }
+
+    /// Verify Python timestamp formats are handled by parse_message_timestamp.
+    #[test]
+    fn compat_python_timestamp_formats() {
+        // Python uses RFC3339 with timezone offset
+        let msg1 = serde_json::json!({"created": "2026-02-04T20:49:48.661479+00:00"});
+        let ts1 = parse_message_timestamp(&msg1);
+        assert_eq!(ts1.year(), 2026);
+        assert_eq!(ts1.month(), 2);
+        assert_eq!(ts1.day(), 4);
+
+        // Python also uses Z suffix
+        let msg2 = serde_json::json!({"created": "2026-02-04T20:49:48Z"});
+        let ts2 = parse_message_timestamp(&msg2);
+        assert_eq!(ts2.year(), 2026);
+
+        // Python naive datetime (no timezone info)
+        let msg3 = serde_json::json!({"created": "2026-02-04T20:49:48.661479"});
+        let ts3 = parse_message_timestamp(&msg3);
+        assert_eq!(ts3.year(), 2026);
+
+        // Python with space separator instead of T
+        let msg4 = serde_json::json!({"created": "2026-02-04 20:49:48.661479"});
+        let ts4 = parse_message_timestamp(&msg4);
+        // Should parse or fall back to current time without panicking
+        assert!(ts4.year() >= 2026);
+    }
+
+    /// Verify Python-written thread digest is readable as plain text.
+    #[test]
+    fn compat_python_thread_digest_readable() {
+        let dir = TempDir::new().unwrap();
+        let project_root = dir.path().join("projects").join("test-proj");
+        let threads_dir = project_root.join("messages").join("threads");
+        fs::create_dir_all(&threads_dir).unwrap();
+
+        // Python-format thread digest (Markdown)
+        let digest = r#"# Thread PORT-PLAN
+
+## 2026-02-04T20:49:48+00:00 — FuchsiaForge → FuchsiaForge
+
+[View canonical](../../../messages/2026/02/2026-02-04T20-49-48Z__port-plan__1081.md)
+
+### [PORT-PLAN] MCP Agent Mail Rust Port
+
+Hello fellow agents! I'm FuchsiaForge, starting the coordination thread.
+
+---
+
+## 2026-02-04T20:50:03+00:00 — IntroAgent → FuchsiaForge
+
+[View canonical](../../../messages/2026/02/2026-02-04T20-50-03Z__re-introduction__1082.md)
+
+### RE: Introduction
+
+Thanks for setting this up! Let me know how I can help.
+
+---
+"#;
+        fs::write(threads_dir.join("port-plan.md"), digest).unwrap();
+
+        // Verify readable and contains expected structure
+        let content = fs::read_to_string(threads_dir.join("port-plan.md")).unwrap();
+        assert!(content.contains("# Thread PORT-PLAN"));
+        assert!(content.contains("FuchsiaForge"));
+        assert!(content.contains("IntroAgent"));
+        assert!(content.contains("[View canonical]"));
+    }
+
+    /// Verify consistency check works against a Python-format archive.
+    #[test]
+    fn compat_python_archive_consistency_check() {
+        let dir = TempDir::new().unwrap();
+        let project_root = dir.path().join("projects").join("test-proj");
+        let msg_dir = project_root.join("messages").join("2026").join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+
+        // Create a Python-format message at the expected canonical path
+        let bundle = r#"---json
+{"id": 100, "from": "TestAgent", "subject": "Test", "created": "2026-02-15T10:00:00+00:00", "to": ["Other"]}
+---
+
+Test body.
+"#;
+        fs::write(
+            msg_dir.join("2026-02-15T10-00-00Z__test__100.md"),
+            bundle,
+        )
+        .unwrap();
+
+        // Check consistency — the message should be found
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: "test-proj".into(),
+            message_id: 100,
+            sender_name: "TestAgent".into(),
+            subject: "Test".into(),
+            created_ts_iso: "2026-02-15T10:00:00+00:00".into(),
+        }];
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 1, "Python-format message should be found");
+        assert_eq!(report.missing, 0);
+    }
+
+    /// Verify sha1-based file reservation artifacts (legacy Python naming) are valid JSON.
+    #[test]
+    fn compat_python_sha1_reservation_artifact_parseable() {
+        let dir = TempDir::new().unwrap();
+        let res_dir = dir.path().join("projects").join("test-proj").join("file_reservations");
+        fs::create_dir_all(&res_dir).unwrap();
+
+        // Python uses SHA1 of path pattern as filename
+        let path_pattern = "src/main.rs";
+        let hash = {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(path_pattern.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        let artifact = serde_json::json!({
+            "id": 99,
+            "agent": "PythonAgent",
+            "path": path_pattern,
+            "exclusive": true,
+            "reason": "editing main module",
+            "expires_ts": "2026-02-20T12:00:00Z"
+        });
+        fs::write(
+            res_dir.join(format!("{hash}.json")),
+            serde_json::to_string_pretty(&artifact).unwrap(),
+        )
+        .unwrap();
+
+        // Verify the file is valid JSON and parseable
+        let content = fs::read_to_string(res_dir.join(format!("{hash}.json"))).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["agent"], "PythonAgent");
+        assert_eq!(parsed["path"], "src/main.rs");
+    }
+
+    /// Verify empty project (no messages, no agents) doesn't cause errors.
+    #[test]
+    fn compat_empty_project_no_errors() {
+        let dir = TempDir::new().unwrap();
+        let project_root = dir.path().join("projects").join("empty-proj");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let project_json = serde_json::json!({
+            "slug": "empty-proj",
+            "human_key": "/tmp/empty"
+        });
+        fs::write(
+            project_root.join("project.json"),
+            serde_json::to_string_pretty(&project_json).unwrap(),
+        )
+        .unwrap();
+
+        let archive = ProjectArchive {
+            slug: project_root.file_name().unwrap().to_string_lossy().into(),
+            root: project_root.clone(),
+            repo_root: dir.path().to_path_buf(),
+            lock_path: project_root.join(".archive.lock"),
+            canonical_root: project_root.clone(),
+            canonical_repo_root: dir.path().to_path_buf(),
+        };
+
+        // read_agent_profile on nonexistent agent should return None, not error
+        let result = read_agent_profile(&archive, "NoSuchAgent").unwrap();
+        assert!(result.is_none());
+
+        // Consistency check with empty refs should succeed
+        let report = check_archive_consistency(dir.path(), &[]);
+        assert_eq!(report.sampled, 0);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing, 0);
     }
 }

@@ -21,6 +21,32 @@ use crate::wizard::{
     WizardInputs,
 };
 
+/// Quotes a path for safe inclusion in a shell command string.
+fn quote_path(path: &Path) -> String {
+    quote_str(&path.to_string_lossy())
+}
+
+/// Quotes a string for safe inclusion in a shell command string.
+fn quote_str(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if !s.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\\' | '\'' | '"' | '$' | '&' | '|' | ';' | '<' | '>' | '`' | '*' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '~' | '^' | '#')) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Result type for plan generation.
 pub type PlanResult<T> = Result<T, WizardError>;
 
@@ -220,7 +246,7 @@ fn generate_github_pages_plan(
         index: 1,
         id: "create_output_dir".to_string(),
         description: format!("Create output directory: {}", output_dir.display()),
-        command: Some(format!("mkdir -p {}", output_dir.display())),
+        command: Some(format!("mkdir -p {}", quote_path(&output_dir))),
         optional: false,
         requires_confirm: false,
     });
@@ -236,8 +262,8 @@ fn generate_github_pages_plan(
         ),
         command: Some(format!(
             "cp -r {}/* {}",
-            bundle_path.display(),
-            output_dir.display()
+            quote_path(bundle_path),
+            quote_path(&output_dir)
         )),
         optional: false,
         requires_confirm: false,
@@ -249,7 +275,7 @@ fn generate_github_pages_plan(
         index: 3,
         id: "create_nojekyll".to_string(),
         description: "Create .nojekyll file (required for GitHub Pages)".to_string(),
-        command: Some(format!("touch {}", nojekyll.display())),
+        command: Some(format!("touch {}", quote_path(&nojekyll))),
         optional: false,
         requires_confirm: false,
     });
@@ -297,7 +323,7 @@ fn generate_github_pages_plan(
         index: 7,
         id: "git_push".to_string(),
         description: format!("Push to {} branch", branch),
-        command: Some(format!("git push origin {branch}")),
+        command: Some(format!("git push origin {}", quote_str(branch))),
         optional: false,
         requires_confirm: true,
     });
@@ -379,8 +405,8 @@ fn generate_cloudflare_pages_plan(
         description: format!("Deploy to Cloudflare Pages project: {project}"),
         command: Some(format!(
             "wrangler pages deploy {} --project-name {}",
-            bundle_path.display(),
-            project
+            quote_path(bundle_path),
+            quote_str(project)
         )),
         optional: false,
         requires_confirm: true,
@@ -444,7 +470,7 @@ fn generate_netlify_plan(
         description: format!("Deploy to Netlify site: {site}"),
         command: Some(format!(
             "netlify deploy --dir {} --prod",
-            bundle_path.display()
+            quote_path(bundle_path)
         )),
         optional: false,
         requires_confirm: true,
@@ -490,8 +516,8 @@ fn generate_s3_plan(
         description: format!("Sync bundle to S3 bucket: {bucket}"),
         command: Some(format!(
             "aws s3 sync {} s3://{} --delete",
-            bundle_path.display(),
-            bucket
+            quote_path(bundle_path),
+            quote_str(&bucket)
         )),
         optional: false,
         requires_confirm: true,
@@ -503,10 +529,11 @@ fn generate_s3_plan(
         id: "s3_content_types".to_string(),
         description: "Set Content-Type for SQLite files".to_string(),
         command: Some(format!(
-            "aws s3 cp s3://{bucket}/ s3://{bucket}/ --recursive \
+            "aws s3 cp s3://{0}/ s3://{0}/ --recursive \
              --exclude '*' --include '*.sqlite3' \
              --content-type 'application/x-sqlite3' \
-             --metadata-directive REPLACE"
+             --metadata-directive REPLACE",
+             quote_str(&bucket)
         )),
         optional: false,
         requires_confirm: false,
@@ -520,7 +547,7 @@ fn generate_s3_plan(
             description: format!("Invalidate CloudFront distribution: {dist_id}"),
             command: Some(format!(
                 "aws cloudfront create-invalidation --distribution-id {} --paths '/*'",
-                dist_id
+                quote_str(dist_id)
             )),
             optional: true,
             requires_confirm: true,

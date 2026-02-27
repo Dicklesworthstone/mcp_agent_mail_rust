@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use globset::{Glob, GlobSetBuilder};
+use globset::GlobSetBuilder;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -575,7 +575,7 @@ if __name__ == "__main__":
 }
 
 pub fn install_guard(
-    _project: &str,
+    project: &str,
     repo: &Path,
     default_db_path: Option<&str>,
     install_prepush: bool,
@@ -633,7 +633,7 @@ pub fn install_guard(
         let plugin_path = run_dir.join(PLUGIN_FILE_NAME);
         std::fs::write(
             &plugin_path,
-            render_guard_plugin_script(_project, name, default_db_path),
+            render_guard_plugin_script(project, name, default_db_path),
         )?;
         chmod_exec(&plugin_path)?;
 
@@ -902,11 +902,13 @@ fn check_path_conflicts(
 
     for res in reservations {
         if res.exclusive && res.agent_name != self_agent {
-            // Configure glob to match gitignore semantics (no literal separator implies * crosses /)
-            // matching Python behavior where * crosses /.
+            // Configure glob to match gitignore semantics (literal_separator(true) means * does not cross /)
+            // matching the custom Python glob_to_regex behavior where * -> [^/]* and ** -> .*.
             // Use normalize_path to handle slashes before compiling.
             let pat_str = normalize_path(&res.path_pattern, ignorecase);
-            let glob = Glob::new(&pat_str);
+            let glob = globset::GlobBuilder::new(&pat_str)
+                .literal_separator(true)
+                .build();
             if let Ok(g) = glob {
                 builder.add(g);
                 active_indices.push(res);
