@@ -982,14 +982,18 @@ fn check_threshold(
         return; // Below 50% of threshold — no alert.
     }
 
-    let score = ((ratio - 0.5) / 0.5).clamp(0.0, 1.0);
+    // Map ratio [0.5, 2.0] to score [0.0, 1.0]
+    let score = ((ratio - 0.5) / 1.5).clamp(0.0, 1.0);
+    
     let severity = if ratio >= 2.0 {
         AnomalySeverity::Critical
     } else if ratio >= 1.0 {
         // Threshold breached.
-        severity_from_score(score)
+        AnomalySeverity::High
+    } else if ratio >= 0.75 {
+        AnomalySeverity::Medium
     } else {
-        // Approaching threshold (50%–100%).
+        // Approaching threshold.
         AnomalySeverity::Low
     };
 
@@ -1738,6 +1742,9 @@ mod tests {
                 memory_pressure_level: 0,
                 memory_last_sample_us: 0,
                 memory_sample_errors_total: 0,
+                tui_spin_watchdog_trips_total: 0,
+                tui_spin_watchdog_last_cpu_pct_x100: 0,
+                tui_spin_watchdog_last_trip_us: 0,
             },
             search: SearchMetricsSnapshot::default(),
         }

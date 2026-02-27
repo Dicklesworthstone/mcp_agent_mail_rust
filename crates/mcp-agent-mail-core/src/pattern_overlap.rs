@@ -218,7 +218,7 @@ impl CompiledPattern {
 ///
 /// Rules:
 /// 1. If either pattern contains `**` (recursive), assume overlap.
-/// 2. If segment counts differ (and no `**`), assume disjoint.
+/// 2. If segment counts differ (and no `**`), assume overlap (conservative fallback).
 /// 3. Compare segments pairwise:
 ///    - If both are globs, assume overlap (conservative).
 ///    - If one is glob and one literal, check match.

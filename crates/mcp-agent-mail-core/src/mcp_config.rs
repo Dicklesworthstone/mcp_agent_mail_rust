@@ -707,6 +707,205 @@ fn add_project_candidates(
     );
 }
 
+// ---------------------------------------------------------------------------
+// Fresh MCP config creation (for new installs without existing Python entry)
+// ---------------------------------------------------------------------------
+
+/// Parameters for creating a new `mcp-agent-mail` server entry.
+#[derive(Debug, Clone)]
+pub struct NewServerEntryParams {
+    /// Absolute path to the Rust `mcp-agent-mail` binary.
+    pub rust_binary_path: PathBuf,
+    /// Optional bearer token. If `None`, the caller should generate one.
+    pub bearer_token: Option<String>,
+    /// Optional storage root override. If `None`, the env key is omitted.
+    pub storage_root: Option<String>,
+}
+
+/// Build a fresh `mcp-agent-mail` server entry as a JSON value.
+#[must_use]
+pub fn build_new_server_entry(params: &NewServerEntryParams) -> Value {
+    let mut env = Map::new();
+    if let Some(ref token) = params.bearer_token {
+        env.insert(
+            "HTTP_BEARER_TOKEN".to_string(),
+            Value::String(token.clone()),
+        );
+    }
+    if let Some(ref root) = params.storage_root {
+        env.insert("STORAGE_ROOT".to_string(), Value::String(root.clone()));
+    }
+
+    let mut entry = Map::new();
+    entry.insert(
+        "command".to_string(),
+        Value::String(params.rust_binary_path.to_string_lossy().into_owned()),
+    );
+    entry.insert("args".to_string(), Value::Array(Vec::new()));
+    if !env.is_empty() {
+        entry.insert("env".to_string(), Value::Object(env));
+    }
+    Value::Object(entry)
+}
+
+/// Insert the `mcp-agent-mail` server entry into an existing config text.
+///
+/// If the config already contains the entry, returns unchanged.
+/// If the server container key exists but has no `mcp-agent-mail`, adds it.
+/// If neither `mcpServers` nor alternatives exist, creates `mcpServers`.
+pub fn insert_server_entry_text(
+    text: &str,
+    params: &NewServerEntryParams,
+) -> Result<McpConfigTextUpdate, McpConfigUpdateError> {
+    let (body, had_bom) = strip_utf8_bom(text);
+    let style = detect_render_style(body, had_bom);
+    let (mut doc, used_json5_fallback) = parse_json_or_json5(body)?;
+
+    let root_obj = doc
+        .as_object_mut()
+        .ok_or(McpConfigUpdateError::TopLevelNotObject)?;
+
+    // Check if the entry already exists under any server container key.
+    for key in SERVER_CONTAINER_KEYS {
+        if let Some(servers) = root_obj.get(*key) {
+            if let Some(servers_obj) = servers.as_object() {
+                if servers_obj.contains_key(TARGET_SERVER_NAME) {
+                    return Ok(McpConfigTextUpdate {
+                        updated_text: text.to_string(),
+                        changed: false,
+                        target_found: true,
+                        used_json5_fallback,
+                    });
+                }
+            }
+        }
+    }
+
+    // Find an existing container to insert into, or create `mcpServers`.
+    let container_key = SERVER_CONTAINER_KEYS
+        .iter()
+        .find(|key| {
+            root_obj
+                .get(**key)
+                .is_some_and(|value| value.is_object())
+        })
+        .copied()
+        .unwrap_or("mcpServers");
+
+    let entry = build_new_server_entry(params);
+
+    let servers_obj = root_obj
+        .entry(container_key)
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or(McpConfigUpdateError::TopLevelNotObject)?;
+
+    servers_obj.insert(TARGET_SERVER_NAME.to_string(), entry);
+
+    let updated_text = render_json_with_style(&doc, &style)?;
+    validate_strict_json(&updated_text)?;
+
+    Ok(McpConfigTextUpdate {
+        updated_text,
+        changed: true,
+        target_found: false,
+        used_json5_fallback,
+    })
+}
+
+/// Create a brand new MCP config file text with only the `mcp-agent-mail` entry.
+#[must_use]
+pub fn create_fresh_config_text(params: &NewServerEntryParams) -> String {
+    let entry = build_new_server_entry(params);
+    let mut servers = Map::new();
+    servers.insert(TARGET_SERVER_NAME.to_string(), entry);
+    let mut doc = Map::new();
+    doc.insert("mcpServers".to_string(), Value::Object(servers));
+    serde_json::to_string_pretty(&doc).expect("serialization of fresh config cannot fail") + "\n"
+}
+
+/// Result of setting up an MCP config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConfigSetupResult {
+    pub config_path: PathBuf,
+    /// The backup path if an existing file was modified.
+    pub backup_path: Option<PathBuf>,
+    /// Whether the file was created new (`true`) or an existing file was modified.
+    pub created_new: bool,
+    /// Whether any change was actually made (false if entry already existed).
+    pub changed: bool,
+}
+
+/// Set up an MCP config file: create it if absent, or insert the entry if missing.
+///
+/// This is the main entry point for fresh-install MCP config setup.
+pub fn setup_mcp_config_file(
+    config_path: &Path,
+    params: &NewServerEntryParams,
+) -> Result<McpConfigSetupResult, McpConfigUpdateError> {
+    if !config_path.exists() {
+        // Create parent directories if needed.
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = create_fresh_config_text(params);
+        std::fs::write(config_path, &text)?;
+        return Ok(McpConfigSetupResult {
+            config_path: config_path.to_path_buf(),
+            backup_path: None,
+            created_new: true,
+            changed: true,
+        });
+    }
+
+    // File exists: read, parse, insert if missing.
+    let original = std::fs::read_to_string(config_path)?;
+    let update = insert_server_entry_text(&original, params)?;
+
+    if !update.changed {
+        return Ok(McpConfigSetupResult {
+            config_path: config_path.to_path_buf(),
+            backup_path: None,
+            created_new: false,
+            changed: false,
+        });
+    }
+
+    let backup = backup_path_for(config_path);
+    std::fs::copy(config_path, &backup)?;
+    std::fs::write(config_path, &update.updated_text)?;
+
+    Ok(McpConfigSetupResult {
+        config_path: config_path.to_path_buf(),
+        backup_path: Some(backup),
+        created_new: false,
+        changed: true,
+    })
+}
+
+/// Preferred config path for a given tool (the first candidate path).
+///
+/// Returns the primary config path for a tool regardless of whether it exists.
+/// This is used during fresh installs to decide where to create a new config.
+#[must_use]
+pub fn preferred_config_path(tool: McpConfigTool, home: &Path) -> PathBuf {
+    match tool {
+        McpConfigTool::Claude => home.join(".claude").join("settings.json"),
+        McpConfigTool::Codex => home.join(".codex").join("config.json"),
+        McpConfigTool::Cursor => home.join(".cursor").join("mcp.json"),
+        McpConfigTool::Gemini => home.join(".gemini").join("settings.json"),
+        McpConfigTool::GithubCopilot => home
+            .join(".config")
+            .join("Code")
+            .join("User")
+            .join("settings.json"),
+        McpConfigTool::Windsurf => home.join(".windsurf").join("mcp.json"),
+        McpConfigTool::Cline => home.join(".cline").join("mcp.json"),
+        McpConfigTool::OpenCode => home.join(".opencode").join("opencode.json"),
+        McpConfigTool::FactoryDroid => home.join(".factory").join("mcp.json"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,6 +1275,258 @@ mod tests {
         assert_eq!(
             post, original,
             "no-op update should not rewrite file contents"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for fresh MCP config creation (br-28mgh.4.3)
+    // -----------------------------------------------------------------------
+
+    fn default_params() -> NewServerEntryParams {
+        NewServerEntryParams {
+            rust_binary_path: PathBuf::from("/home/user/.local/bin/mcp-agent-mail"),
+            bearer_token: Some("abc123".to_string()),
+            storage_root: None,
+        }
+    }
+
+    #[test]
+    fn build_new_server_entry_with_token_and_storage() {
+        let params = NewServerEntryParams {
+            rust_binary_path: PathBuf::from("/opt/bin/mcp-agent-mail"),
+            bearer_token: Some("mytoken".to_string()),
+            storage_root: Some("/data/archive".to_string()),
+        };
+        let entry = build_new_server_entry(&params);
+        assert_eq!(
+            entry.get("command").and_then(Value::as_str),
+            Some("/opt/bin/mcp-agent-mail")
+        );
+        assert_eq!(entry.get("args"), Some(&json!([])));
+        let env = entry.get("env").expect("env object");
+        assert_eq!(
+            env.get("HTTP_BEARER_TOKEN").and_then(Value::as_str),
+            Some("mytoken")
+        );
+        assert_eq!(
+            env.get("STORAGE_ROOT").and_then(Value::as_str),
+            Some("/data/archive")
+        );
+    }
+
+    #[test]
+    fn build_new_server_entry_without_optional_fields() {
+        let params = NewServerEntryParams {
+            rust_binary_path: PathBuf::from("/usr/bin/mcp-agent-mail"),
+            bearer_token: None,
+            storage_root: None,
+        };
+        let entry = build_new_server_entry(&params);
+        assert_eq!(
+            entry.get("command").and_then(Value::as_str),
+            Some("/usr/bin/mcp-agent-mail")
+        );
+        assert!(entry.get("env").is_none(), "no env when no token/storage");
+    }
+
+    #[test]
+    fn create_fresh_config_produces_valid_json() {
+        let text = create_fresh_config_text(&default_params());
+        let doc: Value = serde_json::from_str(&text).expect("valid JSON");
+        let servers = doc
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .expect("mcpServers");
+        assert!(
+            servers.contains_key("mcp-agent-mail"),
+            "entry must be present"
+        );
+        let entry = &servers["mcp-agent-mail"];
+        assert_eq!(
+            entry.get("command").and_then(Value::as_str),
+            Some("/home/user/.local/bin/mcp-agent-mail")
+        );
+        assert!(text.ends_with('\n'), "trailing newline expected");
+    }
+
+    #[test]
+    fn insert_entry_into_existing_config_without_target() {
+        let original = r#"{
+  "mcpServers": {
+    "other-server": {
+      "command": "node",
+      "args": ["server.js"]
+    }
+  }
+}
+"#;
+        let update = insert_server_entry_text(original, &default_params()).expect("insert works");
+        assert!(update.changed, "should insert new entry");
+        assert!(!update.target_found, "target did not exist before");
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        let servers = doc
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .expect("mcpServers");
+        assert!(
+            servers.contains_key("mcp-agent-mail"),
+            "new entry must be present"
+        );
+        assert!(
+            servers.contains_key("other-server"),
+            "existing entry must be preserved"
+        );
+    }
+
+    #[test]
+    fn insert_entry_noop_when_already_present() {
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "command": "python",
+      "args": ["-m", "mcp_agent_mail"]
+    }
+  }
+}
+"#;
+        let update = insert_server_entry_text(original, &default_params()).expect("insert works");
+        assert!(!update.changed, "entry exists, no change");
+        assert!(update.target_found, "entry was found");
+        assert_eq!(update.updated_text, original);
+    }
+
+    #[test]
+    fn insert_entry_creates_mcp_servers_key_when_absent() {
+        let original = r#"{
+  "theme": "dark"
+}
+"#;
+        let update = insert_server_entry_text(original, &default_params()).expect("insert works");
+        assert!(update.changed, "should add mcpServers + entry");
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        assert!(
+            doc.get("mcpServers")
+                .and_then(Value::as_object)
+                .unwrap()
+                .contains_key("mcp-agent-mail"),
+            "entry must be inserted under new mcpServers"
+        );
+        assert_eq!(
+            doc.get("theme").and_then(Value::as_str),
+            Some("dark"),
+            "existing keys preserved"
+        );
+    }
+
+    #[test]
+    fn insert_entry_uses_existing_servers_key_variant() {
+        // Some tools use "servers" instead of "mcpServers"
+        let original = r#"{
+  "servers": {
+    "other": { "command": "node", "args": [] }
+  }
+}
+"#;
+        let update = insert_server_entry_text(original, &default_params()).expect("insert works");
+        assert!(update.changed);
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        assert!(
+            doc.get("servers")
+                .and_then(Value::as_object)
+                .unwrap()
+                .contains_key("mcp-agent-mail"),
+            "should insert under existing 'servers' key"
+        );
+    }
+
+    #[test]
+    fn setup_mcp_config_file_creates_new_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = tmp.path().join("subdir").join("mcp.json");
+        let result = setup_mcp_config_file(&config, &default_params()).expect("setup");
+        assert!(result.created_new);
+        assert!(result.changed);
+        assert!(result.backup_path.is_none());
+        assert!(config.exists());
+
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        assert!(doc
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .unwrap()
+            .contains_key("mcp-agent-mail"));
+    }
+
+    #[test]
+    fn setup_mcp_config_file_inserts_into_existing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = tmp.path().join("mcp.json");
+        let original = r#"{
+  "mcpServers": {
+    "other": { "command": "node", "args": [] }
+  }
+}
+"#;
+        std::fs::write(&config, original).expect("write");
+        let result = setup_mcp_config_file(&config, &default_params()).expect("setup");
+        assert!(!result.created_new);
+        assert!(result.changed);
+        assert!(result.backup_path.is_some(), "backup created on modify");
+
+        let backup = result.backup_path.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read backup"),
+            original,
+            "backup has original content"
+        );
+
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        let servers = doc
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert!(servers.contains_key("mcp-agent-mail"));
+        assert!(servers.contains_key("other"));
+    }
+
+    #[test]
+    fn setup_mcp_config_file_noop_when_entry_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = tmp.path().join("mcp.json");
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "command": "/home/user/.local/bin/mcp-agent-mail",
+      "args": []
+    }
+  }
+}
+"#;
+        std::fs::write(&config, original).expect("write");
+        let result = setup_mcp_config_file(&config, &default_params()).expect("setup");
+        assert!(!result.created_new);
+        assert!(!result.changed);
+        assert!(result.backup_path.is_none());
+    }
+
+    #[test]
+    fn preferred_config_path_returns_expected_paths() {
+        let home = Path::new("/home/user");
+        assert_eq!(
+            preferred_config_path(McpConfigTool::Claude, home),
+            PathBuf::from("/home/user/.claude/settings.json")
+        );
+        assert_eq!(
+            preferred_config_path(McpConfigTool::Cursor, home),
+            PathBuf::from("/home/user/.cursor/mcp.json")
+        );
+        assert_eq!(
+            preferred_config_path(McpConfigTool::Gemini, home),
+            PathBuf::from("/home/user/.gemini/settings.json")
         );
     }
 }

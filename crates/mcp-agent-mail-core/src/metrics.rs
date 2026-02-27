@@ -557,6 +557,11 @@ pub struct SystemMetrics {
     pub memory_pressure_level: GaugeU64,
     pub memory_last_sample_us: GaugeU64,
     pub memory_sample_errors_total: Counter,
+
+    // TUI spin watchdog (startup protection)
+    pub tui_spin_watchdog_trips_total: Counter,
+    pub tui_spin_watchdog_last_cpu_pct_x100: GaugeU64,
+    pub tui_spin_watchdog_last_trip_us: GaugeU64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -572,6 +577,10 @@ pub struct SystemMetricsSnapshot {
     pub memory_pressure_level: u64,
     pub memory_last_sample_us: u64,
     pub memory_sample_errors_total: u64,
+
+    pub tui_spin_watchdog_trips_total: u64,
+    pub tui_spin_watchdog_last_cpu_pct_x100: u64,
+    pub tui_spin_watchdog_last_trip_us: u64,
 }
 
 impl Default for SystemMetrics {
@@ -588,6 +597,10 @@ impl Default for SystemMetrics {
             memory_pressure_level: GaugeU64::new(),
             memory_last_sample_us: GaugeU64::new(),
             memory_sample_errors_total: Counter::new(),
+
+            tui_spin_watchdog_trips_total: Counter::new(),
+            tui_spin_watchdog_last_cpu_pct_x100: GaugeU64::new(),
+            tui_spin_watchdog_last_trip_us: GaugeU64::new(),
         }
     }
 }
@@ -607,6 +620,10 @@ impl SystemMetrics {
             memory_pressure_level: self.memory_pressure_level.load(),
             memory_last_sample_us: self.memory_last_sample_us.load(),
             memory_sample_errors_total: self.memory_sample_errors_total.load(),
+
+            tui_spin_watchdog_trips_total: self.tui_spin_watchdog_trips_total.load(),
+            tui_spin_watchdog_last_cpu_pct_x100: self.tui_spin_watchdog_last_cpu_pct_x100.load(),
+            tui_spin_watchdog_last_trip_us: self.tui_spin_watchdog_last_trip_us.load(),
         }
     }
 }

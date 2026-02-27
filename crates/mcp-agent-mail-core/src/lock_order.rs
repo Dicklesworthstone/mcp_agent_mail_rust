@@ -381,14 +381,15 @@ fn did_release(level: LockLevel) {
     #[cfg(debug_assertions)]
     HELD_LOCKS.with(|held| {
         let mut held = held.borrow_mut();
-        let last = held.pop();
-        assert!(
-            last == Some(level),
-            "lock tracking corrupted: expected to release {}, popped={:?}, held={:?}",
-            level,
-            last,
-            held.as_slice()
-        );
+        if let Some(pos) = held.iter().rposition(|&l| l == level) {
+            held.remove(pos);
+        } else {
+            panic!(
+                "lock tracking corrupted: expected to release {}, but it was not held. held={:?}",
+                level,
+                held.as_slice()
+            );
+        }
     });
 }
 

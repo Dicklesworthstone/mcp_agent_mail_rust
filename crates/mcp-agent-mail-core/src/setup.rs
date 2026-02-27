@@ -206,7 +206,28 @@ impl SetupParams {
     /// Build the full MCP server URL.
     #[must_use]
     pub fn server_url(&self) -> String {
-        format!("http://{}:{}{}", self.host, self.port, self.path)
+        format!(
+            "http://{}:{}{}",
+            normalize_client_connect_host(&self.host),
+            self.port,
+            self.path
+        )
+    }
+}
+
+#[must_use]
+fn normalize_client_connect_host(host: &str) -> &str {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return "127.0.0.1";
+    }
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    match unbracketed {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        _ => trimmed,
     }
 }
 
@@ -1022,12 +1043,108 @@ fn check_config_file(path: &Path, expected_url: &str) -> (bool, bool) {
                 .get("url")
                 .or_else(|| entry.get("httpUrl"))
                 .and_then(|v| v.as_str())
-                .is_some_and(|u| u == expected_url);
+                .is_some_and(|u| urls_match_for_status(u, expected_url));
             return (true, url_match);
         }
     }
 
     (false, false)
+}
+
+fn urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
+    if actual_url == expected_url {
+        return true;
+    }
+    let Some(actual) = parse_http_url_for_status(actual_url) else {
+        return false;
+    };
+    let Some(expected) = parse_http_url_for_status(expected_url) else {
+        return false;
+    };
+    actual.scheme == expected.scheme
+        && actual.host.eq_ignore_ascii_case(&expected.host)
+        && actual.port == expected.port
+        && actual.path == expected.path
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusUrlParts {
+    scheme: &'static str,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_http_url_for_status(url: &str) -> Option<StatusUrlParts> {
+    let trimmed = url.trim();
+    let (scheme, remainder, default_port) = if let Some(rest) = trimmed.strip_prefix("http://") {
+        ("http", rest, 80_u16)
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        ("https", rest, 443_u16)
+    } else {
+        return None;
+    };
+
+    let (authority, raw_path) = if let Some((auth, tail)) = remainder.split_once('/') {
+        (auth, format!("/{tail}"))
+    } else {
+        (remainder, "/".to_string())
+    };
+
+    let (host, port) = parse_status_url_authority(authority, default_port)?;
+    let path = normalize_status_url_path(&raw_path);
+
+    Some(StatusUrlParts {
+        scheme,
+        host,
+        port,
+        path,
+    })
+}
+
+fn parse_status_url_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    if authority.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = if tail.is_empty() {
+            default_port
+        } else {
+            let port_str = tail.strip_prefix(':')?;
+            port_str.parse::<u16>().ok()?
+        };
+        return Some((host.to_string(), port));
+    }
+
+    if authority.matches(':').count() == 1
+        && let Some((host, port_str)) = authority.rsplit_once(':')
+    {
+        let port = port_str.parse::<u16>().ok()?;
+        return Some((host.to_string(), port));
+    }
+
+    Some((authority.to_string(), default_port))
+}
+
+fn normalize_status_url_path(path: &str) -> String {
+    let truncated = path.split(['?', '#']).next().unwrap_or(path).trim();
+    let mut normalized = if truncated.is_empty() {
+        "/".to_string()
+    } else if truncated.starts_with('/') {
+        truncated.to_string()
+    } else {
+        format!("/{truncated}")
+    };
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    if normalized == "/api/" || normalized == "/mcp/" {
+        "/mcp-api/".to_string()
+    } else {
+        normalized
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,6 +1752,33 @@ mod tests {
     }
 
     #[test]
+    fn setup_params_server_url_normalizes_unspecified_hosts() {
+        let params = SetupParams {
+            host: "0.0.0.0".into(),
+            port: 8765,
+            path: "/mcp/".into(),
+            ..Default::default()
+        };
+        assert_eq!(params.server_url(), "http://127.0.0.1:8765/mcp/");
+
+        let params = SetupParams {
+            host: "::".into(),
+            port: 8765,
+            path: "/mcp/".into(),
+            ..Default::default()
+        };
+        assert_eq!(params.server_url(), "http://127.0.0.1:8765/mcp/");
+
+        let params = SetupParams {
+            host: "[::]".into(),
+            port: 8765,
+            path: "/mcp/".into(),
+            ..Default::default()
+        };
+        assert_eq!(params.server_url(), "http://127.0.0.1:8765/mcp/");
+    }
+
+    #[test]
     fn setup_params_default_values() {
         let params = SetupParams::default();
         assert_eq!(params.host, "127.0.0.1");
@@ -1882,6 +2026,42 @@ mod tests {
         let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
         assert!(has_server);
         assert!(url_matches);
+    }
+
+    #[test]
+    fn check_config_file_treats_api_and_mcp_paths_as_equivalent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.json");
+        let content = merge_mcp_server(
+            None,
+            "mcpServers",
+            "mcp-agent-mail",
+            json!({"url": "http://127.0.0.1:8765/api/"}),
+        )
+        .unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
+        assert!(has_server);
+        assert!(url_matches);
+    }
+
+    #[test]
+    fn check_config_file_custom_path_stays_strict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.json");
+        let content = merge_mcp_server(
+            None,
+            "mcpServers",
+            "mcp-agent-mail",
+            json!({"url": "http://127.0.0.1:8765/custom/"}),
+        )
+        .unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
+        assert!(has_server);
+        assert!(!url_matches);
     }
 
     #[test]
