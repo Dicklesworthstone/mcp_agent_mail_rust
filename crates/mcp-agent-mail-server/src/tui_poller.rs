@@ -34,6 +34,8 @@ use crate::tui_events::{
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Prevent accidental zero/near-zero env values from creating a busy-loop.
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Manual/test overrides are allowed to go below `MIN_POLL_INTERVAL`, but never to zero.
+const MIN_OVERRIDE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Maximum agents to fetch per poll cycle.
 const MAX_AGENTS: usize = 50;
@@ -336,8 +338,8 @@ impl DbPoller {
 
     /// Override the polling interval (for tests).
     #[must_use]
-    pub const fn with_interval(mut self, interval: Duration) -> Self {
-        self.interval = interval;
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval.max(MIN_OVERRIDE_POLL_INTERVAL);
         self
     }
 
@@ -1396,6 +1398,15 @@ mod tests {
             .with_interval(Duration::from_millis(500));
         assert_eq!(poller.interval, Duration::from_millis(500));
         assert!(!poller.stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn poller_interval_override_clamps_zero() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let poller = DbPoller::new(Arc::clone(&state), "sqlite:///test.db".into())
+            .with_interval(Duration::ZERO);
+        assert_eq!(poller.interval, MIN_OVERRIDE_POLL_INTERVAL);
     }
 
     // ── Handle stop semantics ────────────────────────────────────────

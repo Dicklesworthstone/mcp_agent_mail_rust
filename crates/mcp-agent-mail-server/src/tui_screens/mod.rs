@@ -1193,7 +1193,10 @@ mod tests {
             request_gen: 99,
         };
         let flags = dirty_since(&data_gen, &data_gen);
-        assert!(!flags.any(), "identical generations must produce zero dirty flags");
+        assert!(
+            !flags.any(),
+            "identical generations must produce zero dirty flags"
+        );
         assert!(!flags.events);
         assert!(!flags.console_log);
         assert!(!flags.db_stats);
@@ -1266,9 +1269,9 @@ mod tests {
         };
         let current = DataGeneration {
             event_total_pushed: 15,
-            console_log_seq: 5,  // unchanged
+            console_log_seq: 5, // unchanged
             db_stats_gen: 3,
-            request_gen: 100,    // unchanged
+            request_gen: 100, // unchanged
         };
         let flags = dirty_since(&prev, &current);
         assert!(flags.events);

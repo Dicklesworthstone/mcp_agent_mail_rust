@@ -383,7 +383,10 @@ mod utility_tests {
         // "mark" shouldn't match inside the inserted <mark> tag.
         let body = "This is a mark and another mark.";
         let html = highlight_snippet(body, "mark", 100);
-        assert_eq!(html, "This is a <mark>mark</mark> and another <mark>mark</mark>.");
+        assert_eq!(
+            html,
+            "This is a <mark>mark</mark> and another <mark>mark</mark>."
+        );
 
         // "amp" shouldn't match inside the &amp; entity.
         let body_with_amp = "amp & voltage";

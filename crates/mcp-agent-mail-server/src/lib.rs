@@ -1518,6 +1518,8 @@ fn run_http_server_thread(
         // Match `run_http`: isolate requests so one bad connection cannot
         // starve the entire HTTP surface.
         .worker_threads(resolve_http_runtime_worker_threads())
+        // Keep worker parking explicit to guard against upstream default drift.
+        .enable_parking(true)
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 
@@ -2470,7 +2472,16 @@ impl StartupDashboard {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_console_input_worker(self: &Arc<Self>) {
+        const INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+        const INPUT_DRAIN_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+        const INPUT_ERROR_BACKOFF: Duration = Duration::from_millis(25);
+        const INPUT_EMPTY_READY_STREAK_LIMIT: usize = 8;
+        const INPUT_EMPTY_READY_BACKOFF: Duration = Duration::from_millis(2);
+        const INPUT_DRAIN_CAP_STREAK_LIMIT: usize = 3;
+        const INPUT_DRAIN_CAP_BACKOFF: Duration = Duration::from_millis(1);
+
         if !lock_mutex(&self.console_layout).interactive_enabled || !std::io::stdin().is_terminal()
         {
             return;
@@ -2498,16 +2509,56 @@ impl StartupDashboard {
                     "Console layout keys: +/- or Up/Down (height), t/b (anchor), a (auto-size), i/l (split request), [/ ] (split ratio), ? (help)",
                 );
 
+                let mut poll_error_reported = false;
+                let mut read_error_reported = false;
+                let mut empty_ready_streak = 0usize;
+                let mut drain_cap_streak = 0usize;
+
                 while !this.stop.load(Ordering::Relaxed) {
-                    if !backend
-                        .poll_event(std::time::Duration::from_millis(100))
-                        .unwrap_or(false)
-                    {
+                    let ready = match backend.poll_event(INPUT_POLL_TIMEOUT) {
+                        Ok(ready) => {
+                            poll_error_reported = false;
+                            ready
+                        }
+                        Err(err) => {
+                            if !poll_error_reported {
+                                this.log_line(&format!(
+                                    "Console interactive mode: poll_event failed ({err}); retrying with backoff"
+                                ));
+                                poll_error_reported = true;
+                            }
+                            std::thread::sleep(INPUT_ERROR_BACKOFF);
+                            continue;
+                        }
+                    };
+                    if !ready {
+                        empty_ready_streak = 0;
                         continue;
                     }
 
                     let mut drained_events = 0usize;
-                    while let Ok(Some(event)) = backend.read_event() {
+                    let mut saw_event = false;
+                    let mut hit_drain_cap = false;
+                    loop {
+                        let event = match backend.read_event() {
+                            Ok(Some(event)) => {
+                                read_error_reported = false;
+                                saw_event = true;
+                                event
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                if !read_error_reported {
+                                    this.log_line(&format!(
+                                        "Console interactive mode: read_event failed ({err}); retrying with backoff"
+                                    ));
+                                    read_error_reported = true;
+                                }
+                                std::thread::sleep(INPUT_ERROR_BACKOFF);
+                                break;
+                            }
+                        };
+
                         let term_size = backend.size().unwrap_or((80, 24));
                         if this.handle_console_event(term_size, &event) {
                             break;
@@ -2516,15 +2567,47 @@ impl StartupDashboard {
                         if drained_events >= 128 {
                             // Bound one drain cycle so a hot terminal event stream cannot
                             // monopolize CPU and starve HTTP/tool work.
+                            hit_drain_cap = true;
+                            break;
+                        }
+                        match backend.poll_event(INPUT_DRAIN_POLL_TIMEOUT) {
+                            Ok(true) => {
+                                poll_error_reported = false;
+                            }
+                            Ok(false) => break,
+                            Err(err) => {
+                                if !poll_error_reported {
+                                    this.log_line(&format!(
+                                        "Console interactive mode: drain poll failed ({err}); retrying with backoff"
+                                    ));
+                                    poll_error_reported = true;
+                                }
+                                std::thread::sleep(INPUT_ERROR_BACKOFF);
+                                break;
+                            }
+                        }
+                    }
+
+                    if saw_event {
+                        empty_ready_streak = 0;
+                    } else {
+                        empty_ready_streak = empty_ready_streak.saturating_add(1);
+                        if empty_ready_streak >= INPUT_EMPTY_READY_STREAK_LIMIT {
+                            std::thread::sleep(INPUT_EMPTY_READY_BACKOFF);
+                            empty_ready_streak = 0;
+                        }
+                    }
+
+                    if hit_drain_cap {
+                        drain_cap_streak = drain_cap_streak.saturating_add(1);
+                        if drain_cap_streak >= INPUT_DRAIN_CAP_STREAK_LIMIT {
+                            std::thread::sleep(INPUT_DRAIN_CAP_BACKOFF);
+                            drain_cap_streak = 0;
+                        } else {
                             std::thread::yield_now();
-                            break;
                         }
-                        if !backend
-                            .poll_event(std::time::Duration::from_millis(1))
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
+                    } else {
+                        drain_cap_streak = 0;
                     }
                 }
                 drop(backend);

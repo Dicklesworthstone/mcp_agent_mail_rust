@@ -40,7 +40,7 @@ use super::{HelpEntry, MailScreen, MailScreenMsg};
 const DIAG_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
-const WORKER_SLEEP: Duration = Duration::from_millis(50);
+const WORKER_SLEEP: Duration = Duration::from_millis(500);
 const MAX_READ_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

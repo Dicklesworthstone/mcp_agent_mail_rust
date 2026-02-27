@@ -1176,7 +1176,7 @@ mod tests {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         let gen_before = state.data_generation();
-        state.push_event(crate::tui_events::MailEvent::ServerStarted {
+        let _ = state.push_event(crate::tui_events::MailEvent::ServerStarted {
             seq: 0,
             timestamp_micros: 1,
             source: crate::tui_events::EventSource::Lifecycle,

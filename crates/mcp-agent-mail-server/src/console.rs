@@ -191,10 +191,13 @@ pub struct BannerParams<'a> {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
-    let mut lines = Vec::with_capacity(16);
+    let mut lines = Vec::with_capacity(32);
     let primary = theme::primary_bold();
+    let secondary = theme::secondary_bold();
     let accent = theme::accent();
     let success = theme::success_bold();
+    let warning = theme::warning_bold();
+    let link = theme::link();
     let text = theme::text_bold();
 
     let auth = if params.auth_enabled {
@@ -215,38 +218,96 @@ pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
     let database_url = sanitize_known_value("database_url", params.database_url)
         .unwrap_or_else(|| params.database_url.to_string());
 
+    let logo_lines = [
+        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓",
+        "┃                                                                      ┃",
+        "┃     ███╗   ███╗ ██████╗██████╗     ███╗   ███╗ █████╗ ██╗██╗         ┃",
+        "┃     ████╗ ████║██╔════╝██╔══██╗    ████╗ ████║██╔══██╗██║██║         ┃",
+        "┃     ██╔████╔██║██║     ██████╔╝    ██╔████╔██║███████║██║██║         ┃",
+        "┃     ██║╚██╔╝██║██║     ██╔═══╝     ██║╚██╔╝██║██╔══██║██║██║         ┃",
+        "┃     ██║ ╚═╝ ██║╚██████╗██║         ██║ ╚═╝ ██║██║  ██║██║███████╗    ┃",
+        "┃     ╚═╝     ╚═╝ ╚═════╝╚═╝         ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝╚══════╝    ┃",
+        "┃                                                                      ┃",
+        "┃               📬  Agent Coordination via Message Passing  📨         ┃",
+        "┃                                                                      ┃",
+        "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛",
+    ];
+
+    lines.push(String::new());
+    for row in &logo_lines {
+        lines.push(format!("{secondary}{row}{RESET}"));
+    }
     lines.push(String::new());
     lines.push(format!(
         "{primary}MCP Agent Mail{RESET} {DIM}({}){RESET}",
         params.app_environment
     ));
-    lines.push(format!("  {accent}Endpoint:{RESET} {}", params.endpoint));
-    lines.push(format!("  {accent}Web UI:{RESET} {}", params.web_ui_url));
+    lines.push(format!(
+        "{secondary}╭─ 🚀 Server Configuration ───────────────────────────────────────────╮{RESET}"
+    ));
+    lines.push(format!(
+        "{secondary}│{RESET} {accent}Endpoint:{RESET} {}",
+        params.endpoint
+    ));
+    lines.push(format!(
+        "{secondary}│{RESET} {link}Web UI:{RESET} {}",
+        params.web_ui_url
+    ));
     if let Some(remote) = params.remote_url {
-        lines.push(format!("  {success}Remote:{RESET} {remote}"));
+        lines.push(format!(
+            "{secondary}│{RESET} {success}Remote:{RESET} {remote}"
+        ));
     }
     lines.push(format!(
-        "  {accent}Database:{RESET} {}",
-        compact_path(&database_url, 60)
+        "{secondary}│{RESET} {accent}Database:{RESET} {}",
+        compact_path(&database_url, 70)
     ));
     lines.push(format!(
-        "  {accent}Storage:{RESET} {}",
-        compact_path(params.storage_root, 60)
+        "{secondary}│{RESET} {accent}Storage:{RESET} {}",
+        compact_path(params.storage_root, 70)
     ));
-    lines.push(format!("  {accent}Theme:{RESET} {}", params.console_theme));
-    lines.push(format!("  {accent}Auth:{RESET} {auth}"));
-    lines.push(format!("  {accent}Tool logs:{RESET} {tool_log}"));
-    lines.push(format!("  {accent}Tool panels:{RESET} {tool_panels}"));
     lines.push(format!(
-        "  {text}Stats:{RESET} projects={} agents={} messages={} reservations={} contacts={}",
-        params.projects,
-        params.agents,
-        params.messages,
-        params.file_reservations,
+        "{secondary}│{RESET} {accent}Theme:{RESET} {}",
+        params.console_theme
+    ));
+    lines.push(format!("{secondary}│{RESET} {accent}Auth:{RESET} {auth}"));
+    lines.push(format!(
+        "{secondary}│{RESET} {accent}Tool logs:{RESET} {tool_log}"
+    ));
+    lines.push(format!(
+        "{secondary}│{RESET} {accent}Tool panels:{RESET} {tool_panels}"
+    ));
+    lines.push(format!(
+        "{secondary}╰─────────────────────────────────────────────────────────────────────╯{RESET}"
+    ));
+    lines.push(format!(
+        "{secondary}╭─ 📊 Database Statistics ────────────────────────────────────────────╮{RESET}"
+    ));
+    lines.push(format!(
+        "{secondary}│{RESET} {text}Projects:{RESET} {}",
+        params.projects
+    ));
+    lines.push(format!(
+        "{secondary}│{RESET} {text}Agents:{RESET} {}",
+        params.agents
+    ));
+    lines.push(format!(
+        "{secondary}│{RESET} {text}Messages:{RESET} {}",
+        params.messages
+    ));
+    lines.push(format!(
+        "{secondary}│{RESET} {text}File Reservations:{RESET} {}",
+        params.file_reservations
+    ));
+    lines.push(format!(
+        "{secondary}│{RESET} {text}Contact Links:{RESET} {}",
         params.contact_links
     ));
     lines.push(format!(
-        "  {DIM}Tip: interactive layout keys available via '?'{RESET}"
+        "{secondary}╰─────────────────────────────────────────────────────────────────────╯{RESET}"
+    ));
+    lines.push(format!(
+        "{warning}Tip:{RESET} interactive layout keys available via '?'"
     ));
     lines.push(String::new());
     lines
