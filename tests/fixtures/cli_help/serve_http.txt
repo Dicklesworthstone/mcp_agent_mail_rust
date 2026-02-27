@@ -5,4 +5,5 @@ Options:
       --port <PORT>
       --path <PATH>
       --no-auth      Disable bearer token authentication for this run (for local development)
+      --no-tui       Disable the interactive TUI and run headless
   -h, --help         Print help

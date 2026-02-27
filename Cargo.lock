@@ -4740,6 +4740,7 @@ dependencies = [
  "sqlmodel-sqlite",
  "tempfile",
  "thiserror",
+ "tracing-subscriber",
  "tru",
  "walkdir",
  "zip",

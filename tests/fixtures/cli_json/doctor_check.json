@@ -7,7 +7,7 @@
     },
     {
       "check": "db_file_sanity",
-      "detail": "quick_check OK (147456 bytes)",
+      "detail": "quick_check OK (176128 bytes)",
       "status": "ok"
     },
     {
@@ -31,9 +31,34 @@
       "status": "ok"
     },
     {
+      "check": "path_order",
+      "detail": "/home/ubuntu/.local/bin in PATH at position 5 of 6 (shadowed by /home/ubuntu/.cargo/bin/am at PATH position 1). Fix: move /home/ubuntu/.local/bin earlier in PATH",
+      "status": "warn"
+    },
+    {
+      "check": "mcp_config",
+      "detail": "8 config(s) found: 0 Rust, 0 Python, 8 no entry, 0 unreadable",
+      "status": "warn"
+    },
+    {
       "check": "timestamp_format",
       "detail": "i64 microseconds (Rust native)",
       "status": "ok"
+    },
+    {
+      "check": "wal_mode",
+      "detail": "WAL mode enabled",
+      "status": "ok"
+    },
+    {
+      "check": "schema_version",
+      "detail": "user_version = 0",
+      "status": "warn"
+    },
+    {
+      "check": "fts5",
+      "detail": "No FTS5 virtual tables found",
+      "status": "warn"
     },
     {
       "check": "beads_issue_awareness",

@@ -16,12 +16,13 @@
 #   --verify           Run self-test after install
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
+#   --verbose          Enable detailed installer diagnostics
 #   --no-gum           Disable gum formatting even if available
 #   --no-verify        Skip checksum + signature verification (for testing only)
 #   --offline          Skip network preflight checks
 #   --force            Force reinstall even if already at version
 #
-set -euo pipefail
+set -Eeuo pipefail
 umask 022
 shopt -s lastpipe 2>/dev/null || true
 
@@ -32,6 +33,7 @@ DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
 EASY=0
 QUIET=0
+VERBOSE=0
 VERIFY=0
 FROM_SOURCE=0
 CHECKSUM="${CHECKSUM:-}"
@@ -46,6 +48,10 @@ NO_GUM=0
 NO_CHECKSUM=0
 FORCE_INSTALL=0
 OFFLINE="${AM_OFFLINE:-0}"
+VERBOSE_DUMP_LINES=20
+LOG_FILE="${LOG_FILE:-/tmp/am-install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log}"
+LOG_INITIALIZED=0
+ORIGINAL_ARGS=("$@")
 
 # T2.1: Auto-enable easy-mode for pipe installs (stdin is not a terminal)
 # Also auto-enable in CI environments.
@@ -99,6 +105,74 @@ err() {
   else
     echo -e "\033[0;31mERR\033[0m $*"
   fi
+}
+
+init_verbose_log() {
+  [ "$LOG_INITIALIZED" -eq 1 ] && return 0
+  local log_dir
+  log_dir=$(dirname "$LOG_FILE")
+  mkdir -p "$log_dir" 2>/dev/null || true
+  if ! : > "$LOG_FILE" 2>/dev/null; then
+    LOG_FILE="/tmp/am-install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+    : > "$LOG_FILE" 2>/dev/null || return 0
+  fi
+  LOG_INITIALIZED=1
+  printf '%s [VERBOSE] initialized pid=%s shell=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$$" \
+    "${SHELL:-unknown}" >> "$LOG_FILE" || true
+}
+
+verbose() {
+  init_verbose_log
+  local ts msg
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  msg="$*"
+  if [ "$LOG_INITIALIZED" -eq 1 ]; then
+    printf '%s [VERBOSE] %s\n' "$ts" "$msg" >> "$LOG_FILE" || true
+  fi
+  if [ "$VERBOSE" -eq 1 ] && [ "$QUIET" -eq 0 ]; then
+    echo "[VERBOSE] $msg"
+  fi
+}
+
+dump_verbose_tail() {
+  [ "$LOG_INITIALIZED" -eq 1 ] || return 0
+  [ -f "$LOG_FILE" ] || return 0
+  err "Verbose log: $LOG_FILE"
+  if [ "$VERBOSE" -eq 0 ]; then
+    err "Last ${VERBOSE_DUMP_LINES} verbose log lines:"
+    tail -n "$VERBOSE_DUMP_LINES" "$LOG_FILE" >&2 || true
+  fi
+}
+
+on_error() {
+  local exit_code=$?
+  local line_no="${1:-unknown}"
+  trap - ERR
+  if [ "$exit_code" -ne 0 ]; then
+    err "Installer failed (exit ${exit_code}) at line ${line_no}"
+    dump_verbose_tail
+  fi
+  exit "$exit_code"
+}
+
+download_to_file() {
+  local url="$1"
+  local out="$2"
+  local label="${3:-download}"
+  local start_ts end_ts duration_s size_bytes
+  start_ts=$(date +%s)
+  verbose "${label}:start url=${url} out=${out}"
+  if [ "$VERBOSE" -eq 1 ] && [ "$QUIET" -eq 0 ]; then
+    curl -fL --progress-bar "$url" -o "$out"
+  else
+    curl -fsSL "$url" -o "$out"
+  fi
+  end_ts=$(date +%s)
+  duration_s=$((end_ts - start_ts))
+  size_bytes=$(wc -c < "$out" 2>/dev/null || echo 0)
+  verbose "${label}:done bytes=${size_bytes} duration_s=${duration_s} out=${out}"
 }
 
 # Spinner wrapper for long operations
@@ -156,6 +230,7 @@ draw_box() {
 }
 
 resolve_version() {
+  verbose "resolve_version:start preset=${VERSION:-<unset>}"
   if [ -n "$VERSION" ]; then return 0; fi
 
   info "Resolving latest version..."
@@ -167,6 +242,7 @@ resolve_version() {
 
   if [ -n "$tag" ]; then
     VERSION="$tag"
+    verbose "resolve_version:github_latest tag=${VERSION}"
     info "Resolved latest version: $VERSION"
   else
     # Try redirect-based resolution as fallback
@@ -174,6 +250,7 @@ resolve_version() {
     if tag=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||'); then
       if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
         VERSION="$tag"
+        verbose "resolve_version:redirect_latest tag=${VERSION}"
         info "Resolved latest version via redirect: $VERSION"
         return 0
       fi
@@ -185,19 +262,23 @@ resolve_version() {
          | grep '"name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/'); then
       if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]]; then
         VERSION="$tag"
+        verbose "resolve_version:tags_api tag=${VERSION}"
         info "Resolved latest version via tags: $VERSION"
         return 0
       fi
     fi
 
     VERSION="v0.1.0"
+    verbose "resolve_version:fallback_default tag=${VERSION}"
     warn "Could not resolve latest version; defaulting to $VERSION"
   fi
+  verbose "resolve_version:done resolved=${VERSION}"
 }
 
 detect_platform() {
   OS=$(uname -s | tr 'A-Z' 'a-z')
   ARCH=$(uname -m)
+  verbose "detect_platform:raw os=${OS} arch=${ARCH}"
   case "$ARCH" in
     x86_64|amd64) ARCH="x86_64" ;;
     arm64|aarch64) ARCH="aarch64" ;;
@@ -217,11 +298,13 @@ detect_platform() {
     warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
     FROM_SOURCE=1
   fi
+  verbose "detect_platform:normalized os=${OS} arch=${ARCH} target=${TARGET:-<none>} from_source=${FROM_SOURCE}"
 }
 
 set_artifact_url() {
   TAR=""
   URL=""
+  verbose "set_artifact_url:start artifact_url=${ARTIFACT_URL:-<unset>} target=${TARGET:-<none>} from_source=${FROM_SOURCE}"
   if [ "$FROM_SOURCE" -eq 0 ]; then
     if [ -n "$ARTIFACT_URL" ]; then
       TAR=$(basename "$ARTIFACT_URL")
@@ -234,6 +317,7 @@ set_artifact_url() {
       FROM_SOURCE=1
     fi
   fi
+  verbose "set_artifact_url:done tar=${TAR:-<none>} url=${URL:-<none>} from_source=${FROM_SOURCE}"
 }
 
 check_disk_space() {
@@ -270,11 +354,13 @@ check_write_permissions() {
 }
 
 check_existing_install() {
+  verbose "check_existing_install:start dest=${DEST}"
   if [ -x "$DEST/$BIN_CLI" ]; then
     local current
     current=$("$DEST/$BIN_CLI" --version 2>/dev/null | head -1 || echo "")
     if [ -n "$current" ]; then
       info "Existing am detected: $current"
+      verbose "check_existing_install:am version=${current}"
     fi
   fi
   if [ -x "$DEST/$BIN_SERVER" ]; then
@@ -282,8 +368,10 @@ check_existing_install() {
     current=$("$DEST/$BIN_SERVER" --version 2>/dev/null | head -1 || echo "")
     if [ -n "$current" ]; then
       info "Existing mcp-agent-mail detected: $current"
+      verbose "check_existing_install:mcp-agent-mail version=${current}"
     fi
   fi
+  verbose "check_existing_install:done"
 }
 
 check_network() {
@@ -314,6 +402,7 @@ PYTHON_ALIAS_FOUND=0
 PYTHON_ALIAS_FILE=""
 PYTHON_ALIAS_LINE=0
 PYTHON_ALIAS_CONTENT=""
+PYTHON_ALIAS_KIND=""
 PYTHON_ALIAS_HAS_MARKERS=0
 PYTHON_BINARY_FOUND=0
 PYTHON_BINARY_PATH=""
@@ -332,6 +421,7 @@ detect_python_alias() {
   PYTHON_ALIAS_FILE=""
   PYTHON_ALIAS_LINE=0
   PYTHON_ALIAS_CONTENT=""
+  PYTHON_ALIAS_KIND=""
   PYTHON_ALIAS_HAS_MARKERS=0
 
   local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile")
@@ -345,19 +435,34 @@ detect_python_alias() {
     [ -f "$rc" ] || continue
 
     # Check for marker block: "# >>> MCP Agent Mail alias" ... "# <<< MCP Agent Mail alias"
+    # Only treat as active if the block still contains a live alias/function line.
     if grep -q '# >>> MCP Agent Mail' "$rc" 2>/dev/null; then
-      PYTHON_ALIAS_FOUND=1
-      PYTHON_ALIAS_FILE="$rc"
-      PYTHON_ALIAS_HAS_MARKERS=1
-      PYTHON_ALIAS_LINE=$(grep -n '# >>> MCP Agent Mail' "$rc" | head -1 | cut -d: -f1)
-      # Extract the alias content from within the marker block
-      PYTHON_ALIAS_CONTENT=$(sed -n '/# >>> MCP Agent Mail/,/# <<< MCP Agent Mail/p' "$rc" | grep -E "^alias am=|^alias am " | head -1)
-      return 0
+      local marker_line
+      marker_line=$(grep -n '# >>> MCP Agent Mail' "$rc" | head -1 | cut -d: -f1)
+      local marker_payload
+      marker_payload=$(sed -n '/# >>> MCP Agent Mail/,/# <<< MCP Agent Mail/p' "$rc")
+      local active_entry
+      active_entry=$(printf '%s\n' "$marker_payload" | grep -E "^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\\(\\))" | head -1 || true)
+
+      if [ -n "$active_entry" ]; then
+        PYTHON_ALIAS_FOUND=1
+        PYTHON_ALIAS_FILE="$rc"
+        PYTHON_ALIAS_HAS_MARKERS=1
+        PYTHON_ALIAS_LINE="$marker_line"
+        PYTHON_ALIAS_CONTENT="$active_entry"
+        if echo "$active_entry" | grep -qE "^[[:space:]]*(function am[[:space:](]|am[[:space:]]*\\(\\))"; then
+          PYTHON_ALIAS_KIND="function"
+        else
+          PYTHON_ALIAS_KIND="alias"
+        fi
+        verbose "detect_python_alias:found file=${PYTHON_ALIAS_FILE} line=${PYTHON_ALIAS_LINE} kind=${PYTHON_ALIAS_KIND} markers=1"
+        return 0
+      fi
     fi
 
     # Check for bare "alias am=" (bash/zsh) or "alias am " (fish) outside markers
     local alias_line=""
-    alias_line=$(grep -n -E "^[[:space:]]*(alias am=|alias am )" "$rc" 2>/dev/null | grep -iv "disabled\|#.*alias am" | head -1)
+    alias_line=$(grep -n -E "^[[:space:]]*(alias am=|alias am )" "$rc" 2>/dev/null | grep -iv "disabled\|#.*alias am" | head -1 || true)
     if [ -n "$alias_line" ]; then
       # Skip commented-out aliases
       local line_content
@@ -369,14 +474,16 @@ detect_python_alias() {
       PYTHON_ALIAS_FILE="$rc"
       PYTHON_ALIAS_LINE=$(echo "$alias_line" | cut -d: -f1)
       PYTHON_ALIAS_CONTENT="$line_content"
+      PYTHON_ALIAS_KIND="alias"
       PYTHON_ALIAS_HAS_MARKERS=0
+      verbose "detect_python_alias:found file=${PYTHON_ALIAS_FILE} line=${PYTHON_ALIAS_LINE} kind=${PYTHON_ALIAS_KIND} markers=0"
       return 0
     fi
 
     # Check for function definition: "function am()" or "am()" (bash/zsh)
     # Or "function am" (fish)
     local func_line=""
-    func_line=$(grep -n -E "^[[:space:]]*(function am[[:space:](]|am[[:space:]]*\(\))" "$rc" 2>/dev/null | grep -v "^[[:space:]]*#" | head -1)
+    func_line=$(grep -n -E "^[[:space:]]*(function am[[:space:](]|am[[:space:]]*\(\))" "$rc" 2>/dev/null | grep -v "^[[:space:]]*#" | head -1 || true)
     if [ -n "$func_line" ]; then
       local line_content
       line_content=$(echo "$func_line" | cut -d: -f2-)
@@ -385,11 +492,14 @@ detect_python_alias() {
         PYTHON_ALIAS_FILE="$rc"
         PYTHON_ALIAS_LINE=$(echo "$func_line" | cut -d: -f1)
         PYTHON_ALIAS_CONTENT="$line_content"
+        PYTHON_ALIAS_KIND="function"
         PYTHON_ALIAS_HAS_MARKERS=0
+        verbose "detect_python_alias:found file=${PYTHON_ALIAS_FILE} line=${PYTHON_ALIAS_LINE} kind=${PYTHON_ALIAS_KIND} markers=0"
         return 0
       fi
     fi
   done
+  verbose "detect_python_alias:not_found"
 }
 
 # T1.2: Detect Python am binary/script in PATH
@@ -415,6 +525,7 @@ detect_python_binary() {
       if echo "$link_target" | grep -qiE "python|venv|site-packages|mcp.agent.mail"; then
         PYTHON_BINARY_FOUND=1
         PYTHON_BINARY_PATH="$am_path"
+        verbose "detect_python_binary:found symlink_path=${PYTHON_BINARY_PATH}"
         return 0
       fi
     fi
@@ -426,6 +537,7 @@ detect_python_binary() {
       if echo "$first_lines" | grep -qiE "python|#!/.*python"; then
         PYTHON_BINARY_FOUND=1
         PYTHON_BINARY_PATH="$am_path"
+        verbose "detect_python_binary:found script_path=${PYTHON_BINARY_PATH}"
         return 0
       fi
     fi
@@ -434,6 +546,7 @@ detect_python_binary() {
     if echo "$am_path" | grep -qiE "venv|virtualenv|site-packages|\.local/lib/python"; then
       PYTHON_BINARY_FOUND=1
       PYTHON_BINARY_PATH="$am_path"
+      verbose "detect_python_binary:found pythonish_path=${PYTHON_BINARY_PATH}"
       return 0
     fi
   done <<< "$all_am"
@@ -442,14 +555,18 @@ detect_python_binary() {
   if command -v python3 >/dev/null 2>&1 && python3 -c "import mcp_agent_mail" 2>/dev/null; then
     PYTHON_BINARY_FOUND=1
     PYTHON_BINARY_PATH="python3 -m mcp_agent_mail"
+    verbose "detect_python_binary:found importable=${PYTHON_BINARY_PATH}"
   elif command -v python >/dev/null 2>&1 && python -c "import mcp_agent_mail" 2>/dev/null; then
     PYTHON_BINARY_FOUND=1
     PYTHON_BINARY_PATH="python -m mcp_agent_mail"
+    verbose "detect_python_binary:found importable=${PYTHON_BINARY_PATH}"
   fi
+  [ "$PYTHON_BINARY_FOUND" -eq 0 ] && verbose "detect_python_binary:not_found"
 }
 
 # T1.3: Detect Python virtualenv and git clone
 detect_python_installation() {
+  verbose "detect_python_installation:start"
   PYTHON_CLONE_FOUND=0
   PYTHON_CLONE_PATH=""
   PYTHON_VENV_PATH=""
@@ -522,10 +639,12 @@ detect_python_installation() {
   if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] || [ "$PYTHON_BINARY_FOUND" -eq 1 ] || [ "$PYTHON_CLONE_FOUND" -eq 1 ]; then
     PYTHON_DETECTED=1
   fi
+  verbose "detect_python_installation:done clone_found=${PYTHON_CLONE_FOUND} clone=${PYTHON_CLONE_PATH:-<none>} venv=${PYTHON_VENV_PATH:-<none>} pid=${PYTHON_PID:-<none>}"
 }
 
 # Run all Python detection in sequence
 detect_python() {
+  verbose "detect_python:start"
   detect_python_alias
   detect_python_binary
   detect_python_installation
@@ -538,6 +657,7 @@ detect_python() {
     [ -n "$PYTHON_VENV_PATH" ] && info "  Venv: $PYTHON_VENV_PATH"
     [ -n "$PYTHON_PID" ] && info "  Running PID: $PYTHON_PID"
   fi
+  verbose "detect_python:done detected=${PYTHON_DETECTED} alias=${PYTHON_ALIAS_FOUND} binary=${PYTHON_BINARY_FOUND} clone=${PYTHON_CLONE_FOUND} pid=${PYTHON_PID:-<none>}"
 }
 
 # T1.4: Displace Python alias (comment out with backup)
@@ -553,6 +673,7 @@ displace_python_alias() {
   timestamp=$(date +%Y%m%d_%H%M%S)
   local backup="${rc}.bak.mcp-agent-mail-${timestamp}"
   cp -p "$rc" "$backup"
+  verbose "displace_python_alias:backup rc=${rc} backup=${backup}"
   info "Backed up $rc -> $backup"
 
   # Write to a temp file, then atomic rename
@@ -567,12 +688,57 @@ displace_python_alias() {
       { print }
     ' "$rc" > "$tmpfile"
   else
-    # Comment out the bare alias line
+    # Comment out the bare alias line or function block
     local line_num="$PYTHON_ALIAS_LINE"
-    awk -v line="$line_num" -v dest="$DEST" '
-      NR == line { print "# Disabled by mcp-agent-mail Rust installer: " $0; print "# Rust binary at: " dest "/am"; next }
-      { print }
-    ' "$rc" > "$tmpfile"
+    if [ "${PYTHON_ALIAS_KIND:-alias}" = "function" ]; then
+      awk -v line="$line_num" -v dest="$DEST" '
+        function brace_delta(str,    opens, closes, tmp) {
+          tmp=str
+          opens=gsub(/\{/, "{", tmp)
+          tmp=str
+          closes=gsub(/\}/, "}", tmp)
+          return opens - closes
+        }
+        NR < line { print; next }
+        NR == line {
+          print "# Disabled by mcp-agent-mail Rust installer: " $0
+          print "# Rust binary at: " dest "/am"
+          in_block=1
+          is_fish = ($0 ~ /^[[:space:]]*function am([[:space:]]|$)/ && $0 !~ /\(/ && $0 !~ /\{/)
+          if (!is_fish) {
+            saw_open = ($0 ~ /\{/)
+            depth = brace_delta($0)
+            if (saw_open && depth <= 0) {
+              in_block=0
+            }
+          }
+          next
+        }
+        in_block {
+          print "# Disabled by mcp-agent-mail Rust installer: " $0
+          if (is_fish) {
+            if ($0 ~ /^[[:space:]]*end([[:space:]]|$)/) {
+              in_block=0
+            }
+          } else {
+            if ($0 ~ /\{/) {
+              saw_open=1
+            }
+            depth += brace_delta($0)
+            if (saw_open && depth <= 0) {
+              in_block=0
+            }
+          }
+          next
+        }
+        { print }
+      ' "$rc" > "$tmpfile"
+    else
+      awk -v line="$line_num" -v dest="$DEST" '
+        NR == line { print "# Disabled by mcp-agent-mail Rust installer: " $0; print "# Rust binary at: " dest "/am"; next }
+        { print }
+      ' "$rc" > "$tmpfile"
+    fi
   fi
 
   # Verify the temp file is valid (non-empty, at least as many lines as original)
@@ -590,6 +756,15 @@ displace_python_alias() {
 
   # Atomic rename
   mv "$tmpfile" "$rc"
+  if command -v diff >/dev/null 2>&1; then
+    local diff_out
+    diff_out=$(diff -u "$backup" "$rc" 2>/dev/null || true)
+    if [ -n "$diff_out" ]; then
+      while IFS= read -r line; do
+        verbose "displace_python_alias:diff ${line}"
+      done <<< "$diff_out"
+    fi
+  fi
   ok "Python alias disabled in $rc"
   ok "Backup at $backup"
 }
@@ -865,8 +1040,12 @@ preflight_checks() {
 }
 
 maybe_add_path() {
+  verbose "maybe_add_path:start path=${PATH} dest=${DEST} easy=${EASY}"
   case ":$PATH:" in
-    *:"$DEST":*) return 0;;
+    *:"$DEST":*)
+      verbose "maybe_add_path:dest_already_in_path"
+      return 0
+      ;;
     *)
       if [ "$EASY" -eq 1 ]; then
         UPDATED=0
@@ -874,20 +1053,25 @@ maybe_add_path() {
           if [ -e "$rc" ] && [ -w "$rc" ]; then
             if ! grep -F "$DEST" "$rc" >/dev/null 2>&1; then
               echo "export PATH=\"$DEST:\$PATH\"" >> "$rc"
+              verbose "maybe_add_path:appended rc=${rc} export PATH=\"$DEST:\$PATH\""
             fi
             UPDATED=1
           fi
         done
         if [ "$UPDATED" -eq 1 ]; then
           warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use am / mcp-agent-mail"
+          verbose "maybe_add_path:updated_shell_rc=1"
         else
           warn "Add $DEST to PATH to use am / mcp-agent-mail"
+          verbose "maybe_add_path:updated_shell_rc=0"
         fi
       else
         warn "Add $DEST to PATH to use am / mcp-agent-mail"
+        verbose "maybe_add_path:easy_mode_disabled_no_update"
       fi
     ;;
   esac
+  verbose "maybe_add_path:done"
 }
 
 detect_mcp_configs() {
@@ -995,6 +1179,7 @@ verify_checksum() {
   local file="$1"
   local expected="$2"
   local actual=""
+  verbose "verify_checksum:start file=${file} expected=${expected}"
 
   if [ ! -f "$file" ]; then
     err "File not found: $file"
@@ -1011,6 +1196,7 @@ verify_checksum() {
   fi
 
   if [ "$actual" != "$expected" ]; then
+    verbose "verify_checksum:failed actual=${actual}"
     err "Checksum verification FAILED!"
     err "Expected: $expected"
     err "Got:      $actual"
@@ -1020,6 +1206,7 @@ verify_checksum() {
   fi
 
   ok "Checksum verified: ${actual:0:16}..."
+  verbose "verify_checksum:ok actual=${actual}"
   return 0
 }
 
@@ -1027,6 +1214,7 @@ verify_checksum() {
 verify_sigstore_bundle() {
   local file="$1"
   local artifact_url="$2"
+  verbose "verify_sigstore_bundle:start file=${file} artifact_url=${artifact_url}"
 
   if ! command -v cosign &>/dev/null; then
     warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
@@ -1040,8 +1228,9 @@ verify_sigstore_bundle() {
 
   local bundle_file="$TMP/$(basename "$bundle_url")"
   info "Fetching sigstore bundle from ${bundle_url}"
-  if ! curl -fsSL "$bundle_url" -o "$bundle_file"; then
+  if ! download_to_file "$bundle_url" "$bundle_file" "sigstore-bundle"; then
     warn "Sigstore bundle not found; skipping signature verification"
+    verbose "verify_sigstore_bundle:bundle_missing url=${bundle_url}"
     return 0
   fi
 
@@ -1050,10 +1239,12 @@ verify_sigstore_bundle() {
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
     "$file"; then
+    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file}"
     return 1
   fi
 
   ok "Signature verified (cosign)"
+  verbose "verify_sigstore_bundle:ok bundle=${bundle_file}"
   return 0
 }
 
@@ -1085,7 +1276,7 @@ usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] \\
-                  [--offline] [--no-gum] [--no-verify] [--force] [--from-source]
+                  [--offline] [--no-gum] [--no-verify] [--force] [--from-source] [--verbose]
 
 Installs mcp-agent-mail and am (CLI) binaries.
 
@@ -1097,6 +1288,7 @@ Options:
   --verify           Run self-test after install
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
+  --verbose          Enable detailed installer diagnostics
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
   --no-verify        Skip checksum + signature verification (for testing only)
@@ -1116,6 +1308,7 @@ while [ $# -gt 0 ]; do
     --checksum-url) CHECKSUM_URL="$2"; shift 2;;
     --from-source) FROM_SOURCE=1; shift;;
     --quiet|-q) QUIET=1; shift;;
+    --verbose) VERBOSE=1; shift;;
     --offline) OFFLINE=1; shift;;
     --no-gum) NO_GUM=1; shift;;
     --no-verify) NO_CHECKSUM=1; shift;;
@@ -1124,6 +1317,11 @@ while [ $# -gt 0 ]; do
     *) shift;;
   esac
 done
+
+trap 'on_error $LINENO' ERR
+init_verbose_log
+verbose "argv=${ORIGINAL_ARGS[*]:-(none)}"
+verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL}"
 
 # Show fancy header
 if [ "$QUIET" -eq 0 ]; then
@@ -1195,9 +1393,10 @@ trap cleanup EXIT
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
-  if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
+  if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
     warn "Binary download failed (release may not exist for $VERSION)"
     warn "Attempting build from source as fallback..."
+    verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
     FROM_SOURCE=1
   fi
 fi
@@ -1249,7 +1448,7 @@ else
     [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
     info "Fetching checksum from ${CHECKSUM_URL}"
     CHECKSUM_FILE="$TMP/checksum.sha256"
-    if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
+    if ! download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download"; then
       warn "Checksum file not available; skipping verification"
       warn "Use --checksum <hex> to provide one manually"
       CHECKSUM=""
@@ -1354,12 +1553,60 @@ if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
   done <<< "$MCP_CONFIG_SCAN"
 fi
 
+collect_migration_counts() {
+  local db_path="$1"
+  if ! command -v sqlite3 >/dev/null 2>&1 || [ ! -f "$db_path" ]; then
+    echo "sqlite3_unavailable"
+    return 0
+  fi
+  local tables=(
+    projects
+    agents
+    messages
+    message_recipients
+    file_reservations
+    agent_links
+    message_summaries
+    product_project_links
+  )
+  local table count summary=""
+  for table in "${tables[@]}"; do
+    count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM ${table};" 2>/dev/null || echo "na")
+    summary+="${table}=${count};"
+  done
+  echo "$summary"
+}
+
 # Run database migration if we copied a Python DB
 if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   info "Running database migration on copied Python database"
-  if DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate 2>&1; then
+  migration_start=0
+  migration_end=0
+  migration_seconds=0
+  migration_output=""
+  migration_before_counts=""
+  migration_after_counts=""
+  migration_before_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+  migration_start=$(date +%s)
+  if migration_output=$(DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate 2>&1); then
+    migration_end=$(date +%s)
+    migration_seconds=$((migration_end - migration_start))
+    migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+    verbose "migration:ok duration_s=${migration_seconds} db=${PYTHON_DB_MIGRATED_PATH}"
+    verbose "migration:row_counts_before ${migration_before_counts}"
+    verbose "migration:row_counts_after ${migration_after_counts}"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:output ${line}"
+    done <<< "$migration_output"
     ok "Database schema migrated"
   else
+    migration_end=$(date +%s)
+    migration_seconds=$((migration_end - migration_start))
+    verbose "migration:failed duration_s=${migration_seconds} db=${PYTHON_DB_MIGRATED_PATH}"
+    verbose "migration:row_counts_before ${migration_before_counts}"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:output ${line}"
+    done <<< "$migration_output"
     warn "Database migration had issues (you can retry with: am migrate)"
   fi
 fi
@@ -1367,6 +1614,7 @@ fi
 # T2.4: Post-install verification
 verify_installation() {
   local issues=0
+  verbose "verify_installation:start dest=${DEST} shell=${SHELL:-unknown}"
 
   # 1. Check binaries exist and are executable
   if [ ! -x "$DEST/$BIN_SERVER" ]; then
@@ -1397,8 +1645,10 @@ verify_installation() {
     bash) resolve_cmd="bash -l -c 'type -P am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND'" ;;
     *)    resolve_cmd="sh -l -c 'which am 2>/dev/null || echo NOT_FOUND'" ;;
   esac
+  verbose "verify_installation:path_resolution_command shell=${shell_name} cmd=${resolve_cmd}"
   local resolved_path
   resolved_path=$(eval "$resolve_cmd" 2>/dev/null || echo "NOT_FOUND")
+  verbose "verify_installation:path_resolution_result resolved=${resolved_path:-NOT_FOUND} expected=${DEST}/${BIN_CLI}"
 
   if [ "$resolved_path" = "NOT_FOUND" ] || [ -z "$resolved_path" ]; then
     warn "VERIFY: 'am' not found in login shell PATH"
@@ -1424,11 +1674,11 @@ verify_installation() {
   # 4. If Python was displaced, verify the alias is gone
   if [ "$PYTHON_DETECTED" -eq 1 ] && [ "${MIGRATE_PYTHON:-0}" -eq 1 ]; then
     if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && [ -n "$PYTHON_ALIAS_FILE" ]; then
-      if grep -qE "^alias am=" "$PYTHON_ALIAS_FILE" 2>/dev/null; then
-        warn "VERIFY: Python 'am' alias still active in $PYTHON_ALIAS_FILE"
+      if grep -qE "^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\\(\\))" "$PYTHON_ALIAS_FILE" 2>/dev/null; then
+        warn "VERIFY: Python 'am' alias/function still active in $PYTHON_ALIAS_FILE"
         issues=$((issues + 1))
       else
-        ok "VERIFY: Python alias displaced in $PYTHON_ALIAS_FILE"
+        ok "VERIFY: Python alias/function displaced in $PYTHON_ALIAS_FILE"
       fi
     fi
   fi
@@ -1439,6 +1689,7 @@ verify_installation() {
   else
     ok "All verification checks passed"
   fi
+  verbose "verify_installation:done issues=${issues}"
 }
 
 if [ "$VERIFY" -eq 1 ]; then

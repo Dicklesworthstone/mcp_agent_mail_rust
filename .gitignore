@@ -132,3 +132,4 @@ SESSION_*.md
 verify_*.sh
 newfile.txt
 repro_*.rs
+.claude/settings.local.json
