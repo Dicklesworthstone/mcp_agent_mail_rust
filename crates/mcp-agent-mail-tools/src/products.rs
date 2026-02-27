@@ -453,7 +453,12 @@ pub async fn fetch_inbox_product(
         mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
     )?;
 
-    let max_messages = usize::try_from(limit.unwrap_or(20)).unwrap_or(20);
+    let raw_limit = limit.unwrap_or(20);
+    let max_messages = if raw_limit == 0 {
+        usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+    } else {
+        usize::try_from(raw_limit).unwrap_or(20)
+    };
     let urgent = urgent_only.unwrap_or(false);
     let with_bodies = include_bodies.unwrap_or(false);
     let since_micros = since_ts

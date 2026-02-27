@@ -253,7 +253,10 @@ pub async fn request_contact(
     )
     .await?;
 
-    let ttl = ttl_seconds.unwrap_or(604_800).max(60); // 7 days default; min 60s
+    let ttl = match ttl_seconds {
+        Some(t) if t > 0 => t.max(60),
+        _ => 604_800, // 7 days default
+    };
     let link_row = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::request_contact(
             ctx.cx(),
@@ -388,7 +391,10 @@ pub async fn respond_contact(
     )
     .await?;
 
-    let ttl = ttl_seconds.unwrap_or(2_592_000).max(60); // 30 days default; min 60s
+    let ttl = match ttl_seconds {
+        Some(t) if t > 0 => t.max(60),
+        _ => 2_592_000, // 30 days default
+    };
     let (updated, link_row) = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::respond_contact(
             ctx.cx(),
@@ -806,14 +812,22 @@ mod tests {
     #[test]
     fn ttl_zero_treated_as_default() {
         // TTL of 0 should be treated as using default (validated by tool)
-        let ttl = 0_i64;
-        assert!(ttl <= 0, "Zero TTL should trigger default behavior");
+        let ttl_seconds = Some(0_i64);
+        let ttl = match ttl_seconds {
+            Some(t) if t > 0 => t.max(60),
+            _ => 604_800,
+        };
+        assert_eq!(ttl, 604_800, "Zero TTL should trigger default behavior");
     }
 
     #[test]
     fn ttl_negative_handled() {
-        let ttl = -100_i64;
-        assert!(ttl < 0, "Negative TTL should be rejected or defaulted");
+        let ttl_seconds = Some(-100_i64);
+        let ttl = match ttl_seconds {
+            Some(t) if t > 0 => t.max(60),
+            _ => 604_800,
+        };
+        assert_eq!(ttl, 604_800, "Negative TTL should be defaulted");
     }
 
     // ── ContactLink serialization edge cases ──
