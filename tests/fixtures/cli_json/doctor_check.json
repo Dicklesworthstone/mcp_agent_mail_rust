@@ -27,7 +27,7 @@
     },
     {
       "check": "binary_resolution",
-      "detail": "'am' resolves to /home/ubuntu/.local/bin/am (zsh)",
+      "detail": "'am' resolves to /home/ubuntu/.local/bin/am (bash)",
       "status": "ok"
     },
     {

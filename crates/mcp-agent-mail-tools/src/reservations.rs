@@ -113,8 +113,8 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
              Consider using a more specific pattern."
         ));
     }
-    // 3. Absolute paths (single leading slash, not UNC paths like //network)
-    if p.starts_with('/') && !p.starts_with("//") {
+    // 3. Absolute paths
+    if (p.starts_with('/') && !p.starts_with("//")) || std::path::Path::new(p).is_absolute() {
         return Some(format!(
             "Pattern '{p}' looks like an absolute path. \
              Reservations should use project-relative paths like 'src/module.py'."
@@ -883,8 +883,8 @@ pub async fn force_release_file_reservation(
     let mut stale_reasons = Vec::new();
 
     // Signal 1: Agent inactivity
-    let agent_inactive_secs = (now_micros - holder_agent.last_active_ts) / 1_000_000;
-    let agent_inactive = (now_micros - holder_agent.last_active_ts) > inactivity_micros;
+    let agent_inactive_secs = now_micros.saturating_sub(holder_agent.last_active_ts) / 1_000_000;
+    let agent_inactive = now_micros.saturating_sub(holder_agent.last_active_ts) > inactivity_micros;
     if agent_inactive {
         stale_reasons.push(format!("agent_inactive>{inactivity_seconds}s"));
     } else {
@@ -901,7 +901,7 @@ pub async fn force_release_file_reservation(
         )
         .await,
     )?;
-    let mail_stale = mail_activity.is_none_or(|ts| (now_micros - ts) > grace_micros);
+    let mail_stale = mail_activity.is_none_or(|ts| now_micros.saturating_sub(ts) > grace_micros);
     if mail_stale {
         stale_reasons.push(format!("no_recent_mail_activity>{grace_seconds}s"));
     } else {
@@ -911,7 +911,7 @@ pub async fn force_release_file_reservation(
     // Signal 3: Git activity (via archive commits)
     let config = &Config::get();
     let git_activity = get_git_activity_for_agent(config, &project.slug, &holder_agent.name);
-    let git_stale = git_activity.is_none_or(|ts| (now_micros - ts) > grace_micros);
+    let git_stale = git_activity.is_none_or(|ts| now_micros.saturating_sub(ts) > grace_micros);
     if git_stale {
         stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
     } else {
@@ -991,14 +991,14 @@ pub async fn force_release_file_reservation(
             let _ = writeln!(
                 details,
                 "- last mail activity \u{2248} {}s ago",
-                (now_micros - ts) / 1_000_000
+                now_micros.saturating_sub(ts) / 1_000_000
             );
         }
         if let Some(ts) = git_activity {
             let _ = writeln!(
                 details,
                 "- last git commit \u{2248} {}s ago",
-                (now_micros - ts) / 1_000_000
+                now_micros.saturating_sub(ts) / 1_000_000
             );
         }
         let _ = write!(

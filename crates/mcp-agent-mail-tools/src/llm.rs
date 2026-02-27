@@ -301,7 +301,7 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
             let key =
                 get_env_var("GROQ_API_KEY").ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
             // Strip provider prefix for the API
-            let api_model = model.strip_prefix("groq/").unwrap_or(model);
+            let api_model = model.strip_prefix("groq/").or_else(|| model.strip_prefix("groq:")).unwrap_or(model);
             Ok((
                 "https://api.groq.com/openai/v1/chat/completions".to_string(),
                 format!("Bearer {key}"),
@@ -311,7 +311,7 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
         "deepseek" => {
             let key = get_env_var("DEEPSEEK_API_KEY")
                 .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model.strip_prefix("deepseek/").unwrap_or(model);
+            let api_model = model.strip_prefix("deepseek/").or_else(|| model.strip_prefix("deepseek:")).unwrap_or(model);
             Ok((
                 "https://api.deepseek.com/v1/chat/completions".to_string(),
                 format!("Bearer {key}"),
@@ -321,7 +321,7 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
         "xai" => {
             let key =
                 get_env_var("XAI_API_KEY").ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model.strip_prefix("xai/").unwrap_or(model);
+            let api_model = model.strip_prefix("xai/").or_else(|| model.strip_prefix("xai:")).unwrap_or(model);
             Ok((
                 "https://api.x.ai/v1/chat/completions".to_string(),
                 format!("Bearer {key}"),
@@ -331,7 +331,7 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
         "openrouter" => {
             let key = get_env_var("OPENROUTER_API_KEY")
                 .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model.strip_prefix("openrouter/").unwrap_or(model);
+            let api_model = model.strip_prefix("openrouter/").or_else(|| model.strip_prefix("openrouter:")).unwrap_or(model);
             Ok((
                 "https://openrouter.ai/api/v1/chat/completions".to_string(),
                 format!("Bearer {key}"),

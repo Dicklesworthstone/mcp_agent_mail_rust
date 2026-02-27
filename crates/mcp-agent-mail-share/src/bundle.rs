@@ -626,36 +626,41 @@ fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<String>) -> st
     if !current.is_dir() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if file_type.is_dir() {
-            collect_entries(base, &path, entries)?;
-            continue;
-        }
 
-        if file_type.is_symlink() {
-            // Avoid traversing symlinked directories during ZIP packaging; for symlinked files,
-            // we rely on canonicalization guards in `package_directory_as_zip`.
-            if std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+    let mut stack = vec![current.to_path_buf()];
+
+    while let Some(current_dir) = stack.pop() {
+        for entry in std::fs::read_dir(current_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                stack.push(path);
                 continue;
             }
-        }
 
-        if !(file_type.is_file() || file_type.is_symlink()) {
-            continue;
-        }
+            if file_type.is_symlink() {
+                // Avoid traversing symlinked directories during ZIP packaging; for symlinked files,
+                // we rely on canonicalization guards in `package_directory_as_zip`.
+                if std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+                    continue;
+                }
+            }
 
-        let relative = path
-            .strip_prefix(base)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        entries.push(relative);
+            if !(file_type.is_file() || file_type.is_symlink()) {
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            entries.push(relative);
+        }
     }
     Ok(())
 }
