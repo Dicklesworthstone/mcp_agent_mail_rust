@@ -119,6 +119,7 @@ jobs:
       - name: Copy install scripts to dist
         run: |
           cp install.sh dist/ 2>/dev/null || echo "No install.sh found"
+          cp install.ps1 dist/ 2>/dev/null || echo "No install.ps1 found"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
