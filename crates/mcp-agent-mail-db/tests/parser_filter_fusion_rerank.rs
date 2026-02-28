@@ -656,8 +656,14 @@ fn prepare_first_source_attribution() {
     let prep = prepare_candidates(&lexical, &semantic, budget);
     let doc1 = prep.candidates.iter().find(|c| c.doc_id == 1).unwrap();
     let doc2 = prep.candidates.iter().find(|c| c.doc_id == 2).unwrap();
-    assert_eq!(doc1.first_source, CandidateSource::Lexical);
-    assert_eq!(doc2.first_source, CandidateSource::Semantic);
+    assert_eq!(
+        doc1.first_source,
+        mcp_agent_mail_db::search_candidates::CandidateSource::Lexical
+    );
+    assert_eq!(
+        doc2.first_source,
+        mcp_agent_mail_db::search_candidates::CandidateSource::Semantic
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
