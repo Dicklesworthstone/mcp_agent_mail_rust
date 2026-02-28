@@ -541,6 +541,111 @@ fn perform_health_check(host: &str, port: u16, path: &str, timeout_secs: u64) ->
     }
 }
 
+/// Get service status (platform-specific)
+pub fn status_service(json: bool) -> crate::CliResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let backend = LaunchAgentBackend;
+        let status = backend.status()?;
+
+        if json {
+            // Output JSON format
+            let json_output = serde_json::json!({
+                "status": status.status,
+                "pid": status.pid,
+                "uptime_secs": status.uptime_secs,
+                "version": status.version,
+                "installed_at": status.installed_at,
+                "health": status.health,
+            });
+            println!("{}", json_output.to_string());
+        } else {
+            // Human-readable output
+            println!("Service: mcp-agent-mail");
+            println!("Status:  {}", status.status);
+            if let Some(pid) = status.pid {
+                println!("PID:     {}", pid);
+            }
+            if let Some(uptime) = status.uptime_secs {
+                println!("Uptime:  {} seconds", uptime);
+            }
+            println!("Version: {}", status.version);
+            if let Some(installed_at) = &status.installed_at {
+                println!("Installed: {}", installed_at);
+            }
+            if let Some(health) = status.health {
+                println!("Health:  {}", if health { "✓ healthy" } else { "✗ unhealthy" });
+            }
+            if let Some(error) = &status.error {
+                println!("Error:   {}", error);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!("TODO: Implement Linux systemd status");
+        Err(crate::CliError::NotImplemented("Linux service status"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!("TODO: Implement Windows service status");
+        Err(crate::CliError::NotImplemented("Windows service status"))
+    }
+}
+
+/// Restart service (platform-specific)
+pub fn restart_service() -> crate::CliResult<()> {
+    eprintln!("Restarting mcp-agent-mail service...");
+
+    #[cfg(target_os = "macos")]
+    {
+        let backend = LaunchAgentBackend;
+        backend.restart()?;
+        eprintln!("Service restarted successfully");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!("TODO: Implement Linux systemd restart");
+        Err(crate::CliError::NotImplemented("Linux service restart"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!("TODO: Implement Windows service restart");
+        Err(crate::CliError::NotImplemented("Windows service restart"))
+    }
+}
+
+/// Uninstall service (platform-specific)
+pub fn uninstall_service() -> crate::CliResult<()> {
+    eprintln!("Uninstalling mcp-agent-mail service...");
+
+    #[cfg(target_os = "macos")]
+    {
+        let backend = LaunchAgentBackend;
+        backend.uninstall()?;
+        eprintln!("Service uninstalled successfully");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!("TODO: Implement Linux systemd uninstall");
+        Err(crate::CliError::NotImplemented("Linux service uninstall"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!("TODO: Implement Windows service uninstall");
+        Err(crate::CliError::NotImplemented("Windows service uninstall"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

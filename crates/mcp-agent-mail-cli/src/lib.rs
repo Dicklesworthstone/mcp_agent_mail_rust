@@ -2283,22 +2283,13 @@ fn handle_service(action: service::ServiceCommand) -> CliResult<()> {
             dry_run,
             health_timeout,
         } => service::install_service(dry_run, health_timeout),
-        service::ServiceCommand::Uninstall => {
-            eprintln!("TODO: implement am service uninstall");
-            Err(CliError::NotImplemented("am service uninstall"))
-        }
-        service::ServiceCommand::Status { json } => {
-            eprintln!("TODO: implement am service status (json={})", json);
-            Err(CliError::NotImplemented("am service status"))
-        }
+        service::ServiceCommand::Uninstall => service::uninstall_service(),
+        service::ServiceCommand::Status { json } => service::status_service(json),
         service::ServiceCommand::Logs { follow, lines } => {
             eprintln!("TODO: implement am service logs (follow={}, lines={})", follow, lines);
             Err(CliError::NotImplemented("am service logs"))
         }
-        service::ServiceCommand::Restart => {
-            eprintln!("TODO: implement am service restart");
-            Err(CliError::NotImplemented("am service restart"))
-        }
+        service::ServiceCommand::Restart => service::restart_service(),
     }
 }
 
