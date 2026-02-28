@@ -1160,7 +1160,7 @@ fn build_inbox(
                 Value::BigInt(ack_threshold),
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
-                Value::BigInt(limit as i64),
+                Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),
             ],
         )
         .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
@@ -1283,7 +1283,7 @@ fn build_outbox_entries(
             &[
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
-                Value::BigInt(limit as i64),
+                Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),
             ],
         )
         .map_err(|e| CliError::Other(format!("outbox query failed: {e}")))?;
@@ -1455,7 +1455,7 @@ fn build_thread(
     }
 
     let limit_val = limit.unwrap_or(200);
-    params.push(Value::BigInt(limit_val as i64));
+    params.push(Value::BigInt(limit_val.try_into().unwrap_or(i64::MAX)));
 
     let where_clause = conditions.join(" AND ");
     let sql = format!(
@@ -1882,7 +1882,7 @@ fn build_search(
     fts_params.push(Value::Text(sanitized.clone()));
     fts_params.push(Value::BigInt(project_id));
     fts_params.extend(filter_params.iter().cloned());
-    fts_params.push(Value::BigInt(limit as i64));
+    fts_params.push(Value::BigInt(limit.try_into().unwrap_or(i64::MAX)));
 
     let rows = match conn.query_sync(&fts_sql, &fts_params) {
         Ok(rows) => rows,
@@ -1907,7 +1907,7 @@ fn build_search(
                     like_params.push(Value::Text(escaped.clone()));
                     like_params.push(Value::Text(escaped));
                 }
-                like_params.push(Value::BigInt(limit as i64));
+                like_params.push(Value::BigInt(limit.try_into().unwrap_or(i64::MAX)));
                 let like_clause = like_parts.join(" OR ");
 
                 let like_sql = format!(

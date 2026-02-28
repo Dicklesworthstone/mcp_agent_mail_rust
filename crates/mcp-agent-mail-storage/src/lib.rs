@@ -830,9 +830,9 @@ impl FileLock {
                     } else {
                         50 * (1u64 << attempt.min(4))
                     };
-                    let jitter_range = base_ms / 2 + 1; // ±25% of base
+                    let jitter_range = base_ms / 2 + 1; // 50% range for ±25%
                     let jitter = thread_jitter_ms(jitter_range);
-                    let sleep_ms = base_ms.saturating_add(jitter).max(10);
+                    let sleep_ms = base_ms.saturating_sub(base_ms / 4).saturating_add(jitter).max(10);
                     std::thread::sleep(Duration::from_millis(sleep_ms));
                 }
             }

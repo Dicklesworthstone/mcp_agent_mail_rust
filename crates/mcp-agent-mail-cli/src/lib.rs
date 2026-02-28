@@ -3823,20 +3823,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let results = setup::run_setup(&params);
 
             output::emit_output(&results, fmt, || {
-                if dry_run {
-                    output::section("Dry run — no files will be modified");
-                    ftui_runtime::ftui_println!("");
-                }
-
-                for result in &results {
-                    output::section(&result.platform.to_string());
-                    for action in &result.actions {
-                        ftui_runtime::ftui_println!("  {} — {}", action.file_path, action.outcome);
-                        if !action.description.is_empty() {
-                            ftui_runtime::ftui_println!("    {}", action.description);
-                        }
-                    }
-                }
+                render_setup_actions_table(&results, dry_run);
 
                 let total_actions: usize = results.iter().map(|r| r.actions.len()).sum();
                 let created = results
@@ -3952,6 +3939,97 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             Ok(())
         }
     }
+}
+
+fn setup_action_style(
+    outcome: &mcp_agent_mail_core::setup::ActionOutcome,
+) -> (&'static str, String) {
+    match outcome {
+        mcp_agent_mail_core::setup::ActionOutcome::Created => {
+            ("✓", mcp_agent_mail_server::theme::success_bold())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Updated => {
+            ("↻", mcp_agent_mail_server::theme::primary_bold())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Unchanged => {
+            ("•", mcp_agent_mail_server::theme::muted())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Skipped => {
+            ("◌", mcp_agent_mail_server::theme::warning_bold())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::BackedUp(_) => {
+            ("💾", mcp_agent_mail_server::theme::accent())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Failed(_) => {
+            ("✗", mcp_agent_mail_server::theme::error_bold())
+        }
+    }
+}
+
+fn render_setup_actions_table(results: &[mcp_agent_mail_core::setup::SetupResult], dry_run: bool) {
+    if !output::is_tty() {
+        if dry_run {
+            output::section("Dry run — no files will be modified");
+            ftui_runtime::ftui_println!("");
+        }
+        for result in results {
+            output::section(&result.platform);
+            for action in &result.actions {
+                ftui_runtime::ftui_println!("  {} — {}", action.file_path, action.outcome);
+                if !action.description.is_empty() {
+                    ftui_runtime::ftui_println!("    {}", action.description);
+                }
+            }
+        }
+        return;
+    }
+
+    let _ = mcp_agent_mail_server::theme::init_console_theme();
+    let reset = mcp_agent_mail_server::theme::RESET;
+    let dim = mcp_agent_mail_server::theme::DIM;
+    let border = mcp_agent_mail_server::theme::secondary_bold();
+    let heading = mcp_agent_mail_server::theme::primary_bold();
+    let label = mcp_agent_mail_server::theme::text_bold();
+    let path = mcp_agent_mail_server::theme::accent();
+    let note = mcp_agent_mail_server::theme::warning_bold();
+    let muted = mcp_agent_mail_server::theme::muted();
+
+    ftui_runtime::ftui_println!(
+        "{border}╭─ 🧰 Agent MCP Configuration Sync ───────────────────────────────────────────────╮{reset}"
+    );
+    if dry_run {
+        ftui_runtime::ftui_println!(
+            "{border}│{reset} {note}Dry run{reset} {dim}— no files will be modified{reset}"
+        );
+        ftui_runtime::ftui_println!("{border}│{reset}");
+    }
+
+    for (platform_index, result) in results.iter().enumerate() {
+        ftui_runtime::ftui_println!(
+            "{border}│{reset} {heading}◈{reset} {label}{}{reset}",
+            result.platform
+        );
+        for action in &result.actions {
+            let (icon, icon_color) = setup_action_style(&action.outcome);
+            ftui_runtime::ftui_println!(
+                "{border}│{reset}   {icon_color}{icon}{reset} {dim}{:<14}{reset} {path}{}{reset}",
+                action.outcome,
+                action.file_path
+            );
+            if !action.description.is_empty() {
+                ftui_runtime::ftui_println!(
+                    "{border}│{reset}      {muted}{}{reset}",
+                    action.description
+                );
+            }
+        }
+        if platform_index + 1 < results.len() {
+            ftui_runtime::ftui_println!("{border}│{reset}");
+        }
+    }
+    ftui_runtime::ftui_println!(
+        "{border}╰──────────────────────────────────────────────────────────────────────────────────╯{reset}"
+    );
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

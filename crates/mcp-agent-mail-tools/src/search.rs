@@ -673,7 +673,7 @@ pub async fn search_messages(
     } else {
         offset.unwrap_or(0).max(0).unsigned_abs() as usize
     };
-    let planner_limit = max_results.saturating_add(offset_val).min(1000);
+    let planner_limit = max_results.saturating_add(offset_val).min(10_000);
     let want_explain = explain.unwrap_or(false);
 
     // Legacy parity: empty query returns an empty result set (no DB call).

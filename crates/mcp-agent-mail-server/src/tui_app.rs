@@ -3455,6 +3455,15 @@ impl MailAppModel {
         self.notifications.tick(elapsed_tick);
         self.tick_toast_animation_state();
 
+        if let Some(idx) = self.toast_focus_index {
+            let count = self.notifications.visible_count();
+            if count == 0 {
+                self.toast_focus_index = None;
+            } else if idx >= count {
+                self.toast_focus_index = Some(count - 1);
+            }
+        }
+
         // Drain deferred confirmed actions (from modal callbacks).
         // Side-effects (toast, navigation) are applied inside
         // `dispatch_execute_operation`.

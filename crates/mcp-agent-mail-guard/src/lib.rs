@@ -1284,8 +1284,16 @@ fn parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {
                 }
             }
             _ => {
-                // Unknown status, skip
-                i += 1;
+                // Unknown status, assume 1 path and capture it to maintain alignment
+                if i + 1 < parts.len() {
+                    let p = parts[i + 1];
+                    if !p.is_empty() {
+                        paths.push(p.to_string());
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
         }
     }

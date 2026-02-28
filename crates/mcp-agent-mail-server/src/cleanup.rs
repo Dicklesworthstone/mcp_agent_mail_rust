@@ -283,6 +283,43 @@ fn check_filesystem_activity(
     let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
 
     if has_glob {
+        // Fast path: use `git ls-files -c -o --exclude-standard -- pattern` to get matching files.
+        // This leverages git's index and ignores `.gitignore`d folders like `target/` which would
+        // otherwise cause insane CPU usage during synchronous directory traversal.
+        let git_ls = std::process::Command::new("git")
+            .args([
+                "-C",
+                &workspace.to_string_lossy(),
+                "ls-files",
+                "-c",
+                "-o",
+                "--exclude-standard",
+                "--",
+                pattern,
+            ])
+            .output();
+
+        if let Ok(output) = git_ls {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let file_path = workspace.join(line);
+                    if let Ok(metadata) = file_path.metadata()
+                        && let Ok(modified) = metadata.modified()
+                    {
+                        let mtime_us = modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
+                        if now_us.saturating_sub(mtime_us) <= grace_us {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        }
+
+        // Fallback: unbounded glob (slow, but works outside git repos)
         let base_str = workspace.to_string_lossy();
         let base_escaped = glob::Pattern::escape(&base_str);
         // We use format! instead of Path::join because base_escaped is a string
@@ -294,7 +331,8 @@ fn check_filesystem_activity(
         };
 
         if let Ok(paths) = glob::glob(&full_pattern) {
-            for entry in paths.flatten() {
+            // Cap the fallback traversal so it doesn't freeze the server completely.
+            for entry in paths.flatten().take(5000) {
                 if let Ok(metadata) = entry.metadata()
                     && let Ok(modified) = metadata.modified()
                 {

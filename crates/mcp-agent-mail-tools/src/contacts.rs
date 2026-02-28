@@ -185,6 +185,7 @@ fn parse_contact_target(
         && to_agent.contains('#')
         && let Some((slug, agent)) = to_agent.split_once(':').and_then(|(_, rest)| {
             let (slug, agent) = rest.split_once('#')?;
+            let slug = slug.trim();
             let agent = agent.trim();
             if slug.is_empty() || agent.is_empty() {
                 None

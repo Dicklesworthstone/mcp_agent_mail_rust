@@ -1379,7 +1379,17 @@ impl MessageBrowserScreen {
 
         match result {
             Ok(_) => {
-                let to_summary = if payload.to.len() == 1 {
+                let to_summary = if payload.to.is_empty() {
+                    if let Some(first) = payload.cc.first() {
+                        if payload.cc.len() == 1 {
+                            format!("cc: {}", first)
+                        } else {
+                            format!("cc: {} (+{})", first, payload.cc.len() - 1)
+                        }
+                    } else {
+                        "undisclosed".to_string()
+                    }
+                } else if payload.to.len() == 1 {
                     payload.to[0].clone()
                 } else {
                     format!("{} (+{})", payload.to[0], payload.to.len() - 1)
