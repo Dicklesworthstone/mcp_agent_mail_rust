@@ -2451,6 +2451,7 @@ dependencies = [
  "fsqlite-parser 0.1.1",
  "fsqlite-types",
  "fsqlite-wal 0.1.1",
+ "smallvec",
  "tempfile",
  "tracing",
 ]
