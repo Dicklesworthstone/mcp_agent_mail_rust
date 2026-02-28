@@ -15,6 +15,10 @@ use crate::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilter, SearchResults};
 use sqlmodel_core::Value;
+use tantivy::Order;
+use tantivy::collector::{Count, TopDocs};
+use tantivy::query::TermQuery;
+use tantivy::schema::IndexRecordOption;
 use tantivy::{Index, Term};
 
 use crate::DbConn;
@@ -398,6 +402,116 @@ fn lookup_cached_text(
     Ok(value)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct MessageStats {
+    count: u64,
+    max_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillPlan {
+    Skip,
+    Incremental { start_after_id: i64 },
+    FullRebuild,
+}
+
+fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+            &[],
+        )
+        .map_err(|e| format!("backfill stats query failed: {e}"))?;
+    let Some(row) = rows.first() else {
+        return Ok(MessageStats::default());
+    };
+
+    let count_i64 = row.get_named::<i64>("count").unwrap_or(0).max(0);
+    let max_id_i64 = row.get_named::<i64>("max_id").unwrap_or(0).max(0);
+
+    Ok(MessageStats {
+        count: u64::try_from(count_i64).unwrap_or(0),
+        max_id: u64::try_from(max_id_i64).unwrap_or(0),
+    })
+}
+
+fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String> {
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS count FROM messages WHERE id > ?",
+            &[Value::BigInt(start_after_id)],
+        )
+        .map_err(|e| format!("backfill tail-count query failed: {e}"))?;
+    let count_i64 = rows
+        .first()
+        .and_then(|row| row.get_named::<i64>("count").ok())
+        .unwrap_or(0)
+        .max(0);
+    Ok(u64::try_from(count_i64).unwrap_or(0))
+}
+
+fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, String> {
+    let reader = bridge
+        .index()
+        .reader()
+        .map_err(|e| format!("backfill index reader error: {e}"))?;
+    let searcher = reader.searcher();
+    let handles = bridge.handles();
+    let message_query = TermQuery::new(
+        Term::from_field_text(handles.doc_kind, "message"),
+        IndexRecordOption::Basic,
+    );
+
+    let count = searcher
+        .search(&message_query, &Count)
+        .map_err(|e| format!("backfill index count query failed: {e}"))?;
+    let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher
+        .search(
+            &message_query,
+            &TopDocs::with_limit(1).order_by_fast_field::<u64>("id", Order::Desc),
+        )
+        .map_err(|e| format!("backfill index max-id query failed: {e}"))?;
+    let max_id = top_docs.first().map(|(id, _)| *id).unwrap_or(0);
+
+    Ok(MessageStats {
+        count: count as u64,
+        max_id,
+    })
+}
+
+fn choose_backfill_plan(conn: &DbConn, db: MessageStats, index: MessageStats) -> Result<BackfillPlan, String> {
+    if db.count == 0 {
+        return Ok(if index.count == 0 {
+            BackfillPlan::Skip
+        } else {
+            // DB was cleared/reset — clear stale index docs too.
+            BackfillPlan::FullRebuild
+        });
+    }
+
+    if index.count == 0 {
+        return Ok(BackfillPlan::FullRebuild);
+    }
+
+    if db.count == index.count && db.max_id == index.max_id {
+        return Ok(BackfillPlan::Skip);
+    }
+
+    if db.max_id >= index.max_id && db.count >= index.count {
+        let Ok(start_after_id) = i64::try_from(index.max_id) else {
+            return Ok(BackfillPlan::FullRebuild);
+        };
+        let tail_count = fetch_db_tail_count(conn, start_after_id)?;
+        if index.count.saturating_add(tail_count) == db.count {
+            // Pure append since the last indexed id.
+            return Ok(BackfillPlan::Incremental { start_after_id });
+        }
+    }
+
+    // Any other shape implies deletes/resets/mismatch; rebuild is the safe path.
+    Ok(BackfillPlan::FullRebuild)
+}
+
 /// Index a single message into the global Tantivy bridge.
 ///
 /// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
@@ -487,12 +601,6 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         return Ok((0, 0));
     };
 
-    // Check how many docs are already in the index.
-    let existing_count = bridge
-        .index()
-        .reader()
-        .map_or(0, |r| r.searcher().num_docs());
-
     // Open a sync connection via FrankenSQLite.
     let db_path_owned = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
         ":memory:".to_string()
@@ -507,14 +615,32 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let conn = DbConn::open_file(db_path)
         .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
 
+    let db_stats = fetch_db_message_stats(&conn)?;
+    let index_stats = fetch_index_message_stats(&bridge)?;
+    let plan = choose_backfill_plan(&conn, db_stats, index_stats)?;
+
+    if matches!(plan, BackfillPlan::Skip) {
+        tracing::info!(
+            db_count = db_stats.count,
+            db_max_id = db_stats.max_id,
+            index_count = index_stats.count,
+            index_max_id = index_stats.max_id,
+            "backfill: Tantivy index already up-to-date, skipping"
+        );
+        refresh_index_health_metrics(&bridge);
+        return Ok((0, usize::try_from(db_stats.count).unwrap_or(usize::MAX)));
+    }
+
     let mut writer = bridge
         .index()
         .writer(15_000_000)
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
     let handles = bridge.handles();
-    writer
-        .delete_all_documents()
-        .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
+    if matches!(plan, BackfillPlan::FullRebuild) {
+        writer
+            .delete_all_documents()
+            .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
+    }
 
     // Paged reads avoid loading the full mailbox into memory during startup.
     // Keep this query JOIN-free to avoid parity-cert fallback overhead on
@@ -528,7 +654,10 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let mut sender_name_cache: HashMap<i64, String> = HashMap::new();
     let mut project_slug_cache: HashMap<i64, String> = HashMap::new();
 
-    let mut last_id = 0_i64;
+    let mut last_id = match plan {
+        BackfillPlan::Incremental { start_after_id } => start_after_id,
+        BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
+    };
     let mut pending_batches = 0_usize;
     let mut total_indexed = 0_usize;
     loop {
@@ -586,7 +715,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         }
     }
 
-    if pending_batches > 0 || total_indexed == 0 {
+    if pending_batches > 0 || (matches!(plan, BackfillPlan::FullRebuild) && total_indexed == 0) {
         writer
             .commit()
             .map_err(|e| format!("Tantivy commit error: {e}"))?;
@@ -595,11 +724,22 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     refresh_index_health_metrics(&bridge);
     crate::search_service::invalidate_search_cache(crate::search_cache::InvalidationTrigger::IndexUpdate);
 
-    tracing::info!(
-        total_indexed,
-        existing_count,
-        "backfill: Tantivy index rebuilt from database"
-    );
+    match plan {
+        BackfillPlan::Incremental { start_after_id } => tracing::info!(
+            total_indexed,
+            start_after_id,
+            db_count = db_stats.count,
+            index_count_before = index_stats.count,
+            "backfill: incrementally indexed new messages"
+        ),
+        BackfillPlan::FullRebuild => tracing::info!(
+            total_indexed,
+            db_count = db_stats.count,
+            index_count_before = index_stats.count,
+            "backfill: Tantivy index rebuilt from database"
+        ),
+        BackfillPlan::Skip => {}
+    }
 
     Ok((total_indexed, 0))
 }

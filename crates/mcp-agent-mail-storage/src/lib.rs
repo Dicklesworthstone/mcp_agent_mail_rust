@@ -2965,8 +2965,58 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
     let mut result = HealResult::default();
     let mut metadata_candidates: Vec<PathBuf> = Vec::new();
 
-    // Single recursive walk: track lock files and collect metadata paths.
-    fn walk_once(
+    fn should_force_deep_scan() -> bool {
+        std::env::var("AM_HEAL_LOCKS_DEEP_SCAN").is_ok_and(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
+    fn maybe_collect_metadata(path: &Path, metadata_candidates: &mut Vec<PathBuf>) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name.ends_with(".lock.owner.json") {
+            metadata_candidates.push(path.to_path_buf());
+        }
+    }
+
+    fn maybe_cleanup_lock(path: &Path, result: &mut HealResult) {
+        if !path.extension().is_some_and(|e| e == "lock") {
+            return;
+        }
+
+        result.locks_scanned += 1;
+
+        // Try to acquire exclusive lock. If successful, it means no one else
+        // is holding it, so we can treat it as a stale artifact from a previous run.
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            use fs2::FileExt;
+            if f.try_lock_exclusive().is_ok() {
+                let mut removed = false;
+                match std::fs::remove_file(path) {
+                    Ok(()) => removed = true,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        // Windows can require closing/unlocking first before unlinking.
+                        let _ = f.unlock();
+                        drop(f);
+                        removed = std::fs::remove_file(path).is_ok();
+                    }
+                    Err(_) => {}
+                }
+
+                if removed {
+                    result.locks_removed.push(path.display().to_string());
+                    // Try to remove corresponding metadata file.
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    let meta_path = path.with_file_name(format!("{name}.owner.json"));
+                    let _ = std::fs::remove_file(meta_path);
+                }
+            }
+        }
+    }
+
+    fn walk_recursive(
         dir: &Path,
         result: &mut HealResult,
         metadata_candidates: &mut Vec<PathBuf>,
@@ -2983,47 +3033,71 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             }
             let path = entry.path();
             if file_type.is_dir() {
-                walk_once(&path, result, metadata_candidates)?;
-            } else if file_type.is_file() && path.extension().is_some_and(|e| e == "lock") {
-                result.locks_scanned += 1;
-
-                // Try to acquire exclusive lock. If successful, it means no one else
-                // is holding it, so we can treat it as a stale artifact from a previous run.
-                if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
-                    use fs2::FileExt;
-                    if f.try_lock_exclusive().is_ok() {
-                        let mut removed = false;
-                        match std::fs::remove_file(&path) {
-                            Ok(()) => removed = true,
-                            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                                // Windows can require closing/unlocking first before unlinking.
-                                let _ = f.unlock();
-                                drop(f);
-                                removed = std::fs::remove_file(&path).is_ok();
-                            }
-                            Err(_) => {}
-                        }
-
-                        if removed {
-                            result.locks_removed.push(path.display().to_string());
-                            // Try to remove corresponding metadata file
-                            let name = path.file_name().unwrap_or_default().to_string_lossy();
-                            let meta_path = path.with_file_name(format!("{name}.owner.json"));
-                            let _ = std::fs::remove_file(meta_path);
-                        }
-                    }
-                }
+                walk_recursive(&path, result, metadata_candidates)?;
             } else if file_type.is_file() {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                if name.ends_with(".lock.owner.json") {
-                    metadata_candidates.push(path);
-                }
+                maybe_cleanup_lock(&path, result);
+                maybe_collect_metadata(&path, metadata_candidates);
             }
         }
         Ok(())
     }
 
-    walk_once(root, &mut result, &mut metadata_candidates)?;
+    fn scan_dir_shallow(
+        dir: &Path,
+        result: &mut HealResult,
+        metadata_candidates: &mut Vec<PathBuf>,
+    ) -> std::io::Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            maybe_cleanup_lock(&path, result);
+            maybe_collect_metadata(&path, metadata_candidates);
+        }
+        Ok(())
+    }
+
+    fn gather_lock_scan_dirs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut dirs = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+
+        let mut push_dir = |dir: PathBuf| {
+            if dir.is_dir() && seen.insert(dir.clone()) {
+                dirs.push(dir);
+            }
+        };
+
+        push_dir(root.to_path_buf());
+        push_dir(root.join(".git"));
+
+        let projects_dir = root.join("projects");
+        push_dir(projects_dir.clone());
+        if projects_dir.is_dir() {
+            for entry in fs::read_dir(&projects_dir)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    push_dir(entry.path());
+                }
+            }
+        }
+
+        Ok(dirs)
+    }
+
+    if should_force_deep_scan() {
+        walk_recursive(root, &mut result, &mut metadata_candidates)?;
+    } else {
+        for dir in gather_lock_scan_dirs(root)? {
+            scan_dir_shallow(&dir, &mut result, &mut metadata_candidates)?;
+        }
+    }
 
     // Clean orphaned metadata files (no matching lock) without re-walking.
     for path in metadata_candidates {

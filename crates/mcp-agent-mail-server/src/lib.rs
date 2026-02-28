@@ -856,6 +856,15 @@ fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
     }
 }
 
+fn start_advisory_consistency_probe(config: &mcp_agent_mail_core::Config) {
+    let config = config.clone();
+    let _ = std::thread::Builder::new()
+        .name("startup-consistency-probe".into())
+        .spawn(move || {
+            startup_checks::run_consistency_probe_advisory(&config);
+        });
+}
+
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -1336,6 +1345,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     integrity_guard::note_startup_integrity_probe_completed();
     integrity_guard::start(config);
     disk_monitor::start(config);
+    start_advisory_consistency_probe(config);
     let dashboard = StartupDashboard::maybe_start(config);
     set_dashboard_handle(dashboard.clone());
 
@@ -1409,6 +1419,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     integrity_guard::note_startup_integrity_probe_completed();
     integrity_guard::start(config);
     disk_monitor::start(config);
+    start_advisory_consistency_probe(config);
 
     // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
     let tui_state = tui_bridge::TuiSharedState::new(config);

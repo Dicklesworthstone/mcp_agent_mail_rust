@@ -701,6 +701,14 @@ fn probe_consistency(config: &Config) -> ProbeResult {
     }
 }
 
+/// Run the archive consistency probe as an advisory one-shot.
+///
+/// Intended for background execution so startup critical path stays focused on
+/// hard readiness checks while still preserving consistency diagnostics.
+pub fn run_consistency_probe_advisory(config: &Config) {
+    let _ = probe_consistency(config);
+}
+
 /// Minimum recommended file descriptor limit for production workloads.
 ///
 /// Under burst/multi-agent load, each connection + WAL + archive file can
@@ -773,7 +781,6 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
         probe_integrity(config),
         probe_storage_root(config),
         probe_port(config),
-        probe_consistency(config),
         probe_fd_limit(config),
     ];
     StartupReport { results }
@@ -957,7 +964,7 @@ mod tests {
     fn run_startup_probes_returns_results() {
         let config = default_config();
         let report = run_startup_probes(&config);
-        // Should have 7 probes (http, auth, db, integrity, storage, port, consistency)
+        // Should have 7 critical probes (consistency is now background/advisory).
         assert_eq!(report.results.len(), 7);
     }
 
