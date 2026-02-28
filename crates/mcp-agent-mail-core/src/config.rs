@@ -1511,6 +1511,17 @@ impl Config {
         config.tui_coach_hints_enabled =
             console_bool("AM_TUI_COACH_HINTS_ENABLED", config.tui_coach_hints_enabled);
 
+        // Deprecation warning: DATABASE_URL with relative path
+        if config.database_url.contains("./") || config.database_url.contains("storage.sqlite3")
+            && !config.database_url.starts_with("sqlite")
+        {
+            eprintln!(
+                "⚠ Warning: DATABASE_URL uses a relative path ({}). \
+                 This is deprecated. Run 'am service install' to migrate to an absolute path.",
+                config.database_url
+            );
+        }
+
         config
     }
 
@@ -1846,8 +1857,9 @@ pub fn dotenv_value(key: &str) -> Option<String> {
 fn user_env_file_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let candidates = [
-        home.join(".mcp_agent_mail").join(".env"),
-        home.join("mcp_agent_mail").join(".env"),
+        crate::paths::env_file_path(),                 // NEW: ~/.config/mcp-agent-mail/env (XDG canonical)
+        home.join(".mcp_agent_mail").join(".env"),     // existing preferred (backward compat)
+        home.join("mcp_agent_mail").join(".env"),      // existing legacy
     ];
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -1965,10 +1977,20 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
     {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, out)
+    fs::write(path, out)?;
+
+    // Set file permissions to 600 (rw-------) on Unix to prevent world-readable access to env vars.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, perms)?;
+    }
+
+    Ok(())
 }
 
-fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {
+pub fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for raw_line in contents.lines() {
         let line = raw_line.trim();

@@ -26,6 +26,7 @@ pub mod mcp_config;
 pub mod memory;
 pub mod metrics;
 pub mod models;
+pub mod paths;
 pub mod pattern_overlap;
 pub mod setup;
 pub mod slo;

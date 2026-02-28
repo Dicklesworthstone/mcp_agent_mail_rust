@@ -451,9 +451,10 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 
 /// Backfill the Tantivy index with all messages from the database.
 ///
-/// Uses a sync `SqliteConnection` (C `SQLite`) to scan the messages table joined
-/// with agents and projects, then batch-indexes everything. Skips documents
-/// that are already in the index (idempotent via doc-count watermark).
+/// Uses the same FrankenSQLite connection path as runtime DB traffic to scan
+/// the messages table joined with agents and projects, then batch-indexes
+/// everything. Skips documents that are already in the index (idempotent via
+/// doc-count watermark).
 ///
 /// Returns `(indexed_count, skipped_count)`.
 pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
@@ -469,7 +470,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         .reader()
         .map_or(0, |r| r.searcher().num_docs());
 
-    // Open a sync read-only connection via C SQLite (not FrankenSQLite).
+    // Use the same DB driver/runtime path as the rest of the server.
     let db_path_owned = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
         ":memory:".to_string()
     } else if let Some(path) = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)
@@ -480,7 +481,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     };
     let db_path = &db_path_owned;
 
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path)
+    let conn = crate::open_sqlite_file_with_recovery(db_path)
         .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
 
     // Count messages in DB.

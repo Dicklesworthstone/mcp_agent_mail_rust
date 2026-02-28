@@ -304,7 +304,6 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
- "signal-hook 0.3.18",
  "slab",
  "smallvec",
  "socket2",
@@ -2450,6 +2449,7 @@ dependencies = [
  "fsqlite-parser 0.1.1",
  "fsqlite-types",
  "fsqlite-wal 0.1.1",
+ "smallvec",
  "tempfile",
  "tracing",
 ]
@@ -5163,6 +5163,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

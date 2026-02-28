@@ -258,6 +258,29 @@ fn load_env_file_value(path: &Path, key: &str) -> Option<String> {
     matched.flatten()
 }
 
+/// Apply all environment variables from env file to process environment.
+///
+/// Called BEFORE Config::from_env() to ensure env file vars are available during config loading.
+/// Process env vars take precedence - existing vars are not overwritten.
+fn apply_env_file(path: Option<&str>) {
+    let Some(path_str) = path else {
+        return;
+    };
+
+    let path = std::path::Path::new(path_str);
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+
+    let vars = mcp_agent_mail_core::parse_dotenv_contents(&contents);
+    for (key, value) in vars {
+        // Only set if not already in environment (process env takes precedence)
+        if std::env::var(&key).is_err() {
+            std::env::set_var(&key, value);
+        }
+    }
+}
+
 fn resolve_http_bearer_token_for_serve(
     current_token: Option<&str>,
     env_file: Option<&str>,
@@ -380,7 +403,11 @@ fn main() {
             reuse_running,
             no_reuse_running,
         }) => {
-            let mut config = config;
+            // Apply env file variables BEFORE using config to ensure all env vars are available.
+            // This happens after Config::from_env() was called above, so we need to reload config.
+            apply_env_file(env_file.as_deref());
+            let mut config = Config::from_env();
+
             let host_cli = host.is_some();
             let port_cli = port.is_some();
             if let Some(host) = host {

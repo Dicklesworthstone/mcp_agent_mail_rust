@@ -101,11 +101,11 @@ tantivy = "0.25"
 indexmap = "2"
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank
-frankensearch = { version = "0.1.0", path = "/dp/frankensearch/frankensearch", features = ["hybrid", "rerank"] }
-frankensearch-core = { version = "0.1.1", path = "/dp/frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.1.2", path = "/dp/frankensearch/crates/frankensearch-embed" }
-frankensearch-index = { version = "0.1.1", path = "/dp/frankensearch/crates/frankensearch-index" }
-frankensearch-fusion = { version = "0.1.0", path = "/dp/frankensearch/crates/frankensearch-fusion" }
+frankensearch = { version = "0.1.0", path = "/Volumes/XS2000/projects/joyshmitz/frankensearch/frankensearch", features = ["hybrid", "rerank"] }
+frankensearch-core = { version = "0.1.1", path = "/Volumes/XS2000/projects/joyshmitz/frankensearch/crates/frankensearch-core" }
+frankensearch-embed = { version = "0.1.2", path = "/Volumes/XS2000/projects/joyshmitz/frankensearch/crates/frankensearch-embed" }
+frankensearch-index = { version = "0.1.1", path = "/Volumes/XS2000/projects/joyshmitz/frankensearch/crates/frankensearch-index" }
+frankensearch-fusion = { version = "0.1.0", path = "/Volumes/XS2000/projects/joyshmitz/frankensearch/crates/frankensearch-fusion" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
@@ -150,39 +150,39 @@ inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
 uring-fs = { path = "vendor/uring-fs" }
-asupersync = { path = "/dp/asupersync" }
-asupersync-macros = { path = "/dp/asupersync/asupersync-macros" }
-franken-kernel = { path = "/dp/asupersync/franken_kernel" }
-franken-evidence = { path = "/dp/asupersync/franken_evidence" }
-franken-decision = { path = "/dp/asupersync/franken_decision" }
+asupersync = { path = "/Volumes/XS2000/projects/joyshmitz/asupersync" }
+asupersync-macros = { path = "/Volumes/XS2000/projects/joyshmitz/asupersync/asupersync-macros" }
+franken-kernel = { path = "/Volumes/XS2000/projects/joyshmitz/asupersync/franken_kernel" }
+franken-evidence = { path = "/Volumes/XS2000/projects/joyshmitz/asupersync/franken_evidence" }
+franken-decision = { path = "/Volumes/XS2000/projects/joyshmitz/asupersync/franken_decision" }
 # sqlmodel/frankensqlite stack: force latest local /dp checkouts to avoid stale registry builds.
-sqlmodel = { path = "/dp/sqlmodel_rust/crates/sqlmodel" }
-sqlmodel-core = { path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-macros = { path = "/dp/sqlmodel_rust/crates/sqlmodel-macros" }
-sqlmodel-query = { path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
-sqlmodel-schema = { path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
-sqlmodel-session = { path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
-sqlmodel-pool = { path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
-sqlmodel-sqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-sqlite" }
-sqlmodel-frankensqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
-fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
-fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }
-fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
-fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
-fsqlite-vfs = { path = "/dp/frankensqlite/crates/fsqlite-vfs" }
-fsqlite-wal = { path = "/dp/frankensqlite/crates/fsqlite-wal" }
-fsqlite-pager = { path = "/dp/frankensqlite/crates/fsqlite-pager" }
+sqlmodel = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-core = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-macros = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel-macros" }
+sqlmodel-query = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-pool = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-sqlite = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel-sqlite" }
+sqlmodel-frankensqlite = { path = "/Volumes/XS2000/projects/joyshmitz/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
+fsqlite = { path = "/Volumes/XS2000/projects/joyshmitz/frankensqlite/crates/fsqlite" }
+fsqlite-core = { path = "/Volumes/XS2000/projects/joyshmitz/frankensqlite/crates/fsqlite-core" }
+fsqlite-types = { path = "/Volumes/XS2000/projects/joyshmitz/frankensqlite/crates/fsqlite-types" }
+fsqlite-error = { path = "/Volumes/XS2000/projects/joyshmitz/frankensqlite/crates/fsqlite-error" }
+fsqlite-vfs = { path = "/Volumes/XS2000/projects/joyshmitz/frankensqlite/crates/fsqlite-vfs" }
+fsqlite-wal = { path = "/Volumes/XS2000/projects/joyshmitz/frankensqlite/crates/fsqlite-wal" }
+fsqlite-pager = { path = "/Volumes/XS2000/projects/joyshmitz/frankensqlite/crates/fsqlite-pager" }
 # ftui patches needed until ftui v0.2.2 is published (local code uses newer APIs)
-ftui = { path = "/dp/frankentui/crates/ftui" }
-ftui-core = { path = "/dp/frankentui/crates/ftui-core" }
-ftui-runtime = { path = "/dp/frankentui/crates/ftui-runtime" }
-ftui-extras = { path = "/dp/frankentui/crates/ftui-extras" }
-ftui-widgets = { path = "/dp/frankentui/crates/ftui-widgets" }
-ftui-tty = { path = "/dp/frankentui/crates/ftui-tty" }
-ftui-harness = { path = "/dp/frankentui/crates/ftui-harness" }
-ftui-render = { path = "/dp/frankentui/crates/ftui-render" }
-ftui-layout = { path = "/dp/frankentui/crates/ftui-layout" }
-ftui-style = { path = "/dp/frankentui/crates/ftui-style" }
-ftui-text = { path = "/dp/frankentui/crates/ftui-text" }
-ftui-backend = { path = "/dp/frankentui/crates/ftui-backend" }
-ftui-i18n = { path = "/dp/frankentui/crates/ftui-i18n" }
+ftui = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui" }
+ftui-core = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-core" }
+ftui-runtime = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-runtime" }
+ftui-extras = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-extras" }
+ftui-widgets = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-widgets" }
+ftui-tty = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-tty" }
+ftui-harness = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-harness" }
+ftui-render = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-render" }
+ftui-layout = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-layout" }
+ftui-style = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-style" }
+ftui-text = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-text" }
+ftui-backend = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-backend" }
+ftui-i18n = { path = "/Volumes/XS2000/projects/joyshmitz/frankentui/crates/ftui-i18n" }
