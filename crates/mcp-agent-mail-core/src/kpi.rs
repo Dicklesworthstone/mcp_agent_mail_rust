@@ -1742,6 +1742,8 @@ mod tests {
                 memory_pressure_level: 0,
                 memory_last_sample_us: 0,
                 memory_sample_errors_total: 0,
+                disk_io_write_bytes: 0,
+                disk_io_read_bytes: 0,
                 tui_spin_watchdog_trips_total: 0,
                 tui_spin_watchdog_last_cpu_pct_x100: 0,
                 tui_spin_watchdog_last_trip_us: 0,

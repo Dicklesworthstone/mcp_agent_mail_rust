@@ -415,29 +415,60 @@ fn parse_and_insert_message(
     let cc_names = json_str_array(&msg, "cc");
     let bcc_names = json_str_array(&msg, "bcc");
 
-    // Insert message
+    // Insert message, preserving canonical frontmatter ID when available.
+    //
+    // If the frontmatter contains a valid positive `id` field, use it as the
+    // DB primary key so that archive filenames (which embed `__{id}.md`)
+    // remain consistent with DB row IDs.
+    // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/9
     let thread_id_val = thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
+    let canonical_id = msg
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .filter(|&id| id > 0);
 
-    conn.execute_sync(
-        "INSERT INTO messages \
-         (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        &[
-            Value::BigInt(project_id),
-            Value::BigInt(sender_id),
-            thread_id_val,
-            Value::Text(subject.to_string()),
-            Value::Text(body_md.to_string()),
-            Value::Text(importance.to_string()),
-            Value::BigInt(i64::from(ack_required)),
-            Value::BigInt(created_ts),
-            Value::Text(attachments),
-        ],
-    )
-    .map_err(|e| DbError::Sqlite(format!("insert message: {e}")))?;
+    let message_id = if let Some(cid) = canonical_id {
+        conn.execute_sync(
+            "INSERT OR REPLACE INTO messages \
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(cid),
+                Value::BigInt(project_id),
+                Value::BigInt(sender_id),
+                thread_id_val,
+                Value::Text(subject.to_string()),
+                Value::Text(body_md.to_string()),
+                Value::Text(importance.to_string()),
+                Value::BigInt(i64::from(ack_required)),
+                Value::BigInt(created_ts),
+                Value::Text(attachments),
+            ],
+        )
+        .map_err(|e| DbError::Sqlite(format!("insert message with id {cid}: {e}")))?;
+        cid
+    } else {
+        conn.execute_sync(
+            "INSERT INTO messages \
+             (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(sender_id),
+                thread_id_val,
+                Value::Text(subject.to_string()),
+                Value::Text(body_md.to_string()),
+                Value::Text(importance.to_string()),
+                Value::BigInt(i64::from(ack_required)),
+                Value::BigInt(created_ts),
+                Value::Text(attachments),
+            ],
+        )
+        .map_err(|e| DbError::Sqlite(format!("insert message: {e}")))?;
 
-    // Retrieve the inserted row ID via last_insert_rowid() for reliability.
-    let message_id = query_last_insert_rowid(conn)?;
+        // Retrieve the inserted row ID via last_insert_rowid() for reliability.
+        query_last_insert_rowid(conn)?
+    };
 
     stats.messages += 1;
 

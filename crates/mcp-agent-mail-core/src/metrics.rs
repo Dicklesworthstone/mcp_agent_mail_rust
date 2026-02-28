@@ -286,6 +286,10 @@ pub struct HttpMetrics {
     pub requests_4xx: Counter,
     pub requests_5xx: Counter,
     pub latency_us: Log2Histogram,
+    /// Total requests rejected by the rate limiter (HTTP 429).
+    pub rate_limit_rejected_total: Counter,
+    /// Total requests checked by the rate limiter (allowed + rejected).
+    pub rate_limit_checked_total: Counter,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -296,6 +300,8 @@ pub struct HttpMetricsSnapshot {
     pub requests_4xx: u64,
     pub requests_5xx: u64,
     pub latency_us: HistogramSnapshot,
+    pub rate_limit_rejected_total: u64,
+    pub rate_limit_checked_total: u64,
 }
 
 impl Default for HttpMetrics {
@@ -307,6 +313,8 @@ impl Default for HttpMetrics {
             requests_4xx: Counter::new(),
             requests_5xx: Counter::new(),
             latency_us: Log2Histogram::new(),
+            rate_limit_rejected_total: Counter::new(),
+            rate_limit_checked_total: Counter::new(),
         }
     }
 }
@@ -324,6 +332,15 @@ impl HttpMetrics {
         self.latency_us.record(latency_us);
     }
 
+    /// Record a rate limit check result.
+    #[inline]
+    pub fn record_rate_limit_check(&self, allowed: bool) {
+        self.rate_limit_checked_total.inc();
+        if !allowed {
+            self.rate_limit_rejected_total.inc();
+        }
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> HttpMetricsSnapshot {
         HttpMetricsSnapshot {
@@ -333,6 +350,8 @@ impl HttpMetrics {
             requests_4xx: self.requests_4xx.load(),
             requests_5xx: self.requests_5xx.load(),
             latency_us: self.latency_us.snapshot(),
+            rate_limit_rejected_total: self.rate_limit_rejected_total.load(),
+            rate_limit_checked_total: self.rate_limit_checked_total.load(),
         }
     }
 }
@@ -558,6 +577,11 @@ pub struct SystemMetrics {
     pub memory_last_sample_us: GaugeU64,
     pub memory_sample_errors_total: Counter,
 
+    // Disk I/O bytes (from /proc/self/io on Linux)
+    // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/17
+    pub disk_io_write_bytes: GaugeU64,
+    pub disk_io_read_bytes: GaugeU64,
+
     // TUI spin watchdog (startup protection)
     pub tui_spin_watchdog_trips_total: Counter,
     pub tui_spin_watchdog_last_cpu_pct_x100: GaugeU64,
@@ -578,6 +602,13 @@ pub struct SystemMetricsSnapshot {
     pub memory_last_sample_us: u64,
     pub memory_sample_errors_total: u64,
 
+    /// Cumulative bytes written by this process (from `/proc/self/io`).
+    /// Always 0 on non-Linux platforms.
+    pub disk_io_write_bytes: u64,
+    /// Cumulative bytes read by this process (from `/proc/self/io`).
+    /// Always 0 on non-Linux platforms.
+    pub disk_io_read_bytes: u64,
+
     pub tui_spin_watchdog_trips_total: u64,
     pub tui_spin_watchdog_last_cpu_pct_x100: u64,
     pub tui_spin_watchdog_last_trip_us: u64,
@@ -597,6 +628,9 @@ impl Default for SystemMetrics {
             memory_pressure_level: GaugeU64::new(),
             memory_last_sample_us: GaugeU64::new(),
             memory_sample_errors_total: Counter::new(),
+
+            disk_io_write_bytes: GaugeU64::new(),
+            disk_io_read_bytes: GaugeU64::new(),
 
             tui_spin_watchdog_trips_total: Counter::new(),
             tui_spin_watchdog_last_cpu_pct_x100: GaugeU64::new(),
@@ -620,6 +654,9 @@ impl SystemMetrics {
             memory_pressure_level: self.memory_pressure_level.load(),
             memory_last_sample_us: self.memory_last_sample_us.load(),
             memory_sample_errors_total: self.memory_sample_errors_total.load(),
+
+            disk_io_write_bytes: self.disk_io_write_bytes.load(),
+            disk_io_read_bytes: self.disk_io_read_bytes.load(),
 
             tui_spin_watchdog_trips_total: self.tui_spin_watchdog_trips_total.load(),
             tui_spin_watchdog_last_cpu_pct_x100: self.tui_spin_watchdog_last_cpu_pct_x100.load(),

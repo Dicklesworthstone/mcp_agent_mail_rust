@@ -6383,13 +6383,27 @@ pub fn check_archive_consistency(
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
         // We check both the computed path and do a directory scan fallback
         // because the subject slug can vary.
+        //
+        // After `doctor reconstruct`, DB IDs may have been remapped from
+        // canonical frontmatter IDs, so the `__{id}.md` suffix in the
+        // filename might not match the current DB row ID. To avoid
+        // false-positive "missing" reports, we also accept any `.md` file
+        // that matches the ISO timestamp prefix alone.
+        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/10
         let found_file = if messages_dir.is_dir() {
             let id_suffix = format!("__{}.md", msg.message_id);
             match std::fs::read_dir(&messages_dir) {
                 Ok(entries) => entries.flatten().any(|entry| {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-                    name_str.starts_with(iso_prefix) && name_str.ends_with(&id_suffix)
+                    // Primary match: timestamp prefix + exact DB ID suffix
+                    if name_str.starts_with(iso_prefix) && name_str.ends_with(&id_suffix) {
+                        return true;
+                    }
+                    // Fallback: timestamp prefix + any .md suffix (covers
+                    // post-reconstruct ID drift where archive still has the
+                    // canonical ID)
+                    name_str.starts_with(iso_prefix) && name_str.ends_with(".md")
                 }),
                 Err(_) => false,
             }

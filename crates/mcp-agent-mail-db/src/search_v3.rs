@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilter, SearchResults};
+use sqlmodel_core::Value;
 use crate::search_filter_compiler::compile_filters;
 use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
 use crate::search_response::{self as lexical_response, ResponseConfig};
@@ -18,6 +19,7 @@ use tantivy::Index;
 use crate::search_planner::{
     DocKind, Importance, SearchQuery as PlannerQuery, SearchResult as PlannerResult,
 };
+use crate::DbConn;
 
 /// Bridge between the Tantivy search engine and the planner query/result types.
 pub struct TantivyBridge {
@@ -325,24 +327,11 @@ pub struct IndexableMessage {
     pub created_ts: i64,
 }
 
-/// Index a single message into the global Tantivy bridge.
-///
-/// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
-/// is not initialized (search V3 disabled), or `Err` on write failure.
-///
-/// This is intentionally fire-and-forget safe: callers should not fail the
-/// message send operation if indexing fails.
-pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
-    let Some(bridge) = get_bridge() else {
-        return Ok(false); // bridge not initialized, skip silently
-    };
-
-    let handles = bridge.handles();
-    let mut writer = bridge
-        .index()
-        .writer(15_000_000)
-        .map_err(|e| format!("Tantivy writer error: {e}"))?;
-
+fn add_indexable_message(
+    writer: &mut tantivy::IndexWriter,
+    handles: &FieldHandles,
+    msg: &IndexableMessage,
+) -> Result<(), String> {
     #[allow(clippy::cast_sign_loss)]
     let id_u64 = msg.id as u64;
     #[allow(clippy::cast_sign_loss)]
@@ -363,11 +352,10 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
         ))
         .map_err(|e| format!("Tantivy add_document error: {e}"))?;
 
-    writer
-        .commit()
-        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+    Ok(())
+}
 
-    // Update index health metrics.
+fn refresh_index_health_metrics(bridge: &TantivyBridge) {
     let doc_count = bridge
         .index()
         .reader()
@@ -376,6 +364,32 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     mcp_agent_mail_core::metrics::global_metrics()
         .search
         .update_index_health(index_size_bytes, doc_count);
+}
+
+/// Index a single message into the global Tantivy bridge.
+///
+/// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
+/// is not initialized (search V3 disabled), or `Err` on write failure.
+///
+/// This is intentionally fire-and-forget safe: callers should not fail the
+/// message send operation if indexing fails.
+pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
+    let Some(bridge) = get_bridge() else {
+        return Ok(false); // bridge not initialized, skip silently
+    };
+
+    let handles = bridge.handles();
+    let mut writer = bridge
+        .index()
+        .writer(15_000_000)
+        .map_err(|e| format!("Tantivy writer error: {e}"))?;
+    add_indexable_message(&mut writer, handles, msg)?;
+
+    writer
+        .commit()
+        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+
+    refresh_index_health_metrics(&bridge);
 
     // Invalidate search cache so new messages appear immediately.
     crate::search_service::invalidate_search_cache(
@@ -405,39 +419,14 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
 
     for msg in messages {
-        #[allow(clippy::cast_sign_loss)]
-        let id_u64 = msg.id as u64;
-        #[allow(clippy::cast_sign_loss)]
-        let project_id_u64 = msg.project_id as u64;
-
-        writer
-            .add_document(tantivy::doc!(
-                handles.id => id_u64,
-                handles.doc_kind => "message",
-                handles.subject => msg.subject.as_str(),
-                handles.body => msg.body_md.as_str(),
-                handles.sender => msg.sender_name.as_str(),
-                handles.project_slug => msg.project_slug.as_str(),
-                handles.project_id => project_id_u64,
-                handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
-                handles.importance => msg.importance.as_str(),
-                handles.created_ts => msg.created_ts
-            ))
-            .map_err(|e| format!("Tantivy add_document error: {e}"))?;
+        add_indexable_message(&mut writer, handles, msg)?;
     }
 
     writer
         .commit()
         .map_err(|e| format!("Tantivy commit error: {e}"))?;
 
-    let doc_count = bridge
-        .index()
-        .reader()
-        .map_or(0, |reader| reader.searcher().num_docs());
-    let index_size_bytes = measure_index_dir_bytes(bridge.index_dir());
-    mcp_agent_mail_core::metrics::global_metrics()
-        .search
-        .update_index_health(index_size_bytes, doc_count);
+    refresh_index_health_metrics(&bridge);
 
     crate::search_service::invalidate_search_cache(
         crate::search_cache::InvalidationTrigger::IndexUpdate,
@@ -450,13 +439,15 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 
 /// Backfill the Tantivy index with all messages from the database.
 ///
-/// Uses a sync `SqliteConnection` (C `SQLite`) to scan the messages table joined
-/// with agents and projects, then batch-indexes everything. Skips documents
-/// that are already in the index (idempotent via doc-count watermark).
+/// Uses a sync `DbConn` (FrankenSQLite) to scan the messages table joined with
+/// agents and projects, then batch-indexes everything with a single writer.
+/// Skips documents that are already in the index (idempotent via doc-count
+/// watermark).
 ///
 /// Returns `(indexed_count, skipped_count)`.
 pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
-    const BATCH_SIZE: usize = 500;
+    const FETCH_BATCH_SIZE: i64 = 500;
+    const COMMIT_EVERY_BATCHES: usize = 8;
 
     let Some(bridge) = get_bridge() else {
         return Ok((0, 0));
@@ -468,7 +459,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         .reader()
         .map_or(0, |r| r.searcher().num_docs());
 
-    // Open a sync read-only connection via C SQLite (not FrankenSQLite).
+    // Open a sync connection via FrankenSQLite.
     let db_path_owned = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
         ":memory:".to_string()
     } else if let Some(path) = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)
@@ -479,7 +470,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     };
     let db_path = &db_path_owned;
 
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path)
+    let conn = DbConn::open_file(db_path)
         .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
 
     // Count messages in DB.
@@ -495,17 +486,36 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let db_count_u64 = db_count as u64;
 
     // If the index already has at least as many docs as the DB, skip.
+    // Guard: when db_count is 0 but the index has docs, the DB may be degraded
+    // (e.g. freshly created, post-corruption recovery, or malformed).
+    // In that case, do NOT skip -- log a warning and proceed to revalidate.
+    // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/12
     if existing_count >= db_count_u64 {
-        tracing::info!(
-            existing_count,
-            db_count,
-            "backfill: index already up-to-date, skipping"
-        );
-        #[allow(clippy::cast_possible_truncation)]
-        return Ok((0, db_count_u64 as usize));
+        if db_count_u64 == 0 && existing_count > 0 {
+            tracing::warn!(
+                existing_count,
+                db_count,
+                "backfill: db_count is 0 but index has docs; DB may be degraded — rebuilding index"
+            );
+            // Fall through to full backfill to avoid stale index.
+        } else {
+            tracing::info!(
+                existing_count,
+                db_count,
+                "backfill: index already up-to-date, skipping"
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            return Ok((0, db_count_u64 as usize));
+        }
     }
 
-    // Fetch all messages with sender name and project slug.
+    let mut writer = bridge
+        .index()
+        .writer(15_000_000)
+        .map_err(|e| format!("Tantivy writer error: {e}"))?;
+    let handles = bridge.handles();
+
+    // Paged reads avoid loading the full mailbox into memory during startup.
     let sql = "SELECT m.id AS id, m.project_id AS project_id, \
                p.slug AS slug, a.name AS sender_name, \
                m.subject AS subject, m.body_md AS body_md, \
@@ -514,39 +524,65 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                FROM messages m \
                JOIN agents a ON a.id = m.sender_id \
                JOIN projects p ON p.id = m.project_id \
-               ORDER BY m.id";
-    let rows = conn
-        .query_sync(sql, &[])
-        .map_err(|e| format!("backfill: query failed: {e}"))?;
+               WHERE m.id > ? \
+               ORDER BY m.id \
+               LIMIT ?";
 
-    let mut batch: Vec<IndexableMessage> = Vec::with_capacity(BATCH_SIZE);
+    let mut last_id = 0_i64;
+    let mut pending_batches = 0_usize;
     let mut total_indexed = 0_usize;
+    loop {
+        let rows = conn
+            .query_sync(
+                sql,
+                &[Value::BigInt(last_id), Value::BigInt(FETCH_BATCH_SIZE)],
+            )
+            .map_err(|e| format!("backfill: query failed: {e}"))?;
+        if rows.is_empty() {
+            break;
+        }
 
-    for row in &rows {
-        let msg = IndexableMessage {
-            id: row.get_as::<i64>(0).unwrap_or(0),
-            project_id: row.get_as::<i64>(1).unwrap_or(0),
-            project_slug: row.get_as::<String>(2).unwrap_or_default(),
-            sender_name: row.get_as::<String>(3).unwrap_or_default(),
-            subject: row.get_as::<String>(4).unwrap_or_default(),
-            body_md: row.get_as::<String>(5).unwrap_or_default(),
-            thread_id: row.get_as::<Option<String>>(6).unwrap_or_default(),
-            importance: row
-                .get_as::<String>(7)
-                .unwrap_or_else(|_| "normal".to_string()),
-            created_ts: row.get_as::<i64>(8).unwrap_or(0),
-        };
-        batch.push(msg);
+        for row in &rows {
+            let msg = IndexableMessage {
+                id: row.get_as::<i64>(0).unwrap_or(0),
+                project_id: row.get_as::<i64>(1).unwrap_or(0),
+                project_slug: row.get_as::<String>(2).unwrap_or_default(),
+                sender_name: row.get_as::<String>(3).unwrap_or_default(),
+                subject: row.get_as::<String>(4).unwrap_or_default(),
+                body_md: row.get_as::<String>(5).unwrap_or_default(),
+                thread_id: row.get_as::<Option<String>>(6).unwrap_or_default(),
+                importance: row
+                    .get_as::<String>(7)
+                    .unwrap_or_else(|_| "normal".to_string()),
+                created_ts: row.get_as::<i64>(8).unwrap_or(0),
+            };
+            add_indexable_message(&mut writer, handles, &msg)?;
+            total_indexed += 1;
+            if msg.id > last_id {
+                last_id = msg.id;
+            }
+        }
 
-        if batch.len() >= BATCH_SIZE {
-            total_indexed += index_messages_batch(&batch)?;
-            batch.clear();
+        pending_batches += 1;
+        if pending_batches >= COMMIT_EVERY_BATCHES {
+            writer
+                .commit()
+                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+            pending_batches = 0;
         }
     }
 
-    // Flush remaining batch.
-    if !batch.is_empty() {
-        total_indexed += index_messages_batch(&batch)?;
+    if pending_batches > 0 {
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
+    }
+
+    if total_indexed > 0 {
+        refresh_index_health_metrics(&bridge);
+        crate::search_service::invalidate_search_cache(
+            crate::search_cache::InvalidationTrigger::IndexUpdate,
+        );
     }
 
     tracing::info!(
@@ -1366,7 +1402,7 @@ mod tests {
     fn create_test_db(dir: &std::path::Path, messages: &[(i64, &str, &str, &str, &str)]) -> String {
         let db_path = dir.join("test.sqlite3");
         let path_str = db_path.to_str().unwrap();
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str).unwrap();
+        let conn = DbConn::open_file(path_str).unwrap();
 
         conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, \

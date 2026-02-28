@@ -619,14 +619,13 @@ impl DbPool {
             return Ok(Vec::new());
         }
 
-        // Use the native C SQLite path for this startup probe to avoid
-        // FrankenSQLite parity-cert fallback contention under JOIN-heavy reads.
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&self.sqlite_path)
+        // Keep consistency sampling on FrankenSQLite and avoid JOIN-heavy scans:
+        // 1) fetch recent envelopes
+        // 2) resolve slugs/names via batched point lookups
+        let conn = open_sqlite_file_with_lock_retry(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
-        // Two-phase sampling is materially faster than a three-way JOIN on large
-        // mailboxes and avoids parity-cert fallback in startup probes:
-        // 1) Fetch the latest message envelopes.
-        // 2) Resolve project slugs and sender names in batched point-lookups.
+        // This two-phase strategy is materially faster than a three-way JOIN on
+        // large mailboxes and reduces startup probe lock contention.
         let message_rows = conn
             .query_sync(
                 "SELECT id, project_id, sender_id, subject, created_ts \
@@ -926,6 +925,22 @@ async fn run_sqlite_init_once(
     // caused post-crash rowid/index mismatch failures.
     if let Err(err) = schema::enforce_runtime_fts_cleanup(&mig_conn) {
         return Outcome::Err(err);
+    }
+
+    // Switch to WAL journal mode AFTER migrations complete.
+    //
+    // Migrations run in DELETE (rollback) mode for safety, but the runtime
+    // pool connections assume WAL mode (e.g. `wal_autocheckpoint` PRAGMAs).
+    // If we leave the DB in DELETE mode, concurrent pool connections applying
+    // WAL-specific PRAGMAs can corrupt a freshly created database.
+    // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/13
+    if let Err(err) = mig_conn.execute_raw("PRAGMA journal_mode = WAL;") {
+        tracing::warn!(
+            path = %sqlite_path,
+            error = %err,
+            "failed to switch journal_mode to WAL after init; pool connections may fail"
+        );
+        // Non-fatal: pool connections will attempt WAL mode themselves.
     }
 
     drop(mig_conn);

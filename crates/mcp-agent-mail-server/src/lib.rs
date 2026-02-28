@@ -4778,13 +4778,18 @@ impl HttpState {
         }
 
         // Rate limiting (memory + optional Redis backend)
+        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/16
         if self.config.http_rate_limit_enabled {
             let (rpm, burst) = rate_limits_for(&self.config, kind);
             let identity = rate_limit_identity(req, jwt_sub.as_deref());
             let endpoint = tool_name.as_deref().unwrap_or("*");
             let key = format!("{kind}:{endpoint}:{identity}");
 
-            if !self.consume_rate_limit(&key, rpm, burst).await {
+            let allowed = self.consume_rate_limit(&key, rpm, burst).await;
+            mcp_agent_mail_core::global_metrics()
+                .http
+                .record_rate_limit_check(allowed);
+            if !allowed {
                 return Some(self.error_response(req, 429, "Rate limit exceeded"));
             }
         }

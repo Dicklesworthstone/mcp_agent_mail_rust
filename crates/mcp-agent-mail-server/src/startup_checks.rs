@@ -520,14 +520,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     };
 
     match pool.run_startup_integrity_check() {
-        Ok(_) => {
-            // Integrity check passed — create a proactive backup so future
-            // corruption has something to restore from.
-            if let Err(e) = pool.create_proactive_backup(Duration::from_hours(1)) {
-                tracing::warn!(error = %e, "proactive backup failed (non-fatal)");
-            }
-            ProbeResult::Ok { name: "integrity" }
-        }
+        Ok(_) => ProbeResult::Ok { name: "integrity" },
         Err(ref e) => {
             let err_str = e.to_string();
             tracing::warn!(
@@ -708,6 +701,65 @@ fn probe_consistency(config: &Config) -> ProbeResult {
     }
 }
 
+/// Minimum recommended file descriptor limit for production workloads.
+///
+/// Under burst/multi-agent load, each connection + WAL + archive file can
+/// consume FDs. Below this threshold the server may run out of FDs under
+/// moderate concurrency.
+const MIN_RECOMMENDED_NOFILE: u64 = 256;
+
+/// Try to read the soft file descriptor limit from `/proc/self/limits` (Linux)
+/// or `/dev/fd` directory scanning (macOS/BSD fallback).
+///
+/// Returns `None` if the limit cannot be determined.
+fn read_fd_soft_limit() -> Option<u64> {
+    // Linux: parse /proc/self/limits
+    if let Ok(content) = std::fs::read_to_string("/proc/self/limits") {
+        for line in content.lines() {
+            if line.starts_with("Max open files") {
+                // Format: "Max open files            1024                 1048576              files"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                // The soft limit is the 4th token (0-indexed: 3)
+                if parts.len() >= 5 {
+                    if let Ok(soft) = parts[3].parse::<u64>() {
+                        return Some(soft);
+                    }
+                }
+            }
+        }
+    }
+
+    // macOS/BSD fallback: count entries in /dev/fd is unreliable,
+    // so we skip the check on platforms without /proc.
+    None
+}
+
+/// Check effective file descriptor limit and warn if too low for burst workloads.
+///
+/// See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/18
+fn probe_fd_limit(_config: &Config) -> ProbeResult {
+    if let Some(soft_limit) = read_fd_soft_limit() {
+        if soft_limit < MIN_RECOMMENDED_NOFILE {
+            tracing::warn!(
+                soft_limit,
+                recommended = MIN_RECOMMENDED_NOFILE,
+                "file descriptor limit (ulimit -n) is low; may cause failures under burst load"
+            );
+            return ProbeResult::Fail(ProbeFailure {
+                name: "fd_limit",
+                problem: format!(
+                    "File descriptor limit (ulimit -n) is {soft_limit}, below recommended minimum of {MIN_RECOMMENDED_NOFILE}"
+                ),
+                fix: format!(
+                    "Increase the limit: `ulimit -n {MIN_RECOMMENDED_NOFILE}` or set in /etc/security/limits.conf"
+                ),
+            });
+        }
+        tracing::debug!(soft_limit, "file descriptor limit check passed");
+    }
+    ProbeResult::Ok { name: "fd_limit" }
+}
+
 /// Run all startup probes and return a report.
 ///
 /// The probes are ordered from fastest to slowest, and all probes run
@@ -722,6 +774,7 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
         probe_storage_root(config),
         probe_port(config),
         probe_consistency(config),
+        probe_fd_limit(config),
     ];
     StartupReport { results }
 }
