@@ -172,6 +172,13 @@ fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
 fsqlite-vfs = { path = "/dp/frankensqlite/crates/fsqlite-vfs" }
 fsqlite-wal = { path = "/dp/frankensqlite/crates/fsqlite-wal" }
 fsqlite-pager = { path = "/dp/frankensqlite/crates/fsqlite-pager" }
+fsqlite-mvcc = { path = "/dp/frankensqlite/crates/fsqlite-mvcc" }
+fsqlite-btree = { path = "/dp/frankensqlite/crates/fsqlite-btree" }
+fsqlite-ast = { path = "/dp/frankensqlite/crates/fsqlite-ast" }
+fsqlite-parser = { path = "/dp/frankensqlite/crates/fsqlite-parser" }
+fsqlite-planner = { path = "/dp/frankensqlite/crates/fsqlite-planner" }
+fsqlite-vdbe = { path = "/dp/frankensqlite/crates/fsqlite-vdbe" }
+fsqlite-func = { path = "/dp/frankensqlite/crates/fsqlite-func" }
 # ftui patches needed until ftui v0.2.2 is published (local code uses newer APIs)
 ftui = { path = "/dp/frankentui/crates/ftui" }
 ftui-core = { path = "/dp/frankentui/crates/ftui-core" }
