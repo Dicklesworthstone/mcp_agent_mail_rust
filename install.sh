@@ -1891,6 +1891,12 @@ uninstall() {
     [ "$PURGE" -eq 1 ] && info "Data purge is enabled (--purge)"
   fi
 
+  # Pre-uninstall: Stop and remove service (Step 13 of PR 2)
+  # Best-effort service cleanup: do not fail uninstall if service cleanup fails
+  if [ -x "$DEST/$BIN_CLI" ]; then
+    "$DEST/$BIN_CLI" service uninstall 2>/dev/null || true
+  fi
+
   if confirm_uninstall_step "Remove installed binaries from ${DEST}?"; then
     remove_installed_binaries
   else
@@ -2394,6 +2400,12 @@ fi
 #   - Backup before modification
 if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
   update_mcp_configs "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"
+fi
+
+# Post-install: Optional service registration (Step 13 of PR 2)
+# Best-effort service registration: do not fail installation if service setup fails
+if [ -x "$DEST/$BIN_CLI" ]; then
+  "$DEST/$BIN_CLI" service install --health-timeout 10 2>/dev/null || true
 fi
 
 collect_migration_counts() {
