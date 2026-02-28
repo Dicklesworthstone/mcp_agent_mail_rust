@@ -639,6 +639,8 @@ mod tests {
                 requests_2xx: 0,
                 requests_4xx: 0,
                 requests_5xx: 0,
+                rate_limit_checked_total: 0,
+                rate_limit_rejected_total: 0,
                 latency_us: HistogramSnapshot {
                     count: 0,
                     sum: 0,

@@ -1677,6 +1677,8 @@ mod tests {
                 requests_2xx: http_requests,
                 requests_4xx: 0,
                 requests_5xx: 0,
+                rate_limit_checked_total: 0,
+                rate_limit_rejected_total: 0,
                 latency_us: make_histogram(500, 2000, 5000),
             },
             tools: ToolsMetricsSnapshot {
