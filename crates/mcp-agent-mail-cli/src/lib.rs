@@ -2285,10 +2285,7 @@ fn handle_service(action: service::ServiceCommand) -> CliResult<()> {
         } => service::install_service(dry_run, health_timeout),
         service::ServiceCommand::Uninstall => service::uninstall_service(),
         service::ServiceCommand::Status { json } => service::status_service(json),
-        service::ServiceCommand::Logs { follow, lines } => {
-            eprintln!("TODO: implement am service logs (follow={}, lines={})", follow, lines);
-            Err(CliError::NotImplemented("am service logs"))
-        }
+        service::ServiceCommand::Logs { follow, lines } => service::logs_service(follow, lines),
         service::ServiceCommand::Restart => service::restart_service(),
     }
 }

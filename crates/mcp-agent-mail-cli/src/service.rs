@@ -646,6 +646,68 @@ pub fn uninstall_service() -> crate::CliResult<()> {
     }
 }
 
+/// View service logs
+pub fn logs_service(follow: bool, lines: u32) -> crate::CliResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let backend = LaunchAgentBackend;
+        let log_paths = backend.log_paths()?;
+
+        if log_paths.is_empty() {
+            eprintln!("No log files found. Service may not be installed.");
+            return Ok(());
+        }
+
+        for log_path in log_paths {
+            if !log_path.exists() {
+                eprintln!("Log file not found: {}", log_path.display());
+                continue;
+            }
+
+            if follow {
+                // Use tail -f to follow logs
+                Command::new("tail")
+                    .args(&["-f", "-n", &lines.to_string(), &log_path.display().to_string()])
+                    .status()
+                    .map_err(|e| crate::CliError::Other(format!("Failed to tail logs: {}", e)))?;
+            } else {
+                // Use tail to show last N lines
+                Command::new("tail")
+                    .args(&["-n", &lines.to_string(), &log_path.display().to_string()])
+                    .status()
+                    .map_err(|e| crate::CliError::Other(format!("Failed to read logs: {}", e)))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if follow {
+            // Use journalctl -f to follow logs
+            Command::new("journalctl")
+                .args(&["--user", "-u", "mcp-agent-mail.service", "-f", "-n", &lines.to_string()])
+                .status()
+                .map_err(|e| crate::CliError::Other(format!("Failed to tail journal: {}", e)))?;
+        } else {
+            // Use journalctl to show last N lines
+            Command::new("journalctl")
+                .args(&["--user", "-u", "mcp-agent-mail.service", "-n", &lines.to_string(), "--no-pager"])
+                .status()
+                .map_err(|e| crate::CliError::Other(format!("Failed to read journal: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!("TODO: Implement Windows event log viewing");
+        Err(crate::CliError::NotImplemented("Windows service logs"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
