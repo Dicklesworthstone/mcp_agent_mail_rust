@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static SKIP_NEXT_QUICK_CYCLE: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
@@ -47,6 +48,14 @@ fn full_check_interval(config: &Config) -> Option<Duration> {
         .saturating_mul(3600)
         .max(MIN_FULL_CHECK_INTERVAL_SECS);
     Some(Duration::from_secs(secs))
+}
+
+/// Tell the guard that startup already ran an integrity probe.
+///
+/// Used by HTTP/TUI startup to avoid immediately repeating the same quick-check
+/// in the background worker before the first interval elapses.
+pub fn note_startup_integrity_probe_completed() {
+    SKIP_NEXT_QUICK_CYCLE.store(true, Ordering::Release);
 }
 
 pub fn start(config: &Config) {
@@ -117,6 +126,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
 
     let mut last_full_check = Instant::now();
     let mut last_recovery_attempt: Option<Instant> = None;
+    let mut skip_first_quick_cycle = SKIP_NEXT_QUICK_CYCLE.swap(false, Ordering::AcqRel);
 
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
@@ -124,12 +134,19 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             return;
         }
 
-        run_quick_cycle(
-            &pool,
-            sqlite_path,
-            &storage_root,
-            &mut last_recovery_attempt,
-        );
+        if skip_first_quick_cycle {
+            skip_first_quick_cycle = false;
+            tracing::debug!(
+                "integrity guard: skipped immediate quick cycle (startup probe already executed)"
+            );
+        } else {
+            run_quick_cycle(
+                &pool,
+                sqlite_path,
+                &storage_root,
+                &mut last_recovery_attempt,
+            );
+        }
 
         if let Some(interval) = full_every
             && last_full_check.elapsed() >= interval

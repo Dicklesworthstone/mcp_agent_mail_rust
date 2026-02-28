@@ -1331,6 +1331,9 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    // Startup probes already performed the first integrity verification.
+    // Avoid immediately repeating the same expensive check in the guard loop.
+    integrity_guard::note_startup_integrity_probe_completed();
     integrity_guard::start(config);
     disk_monitor::start(config);
     let dashboard = StartupDashboard::maybe_start(config);
@@ -1401,6 +1404,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    // Startup probes already performed the first integrity verification.
+    // Avoid immediately repeating the same expensive check in the guard loop.
+    integrity_guard::note_startup_integrity_probe_completed();
     integrity_guard::start(config);
     disk_monitor::start(config);
 
@@ -5978,22 +5984,18 @@ fn map_asupersync_err(err: &asupersync::Error) -> std::io::Error {
 }
 
 fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
-    // Use auto_pool_size when config values are not explicitly set, so the
-    // server automatically scales to the available hardware.
-    let (auto_min, auto_max) = mcp_agent_mail_db::pool::auto_pool_size();
-    let pool_size = config.database_pool_size.unwrap_or(auto_min);
-    let max_overflow = config
-        .database_max_overflow
-        .unwrap_or_else(|| auto_max.saturating_sub(auto_min));
     let pool_timeout_ms = config
         .database_pool_timeout
         .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
             v.saturating_mul(1000)
         });
+    // Keep readiness initialization intentionally minimal: we only need one
+    // successful acquire/query path to force migration initialization. Building
+    // a large auto-sized pool here causes avoidable startup churn on big hosts.
     let db_config = DbPoolConfig {
         database_url: config.database_url.clone(),
-        min_connections: pool_size,
-        max_connections: pool_size + max_overflow,
+        min_connections: 1,
+        max_connections: 1,
         acquire_timeout_ms: pool_timeout_ms,
         max_lifetime_ms: mcp_agent_mail_db::pool::DEFAULT_POOL_RECYCLE_MS,
         run_migrations: true,
