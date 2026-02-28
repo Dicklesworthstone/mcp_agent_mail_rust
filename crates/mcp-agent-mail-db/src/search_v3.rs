@@ -8,12 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use mcp_agent_mail_core::metrics::global_metrics;
-use mcp_agent_mail_search_core::filter_compiler::compile_filters;
-use mcp_agent_mail_search_core::lexical_parser::{LexicalParser, ParseOutcome, extract_terms};
-use mcp_agent_mail_search_core::lexical_response::{self, ResponseConfig};
-use mcp_agent_mail_search_core::query::{DateRange, ImportanceFilter, SearchFilter};
-use mcp_agent_mail_search_core::results::SearchResults;
-use mcp_agent_mail_search_core::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
+use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilter, SearchResults};
+use crate::search_filter_compiler::compile_filters;
+use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
+use crate::search_response::{self as lexical_response, ResponseConfig};
+use crate::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
 use tantivy::Index;
 
 use crate::search_planner::{
@@ -202,10 +201,10 @@ fn build_search_filter(query: &PlannerQuery) -> SearchFilter {
 
     // Doc kind
     let doc_kind = match query.doc_kind {
-        DocKind::Message => mcp_agent_mail_search_core::document::DocKind::Message,
-        DocKind::Agent => mcp_agent_mail_search_core::document::DocKind::Agent,
-        DocKind::Project => mcp_agent_mail_search_core::document::DocKind::Project,
-        DocKind::Thread => mcp_agent_mail_search_core::document::DocKind::Thread,
+        DocKind::Message => mcp_agent_mail_core::DocKind::Message,
+        DocKind::Agent => mcp_agent_mail_core::DocKind::Agent,
+        DocKind::Project => mcp_agent_mail_core::DocKind::Project,
+        DocKind::Thread => mcp_agent_mail_core::DocKind::Thread,
     };
     filter.doc_kind = Some(doc_kind);
 
@@ -286,7 +285,7 @@ static BRIDGE: OnceLock<Option<Arc<TantivyBridge>>> = OnceLock::new();
 /// is configured. Returns `Ok(())` on success.
 pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
     use crate::search_service::{record_warmup, record_warmup_failure, record_warmup_start};
-    use mcp_agent_mail_search_core::cache::WarmResource;
+    use crate::search_cache::WarmResource;
 
     record_warmup_start(WarmResource::LexicalIndex);
     let warmup_timer = std::time::Instant::now();
@@ -380,7 +379,7 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
 
     // Invalidate search cache so new messages appear immediately.
     crate::search_service::invalidate_search_cache(
-        mcp_agent_mail_search_core::cache::InvalidationTrigger::IndexUpdate,
+        crate::search_cache::InvalidationTrigger::IndexUpdate,
     );
 
     Ok(true)
@@ -441,7 +440,7 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
         .update_index_health(index_size_bytes, doc_count);
 
     crate::search_service::invalidate_search_cache(
-        mcp_agent_mail_search_core::cache::InvalidationTrigger::IndexUpdate,
+        crate::search_cache::InvalidationTrigger::IndexUpdate,
     );
 
     Ok(messages.len())
@@ -755,7 +754,7 @@ mod tests {
         let filter = build_search_filter(&query);
         assert_eq!(
             filter.doc_kind,
-            Some(mcp_agent_mail_search_core::document::DocKind::Message)
+            Some(mcp_agent_mail_core::DocKind::Message)
         );
         assert_eq!(filter.project_id, Some(1));
         assert!(filter.sender.is_none());
@@ -774,7 +773,7 @@ mod tests {
         let filter = build_search_filter(&query);
         assert_eq!(
             filter.doc_kind,
-            Some(mcp_agent_mail_search_core::document::DocKind::Agent)
+            Some(mcp_agent_mail_core::DocKind::Agent)
         );
     }
 
@@ -788,7 +787,7 @@ mod tests {
         let filter = build_search_filter(&query);
         assert_eq!(
             filter.doc_kind,
-            Some(mcp_agent_mail_search_core::document::DocKind::Project)
+            Some(mcp_agent_mail_core::DocKind::Project)
         );
     }
 
@@ -802,7 +801,7 @@ mod tests {
         let filter = build_search_filter(&query);
         assert_eq!(
             filter.doc_kind,
-            Some(mcp_agent_mail_search_core::document::DocKind::Thread)
+            Some(mcp_agent_mail_core::DocKind::Thread)
         );
     }
 
@@ -959,9 +958,9 @@ mod tests {
     // -- convert_results tests ---------------------------------------------
 
     fn make_search_results(
-        hits: Vec<mcp_agent_mail_search_core::results::SearchHit>,
+        hits: Vec<mcp_agent_mail_core::SearchHit>,
     ) -> SearchResults {
-        use mcp_agent_mail_search_core::query::SearchMode;
+        use mcp_agent_mail_core::SearchMode;
         SearchResults {
             total_count: hits.len(),
             hits,
@@ -976,9 +975,9 @@ mod tests {
         score: f64,
         snippet: Option<&str>,
         metadata: std::collections::HashMap<String, serde_json::Value>,
-    ) -> mcp_agent_mail_search_core::results::SearchHit {
-        use mcp_agent_mail_search_core::document::DocKind as CoreDocKind;
-        mcp_agent_mail_search_core::results::SearchHit {
+    ) -> mcp_agent_mail_core::SearchHit {
+        use mcp_agent_mail_core::DocKind as CoreDocKind;
+        mcp_agent_mail_core::SearchHit {
             doc_id,
             doc_kind: CoreDocKind::Message,
             score,

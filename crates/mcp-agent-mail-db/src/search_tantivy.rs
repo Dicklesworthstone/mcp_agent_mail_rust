@@ -8,16 +8,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use mcp_agent_mail_search_core::document::DocKind as ScDocKind;
-use mcp_agent_mail_search_core::query::{DateRange, ImportanceFilter, SearchFilter};
-use mcp_agent_mail_search_core::results::{SearchHit, SearchResults};
-use mcp_agent_mail_search_core::tantivy_schema::{
+use mcp_agent_mail_core::search_types::{
+    DateRange, DocKind as ScDocKind, ImportanceFilter, SearchFilter, SearchHit, SearchResults,
+};
+use crate::tantivy_schema::{
     build_schema, register_tokenizer, FieldHandles, BODY_BOOST, SUBJECT_BOOST,
 };
-use mcp_agent_mail_search_core::{
-    compile_filters, execute_search as tantivy_execute, extract_terms, sanitize_query,
-    LexicalParser, LexicalParserConfig, ParseOutcome, ResponseConfig, SanitizedQuery,
+use crate::search_filter_compiler::compile_filters;
+use crate::query_assistance::{
+    LexicalParser, LexicalParserConfig, ParseOutcome, SanitizedQuery, extract_terms, sanitize_query,
 };
+use crate::search_response::{execute_search as tantivy_execute, ResponseConfig};
 use tantivy::query::AllQuery;
 use tantivy::Index;
 

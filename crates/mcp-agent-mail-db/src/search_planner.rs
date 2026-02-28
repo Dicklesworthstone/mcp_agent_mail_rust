@@ -10,7 +10,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use mcp_agent_mail_search_core::QueryAssistance;
+use crate::query_assistance::QueryAssistance;
 use serde::{Deserialize, Serialize};
 
 // ────────────────────────────────────────────────────────────────────
@@ -354,8 +354,8 @@ impl SearchQuery {
 
     /// Convert query facets to a [`SearchFilter`] for cache key construction.
     #[must_use]
-    pub fn to_search_filter(&self) -> mcp_agent_mail_search_core::SearchFilter {
-        use mcp_agent_mail_search_core::{DateRange, ImportanceFilter, SearchFilter};
+    pub fn to_search_filter(&self) -> mcp_agent_mail_core::SearchFilter {
+        use mcp_agent_mail_core::{DateRange, ImportanceFilter, SearchFilter};
 
         let importance = if self.importance.is_empty() {
             None

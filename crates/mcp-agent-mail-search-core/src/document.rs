@@ -1,95 +1,11 @@
-//! Document model for the search index
-//!
-//! Documents are the unit of indexing. Each document represents a searchable
-//! entity (message, agent profile, project metadata, etc.).
+//! Document model for the search index — re-exported from `mcp-agent-mail-core`.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-/// Unique identifier for a document in the search index
-pub type DocId = i64;
-
-/// The kind of document (maps to different index schemas)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DocKind {
-    /// A message (subject + body)
-    Message,
-    /// An agent profile
-    Agent,
-    /// A project
-    Project,
-    /// A thread (aggregated from messages)
-    Thread,
-}
-
-impl std::fmt::Display for DocKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Message => write!(f, "message"),
-            Self::Agent => write!(f, "agent"),
-            Self::Project => write!(f, "project"),
-            Self::Thread => write!(f, "thread"),
-        }
-    }
-}
-
-/// A document to be indexed
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Document {
-    /// Unique ID within the document kind
-    pub id: DocId,
-    /// What kind of entity this document represents
-    pub kind: DocKind,
-    /// Primary text content (e.g., message body, agent description)
-    pub body: String,
-    /// Secondary text content (e.g., message subject, agent name)
-    pub title: String,
-    /// The project this document belongs to (for scoping)
-    pub project_id: Option<i64>,
-    /// Timestamp in microseconds since epoch
-    pub created_ts: i64,
-    /// Structured metadata for faceted search
-    pub metadata: HashMap<String, serde_json::Value>,
-}
-
-/// Describes a change to a document for incremental index updates
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DocChange {
-    /// A new document was created or an existing one was updated
-    Upsert(Document),
-    /// A document was deleted
-    Delete {
-        /// The ID of the deleted document
-        id: DocId,
-        /// The kind of the deleted document
-        kind: DocKind,
-    },
-}
-
-impl DocChange {
-    /// Returns the document ID affected by this change
-    #[must_use]
-    pub const fn doc_id(&self) -> DocId {
-        match self {
-            Self::Upsert(doc) => doc.id,
-            Self::Delete { id, .. } => *id,
-        }
-    }
-
-    /// Returns the document kind affected by this change
-    #[must_use]
-    pub const fn doc_kind(&self) -> DocKind {
-        match self {
-            Self::Upsert(doc) => doc.kind,
-            Self::Delete { kind, .. } => *kind,
-        }
-    }
-}
+pub use mcp_agent_mail_core::search_types::{DocChange, DocId, DocKind, Document};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn sample_doc() -> Document {
         Document {
@@ -181,8 +97,6 @@ mod tests {
         assert_eq!(delete2.doc_kind(), DocKind::Thread);
     }
 
-    // ── DocKind Hash ────────────────────────────────────────────────────
-
     #[test]
     fn doc_kind_hash_distinct_variants() {
         use std::collections::HashSet;
@@ -193,8 +107,6 @@ mod tests {
         set.insert(DocKind::Thread);
         assert_eq!(set.len(), 4);
     }
-
-    // ── Document metadata ───────────────────────────────────────────────
 
     #[test]
     fn document_with_metadata_serde() {
@@ -218,8 +130,6 @@ mod tests {
         assert!(back.project_id.is_none());
     }
 
-    // ── Document Clone + Debug ──────────────────────────────────────────
-
     #[test]
     fn document_clone() {
         let doc = sample_doc();
@@ -235,8 +145,6 @@ mod tests {
         let debug = format!("{doc:?}");
         assert!(debug.contains("Document"));
     }
-
-    // ── DocChange Clone + Debug ─────────────────────────────────────────
 
     #[test]
     fn doc_change_clone() {
@@ -256,8 +164,6 @@ mod tests {
         assert!(debug.contains("Agent"));
     }
 
-    // ── DocChange all kinds ─────────────────────────────────────────────
-
     #[test]
     fn doc_change_delete_all_kinds() {
         for kind in [
@@ -270,8 +176,6 @@ mod tests {
             assert_eq!(change.doc_kind(), kind);
         }
     }
-
-    // ── DocKind trait coverage ─────────────────────────────────────────
 
     #[test]
     fn doc_kind_debug() {
@@ -286,8 +190,6 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, DocKind::Project);
     }
-
-    // ── Document edge cases ───────────────────────────────────────────
 
     #[test]
     fn document_empty_fields() {
@@ -323,8 +225,6 @@ mod tests {
         assert_eq!(back.created_ts, -1_000_000);
     }
 
-    // ── DocChange upsert for all kinds ────────────────────────────────
-
     #[test]
     fn doc_change_upsert_all_kinds() {
         for kind in [
@@ -347,8 +247,6 @@ mod tests {
             assert_eq!(change.doc_kind(), kind);
         }
     }
-
-    // ── DocId type alias ──────────────────────────────────────────────
 
     #[test]
     fn doc_id_is_i64() {

@@ -26,25 +26,32 @@ use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configur
 use asupersync::{Budget, Cx, Outcome, Time};
 #[cfg(feature = "hybrid")]
 use half::f16;
-use mcp_agent_mail_search_core::SearchMode;
-use mcp_agent_mail_search_core::cache::{
+use mcp_agent_mail_core::SearchMode;
+use crate::search_cache::{
     CacheConfig, InvalidationTrigger, QueryCache, QueryCacheKey, WarmResource, WarmWorker,
     WarmWorkerConfig,
 };
-use mcp_agent_mail_search_core::{
+use crate::search_candidates::{
     CandidateBudget, CandidateBudgetConfig, CandidateBudgetDecision, CandidateBudgetDerivation,
-    CandidateHit, CandidateMode, CandidateStageCounts, QueryAssistance, QueryClass,
-    parse_query_assistance, prepare_candidates,
+    CandidateHit, CandidateMode, CandidateStageCounts, QueryClass,
+    prepare_candidates,
 };
+use crate::query_assistance::{QueryAssistance, parse_query_assistance};
+#[cfg(feature = "hybrid")]
+use mcp_agent_mail_core::DocKind as SearchDocKind;
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
-    DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
-    EmbeddingRequest, EmbeddingResult, FsScoredResult, HashEmbedder, JobMetricsSnapshot, ModelInfo,
-    ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult,
-    SearchPhase, TwoTierAlertConfig, TwoTierAvailability, TwoTierConfig, TwoTierEntry,
-    TwoTierIndex, TwoTierMetrics, TwoTierMetricsSnapshot, VectorFilter, VectorIndex,
-    VectorIndexConfig, fs, get_two_tier_context,
+    Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest,
+    EmbeddingResult, HashEmbedder, JobMetricsSnapshot, ModelInfo, ModelRegistry, ModelTier,
+    QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult, SearchPhase,
+    TwoTierAlertConfig, TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex,
+    TwoTierMetrics, TwoTierMetricsSnapshot, VectorFilter, VectorIndex, VectorIndexConfig,
+    get_two_tier_context,
 };
+#[cfg(feature = "hybrid")]
+use frankensearch as fs;
+#[cfg(feature = "hybrid")]
+use frankensearch_core::types::ScoredResult as FsScoredResult;
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
@@ -96,13 +103,13 @@ pub fn invalidate_search_cache(trigger: InvalidationTrigger) {
 
 /// Get search cache metrics snapshot (for diagnostics).
 #[must_use]
-pub fn search_cache_metrics() -> mcp_agent_mail_search_core::cache::CacheMetrics {
+pub fn search_cache_metrics() -> crate::search_cache::CacheMetrics {
     SEARCH_CACHE.get().map(|c| c.metrics()).unwrap_or_default()
 }
 
 /// Get warm worker status snapshot (for diagnostics).
 #[must_use]
-pub fn warm_worker_status() -> Vec<mcp_agent_mail_search_core::cache::WarmStatus> {
+pub fn warm_worker_status() -> Vec<crate::search_cache::WarmStatus> {
     WARM_WORKER
         .get()
         .map(|w| w.all_status())
@@ -388,7 +395,7 @@ impl Embedder for AutoInitSemanticEmbedder {
                 self.info.id.clone(),
                 ModelTier::Fast,
                 start.elapsed(),
-                mcp_agent_mail_search_core::canonical::content_hash(text),
+                crate::search_canonical::content_hash(text),
             ));
         }
         if let Ok(vector) = ctx.embed_quality(text) {
@@ -397,7 +404,7 @@ impl Embedder for AutoInitSemanticEmbedder {
                 "auto-init-semantic-quality".to_string(),
                 ModelTier::Quality,
                 start.elapsed(),
-                mcp_agent_mail_search_core::canonical::content_hash(text),
+                crate::search_canonical::content_hash(text),
             ));
         }
         self.hash_fallback.embed(text)
@@ -2391,10 +2398,10 @@ fn emit_hybrid_budget_evidence(
 ) {
     let confidence = decision_confidence(&derivation.decision);
     let action_label = match derivation.decision.chosen_action {
-        mcp_agent_mail_search_core::CandidateBudgetAction::LexicalDominant => "lexical_dominant",
-        mcp_agent_mail_search_core::CandidateBudgetAction::Balanced => "balanced",
-        mcp_agent_mail_search_core::CandidateBudgetAction::SemanticDominant => "semantic_dominant",
-        mcp_agent_mail_search_core::CandidateBudgetAction::LexicalOnly => "lexical_only",
+        crate::search_candidates::CandidateBudgetAction::LexicalDominant => "lexical_dominant",
+        crate::search_candidates::CandidateBudgetAction::Balanced => "balanced",
+        crate::search_candidates::CandidateBudgetAction::SemanticDominant => "semantic_dominant",
+        crate::search_candidates::CandidateBudgetAction::LexicalOnly => "lexical_only",
     };
     let mode = derivation.decision.mode;
     let decision_id = format!(
@@ -3264,7 +3271,7 @@ mod tests {
         let assistance = Some(QueryAssistance {
             query_text: "form:BlueLake migration".to_string(),
             applied_filter_hints: Vec::new(),
-            did_you_mean: vec![mcp_agent_mail_search_core::DidYouMeanHint {
+            did_you_mean: vec![crate::query_assistance::DidYouMeanHint {
                 token: "form:BlueLake".to_string(),
                 suggested_field: "from".to_string(),
                 value: "BlueLake".to_string(),
@@ -3947,7 +3954,7 @@ mod tests {
                 self.info.id.clone(),
                 ModelTier::Fast,
                 Duration::from_millis(1),
-                mcp_agent_mail_search_core::canonical::content_hash(text),
+                crate::search_canonical::content_hash(text),
             ))
         }
 
