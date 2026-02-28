@@ -4720,6 +4720,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.28.1",
+ "dirs",
  "ftui",
  "ftui-runtime",
  "glob",

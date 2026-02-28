@@ -21,6 +21,7 @@ pub mod golden;
 pub mod legacy;
 pub mod output;
 pub mod robot;
+pub mod service;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::OsString;
@@ -369,6 +370,12 @@ pub enum Commands {
         /// Install a specific version instead of the latest.
         #[arg(long)]
         version: Option<String>,
+    },
+    /// Manage mcp-agent-mail as a background service (install, uninstall, status, logs, restart).
+    #[command(name = "service")]
+    Service {
+        #[command(subcommand)]
+        action: service::ServiceCommand,
     },
 }
 
@@ -2056,6 +2063,7 @@ fn execute(cli: Cli) -> CliResult<()> {
                 handle_self_update_full(force, version)
             }
         }
+        Commands::Service { action } => handle_service(action),
     }
 }
 
@@ -2266,6 +2274,35 @@ mod invocation_name_tests {
         let cmd = Cli::command().name("am").bin_name("am");
         let help = long_help_text(cmd);
         assert!(help.contains("am"), "expected help to reference am");
+    }
+}
+
+fn handle_service(action: service::ServiceCommand) -> CliResult<()> {
+    match action {
+        service::ServiceCommand::Install {
+            dry_run,
+            health_timeout,
+        } => {
+            eprintln!("service install: dry_run={}, health_timeout={}", dry_run, health_timeout);
+            eprintln!("TODO: implement am service install");
+            Err(CliError::NotImplemented("am service install"))
+        }
+        service::ServiceCommand::Uninstall => {
+            eprintln!("TODO: implement am service uninstall");
+            Err(CliError::NotImplemented("am service uninstall"))
+        }
+        service::ServiceCommand::Status { json } => {
+            eprintln!("TODO: implement am service status (json={})", json);
+            Err(CliError::NotImplemented("am service status"))
+        }
+        service::ServiceCommand::Logs { follow, lines } => {
+            eprintln!("TODO: implement am service logs (follow={}, lines={})", follow, lines);
+            Err(CliError::NotImplemented("am service logs"))
+        }
+        service::ServiceCommand::Restart => {
+            eprintln!("TODO: implement am service restart");
+            Err(CliError::NotImplemented("am service restart"))
+        }
     }
 }
 
