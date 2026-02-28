@@ -4,22 +4,23 @@
 //! (FTS5-based `search_planner` + `search_service`) and the Tantivy-based
 //! search engine in `mcp-agent-mail-search-core`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
+use crate::search_filter_compiler::compile_filters;
+use crate::search_response::{self as lexical_response, ResponseConfig};
+use crate::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilter, SearchResults};
 use sqlmodel_core::Value;
-use crate::search_filter_compiler::compile_filters;
-use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
-use crate::search_response::{self as lexical_response, ResponseConfig};
-use crate::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
 use tantivy::Index;
 
+use crate::DbConn;
 use crate::search_planner::{
     DocKind, Importance, SearchQuery as PlannerQuery, SearchResult as PlannerResult,
 };
-use crate::DbConn;
 
 /// Bridge between the Tantivy search engine and the planner query/result types.
 pub struct TantivyBridge {
@@ -286,8 +287,8 @@ static BRIDGE: OnceLock<Option<Arc<TantivyBridge>>> = OnceLock::new();
 /// Should be called once at startup when `SearchEngine::Tantivy` or `Shadow`
 /// is configured. Returns `Ok(())` on success.
 pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
-    use crate::search_service::{record_warmup, record_warmup_failure, record_warmup_start};
     use crate::search_cache::WarmResource;
+    use crate::search_service::{record_warmup, record_warmup_failure, record_warmup_start};
 
     record_warmup_start(WarmResource::LexicalIndex);
     let warmup_timer = std::time::Instant::now();
@@ -364,6 +365,26 @@ fn refresh_index_health_metrics(bridge: &TantivyBridge) {
     mcp_agent_mail_core::metrics::global_metrics()
         .search
         .update_index_health(index_size_bytes, doc_count);
+}
+
+fn lookup_cached_text(
+    conn: &DbConn,
+    cache: &mut HashMap<i64, String>,
+    key: i64,
+    sql: &str,
+) -> Result<String, String> {
+    if let Some(value) = cache.get(&key) {
+        return Ok(value.clone());
+    }
+    let rows = conn
+        .query_sync(sql, &[Value::BigInt(key)])
+        .map_err(|e| format!("backfill lookup failed: {e}"))?;
+    let value = rows
+        .first()
+        .and_then(|r| r.get_named::<String>("value").ok())
+        .unwrap_or_default();
+    cache.insert(key, value.clone());
+    Ok(value)
 }
 
 /// Index a single message into the global Tantivy bridge.
@@ -473,39 +494,49 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let conn = DbConn::open_file(db_path)
         .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
 
-    // Count messages in DB.
-    let count_rows = conn
-        .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
-        .map_err(|e| format!("backfill: count query failed: {e}"))?;
-    let db_count = count_rows
-        .first()
-        .and_then(|r| r.get_named::<i64>("cnt").ok())
-        .unwrap_or(0);
-
-    #[allow(clippy::cast_sign_loss)]
-    let db_count_u64 = db_count as u64;
-
-    // If the index already has at least as many docs as the DB, skip.
-    // Guard: when db_count is 0 but the index has docs, the DB may be degraded
-    // (e.g. freshly created, post-corruption recovery, or malformed).
-    // In that case, do NOT skip -- log a warning and proceed to revalidate.
-    // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/12
-    if existing_count >= db_count_u64 {
-        if db_count_u64 == 0 && existing_count > 0 {
-            tracing::warn!(
-                existing_count,
-                db_count,
-                "backfill: db_count is 0 but index has docs; DB may be degraded — rebuilding index"
+    // Count messages in DB when the backend supports aggregate COUNT semantics.
+    // FrankenSQLite builds without COUNT() support can still backfill safely:
+    // we just skip the up-to-date fast path and proceed with paged indexing.
+    let db_count = match conn.query_sync("SELECT COUNT(id) AS cnt FROM messages", &[]) {
+        Ok(rows) => rows
+            .first()
+            .and_then(|r| r.get_named::<i64>("cnt").ok())
+            .filter(|v| *v >= 0),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "backfill: COUNT(id) unavailable; continuing without up-to-date skip fast path"
             );
-            // Fall through to full backfill to avoid stale index.
-        } else {
-            tracing::info!(
-                existing_count,
-                db_count,
-                "backfill: index already up-to-date, skipping"
-            );
-            #[allow(clippy::cast_possible_truncation)]
-            return Ok((0, db_count_u64 as usize));
+            None
+        }
+    };
+
+    if let Some(db_count) = db_count {
+        #[allow(clippy::cast_sign_loss)]
+        let db_count_u64 = db_count as u64;
+
+        // If the index already has at least as many docs as the DB, skip.
+        // Guard: when db_count is 0 but the index has docs, the DB may be degraded
+        // (e.g. freshly created, post-corruption recovery, or malformed).
+        // In that case, do NOT skip -- log a warning and proceed to revalidate.
+        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/12
+        if existing_count >= db_count_u64 {
+            if db_count_u64 == 0 && existing_count > 0 {
+                tracing::warn!(
+                    existing_count,
+                    db_count,
+                    "backfill: db_count is 0 but index has docs; DB may be degraded — rebuilding index"
+                );
+                // Fall through to full backfill to avoid stale index.
+            } else {
+                tracing::info!(
+                    existing_count,
+                    db_count,
+                    "backfill: index already up-to-date, skipping"
+                );
+                #[allow(clippy::cast_possible_truncation)]
+                return Ok((0, db_count_u64 as usize));
+            }
         }
     }
 
@@ -516,17 +547,16 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let handles = bridge.handles();
 
     // Paged reads avoid loading the full mailbox into memory during startup.
-    let sql = "SELECT m.id AS id, m.project_id AS project_id, \
-               p.slug AS slug, a.name AS sender_name, \
-               m.subject AS subject, m.body_md AS body_md, \
-               m.thread_id AS thread_id, m.importance AS importance, \
-               m.created_ts AS created_ts \
-               FROM messages m \
-               JOIN agents a ON a.id = m.sender_id \
-               JOIN projects p ON p.id = m.project_id \
-               WHERE m.id > ? \
-               ORDER BY m.id \
+    // Keep this query JOIN-free to avoid parity-cert fallback overhead on
+    // FrankenSQLite for join-heavy startup scans.
+    let sql = "SELECT id, project_id, sender_id, subject, body_md, \
+               thread_id, importance, created_ts \
+               FROM messages \
+               WHERE id > ? \
+               ORDER BY id \
                LIMIT ?";
+    let mut sender_name_cache: HashMap<i64, String> = HashMap::new();
+    let mut project_slug_cache: HashMap<i64, String> = HashMap::new();
 
     let mut last_id = 0_i64;
     let mut pending_batches = 0_usize;
@@ -543,18 +573,32 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         }
 
         for row in &rows {
+            let project_id = row.get_as::<i64>(1).unwrap_or(0);
+            let sender_id = row.get_as::<i64>(2).unwrap_or(0);
+            let project_slug = lookup_cached_text(
+                &conn,
+                &mut project_slug_cache,
+                project_id,
+                "SELECT slug AS value FROM projects WHERE id = ? LIMIT 1",
+            )?;
+            let sender_name = lookup_cached_text(
+                &conn,
+                &mut sender_name_cache,
+                sender_id,
+                "SELECT name AS value FROM agents WHERE id = ? LIMIT 1",
+            )?;
             let msg = IndexableMessage {
                 id: row.get_as::<i64>(0).unwrap_or(0),
-                project_id: row.get_as::<i64>(1).unwrap_or(0),
-                project_slug: row.get_as::<String>(2).unwrap_or_default(),
-                sender_name: row.get_as::<String>(3).unwrap_or_default(),
-                subject: row.get_as::<String>(4).unwrap_or_default(),
-                body_md: row.get_as::<String>(5).unwrap_or_default(),
-                thread_id: row.get_as::<Option<String>>(6).unwrap_or_default(),
+                project_id,
+                project_slug,
+                sender_name,
+                subject: row.get_as::<String>(3).unwrap_or_default(),
+                body_md: row.get_as::<String>(4).unwrap_or_default(),
+                thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
                 importance: row
-                    .get_as::<String>(7)
+                    .get_as::<String>(6)
                     .unwrap_or_else(|_| "normal".to_string()),
-                created_ts: row.get_as::<i64>(8).unwrap_or(0),
+                created_ts: row.get_as::<i64>(7).unwrap_or(0),
             };
             add_indexable_message(&mut writer, handles, &msg)?;
             total_indexed += 1;
@@ -587,7 +631,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
 
     tracing::info!(
         total_indexed,
-        db_count,
+        db_count = db_count.unwrap_or(-1),
         existing_count,
         "backfill: Tantivy index populated from database"
     );
@@ -788,10 +832,7 @@ mod tests {
     fn filter_default_query_has_message_doc_kind() {
         let query = PlannerQuery::messages("test", 1);
         let filter = build_search_filter(&query);
-        assert_eq!(
-            filter.doc_kind,
-            Some(mcp_agent_mail_core::DocKind::Message)
-        );
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Message));
         assert_eq!(filter.project_id, Some(1));
         assert!(filter.sender.is_none());
         assert!(filter.thread_id.is_none());
@@ -807,10 +848,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_search_filter(&query);
-        assert_eq!(
-            filter.doc_kind,
-            Some(mcp_agent_mail_core::DocKind::Agent)
-        );
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Agent));
     }
 
     #[test]
@@ -821,10 +859,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_search_filter(&query);
-        assert_eq!(
-            filter.doc_kind,
-            Some(mcp_agent_mail_core::DocKind::Project)
-        );
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Project));
     }
 
     #[test]
@@ -835,10 +870,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_search_filter(&query);
-        assert_eq!(
-            filter.doc_kind,
-            Some(mcp_agent_mail_core::DocKind::Thread)
-        );
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Thread));
     }
 
     #[test]
@@ -993,9 +1025,7 @@ mod tests {
 
     // -- convert_results tests ---------------------------------------------
 
-    fn make_search_results(
-        hits: Vec<mcp_agent_mail_core::SearchHit>,
-    ) -> SearchResults {
+    fn make_search_results(hits: Vec<mcp_agent_mail_core::SearchHit>) -> SearchResults {
         use mcp_agent_mail_core::SearchMode;
         SearchResults {
             total_count: hits.len(),

@@ -4,7 +4,7 @@
 //! - `SQLite` database operations via `sqlmodel` on frankensqlite
 //! - Connection pooling
 //! - Schema migrations
-//! - FTS5 full-text search
+//! - Search V3 retrieval integration (frankensearch lexical/semantic/hybrid)
 //!
 //! # Timestamp Convention
 //!

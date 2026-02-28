@@ -141,6 +141,17 @@ fn run_check(conn: &DbConn, pragma: &str, kind: CheckKind) -> DbResult<Integrity
     let duration_us =
         u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
 
+    evaluate_check_rows(&rows, kind, duration_us)
+}
+
+/// Evaluate integrity/quick-check pragma rows and update global integrity metrics.
+///
+/// Shared helper to keep integrity semantics consistent across all callers.
+pub fn evaluate_check_rows(
+    rows: &[Row],
+    kind: CheckKind,
+    duration_us: u64,
+) -> DbResult<IntegrityCheckResult> {
     let mut details: Vec<String> = rows
         .iter()
         .filter_map(|r| {

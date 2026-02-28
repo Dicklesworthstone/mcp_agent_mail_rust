@@ -33,7 +33,7 @@ use crate::search_planner::SearchResult;
 /// Which search engine to use. Controlled by `SEARCH_V3_ENGINE` env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchEngineKind {
-    /// SQL LIKE fallback (only when Tantivy is unavailable).
+    /// Legacy SQL fallback mode retained for conformance/testing-only paths.
     Sql,
     /// Tantivy BM25 lexical engine (default since FTS5 decommission).
     Tantivy,
