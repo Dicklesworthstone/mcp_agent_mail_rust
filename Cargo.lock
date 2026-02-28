@@ -4799,6 +4799,8 @@ dependencies = [
  "asupersync",
  "chrono",
  "criterion",
+ "dirs",
+ "fastembed",
  "frankensearch",
  "frankensearch-core",
  "frankensearch-embed",
@@ -4809,9 +4811,10 @@ dependencies = [
  "indexmap",
  "loom",
  "mcp-agent-mail-core",
- "mcp-agent-mail-search-core",
  "proptest",
+ "rayon",
  "regex",
+ "safetensors",
  "serde",
  "serde_json",
  "sha2",
@@ -4826,7 +4829,9 @@ dependencies = [
  "tantivy",
  "tempfile",
  "thiserror",
+ "tokenizers",
  "tracing",
+ "wide",
 ]
 
 [[package]]
@@ -5171,6 +5176,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

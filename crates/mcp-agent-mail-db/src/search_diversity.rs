@@ -20,7 +20,7 @@ use std::hash::BuildHasher;
 
 use serde::{Deserialize, Serialize};
 
-use mcp_agent_mail_search_core::fusion::FusedHit;
+use crate::search_fusion::FusedHit;
 
 // ── Environment variable names ────────────────────────────────────────────
 
@@ -302,8 +302,8 @@ fn would_violate_caps(
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
-    use mcp_agent_mail_search_core::fusion::FusionExplain;
-    use mcp_agent_mail_search_core::hybrid_candidates::CandidateSource;
+    use crate::search_fusion::FusionExplain;
+    use crate::search_candidates::CandidateSource;
 
     fn make_hit(doc_id: i64, score: f64) -> FusedHit {
         FusedHit {

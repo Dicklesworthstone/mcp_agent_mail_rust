@@ -11,9 +11,9 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use mcp_agent_mail_core::DocChange;
-use mcp_agent_mail_search_core::engine::{DocumentSource, IndexHealth, IndexLifecycle, IndexStats};
-use mcp_agent_mail_search_core::error::SearchResult;
-use mcp_agent_mail_search_core::index_layout::{IndexCheckpoint, IndexLayout, IndexScope, SchemaHash};
+use crate::search_engine::{DocumentSource, IndexHealth, IndexLifecycle, IndexStats};
+use crate::search_error::SearchResult;
+use crate::search_index_layout::{IndexCheckpoint, IndexLayout, IndexScope, SchemaHash};
 
 // ── Consistency check types ──────────────────────────────────────────────────
 
@@ -501,7 +501,7 @@ pub fn repair_if_needed(
 mod tests {
     use super::*;
     use mcp_agent_mail_core::{DocKind, Document};
-    use mcp_agent_mail_search_core::engine::IndexHealth;
+    use crate::search_engine::IndexHealth;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};

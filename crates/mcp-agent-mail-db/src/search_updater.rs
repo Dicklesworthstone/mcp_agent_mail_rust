@@ -9,11 +9,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use mcp_agent_mail_core::{DocChange, DocKind};
-use mcp_agent_mail_search_core::engine::IndexLifecycle;
+use crate::search_engine::IndexLifecycle;
 use crate::search_envelope::{
     AgentRow, MessageRow, ProjectRow, agent_to_envelope, message_to_envelope, project_to_envelope,
 };
-use mcp_agent_mail_search_core::error::SearchResult;
+use crate::search_error::SearchResult;
 
 /// Configuration for the incremental index updater
 #[derive(Debug, Clone)]
@@ -228,7 +228,7 @@ pub fn deduplicate_changes(changes: Vec<DocChange>) -> Vec<DocChange> {
 mod tests {
     use super::*;
     use mcp_agent_mail_core::Document;
-    use mcp_agent_mail_search_core::engine::{IndexHealth, IndexStats};
+    use crate::search_engine::{IndexHealth, IndexStats};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -668,13 +668,13 @@ mod tests {
 
     impl IndexLifecycle for FailingLifecycle {
         fn rebuild(&self) -> SearchResult<IndexStats> {
-            Err(mcp_agent_mail_search_core::error::SearchError::IndexNotReady(
+            Err(crate::search_error::SearchError::IndexNotReady(
                 "test failure".into(),
             ))
         }
 
         fn update_incremental(&self, _changes: &[DocChange]) -> SearchResult<usize> {
-            Err(mcp_agent_mail_search_core::error::SearchError::IndexNotReady(
+            Err(crate::search_error::SearchError::IndexNotReady(
                 "backend offline".into(),
             ))
         }

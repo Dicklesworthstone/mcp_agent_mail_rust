@@ -19,9 +19,9 @@ use mcp_agent_mail_db::search_consistency::{
     repair_if_needed,
 };
 use mcp_agent_mail_core::{DocChange, DocKind, Document};
-use mcp_agent_mail_search_core::engine::{DocumentSource, IndexHealth, IndexLifecycle, IndexStats};
-use mcp_agent_mail_search_core::error::{SearchError, SearchResult};
-use mcp_agent_mail_search_core::index_layout::{
+use mcp_agent_mail_db::search_engine::{DocumentSource, IndexHealth, IndexLifecycle, IndexStats};
+use mcp_agent_mail_db::search_error::{SearchError, SearchResult};
+use mcp_agent_mail_db::search_index_layout::{
     IndexCheckpoint, IndexLayout, IndexScope, SchemaField, SchemaHash,
 };
 

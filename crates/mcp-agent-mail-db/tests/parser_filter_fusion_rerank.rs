@@ -17,13 +17,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use mcp_agent_mail_search_core::fusion::{RrfConfig, fuse_rrf, fuse_rrf_default};
-use mcp_agent_mail_search_core::hybrid_candidates::{
-    PreparedCandidate, CandidateSource,
-};
+use mcp_agent_mail_db::search_fusion::{RrfConfig, fuse_rrf, fuse_rrf_default};
 use mcp_agent_mail_db::search_candidates::{
     CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode,
-    QueryClass, prepare_candidates,
+    CandidateSource, PreparedCandidate, QueryClass, prepare_candidates,
 };
 use mcp_agent_mail_core::{DateRange, ImportanceFilter, SearchFilter, SearchMode};
 use mcp_agent_mail_core::{
@@ -656,14 +653,8 @@ fn prepare_first_source_attribution() {
     let prep = prepare_candidates(&lexical, &semantic, budget);
     let doc1 = prep.candidates.iter().find(|c| c.doc_id == 1).unwrap();
     let doc2 = prep.candidates.iter().find(|c| c.doc_id == 2).unwrap();
-    assert_eq!(
-        doc1.first_source,
-        mcp_agent_mail_db::search_candidates::CandidateSource::Lexical
-    );
-    assert_eq!(
-        doc2.first_source,
-        mcp_agent_mail_db::search_candidates::CandidateSource::Semantic
-    );
+    assert_eq!(doc1.first_source, CandidateSource::Lexical);
+    assert_eq!(doc2.first_source, CandidateSource::Semantic);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -867,29 +858,8 @@ fn pipeline_candidates_to_fusion_to_explain() {
     assert_eq!(prep.counts.duplicates_removed, 1);
 
     // Step 2: Fuse with RRF
-    // Convert db-crate PreparedCandidate to search-core PreparedCandidate
-    // (identical struct layout but different crate origins).
-    let fuse_candidates: Vec<PreparedCandidate> = prep
-        .candidates
-        .iter()
-        .map(|c| PreparedCandidate {
-            doc_id: c.doc_id,
-            lexical_rank: c.lexical_rank,
-            semantic_rank: c.semantic_rank,
-            lexical_score: c.lexical_score,
-            semantic_score: c.semantic_score,
-            first_source: match c.first_source {
-                mcp_agent_mail_db::search_candidates::CandidateSource::Lexical => {
-                    CandidateSource::Lexical
-                }
-                mcp_agent_mail_db::search_candidates::CandidateSource::Semantic => {
-                    CandidateSource::Semantic
-                }
-            },
-        })
-        .collect();
     let config = RrfConfig::default();
-    let fusion = fuse_rrf(&fuse_candidates, config, 0, 10);
+    let fusion = fuse_rrf(&prep.candidates, config, 0, 10);
     assert_eq!(fusion.hits.len(), 5);
 
     // Doc 2 should rank highest (dual source)

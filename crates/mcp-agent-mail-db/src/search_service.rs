@@ -40,14 +40,22 @@ use crate::query_assistance::{QueryAssistance, parse_query_assistance};
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_core::DocKind as SearchDocKind;
 #[cfg(feature = "hybrid")]
-use mcp_agent_mail_search_core::{
-    Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest,
-    EmbeddingResult, HashEmbedder, JobMetricsSnapshot, ModelInfo, ModelRegistry, ModelTier,
-    QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult, SearchPhase,
-    TwoTierAlertConfig, TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex,
-    TwoTierMetrics, TwoTierMetricsSnapshot, VectorFilter, VectorIndex, VectorIndexConfig,
-    get_two_tier_context,
+use crate::search_embedder::{
+    Embedder, EmbeddingResult, HashEmbedder, ModelInfo, ModelRegistry, ModelTier, RegistryConfig,
 };
+#[cfg(feature = "hybrid")]
+use crate::search_embedding_jobs::{
+    EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest,
+    IndexRefreshWorker, JobMetricsSnapshot, QueueStats, RefreshWorkerConfig,
+};
+#[cfg(feature = "hybrid")]
+use crate::search_two_tier::{ScoredResult, SearchPhase, TwoTierConfig, TwoTierEntry, TwoTierIndex};
+#[cfg(feature = "hybrid")]
+use crate::search_metrics::{TwoTierAlertConfig, TwoTierMetrics, TwoTierMetricsSnapshot};
+#[cfg(feature = "hybrid")]
+use crate::search_auto_init::{TwoTierAvailability, get_two_tier_context};
+#[cfg(feature = "hybrid")]
+use crate::search_vector_index::{VectorFilter, VectorIndex, VectorIndexConfig};
 #[cfg(feature = "hybrid")]
 use frankensearch as fs;
 #[cfg(feature = "hybrid")]
@@ -386,7 +394,7 @@ impl Embedder for AutoInitSemanticEmbedder {
     fn embed(
         &self,
         text: &str,
-    ) -> mcp_agent_mail_search_core::error::SearchResult<EmbeddingResult> {
+    ) -> crate::search_error::SearchResult<EmbeddingResult> {
         let ctx = get_two_tier_context();
         let start = std::time::Instant::now();
         if let Ok(vector) = ctx.embed_fast(text) {
@@ -427,7 +435,7 @@ pub struct SemanticBridge {
     /// Batch runner for embedding/index updates.
     runner: Arc<EmbeddingJobRunner>,
     /// Background refresh worker.
-    refresh_worker: Arc<mcp_agent_mail_search_core::IndexRefreshWorker>,
+    refresh_worker: Arc<IndexRefreshWorker>,
     /// Background refresh worker handle.
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -457,7 +465,7 @@ impl SemanticBridge {
             rebuild_on_startup: false,
             max_docs_per_cycle: 256,
         };
-        let refresh_worker = Arc::new(mcp_agent_mail_search_core::IndexRefreshWorker::new(
+        let refresh_worker = Arc::new(IndexRefreshWorker::new(
             worker_cfg,
             runner.clone(),
         ));
@@ -3948,7 +3956,7 @@ mod tests {
         fn embed(
             &self,
             text: &str,
-        ) -> mcp_agent_mail_search_core::error::SearchResult<EmbeddingResult> {
+        ) -> crate::search_error::SearchResult<EmbeddingResult> {
             Ok(EmbeddingResult::new(
                 vec![0.42_f32; self.info.dimension],
                 self.info.id.clone(),
@@ -4055,8 +4063,8 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     fn two_tier_test_bridge() -> Arc<TwoTierBridge> {
-        let config = mcp_agent_mail_search_core::TwoTierConfig::default();
-        let index = mcp_agent_mail_search_core::TwoTierIndex::new(&config);
+        let config = TwoTierConfig::default();
+        let index = TwoTierIndex::new(&config);
         let mut metrics = TwoTierMetrics::default();
         metrics.record_index(index.metrics());
         Arc::new(TwoTierBridge {

@@ -33,8 +33,12 @@ pub mod search_candidates;
 pub mod search_canonical;
 pub mod search_consistency;
 pub mod search_diversity;
+pub mod search_engine;
 pub mod search_envelope;
+pub mod search_error;
 pub mod search_filter_compiler;
+pub mod search_fusion;
+pub mod search_index_layout;
 pub mod search_planner;
 pub mod search_recipes;
 pub mod search_response;
@@ -46,6 +50,26 @@ pub mod search_v3;
 pub mod sync;
 #[cfg(feature = "tantivy-engine")]
 pub mod tantivy_schema;
+
+// Semantic/hybrid search modules (feature-gated)
+#[cfg(feature = "hybrid")]
+pub mod search_auto_init;
+#[cfg(feature = "hybrid")]
+pub mod search_embedder;
+#[cfg(feature = "hybrid")]
+pub mod search_embedding_jobs;
+#[cfg(feature = "hybrid")]
+pub mod search_fastembed;
+#[cfg(feature = "hybrid")]
+pub mod search_fs_bridge;
+#[cfg(feature = "hybrid")]
+pub mod search_metrics;
+#[cfg(feature = "hybrid")]
+pub mod search_model2vec;
+#[cfg(feature = "hybrid")]
+pub mod search_two_tier;
+#[cfg(feature = "hybrid")]
+pub mod search_vector_index;
 pub mod timestamps;
 pub mod tracking;
 
