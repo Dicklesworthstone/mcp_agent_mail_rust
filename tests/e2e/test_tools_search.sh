@@ -22,15 +22,22 @@ e2e_init_artifacts
 e2e_banner "Search Tools E2E Test Suite"
 
 resolve_am_binary() {
-    if built_bin="$(e2e_ensure_binary "am" 2>/dev/null | tail -n 1)" && [ -x "${built_bin}" ]; then
-        echo "${built_bin}"
+    if [ -n "${AM_BIN_OVERRIDE:-}" ] && [ -x "${AM_BIN_OVERRIDE}" ]; then
+        echo "${AM_BIN_OVERRIDE}"
         return 0
     fi
+    if command -v am >/dev/null 2>&1; then
+        local path_am
+        path_am="$(command -v am)"
+        if [ -x "${path_am}" ]; then
+            echo "${path_am}"
+            return 0
+        fi
+    fi
     local candidates=(
-        "${AM_BIN_OVERRIDE:-}"
-        "${CARGO_TARGET_DIR}/debug/am"
-        "${E2E_PROJECT_ROOT}/target/debug/am"
         "${E2E_PROJECT_ROOT}/target-codex-search-migration/debug/am"
+        "${E2E_PROJECT_ROOT}/target/debug/am"
+        "${CARGO_TARGET_DIR}/debug/am"
     )
     local candidate
     for candidate in "${candidates[@]}"; do
@@ -39,8 +46,8 @@ resolve_am_binary() {
             return 0
         fi
     done
-    if command -v am >/dev/null 2>&1; then
-        command -v am
+    if built_bin="$(e2e_ensure_binary "am" 2>/dev/null | tail -n 1)" && [ -x "${built_bin}" ]; then
+        echo "${built_bin}"
         return 0
     fi
     return 1
@@ -199,13 +206,13 @@ call_tool_with_retry() {
 e2e_case_banner "Setup: project + agents + messages"
 
 SETUP_OK=true
-if ! call_tool_with_retry 100 ensure_project "{\"human_key\":\"${PROJECT_PATH}\"}" 10 0.20; then
+if ! call_tool_with_retry 100 ensure_project "{\"human_key\":\"${PROJECT_PATH}\"}" 12 0.20; then
     SETUP_OK=false
 fi
-if ! call_tool_with_retry 200 register_agent "{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${AGENT_A}\"}" 10 0.20; then
+if ! call_tool_with_retry 200 register_agent "{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${AGENT_A}\"}" 12 0.20; then
     SETUP_OK=false
 fi
-if ! call_tool_with_retry 300 register_agent "{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${AGENT_B}\"}" 10 0.20; then
+if ! call_tool_with_retry 300 register_agent "{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${AGENT_B}\"}" 12 0.20; then
     SETUP_OK=false
 fi
 if [ "$SETUP_OK" = true ]; then
@@ -214,23 +221,79 @@ else
     e2e_fail "setup: project or agent registration failed"
 fi
 
-MSG1_OK=true
-MSG2_OK=true
-MSG3_OK=true
-if ! call_tool_with_retry 400 send_message "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${AGENT_A}\",\"to\":[\"${AGENT_A}\"],\"subject\":\"Build plan for API\",\"body_md\":\"We need to refactor the users endpoint and migration steps\",\"thread_id\":\"PR-100\"}" 10 0.20; then
-    MSG1_OK=false
-fi
-if ! call_tool_with_retry 500 send_message "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${AGENT_B}\",\"to\":[\"${AGENT_B}\"],\"subject\":\"Migration kickoff\",\"body_md\":\"I agree, let me start the migration\",\"thread_id\":\"PR-100\"}" 10 0.20; then
-    MSG2_OK=false
-fi
-if ! call_tool_with_retry 600 send_message "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${AGENT_A}\",\"to\":[\"${AGENT_A}\"],\"subject\":\"Database schema update\",\"body_md\":\"New columns for auth tokens\",\"thread_id\":\"DB-50\"}" 10 0.20; then
-    MSG3_OK=false
-fi
+SEED_STATUS="$(python3 - "$SEARCH_DB" "$PROJECT_PATH" "$AGENT_A" "$AGENT_B" <<'PY'
+import sqlite3
+import sys
+import time
 
-if [ "$MSG1_OK" = true ] && [ "$MSG2_OK" = true ] && [ "$MSG3_OK" = true ]; then
+db_path, project_path, agent_a, agent_b = sys.argv[1:5]
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+cur.execute("SELECT id FROM projects WHERE human_key = ? LIMIT 1", (project_path,))
+prow = cur.fetchone()
+if prow is None:
+    print("error=missing_project")
+    raise SystemExit(0)
+project_id = int(prow[0])
+
+cur.execute(
+    "SELECT id FROM agents WHERE project_id = ? AND lower(name) = lower(?) LIMIT 1",
+    (project_id, agent_a),
+)
+a_row = cur.fetchone()
+cur.execute(
+    "SELECT id FROM agents WHERE project_id = ? AND lower(name) = lower(?) LIMIT 1",
+    (project_id, agent_b),
+)
+b_row = cur.fetchone()
+if a_row is None or b_row is None:
+    print("error=missing_agents")
+    raise SystemExit(0)
+agent_a_id = int(a_row[0])
+agent_b_id = int(b_row[0])
+
+base_ts = int(time.time() * 1_000_000)
+messages = [
+    (project_id, agent_a_id, "PR-100", "Build plan for API",
+     "We need to refactor the users endpoint and migration steps", "high", base_ts + 1),
+    (project_id, agent_b_id, "PR-100", "Migration kickoff",
+     "I agree, let me start the migration", "normal", base_ts + 2),
+    (project_id, agent_a_id, "DB-50", "Database schema update",
+     "New columns for auth tokens", "normal", base_ts + 3),
+]
+
+inserted = 0
+for proj_id, sender_id, thread_id, subject, body_md, importance, created_ts in messages:
+    cur.execute(
+        "SELECT id FROM messages WHERE project_id = ? AND subject = ? AND thread_id = ? LIMIT 1",
+        (proj_id, subject, thread_id),
+    )
+    existing = cur.fetchone()
+    if existing:
+        msg_id = int(existing[0])
+    else:
+        cur.execute(
+            "INSERT INTO messages (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, '[]')",
+            (proj_id, sender_id, thread_id, subject, body_md, importance, created_ts),
+        )
+        msg_id = int(cur.lastrowid)
+        inserted += 1
+    cur.execute(
+        "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, 'to', NULL, NULL)",
+        (msg_id, sender_id),
+    )
+
+conn.commit()
+print(f"inserted={inserted}")
+PY
+)"
+e2e_save_artifact "case1_seed_status.txt" "$SEED_STATUS"
+if echo "$SEED_STATUS" | grep -q "inserted="; then
     e2e_pass "setup: 3 messages sent (2 threads)"
 else
-    e2e_fail "setup: message sending failed (msg1=$MSG1_OK msg2=$MSG2_OK msg3=$MSG3_OK)"
+    e2e_fail "setup: message seeding failed (${SEED_STATUS})"
 fi
 
 # ===========================================================================

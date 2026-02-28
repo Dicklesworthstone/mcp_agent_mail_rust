@@ -32,18 +32,22 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 resolve_am_binary() {
-    if [ "${SEARCH_QUALITY_SKIP_BUILD:-0}" != "1" ]; then
-        local built_bin
-        if built_bin="$(e2e_ensure_binary "am" 2>/dev/null | tail -n 1)" && [ -x "${built_bin}" ]; then
-            echo "${built_bin}"
+    if [ -n "${AM_BIN_OVERRIDE:-}" ] && [ -x "${AM_BIN_OVERRIDE}" ]; then
+        echo "${AM_BIN_OVERRIDE}"
+        return 0
+    fi
+    if command -v am >/dev/null 2>&1; then
+        local path_am
+        path_am="$(command -v am)"
+        if [ -x "${path_am}" ]; then
+            echo "${path_am}"
             return 0
         fi
     fi
     local candidates=(
-        "${AM_BIN_OVERRIDE:-}"
-        "${CARGO_TARGET_DIR}/debug/am"
-        "${E2E_PROJECT_ROOT}/target/debug/am"
         "${E2E_PROJECT_ROOT}/target-codex-search-migration/debug/am"
+        "${E2E_PROJECT_ROOT}/target/debug/am"
+        "${CARGO_TARGET_DIR}/debug/am"
     )
     local candidate
     for candidate in "${candidates[@]}"; do
@@ -52,11 +56,14 @@ resolve_am_binary() {
             return 0
         fi
     done
-    if command -v am >/dev/null 2>&1; then
-        command -v am
-        return 0
+    if [ "${SEARCH_QUALITY_SKIP_BUILD:-0}" != "1" ]; then
+        local built_bin
+        if built_bin="$(e2e_ensure_binary "am" 2>/dev/null | tail -n 1)" && [ -x "${built_bin}" ]; then
+            echo "${built_bin}"
+            return 0
+        fi
     fi
-    e2e_ensure_binary "am" | tail -n 1
+    return 1
 }
 
 AM_BIN="$(resolve_am_binary)"
