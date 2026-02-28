@@ -81,7 +81,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **11-Screen TUI** | Real-time dashboard, message browser, thread view, agent roster, search, reservations, metrics, health, timeline, projects, and contacts |
 | **Robot Mode** | 16 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
-| **Hybrid Search** | FTS5 full-text search with optional semantic search via frankensearch |
+| **Hybrid Search** | Search V3 via frankensearch with lexical, semantic, and hybrid routing |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
 | **Dual-Mode Interface** | MCP server (`mcp-agent-mail`) and operator CLI (`am`) share tools but enforce strict surface separation |
 
@@ -232,7 +232,7 @@ One disciplined hour of AI coding agents often produces 10-20 "human hours" of w
 
 **Resilient to agent death.** Agents die all the time: context windows overflow, sessions crash, memory gets wiped. Any agent can vanish without breaking the system. No ringleader agents, no single points of failure. Semi-persistent identities exist for coordination but don't create hard dependencies.
 
-**Dual persistence.** Human-readable Markdown in Git for auditability; SQLite with FTS5 for sub-millisecond queries, search, and directory lookups. Both stay in sync through the write pipeline.
+**Dual persistence.** Human-readable Markdown in Git for auditability; SQLite for indexing plus Search V3 for fast lexical/semantic retrieval. Both stay in sync through the write pipeline.
 
 **Structured concurrency, no Tokio.** The entire async stack uses [asupersync](https://github.com/Dicklesworthstone/asupersync) with `Cx`-threaded structured concurrency. No orphan tasks, cancel-correct channels, and deterministic testing with virtual time.
 
@@ -720,7 +720,7 @@ The server includes a lightweight, server-rendered web UI for humans at `/mail/`
 | `/mail/{project}` | Project overview with search, agent roster, quick links to reservations and attachments |
 | `/mail/{project}/inbox/{agent}` | Reverse-chronological inbox for one agent with pagination |
 | `/mail/{project}/message/{id}` | Full message detail with metadata, thread context, and attachments |
-| `/mail/{project}/search?q=...` | FTS5-powered search with field filters (`subject:foo`, `body:"multi word"`) |
+| `/mail/{project}/search?q=...` | Search V3-powered query route with field filters (`subject:foo`, `body:"multi word"`) |
 | `/mail/{project}/file_reservations` | Active and historical file reservations |
 | `/mail/{project}/attachments` | Messages with attachments |
 
@@ -825,7 +825,7 @@ mcp_agent_mail_rust/
 ├── Cargo.toml                              # Workspace root (12 member crates)
 ├── crates/
 │   ├── mcp-agent-mail-core/                # Zero-dep: config, models, errors, metrics
-│   ├── mcp-agent-mail-db/                  # SQLite schema, queries, pool, cache, FTS, hybrid search
+│   ├── mcp-agent-mail-db/                  # SQLite schema, queries, pool, cache, Search V3 integration
 │   ├── mcp-agent-mail-storage/             # Git archive, commit coalescer, notification signals
 │   ├── mcp-agent-mail-search-core/         # Pluggable search traits
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
@@ -869,7 +869,7 @@ mcp_agent_mail_rust/
 - **Write-behind cache** with dual-indexed ReadCache and deferred touch batching (30s flush)
 - **Async git commit coalescer** (write-behind queue) to avoid commit storms
 - **i64 microseconds** for all timestamps (no `chrono::NaiveDateTime` in storage layer)
-- **FTS5 full-text search** with sanitized queries and LIKE fallback
+- **Search V3 via frankensearch** with lexical/semantic/hybrid routing and unified diagnostics
 - **Conformance testing** against the Python reference implementation (23 tools, 23+ resources)
 - **Advisory file reservations** with symmetric fnmatch, archive reading, and rename handling
 - **`#![forbid(unsafe_code)]`** across all crates
@@ -886,7 +886,7 @@ mcp_agent_mail_rust/
 | File reservation / advisory locks | Glob patterns, TTL, exclusive/shared, pre-commit guard | Lockfiles (no TTL, no glob) | Build yourself | None |
 | Audit trail | Full Git history of all communication | File timestamps | Depends | Chat logs (if saved) |
 | Cross-repo coordination | Product bus, contact system | Manual | Build yourself | Manual |
-| Search | FTS5 + optional semantic search | `grep` | Build yourself | Limited |
+| Search | Search V3 (lexical + semantic + hybrid) | `grep` | Build yourself | Limited |
 | Operational visibility | 15-screen TUI, robot CLI, metrics | None | None | None |
 | Token efficiency | Messages stored externally, not in context | Files in context | Varies | All in context |
 
@@ -1005,7 +1005,7 @@ The repair command applies safe fixes (stale locks, expired reservations) automa
 | Port 8765 already in use | `am serve-http --port 9000` or stop the existing server |
 | TUI not rendering | Check `TUI_ENABLED=true` and that your terminal supports 256 colors |
 | Empty inbox | Verify recipient names match exactly and messages were sent to that agent |
-| Search returns nothing | Try simpler terms; FTS5 falls back to LIKE for edge cases |
+| Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
 
 ---

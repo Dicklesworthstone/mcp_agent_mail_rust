@@ -832,7 +832,10 @@ impl FileLock {
                     };
                     let jitter_range = base_ms / 2 + 1; // 50% range for ±25%
                     let jitter = thread_jitter_ms(jitter_range);
-                    let sleep_ms = base_ms.saturating_sub(base_ms / 4).saturating_add(jitter).max(10);
+                    let sleep_ms = base_ms
+                        .saturating_sub(base_ms / 4)
+                        .saturating_add(jitter)
+                        .max(10);
                     std::thread::sleep(Duration::from_millis(sleep_ms));
                 }
             }
@@ -2960,9 +2963,14 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
     }
 
     let mut result = HealResult::default();
+    let mut metadata_candidates: Vec<PathBuf> = Vec::new();
 
-    // Walk looking for .lock files
-    fn walk_for_locks(dir: &Path, result: &mut HealResult) -> std::io::Result<()> {
+    // Single recursive walk: track lock files and collect metadata paths.
+    fn walk_once(
+        dir: &Path,
+        result: &mut HealResult,
+        metadata_candidates: &mut Vec<PathBuf>,
+    ) -> std::io::Result<()> {
         if !dir.is_dir() {
             return Ok(());
         }
@@ -2975,7 +2983,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             }
             let path = entry.path();
             if file_type.is_dir() {
-                walk_for_locks(&path, result)?;
+                walk_once(&path, result, metadata_candidates)?;
             } else if file_type.is_file() && path.extension().is_some_and(|e| e == "lock") {
                 result.locks_scanned += 1;
 
@@ -3005,44 +3013,33 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                         }
                     }
                 }
-            }
-        }
-        Ok(())
-    }
-
-    walk_for_locks(root, &mut result)?;
-
-    // Clean orphaned metadata files (no matching lock)
-    fn walk_for_orphaned_meta(dir: &Path, result: &mut HealResult) -> std::io::Result<()> {
-        if !dir.is_dir() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                // Avoid recursing into symlink loops or scanning outside the archive root.
-                continue;
-            }
-            let path = entry.path();
-            if file_type.is_dir() {
-                walk_for_orphaned_meta(&path, result)?;
             } else if file_type.is_file() {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 if name.ends_with(".lock.owner.json") {
-                    let lock_name = &name[..name.len() - ".owner.json".len()];
-                    let lock_candidate = path.parent().unwrap_or(dir).join(lock_name);
-                    if !lock_candidate.exists() {
-                        let _ = fs::remove_file(&path);
-                        result.metadata_removed.push(path.display().to_string());
-                    }
+                    metadata_candidates.push(path);
                 }
             }
         }
         Ok(())
     }
 
-    walk_for_orphaned_meta(root, &mut result)?;
+    walk_once(root, &mut result, &mut metadata_candidates)?;
+
+    // Clean orphaned metadata files (no matching lock) without re-walking.
+    for path in metadata_candidates {
+        if !path.exists() {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let lock_name = &name[..name.len() - ".owner.json".len()];
+        let lock_candidate = parent.join(lock_name);
+        if !lock_candidate.exists() && fs::remove_file(&path).is_ok() {
+            result.metadata_removed.push(path.display().to_string());
+        }
+    }
 
     Ok(result)
 }

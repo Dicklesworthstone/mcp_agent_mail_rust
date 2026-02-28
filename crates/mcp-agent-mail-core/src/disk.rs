@@ -248,16 +248,15 @@ pub fn sample_disk(config: &Config) -> DiskSample {
 /// Returns `(read_bytes, write_bytes)`. On non-Linux platforms, returns `(0, 0)`.
 /// The `write_bytes` field corresponds to the kernel's `write_bytes` counter,
 /// which tracks actual storage writes (post page-cache), giving a real signal
-/// under SQLite + git archive workloads.
+/// under `SQLite` + git archive workloads.
 ///
 /// See: <https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/17>
 #[must_use]
 pub fn read_proc_io_bytes() -> (u64, u64) {
     #[cfg(target_os = "linux")]
     {
-        let content = match std::fs::read_to_string("/proc/self/io") {
-            Ok(c) => c,
-            Err(_) => return (0, 0),
+        let Ok(content) = std::fs::read_to_string("/proc/self/io") else {
+            return (0, 0);
         };
 
         let mut read_bytes = 0u64;
