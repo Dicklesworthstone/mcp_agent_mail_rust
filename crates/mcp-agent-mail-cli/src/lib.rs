@@ -1344,7 +1344,7 @@ pub enum MailCommand {
         /// Project key.
         #[arg(long = "project", short = 'p')]
         project_key: String,
-        /// Search query (FTS5 syntax).
+        /// Search query string.
         query: String,
         /// Max results.
         #[arg(long, short = 'l', default_value_t = 20)]
@@ -2675,18 +2675,6 @@ struct PreflightBannerStats {
     contact_links: u64,
 }
 
-fn query_table_count(conn: &mcp_agent_mail_db::DbConn, table: &str) -> u64 {
-    let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
-    conn.query_sync(&sql, &[])
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<i64>("cnt").ok())
-        })
-        .and_then(|count| u64::try_from(count).ok())
-        .unwrap_or(0)
-}
-
 fn query_preflight_banner_stats_batched(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> Option<PreflightBannerStats> {
@@ -2712,8 +2700,32 @@ fn query_preflight_banner_stats_batched(
     })
 }
 
+fn query_table_count(conn: &mcp_agent_mail_db::DbConn, table: &str) -> u64 {
+    let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
+    conn.query_sync(&sql, &[])
+        .ok()
+        .and_then(|rows| {
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("cnt").ok())
+        })
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0)
+}
+
 fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
-    let Ok(conn) = open_db_sync_with_database_url(database_url) else {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let Ok(sqlite_path) = cfg.sqlite_path() else {
+        return PreflightBannerStats::default();
+    };
+    if sqlite_path != ":memory:" && !Path::new(&sqlite_path).exists() {
+        return PreflightBannerStats::default();
+    }
+    // Keep startup stats on FrankenSQLite while avoiding schema/migration work.
+    // We only need read-only counts for banner rendering.
+    let Ok((conn, _opened_path)) = open_sqlite_with_fallback(&sqlite_path) else {
         return PreflightBannerStats::default();
     };
     if let Some(stats) = query_preflight_banner_stats_batched(&conn) {
@@ -10155,34 +10167,37 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
-            let rows = outcome_to_result(
-                mcp_agent_mail_db::queries::search_messages(
+            let mut search_query =
+                mcp_agent_mail_db::search_planner::SearchQuery::messages(&query, pid);
+            search_query.limit = Some(limit.max(0) as usize);
+
+            let response = outcome_to_result(
+                mcp_agent_mail_db::search_service::execute_search_simple(
                     &cx,
                     &ctx.pool,
-                    pid,
-                    &query,
-                    limit.max(0) as usize,
+                    &search_query,
                 )
                 .await,
             )?;
 
-            if rows.is_empty() {
+            if response.results.is_empty() {
                 output::emit_empty(fmt, "No results.");
                 return Ok(());
             }
 
             // Build serializable data for JSON/TOON
-            let data: Vec<serde_json::Value> = rows
+            let data: Vec<serde_json::Value> = response
+                .results
                 .iter()
                 .map(|r| {
                     serde_json::json!({
                         "id": r.id,
-                        "subject": r.subject,
+                        "subject": r.title,
                         "importance": r.importance,
-                        "ack_required": r.ack_required != 0,
-                        "created_ts": mcp_agent_mail_db::micros_to_iso(r.created_ts),
+                        "ack_required": r.ack_required.unwrap_or(false),
+                        "created_ts": r.created_ts.map(mcp_agent_mail_db::micros_to_iso),
                         "thread_id": r.thread_id,
-                        "from": r.from,
+                        "from": r.from_agent,
                     })
                 })
                 .collect();
@@ -10190,13 +10205,15 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             output::emit_output(&data, fmt, || {
                 let mut table =
                     output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
-                for r in &rows {
+                for r in &response.results {
                     table.add_row(vec![
                         r.id.to_string(),
-                        r.from.clone(),
-                        truncate_str(&r.subject, 50),
-                        r.importance.clone(),
-                        context::format_ts_short(r.created_ts),
+                        r.from_agent.clone().unwrap_or_default(),
+                        truncate_str(&r.title, 50),
+                        r.importance.clone().unwrap_or_default(),
+                        r.created_ts
+                            .map(context::format_ts_short)
+                            .unwrap_or_default(),
                     ]);
                 }
                 table.render();
@@ -24876,14 +24893,6 @@ async fn handle_products_with(
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let Some(sanitized) = mcp_agent_mail_db::queries::sanitize_fts_query(&query) else {
-                output::emit_empty(
-                    fmt,
-                    &format!("Query '{query}' cannot produce search results."),
-                );
-                return Ok(());
-            };
-
             let prod = get_product_by_key(cx, pool, product_key.trim())
                 .await?
                 .ok_or_else(|| {
@@ -24891,113 +24900,29 @@ async fn handle_products_with(
                     CliError::ExitCode(2)
                 })?;
             let prod_id = prod.id.unwrap_or(0);
-            let projects =
-                match mcp_agent_mail_db::queries::list_product_projects(cx, pool, prod_id).await {
-                    asupersync::Outcome::Ok(v) => v,
-                    asupersync::Outcome::Err(e) => {
-                        return Err(CliError::Other(format!("project list failed: {e}")));
-                    }
-                    asupersync::Outcome::Cancelled(_) => {
-                        return Err(CliError::Other("request cancelled".to_string()));
-                    }
-                    asupersync::Outcome::Panicked(p) => {
-                        return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                    }
-                };
-            let project_ids = projects.iter().filter_map(|p| p.id).collect::<Vec<_>>();
-            if project_ids.is_empty() {
-                output::emit_empty(fmt, "No results.");
-                return Ok(());
-            }
+            let mut search_query =
+                mcp_agent_mail_db::search_planner::SearchQuery::product_messages(&query, prod_id);
+            search_query.limit = Some(limit.max(0) as usize);
 
-            use mcp_agent_mail_db::sqlmodel::Value;
-            let conn = match pool.acquire(cx).await {
-                asupersync::Outcome::Ok(c) => c,
-                asupersync::Outcome::Err(e) => {
-                    return Err(CliError::Other(format!("db acquire failed: {e}")));
-                }
-                asupersync::Outcome::Cancelled(_) => {
-                    return Err(CliError::Other("request cancelled".to_string()));
-                }
-                asupersync::Outcome::Panicked(p) => {
-                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                }
-            };
+            let response = outcome_to_result(
+                mcp_agent_mail_db::search_service::execute_search_simple(cx, pool, &search_query)
+                    .await,
+            )?;
+            let out: Vec<serde_json::Value> = response
+                .results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "project_id": r.project_id.unwrap_or(0),
+                        "id": r.id,
+                        "subject": r.title,
+                        "from": r.from_agent.clone().unwrap_or_default(),
+                        "created_ts": r.created_ts.map(mcp_agent_mail_db::micros_to_iso),
+                    })
+                })
+                .collect();
 
-            let limit_i64 = limit.max(0);
-            let placeholders = std::iter::repeat_n("?", project_ids.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            // Try FTS query first, fall back to LIKE if FTS table doesn't exist
-            let fts_sql = format!(
-                "SELECT m.id, m.subject, m.created_ts, a.name AS sender_name, m.project_id \
-                 FROM fts_messages \
-                 JOIN messages m ON m.id = fts_messages.message_id \
-                 JOIN agents a ON a.id = m.sender_id \
-                 WHERE m.project_id IN ({placeholders}) AND fts_messages MATCH ? \
-                 ORDER BY bm25(fts_messages) ASC, m.id ASC \
-                 LIMIT ?"
-            );
-            let mut fts_params: Vec<Value> =
-                project_ids.iter().copied().map(Value::BigInt).collect();
-            fts_params.push(Value::Text(sanitized.clone()));
-            fts_params.push(Value::BigInt(limit_i64));
-
-            let rows = match conn.query_sync(&fts_sql, &fts_params) {
-                Ok(r) => r,
-                Err(_) => {
-                    // FTS query failed (likely fts_messages table doesn't exist), try LIKE fallback
-                    let terms = mcp_agent_mail_db::queries::extract_like_terms(&query, 5);
-                    if terms.is_empty() {
-                        Vec::new()
-                    } else {
-                        // Build LIKE query
-                        let mut like_parts = Vec::new();
-                        let mut like_params: Vec<Value> =
-                            project_ids.iter().copied().map(Value::BigInt).collect();
-                        for term in &terms {
-                            let escaped =
-                                format!("%{}%", mcp_agent_mail_db::queries::like_escape(term));
-                            like_parts.push(
-                                "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')"
-                                    .to_string(),
-                            );
-                            like_params.push(Value::Text(escaped.clone()));
-                            like_params.push(Value::Text(escaped));
-                        }
-                        like_params.push(Value::BigInt(limit_i64));
-                        let like_clause = like_parts.join(" AND ");
-                        let like_sql = format!(
-                            "SELECT m.id, m.subject, m.created_ts, a.name AS sender_name, m.project_id \
-                             FROM messages m \
-                             JOIN agents a ON a.id = m.sender_id \
-                             WHERE m.project_id IN ({placeholders}) AND {like_clause} \
-                             ORDER BY m.id ASC \
-                             LIMIT ?"
-                        );
-                        conn.query_sync(&like_sql, &like_params).unwrap_or_default()
-                    }
-                }
-            };
-
-            let mut out = Vec::new();
-            for r in rows {
-                let id: i64 = r.get_named("id").unwrap_or(0);
-                let subject: String = r.get_named("subject").unwrap_or_default();
-                let from: String = r.get_named("sender_name").unwrap_or_default();
-                let project_id: i64 = r.get_named("project_id").unwrap_or(0);
-                let created_ts: i64 = r.get_named("created_ts").unwrap_or(0);
-                out.push(serde_json::json!({
-                    "project_id": project_id,
-                    "id": id,
-                    "subject": subject,
-                    "from": from,
-                    "created_ts": mcp_agent_mail_db::micros_to_iso(created_ts),
-                }));
-            }
-
-            if out.is_empty() {
+            if response.results.is_empty() {
                 output::emit_empty(fmt, "No results.");
                 return Ok(());
             }
