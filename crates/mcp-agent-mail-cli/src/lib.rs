@@ -9514,6 +9514,109 @@ fn handle_doctor_check_with(
         }
     }
 
+    // Service management checks (Step 11 of PR 2)
+    #[cfg(target_os = "macos")]
+    {
+        // Check: Service registered
+        let plist_path = {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            home.join("Library")
+                .join("LaunchAgents")
+                .join("com.mcp-agent-mail.server.plist")
+        };
+        let service_registered = plist_path.exists();
+        checks.push(serde_json::json!({
+            "check": "service_registered",
+            "status": if service_registered { "ok" } else { "warn" },
+            "detail": if service_registered {
+                format!("LaunchAgent registered at {}", plist_path.display())
+            } else {
+                "Service not registered. Run 'am service install' to register".to_string()
+            },
+        }));
+
+        // Check: Service running
+        if service_registered {
+            let backend = service::LaunchAgentBackend;
+            match backend.status() {
+                Ok(status) => {
+                    let is_running = status.status == "running";
+                    checks.push(serde_json::json!({
+                        "check": "service_running",
+                        "status": if is_running { "ok" } else { "warn" },
+                        "detail": if is_running {
+                            format!("Service is running (v{})", status.version)
+                        } else {
+                            format!("Service is {}", status.status)
+                        },
+                    }));
+
+                    // Check: Service health (only if running)
+                    if is_running {
+                        let health_result = service::perform_health_check("127.0.0.1", 8765, "/mcp/", 5);
+                        match health_result {
+                            Ok(latency) => {
+                                checks.push(serde_json::json!({
+                                    "check": "service_health",
+                                    "status": "ok",
+                                    "detail": format!("Service healthy (latency: {}ms)", latency),
+                                }));
+                            }
+                            Err(e) => {
+                                checks.push(serde_json::json!({
+                                    "check": "service_health",
+                                    "status": "warn",
+                                    "detail": format!("Health check failed: {}", e),
+                                }));
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    checks.push(serde_json::json!({
+                        "check": "service_running",
+                        "status": "warn",
+                        "detail": "Cannot determine service status",
+                    }));
+                }
+            }
+        }
+
+        // Check: Env file permissions
+        let env_file = mcp_agent_mail_core::paths::env_file_path();
+        if env_file.exists() {
+            match std::fs::metadata(&env_file) {
+                Ok(metadata) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = metadata.permissions().mode();
+                        let is_secure = (mode & 0o077) == 0; // Check if readable only by owner
+                        checks.push(serde_json::json!({
+                            "check": "env_file_permissions",
+                            "status": if is_secure { "ok" } else { "fail" },
+                            "detail": if is_secure {
+                                format!("Env file has secure permissions ({})", format!("{:o}", mode & 0o777))
+                            } else {
+                                format!("Env file has insecure permissions ({}). Run 'chmod 600 {}'",
+                                    format!("{:o}", mode & 0o777),
+                                    env_file.display()
+                                )
+                            },
+                        }));
+                    }
+                }
+                Err(_) => {
+                    checks.push(serde_json::json!({
+                        "check": "env_file_permissions",
+                        "status": "warn",
+                        "detail": "Cannot read env file metadata",
+                    }));
+                }
+            }
+        }
+    }
+
     // Output
     let all_ok = checks.iter().all(|c| c["status"] != "fail");
     let fmt = output::CliOutputFormat::resolve(format, json);

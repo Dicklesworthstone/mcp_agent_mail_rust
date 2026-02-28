@@ -513,7 +513,7 @@ pub fn install_service(dry_run: bool, health_timeout: u64) -> crate::CliResult<(
 }
 
 /// Perform health check on service endpoint with exponential backoff
-fn perform_health_check(host: &str, port: u16, path: &str, timeout_secs: u64) -> Result<u64, String> {
+pub fn perform_health_check(host: &str, port: u16, path: &str, timeout_secs: u64) -> Result<u64, String> {
     let url = format!("http://{}:{}{}", host, port, path);
     let start = std::time::Instant::now();
     let deadline = start + std::time::Duration::from_secs(timeout_secs);
