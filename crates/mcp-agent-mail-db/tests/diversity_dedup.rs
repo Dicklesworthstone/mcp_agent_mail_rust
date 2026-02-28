@@ -32,9 +32,9 @@ use mcp_agent_mail_db::search_planner::SearchQuery;
 use mcp_agent_mail_db::search_service::execute_search_simple;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig, queries};
 
-use mcp_agent_mail_search_core::diversity::{DiversityConfig, DiversityMeta, diversify};
-use mcp_agent_mail_search_core::fusion::{FusedHit, FusionExplain, SourceContribution};
-use mcp_agent_mail_search_core::hybrid_candidates::CandidateSource;
+use mcp_agent_mail_db::search_diversity::{DiversityConfig, DiversityMeta, diversify};
+use mcp_agent_mail_db::search_fusion::{FusedHit, FusionExplain, SourceContribution};
+use mcp_agent_mail_db::search_candidates::CandidateSource;
 
 // ────────────────────────────────────────────────────────────────────
 // Helpers

@@ -431,6 +431,21 @@ pub struct DataGeneration {
     pub request_gen: u64,
 }
 
+impl DataGeneration {
+    /// Sentinel value that is guaranteed to differ from any real generation
+    /// snapshot (which starts at zero and only increments). Use this as the
+    /// initial `last_data_gen` so the first tick always evaluates as dirty.
+    #[must_use]
+    pub const fn stale() -> Self {
+        Self {
+            event_total_pushed: u64::MAX,
+            console_log_seq: u64::MAX,
+            db_stats_gen: u64::MAX,
+            request_gen: u64::MAX,
+        }
+    }
+}
+
 /// Bit-flags indicating which data channels have changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1178,7 +1193,10 @@ mod tests {
             request_gen: 99,
         };
         let flags = dirty_since(&data_gen, &data_gen);
-        assert!(!flags.any(), "identical generations must produce zero dirty flags");
+        assert!(
+            !flags.any(),
+            "identical generations must produce zero dirty flags"
+        );
         assert!(!flags.events);
         assert!(!flags.console_log);
         assert!(!flags.db_stats);
@@ -1251,9 +1269,9 @@ mod tests {
         };
         let current = DataGeneration {
             event_total_pushed: 15,
-            console_log_seq: 5,  // unchanged
+            console_log_seq: 5, // unchanged
             db_stats_gen: 3,
-            request_gen: 100,    // unchanged
+            request_gen: 100, // unchanged
         };
         let flags = dirty_since(&prev, &current);
         assert!(flags.events);

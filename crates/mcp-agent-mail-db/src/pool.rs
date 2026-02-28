@@ -15,7 +15,7 @@ use mcp_agent_mail_core::{
 };
 use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -619,54 +619,153 @@ impl DbPool {
             return Ok(Vec::new());
         }
 
+        // Keep consistency sampling on FrankenSQLite and avoid JOIN-heavy scans:
+        // 1) fetch recent envelopes
+        // 2) resolve slugs/names via batched point lookups
         let conn = open_sqlite_file_with_lock_retry(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
-
-        // Query recent messages joined with projects and agents to get
-        // the slug, sender name, subject, and created timestamp.
-        let sql = "\
-            SELECT m.id, p.slug, a.name AS sender_name, m.subject, m.created_ts \
-            FROM messages m \
-            JOIN projects p ON m.project_id = p.id \
-            JOIN agents a ON m.sender_id = a.id \
-            ORDER BY m.id DESC \
-            LIMIT ?";
-
-        let rows = conn
-            .query_sync(sql, &[sqlmodel_core::Value::BigInt(limit)])
+        // This two-phase strategy is materially faster than a three-way JOIN on
+        // large mailboxes and reduces startup probe lock contention.
+        let message_rows = conn
+            .query_sync(
+                "SELECT id, project_id, sender_id, subject, created_ts \
+                 FROM messages \
+                 ORDER BY id DESC \
+                 LIMIT ?",
+                &[sqlmodel_core::Value::BigInt(limit)],
+            )
             .map_err(|e| DbError::Sqlite(format!("consistency probe query: {e}")))?;
 
-        let mut refs = Vec::with_capacity(rows.len());
-        for row in &rows {
+        if message_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        #[derive(Clone)]
+        struct SampledMessage {
+            id: i64,
+            project_id: i64,
+            sender_id: i64,
+            subject: String,
+            created_ts_iso: String,
+        }
+
+        let mut sampled: Vec<SampledMessage> = Vec::with_capacity(message_rows.len());
+        let mut project_ids: Vec<i64> = Vec::new();
+        let mut sender_ids: Vec<i64> = Vec::new();
+        let mut seen_projects: HashSet<i64> = HashSet::new();
+        let mut seen_senders: HashSet<i64> = HashSet::new();
+
+        for row in &message_rows {
             let id = match row.get_by_name("id") {
                 Some(sqlmodel_core::Value::BigInt(n)) => *n,
                 Some(sqlmodel_core::Value::Int(n)) => i64::from(*n),
                 _ => continue,
             };
-            let slug = match row.get_by_name("slug") {
-                Some(sqlmodel_core::Value::Text(s)) => s.clone(),
+            let project_id = match row.get_by_name("project_id") {
+                Some(sqlmodel_core::Value::BigInt(n)) => *n,
+                Some(sqlmodel_core::Value::Int(n)) => i64::from(*n),
                 _ => continue,
             };
-            let sender = match row.get_by_name("sender_name") {
-                Some(sqlmodel_core::Value::Text(s)) => s.clone(),
+            let sender_id = match row.get_by_name("sender_id") {
+                Some(sqlmodel_core::Value::BigInt(n)) => *n,
+                Some(sqlmodel_core::Value::Int(n)) => i64::from(*n),
                 _ => continue,
             };
             let subject = match row.get_by_name("subject") {
                 Some(sqlmodel_core::Value::Text(s)) => s.clone(),
                 _ => continue,
             };
-            let created_ts = match row.get_by_name("created_ts") {
+            let created_ts_iso = match row.get_by_name("created_ts") {
                 Some(sqlmodel_core::Value::BigInt(us)) => crate::micros_to_iso(*us),
                 Some(sqlmodel_core::Value::Text(s)) => s.clone(),
                 _ => continue,
             };
 
-            refs.push(ConsistencyMessageRef {
-                project_slug: slug,
-                message_id: id,
-                sender_name: sender,
+            if seen_projects.insert(project_id) {
+                project_ids.push(project_id);
+            }
+            if seen_senders.insert(sender_id) {
+                sender_ids.push(sender_id);
+            }
+            sampled.push(SampledMessage {
+                id,
+                project_id,
+                sender_id,
                 subject,
-                created_ts_iso: created_ts,
+                created_ts_iso,
+            });
+        }
+
+        if sampled.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut project_slugs_by_id: HashMap<i64, String> = HashMap::new();
+        if !project_ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", project_ids.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!("SELECT id, slug FROM projects WHERE id IN ({placeholders})");
+            let params = project_ids
+                .iter()
+                .copied()
+                .map(sqlmodel_core::Value::BigInt)
+                .collect::<Vec<_>>();
+            let rows = conn
+                .query_sync(&sql, &params)
+                .map_err(|e| DbError::Sqlite(format!("consistency probe project lookup: {e}")))?;
+            for row in &rows {
+                let id = match row.get_by_name("id") {
+                    Some(sqlmodel_core::Value::BigInt(n)) => *n,
+                    Some(sqlmodel_core::Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                let slug = match row.get_by_name("slug") {
+                    Some(sqlmodel_core::Value::Text(s)) => s.clone(),
+                    _ => continue,
+                };
+                project_slugs_by_id.insert(id, slug);
+            }
+        }
+
+        let mut sender_names_by_id: HashMap<i64, String> = HashMap::new();
+        if !sender_ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", sender_ids.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!("SELECT id, name FROM agents WHERE id IN ({placeholders})");
+            let params = sender_ids
+                .iter()
+                .copied()
+                .map(sqlmodel_core::Value::BigInt)
+                .collect::<Vec<_>>();
+            let rows = conn
+                .query_sync(&sql, &params)
+                .map_err(|e| DbError::Sqlite(format!("consistency probe agent lookup: {e}")))?;
+            for row in &rows {
+                let id = match row.get_by_name("id") {
+                    Some(sqlmodel_core::Value::BigInt(n)) => *n,
+                    Some(sqlmodel_core::Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                let name = match row.get_by_name("name") {
+                    Some(sqlmodel_core::Value::Text(s)) => s.clone(),
+                    _ => continue,
+                };
+                sender_names_by_id.insert(id, name);
+            }
+        }
+
+        let mut refs = Vec::with_capacity(sampled.len());
+        for message in sampled {
+            let Some(project_slug) = project_slugs_by_id.get(&message.project_id) else {
+                continue;
+            };
+            let Some(sender_name) = sender_names_by_id.get(&message.sender_id) else {
+                continue;
+            };
+            refs.push(ConsistencyMessageRef {
+                project_slug: project_slug.clone(),
+                message_id: message.id,
+                sender_name: sender_name.clone(),
+                subject: message.subject,
+                created_ts_iso: message.created_ts_iso,
             });
         }
 
@@ -826,6 +925,22 @@ async fn run_sqlite_init_once(
     // caused post-crash rowid/index mismatch failures.
     if let Err(err) = schema::enforce_runtime_fts_cleanup(&mig_conn) {
         return Outcome::Err(err);
+    }
+
+    // Switch to WAL journal mode AFTER migrations complete.
+    //
+    // Migrations run in DELETE (rollback) mode for safety, but the runtime
+    // pool connections assume WAL mode (e.g. `wal_autocheckpoint` PRAGMAs).
+    // If we leave the DB in DELETE mode, concurrent pool connections applying
+    // WAL-specific PRAGMAs can corrupt a freshly created database.
+    // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/13
+    if let Err(err) = mig_conn.execute_raw("PRAGMA journal_mode = WAL;") {
+        tracing::warn!(
+            path = %sqlite_path,
+            error = %err,
+            "failed to switch journal_mode to WAL after init; pool connections may fail"
+        );
+        // Non-fatal: pool connections will attempt WAL mode themselves.
     }
 
     drop(mig_conn);

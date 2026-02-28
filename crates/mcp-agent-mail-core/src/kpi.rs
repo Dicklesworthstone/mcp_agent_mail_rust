@@ -984,7 +984,7 @@ fn check_threshold(
 
     // Map ratio [0.5, 2.0] to score [0.0, 1.0]
     let score = ((ratio - 0.5) / 1.5).clamp(0.0, 1.0);
-    
+
     let severity = if ratio >= 2.0 {
         AnomalySeverity::Critical
     } else if ratio >= 1.0 {
@@ -1677,6 +1677,8 @@ mod tests {
                 requests_2xx: http_requests,
                 requests_4xx: 0,
                 requests_5xx: 0,
+                rate_limit_checked_total: 0,
+                rate_limit_rejected_total: 0,
                 latency_us: make_histogram(500, 2000, 5000),
             },
             tools: ToolsMetricsSnapshot {
@@ -1742,6 +1744,8 @@ mod tests {
                 memory_pressure_level: 0,
                 memory_last_sample_us: 0,
                 memory_sample_errors_total: 0,
+                disk_io_write_bytes: 0,
+                disk_io_read_bytes: 0,
                 tui_spin_watchdog_trips_total: 0,
                 tui_spin_watchdog_last_cpu_pct_x100: 0,
                 tui_spin_watchdog_last_trip_us: 0,

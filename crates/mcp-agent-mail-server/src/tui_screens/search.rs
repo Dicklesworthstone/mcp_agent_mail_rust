@@ -23,15 +23,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use asupersync::Outcome;
+use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
     DocKind, Importance, RankingMode, RecoverySuggestion, SearchQuery, ZeroResultGuidance,
-    plan_search,
 };
 use mcp_agent_mail_db::search_recipes::{
     MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
     list_recent_history, list_recipes, touch_recipe,
 };
+use mcp_agent_mail_db::search_service::SearchOptions;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 use mcp_agent_mail_db::{DbConn, QueryAssistance, parse_query_assistance};
@@ -294,10 +296,10 @@ enum SortDirection {
     Relevance,
 }
 
-/// Field scope for limiting FTS search to subject, body, or both.
+/// Field scope for limiting lexical search to subject, body, or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum FieldScope {
-    /// Search both subject and body (default FTS behavior).
+    /// Search both subject and body (default behavior).
     #[default]
     SubjectAndBody,
     /// Search subject field only.
@@ -331,7 +333,7 @@ impl FieldScope {
         }
     }
 
-    /// Apply field scope to a query string for FTS5 column filtering.
+    /// Apply field scope to a query string for parser-recognized field filtering.
     /// Returns the query wrapped with column prefix for SubjectOnly/BodyOnly.
     fn apply_to_query(self, query: &str) -> String {
         if query.is_empty() {
@@ -385,7 +387,7 @@ enum SearchModeFilter {
     /// Engine picks the best mode based on query characteristics.
     #[default]
     Auto,
-    /// Full-text lexical search (FTS5/Tantivy BM25).
+    /// Lexical full-text retrieval.
     Lexical,
     /// Vector similarity search (embeddings).
     Semantic,
@@ -418,6 +420,15 @@ impl SearchModeFilter {
             Self::Lexical => Self::Auto,
             Self::Semantic => Self::Lexical,
             Self::Hybrid => Self::Semantic,
+        }
+    }
+
+    const fn search_engine(self) -> SearchEngine {
+        match self {
+            Self::Auto => SearchEngine::Auto,
+            Self::Lexical => SearchEngine::Lexical,
+            Self::Semantic => SearchEngine::Semantic,
+            Self::Hybrid => SearchEngine::Hybrid,
         }
     }
 }
@@ -511,7 +522,7 @@ fn explain_facet_value<'a>(
 
 fn derive_tui_degraded_diagnostics(
     explain: Option<&mcp_agent_mail_db::search_planner::QueryExplain>,
-    selected_mode: SearchModeFilter,
+    _selected_mode: SearchModeFilter,
 ) -> Option<SearchDegradedDiagnostics> {
     let mut diagnostics = SearchDegradedDiagnostics {
         degraded: false,
@@ -522,31 +533,7 @@ fn derive_tui_degraded_diagnostics(
         remediation_hint: None,
     };
 
-    // Current TUI path uses planner SQL for deterministic sync execution.
-    // Non-auto mode selection degrades to lexical behavior and must be visible.
-    if !matches!(
-        selected_mode,
-        SearchModeFilter::Auto | SearchModeFilter::Lexical
-    ) {
-        diagnostics.degraded = true;
-        diagnostics.fallback_mode = Some("mode_degraded_to_lexical".to_string());
-        diagnostics.remediation_hint = Some(
-            "Semantic/Hybrid mode selection is currently degraded to lexical in this TUI path."
-                .to_string(),
-        );
-    }
-
     if let Some(explain) = explain {
-        if explain.used_like_fallback || explain.method.eq_ignore_ascii_case("like_fallback") {
-            diagnostics.degraded = true;
-            diagnostics
-                .fallback_mode
-                .get_or_insert_with(|| "like_fallback".to_string());
-            diagnostics.remediation_hint.get_or_insert_with(|| {
-                "FTS syntax fallback active; simplify operators or use quoted phrases.".to_string()
-            });
-        }
-
         if let Some(outcome) = explain_facet_value(explain, "rerank_outcome") {
             if let Some(tier) = outcome.strip_prefix("skipped_by_budget_governor_") {
                 diagnostics.degraded = true;
@@ -1220,7 +1207,7 @@ impl SearchCockpitScreen {
             ui_phase: 0,
             rendered_markdown_cache: RefCell::new(HashMap::new()),
             rendered_detail_cache: RefCell::new(HashMap::new()),
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 
@@ -1520,7 +1507,7 @@ impl SearchCockpitScreen {
         }
     }
 
-    /// Run a search for a single doc kind using sync queries.
+    /// Run a search for a single doc kind.
     fn run_kind_search(&mut self, conn: &DbConn, kind: DocKind, raw: &str) -> Vec<ResultEntry> {
         match kind {
             DocKind::Message | DocKind::Thread => self.search_messages(conn, raw),
@@ -1529,7 +1516,7 @@ impl SearchCockpitScreen {
         }
     }
 
-    /// Search messages using the global planner for non-empty queries.
+    /// Search messages via the unified search service for non-empty queries.
     fn search_messages(&mut self, conn: &DbConn, raw: &str) -> Vec<ResultEntry> {
         if raw.is_empty() {
             return self.search_messages_recent(conn);
@@ -1560,16 +1547,12 @@ impl SearchCockpitScreen {
             query.thread_id = Some(tid.clone());
         }
 
-        let plan = plan_search(&query);
-        self.last_diagnostics =
-            derive_tui_degraded_diagnostics(Some(&plan.explain()), self.search_mode);
-        if plan.sql.is_empty() {
-            return Vec::new();
-        }
-
-        let params: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
-        match query_message_rows(conn, &plan.sql, &params, &self.highlight_terms) {
-            Ok(results) => results,
+        match run_unified_search(&query, self.search_mode) {
+            Ok(resp) => {
+                self.last_diagnostics =
+                    derive_tui_degraded_diagnostics(resp.explain.as_ref(), self.search_mode);
+                map_unified_results(resp.results, &self.highlight_terms)
+            }
             Err(e) => {
                 self.last_error = Some(format!("Search failed: {e}"));
                 Vec::new()
@@ -1640,12 +1623,10 @@ impl SearchCockpitScreen {
             limit: Some(MAX_RESULTS),
             ..Default::default()
         };
-        let plan = plan_search(&query);
-        if plan.sql.is_empty() {
-            return Vec::new();
+        match run_unified_search(&query, SearchModeFilter::Auto) {
+            Ok(resp) => map_unified_results(resp.results, &[]),
+            Err(_) => Vec::new(),
         }
-        let params: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
-        query_agent_rows(conn, &plan.sql, &params)
     }
 
     /// Search projects.
@@ -1662,12 +1643,10 @@ impl SearchCockpitScreen {
             limit: Some(MAX_RESULTS),
             ..Default::default()
         };
-        let plan = plan_search(&query);
-        if plan.sql.is_empty() {
-            return Vec::new();
+        match run_unified_search(&query, SearchModeFilter::Auto) {
+            Ok(resp) => map_unified_results(resp.results, &[]),
+            Err(_) => Vec::new(),
         }
-        let params: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
-        query_project_rows(conn, &plan.sql, &params)
     }
 
     /// Toggle the active facet's value.
@@ -1981,7 +1960,7 @@ fn validate_query_syntax(raw: &str) -> Option<String> {
         return None;
     }
 
-    // Simple, deterministic validation: avoid FTS5 parse failures while typing.
+    // Simple deterministic validation to avoid obviously malformed typed queries.
     let quote_count = trimmed.chars().filter(|c| *c == '"').count();
     if quote_count % 2 == 1 {
         return Some("Unbalanced quotes: close your \"phrase\"".to_string());
@@ -2409,7 +2388,8 @@ impl MailScreen for SearchCockpitScreen {
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         // ── Dirty-state gated data ingestion ────────────────────────
         let current_gen = state.data_generation();
-        let _dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+        // Search is purely user-driven (debounce-gated), so we track
+        // the generation for baseline continuity but do not gate on it.
 
         self.ui_phase = (tick_count % 16) as u8;
         if self.search_dirty {
@@ -2819,11 +2799,172 @@ impl MailScreen for SearchCockpitScreen {
 // DB query helpers
 // ──────────────────────────────────────────────────────────────────────
 
-fn plan_param_to_value(param: &mcp_agent_mail_db::search_planner::PlanParam) -> Value {
-    match param {
-        mcp_agent_mail_db::search_planner::PlanParam::Int(v) => Value::BigInt(*v),
-        mcp_agent_mail_db::search_planner::PlanParam::Text(s) => Value::Text(s.clone()),
-        mcp_agent_mail_db::search_planner::PlanParam::Float(f) => Value::Double(*f),
+fn run_unified_search(
+    query: &SearchQuery,
+    mode: SearchModeFilter,
+) -> Result<mcp_agent_mail_db::search_planner::SearchResponse, String> {
+    let pool_cfg = DbPoolConfig::from_env();
+    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+        .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| format!("failed to initialize async runtime: {e}"))?;
+    let cx = asupersync::Cx::for_request();
+    let options = SearchOptions {
+        scope_ctx: None,
+        redaction_policy: None,
+        track_telemetry: true,
+        search_engine: Some(mode.search_engine()),
+    };
+    match runtime.block_on(async {
+        mcp_agent_mail_db::search_service::execute_search(&cx, &pool, query, &options).await
+    }) {
+        Outcome::Ok(scoped) => Ok(mcp_agent_mail_db::search_planner::SearchResponse {
+            results: scoped.results.into_iter().map(|row| row.result).collect(),
+            next_cursor: scoped.next_cursor,
+            explain: scoped.explain,
+            assistance: scoped.assistance,
+            guidance: scoped.guidance,
+            audit: Vec::new(),
+        }),
+        Outcome::Err(e) => Err(e.to_string()),
+        Outcome::Cancelled(_) => Err("request cancelled".to_string()),
+        Outcome::Panicked(p) => Err(format!("request panicked: {p}")),
+    }
+}
+
+fn map_unified_results(
+    results: Vec<mcp_agent_mail_db::search_planner::SearchResult>,
+    highlight_terms: &[QueryTerm],
+) -> Vec<ResultEntry> {
+    results
+        .into_iter()
+        .map(|result| map_unified_result(result, highlight_terms))
+        .collect()
+}
+
+fn map_unified_result(
+    result: mcp_agent_mail_db::search_planner::SearchResult,
+    highlight_terms: &[QueryTerm],
+) -> ResultEntry {
+    match result.doc_kind {
+        DocKind::Message | DocKind::Thread => map_unified_message_result(result, highlight_terms),
+        DocKind::Agent => ResultEntry {
+            id: result.id,
+            doc_kind: DocKind::Agent,
+            title: result.title,
+            body_preview: truncate_str(&collapse_whitespace(&result.body), 120),
+            context_snippet: String::new(),
+            match_count: 0,
+            full_body: None,
+            rendered_body: None,
+            score: result.score,
+            importance: None,
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            project_id: result.project_id,
+            reason_codes: result.reason_codes,
+            score_factors: result.score_factors,
+        },
+        DocKind::Project => {
+            let id = result.id;
+            ResultEntry {
+                id,
+                doc_kind: DocKind::Project,
+                title: result.title,
+                body_preview: result.body,
+                context_snippet: String::new(),
+                match_count: 0,
+                full_body: None,
+                rendered_body: None,
+                score: result.score,
+                importance: None,
+                ack_required: None,
+                created_ts: None,
+                thread_id: None,
+                from_agent: None,
+                project_id: result.project_id.or(Some(id)),
+                reason_codes: result.reason_codes,
+                score_factors: result.score_factors,
+            }
+        }
+    }
+}
+
+fn map_unified_message_result(
+    result: mcp_agent_mail_db::search_planner::SearchResult,
+    highlight_terms: &[QueryTerm],
+) -> ResultEntry {
+    let subject_text = collapse_whitespace(&result.title);
+    let has_highlight_terms = highlight_terms
+        .iter()
+        .any(|term| !term.negated && term.text.len() >= 2);
+    let (line_cap, char_cap) = if has_highlight_terms {
+        (SEARCHABLE_BODY_MAX_LINES, SEARCHABLE_BODY_MAX_CHARS)
+    } else {
+        (SEARCHABLE_PREVIEW_MAX_LINES, SEARCHABLE_PREVIEW_MAX_CHARS)
+    };
+    let body_lines = markdown_to_searchable_lines_with_caps(&result.body, line_cap, char_cap);
+    let subject_match_count = if has_highlight_terms {
+        count_term_matches(&subject_text, highlight_terms)
+    } else {
+        0
+    };
+    let body_match_count = if has_highlight_terms {
+        count_term_matches_in_lines(&body_lines, highlight_terms)
+    } else {
+        0
+    };
+    let match_count = subject_match_count.saturating_add(body_match_count);
+    let body_preview_source = if body_lines.is_empty() {
+        String::new()
+    } else {
+        body_lines
+            .iter()
+            .take(8)
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ⟫ ")
+    };
+    let mut preview = if !has_highlight_terms {
+        truncate_str(&body_preview_source, 120)
+    } else if body_match_count > 0 {
+        extract_context_snippet_from_lines(&body_lines, highlight_terms, MAX_SNIPPET_CHARS)
+    } else if subject_match_count > 0 {
+        let subject_snippet = extract_snippet(&subject_text, highlight_terms, MAX_SNIPPET_CHARS);
+        format!("subject: {subject_snippet}")
+    } else {
+        extract_snippet(&body_preview_source, highlight_terms, MAX_SNIPPET_CHARS)
+    };
+    if preview.is_empty() {
+        preview = truncate_str(&subject_text, 120);
+    }
+    let body_preview = if body_preview_source.is_empty() {
+        truncate_str(&subject_text, 320)
+    } else {
+        truncate_str(&body_preview_source, 320)
+    };
+
+    ResultEntry {
+        id: result.id,
+        doc_kind: DocKind::Message,
+        title: result.title,
+        body_preview,
+        context_snippet: preview,
+        match_count,
+        full_body: Some(result.body),
+        rendered_body: None,
+        score: result.score,
+        importance: result.importance,
+        ack_required: result.ack_required,
+        created_ts: result.created_ts,
+        thread_id: result.thread_id,
+        from_agent: result.from_agent,
+        project_id: result.project_id,
+        reason_codes: result.reason_codes,
+        score_factors: result.score_factors,
     }
 }
 
@@ -3309,14 +3450,14 @@ fn render_query_bar(
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
     let content_inner = if inner.width > 2 {
         Rect::new(
             inner.x.saturating_add(1),
@@ -3496,7 +3637,6 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
 
     let text = "AND/OR: error AND deploy\n\
 Quotes: \"build failed\"\n\
@@ -3662,13 +3802,13 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
     let block = Block::bordered()
         .title("Query Lab")
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border_dim));
+        .border_style(Style::default().fg(tp.panel_border_dim))
+        .style(Style::default().bg(tp.panel_bg));
     let lab_inner = block.inner(lab_area);
     block.render(lab_area, frame);
     if lab_inner.height == 0 || lab_inner.width == 0 {
         return;
     }
-    fill_rect(frame, lab_inner, tp.panel_bg);
 
     let mut rows: Vec<String> = Vec::new();
     let q = screen.query_input.value().trim();
@@ -3901,14 +4041,14 @@ fn render_results(
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
     let content = if inner.width > 2 {
         Rect::new(
             inner.x.saturating_add(1),
@@ -4336,14 +4476,14 @@ fn render_detail(
     let block = Block::bordered()
         .title("Detail")
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
 
     let (content_inner, scrollbar_area) = if inner.width > 6 {
         (
@@ -4645,13 +4785,13 @@ mod tests {
     }
 
     #[test]
-    fn derive_tui_diagnostics_like_fallback() {
+    fn derive_tui_diagnostics_detects_rerank_timeout() {
         let explain = mcp_agent_mail_db::search_planner::QueryExplain {
-            method: "like_fallback".to_string(),
+            method: "hybrid_v3".to_string(),
             normalized_query: Some("x".to_string()),
-            used_like_fallback: true,
-            facet_count: 0,
-            facets_applied: Vec::new(),
+            used_like_fallback: false,
+            facet_count: 1,
+            facets_applied: vec!["rerank_outcome:timeout".to_string()],
             sql: "SELECT 1".to_string(),
             scope_policy: "unrestricted".to_string(),
             denied_count: 0,
@@ -4660,18 +4800,13 @@ mod tests {
         let diagnostics = derive_tui_degraded_diagnostics(Some(&explain), SearchModeFilter::Auto)
             .expect("diagnostics");
         assert!(diagnostics.degraded);
-        assert_eq!(diagnostics.fallback_mode.as_deref(), Some("like_fallback"));
+        assert_eq!(diagnostics.fallback_mode.as_deref(), Some("rerank_timeout"));
     }
 
     #[test]
-    fn derive_tui_diagnostics_marks_semantic_mode_degraded() {
-        let diagnostics =
-            derive_tui_degraded_diagnostics(None, SearchModeFilter::Semantic).expect("diagnostics");
-        assert!(diagnostics.degraded);
-        assert_eq!(
-            diagnostics.fallback_mode.as_deref(),
-            Some("mode_degraded_to_lexical")
-        );
+    fn derive_tui_diagnostics_none_without_signals() {
+        let diagnostics = derive_tui_degraded_diagnostics(None, SearchModeFilter::Semantic);
+        assert!(diagnostics.is_none());
     }
 
     #[test]

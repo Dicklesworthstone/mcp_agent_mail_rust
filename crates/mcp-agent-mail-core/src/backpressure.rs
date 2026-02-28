@@ -639,6 +639,8 @@ mod tests {
                 requests_2xx: 0,
                 requests_4xx: 0,
                 requests_5xx: 0,
+                rate_limit_checked_total: 0,
+                rate_limit_rejected_total: 0,
                 latency_us: HistogramSnapshot {
                     count: 0,
                     sum: 0,
@@ -765,6 +767,8 @@ mod tests {
                 memory_pressure_level: 0,
                 memory_last_sample_us: 0,
                 memory_sample_errors_total: 0,
+                disk_io_write_bytes: 0,
+                disk_io_read_bytes: 0,
                 tui_spin_watchdog_trips_total: 0,
                 tui_spin_watchdog_last_cpu_pct_x100: 0,
                 tui_spin_watchdog_last_trip_us: 0,

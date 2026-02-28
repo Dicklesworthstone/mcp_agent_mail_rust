@@ -233,7 +233,7 @@ fn should_ignore(name: &str, patterns: &[String]) -> bool {
         if pat.is_empty() {
             continue;
         }
-        
+
         let starts_with_star = pat.starts_with('*');
         let ends_with_star = pat.ends_with('*');
         let core = pat.trim_matches('*');

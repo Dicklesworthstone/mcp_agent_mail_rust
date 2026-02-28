@@ -5,6 +5,7 @@
 //! definitions from [`mcp_agent_mail_db::mail_explorer`] for consistency
 //! with the MCP tool surface.
 
+use asupersync::Outcome;
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::{Line, Text};
 use ftui::widgets::Widget;
@@ -32,6 +33,7 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 // ──────────────────────────────────────────────────────────────────────
 
 const MAX_ENTRIES: usize = 200;
+const MAX_TEXT_FILTER_IDS: usize = 600;
 const DEBOUNCE_TICKS: u8 = 1;
 
 /// Default SLA threshold for overdue acks: 30 minutes in microseconds.
@@ -398,7 +400,7 @@ impl MailExplorerScreen {
             focused_synthetic: None,
             list_state: RefCell::new(VirtualizedListState::default()),
             detail_visible: true,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 
@@ -444,12 +446,21 @@ impl MailExplorerScreen {
         };
 
         let text_filter = self.search_input.value().trim().to_string();
+        let text_match_ids = match self.resolve_text_filter_message_ids(&text_filter) {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.last_error = Some(e);
+                self.db_conn = Some(conn);
+                self.search_dirty = false;
+                return;
+            }
+        };
 
         // Build and execute inbound + outbound queries
         let mut all_entries = Vec::new();
 
         if self.direction != Direction::Outbound {
-            match self.fetch_inbound(&conn, &text_filter) {
+            match self.fetch_inbound(&conn, text_match_ids.as_ref()) {
                 Ok(entries) => all_entries.extend(entries),
                 Err(e) => {
                     self.last_error = Some(e);
@@ -461,7 +472,7 @@ impl MailExplorerScreen {
         }
 
         if self.direction != Direction::Inbound {
-            match self.fetch_outbound(&conn, &text_filter) {
+            match self.fetch_outbound(&conn, text_match_ids.as_ref()) {
                 Ok(entries) => all_entries.extend(entries),
                 Err(e) => {
                     self.last_error = Some(e);
@@ -492,6 +503,45 @@ impl MailExplorerScreen {
         self.last_error = None;
         self.search_dirty = false;
         self.db_conn = Some(conn);
+    }
+
+    fn resolve_text_filter_message_ids(
+        &self,
+        text_filter: &str,
+    ) -> Result<Option<std::collections::HashSet<i64>>, String> {
+        if text_filter.is_empty() {
+            return Ok(None);
+        }
+
+        let pool_cfg = DbPoolConfig::from_env();
+        let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+            .map_err(|e| format!("search filter pool init failed: {e}"))?;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| format!("search filter runtime init failed: {e}"))?;
+        let cx = asupersync::Cx::for_request();
+
+        let mut query = mcp_agent_mail_db::search_planner::SearchQuery::default();
+        query.text = text_filter.to_string();
+        query.doc_kind = mcp_agent_mail_db::search_planner::DocKind::Message;
+        query.ranking = mcp_agent_mail_db::search_planner::RankingMode::Recency;
+        query.limit = Some(MAX_TEXT_FILTER_IDS);
+
+        match runtime.block_on(async {
+            mcp_agent_mail_db::search_service::execute_search_simple(&cx, &pool, &query).await
+        }) {
+            Outcome::Ok(response) => {
+                let ids = response
+                    .results
+                    .into_iter()
+                    .map(|result| result.id)
+                    .collect();
+                Ok(Some(ids))
+            }
+            Outcome::Err(e) => Err(format!("search filter query failed: {e}")),
+            Outcome::Cancelled(_) => Err("search filter query cancelled".to_string()),
+            Outcome::Panicked(p) => Err(format!("search filter query panicked: {p}")),
+        }
     }
 
     fn refresh_pressure_board(&mut self, state: &TuiSharedState) {
@@ -633,7 +683,11 @@ impl MailExplorerScreen {
             })
     }
 
-    fn fetch_inbound(&self, conn: &DbConn, text_filter: &str) -> Result<Vec<DisplayEntry>, String> {
+    fn fetch_inbound(
+        &self,
+        conn: &DbConn,
+        text_match_ids: Option<&std::collections::HashSet<i64>>,
+    ) -> Result<Vec<DisplayEntry>, String> {
         let mut conditions = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 
@@ -643,15 +697,8 @@ impl MailExplorerScreen {
             params.push(Value::Text(self.agent_filter.clone()));
         }
 
-        // Text filter
-        if !text_filter.is_empty() {
-            let escaped = text_filter.replace('%', "\\%").replace('_', "\\_");
-            let like = format!("%{escaped}%");
-            let idx = params.len() + 1;
-            conditions.push(format!(
-                "(m.subject LIKE ?{idx} ESCAPE '\\' OR m.body_md LIKE ?{idx} ESCAPE '\\')"
-            ));
-            params.push(Value::Text(like));
+        if !append_message_id_filter(&mut conditions, &mut params, text_match_ids) {
+            return Ok(Vec::new());
         }
 
         // Ack filter
@@ -705,7 +752,7 @@ impl MailExplorerScreen {
     fn fetch_outbound(
         &self,
         conn: &DbConn,
-        text_filter: &str,
+        text_match_ids: Option<&std::collections::HashSet<i64>>,
     ) -> Result<Vec<DisplayEntry>, String> {
         let mut conditions = Vec::new();
         let mut params: Vec<Value> = Vec::new();
@@ -716,15 +763,8 @@ impl MailExplorerScreen {
             params.push(Value::Text(self.agent_filter.clone()));
         }
 
-        // Text filter
-        if !text_filter.is_empty() {
-            let escaped = text_filter.replace('%', "\\%").replace('_', "\\_");
-            let like = format!("%{escaped}%");
-            let idx = params.len() + 1;
-            conditions.push(format!(
-                "(m.subject LIKE ?{idx} ESCAPE '\\' OR m.body_md LIKE ?{idx} ESCAPE '\\')"
-            ));
-            params.push(Value::Text(like));
+        if !append_message_id_filter(&mut conditions, &mut params, text_match_ids) {
+            return Ok(Vec::new());
         }
 
         let where_clause = if conditions.is_empty() {
@@ -777,6 +817,26 @@ impl MailExplorerScreen {
         self.search_dirty = true;
         self.debounce_remaining = 0;
     }
+}
+
+fn append_message_id_filter(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Value>,
+    message_ids: Option<&std::collections::HashSet<i64>>,
+) -> bool {
+    let Some(message_ids) = message_ids else {
+        return true;
+    };
+    if message_ids.is_empty() {
+        return false;
+    }
+
+    let mut ids: Vec<i64> = message_ids.iter().copied().collect();
+    ids.sort_unstable();
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    conditions.push(format!("m.id IN ({placeholders})"));
+    params.extend(ids.into_iter().map(Value::BigInt));
+    true
 }
 
 impl Default for MailExplorerScreen {

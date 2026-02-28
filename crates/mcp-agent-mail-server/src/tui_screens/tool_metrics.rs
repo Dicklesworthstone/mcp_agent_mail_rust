@@ -399,7 +399,7 @@ impl ToolMetricsScreen {
             drilldown_index: 0,
             detail_visible: true,
             detail_scroll: 0,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

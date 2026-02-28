@@ -1,10 +1,10 @@
-//! Unified search service bridging the query planner, SQL execution, and scope enforcement.
+//! Unified search service for lexical/semantic/hybrid retrieval with scope enforcement.
 //!
 //! This module provides [`execute_search`] — the single entry point for all search
-//! operations across TUI, MCP tools, and web surfaces. It:
+//! operations across CLI, TUI, MCP tools, and web surfaces. It:
 //!
-//! 1. Plans the query via [`plan_search`]
-//! 2. Executes the resulting SQL against the database
+//! 1. Resolves the configured search engine mode
+//! 2. Executes retrieval via frankensearch-backed lexical/semantic/hybrid paths
 //! 3. Applies scope and redaction via [`apply_scope`]
 //! 4. Tracks query telemetry
 //! 5. Returns a rich [`SearchResponse`] with pagination, explain, and audit
@@ -12,8 +12,8 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    DocKind, PlanMethod, PlanParam, RankingMode, RecoverySuggestion, SearchCursor, SearchQuery,
-    SearchResponse, SearchResult, ZeroResultGuidance, plan_search,
+    DocKind, RankingMode, RecoverySuggestion, SearchCursor, SearchQuery, SearchResponse,
+    SearchResult, ZeroResultGuidance,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -23,38 +23,53 @@ use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
 
-use asupersync::{Budget, Cx, Outcome, Time};
+use crate::query_assistance::{QueryAssistance, parse_query_assistance};
 #[cfg(feature = "hybrid")]
-use half::f16;
-use mcp_agent_mail_search_core::SearchMode;
-use mcp_agent_mail_search_core::cache::{
+use crate::search_auto_init::{TwoTierAvailability, get_two_tier_context};
+use crate::search_cache::{
     CacheConfig, InvalidationTrigger, QueryCache, QueryCacheKey, WarmResource, WarmWorker,
     WarmWorkerConfig,
 };
-use mcp_agent_mail_search_core::{
+use crate::search_candidates::{
     CandidateBudget, CandidateBudgetConfig, CandidateBudgetDecision, CandidateBudgetDerivation,
-    CandidateHit, CandidateMode, CandidateStageCounts, QueryAssistance, QueryClass,
-    parse_query_assistance, prepare_candidates,
+    CandidateHit, CandidateMode, CandidateStageCounts, QueryClass, prepare_candidates,
 };
 #[cfg(feature = "hybrid")]
-use mcp_agent_mail_search_core::{
-    DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
-    EmbeddingRequest, EmbeddingResult, FsScoredResult, HashEmbedder, JobMetricsSnapshot, ModelInfo,
-    ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult,
-    SearchPhase, TwoTierAlertConfig, TwoTierAvailability, TwoTierConfig, TwoTierEntry,
-    TwoTierIndex, TwoTierMetrics, TwoTierMetricsSnapshot, VectorFilter, VectorIndex,
-    VectorIndexConfig, fs, get_two_tier_context,
+use crate::search_embedder::{
+    Embedder, EmbeddingResult, HashEmbedder, ModelInfo, ModelRegistry, ModelTier, RegistryConfig,
 };
+#[cfg(feature = "hybrid")]
+use crate::search_embedding_jobs::{
+    EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest, IndexRefreshWorker,
+    JobMetricsSnapshot, QueueStats, RefreshWorkerConfig,
+};
+#[cfg(feature = "hybrid")]
+use crate::search_metrics::{TwoTierAlertConfig, TwoTierMetrics, TwoTierMetricsSnapshot};
+#[cfg(feature = "hybrid")]
+use crate::search_two_tier::{
+    ScoredResult, SearchPhase, TwoTierConfig, TwoTierEntry, TwoTierIndex,
+};
+#[cfg(feature = "hybrid")]
+use crate::search_vector_index::{VectorFilter, VectorIndex, VectorIndexConfig};
+use asupersync::{Budget, Cx, Outcome, Time};
+#[cfg(feature = "hybrid")]
+use frankensearch as fs;
+#[cfg(feature = "hybrid")]
+use frankensearch_core::types::ScoredResult as FsScoredResult;
+#[cfg(feature = "hybrid")]
+use half::f16;
+#[cfg(feature = "hybrid")]
+use mcp_agent_mail_core::DocKind as SearchDocKind;
+use mcp_agent_mail_core::SearchMode;
 use serde::{Deserialize, Serialize};
-use sqlmodel_core::{Row as SqlRow, Value};
-use sqlmodel_query::raw_query;
 #[cfg(feature = "hybrid")]
 use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "hybrid")]
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
 #[cfg(feature = "hybrid")]
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ────────────────────────────────────────────────────────────────────
 // Global search cache singleton
@@ -96,13 +111,13 @@ pub fn invalidate_search_cache(trigger: InvalidationTrigger) {
 
 /// Get search cache metrics snapshot (for diagnostics).
 #[must_use]
-pub fn search_cache_metrics() -> mcp_agent_mail_search_core::cache::CacheMetrics {
+pub fn search_cache_metrics() -> crate::search_cache::CacheMetrics {
     SEARCH_CACHE.get().map(|c| c.metrics()).unwrap_or_default()
 }
 
 /// Get warm worker status snapshot (for diagnostics).
 #[must_use]
-pub fn warm_worker_status() -> Vec<mcp_agent_mail_search_core::cache::WarmStatus> {
+pub fn warm_worker_status() -> Vec<crate::search_cache::WarmStatus> {
     WARM_WORKER
         .get()
         .map(|w| w.all_status())
@@ -183,33 +198,8 @@ pub struct ScopedSearchResponse {
 pub type SimpleSearchResponse = SearchResponse;
 
 // ────────────────────────────────────────────────────────────────────
-// SQL parameter conversion
-// ────────────────────────────────────────────────────────────────────
-
-fn plan_param_to_value(param: &PlanParam) -> Value {
-    match param {
-        PlanParam::Int(v) => Value::BigInt(*v),
-        PlanParam::Text(s) => Value::Text(s.clone()),
-        PlanParam::Float(f) => Value::Double(*f),
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ────────────────────────────────────────────────────────────────────
-
-fn map_sql_error(e: &sqlmodel_core::Error) -> DbError {
-    DbError::Sqlite(e.to_string())
-}
-
-fn map_sql_outcome<T>(out: Outcome<T, sqlmodel_core::Error>) -> Outcome<T, DbError> {
-    match out {
-        Outcome::Ok(v) => Outcome::Ok(v),
-        Outcome::Err(e) => Outcome::Err(map_sql_error(&e)),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
-}
 
 fn query_assistance_payload(query: &SearchQuery) -> Option<QueryAssistance> {
     let assistance = parse_query_assistance(&query.text);
@@ -324,13 +314,6 @@ fn generate_zero_result_guidance(
     })
 }
 
-async fn acquire_conn(
-    cx: &Cx,
-    pool: &DbPool,
-) -> Outcome<sqlmodel_pool::PooledConnection<crate::DbConn>, DbError> {
-    map_sql_outcome(pool.acquire(cx).await)
-}
-
 // ────────────────────────────────────────────────────────────────────
 // Tantivy routing helpers
 // ────────────────────────────────────────────────────────────────────
@@ -340,6 +323,190 @@ async fn acquire_conn(
 fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
     let bridge = crate::search_v3::get_bridge()?;
     Some(bridge.search(query))
+}
+
+fn detail_matches_query_filters(
+    query: &SearchQuery,
+    detail: &crate::queries::ThreadMessageRow,
+    product_project_ids: Option<&HashSet<i64>>,
+) -> bool {
+    if let Some(project_id) = query.project_id
+        && detail.project_id != project_id
+    {
+        return false;
+    }
+    if let Some(allowed_projects) = product_project_ids
+        && !allowed_projects.contains(&detail.project_id)
+    {
+        return false;
+    }
+    if let Some(agent_name) = query.agent_name.as_deref()
+        && !detail.from.eq_ignore_ascii_case(agent_name)
+    {
+        return false;
+    }
+    if let Some(thread_id) = query.thread_id.as_deref()
+        && detail.thread_id.as_deref() != Some(thread_id)
+    {
+        return false;
+    }
+    if let Some(ack_required) = query.ack_required
+        && (detail.ack_required != 0) != ack_required
+    {
+        return false;
+    }
+    if !query.importance.is_empty() {
+        let Some(level) = crate::search_planner::Importance::parse(&detail.importance) else {
+            return false;
+        };
+        if !query.importance.contains(&level) {
+            return false;
+        }
+    }
+    if let Some(min_ts) = query.time_range.min_ts
+        && detail.created_ts < min_ts
+    {
+        return false;
+    }
+    if let Some(max_ts) = query.time_range.max_ts
+        && detail.created_ts > max_ts
+    {
+        return false;
+    }
+    true
+}
+
+async fn canonicalize_message_results(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    raw_results: Vec<SearchResult>,
+) -> Outcome<Vec<SearchResult>, DbError> {
+    if query.doc_kind != DocKind::Message || raw_results.is_empty() {
+        return Outcome::Ok(raw_results);
+    }
+
+    let mut deduped = Vec::with_capacity(raw_results.len());
+    let mut seen_ids = HashSet::with_capacity(raw_results.len());
+    for result in raw_results {
+        if seen_ids.insert(result.id) {
+            deduped.push(result);
+        }
+    }
+
+    let ids: Vec<i64> = deduped.iter().map(|r| r.id).collect();
+    let details = match crate::queries::get_messages_details_by_ids(cx, pool, &ids).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let details_by_id: HashMap<i64, crate::queries::ThreadMessageRow> =
+        details.into_iter().map(|row| (row.id, row)).collect();
+
+    let product_project_ids = if let Some(product_id) = query.product_id {
+        let projects = match crate::queries::list_product_projects(cx, pool, product_id).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        Some(
+            projects
+                .into_iter()
+                .filter_map(|project| project.id)
+                .collect::<HashSet<i64>>(),
+        )
+    } else {
+        None
+    };
+
+    let mut canonical = Vec::with_capacity(deduped.len());
+    let mut dropped_missing = 0usize;
+    let mut dropped_filter_mismatch = 0usize;
+    for mut result in deduped {
+        let Some(detail) = details_by_id.get(&result.id) else {
+            dropped_missing += 1;
+            continue;
+        };
+        if !detail_matches_query_filters(query, detail, product_project_ids.as_ref()) {
+            dropped_filter_mismatch += 1;
+            continue;
+        }
+
+        result.project_id = Some(detail.project_id);
+        result.title = detail.subject.clone();
+        result.body = detail.body_md.clone();
+        result.importance = Some(detail.importance.clone());
+        result.ack_required = Some(detail.ack_required != 0);
+        result.created_ts = Some(detail.created_ts);
+        result.thread_id = detail.thread_id.clone();
+        result.from_agent = Some(detail.from.clone());
+        canonical.push(result);
+    }
+
+    if dropped_missing > 0 || dropped_filter_mismatch > 0 {
+        tracing::warn!(
+            dropped_missing,
+            dropped_filter_mismatch,
+            kept = canonical.len(),
+            "search canonicalization dropped stale or out-of-scope lexical candidates"
+        );
+    }
+
+    Outcome::Ok(canonical)
+}
+
+/// Serialized bootstrap state for Tantivy bridge initialization in non-server surfaces.
+static LEXICAL_BRIDGE_BOOTSTRAP_STATE: OnceLock<Mutex<Option<Result<(), String>>>> =
+    OnceLock::new();
+
+fn lexical_bootstrap_state() -> &'static Mutex<Option<Result<(), String>>> {
+    LEXICAL_BRIDGE_BOOTSTRAP_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn map_bridge_bootstrap_error(err: &str) -> DbError {
+    DbError::Sqlite(format!("search lexical bridge bootstrap failed: {err}"))
+}
+
+/// Ensure the lexical bridge is initialized for CLI/TUI/web direct search paths.
+///
+/// The MCP server initializes this at startup, but local surfaces can invoke
+/// search without server bootstrap. This helper makes bridge availability
+/// deterministic and removes SQL fallback dependence.
+fn ensure_lexical_bridge_initialized() -> Result<(), DbError> {
+    if crate::search_v3::get_bridge().is_some() {
+        return Ok(());
+    }
+
+    let state_lock = lexical_bootstrap_state();
+    {
+        let state = state_lock
+            .lock()
+            .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?;
+        if let Some(result) = state.as_ref() {
+            return result
+                .clone()
+                .map_err(|err| map_bridge_bootstrap_error(&err));
+        }
+    }
+
+    let config = mcp_agent_mail_core::Config::get();
+    let index_dir = config.storage_root.join("search_index");
+    let result = (|| {
+        crate::search_v3::init_bridge(&index_dir)?;
+        let (_indexed, _skipped) = crate::search_v3::backfill_from_db(&config.database_url)?;
+        Ok(())
+    })();
+
+    {
+        let mut state = state_lock
+            .lock()
+            .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?;
+        *state = Some(result.clone());
+    }
+
+    result.map_err(|err| map_bridge_bootstrap_error(&err))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -376,10 +543,7 @@ impl AutoInitSemanticEmbedder {
 
 #[cfg(feature = "hybrid")]
 impl Embedder for AutoInitSemanticEmbedder {
-    fn embed(
-        &self,
-        text: &str,
-    ) -> mcp_agent_mail_search_core::error::SearchResult<EmbeddingResult> {
+    fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
         let ctx = get_two_tier_context();
         let start = std::time::Instant::now();
         if let Ok(vector) = ctx.embed_fast(text) {
@@ -388,7 +552,7 @@ impl Embedder for AutoInitSemanticEmbedder {
                 self.info.id.clone(),
                 ModelTier::Fast,
                 start.elapsed(),
-                mcp_agent_mail_search_core::canonical::content_hash(text),
+                crate::search_canonical::content_hash(text),
             ));
         }
         if let Ok(vector) = ctx.embed_quality(text) {
@@ -397,7 +561,7 @@ impl Embedder for AutoInitSemanticEmbedder {
                 "auto-init-semantic-quality".to_string(),
                 ModelTier::Quality,
                 start.elapsed(),
-                mcp_agent_mail_search_core::canonical::content_hash(text),
+                crate::search_canonical::content_hash(text),
             ));
         }
         self.hash_fallback.embed(text)
@@ -420,7 +584,7 @@ pub struct SemanticBridge {
     /// Batch runner for embedding/index updates.
     runner: Arc<EmbeddingJobRunner>,
     /// Background refresh worker.
-    refresh_worker: Arc<mcp_agent_mail_search_core::IndexRefreshWorker>,
+    refresh_worker: Arc<IndexRefreshWorker>,
     /// Background refresh worker handle.
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -450,10 +614,7 @@ impl SemanticBridge {
             rebuild_on_startup: false,
             max_docs_per_cycle: 256,
         };
-        let refresh_worker = Arc::new(mcp_agent_mail_search_core::IndexRefreshWorker::new(
-            worker_cfg,
-            runner.clone(),
-        ));
+        let refresh_worker = Arc::new(IndexRefreshWorker::new(worker_cfg, runner.clone()));
         let worker = {
             let worker = refresh_worker.clone();
             std::thread::Builder::new()
@@ -2391,10 +2552,10 @@ fn emit_hybrid_budget_evidence(
 ) {
     let confidence = decision_confidence(&derivation.decision);
     let action_label = match derivation.decision.chosen_action {
-        mcp_agent_mail_search_core::CandidateBudgetAction::LexicalDominant => "lexical_dominant",
-        mcp_agent_mail_search_core::CandidateBudgetAction::Balanced => "balanced",
-        mcp_agent_mail_search_core::CandidateBudgetAction::SemanticDominant => "semantic_dominant",
-        mcp_agent_mail_search_core::CandidateBudgetAction::LexicalOnly => "lexical_only",
+        crate::search_candidates::CandidateBudgetAction::LexicalDominant => "lexical_dominant",
+        crate::search_candidates::CandidateBudgetAction::Balanced => "balanced",
+        crate::search_candidates::CandidateBudgetAction::SemanticDominant => "semantic_dominant",
+        crate::search_candidates::CandidateBudgetAction::LexicalOnly => "lexical_only",
     };
     let mode = derivation.decision.mode;
     let decision_id = format!(
@@ -2446,19 +2607,16 @@ fn record_legacy_error_metrics(metric_key: &str, latency_us: u64, track_telemetr
         .record_legacy_query(latency_us, true);
 }
 
-fn maybe_record_v3_fallback(engine: SearchEngine, query: &SearchQuery) {
-    if matches!(
-        engine,
-        SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
-    ) {
-        global_metrics().search.record_fallback();
-        tracing::warn!(
-            target: "search.metrics",
-            engine = ?engine,
-            query = %query.text,
-            "v3 search unavailable; falling back to legacy FTS5"
-        );
-    }
+fn lexical_bridge_unavailable_error(engine: SearchEngine, query: &SearchQuery) -> DbError {
+    tracing::error!(
+        target: "search.metrics",
+        engine = ?engine,
+        query = %query.text,
+        "lexical bridge unavailable; refusing ad-hoc SQL fallback"
+    );
+    DbError::Sqlite(format!(
+        "search engine unavailable ({engine}); lexical index bridge is not initialized"
+    ))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2529,11 +2687,37 @@ pub async fn execute_search(
     let engine = options
         .search_engine
         .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+    #[allow(deprecated)]
+    let engine = match engine {
+        SearchEngine::Legacy | SearchEngine::Shadow => SearchEngine::Lexical,
+        other => other,
+    };
     let assistance = query_assistance_payload(query);
+
+    if matches!(
+        engine,
+        SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
+    ) && let Err(err) = ensure_lexical_bridge_initialized()
+    {
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        record_legacy_error_metrics(
+            "search_service_bridge_bootstrap",
+            latency_us,
+            options.track_telemetry,
+        );
+        return Outcome::Err(err);
+    }
 
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
         if let Some(raw_results) = try_tantivy_search(query) {
+            let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await
+            {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
             } else {
@@ -2552,8 +2736,62 @@ pub async fn execute_search(
             }
             return resp;
         }
-        maybe_record_v3_fallback(engine, query);
-        // Bridge not initialized → fall through to SQL LIKE fallback.
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        record_legacy_error_metrics(
+            "search_service_lexical_unavailable",
+            latency_us,
+            options.track_telemetry,
+        );
+        return Outcome::Err(lexical_bridge_unavailable_error(engine, query));
+    }
+
+    if engine == SearchEngine::Semantic {
+        #[cfg(feature = "hybrid")]
+        {
+            let mut raw_results = try_two_tier_search_with_cx(cx, query, query.effective_limit())
+                .map_or_else(Vec::new, |outcome| outcome.results);
+
+            if raw_results.is_empty()
+                && let Some(bridge) = get_or_init_semantic_bridge()
+            {
+                raw_results = bridge.search(query, query.effective_limit());
+            }
+            raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+
+            let explain = if query.explain {
+                Some(build_v3_query_explain(query, engine, None))
+            } else {
+                None
+            };
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if options.track_telemetry {
+                record_query("search_service_semantic", latency_us);
+            }
+            global_metrics().search.record_v3_query(latency_us, false);
+            let resp =
+                finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
+            if let Outcome::Ok(ref val) = resp {
+                cache.put(cache_key, val.clone());
+            }
+            return resp;
+        }
+        #[cfg(not(feature = "hybrid"))]
+        {
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+            record_legacy_error_metrics(
+                "search_service_semantic_unavailable",
+                latency_us,
+                options.track_telemetry,
+            );
+            return Outcome::Err(DbError::Sqlite(
+                "semantic search unavailable: build without hybrid feature".to_string(),
+            ));
+        }
     }
 
     // ── Hybrid candidate orchestration path ─────────────────────────
@@ -2603,43 +2841,12 @@ pub async fn execute_search(
                 audit.two_tier_refinement_failed = telemetry.refinement_error.is_some();
                 audit.two_tier_fast_only = telemetry.fast_only_mode;
             }
-
-            // Hydrate missing details for semantic-only results (which lack body/title in the index)
-            let missing_ids: Vec<i64> = raw_results
-                .iter()
-                .filter(|r| r.title.is_empty())
-                .map(|r| r.id)
-                .collect();
-
-            if !missing_ids.is_empty() {
-                match crate::queries::get_messages_details_by_ids(cx, pool, &missing_ids).await {
-                    Outcome::Ok(details) => {
-                        let details_map: std::collections::HashMap<
-                            i64,
-                            crate::queries::ThreadMessageRow,
-                        > = details.into_iter().map(|d| (d.id, d)).collect();
-
-                        for r in &mut raw_results {
-                            if r.title.is_empty()
-                                && let Some(d) = details_map.get(&r.id)
-                            {
-                                r.title = d.subject.clone();
-                                r.body = d.body_md.clone();
-                                r.importance = Some(d.importance.clone());
-                                r.ack_required = Some(d.ack_required != 0);
-                                r.created_ts = Some(d.created_ts);
-                                r.thread_id = d.thread_id.clone();
-                                r.from_agent = Some(d.from.clone());
-                                r.project_id = Some(d.project_id);
-                            }
-                        }
-                    }
-                    Outcome::Err(e) => {
-                        tracing::warn!("failed to hydrate semantic search results: {e}");
-                    }
-                    _ => {}
-                }
-            }
+            raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, rerank_audit.as_ref()))
             } else {
@@ -2657,119 +2864,29 @@ pub async fn execute_search(
             }
             return resp;
         }
-        maybe_record_v3_fallback(engine, query);
-        // No lexical bridge available yet → fall through to SQL LIKE fallback.
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        record_legacy_error_metrics(
+            "search_service_hybrid_unavailable",
+            latency_us,
+            options.track_telemetry,
+        );
+        return Outcome::Err(lexical_bridge_unavailable_error(engine, query));
     }
 
-    // ── SQL LIKE fallback (Tantivy bridge not available) ────────────
-    // NOTE: FTS5 path removed in Search V3 decommission (br-2tnl.8.4).
-    // The planner now generates LIKE-based SQL only.
-
-    let plan = plan_search(query);
-
-    if plan.method == PlanMethod::Empty {
-        let explain = if query.explain {
-            Some(plan.explain())
-        } else {
-            None
-        };
-        let guidance = generate_zero_result_guidance(query, 0, assistance.as_ref());
-        let response = ScopedSearchResponse {
-            results: Vec::new(),
-            next_cursor: None,
-            explain,
-            audit_summary: None,
-            sql_row_count: 0,
-            assistance,
-            guidance,
-        };
-        cache.put(cache_key, response.clone());
-        return Outcome::Ok(response);
-    }
-
-    // Acquire connection
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => {
-            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-            record_legacy_error_metrics("search_service", latency_us, options.track_telemetry);
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    // Execute SQL
-    let values: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
-    let rows_out = map_sql_outcome(raw_query(cx, &*conn, &plan.sql, &values).await);
-
-    let rows = match rows_out {
-        Outcome::Ok(r) => r,
-        Outcome::Err(e) => {
-            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-            record_legacy_error_metrics("search_service", latency_us, options.track_telemetry);
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let fallback_latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-    if options.track_telemetry {
-        record_query("search_service_like_fallback", fallback_latency_us);
-    }
-    global_metrics()
-        .search
-        .record_legacy_query(fallback_latency_us, false);
-
-    let raw_results = map_rows_to_results(&rows, query.doc_kind);
-    let sql_row_count = raw_results.len();
-    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
-
-    let redaction = options.redaction_policy.clone().unwrap_or_default();
-    let scope_ctx = options.scope_ctx.clone().unwrap_or_else(|| ScopeContext {
-        viewer: None,
-        approved_contacts: Vec::new(),
-        viewer_project_ids: Vec::new(),
-        sender_policies: Vec::new(),
-        recipient_map: Vec::new(),
-    });
-
-    let (scoped_results, audit_summary) = apply_scope(raw_results, &scope_ctx, &redaction);
-
-    let explain = if query.explain {
-        let mut e = plan.explain();
-        e.denied_count = audit_summary.denied_count;
-        e.redacted_count = audit_summary.redacted_count;
-        e.scope_policy.clone_from(&plan.scope_label);
-        Some(e)
-    } else {
-        None
-    };
-
-    let audit = if scope_ctx.viewer.is_some() {
-        Some(audit_summary)
-    } else {
-        None
-    };
-
-    let guidance = generate_zero_result_guidance(query, scoped_results.len(), assistance.as_ref());
-
-    let response = ScopedSearchResponse {
-        results: scoped_results,
-        next_cursor,
-        explain,
-        audit_summary: audit,
-        sql_row_count,
-        assistance,
-        guidance,
-    };
-    cache.put(cache_key, response.clone());
-    Outcome::Ok(response)
+    let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+    record_legacy_error_metrics(
+        "search_service_engine_unavailable",
+        latency_us,
+        options.track_telemetry,
+    );
+    Outcome::Err(DbError::Sqlite(format!(
+        "search engine unavailable: {engine}"
+    )))
 }
 
 /// Apply scope enforcement and build a `ScopedSearchResponse` from raw results.
 ///
-/// Shared by both the Tantivy and FTS5 paths to avoid duplicating scope logic.
+/// Shared by lexical, semantic, and hybrid search paths to avoid duplicating scope logic.
 fn finish_scoped_response(
     raw_results: Vec<SearchResult>,
     query: &SearchQuery,
@@ -2819,8 +2936,7 @@ fn finish_scoped_response(
 
 /// Execute a simple (unscoped) search — for backward compatibility with existing tools.
 ///
-/// Tries Tantivy first, falls back to LIKE-based SQL if the bridge is not
-/// initialized. Returns a `SearchResponse` without scope enforcement or audit.
+/// Returns a `SearchResponse` without scope enforcement or audit.
 ///
 /// # Errors
 ///
@@ -2830,178 +2946,26 @@ pub async fn execute_search_simple(
     pool: &DbPool,
     query: &SearchQuery,
 ) -> Outcome<SimpleSearchResponse, DbError> {
-    let timer = std::time::Instant::now();
-    let assistance = query_assistance_payload(query);
+    let options = SearchOptions {
+        scope_ctx: None,
+        redaction_policy: None,
+        track_telemetry: true,
+        search_engine: None,
+    };
 
-    // ── SQL LIKE path ─────────────────────────────────────────────
-    // execute_search_simple always uses the SQL planner (LIKE-based).
-    // Tantivy routing is handled by execute_search via SearchOptions.
-    let plan = plan_search(query);
-
-    if plan.method == PlanMethod::Empty {
-        let explain = if query.explain {
-            Some(plan.explain())
-        } else {
-            None
-        };
-        let guidance = generate_zero_result_guidance(query, 0, assistance.as_ref());
-        return Outcome::Ok(SearchResponse {
-            results: Vec::new(),
-            next_cursor: None,
-            explain,
-            assistance,
-            guidance,
+    match execute_search(cx, pool, query, &options).await {
+        Outcome::Ok(scoped) => Outcome::Ok(SearchResponse {
+            results: scoped.results.into_iter().map(|row| row.result).collect(),
+            next_cursor: scoped.next_cursor,
+            explain: scoped.explain,
+            assistance: scoped.assistance,
+            guidance: scoped.guidance,
             audit: Vec::new(),
-        });
+        }),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
     }
-
-    // Acquire connection
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => {
-            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-            record_legacy_error_metrics("search_service_simple", latency_us, true);
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let values: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
-    let rows_out = map_sql_outcome(raw_query(cx, &*conn, &plan.sql, &values).await);
-
-    let rows = match rows_out {
-        Outcome::Ok(r) => r,
-        Outcome::Err(e) => {
-            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-            record_legacy_error_metrics("search_service_simple", latency_us, true);
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-    record_query("search_service_simple_like", latency_us);
-    global_metrics()
-        .search
-        .record_legacy_query(latency_us, false);
-
-    let raw_results = map_rows_to_results(&rows, query.doc_kind);
-    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
-
-    let explain = if query.explain {
-        Some(plan.explain())
-    } else {
-        None
-    };
-
-    let guidance = generate_zero_result_guidance(query, raw_results.len(), assistance.as_ref());
-
-    Outcome::Ok(SearchResponse {
-        results: raw_results,
-        next_cursor,
-        explain,
-        assistance,
-        guidance,
-        audit: Vec::new(),
-    })
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Row mapping
-// ────────────────────────────────────────────────────────────────────
-
-/// Map database rows to `SearchResult` based on document kind.
-fn map_rows_to_results(rows: &[SqlRow], doc_kind: DocKind) -> Vec<SearchResult> {
-    rows.iter()
-        .filter_map(|row| match doc_kind {
-            DocKind::Message | DocKind::Thread => map_message_row(row),
-            DocKind::Agent => map_agent_row(row),
-            DocKind::Project => map_project_row(row),
-        })
-        .collect()
-}
-
-fn map_message_row(row: &SqlRow) -> Option<SearchResult> {
-    let id: i64 = row.get_as(0).ok()?;
-    let subject: String = row.get_as(1).unwrap_or_default();
-    let importance: Option<String> = row.get_as(2).ok();
-    let ack_required: Option<bool> = row.get_as::<i64>(3).ok().map(|v| v != 0);
-    let created_ts: Option<i64> = row.get_as(4).ok();
-    let thread_id: Option<String> = row.get_as(5).ok();
-    let from_agent: Option<String> = row.get_as(6).ok();
-    let body: String = row.get_as(7).unwrap_or_default();
-    let project_id: Option<i64> = row.get_as(8).ok();
-    let score: Option<f64> = row.get_as(9).ok();
-
-    Some(SearchResult {
-        doc_kind: DocKind::Message,
-        id,
-        project_id,
-        title: subject,
-        body,
-        score,
-        importance,
-        ack_required,
-        created_ts,
-        thread_id,
-        from_agent,
-        reason_codes: Vec::new(),
-        score_factors: Vec::new(),
-        redacted: false,
-        redaction_reason: None,
-    })
-}
-
-fn map_agent_row(row: &SqlRow) -> Option<SearchResult> {
-    let id: i64 = row.get_as(0).ok()?;
-    let name: String = row.get_as(1).unwrap_or_default();
-    let task_desc: String = row.get_as(2).unwrap_or_default();
-    let project_id: Option<i64> = row.get_as(3).ok();
-    let score: Option<f64> = row.get_as(4).ok();
-
-    Some(SearchResult {
-        doc_kind: DocKind::Agent,
-        id,
-        project_id,
-        title: name,
-        body: task_desc,
-        score,
-        importance: None,
-        ack_required: None,
-        created_ts: None,
-        thread_id: None,
-        from_agent: None,
-        reason_codes: Vec::new(),
-        score_factors: Vec::new(),
-        redacted: false,
-        redaction_reason: None,
-    })
-}
-
-fn map_project_row(row: &SqlRow) -> Option<SearchResult> {
-    let id: i64 = row.get_as(0).ok()?;
-    let slug: String = row.get_as(1).unwrap_or_default();
-    let human_key: String = row.get_as(2).unwrap_or_default();
-    let score: Option<f64> = row.get_as(3).ok();
-
-    Some(SearchResult {
-        doc_kind: DocKind::Project,
-        id,
-        project_id: Some(id),
-        title: slug,
-        body: human_key,
-        score,
-        importance: None,
-        ack_required: None,
-        created_ts: None,
-        thread_id: None,
-        from_agent: None,
-        reason_codes: Vec::new(),
-        score_factors: Vec::new(),
-        redacted: false,
-        redaction_reason: None,
-    })
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -3054,23 +3018,6 @@ mod tests {
     use mcp_agent_mail_core::metrics::global_metrics;
     #[cfg(feature = "hybrid")]
     use std::time::Duration;
-
-    #[test]
-    fn plan_param_conversion() {
-        assert!(matches!(
-            plan_param_to_value(&PlanParam::Int(42)),
-            Value::BigInt(42)
-        ));
-        assert!(matches!(
-            plan_param_to_value(&PlanParam::Float(1.5)),
-            Value::Double(_)
-        ));
-        if let Value::Text(s) = plan_param_to_value(&PlanParam::Text("hello".to_string())) {
-            assert_eq!(s, "hello");
-        } else {
-            panic!("expected Text");
-        }
-    }
 
     #[test]
     fn next_cursor_none_when_underfull() {
@@ -3187,6 +3134,127 @@ mod tests {
         assert!(!opts.track_telemetry);
     }
 
+    fn detail_row(
+        id: i64,
+        project_id: i64,
+        from: &str,
+        thread_id: Option<&str>,
+        importance: &str,
+        ack_required: i64,
+        created_ts: i64,
+    ) -> crate::queries::ThreadMessageRow {
+        crate::queries::ThreadMessageRow {
+            id,
+            project_id,
+            sender_id: 1,
+            thread_id: thread_id.map(std::borrow::ToOwned::to_owned),
+            subject: "subject".to_string(),
+            body_md: "body".to_string(),
+            importance: importance.to_string(),
+            ack_required,
+            created_ts,
+            attachments: "[]".to_string(),
+            from: from.to_string(),
+        }
+    }
+
+    #[test]
+    fn detail_filter_enforces_project_and_product_scope() {
+        let detail = detail_row(1, 10, "BlueLake", Some("br-100"), "urgent", 1, 1_000);
+
+        let query = SearchQuery {
+            project_id: Some(10),
+            product_id: Some(7),
+            ..Default::default()
+        };
+        let mut allowed = HashSet::new();
+        allowed.insert(10);
+        assert!(detail_matches_query_filters(&query, &detail, Some(&allowed)));
+
+        let mut disallowed = HashSet::new();
+        disallowed.insert(11);
+        assert!(!detail_matches_query_filters(
+            &query,
+            &detail,
+            Some(&disallowed)
+        ));
+
+        let wrong_project_query = SearchQuery {
+            project_id: Some(11),
+            ..Default::default()
+        };
+        assert!(!detail_matches_query_filters(
+            &wrong_project_query,
+            &detail,
+            None
+        ));
+    }
+
+    #[test]
+    fn detail_filter_enforces_sender_thread_and_ack() {
+        let detail = detail_row(2, 1, "BlueLake", Some("br-200"), "high", 1, 2_000);
+        let query = SearchQuery {
+            agent_name: Some("bluelake".to_string()),
+            thread_id: Some("br-200".to_string()),
+            ack_required: Some(true),
+            ..Default::default()
+        };
+        assert!(detail_matches_query_filters(&query, &detail, None));
+
+        let wrong_thread_query = SearchQuery {
+            thread_id: Some("br-201".to_string()),
+            ..query.clone()
+        };
+        assert!(!detail_matches_query_filters(&wrong_thread_query, &detail, None));
+
+        let ack_mismatch_query = SearchQuery {
+            ack_required: Some(false),
+            ..query
+        };
+        assert!(!detail_matches_query_filters(
+            &ack_mismatch_query,
+            &detail,
+            None
+        ));
+    }
+
+    #[test]
+    fn detail_filter_enforces_importance_and_time_range() {
+        let detail = detail_row(3, 2, "RedPeak", None, "normal", 0, 5_000);
+        let query = SearchQuery {
+            importance: vec![Importance::Normal],
+            time_range: crate::search_planner::TimeRange {
+                min_ts: Some(4_000),
+                max_ts: Some(6_000),
+            },
+            ..Default::default()
+        };
+        assert!(detail_matches_query_filters(&query, &detail, None));
+
+        let wrong_importance_query = SearchQuery {
+            importance: vec![Importance::Urgent],
+            ..query.clone()
+        };
+        assert!(!detail_matches_query_filters(
+            &wrong_importance_query,
+            &detail,
+            None
+        ));
+
+        let outside_time_query = SearchQuery {
+            time_range: crate::search_planner::TimeRange {
+                min_ts: Some(6_001),
+                max_ts: None,
+            },
+            ..query
+        };
+        assert!(!detail_matches_query_filters(
+            &outside_time_query,
+            &detail,
+            None
+        ));
+    }
+
     // ── Zero-result guidance tests ──────────────────────────────────
 
     #[test]
@@ -3264,7 +3332,7 @@ mod tests {
         let assistance = Some(QueryAssistance {
             query_text: "form:BlueLake migration".to_string(),
             applied_filter_hints: Vec::new(),
-            did_you_mean: vec![mcp_agent_mail_search_core::DidYouMeanHint {
+            did_you_mean: vec![crate::query_assistance::DidYouMeanHint {
                 token: "form:BlueLake".to_string(),
                 suggested_field: "from".to_string(),
                 value: "BlueLake".to_string(),
@@ -3616,22 +3684,6 @@ mod tests {
     // NOTE: shadow_comparison_logging test removed — shadow mode + FTS5 decommissioned (br-2tnl.8.4)
 
     #[test]
-    fn v3_fallback_records_metric() {
-        let before = global_metrics().snapshot();
-        let query = SearchQuery::messages("fallback-check", 1);
-
-        maybe_record_v3_fallback(SearchEngine::Lexical, &query);
-
-        let after = global_metrics().snapshot();
-        assert!(
-            after.search.fallback_to_legacy_total > before.search.fallback_to_legacy_total,
-            "expected fallback counter to increase (before={}, after={})",
-            before.search.fallback_to_legacy_total,
-            after.search.fallback_to_legacy_total
-        );
-    }
-
-    #[test]
     fn legacy_error_metrics_record_error_counter() {
         let before = global_metrics().snapshot();
 
@@ -3938,16 +3990,13 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     impl Embedder for FixedSemanticTestEmbedder {
-        fn embed(
-            &self,
-            text: &str,
-        ) -> mcp_agent_mail_search_core::error::SearchResult<EmbeddingResult> {
+        fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
             Ok(EmbeddingResult::new(
                 vec![0.42_f32; self.info.dimension],
                 self.info.id.clone(),
                 ModelTier::Fast,
                 Duration::from_millis(1),
-                mcp_agent_mail_search_core::canonical::content_hash(text),
+                crate::search_canonical::content_hash(text),
             ))
         }
 
@@ -4048,8 +4097,8 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     fn two_tier_test_bridge() -> Arc<TwoTierBridge> {
-        let config = mcp_agent_mail_search_core::TwoTierConfig::default();
-        let index = mcp_agent_mail_search_core::TwoTierIndex::new(&config);
+        let config = TwoTierConfig::default();
+        let index = TwoTierIndex::new(&config);
         let mut metrics = TwoTierMetrics::default();
         metrics.record_index(index.metrics());
         Arc::new(TwoTierBridge {

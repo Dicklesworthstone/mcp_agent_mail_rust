@@ -10,7 +10,6 @@ description = "Database layer for MCP Agent Mail"
 
 [dependencies]
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
-mcp-agent-mail-search-core = { path = "../mcp-agent-mail-search-core" }
 tantivy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,7 +17,24 @@ chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 regex.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+# frankensearch: two-tier hybrid search implementation (optional, for hybrid feature)
+frankensearch = { workspace = true, optional = true }
+frankensearch-core = { workspace = true, optional = true }
+frankensearch-embed = { workspace = true, optional = true }
+frankensearch-fusion = { workspace = true, optional = true }
+frankensearch-index = { workspace = true, optional = true }
+
+# Two-tier semantic search dependencies (optional, enabled by "hybrid" feature)
 half = { workspace = true, optional = true }
+wide = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
 
 # sqlmodel dependencies
 sqlmodel.workspace = true
@@ -37,9 +53,27 @@ indexmap.workspace = true
 asupersync.workspace = true
 
 [features]
-default = ["hybrid", "s3fifo"]
-# Enable hybrid search (lexical + semantic)
-hybrid = ["mcp-agent-mail-search-core/hybrid", "dep:half"]
+default = ["hybrid", "s3fifo", "tantivy-engine"]
+# Enable Tantivy-based lexical search (moved from search-core)
+tantivy-engine = []
+# Enable hybrid search (lexical + semantic + frankensearch)
+hybrid = [
+    "tantivy-engine",
+    "quality-fastembed",
+    "dep:frankensearch",
+    "dep:frankensearch-core",
+    "dep:frankensearch-embed",
+    "dep:frankensearch-fusion",
+    "dep:frankensearch-index",
+    "dep:half",
+    "dep:wide",
+    "dep:safetensors",
+    "dep:tokenizers",
+    "dep:rayon",
+    "dep:dirs",
+]
+# Enable legacy FastEmbed quality tier
+quality-fastembed = ["dep:fastembed"]
 # Enable loom model-checking tests (run with `cargo test --features loom-tests`)
 loom-tests = []
 # Use S3-FIFO eviction in ReadCache (replaces IndexMap LRU)
@@ -62,6 +96,11 @@ harness = false
 [[bench]]
 name = "search_v3_bench"
 harness = false
+
+[[bench]]
+name = "two_tier_bench"
+harness = false
+required-features = ["hybrid"]
 
 [lints]
 workspace = true

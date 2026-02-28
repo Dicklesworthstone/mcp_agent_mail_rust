@@ -345,13 +345,16 @@ fn decode_metric_row(row: &mcp_agent_mail_db::sqlmodel_core::Row) -> Option<Pers
     })
 }
 
+fn is_missing_metrics_table_error(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("no such table") && msg.contains(TOOL_METRICS_SNAPSHOTS_TABLE)
+}
+
 #[must_use]
 pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<PersistedToolMetric> {
     let Some(conn) = open_metrics_connection(database_url) else {
         return Vec::new();
     };
-    ensure_metrics_schema(&conn);
-
     let limit_i64 = i64::try_from(limit.clamp(1, 2_000)).unwrap_or(200);
     let sql = "SELECT s.tool_name, s.calls, s.errors, s.cluster, s.complexity, \
                       s.latency_avg_ms, s.latency_p50_ms, s.latency_p95_ms, s.latency_p99_ms, \
@@ -365,10 +368,17 @@ pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<Pe
                  ON latest.tool_name = s.tool_name AND latest.max_ts = s.collected_ts \
                ORDER BY s.calls DESC, s.tool_name ASC \
                LIMIT ?";
-    conn.query_sync(sql, &[Value::BigInt(limit_i64)])
-        .ok()
-        .map(|rows| rows.iter().filter_map(decode_metric_row).collect())
-        .unwrap_or_default()
+    let rows = match conn.query_sync(sql, &[Value::BigInt(limit_i64)]) {
+        Ok(rows) => rows,
+        Err(err) if is_missing_metrics_table_error(&err) => {
+            // Fast path avoids DDL on every read; recover lazily when schema is missing.
+            ensure_metrics_schema(&conn);
+            conn.query_sync(sql, &[Value::BigInt(limit_i64)])
+                .unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    };
+    rows.iter().filter_map(decode_metric_row).collect()
 }
 
 #[must_use]
@@ -376,16 +386,21 @@ pub fn persisted_metric_store_size(database_url: &str) -> u64 {
     let Some(conn) = open_metrics_connection(database_url) else {
         return 0;
     };
-    ensure_metrics_schema(&conn);
-    conn.query_sync(
-        &format!("SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}"),
-        &[],
-    )
-    .ok()
-    .and_then(|rows| rows.into_iter().next())
-    .and_then(|row| row.get_named::<i64>("c").ok())
-    .and_then(|v| u64::try_from(v).ok())
-    .unwrap_or(0)
+    let sql = format!("SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}");
+    let rows = match conn.query_sync(&sql, &[]) {
+        Ok(rows) => rows,
+        Err(err) if is_missing_metrics_table_error(&err) => {
+            // Fast path avoids DDL on every read; recover lazily when schema is missing.
+            ensure_metrics_schema(&conn);
+            conn.query_sync(&sql, &[]).unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    };
+    rows.into_iter()
+        .next()
+        .and_then(|row| row.get_named::<i64>("c").ok())
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -802,6 +817,15 @@ mod tests {
     #[test]
     fn persisted_metric_store_size_memory_db_returns_zero() {
         assert_eq!(persisted_metric_store_size("sqlite:///:memory:"), 0);
+    }
+
+    #[test]
+    fn missing_metrics_table_error_detection_matches_target_table() {
+        assert!(is_missing_metrics_table_error(
+            &"no such table: tool_metrics_snapshots"
+        ));
+        assert!(!is_missing_metrics_table_error(&"no such table: messages"));
+        assert!(!is_missing_metrics_table_error(&"database is locked"));
     }
 
     #[test]

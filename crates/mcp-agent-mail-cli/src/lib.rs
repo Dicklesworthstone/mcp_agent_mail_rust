@@ -1351,7 +1351,7 @@ pub enum MailCommand {
         /// Project key.
         #[arg(long = "project", short = 'p')]
         project_key: String,
-        /// Search query (FTS5 syntax).
+        /// Search query string.
         query: String,
         /// Max results.
         #[arg(long, short = 'l', default_value_t = 20)]
@@ -2092,19 +2092,20 @@ fn handle_default_launch() -> CliResult<()> {
         });
     }
 
-    apply_release_logging_defaults();
-
     // Interactive: full server launch experience (setup self-heal + port check + serve)
     handle_serve_http(None, None, None, false, false)
 }
 
-fn apply_release_logging_defaults() {
+fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
     TRACING_INIT.call_once(|| {
         let filter = if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        } else if suppress_runtime_logs_for_tui {
+            // Prevent tracing output from corrupting the interactive TUI.
+            tracing_subscriber::EnvFilter::new("off")
         } else {
             tracing_subscriber::EnvFilter::new("info")
         };
@@ -2686,6 +2687,125 @@ fn print_verify_check(check: &share::deploy::VerifyLiveCheck) {
     ftui_runtime::ftui_println!("  [{tag}] {:<20} {}", check.id, check.message);
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct PreflightBannerStats {
+    projects: u64,
+    agents: u64,
+    messages: u64,
+    file_reservations: u64,
+    contact_links: u64,
+}
+
+fn query_preflight_banner_stats_batched(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> Option<PreflightBannerStats> {
+    let sql = "SELECT \
+               (SELECT COUNT(*) FROM projects) AS projects_count, \
+               (SELECT COUNT(*) FROM agents) AS agents_count, \
+               (SELECT COUNT(*) FROM messages) AS messages_count, \
+               (SELECT COUNT(*) FROM file_reservations) AS reservations_count, \
+               (SELECT COUNT(*) FROM agent_links) AS links_count";
+    let row = conn.query_sync(sql, &[]).ok()?.into_iter().next()?;
+    let read_count = |key: &str| {
+        row.get_named::<i64>(key)
+            .ok()
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0)
+    };
+    Some(PreflightBannerStats {
+        projects: read_count("projects_count"),
+        agents: read_count("agents_count"),
+        messages: read_count("messages_count"),
+        file_reservations: read_count("reservations_count"),
+        contact_links: read_count("links_count"),
+    })
+}
+
+fn query_table_count(conn: &mcp_agent_mail_db::DbConn, table: &str) -> u64 {
+    let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
+    conn.query_sync(&sql, &[])
+        .ok()
+        .and_then(|rows| {
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("cnt").ok())
+        })
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0)
+}
+
+fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let Ok(sqlite_path) = cfg.sqlite_path() else {
+        return PreflightBannerStats::default();
+    };
+    if sqlite_path != ":memory:" && !Path::new(&sqlite_path).exists() {
+        return PreflightBannerStats::default();
+    }
+    // Keep startup stats on FrankenSQLite while avoiding schema/migration work.
+    // We only need read-only counts for banner rendering.
+    let Ok((conn, _opened_path)) = open_sqlite_with_fallback(&sqlite_path) else {
+        return PreflightBannerStats::default();
+    };
+    if let Some(stats) = query_preflight_banner_stats_batched(&conn) {
+        return stats;
+    }
+    PreflightBannerStats {
+        projects: query_table_count(&conn, "projects"),
+        agents: query_table_count(&conn, "agents"),
+        messages: query_table_count(&conn, "messages"),
+        file_reservations: query_table_count(&conn, "file_reservations"),
+        contact_links: query_table_count(&conn, "agent_links"),
+    }
+}
+
+fn emit_pre_tui_startup_banner(config: &Config) {
+    if !output::is_tty() {
+        return;
+    }
+
+    let _ = mcp_agent_mail_server::theme::init_console_theme_from_config(config.console_theme);
+    let stats = preflight_banner_stats(&config.database_url);
+
+    let endpoint = format!(
+        "http://{}:{}{}",
+        config.http_host, config.http_port, config.http_path
+    );
+    let ui_host = if matches!(config.http_host.as_str(), "0.0.0.0" | "::") {
+        "localhost"
+    } else {
+        config.http_host.as_str()
+    };
+    let web_ui = format!("http://{}:{}/mail", ui_host, config.http_port);
+    let storage_root = config.storage_root.to_string_lossy();
+    let app_env_str = config.app_environment.to_string();
+    let banner_lines = mcp_agent_mail_server::console::render_startup_banner(
+        &mcp_agent_mail_server::console::BannerParams {
+            app_environment: &app_env_str,
+            endpoint: endpoint.as_str(),
+            database_url: config.database_url.as_str(),
+            storage_root: storage_root.as_ref(),
+            auth_enabled: config.http_bearer_token.is_some(),
+            tools_log_enabled: config.tools_log_enabled,
+            tool_calls_log_enabled: config.log_tool_calls_enabled,
+            console_theme: mcp_agent_mail_server::theme::current_theme_display_name(),
+            web_ui_url: web_ui.as_str(),
+            remote_url: None,
+            projects: stats.projects,
+            agents: stats.agents,
+            messages: stats.messages,
+            file_reservations: stats.file_reservations,
+            contact_links: stats.contact_links,
+        },
+    );
+
+    for line in banner_lines {
+        ftui_runtime::ftui_println!("{line}");
+    }
+}
+
 fn handle_serve_http(
     host: Option<String>,
     port: Option<u16>,
@@ -2693,18 +2813,21 @@ fn handle_serve_http(
     no_auth: bool,
     no_tui: bool,
 ) -> CliResult<()> {
-    apply_release_logging_defaults();
-
     let mut config = build_http_config(host, port, path, no_auth);
     if no_tui {
         config.tui_enabled = false;
     }
+    let suppress_runtime_logs_for_tui = config.tui_enabled && crate::output::is_tty();
+    apply_release_logging_defaults(suppress_runtime_logs_for_tui);
     if let Err(e) = run_setup_self_heal_for_server(&config) {
         output::warn(&format!(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
         ));
     }
     auto_clear_port(&config.http_host, config.http_port)?;
+    if !no_tui {
+        emit_pre_tui_startup_banner(&config);
+    }
     mcp_agent_mail_server::run_http_with_tui(&config)?;
     Ok(())
 }
@@ -3733,20 +3856,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let results = setup::run_setup(&params);
 
             output::emit_output(&results, fmt, || {
-                if dry_run {
-                    output::section("Dry run — no files will be modified");
-                    ftui_runtime::ftui_println!("");
-                }
-
-                for result in &results {
-                    output::section(&result.platform.to_string());
-                    for action in &result.actions {
-                        ftui_runtime::ftui_println!("  {} — {}", action.file_path, action.outcome);
-                        if !action.description.is_empty() {
-                            ftui_runtime::ftui_println!("    {}", action.description);
-                        }
-                    }
-                }
+                render_setup_actions_table(&results, dry_run);
 
                 let total_actions: usize = results.iter().map(|r| r.actions.len()).sum();
                 let created = results
@@ -3862,6 +3972,97 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             Ok(())
         }
     }
+}
+
+fn setup_action_style(
+    outcome: &mcp_agent_mail_core::setup::ActionOutcome,
+) -> (&'static str, String) {
+    match outcome {
+        mcp_agent_mail_core::setup::ActionOutcome::Created => {
+            ("✓", mcp_agent_mail_server::theme::success_bold())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Updated => {
+            ("↻", mcp_agent_mail_server::theme::primary_bold())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Unchanged => {
+            ("•", mcp_agent_mail_server::theme::muted())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Skipped => {
+            ("◌", mcp_agent_mail_server::theme::warning_bold())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::BackedUp(_) => {
+            ("💾", mcp_agent_mail_server::theme::accent())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Failed(_) => {
+            ("✗", mcp_agent_mail_server::theme::error_bold())
+        }
+    }
+}
+
+fn render_setup_actions_table(results: &[mcp_agent_mail_core::setup::SetupResult], dry_run: bool) {
+    if !output::is_tty() {
+        if dry_run {
+            output::section("Dry run — no files will be modified");
+            ftui_runtime::ftui_println!("");
+        }
+        for result in results {
+            output::section(&result.platform);
+            for action in &result.actions {
+                ftui_runtime::ftui_println!("  {} — {}", action.file_path, action.outcome);
+                if !action.description.is_empty() {
+                    ftui_runtime::ftui_println!("    {}", action.description);
+                }
+            }
+        }
+        return;
+    }
+
+    let _ = mcp_agent_mail_server::theme::init_console_theme();
+    let reset = mcp_agent_mail_server::theme::RESET;
+    let dim = mcp_agent_mail_server::theme::DIM;
+    let border = mcp_agent_mail_server::theme::secondary_bold();
+    let heading = mcp_agent_mail_server::theme::primary_bold();
+    let label = mcp_agent_mail_server::theme::text_bold();
+    let path = mcp_agent_mail_server::theme::accent();
+    let note = mcp_agent_mail_server::theme::warning_bold();
+    let muted = mcp_agent_mail_server::theme::muted();
+
+    ftui_runtime::ftui_println!(
+        "{border}╭─ 🧰 Agent MCP Configuration Sync ───────────────────────────────────────────────╮{reset}"
+    );
+    if dry_run {
+        ftui_runtime::ftui_println!(
+            "{border}│{reset} {note}Dry run{reset} {dim}— no files will be modified{reset}"
+        );
+        ftui_runtime::ftui_println!("{border}│{reset}");
+    }
+
+    for (platform_index, result) in results.iter().enumerate() {
+        ftui_runtime::ftui_println!(
+            "{border}│{reset} {heading}◈{reset} {label}{}{reset}",
+            result.platform
+        );
+        for action in &result.actions {
+            let (icon, icon_color) = setup_action_style(&action.outcome);
+            ftui_runtime::ftui_println!(
+                "{border}│{reset}   {icon_color}{icon}{reset} {dim}{:<14}{reset} {path}{}{reset}",
+                action.outcome,
+                action.file_path
+            );
+            if !action.description.is_empty() {
+                ftui_runtime::ftui_println!(
+                    "{border}│{reset}      {muted}{}{reset}",
+                    action.description
+                );
+            }
+        }
+        if platform_index + 1 < results.len() {
+            ftui_runtime::ftui_println!("{border}│{reset}");
+        }
+    }
+    ftui_runtime::ftui_println!(
+        "{border}╰──────────────────────────────────────────────────────────────────────────────────╯{reset}"
+    );
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -10090,34 +10291,37 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
-            let rows = outcome_to_result(
-                mcp_agent_mail_db::queries::search_messages(
+            let mut search_query =
+                mcp_agent_mail_db::search_planner::SearchQuery::messages(&query, pid);
+            search_query.limit = Some(limit.max(0) as usize);
+
+            let response = outcome_to_result(
+                mcp_agent_mail_db::search_service::execute_search_simple(
                     &cx,
                     &ctx.pool,
-                    pid,
-                    &query,
-                    limit.max(0) as usize,
+                    &search_query,
                 )
                 .await,
             )?;
 
-            if rows.is_empty() {
+            if response.results.is_empty() {
                 output::emit_empty(fmt, "No results.");
                 return Ok(());
             }
 
             // Build serializable data for JSON/TOON
-            let data: Vec<serde_json::Value> = rows
+            let data: Vec<serde_json::Value> = response
+                .results
                 .iter()
                 .map(|r| {
                     serde_json::json!({
                         "id": r.id,
-                        "subject": r.subject,
+                        "subject": r.title,
                         "importance": r.importance,
-                        "ack_required": r.ack_required != 0,
-                        "created_ts": mcp_agent_mail_db::micros_to_iso(r.created_ts),
+                        "ack_required": r.ack_required.unwrap_or(false),
+                        "created_ts": r.created_ts.map(mcp_agent_mail_db::micros_to_iso),
                         "thread_id": r.thread_id,
-                        "from": r.from,
+                        "from": r.from_agent,
                     })
                 })
                 .collect();
@@ -10125,13 +10329,15 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             output::emit_output(&data, fmt, || {
                 let mut table =
                     output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
-                for r in &rows {
+                for r in &response.results {
                     table.add_row(vec![
                         r.id.to_string(),
-                        r.from.clone(),
-                        truncate_str(&r.subject, 50),
-                        r.importance.clone(),
-                        context::format_ts_short(r.created_ts),
+                        r.from_agent.clone().unwrap_or_default(),
+                        truncate_str(&r.title, 50),
+                        r.importance.clone().unwrap_or_default(),
+                        r.created_ts
+                            .map(context::format_ts_short)
+                            .unwrap_or_default(),
                     ]);
                 }
                 table.render();
@@ -20618,6 +20824,58 @@ mod tests {
     }
 
     #[test]
+    fn query_preflight_banner_stats_batched_reads_expected_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("preflight_banner.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY)")
+            .expect("create projects");
+        conn.execute_raw("CREATE TABLE agents(id INTEGER PRIMARY KEY)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create messages");
+        conn.execute_raw("CREATE TABLE file_reservations(id INTEGER PRIMARY KEY)")
+            .expect("create file_reservations");
+        conn.execute_raw("CREATE TABLE agent_links(id INTEGER PRIMARY KEY)")
+            .expect("create agent_links");
+
+        conn.execute_raw("INSERT INTO projects(id) VALUES (1), (2)")
+            .expect("seed projects");
+        conn.execute_raw("INSERT INTO agents(id) VALUES (1)")
+            .expect("seed agents");
+        conn.execute_raw("INSERT INTO messages(id) VALUES (1), (2), (3)")
+            .expect("seed messages");
+        conn.execute_raw("INSERT INTO file_reservations(id) VALUES (1)")
+            .expect("seed file_reservations");
+        conn.execute_raw("INSERT INTO agent_links(id) VALUES (1), (2)")
+            .expect("seed agent_links");
+
+        let stats =
+            query_preflight_banner_stats_batched(&conn).expect("batched preflight stats query");
+        assert_eq!(stats.projects, 2);
+        assert_eq!(stats.agents, 1);
+        assert_eq!(stats.messages, 3);
+        assert_eq!(stats.file_reservations, 1);
+        assert_eq!(stats.contact_links, 2);
+    }
+
+    #[test]
+    fn query_preflight_banner_stats_batched_returns_none_on_missing_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("preflight_banner_missing.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY)")
+            .expect("create projects");
+        // Intentionally omit the other required tables to trigger a graceful
+        // batched-query miss so callers can fallback to per-table probes.
+        assert!(query_preflight_banner_stats_batched(&conn).is_none());
+    }
+
+    #[test]
     fn sqlite_corruption_error_message_detection_includes_no_backup_marker() {
         assert!(is_sqlite_corruption_error_message(
             "database file tmp/storage.sqlite3 is malformed and no healthy backup was found"
@@ -24759,14 +25017,6 @@ async fn handle_products_with(
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let Some(sanitized) = mcp_agent_mail_db::queries::sanitize_fts_query(&query) else {
-                output::emit_empty(
-                    fmt,
-                    &format!("Query '{query}' cannot produce search results."),
-                );
-                return Ok(());
-            };
-
             let prod = get_product_by_key(cx, pool, product_key.trim())
                 .await?
                 .ok_or_else(|| {
@@ -24774,113 +25024,29 @@ async fn handle_products_with(
                     CliError::ExitCode(2)
                 })?;
             let prod_id = prod.id.unwrap_or(0);
-            let projects =
-                match mcp_agent_mail_db::queries::list_product_projects(cx, pool, prod_id).await {
-                    asupersync::Outcome::Ok(v) => v,
-                    asupersync::Outcome::Err(e) => {
-                        return Err(CliError::Other(format!("project list failed: {e}")));
-                    }
-                    asupersync::Outcome::Cancelled(_) => {
-                        return Err(CliError::Other("request cancelled".to_string()));
-                    }
-                    asupersync::Outcome::Panicked(p) => {
-                        return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                    }
-                };
-            let project_ids = projects.iter().filter_map(|p| p.id).collect::<Vec<_>>();
-            if project_ids.is_empty() {
-                output::emit_empty(fmt, "No results.");
-                return Ok(());
-            }
+            let mut search_query =
+                mcp_agent_mail_db::search_planner::SearchQuery::product_messages(&query, prod_id);
+            search_query.limit = Some(limit.max(0) as usize);
 
-            use mcp_agent_mail_db::sqlmodel::Value;
-            let conn = match pool.acquire(cx).await {
-                asupersync::Outcome::Ok(c) => c,
-                asupersync::Outcome::Err(e) => {
-                    return Err(CliError::Other(format!("db acquire failed: {e}")));
-                }
-                asupersync::Outcome::Cancelled(_) => {
-                    return Err(CliError::Other("request cancelled".to_string()));
-                }
-                asupersync::Outcome::Panicked(p) => {
-                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                }
-            };
+            let response = outcome_to_result(
+                mcp_agent_mail_db::search_service::execute_search_simple(cx, pool, &search_query)
+                    .await,
+            )?;
+            let out: Vec<serde_json::Value> = response
+                .results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "project_id": r.project_id.unwrap_or(0),
+                        "id": r.id,
+                        "subject": r.title,
+                        "from": r.from_agent.clone().unwrap_or_default(),
+                        "created_ts": r.created_ts.map(mcp_agent_mail_db::micros_to_iso),
+                    })
+                })
+                .collect();
 
-            let limit_i64 = limit.max(0);
-            let placeholders = std::iter::repeat_n("?", project_ids.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            // Try FTS query first, fall back to LIKE if FTS table doesn't exist
-            let fts_sql = format!(
-                "SELECT m.id, m.subject, m.created_ts, a.name AS sender_name, m.project_id \
-                 FROM fts_messages \
-                 JOIN messages m ON m.id = fts_messages.message_id \
-                 JOIN agents a ON a.id = m.sender_id \
-                 WHERE m.project_id IN ({placeholders}) AND fts_messages MATCH ? \
-                 ORDER BY bm25(fts_messages) ASC, m.id ASC \
-                 LIMIT ?"
-            );
-            let mut fts_params: Vec<Value> =
-                project_ids.iter().copied().map(Value::BigInt).collect();
-            fts_params.push(Value::Text(sanitized.clone()));
-            fts_params.push(Value::BigInt(limit_i64));
-
-            let rows = match conn.query_sync(&fts_sql, &fts_params) {
-                Ok(r) => r,
-                Err(_) => {
-                    // FTS query failed (likely fts_messages table doesn't exist), try LIKE fallback
-                    let terms = mcp_agent_mail_db::queries::extract_like_terms(&query, 5);
-                    if terms.is_empty() {
-                        Vec::new()
-                    } else {
-                        // Build LIKE query
-                        let mut like_parts = Vec::new();
-                        let mut like_params: Vec<Value> =
-                            project_ids.iter().copied().map(Value::BigInt).collect();
-                        for term in &terms {
-                            let escaped =
-                                format!("%{}%", mcp_agent_mail_db::queries::like_escape(term));
-                            like_parts.push(
-                                "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')"
-                                    .to_string(),
-                            );
-                            like_params.push(Value::Text(escaped.clone()));
-                            like_params.push(Value::Text(escaped));
-                        }
-                        like_params.push(Value::BigInt(limit_i64));
-                        let like_clause = like_parts.join(" AND ");
-                        let like_sql = format!(
-                            "SELECT m.id, m.subject, m.created_ts, a.name AS sender_name, m.project_id \
-                             FROM messages m \
-                             JOIN agents a ON a.id = m.sender_id \
-                             WHERE m.project_id IN ({placeholders}) AND {like_clause} \
-                             ORDER BY m.id ASC \
-                             LIMIT ?"
-                        );
-                        conn.query_sync(&like_sql, &like_params).unwrap_or_default()
-                    }
-                }
-            };
-
-            let mut out = Vec::new();
-            for r in rows {
-                let id: i64 = r.get_named("id").unwrap_or(0);
-                let subject: String = r.get_named("subject").unwrap_or_default();
-                let from: String = r.get_named("sender_name").unwrap_or_default();
-                let project_id: i64 = r.get_named("project_id").unwrap_or(0);
-                let created_ts: i64 = r.get_named("created_ts").unwrap_or(0);
-                out.push(serde_json::json!({
-                    "project_id": project_id,
-                    "id": id,
-                    "subject": subject,
-                    "from": from,
-                    "created_ts": mcp_agent_mail_db::micros_to_iso(created_ts),
-                }));
-            }
-
-            if out.is_empty() {
+            if response.results.is_empty() {
                 output::emit_empty(fmt, "No results.");
                 return Ok(());
             }

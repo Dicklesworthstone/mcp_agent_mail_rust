@@ -70,7 +70,7 @@ impl ProjectsScreen {
             prev_totals: (0, 0, 0, 0),
             detail_visible: true,
             detail_scroll: 0,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

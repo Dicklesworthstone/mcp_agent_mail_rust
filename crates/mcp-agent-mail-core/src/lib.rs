@@ -28,6 +28,7 @@ pub mod metrics;
 pub mod models;
 pub mod paths;
 pub mod pattern_overlap;
+pub mod search_types;
 pub mod setup;
 pub mod slo;
 pub mod test_harness;
@@ -87,5 +88,12 @@ pub use models::{
     ProductProjectLink, Project, ProjectSiblingSuggestion, VALID_ADJECTIVES, VALID_NOUNS,
     detect_agent_name_mistake, generate_agent_name, is_valid_agent_name, looks_like_model_name,
     looks_like_program_name, looks_like_unix_username,
+};
+pub use search_types::{
+    DateRange, DocChange, DocId, DocKind, Document, ExplainComposerConfig, ExplainReasonCode,
+    ExplainReport, ExplainStage, ExplainVerbosity, HighlightRange, HitExplanation,
+    ImportanceFilter, ScoreFactor, SearchFilter, SearchHit, SearchMode, SearchQuery, SearchResults,
+    StageExplanation, StageScoreInput, compose_explain_report, compose_hit_explanation,
+    factor_sort_cmp, missing_stage, redact_hit_explanation, redact_report_for_docs,
 };
 pub use slo::{OpClass, PoolHealth};

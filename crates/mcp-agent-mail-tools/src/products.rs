@@ -273,10 +273,10 @@ pub struct ProductSearchResponse {
     pub diagnostics: Option<crate::search::SearchDiagnostics>,
 }
 
-/// Full-text search across all projects linked to a product.
+/// Search across all projects linked to a product.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
-    description = "Full-text search across all projects linked to a product.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\ncursor : str\n    Stable pagination cursor for large result sets.\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id }], assistance?, next_cursor?, diagnostics? }"
+    description = "Search across all projects linked to a product using the unified Search V3 service.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\ncursor : str\n    Stable pagination cursor for large result sets.\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id }], assistance?, next_cursor?, diagnostics? }"
 )]
 pub async fn search_messages_product(
     ctx: &McpContext,
@@ -386,7 +386,7 @@ pub async fn search_messages_product(
         ..Default::default()
     };
 
-    // Try the planner path first; fall back to legacy product search if unavailable
+    // Product search always routes through the unified Search V3 service.
     let planner_response = db_outcome_to_mcp_result(
         mcp_agent_mail_db::search_service::execute_search_simple(ctx.cx(), &pool, &search_query)
             .await,

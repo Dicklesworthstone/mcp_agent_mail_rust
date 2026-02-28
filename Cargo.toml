@@ -78,7 +78,7 @@ minijinja = "2.15.1"
 ammonia = "4.1.2"
 regex = "1"
 similar = "2"
-git2 = "0.20"
+git2 = { version = "0.20", features = ["vendored-libgit2"] }
 glob = "0.3.3"
 globset = "0.4"
 tracing = "0.1"

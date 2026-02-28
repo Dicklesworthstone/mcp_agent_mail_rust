@@ -431,6 +431,7 @@ PYTHON_DETECTED=0
 PYTHON_DB_FOUND=0
 PYTHON_DB_PATH=""
 PYTHON_DB_MIGRATED_PATH=""
+MIGRATED_BEARER_TOKEN=""
 
 # T1.1: Detect Python am alias in shell rc files
 detect_python_alias() {

@@ -830,9 +830,12 @@ impl FileLock {
                     } else {
                         50 * (1u64 << attempt.min(4))
                     };
-                    let jitter_range = base_ms / 2 + 1; // ±25% of base
+                    let jitter_range = base_ms / 2 + 1; // 50% range for ±25%
                     let jitter = thread_jitter_ms(jitter_range);
-                    let sleep_ms = base_ms.saturating_add(jitter).max(10);
+                    let sleep_ms = base_ms
+                        .saturating_sub(base_ms / 4)
+                        .saturating_add(jitter)
+                        .max(10);
                     std::thread::sleep(Duration::from_millis(sleep_ms));
                 }
             }
@@ -1420,7 +1423,8 @@ pub struct CommitCoalescer {
     /// Per-repo queues, lazily created on first enqueue.
     repos: Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
     /// Condvar to wake workers when work is available.
-    work_cv: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// Stores wake tokens to avoid dropping concurrent wakeups.
+    work_cv: Arc<(Mutex<u64>, std::sync::Condvar)>,
     /// Signal workers to shut down.
     shutdown: Arc<AtomicBool>,
     /// Global stats (backward-compatible aggregate view).
@@ -1437,6 +1441,9 @@ pub struct CommitCoalescer {
 /// This is the maximum time a commit request waits before being processed.
 /// Under sustained load, workers drain all pending requests every interval.
 pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 50;
+/// Guardrail against accidental zero-duration flush intervals.
+const MIN_COALESCER_FLUSH_MS: u64 = 5;
+const MIN_COALESCER_FLUSH_INTERVAL: Duration = Duration::from_millis(MIN_COALESCER_FLUSH_MS);
 
 const COALESCER_MAX_BATCH_SIZE: usize = 10;
 const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
@@ -1449,6 +1456,11 @@ const COALESCER_SPILL_PATH_CAP: usize = 4_096;
 const COALESCER_SPILL_MESSAGE_CAP: usize = 32;
 const COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS: usize = 120;
 
+#[inline]
+fn clamp_coalescer_flush_interval(interval: Duration) -> Duration {
+    interval.max(MIN_COALESCER_FLUSH_INTERVAL)
+}
+
 /// Auto-detect worker count: `min(available_parallelism, COALESCER_MAX_WORKERS)`, minimum 2.
 fn coalescer_worker_count() -> usize {
     std::thread::available_parallelism()
@@ -1460,12 +1472,13 @@ fn coalescer_worker_count() -> usize {
 impl CommitCoalescer {
     /// Create a new coalescer and spawn the worker pool.
     pub fn new(flush_interval: Duration) -> Self {
+        let flush_interval = clamp_coalescer_flush_interval(flush_interval);
         let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
         let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
         let pending_requests = Arc::new(AtomicU64::new(0));
         let repos: Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let work_cv = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let work_cv = Arc::new((Mutex::new(0_u64), std::sync::Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let worker_count = coalescer_worker_count();
@@ -1662,8 +1675,8 @@ impl CommitCoalescer {
         // Wake a worker
         let (lock, cvar) = &*self.work_cv;
         {
-            let mut ready = lock.lock().unwrap_or_else(|e| e.into_inner());
-            *ready = true;
+            let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *wake_tokens = wake_tokens.saturating_add(1);
         }
         cvar.notify_one();
     }
@@ -1679,8 +1692,8 @@ impl CommitCoalescer {
             // Wake all workers
             {
                 let (lock, cvar) = &*self.work_cv;
-                let mut ready = lock.lock().unwrap_or_else(|e| e.into_inner());
-                *ready = true;
+                let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *wake_tokens = wake_tokens.saturating_add(self.worker_count as u64);
                 cvar.notify_all();
             }
 
@@ -1759,7 +1772,7 @@ impl Drop for CommitCoalescer {
 /// Worker thread for the per-repo commit coalescer pool.
 ///
 /// Strategy:
-/// 1. Wait on condvar (with flush_interval timeout)
+/// 1. Wait on condvar (with a bounded idle timeout as a safety probe)
 /// 2. Scan all repos; pick the one with lowest last_serviced_us that has depth > 0
 ///    and is not currently being processed by another worker (CAS lock)
 /// 3. Drain its queue + spill (up to batch size)
@@ -1769,25 +1782,34 @@ impl Drop for CommitCoalescer {
 /// 7. Repeat
 fn coalescer_pool_worker(
     repos: Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
-    work_cv: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    work_cv: Arc<(Mutex<u64>, std::sync::Condvar)>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<CommitQueueStats>>,
     batch_sizes: Arc<Mutex<VecDeque<usize>>>,
     pending_requests: Arc<AtomicU64>,
     flush_interval: Duration,
 ) {
+    // Reduce idle wakeups while keeping periodic safety probes in case a
+    // notification is lost under extreme contention.
+    let idle_wait = flush_interval.max(Duration::from_secs(1));
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
 
-        // Phase 1: Wait for work or timeout
+        // Phase 1: Wait for work
         {
             let (lock, cvar) = &*work_cv;
-            let ready = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let _guard = cvar
-                .wait_timeout(ready, flush_interval)
-                .unwrap_or_else(|e| e.into_inner());
+            let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while *wake_tokens == 0 && !shutdown.load(Ordering::Relaxed) {
+                let (guard, _) = cvar
+                    .wait_timeout(wake_tokens, idle_wait)
+                    .unwrap_or_else(|e| e.into_inner());
+                wake_tokens = guard;
+            }
+            if *wake_tokens > 0 {
+                *wake_tokens -= 1;
+            }
         }
 
         if shutdown.load(Ordering::Relaxed) {
@@ -1873,8 +1895,9 @@ fn coalescer_pool_worker(
             batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
 
         if drained_count == 0 {
-            // Nothing found to process. Depth should now be perfectly synchronized.
-            std::thread::sleep(Duration::from_millis(1));
+            // Defensive self-heal: if depth and queue contents diverge, reconcile
+            // once here to avoid repeatedly selecting an empty repo.
+            let _ = coalescer_reconcile_repo_depth(&rq);
         }
 
         // Phase 4: Commit
@@ -1956,8 +1979,8 @@ fn coalescer_pool_worker(
         if more_work {
             let (lock, cvar) = &*work_cv;
             {
-                let mut ready = lock.lock().unwrap_or_else(|e| e.into_inner());
-                *ready = true;
+                let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *wake_tokens = wake_tokens.saturating_add(1);
             }
             cvar.notify_one();
         }
@@ -2009,6 +2032,21 @@ fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<Coales
         message_first_lines: repo.message_first_lines.into_iter().collect(),
         message_total: repo.message_total,
     })
+}
+
+/// Recompute and store the true per-repo queue depth.
+fn coalescer_reconcile_repo_depth(rq: &RepoQueue) -> u64 {
+    let queue_depth = {
+        let queue = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+        u64::try_from(queue.len()).unwrap_or(u64::MAX)
+    };
+    let spill_depth = {
+        let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        spill.inner.as_ref().map_or(0, |repo| repo.pending_requests)
+    };
+    let actual = queue_depth.saturating_add(spill_depth);
+    rq.depth.store(actual, Ordering::Relaxed);
+    actual
 }
 
 fn coalescer_commit_spilled_work(
@@ -2925,9 +2963,14 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
     }
 
     let mut result = HealResult::default();
+    let mut metadata_candidates: Vec<PathBuf> = Vec::new();
 
-    // Walk looking for .lock files
-    fn walk_for_locks(dir: &Path, result: &mut HealResult) -> std::io::Result<()> {
+    // Single recursive walk: track lock files and collect metadata paths.
+    fn walk_once(
+        dir: &Path,
+        result: &mut HealResult,
+        metadata_candidates: &mut Vec<PathBuf>,
+    ) -> std::io::Result<()> {
         if !dir.is_dir() {
             return Ok(());
         }
@@ -2940,7 +2983,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             }
             let path = entry.path();
             if file_type.is_dir() {
-                walk_for_locks(&path, result)?;
+                walk_once(&path, result, metadata_candidates)?;
             } else if file_type.is_file() && path.extension().is_some_and(|e| e == "lock") {
                 result.locks_scanned += 1;
 
@@ -2970,44 +3013,33 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                         }
                     }
                 }
-            }
-        }
-        Ok(())
-    }
-
-    walk_for_locks(root, &mut result)?;
-
-    // Clean orphaned metadata files (no matching lock)
-    fn walk_for_orphaned_meta(dir: &Path, result: &mut HealResult) -> std::io::Result<()> {
-        if !dir.is_dir() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                // Avoid recursing into symlink loops or scanning outside the archive root.
-                continue;
-            }
-            let path = entry.path();
-            if file_type.is_dir() {
-                walk_for_orphaned_meta(&path, result)?;
             } else if file_type.is_file() {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 if name.ends_with(".lock.owner.json") {
-                    let lock_name = &name[..name.len() - ".owner.json".len()];
-                    let lock_candidate = path.parent().unwrap_or(dir).join(lock_name);
-                    if !lock_candidate.exists() {
-                        let _ = fs::remove_file(&path);
-                        result.metadata_removed.push(path.display().to_string());
-                    }
+                    metadata_candidates.push(path);
                 }
             }
         }
         Ok(())
     }
 
-    walk_for_orphaned_meta(root, &mut result)?;
+    walk_once(root, &mut result, &mut metadata_candidates)?;
+
+    // Clean orphaned metadata files (no matching lock) without re-walking.
+    for path in metadata_candidates {
+        if !path.exists() {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let lock_name = &name[..name.len() - ".owner.json".len()];
+        let lock_candidate = parent.join(lock_name);
+        if !lock_candidate.exists() && fs::remove_file(&path).is_ok() {
+            result.metadata_removed.push(path.display().to_string());
+        }
+    }
 
     Ok(result)
 }
@@ -6348,13 +6380,27 @@ pub fn check_archive_consistency(
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
         // We check both the computed path and do a directory scan fallback
         // because the subject slug can vary.
+        //
+        // After `doctor reconstruct`, DB IDs may have been remapped from
+        // canonical frontmatter IDs, so the `__{id}.md` suffix in the
+        // filename might not match the current DB row ID. To avoid
+        // false-positive "missing" reports, we also accept any `.md` file
+        // that matches the ISO timestamp prefix alone.
+        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/10
         let found_file = if messages_dir.is_dir() {
             let id_suffix = format!("__{}.md", msg.message_id);
             match std::fs::read_dir(&messages_dir) {
                 Ok(entries) => entries.flatten().any(|entry| {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-                    name_str.starts_with(iso_prefix) && name_str.ends_with(&id_suffix)
+                    // Primary match: timestamp prefix + exact DB ID suffix
+                    if name_str.starts_with(iso_prefix) && name_str.ends_with(&id_suffix) {
+                        return true;
+                    }
+                    // Fallback: timestamp prefix + any .md suffix (covers
+                    // post-reconstruct ID drift where archive still has the
+                    // canonical ID)
+                    name_str.starts_with(iso_prefix) && name_str.ends_with(".md")
                 }),
                 Err(_) => false,
             }
@@ -6433,6 +6479,20 @@ mod tests {
             .build()
             .expect("build runtime");
         rt.block_on(f(cx))
+    }
+
+    #[test]
+    fn coalescer_flush_interval_clamps_zero_duration() {
+        assert_eq!(
+            clamp_coalescer_flush_interval(Duration::ZERO),
+            MIN_COALESCER_FLUSH_INTERVAL
+        );
+    }
+
+    #[test]
+    fn coalescer_flush_interval_preserves_reasonable_values() {
+        let interval = Duration::from_millis(50);
+        assert_eq!(clamp_coalescer_flush_interval(interval), interval);
     }
 
     fn unique_human_key(prefix: &str) -> String {
@@ -10895,7 +10955,10 @@ This is a test message from the Python version.
 
         // Verify the file exists and is readable
         let content = fs::read_to_string(msg_dir.join(filename)).unwrap();
-        assert!(content.contains("---json"), "should have JSON frontmatter marker");
+        assert!(
+            content.contains("---json"),
+            "should have JSON frontmatter marker"
+        );
 
         // Extract and parse JSON frontmatter
         let json_start = content.find("---json\n").unwrap() + 8;
@@ -10907,7 +10970,12 @@ This is a test message from the Python version.
         assert_eq!(parsed["id"], 1081);
         assert_eq!(parsed["thread_id"], "PORT-PLAN");
         assert_eq!(parsed["importance"], "high");
-        assert!(parsed["to"].as_array().unwrap().contains(&serde_json::json!("FuchsiaForge")));
+        assert!(
+            parsed["to"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("FuchsiaForge"))
+        );
     }
 
     /// Verify Python-format file reservation JSON is parseable by Rust.
@@ -11044,11 +11112,7 @@ Thanks for setting this up! Let me know how I can help.
 
 Test body.
 "#;
-        fs::write(
-            msg_dir.join("2026-02-15T10-00-00Z__test__100.md"),
-            bundle,
-        )
-        .unwrap();
+        fs::write(msg_dir.join("2026-02-15T10-00-00Z__test__100.md"), bundle).unwrap();
 
         // Check consistency — the message should be found
         let refs = vec![ConsistencyMessageRef {
@@ -11068,7 +11132,11 @@ Test body.
     #[test]
     fn compat_python_sha1_reservation_artifact_parseable() {
         let dir = TempDir::new().unwrap();
-        let res_dir = dir.path().join("projects").join("test-proj").join("file_reservations");
+        let res_dir = dir
+            .path()
+            .join("projects")
+            .join("test-proj")
+            .join("file_reservations");
         fs::create_dir_all(&res_dir).unwrap();
 
         // Python uses SHA1 of path pattern as filename

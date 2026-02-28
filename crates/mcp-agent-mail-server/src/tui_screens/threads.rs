@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use asupersync::Outcome;
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
@@ -41,6 +42,7 @@ use crate::tui_widgets::{MermaidThreadMessage, generate_thread_flow_mermaid};
 
 /// Max threads to fetch.
 const MAX_THREADS: usize = 500;
+const MAX_THREAD_FILTER_IDS: usize = 400;
 
 /// Periodic refresh interval in seconds.
 const REFRESH_INTERVAL_SECS: u64 = 5;
@@ -533,7 +535,7 @@ impl ThreadExplorerScreen {
             last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
             detail_visible: true,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 
@@ -601,8 +603,13 @@ impl ThreadExplorerScreen {
         let Some(conn) = &self.db_conn else {
             return;
         };
-
-        self.threads = fetch_threads(conn, &self.filter_text, MAX_THREADS);
+        let text_match_thread_ids = resolve_text_filter_thread_ids(&self.filter_text);
+        self.threads = fetch_threads(
+            conn,
+            &self.filter_text,
+            text_match_thread_ids.as_ref(),
+            MAX_THREADS,
+        );
         self.apply_sort();
         self.last_refresh = Some(Instant::now());
         self.list_dirty = false;
@@ -1020,14 +1027,14 @@ impl ThreadExplorerScreen {
         let block = Block::bordered()
             .title(title.as_str())
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+            .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+            .style(Style::default().bg(tp.panel_bg));
         let inner = block.inner(area);
         block.render(area, frame);
 
         if inner.width < 4 || inner.height < 4 {
             return;
         }
-        clear_rect(frame, inner, tp.panel_bg);
 
         let mermaid_messages = self.thread_mermaid_messages();
         let source = generate_thread_flow_mermaid(&mermaid_messages);
@@ -1822,16 +1829,36 @@ impl MailScreen for ThreadExplorerScreen {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Fetch thread summaries grouped by `thread_id`, sorted by last activity.
-fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary> {
-    let (filter_clause, params) = if filter.is_empty() {
-        (String::new(), Vec::new())
-    } else {
+fn fetch_threads(
+    conn: &DbConn,
+    filter: &str,
+    text_match_thread_ids: Option<&HashSet<String>>,
+    limit: usize,
+) -> Vec<ThreadSummary> {
+    let mut predicates = Vec::new();
+    let mut params = Vec::new();
+
+    if !filter.is_empty() {
         let like_term = format!("%{filter}%");
-        let clause = "WHERE m.thread_id LIKE ? \
-             OR m.subject LIKE ? \
-             OR a_sender.name LIKE ?";
-        let p = Value::Text(like_term);
-        (clause.to_string(), vec![p.clone(), p.clone(), p])
+        predicates.push("(m.thread_id LIKE ? OR a_sender.name LIKE ?)".to_string());
+        params.push(Value::Text(like_term.clone()));
+        params.push(Value::Text(like_term));
+    }
+
+    if let Some(thread_ids) = text_match_thread_ids
+        && !thread_ids.is_empty()
+    {
+        let mut ids: Vec<String> = thread_ids.iter().cloned().collect();
+        ids.sort_unstable();
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        predicates.push(format!("m.thread_id IN ({placeholders})"));
+        params.extend(ids.into_iter().map(Value::Text));
+    }
+
+    let filter_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", predicates.join(" OR "))
     };
 
     let sql = format!(
@@ -1930,6 +1957,60 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
     }
 
     threads
+}
+
+fn resolve_text_filter_thread_ids(filter: &str) -> Option<HashSet<String>> {
+    let trimmed = filter.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let pool_cfg = DbPoolConfig::from_env();
+    let pool = match mcp_agent_mail_db::create_pool(&pool_cfg) {
+        Ok(pool) => pool,
+        Err(err) => {
+            tracing::warn!("thread filter search pool init failed: {err}");
+            return None;
+        }
+    };
+    let runtime = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::warn!("thread filter search runtime init failed: {err}");
+            return None;
+        }
+    };
+    let cx = asupersync::Cx::for_request();
+
+    let mut query = mcp_agent_mail_db::search_planner::SearchQuery::default();
+    query.text = trimmed.to_string();
+    query.doc_kind = mcp_agent_mail_db::search_planner::DocKind::Message;
+    query.ranking = mcp_agent_mail_db::search_planner::RankingMode::Recency;
+    query.limit = Some(MAX_THREAD_FILTER_IDS);
+
+    let outcome = runtime.block_on(async {
+        mcp_agent_mail_db::search_service::execute_search_simple(&cx, &pool, &query).await
+    });
+
+    match outcome {
+        Outcome::Ok(response) => Some(
+            response
+                .results
+                .into_iter()
+                .filter_map(|row| row.thread_id)
+                .filter(|thread_id| !thread_id.is_empty())
+                .collect(),
+        ),
+        Outcome::Err(err) => {
+            tracing::warn!("thread filter search query failed: {err}");
+            None
+        }
+        Outcome::Cancelled(_) => None,
+        Outcome::Panicked(err) => {
+            tracing::warn!("thread filter search query panicked: {err}");
+            None
+        }
+    }
 }
 
 /// Get the total count of messages in a thread.
@@ -2124,15 +2205,14 @@ fn render_thread_list(
     let block = Block::bordered()
         .title(title.as_str())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    // Clear interior cells each frame to avoid stale glyphs from previous layouts.
-    clear_rect(frame, inner, tp.panel_bg);
 
     // Use full inner area to maximize density and reduce wasted space.
     let content_inner = if inner.width >= THREAD_LIST_SIDE_PADDING_MIN_WIDTH {
@@ -2487,15 +2567,14 @@ fn render_thread_detail(
     let block = Block::bordered()
         .title(title.as_str())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    // Clear interior cells each frame to avoid stale tree/border glyph artifacts.
-    clear_rect(frame, inner, tp.panel_bg);
     // Use full inner area to maximize density and reduce wasted space.
     let content_inner = if inner.width >= THREAD_DETAIL_SIDE_PADDING_MIN_WIDTH {
         Rect::new(

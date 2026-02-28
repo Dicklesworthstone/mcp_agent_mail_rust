@@ -725,8 +725,8 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
 }
 
 fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
-    // Only initialize if V3 (Lexical/Hybrid) or Shadow mode is enabled.
-    // This avoids creating the index directory if the user sticks to Legacy FTS5.
+    // Only initialize when lexical-capable modes are active.
+    // This avoids creating the index directory when lexical retrieval is disabled.
     let rollout = &config.search_rollout;
     let uses_v3 = rollout.engine.uses_lexical()
         || rollout.surface_overrides.values().any(|e| e.uses_lexical());
@@ -1518,6 +1518,8 @@ fn run_http_server_thread(
         // Match `run_http`: isolate requests so one bad connection cannot
         // starve the entire HTTP surface.
         .worker_threads(resolve_http_runtime_worker_threads())
+        // Keep worker parking explicit to guard against upstream default drift.
+        .enable_parking(true)
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 
@@ -2470,7 +2472,16 @@ impl StartupDashboard {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_console_input_worker(self: &Arc<Self>) {
+        const INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+        const INPUT_DRAIN_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+        const INPUT_ERROR_BACKOFF: Duration = Duration::from_millis(25);
+        const INPUT_EMPTY_READY_STREAK_LIMIT: usize = 8;
+        const INPUT_EMPTY_READY_BACKOFF: Duration = Duration::from_millis(2);
+        const INPUT_DRAIN_CAP_STREAK_LIMIT: usize = 3;
+        const INPUT_DRAIN_CAP_BACKOFF: Duration = Duration::from_millis(1);
+
         if !lock_mutex(&self.console_layout).interactive_enabled || !std::io::stdin().is_terminal()
         {
             return;
@@ -2498,16 +2509,56 @@ impl StartupDashboard {
                     "Console layout keys: +/- or Up/Down (height), t/b (anchor), a (auto-size), i/l (split request), [/ ] (split ratio), ? (help)",
                 );
 
+                let mut poll_error_reported = false;
+                let mut read_error_reported = false;
+                let mut empty_ready_streak = 0usize;
+                let mut drain_cap_streak = 0usize;
+
                 while !this.stop.load(Ordering::Relaxed) {
-                    if !backend
-                        .poll_event(std::time::Duration::from_millis(100))
-                        .unwrap_or(false)
-                    {
+                    let ready = match backend.poll_event(INPUT_POLL_TIMEOUT) {
+                        Ok(ready) => {
+                            poll_error_reported = false;
+                            ready
+                        }
+                        Err(err) => {
+                            if !poll_error_reported {
+                                this.log_line(&format!(
+                                    "Console interactive mode: poll_event failed ({err}); retrying with backoff"
+                                ));
+                                poll_error_reported = true;
+                            }
+                            std::thread::sleep(INPUT_ERROR_BACKOFF);
+                            continue;
+                        }
+                    };
+                    if !ready {
+                        empty_ready_streak = 0;
                         continue;
                     }
 
                     let mut drained_events = 0usize;
-                    while let Ok(Some(event)) = backend.read_event() {
+                    let mut saw_event = false;
+                    let mut hit_drain_cap = false;
+                    loop {
+                        let event = match backend.read_event() {
+                            Ok(Some(event)) => {
+                                read_error_reported = false;
+                                saw_event = true;
+                                event
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                if !read_error_reported {
+                                    this.log_line(&format!(
+                                        "Console interactive mode: read_event failed ({err}); retrying with backoff"
+                                    ));
+                                    read_error_reported = true;
+                                }
+                                std::thread::sleep(INPUT_ERROR_BACKOFF);
+                                break;
+                            }
+                        };
+
                         let term_size = backend.size().unwrap_or((80, 24));
                         if this.handle_console_event(term_size, &event) {
                             break;
@@ -2516,15 +2567,47 @@ impl StartupDashboard {
                         if drained_events >= 128 {
                             // Bound one drain cycle so a hot terminal event stream cannot
                             // monopolize CPU and starve HTTP/tool work.
+                            hit_drain_cap = true;
+                            break;
+                        }
+                        match backend.poll_event(INPUT_DRAIN_POLL_TIMEOUT) {
+                            Ok(true) => {
+                                poll_error_reported = false;
+                            }
+                            Ok(false) => break,
+                            Err(err) => {
+                                if !poll_error_reported {
+                                    this.log_line(&format!(
+                                        "Console interactive mode: drain poll failed ({err}); retrying with backoff"
+                                    ));
+                                    poll_error_reported = true;
+                                }
+                                std::thread::sleep(INPUT_ERROR_BACKOFF);
+                                break;
+                            }
+                        }
+                    }
+
+                    if saw_event {
+                        empty_ready_streak = 0;
+                    } else {
+                        empty_ready_streak = empty_ready_streak.saturating_add(1);
+                        if empty_ready_streak >= INPUT_EMPTY_READY_STREAK_LIMIT {
+                            std::thread::sleep(INPUT_EMPTY_READY_BACKOFF);
+                            empty_ready_streak = 0;
+                        }
+                    }
+
+                    if hit_drain_cap {
+                        drain_cap_streak = drain_cap_streak.saturating_add(1);
+                        if drain_cap_streak >= INPUT_DRAIN_CAP_STREAK_LIMIT {
+                            std::thread::sleep(INPUT_DRAIN_CAP_BACKOFF);
+                            drain_cap_streak = 0;
+                        } else {
                             std::thread::yield_now();
-                            break;
                         }
-                        if !backend
-                            .poll_event(std::time::Duration::from_millis(1))
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
+                    } else {
+                        drain_cap_streak = 0;
                     }
                 }
                 drop(backend);
@@ -4695,13 +4778,18 @@ impl HttpState {
         }
 
         // Rate limiting (memory + optional Redis backend)
+        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/16
         if self.config.http_rate_limit_enabled {
             let (rpm, burst) = rate_limits_for(&self.config, kind);
             let identity = rate_limit_identity(req, jwt_sub.as_deref());
             let endpoint = tool_name.as_deref().unwrap_or("*");
             let key = format!("{kind}:{endpoint}:{identity}");
 
-            if !self.consume_rate_limit(&key, rpm, burst).await {
+            let allowed = self.consume_rate_limit(&key, rpm, burst).await;
+            mcp_agent_mail_core::global_metrics()
+                .http
+                .record_rate_limit_check(allowed);
+            if !allowed {
                 return Some(self.error_response(req, 429, "Rate limit exceeded"));
             }
         }

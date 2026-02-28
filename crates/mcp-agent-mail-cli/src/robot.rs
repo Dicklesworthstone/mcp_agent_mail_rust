@@ -5,6 +5,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use asupersync::Outcome;
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -727,13 +728,12 @@ impl RobotSubcommand {
 use mcp_agent_mail_db::DbConn;
 
 /// Resolve a project by slug or human_key.
-///
-/// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
 fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliError> {
+    let key = key.trim();
     // Try slug first
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE slug LIKE ?",
+            "SELECT id, slug FROM projects WHERE lower(slug) = lower(?)",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
@@ -747,7 +747,7 @@ fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliEr
     // Try human_key
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE human_key LIKE ?",
+            "SELECT id, slug FROM projects WHERE human_key = ?",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
@@ -791,8 +791,6 @@ fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), C
 }
 
 /// Resolve agent ID from --agent flag or AGENT_MAIL_AGENT/AGENT_NAME env vars.
-///
-/// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
 fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Option<(i64, String)> {
     let name = flag
         .map(str::trim)
@@ -812,13 +810,16 @@ fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Optio
         })?;
     let rows = conn
         .query_sync(
-            "SELECT id, name FROM agents WHERE project_id = ? AND name LIKE ?",
+            "SELECT id, name
+             FROM agents
+             WHERE project_id = ? AND lower(name) = lower(?)
+             LIMIT 1",
             &[Value::BigInt(project_id), Value::Text(name)],
         )
         .ok()?;
     let row = rows.first()?;
-    let id: i64 = row.get_as(0).ok()?;
-    let agent_name: String = row.get_as(1).ok()?;
+    let id: i64 = row.get_named("id").ok().or_else(|| row.get_as(0).ok())?;
+    let agent_name: String = row.get_named("name").ok().or_else(|| row.get_as(1).ok())?;
     if id > 0 { Some((id, agent_name)) } else { None }
 }
 
@@ -1160,7 +1161,7 @@ fn build_inbox(
                 Value::BigInt(ack_threshold),
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
-                Value::BigInt(limit as i64),
+                Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),
             ],
         )
         .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
@@ -1283,7 +1284,7 @@ fn build_outbox_entries(
             &[
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
-                Value::BigInt(limit as i64),
+                Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),
             ],
         )
         .map_err(|e| CliError::Other(format!("outbox query failed: {e}")))?;
@@ -1455,7 +1456,7 @@ fn build_thread(
     }
 
     let limit_val = limit.unwrap_or(200);
-    params.push(Value::BigInt(limit_val as i64));
+    params.push(Value::BigInt(limit_val.try_into().unwrap_or(i64::MAX)));
 
     let where_clause = conditions.join(" AND ");
     let sql = format!(
@@ -1819,23 +1820,8 @@ fn build_search(
     since: Option<&str>,
     limit: usize,
 ) -> Result<SearchData, CliError> {
-    let now_us = mcp_agent_mail_db::now_micros();
-
-    // Sanitize the FTS query
-    let sanitized = match mcp_agent_mail_db::queries::sanitize_fts_query(query) {
-        Some(s) => s,
-        None => {
-            return Ok(SearchData {
-                query: query.to_string(),
-                total_results: 0,
-                results: vec![],
-                by_thread: vec![],
-                by_agent: vec![],
-                by_importance: vec![],
-            });
-        }
-    };
-    if sanitized.is_empty() {
+    let raw_query = query.trim();
+    if raw_query.is_empty() {
         return Ok(SearchData {
             query: query.to_string(),
             total_results: 0,
@@ -1846,92 +1832,43 @@ fn build_search(
         });
     }
 
-    // Build additional WHERE conditions shared by FTS and LIKE fallback.
-    let mut extra_where = String::new();
-    let mut filter_params: Vec<Value> = Vec::new();
+    let now_us = mcp_agent_mail_db::now_micros();
+    let mut search_query =
+        mcp_agent_mail_db::search_planner::SearchQuery::messages(raw_query.to_string(), project_id);
+    search_query.limit = Some(limit);
 
-    if let Some(kind) = kind_filter {
-        extra_where
-            .push_str(" AND m.id IN (SELECT message_id FROM message_recipients WHERE kind = ?)");
-        filter_params.push(Value::Text(kind.to_string()));
+    if let Some(imp) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        let parsed = mcp_agent_mail_db::search_planner::Importance::parse(imp);
+        let Some(parsed) = parsed else {
+            return Ok(SearchData {
+                query: query.to_string(),
+                total_results: 0,
+                results: vec![],
+                by_thread: vec![],
+                by_agent: vec![],
+                by_importance: vec![],
+            });
+        };
+        search_query.importance = vec![parsed];
     }
-    if let Some(imp) = importance_filter {
-        extra_where.push_str(" AND m.importance = ?");
-        filter_params.push(Value::Text(imp.to_string()));
-    }
-    if let Some(since_str) = since {
+
+    if let Some(since_str) = since.map(str::trim).filter(|s| !s.is_empty()) {
         let since_us = parse_since_micros(since_str)?;
-        extra_where.push_str(" AND m.created_ts > ?");
-        filter_params.push(Value::BigInt(since_us));
+        search_query.time_range = mcp_agent_mail_db::search_planner::TimeRange {
+            min_ts: Some(since_us),
+            max_ts: None,
+        };
     }
 
-    let fts_sql = format!(
-        "SELECT m.id, m.subject, m.thread_id, m.importance, m.created_ts,
-                a.name AS sender_name,
-                snippet(fts_messages, 1, '»', '«', '…', 20) AS snippet
-         FROM fts_messages
-         JOIN messages m ON fts_messages.rowid = m.id
-         JOIN agents a ON a.id = m.sender_id
-         WHERE fts_messages MATCH ? AND m.project_id = ?
-         {extra_where}
-         ORDER BY bm25(fts_messages)
-         LIMIT ?"
-    );
-
-    let mut fts_params: Vec<Value> = Vec::with_capacity(filter_params.len() + 3);
-    fts_params.push(Value::Text(sanitized.clone()));
-    fts_params.push(Value::BigInt(project_id));
-    fts_params.extend(filter_params.iter().cloned());
-    fts_params.push(Value::BigInt(limit as i64));
-
-    let rows = match conn.query_sync(&fts_sql, &fts_params) {
-        Ok(rows) => rows,
-        Err(fts_err) => {
-            // Runtime DBs intentionally use base schema (no FTS tables). Degrade to LIKE automatically.
-            let terms = mcp_agent_mail_db::queries::extract_like_terms(query, 5);
-            if terms.is_empty() {
-                Vec::new()
-            } else {
-                let mut like_params: Vec<Value> =
-                    Vec::with_capacity(filter_params.len() + terms.len() * 2 + 2);
-                like_params.push(Value::BigInt(project_id));
-                like_params.extend(filter_params.iter().cloned());
-
-                let mut like_parts: Vec<String> = Vec::with_capacity(terms.len());
-                for term in terms {
-                    let escaped = format!("%{}%", mcp_agent_mail_db::queries::like_escape(&term));
-                    like_parts.push(
-                        "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')"
-                            .to_string(),
-                    );
-                    like_params.push(Value::Text(escaped.clone()));
-                    like_params.push(Value::Text(escaped));
-                }
-                like_params.push(Value::BigInt(limit as i64));
-                let like_clause = like_parts.join(" OR ");
-
-                let like_sql = format!(
-                    "SELECT m.id, m.subject, m.thread_id, m.importance, m.created_ts,
-                            a.name AS sender_name,
-                            CASE
-                                WHEN length(trim(COALESCE(m.body_md, ''))) > 0 THEN substr(m.body_md, 1, 220)
-                                ELSE substr(m.subject, 1, 220)
-                            END AS snippet
-                     FROM messages m
-                     JOIN agents a ON a.id = m.sender_id
-                     WHERE m.project_id = ? {extra_where}
-                     AND ({like_clause})
-                     ORDER BY m.created_ts DESC, m.id DESC
-                     LIMIT ?"
-                );
-                conn.query_sync(&like_sql, &like_params)
-                    .map_err(|like_err| {
-                        CliError::Other(format!(
-                            "search query failed: fts_error={fts_err}; like_error={like_err}"
-                        ))
-                    })?
-            }
-        }
+    let response = run_robot_search_query(&search_query)?;
+    let recipient_kind = kind_filter.map(str::trim).filter(|s| !s.is_empty());
+    let kind_id_filter = match recipient_kind {
+        Some(kind) => Some(search_message_ids_by_recipient_kind(
+            conn,
+            kind,
+            &response.results,
+        )?),
+        None => None,
     };
 
     // Build results and facets
@@ -1943,26 +1880,40 @@ fn build_search(
     let mut importance_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
-    for row in &rows {
-        let msg_id: i64 = row.get_named("id").unwrap_or(0);
-        let subject: String = row.get_named("subject").unwrap_or_default();
-        let thread_id: String = row.get_named("thread_id").unwrap_or_default();
-        let importance: String = row.get_named("importance").unwrap_or_default();
-        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
-        let sender: String = row.get_named("sender_name").unwrap_or_default();
-        let snippet: String = row.get_named("snippet").unwrap_or_default();
+    for row in response.results {
+        if let Some(filter_ids) = &kind_id_filter
+            && !filter_ids.contains(&row.id)
+        {
+            continue;
+        }
 
-        // Aggregate facets
+        let subject = row.title;
+        let thread_id = row.thread_id.unwrap_or_default();
+        let importance = row.importance.unwrap_or_else(|| "normal".to_string());
+        let created_ts = row.created_ts.unwrap_or(0);
+        let sender = row.from_agent.unwrap_or_default();
+        let snippet_source = if row.body.is_empty() {
+            subject.clone()
+        } else {
+            row.body
+        };
+        let snippet = truncate_str(&snippet_source, 220);
+
         if !thread_id.is_empty() {
             *thread_counts.entry(thread_id.clone()).or_insert(0) += 1;
         }
         *agent_counts.entry(sender.clone()).or_insert(0) += 1;
         *importance_counts.entry(importance.clone()).or_insert(0) += 1;
 
-        let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
+        let age_seconds = if created_ts > 0 {
+            now_us.saturating_sub(created_ts) / 1_000_000
+        } else {
+            0
+        };
+
         results.push(SearchResult {
-            id: msg_id,
-            relevance: 0.0, // bm25 returns negative scores; normalize later if needed
+            id: row.id,
+            relevance: row.score.unwrap_or(0.0),
             from: sender,
             subject,
             thread: thread_id,
@@ -1999,6 +1950,63 @@ fn build_search(
         by_agent,
         by_importance,
     })
+}
+
+fn run_robot_search_query(
+    query: &mcp_agent_mail_db::search_planner::SearchQuery,
+) -> Result<mcp_agent_mail_db::search_planner::SearchResponse, CliError> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let pool = mcp_agent_mail_db::create_pool(&cfg)
+        .map_err(|e| CliError::Other(format!("failed to initialize DB pool for search: {e}")))?;
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| CliError::Other(format!("failed to build async runtime for search: {e}")))?;
+    let cx = asupersync::Cx::for_request();
+
+    match runtime.block_on(async {
+        mcp_agent_mail_db::search_service::execute_search_simple(&cx, &pool, query).await
+    }) {
+        Outcome::Ok(resp) => Ok(resp),
+        Outcome::Err(e) => Err(CliError::Other(format!("search query failed: {e}"))),
+        Outcome::Cancelled(_) => Err(CliError::Other("search request cancelled".to_string())),
+        Outcome::Panicked(p) => Err(CliError::Other(format!("search request panicked: {p}"))),
+    }
+}
+
+fn search_message_ids_by_recipient_kind(
+    conn: &DbConn,
+    kind: &str,
+    results: &[mcp_agent_mail_db::search_planner::SearchResult],
+) -> Result<std::collections::HashSet<i64>, CliError> {
+    if results.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let mut ids = Vec::with_capacity(results.len());
+    for result in results {
+        ids.push(result.id);
+    }
+
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT DISTINCT message_id FROM message_recipients \
+         WHERE kind = ? AND message_id IN ({placeholders})"
+    );
+
+    let mut params = Vec::with_capacity(ids.len() + 1);
+    params.push(Value::Text(kind.to_string()));
+    params.extend(ids.into_iter().map(Value::BigInt));
+
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|e| CliError::Other(format!("kind filter query failed: {e}")))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        if let Ok(id) = row.get_named::<i64>("message_id") {
+            out.insert(id);
+        }
+    }
+    Ok(out)
 }
 
 // ── Reservations command implementation ─────────────────────────────────────

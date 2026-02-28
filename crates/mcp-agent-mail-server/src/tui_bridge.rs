@@ -1176,7 +1176,7 @@ mod tests {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         let gen_before = state.data_generation();
-        state.push_event(crate::tui_events::MailEvent::ServerStarted {
+        let _ = state.push_event(crate::tui_events::MailEvent::ServerStarted {
             seq: 0,
             timestamp_micros: 1,
             source: crate::tui_events::EventSource::Lifecycle,
@@ -1241,5 +1241,137 @@ mod tests {
         assert!(flags.console_log, "console_log should be dirty");
         assert!(!flags.db_stats, "db_stats should be clean");
         assert!(!flags.requests, "requests should be clean");
+    }
+
+    // ── D2: dirty-state invalidation tests (br-legjy.4.2) ──────────
+
+    #[test]
+    fn stale_sentinel_produces_all_dirty_flags() {
+        let stale = crate::tui_screens::DataGeneration::stale();
+        let fresh = crate::tui_screens::DataGeneration::default();
+        let flags = crate::tui_screens::dirty_since(&stale, &fresh);
+        assert!(flags.events, "stale→fresh: events should be dirty");
+        assert!(flags.console_log, "stale→fresh: console_log should be dirty");
+        assert!(flags.db_stats, "stale→fresh: db_stats should be dirty");
+        assert!(flags.requests, "stale→fresh: requests should be dirty");
+        assert!(flags.any(), "stale→fresh: any() must be true");
+    }
+
+    #[test]
+    fn dirty_flags_all_returns_all_dirty() {
+        let flags = crate::tui_screens::DirtyFlags::all();
+        assert!(flags.events);
+        assert!(flags.console_log);
+        assert!(flags.db_stats);
+        assert!(flags.requests);
+        assert!(flags.any());
+    }
+
+    #[test]
+    fn dirty_flags_default_returns_all_clean() {
+        let flags = crate::tui_screens::DirtyFlags::default();
+        assert!(!flags.events);
+        assert!(!flags.console_log);
+        assert!(!flags.db_stats);
+        assert!(!flags.requests);
+        assert!(!flags.any());
+    }
+
+    #[test]
+    fn dirty_since_events_only() {
+        let prev = crate::tui_screens::DataGeneration::default();
+        let curr = crate::tui_screens::DataGeneration {
+            event_total_pushed: 1,
+            ..Default::default()
+        };
+        let flags = crate::tui_screens::dirty_since(&prev, &curr);
+        assert!(flags.events);
+        assert!(!flags.console_log);
+        assert!(!flags.db_stats);
+        assert!(!flags.requests);
+    }
+
+    #[test]
+    fn dirty_since_db_stats_only() {
+        let prev = crate::tui_screens::DataGeneration::default();
+        let curr = crate::tui_screens::DataGeneration {
+            db_stats_gen: 42,
+            ..Default::default()
+        };
+        let flags = crate::tui_screens::dirty_since(&prev, &curr);
+        assert!(!flags.events);
+        assert!(!flags.console_log);
+        assert!(flags.db_stats);
+        assert!(!flags.requests);
+    }
+
+    #[test]
+    fn dirty_since_requests_only() {
+        let prev = crate::tui_screens::DataGeneration::default();
+        let curr = crate::tui_screens::DataGeneration {
+            request_gen: 7,
+            ..Default::default()
+        };
+        let flags = crate::tui_screens::dirty_since(&prev, &curr);
+        assert!(!flags.events);
+        assert!(!flags.console_log);
+        assert!(!flags.db_stats);
+        assert!(flags.requests);
+    }
+
+    #[test]
+    fn dirty_since_multiple_channels_simultaneously() {
+        let prev = crate::tui_screens::DataGeneration::default();
+        let curr = crate::tui_screens::DataGeneration {
+            event_total_pushed: 5,
+            console_log_seq: 3,
+            db_stats_gen: 0,
+            request_gen: 0,
+        };
+        let flags = crate::tui_screens::dirty_since(&prev, &curr);
+        assert!(flags.events);
+        assert!(flags.console_log);
+        assert!(!flags.db_stats);
+        assert!(!flags.requests);
+        assert!(flags.any());
+    }
+
+    #[test]
+    fn dirty_since_identical_generations_are_clean() {
+        let snapshot = crate::tui_screens::DataGeneration {
+            event_total_pushed: 10,
+            console_log_seq: 20,
+            db_stats_gen: 30,
+            request_gen: 40,
+        };
+        let flags = crate::tui_screens::dirty_since(&snapshot, &snapshot);
+        assert!(!flags.any(), "identical generations must yield all-clean");
+    }
+
+    #[test]
+    fn dirty_since_resets_after_snapshot_update() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        // Take initial snapshot
+        let gen1 = state.data_generation();
+        // Mutate console log
+        state.push_console_log("line-1".into());
+        let gen2 = state.data_generation();
+
+        // gen1→gen2: console_log dirty
+        let flags = crate::tui_screens::dirty_since(&gen1, &gen2);
+        assert!(flags.console_log);
+
+        // gen2→gen2: nothing changed since we snapshotted
+        let flags2 = crate::tui_screens::dirty_since(&gen2, &gen2);
+        assert!(!flags2.any(), "after snapshot update, should be clean");
+    }
+
+    #[test]
+    fn stale_sentinel_differs_from_default() {
+        let stale = crate::tui_screens::DataGeneration::stale();
+        let default = crate::tui_screens::DataGeneration::default();
+        assert_ne!(stale, default, "stale must differ from default");
     }
 }

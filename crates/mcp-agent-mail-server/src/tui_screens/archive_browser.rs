@@ -258,7 +258,7 @@ impl ArchiveBrowserScreen {
             selected_project: None,
             last_refresh_tick: 0,
             detail_visible: true,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 

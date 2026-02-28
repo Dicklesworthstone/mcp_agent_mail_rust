@@ -81,6 +81,10 @@ fn monitor_loop(config: &Config) {
         );
     }
 
+    // Track memory pressure for post-spike trim.
+    let mem_sample = mcp_agent_mail_core::memory::sample_and_record(config);
+    let mut last_memory_pressure = mem_sample.pressure;
+
     loop {
         // Sleep in small increments to allow quick shutdown.
         let mut remaining = interval;
@@ -113,6 +117,22 @@ fn monitor_loop(config: &Config) {
             );
             last_pressure = pressure;
         }
+
+        // Sample memory and attempt post-spike reclaim.
+        // When memory pressure drops from Warning/Critical back to Ok,
+        // call malloc_trim to release retained allocator pages to the OS.
+        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/15
+        let mem_sample = mcp_agent_mail_core::memory::sample_and_record(config);
+        let mem_pressure = mem_sample.pressure;
+        if last_memory_pressure != mem_pressure {
+            tracing::info!(
+                from = last_memory_pressure.label(),
+                to = mem_pressure.label(),
+                rss_bytes = mem_sample.rss_bytes,
+                "memory pressure level changed"
+            );
+        }
+        last_memory_pressure = mem_pressure;
     }
 }
 

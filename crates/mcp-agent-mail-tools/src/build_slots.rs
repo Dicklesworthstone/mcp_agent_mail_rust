@@ -88,6 +88,8 @@ fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> V
         };
         let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts) else {
             // Ignore malformed leases: invalid expiration should not block slots forever.
+            // Clean it up to prevent unlimited file accumulation.
+            let _ = std::fs::remove_file(&path);
             continue;
         };
         if exp.with_timezone(&chrono::Utc) <= now {
@@ -240,7 +242,7 @@ pub async fn renew_build_slot(
     let active = read_active_leases(&slot_path, now);
 
     for mut current in active {
-        if current.agent == agent_name {
+        if current.agent == agent_name && current.released_ts.is_none() {
             let holder_id = safe_component(&format!(
                 "{}__{}",
                 current.agent,
@@ -303,6 +305,10 @@ pub async fn release_build_slot(
 
     for mut lease in active {
         if lease.agent == agent_name {
+            if lease.released_ts.is_some() {
+                released = true;
+                continue;
+            }
             let holder_id = safe_component(&format!(
                 "{}__{}",
                 lease.agent,

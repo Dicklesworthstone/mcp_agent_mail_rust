@@ -238,6 +238,7 @@ PRAGMA journal_mode = 'DELETE';
 pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;
 PRAGMA cache_size = -8192;
@@ -272,6 +273,7 @@ pub fn build_conn_pragmas(max_connections: usize) -> String {
         "\
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;
 PRAGMA cache_size = -{per_conn_kb};

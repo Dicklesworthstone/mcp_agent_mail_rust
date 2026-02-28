@@ -4,18 +4,20 @@
 //! (FTS5-based `search_planner` + `search_service`) and the Tantivy-based
 //! search engine in `mcp-agent-mail-search-core`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
+use crate::search_filter_compiler::compile_filters;
+use crate::search_response::{self as lexical_response, ResponseConfig};
+use crate::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
 use mcp_agent_mail_core::metrics::global_metrics;
-use mcp_agent_mail_search_core::filter_compiler::compile_filters;
-use mcp_agent_mail_search_core::lexical_parser::{LexicalParser, ParseOutcome, extract_terms};
-use mcp_agent_mail_search_core::lexical_response::{self, ResponseConfig};
-use mcp_agent_mail_search_core::query::{DateRange, ImportanceFilter, SearchFilter};
-use mcp_agent_mail_search_core::results::SearchResults;
-use mcp_agent_mail_search_core::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
-use tantivy::Index;
+use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilter, SearchResults};
+use sqlmodel_core::Value;
+use tantivy::{Index, Term};
 
+use crate::DbConn;
 use crate::search_planner::{
     DocKind, Importance, SearchQuery as PlannerQuery, SearchResult as PlannerResult,
 };
@@ -202,10 +204,10 @@ fn build_search_filter(query: &PlannerQuery) -> SearchFilter {
 
     // Doc kind
     let doc_kind = match query.doc_kind {
-        DocKind::Message => mcp_agent_mail_search_core::document::DocKind::Message,
-        DocKind::Agent => mcp_agent_mail_search_core::document::DocKind::Agent,
-        DocKind::Project => mcp_agent_mail_search_core::document::DocKind::Project,
-        DocKind::Thread => mcp_agent_mail_search_core::document::DocKind::Thread,
+        DocKind::Message => mcp_agent_mail_core::DocKind::Message,
+        DocKind::Agent => mcp_agent_mail_core::DocKind::Agent,
+        DocKind::Project => mcp_agent_mail_core::DocKind::Project,
+        DocKind::Thread => mcp_agent_mail_core::DocKind::Thread,
     };
     filter.doc_kind = Some(doc_kind);
 
@@ -285,8 +287,8 @@ static BRIDGE: OnceLock<Option<Arc<TantivyBridge>>> = OnceLock::new();
 /// Should be called once at startup when `SearchEngine::Tantivy` or `Shadow`
 /// is configured. Returns `Ok(())` on success.
 pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
+    use crate::search_cache::WarmResource;
     use crate::search_service::{record_warmup, record_warmup_failure, record_warmup_start};
-    use mcp_agent_mail_search_core::cache::WarmResource;
 
     record_warmup_start(WarmResource::LexicalIndex);
     let warmup_timer = std::time::Instant::now();
@@ -326,6 +328,76 @@ pub struct IndexableMessage {
     pub created_ts: i64,
 }
 
+fn add_indexable_message(
+    writer: &mut tantivy::IndexWriter,
+    handles: &FieldHandles,
+    msg: &IndexableMessage,
+) -> Result<(), String> {
+    let id_u64 =
+        u64::try_from(msg.id).map_err(|_| format!("message id must be non-negative: {}", msg.id))?;
+    let project_id_u64 = u64::try_from(msg.project_id)
+        .map_err(|_| format!("project id must be non-negative: {}", msg.project_id))?;
+
+    writer
+        .add_document(tantivy::doc!(
+            handles.id => id_u64,
+            handles.doc_kind => "message",
+            handles.subject => msg.subject.as_str(),
+            handles.body => msg.body_md.as_str(),
+            handles.sender => msg.sender_name.as_str(),
+            handles.project_slug => msg.project_slug.as_str(),
+            handles.project_id => project_id_u64,
+            handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
+            handles.importance => msg.importance.as_str(),
+            handles.created_ts => msg.created_ts
+        ))
+        .map_err(|e| format!("Tantivy add_document error: {e}"))?;
+
+    Ok(())
+}
+
+fn upsert_indexable_message(
+    writer: &mut tantivy::IndexWriter,
+    handles: &FieldHandles,
+    msg: &IndexableMessage,
+) -> Result<(), String> {
+    let id_u64 =
+        u64::try_from(msg.id).map_err(|_| format!("message id must be non-negative: {}", msg.id))?;
+    writer.delete_term(Term::from_field_u64(handles.id, id_u64));
+    add_indexable_message(writer, handles, msg)
+}
+
+fn refresh_index_health_metrics(bridge: &TantivyBridge) {
+    let doc_count = bridge
+        .index()
+        .reader()
+        .map_or(0, |reader| reader.searcher().num_docs());
+    let index_size_bytes = measure_index_dir_bytes(bridge.index_dir());
+    mcp_agent_mail_core::metrics::global_metrics()
+        .search
+        .update_index_health(index_size_bytes, doc_count);
+}
+
+fn lookup_cached_text(
+    conn: &DbConn,
+    cache: &mut HashMap<i64, String>,
+    key: i64,
+    sql: &str,
+) -> Result<String, String> {
+    if let Some(value) = cache.get(&key) {
+        return Ok(value.clone());
+    }
+    let rows = conn
+        .query_sync(sql, &[Value::BigInt(key)])
+        .map_err(|e| format!("backfill lookup failed: {e}"))?;
+    let value = rows
+        .first()
+        .and_then(|r| r.get_named::<String>("value").ok())
+        .unwrap_or_default();
+    cache.insert(key, value.clone());
+    Ok(value)
+}
+
 /// Index a single message into the global Tantivy bridge.
 ///
 /// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
@@ -343,44 +415,17 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
         .index()
         .writer(15_000_000)
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
-
-    #[allow(clippy::cast_sign_loss)]
-    let id_u64 = msg.id as u64;
-    #[allow(clippy::cast_sign_loss)]
-    let project_id_u64 = msg.project_id as u64;
-
-    writer
-        .add_document(tantivy::doc!(
-            handles.id => id_u64,
-            handles.doc_kind => "message",
-            handles.subject => msg.subject.as_str(),
-            handles.body => msg.body_md.as_str(),
-            handles.sender => msg.sender_name.as_str(),
-            handles.project_slug => msg.project_slug.as_str(),
-            handles.project_id => project_id_u64,
-            handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
-            handles.importance => msg.importance.as_str(),
-            handles.created_ts => msg.created_ts
-        ))
-        .map_err(|e| format!("Tantivy add_document error: {e}"))?;
+    upsert_indexable_message(&mut writer, handles, msg)?;
 
     writer
         .commit()
         .map_err(|e| format!("Tantivy commit error: {e}"))?;
 
-    // Update index health metrics.
-    let doc_count = bridge
-        .index()
-        .reader()
-        .map_or(0, |reader| reader.searcher().num_docs());
-    let index_size_bytes = measure_index_dir_bytes(bridge.index_dir());
-    mcp_agent_mail_core::metrics::global_metrics()
-        .search
-        .update_index_health(index_size_bytes, doc_count);
+    refresh_index_health_metrics(&bridge);
 
     // Invalidate search cache so new messages appear immediately.
     crate::search_service::invalidate_search_cache(
-        mcp_agent_mail_search_core::cache::InvalidationTrigger::IndexUpdate,
+        crate::search_cache::InvalidationTrigger::IndexUpdate,
     );
 
     Ok(true)
@@ -406,42 +451,17 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
 
     for msg in messages {
-        #[allow(clippy::cast_sign_loss)]
-        let id_u64 = msg.id as u64;
-        #[allow(clippy::cast_sign_loss)]
-        let project_id_u64 = msg.project_id as u64;
-
-        writer
-            .add_document(tantivy::doc!(
-                handles.id => id_u64,
-                handles.doc_kind => "message",
-                handles.subject => msg.subject.as_str(),
-                handles.body => msg.body_md.as_str(),
-                handles.sender => msg.sender_name.as_str(),
-                handles.project_slug => msg.project_slug.as_str(),
-                handles.project_id => project_id_u64,
-                handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
-                handles.importance => msg.importance.as_str(),
-                handles.created_ts => msg.created_ts
-            ))
-            .map_err(|e| format!("Tantivy add_document error: {e}"))?;
+        upsert_indexable_message(&mut writer, handles, msg)?;
     }
 
     writer
         .commit()
         .map_err(|e| format!("Tantivy commit error: {e}"))?;
 
-    let doc_count = bridge
-        .index()
-        .reader()
-        .map_or(0, |reader| reader.searcher().num_docs());
-    let index_size_bytes = measure_index_dir_bytes(bridge.index_dir());
-    mcp_agent_mail_core::metrics::global_metrics()
-        .search
-        .update_index_health(index_size_bytes, doc_count);
+    refresh_index_health_metrics(&bridge);
 
     crate::search_service::invalidate_search_cache(
-        mcp_agent_mail_search_core::cache::InvalidationTrigger::IndexUpdate,
+        crate::search_cache::InvalidationTrigger::IndexUpdate,
     );
 
     Ok(messages.len())
@@ -456,9 +476,10 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 /// everything. Skips documents that are already in the index (idempotent via
 /// doc-count watermark).
 ///
-/// Returns `(indexed_count, skipped_count)`.
+/// Returns `(indexed_count, skipped_count)` where `skipped_count` is always 0.
 pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
-    const BATCH_SIZE: usize = 500;
+    const FETCH_BATCH_SIZE: i64 = 500;
+    const COMMIT_EVERY_BATCHES: usize = 8;
 
     let Some(bridge) = get_bridge() else {
         return Ok((0, 0));
@@ -484,78 +505,98 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let conn = crate::open_sqlite_file_with_recovery(db_path)
         .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
 
-    // Count messages in DB.
-    let count_rows = conn
-        .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
-        .map_err(|e| format!("backfill: count query failed: {e}"))?;
-    let db_count = count_rows
-        .first()
-        .and_then(|r| r.get_named::<i64>("cnt").ok())
-        .unwrap_or(0);
+    let mut writer = bridge
+        .index()
+        .writer(15_000_000)
+        .map_err(|e| format!("Tantivy writer error: {e}"))?;
+    let handles = bridge.handles();
+    writer
+        .delete_all_documents()
+        .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
 
-    #[allow(clippy::cast_sign_loss)]
-    let db_count_u64 = db_count as u64;
+    // Paged reads avoid loading the full mailbox into memory during startup.
+    // Keep this query JOIN-free to avoid parity-cert fallback overhead on
+    // FrankenSQLite for join-heavy startup scans.
+    let sql = "SELECT id, project_id, sender_id, subject, body_md, \
+               thread_id, importance, created_ts \
+               FROM messages \
+               WHERE id > ? \
+               ORDER BY id \
+               LIMIT ?";
+    let mut sender_name_cache: HashMap<i64, String> = HashMap::new();
+    let mut project_slug_cache: HashMap<i64, String> = HashMap::new();
 
-    // If the index already has at least as many docs as the DB, skip.
-    if existing_count >= db_count_u64 {
-        tracing::info!(
-            existing_count,
-            db_count,
-            "backfill: index already up-to-date, skipping"
-        );
-        #[allow(clippy::cast_possible_truncation)]
-        return Ok((0, db_count_u64 as usize));
-    }
-
-    // Fetch all messages with sender name and project slug.
-    let sql = "SELECT m.id AS id, m.project_id AS project_id, \
-               p.slug AS slug, a.name AS sender_name, \
-               m.subject AS subject, m.body_md AS body_md, \
-               m.thread_id AS thread_id, m.importance AS importance, \
-               m.created_ts AS created_ts \
-               FROM messages m \
-               JOIN agents a ON a.id = m.sender_id \
-               JOIN projects p ON p.id = m.project_id \
-               ORDER BY m.id";
-    let rows = conn
-        .query_sync(sql, &[])
-        .map_err(|e| format!("backfill: query failed: {e}"))?;
-
-    let mut batch: Vec<IndexableMessage> = Vec::with_capacity(BATCH_SIZE);
+    let mut last_id = 0_i64;
+    let mut pending_batches = 0_usize;
     let mut total_indexed = 0_usize;
+    loop {
+        let rows = conn
+            .query_sync(
+                sql,
+                &[Value::BigInt(last_id), Value::BigInt(FETCH_BATCH_SIZE)],
+            )
+            .map_err(|e| format!("backfill: query failed: {e}"))?;
+        if rows.is_empty() {
+            break;
+        }
 
-    for row in &rows {
-        let msg = IndexableMessage {
-            id: row.get_as::<i64>(0).unwrap_or(0),
-            project_id: row.get_as::<i64>(1).unwrap_or(0),
-            project_slug: row.get_as::<String>(2).unwrap_or_default(),
-            sender_name: row.get_as::<String>(3).unwrap_or_default(),
-            subject: row.get_as::<String>(4).unwrap_or_default(),
-            body_md: row.get_as::<String>(5).unwrap_or_default(),
-            thread_id: row.get_as::<Option<String>>(6).unwrap_or_default(),
-            importance: row
-                .get_as::<String>(7)
-                .unwrap_or_else(|_| "normal".to_string()),
-            created_ts: row.get_as::<i64>(8).unwrap_or(0),
-        };
-        batch.push(msg);
+        for row in &rows {
+            let project_id = row.get_as::<i64>(1).unwrap_or(0);
+            let sender_id = row.get_as::<i64>(2).unwrap_or(0);
+            let project_slug = lookup_cached_text(
+                &conn,
+                &mut project_slug_cache,
+                project_id,
+                "SELECT slug AS value FROM projects WHERE id = ? LIMIT 1",
+            )?;
+            let sender_name = lookup_cached_text(
+                &conn,
+                &mut sender_name_cache,
+                sender_id,
+                "SELECT name AS value FROM agents WHERE id = ? LIMIT 1",
+            )?;
+            let msg = IndexableMessage {
+                id: row.get_as::<i64>(0).unwrap_or(0),
+                project_id,
+                project_slug,
+                sender_name,
+                subject: row.get_as::<String>(3).unwrap_or_default(),
+                body_md: row.get_as::<String>(4).unwrap_or_default(),
+                thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
+                importance: row
+                    .get_as::<String>(6)
+                    .unwrap_or_else(|_| "normal".to_string()),
+                created_ts: row.get_as::<i64>(7).unwrap_or(0),
+            };
+            add_indexable_message(&mut writer, handles, &msg)?;
+            total_indexed += 1;
+            if msg.id > last_id {
+                last_id = msg.id;
+            }
+        }
 
-        if batch.len() >= BATCH_SIZE {
-            total_indexed += index_messages_batch(&batch)?;
-            batch.clear();
+        pending_batches += 1;
+        if pending_batches >= COMMIT_EVERY_BATCHES {
+            writer
+                .commit()
+                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+            pending_batches = 0;
         }
     }
 
-    // Flush remaining batch.
-    if !batch.is_empty() {
-        total_indexed += index_messages_batch(&batch)?;
+    if pending_batches > 0 || total_indexed == 0 {
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
     }
+
+    refresh_index_health_metrics(&bridge);
+    crate::search_service::invalidate_search_cache(crate::search_cache::InvalidationTrigger::IndexUpdate);
 
     tracing::info!(
         total_indexed,
-        db_count,
         existing_count,
-        "backfill: Tantivy index populated from database"
+        "backfill: Tantivy index rebuilt from database"
     );
 
     Ok((total_indexed, 0))
@@ -754,10 +795,7 @@ mod tests {
     fn filter_default_query_has_message_doc_kind() {
         let query = PlannerQuery::messages("test", 1);
         let filter = build_search_filter(&query);
-        assert_eq!(
-            filter.doc_kind,
-            Some(mcp_agent_mail_search_core::document::DocKind::Message)
-        );
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Message));
         assert_eq!(filter.project_id, Some(1));
         assert!(filter.sender.is_none());
         assert!(filter.thread_id.is_none());
@@ -773,10 +811,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_search_filter(&query);
-        assert_eq!(
-            filter.doc_kind,
-            Some(mcp_agent_mail_search_core::document::DocKind::Agent)
-        );
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Agent));
     }
 
     #[test]
@@ -787,10 +822,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_search_filter(&query);
-        assert_eq!(
-            filter.doc_kind,
-            Some(mcp_agent_mail_search_core::document::DocKind::Project)
-        );
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Project));
     }
 
     #[test]
@@ -801,10 +833,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_search_filter(&query);
-        assert_eq!(
-            filter.doc_kind,
-            Some(mcp_agent_mail_search_core::document::DocKind::Thread)
-        );
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Thread));
     }
 
     #[test]
@@ -959,10 +988,8 @@ mod tests {
 
     // -- convert_results tests ---------------------------------------------
 
-    fn make_search_results(
-        hits: Vec<mcp_agent_mail_search_core::results::SearchHit>,
-    ) -> SearchResults {
-        use mcp_agent_mail_search_core::query::SearchMode;
+    fn make_search_results(hits: Vec<mcp_agent_mail_core::SearchHit>) -> SearchResults {
+        use mcp_agent_mail_core::SearchMode;
         SearchResults {
             total_count: hits.len(),
             hits,
@@ -977,9 +1004,9 @@ mod tests {
         score: f64,
         snippet: Option<&str>,
         metadata: std::collections::HashMap<String, serde_json::Value>,
-    ) -> mcp_agent_mail_search_core::results::SearchHit {
-        use mcp_agent_mail_search_core::document::DocKind as CoreDocKind;
-        mcp_agent_mail_search_core::results::SearchHit {
+    ) -> mcp_agent_mail_core::SearchHit {
+        use mcp_agent_mail_core::DocKind as CoreDocKind;
+        mcp_agent_mail_core::SearchHit {
             doc_id,
             doc_kind: CoreDocKind::Message,
             score,
@@ -1313,6 +1340,60 @@ mod tests {
     }
 
     #[test]
+    fn upsert_indexable_message_replaces_previous_document_by_id() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+
+        let first = make_indexable(99, "Legacy subject", "legacy token alpha");
+        let second = make_indexable(99, "Canonical subject", "canonical token beta");
+
+        upsert_indexable_message(&mut writer, handles, &first).unwrap();
+        upsert_indexable_message(&mut writer, handles, &second).unwrap();
+        writer.commit().unwrap();
+
+        let reader = bridge.index().reader().unwrap();
+        assert_eq!(
+            reader.searcher().num_docs(),
+            1,
+            "upsert must leave exactly one live document per id"
+        );
+
+        let beta_query = PlannerQuery {
+            text: "canonical token".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let beta_results = bridge.search(&beta_query);
+        assert_eq!(beta_results.len(), 1);
+        assert_eq!(beta_results[0].id, 99);
+        assert_eq!(beta_results[0].title, "Canonical subject");
+
+        let legacy_query = PlannerQuery {
+            text: "legacy token".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let legacy_results = bridge.search(&legacy_query);
+        assert!(legacy_results.is_empty(), "legacy document should be replaced");
+    }
+
+    #[test]
+    fn upsert_indexable_message_rejects_negative_id() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+
+        let mut invalid = make_indexable(1, "x", "y");
+        invalid.id = -1;
+
+        let result = upsert_indexable_message(&mut writer, handles, &invalid);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn indexable_message_no_thread_id() {
         let msg = IndexableMessage {
             id: 1,
@@ -1368,7 +1449,7 @@ mod tests {
     fn create_test_db(dir: &std::path::Path, messages: &[(i64, &str, &str, &str, &str)]) -> String {
         let db_path = dir.join("test.sqlite3");
         let path_str = db_path.to_str().unwrap();
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str).unwrap();
+        let conn = DbConn::open_file(path_str).unwrap();
 
         conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, \

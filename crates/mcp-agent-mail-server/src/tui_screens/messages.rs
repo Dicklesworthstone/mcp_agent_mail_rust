@@ -1,7 +1,7 @@
 //! Message Browser screen with search bar, results list, and detail panel.
 //!
-//! Provides full-text search across all messages via FTS5 and live event
-//! stream search.  Results are displayed in a split-pane layout with
+//! Provides unified Search V3 lookups across all messages plus live event
+//! stream merging. Results are displayed in a split-pane layout with
 //! keyboard-first navigation.
 
 use std::cell::{Cell, RefCell};
@@ -201,10 +201,8 @@ enum SearchMethod {
     None,
     /// Showing recent messages (empty query).
     Recent,
-    /// FTS5 full-text match.
-    Fts,
-    /// LIKE fallback (FTS returned no results).
-    LikeFallback,
+    /// Unified search service (lexical/semantic/hybrid routing).
+    Unified,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1088,7 +1086,7 @@ impl MessageBrowserScreen {
             last_search_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
             quick_reply_form: None,
             compose_form: None,
             detail_cache: RefCell::new(None),
@@ -1379,7 +1377,17 @@ impl MessageBrowserScreen {
 
         match result {
             Ok(_) => {
-                let to_summary = if payload.to.len() == 1 {
+                let to_summary = if payload.to.is_empty() {
+                    if let Some(first) = payload.cc.first() {
+                        if payload.cc.len() == 1 {
+                            format!("cc: {}", first)
+                        } else {
+                            format!("cc: {} (+{})", first, payload.cc.len() - 1)
+                        }
+                    } else {
+                        "undisclosed".to_string()
+                    }
+                } else if payload.to.len() == 1 {
                     payload.to[0].clone()
                 } else {
                     format!("{} (+{})", payload.to[0], payload.to.len() - 1)
@@ -2226,7 +2234,7 @@ impl MessageBrowserScreen {
         } else {
             self.last_search.clone_from(&query);
             let (r, t, m) =
-                search_messages_fts(conn, &query, MAX_RESULTS, project_filter, show_project);
+                search_messages_unified(conn, &query, MAX_RESULTS, project_filter, show_project);
             (r, t, m)
         };
         self.search_method = method;
@@ -2787,8 +2795,7 @@ impl MailScreen for MessageBrowserScreen {
         let method_label = match self.search_method {
             SearchMethod::None => "",
             SearchMethod::Recent => "recent",
-            SearchMethod::Fts => "FTS",
-            SearchMethod::LikeFallback => "LIKE",
+            SearchMethod::Unified => "search-v3",
         };
         let preset_label = if self.preset_index > 0 {
             self.active_preset().label
@@ -3174,127 +3181,163 @@ fn fetch_recent_messages(
     (results, total)
 }
 
-/// Full-text search using FTS5, returning results and the search method used.
+/// Unified message search, returning results and the search method used.
 ///
 /// If `project_filter` is Some, only search within that project (Local mode).
 /// Otherwise, search across all projects (Global mode).
-#[allow(clippy::too_many_lines)]
-fn search_messages_fts(
+fn search_messages_unified(
     conn: &DbConn,
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
     show_project: bool,
 ) -> (Vec<MessageEntry>, usize, SearchMethod) {
-    // Use the robust sanitizer from the DB crate
-    let sanitized = mcp_agent_mail_db::queries::sanitize_fts_query(query);
+    let project_id = project_filter.and_then(|slug| project_id_for_slug(conn, slug));
+    let mut search_query = mcp_agent_mail_db::search_planner::SearchQuery {
+        text: query.trim().to_string(),
+        doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
+        project_id,
+        limit: Some(limit),
+        ..Default::default()
+    };
+    // Messages screen expects newest-first ordering when scanning inbox content.
+    search_query.ranking = mcp_agent_mail_db::search_planner::RankingMode::Recency;
 
-    if let Some(fts_query) = sanitized {
-        // Build FTS query with parameters
-        let mut params = vec![Value::Text(fts_query)];
-        let project_condition = project_filter.map_or("", |slug| {
-            params.push(Value::Text(slug.to_string()));
-            "AND p.slug = ?"
-        });
-
-        let sql = format!(
-            "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
-             m.created_ts, \
-             a_sender.name AS sender_name, \
-             p.slug AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
-             FROM fts_messages fts \
-             JOIN messages m ON m.id = fts.message_id \
-             JOIN agents a_sender ON a_sender.id = m.sender_id \
-             JOIN projects p ON p.id = m.project_id \
-             LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-             LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-             WHERE fts_messages MATCH ? {project_condition} \
-             GROUP BY m.id \
-             ORDER BY rank \
-             LIMIT {limit}"
-        );
-
-        let rows_result = conn.query_sync(&sql, &params);
-        let results = rows_result.map_or_else(
-            |_| Vec::new(),
-            |rows| {
-                rows.into_iter()
-                    .filter_map(|row| {
-                        let created_ts = row.get_named::<i64>("created_ts").ok()?;
-                        Some(MessageEntry {
-                            id: row.get_named::<i64>("id").ok()?,
-                            subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
-                            from_agent: row
-                                .get_named::<String>("sender_name")
-                                .ok()
-                                .unwrap_or_default(),
-                            to_agents: row
-                                .get_named::<String>("to_agents")
-                                .ok()
-                                .unwrap_or_default(),
-                            project_slug: row
-                                .get_named::<String>("project_slug")
-                                .ok()
-                                .unwrap_or_default(),
-                            thread_id: row
-                                .get_named::<String>("thread_id")
-                                .ok()
-                                .unwrap_or_default(),
-                            timestamp_iso: micros_to_iso(created_ts),
-                            timestamp_micros: created_ts,
-                            body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
-                            importance: row
-                                .get_named::<String>("importance")
-                                .ok()
-                                .unwrap_or_else(|| "normal".to_string()),
-                            ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0)
-                                != 0,
-                            show_project,
-                        })
-                    })
-                    .collect()
-            },
-        );
-
-        if !results.is_empty() {
-            let total = results.len();
-            return (results, total, SearchMethod::Fts);
+    let response = match run_message_search_via_service(&search_query) {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!("messages screen unified search failed: {err}");
+            return (Vec::new(), 0, SearchMethod::Unified);
         }
+    };
+
+    let message_ids: Vec<i64> = response.results.iter().map(|r| r.id).collect();
+    let project_ids: Vec<i64> = response
+        .results
+        .iter()
+        .filter_map(|r| r.project_id)
+        .collect();
+    let recipient_map = recipient_names_by_message(conn, &message_ids);
+    let project_slug_map = project_slugs_by_id(conn, &project_ids);
+
+    let mut out = Vec::with_capacity(response.results.len());
+    for row in response.results {
+        let created_ts = row.created_ts.unwrap_or(0);
+        let project_slug = row
+            .project_id
+            .and_then(|pid| project_slug_map.get(&pid).cloned())
+            .unwrap_or_default();
+        out.push(MessageEntry {
+            id: row.id,
+            subject: row.title,
+            from_agent: row.from_agent.unwrap_or_default(),
+            to_agents: recipient_map.get(&row.id).cloned().unwrap_or_default(),
+            project_slug,
+            thread_id: row.thread_id.unwrap_or_default(),
+            timestamp_iso: micros_to_iso(created_ts),
+            timestamp_micros: created_ts,
+            body_md: row.body,
+            importance: row.importance.unwrap_or_else(|| "normal".to_string()),
+            ack_required: row.ack_required.unwrap_or(false),
+            show_project,
+        });
     }
 
-    // LIKE fallback
-    // Matches if query is substring of subject or body
-    let mut params = Vec::new();
-    let like_term = format!("%{query}%");
-    params.push(Value::Text(like_term.clone())); // subject
-    params.push(Value::Text(like_term)); // body
+    let total = out.len();
+    (out, total, SearchMethod::Unified)
+}
 
-    let like_where = project_filter.map_or("WHERE m.subject LIKE ? OR m.body_md LIKE ?", |slug| {
-        params.push(Value::Text(slug.to_string()));
-        "WHERE (m.subject LIKE ? OR m.body_md LIKE ?) AND p.slug = ?"
-    });
+fn run_message_search_via_service(
+    query: &mcp_agent_mail_db::search_planner::SearchQuery,
+) -> Result<mcp_agent_mail_db::search_planner::SearchResponse, String> {
+    let pool_cfg = DbPoolConfig::from_env();
+    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+        .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
+    let cx = Cx::for_request();
+    match block_on(mcp_agent_mail_db::search_service::execute_search_simple(
+        &cx, &pool, query,
+    )) {
+        asupersync::Outcome::Ok(resp) => Ok(resp),
+        asupersync::Outcome::Err(e) => Err(e.to_string()),
+        asupersync::Outcome::Cancelled(_) => Err("request cancelled".to_string()),
+        asupersync::Outcome::Panicked(p) => Err(format!("request panicked: {p}")),
+    }
+}
 
-    let like_sql = format!(
-        "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
-         m.created_ts, \
-         a_sender.name AS sender_name, \
-         p.slug AS project_slug, \
-         COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
-         FROM messages m \
-         JOIN agents a_sender ON a_sender.id = m.sender_id \
-         JOIN projects p ON p.id = m.project_id \
-         LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-         LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-         {like_where} \
-         GROUP BY m.id \
-         ORDER BY m.created_ts DESC \
-         LIMIT {limit}"
+fn project_id_for_slug(conn: &DbConn, slug: &str) -> Option<i64> {
+    conn.query_sync(
+        "SELECT id FROM projects WHERE slug = ? LIMIT 1",
+        &[Value::Text(slug.to_string())],
+    )
+    .ok()
+    .and_then(|rows| rows.into_iter().next())
+    .and_then(|row| row.get_named::<i64>("id").ok())
+}
+
+fn project_slugs_by_id(
+    conn: &DbConn,
+    project_ids: &[i64],
+) -> std::collections::HashMap<i64, String> {
+    if project_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let mut dedup = std::collections::BTreeSet::new();
+    dedup.extend(project_ids.iter().copied());
+    if dedup.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let placeholders = vec!["?"; dedup.len()].join(", ");
+    let sql = format!("SELECT id, slug FROM projects WHERE id IN ({placeholders})");
+    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let id = row.get_named::<i64>("id").ok()?;
+                    let slug = row.get_named::<String>("slug").ok()?;
+                    Some((id, slug))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn recipient_names_by_message(
+    conn: &DbConn,
+    message_ids: &[i64],
+) -> std::collections::HashMap<i64, String> {
+    if message_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let mut dedup = std::collections::BTreeSet::new();
+    dedup.extend(message_ids.iter().copied());
+    if dedup.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let placeholders = vec!["?"; dedup.len()].join(", ");
+    let sql = format!(
+        "SELECT mr.message_id, COALESCE(GROUP_CONCAT(DISTINCT a.name), '') AS to_agents \
+         FROM message_recipients mr \
+         JOIN agents a ON a.id = mr.agent_id \
+         WHERE mr.message_id IN ({placeholders}) \
+         GROUP BY mr.message_id"
     );
-
-    let results = query_messages(conn, &like_sql, &params, show_project);
-    let total = results.len();
-    (results, total, SearchMethod::LikeFallback)
+    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let message_id = row.get_named::<i64>("message_id").ok()?;
+                    let to_agents = row.get_named::<String>("to_agents").ok()?;
+                    Some((message_id, to_agents))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Execute a message query and extract rows into `MessageEntry` structs.
@@ -4964,10 +5007,6 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use tempfile::tempdir;
 
-    fn sanitize_fts_query(query: &str) -> String {
-        mcp_agent_mail_db::queries::sanitize_fts_query(query).unwrap_or_default()
-    }
-
     fn test_message_entry(id: i64, thread_id: &str, subject: &str) -> MessageEntry {
         MessageEntry {
             id,
@@ -5604,37 +5643,6 @@ mod tests {
         assert!(state.keyboard_move_snapshot().is_none());
     }
 
-    // ── FTS sanitization ────────────────────────────────────────────
-
-    #[test]
-    fn sanitize_fts_empty() {
-        assert!(sanitize_fts_query("").is_empty());
-    }
-
-    #[test]
-    fn sanitize_fts_simple_terms() {
-        let result = sanitize_fts_query("hello world");
-        assert_eq!(result, "hello world");
-    }
-
-    #[test]
-    fn sanitize_fts_strips_operators() {
-        let result = sanitize_fts_query("foo AND bar OR NOT baz");
-        assert_eq!(result, "foo AND bar OR NOT baz");
-    }
-
-    #[test]
-    fn sanitize_fts_handles_special_chars() {
-        let result = sanitize_fts_query("test-case with_underscore");
-        assert_eq!(result, "\"test-case\" with_underscore");
-    }
-
-    #[test]
-    fn sanitize_fts_strips_quotes() {
-        let result = sanitize_fts_query(r#""quoted" term"#);
-        assert_eq!(result, "\"quoted\" term");
-    }
-
     // ── JSON helpers ───────────────────────────────────────────────
 
     #[test]
@@ -5825,7 +5833,7 @@ mod tests {
             &input,
             42,
             false,
-            "FTS",
+            "search-v3",
             "",
             "", // mode_label
             "",
@@ -6511,8 +6519,7 @@ mod tests {
         // Ensure all variants compile
         let _ = SearchMethod::None;
         let _ = SearchMethod::Recent;
-        let _ = SearchMethod::Fts;
-        let _ = SearchMethod::LikeFallback;
+        let _ = SearchMethod::Unified;
     }
 
     #[test]
@@ -6526,7 +6533,7 @@ mod tests {
             &input,
             42,
             false,
-            "FTS",
+            "search-v3",
             "Urgent",
             "", // mode_label
             "Right 40%",

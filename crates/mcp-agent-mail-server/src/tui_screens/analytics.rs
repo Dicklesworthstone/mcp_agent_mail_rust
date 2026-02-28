@@ -195,7 +195,7 @@ impl AnalyticsScreen {
             detail_focus_available: Cell::new(false),
             cached_viz: AnalyticsVizSnapshot::default(),
             detail_visible: true,
-            last_data_gen: super::DataGeneration::default(),
+            last_data_gen: super::DataGeneration::stale(),
         }
     }
 
@@ -1341,13 +1341,13 @@ fn render_context_lens(
     let block = Block::new()
         .title(" Context Lens ")
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border));
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(lens_bg));
     let inner = block.inner(area);
     block.render(area, frame);
     if inner.is_empty() {
         return;
     }
-    fill_rect(frame, inner, lens_bg);
 
     if inner.height < 4 {
         Paragraph::new(format!(
@@ -1511,13 +1511,13 @@ fn render_filtered_empty_state(
     let block = Block::bordered()
         .title(" Insight Feed ")
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
 
     let lines = vec![
         Line::raw(""),
@@ -1552,13 +1552,13 @@ fn render_empty_state(
     let block = Block::bordered()
         .title(" Insight Feed ")
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border));
+        .border_style(Style::default().fg(tp.panel_border))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
 
     // Centered icon and structured guidance
     let mut lines = Vec::new();
@@ -1642,17 +1642,17 @@ fn render_viz_metric_tile(
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let tile_bg = crate::tui_theme::lerp_color(tp.panel_bg, color, 0.08);
     let block = Block::new()
         .title(title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color));
+        .border_style(Style::default().fg(color))
+        .style(Style::default().bg(tile_bg));
     let inner = block.inner(area);
     block.render(area, frame);
     if inner.is_empty() {
         return;
     }
-    let tile_bg = crate::tui_theme::lerp_color(tp.panel_bg, color, 0.08);
-    fill_rect(frame, inner, tile_bg);
     let line = Line::from_spans(vec![
         Span::styled("● ", Style::default().fg(color)),
         Span::styled(
@@ -1690,13 +1690,13 @@ fn render_runtime_viz_fallback(
     let shell = Block::new()
         .title(title.as_str())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(shell_border));
+        .border_style(Style::default().fg(shell_border))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = shell.inner(area);
     shell.render(area, frame);
     if inner.width < 8 || inner.height < 3 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
     if inner.height < 5 {
         Paragraph::new(format!(
             "calls:{}  err:{}  p95:{:.1}ms",
@@ -1839,18 +1839,15 @@ fn render_runtime_viz_fallback(
             mid.height,
         );
 
+        let spark_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[1], 0.06);
         let spark_block = Block::new()
             .title("Activity Signature")
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
+            .border_style(Style::default().fg(tp.panel_border))
+            .style(Style::default().bg(spark_bg));
         let spark_inner = spark_block.inner(spark_area);
         spark_block.render(spark_area, frame);
         if spark_inner.height > 0 && spark_inner.width > 0 {
-            fill_rect(
-                frame,
-                spark_inner,
-                crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[1], 0.06),
-            );
             let rows = spark_inner.height;
             if rows >= 2 {
                 let label_area = Rect::new(spark_inner.x, spark_inner.y, spark_inner.width, 1);
@@ -1880,18 +1877,15 @@ fn render_runtime_viz_fallback(
             }
         }
 
+        let calls_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[0], 0.05);
         let calls_block = Block::new()
             .title("Top Tool Volume")
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
+            .border_style(Style::default().fg(tp.panel_border))
+            .style(Style::default().bg(calls_bg));
         let calls_inner = calls_block.inner(calls_area);
         calls_block.render(calls_area, frame);
         if calls_inner.height > 0 && calls_inner.width > 0 {
-            fill_rect(
-                frame,
-                calls_inner,
-                crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[0], 0.05),
-            );
             if snapshot.top_call_tools.is_empty() {
                 Paragraph::new("Collecting tool call samples…")
                     .style(crate::tui_theme::text_hint(&tp))
@@ -1925,18 +1919,15 @@ fn render_runtime_viz_fallback(
             bottom.height,
         );
 
+        let lat_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[2], 0.06);
         let lat_block = Block::new()
             .title("Latency Hotspots (p95 ms)")
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
+            .border_style(Style::default().fg(tp.panel_border))
+            .style(Style::default().bg(lat_bg));
         let lat_inner = lat_block.inner(lat_area);
         lat_block.render(lat_area, frame);
         if lat_inner.height > 0 && lat_inner.width > 0 {
-            fill_rect(
-                frame,
-                lat_inner,
-                crate::tui_theme::lerp_color(tp.panel_bg, tp.chart_series[2], 0.06),
-            );
             if snapshot.top_latency_tools.is_empty() {
                 Paragraph::new("Collecting latency samples…")
                     .style(crate::tui_theme::text_hint(&tp))
@@ -1957,18 +1948,15 @@ fn render_runtime_viz_fallback(
             }
         }
 
+        let summary_bg = crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border, 0.05);
         let summary_block = Block::new()
             .title("Insights")
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(tp.panel_border));
+            .border_style(Style::default().fg(tp.panel_border))
+            .style(Style::default().bg(summary_bg));
         let summary_inner = summary_block.inner(summary_area);
         summary_block.render(summary_area, frame);
         if summary_inner.height > 0 && summary_inner.width > 0 {
-            fill_rect(
-                frame,
-                summary_inner,
-                crate::tui_theme::lerp_color(tp.panel_bg, tp.panel_border, 0.05),
-            );
             let mut lines = Vec::new();
             lines.push("feed: no anomaly cards; showing live telemetry instead".to_string());
             lines.push(format!(

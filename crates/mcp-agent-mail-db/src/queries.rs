@@ -3542,7 +3542,10 @@ pub async fn mark_message_read(
                 _ => None,
             })
             .unwrap_or(now),
-        Outcome::Err(_) => now,
+        Outcome::Err(e) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(e);
+        }
         Outcome::Cancelled(r) => {
             rollback_tx(cx, &tracked).await;
             return Outcome::Cancelled(r);
@@ -3633,7 +3636,10 @@ pub async fn acknowledge_message(
                     .unwrap_or(now);
                 (read_ts, ack_ts)
             }
-            Outcome::Err(_) => (now, now),
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
             Outcome::Cancelled(r) => {
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Cancelled(r);

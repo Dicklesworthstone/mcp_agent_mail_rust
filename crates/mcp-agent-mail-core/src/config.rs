@@ -274,7 +274,7 @@ impl std::fmt::Display for AppEnvironment {
 /// Search engine backend selection.
 ///
 /// Controls which search implementation is used:
-/// - `Legacy` — `SQLite` FTS5 (current default for stability)
+/// - `Legacy` — deprecated alias retained for config compatibility (maps to lexical)
 /// - `Lexical` — Tantivy-based lexical search (Search V3)
 /// - `Semantic` — vector embedding search (requires semantic feature)
 /// - `Hybrid` — two-tier fusion: lexical + semantic + rerank
@@ -294,7 +294,7 @@ pub enum SearchEngine {
     Hybrid,
     /// Adaptive engine selection based on query characteristics
     Auto,
-    /// Shadow mode: execute both engines, return FTS5 results, log discrepancies.
+    /// Shadow mode: execute comparison paths and log discrepancies.
     /// **Deprecated:** Use `SearchShadowMode` instead for finer control.
     #[deprecated(since = "0.2.0", note = "Use SearchShadowMode for shadow comparison")]
     Shadow,
@@ -419,7 +419,7 @@ pub struct SearchRolloutConfig {
     pub semantic_enabled: bool,
     /// Kill switch for reranking tier (default: false).
     pub rerank_enabled: bool,
-    /// Fall back to SQL LIKE on Tantivy error (default: true).
+    /// Allow degraded fallback handling on search errors (default: true).
     pub fallback_on_error: bool,
     /// Kill switch for post-fusion diversity reranking (default: true).
     pub diversity_enabled: bool,

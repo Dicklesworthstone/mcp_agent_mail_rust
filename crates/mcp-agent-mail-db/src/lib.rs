@@ -4,7 +4,7 @@
 //! - `SQLite` database operations via `sqlmodel` on frankensqlite
 //! - Connection pooling
 //! - Schema migrations
-//! - FTS5 full-text search
+//! - Search V3 retrieval integration (frankensearch lexical/semantic/hybrid)
 //!
 //! # Timestamp Convention
 //!
@@ -23,16 +23,53 @@ pub mod migrate;
 pub mod models;
 pub mod pool;
 pub mod queries;
+pub mod query_assistance;
 pub mod reconstruct;
 pub mod retry;
 pub mod s3fifo;
 pub mod schema;
+pub mod search_cache;
+pub mod search_candidates;
+pub mod search_canonical;
+pub mod search_consistency;
+pub mod search_diversity;
+pub mod search_engine;
+pub mod search_envelope;
+pub mod search_error;
+pub mod search_filter_compiler;
+pub mod search_fusion;
+pub mod search_index_layout;
 pub mod search_planner;
 pub mod search_recipes;
+pub mod search_response;
+pub mod search_rollout;
 pub mod search_scope;
 pub mod search_service;
+pub mod search_updater;
 pub mod search_v3;
 pub mod sync;
+#[cfg(feature = "tantivy-engine")]
+pub mod tantivy_schema;
+
+// Semantic/hybrid search modules (feature-gated)
+#[cfg(feature = "hybrid")]
+pub mod search_auto_init;
+#[cfg(feature = "hybrid")]
+pub mod search_embedder;
+#[cfg(feature = "hybrid")]
+pub mod search_embedding_jobs;
+#[cfg(feature = "hybrid")]
+pub mod search_fastembed;
+#[cfg(feature = "hybrid")]
+pub mod search_fs_bridge;
+#[cfg(feature = "hybrid")]
+pub mod search_metrics;
+#[cfg(feature = "hybrid")]
+pub mod search_model2vec;
+#[cfg(feature = "hybrid")]
+pub mod search_two_tier;
+#[cfg(feature = "hybrid")]
+pub mod search_vector_index;
 pub mod timestamps;
 pub mod tracking;
 
@@ -77,8 +114,8 @@ pub use tracking::{
 pub static QUERY_TRACKER: std::sync::LazyLock<QueryTracker> =
     std::sync::LazyLock::new(QueryTracker::new);
 
-// Re-export sqlmodel for convenience
-pub use mcp_agent_mail_search_core::{QueryAssistance, parse_query_assistance};
+// Re-export search types for consumers
+pub use query_assistance::{QueryAssistance, parse_query_assistance};
 pub use sqlmodel;
 pub use sqlmodel_core;
 pub use sqlmodel_frankensqlite;

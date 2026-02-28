@@ -243,6 +243,42 @@ pub fn sample_disk(config: &Config) -> DiskSample {
     }
 }
 
+/// Read cumulative process I/O bytes from `/proc/self/io` (Linux).
+///
+/// Returns `(read_bytes, write_bytes)`. On non-Linux platforms, returns `(0, 0)`.
+/// The `write_bytes` field corresponds to the kernel's `write_bytes` counter,
+/// which tracks actual storage writes (post page-cache), giving a real signal
+/// under `SQLite` + git archive workloads.
+///
+/// See: <https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/17>
+#[must_use]
+pub fn read_proc_io_bytes() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(content) = std::fs::read_to_string("/proc/self/io") else {
+            return (0, 0);
+        };
+
+        let mut read_bytes = 0u64;
+        let mut write_bytes = 0u64;
+
+        for line in content.lines() {
+            if let Some(val) = line.strip_prefix("read_bytes: ") {
+                read_bytes = val.trim().parse().unwrap_or(0);
+            } else if let Some(val) = line.strip_prefix("write_bytes: ") {
+                write_bytes = val.trim().parse().unwrap_or(0);
+            }
+        }
+
+        (read_bytes, write_bytes)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        (0, 0)
+    }
+}
+
 /// Sample disk space and update core system metrics gauges.
 #[must_use]
 pub fn sample_and_record(config: &Config) -> DiskSample {
@@ -273,6 +309,11 @@ pub fn sample_and_record(config: &Config) -> DiskSample {
             .disk_sample_errors_total
             .add(u64::try_from(sample.errors.len()).unwrap_or(u64::MAX));
     }
+
+    // Sample process I/O bytes (Linux only; 0 on other platforms).
+    let (io_read, io_write) = read_proc_io_bytes();
+    metrics.system.disk_io_read_bytes.set(io_read);
+    metrics.system.disk_io_write_bytes.set(io_write);
 
     sample
 }
@@ -693,5 +734,55 @@ mod tests {
             metrics.system.disk_sample_errors_total.load(),
             u64::try_from(sample.errors.len()).expect("error count should fit u64")
         );
+    }
+
+    #[test]
+    fn read_proc_io_bytes_returns_non_zero_on_linux() {
+        let (read, write) = read_proc_io_bytes();
+        // On Linux, the test process itself has done I/O, so at least read > 0.
+        // On non-Linux, both are 0 (no /proc/self/io).
+        #[cfg(target_os = "linux")]
+        {
+            assert!(read > 0, "process should have read bytes on Linux");
+            // write may be 0 in some CI envs if no fsyncs have happened yet.
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(read, 0);
+            assert_eq!(write, 0);
+        }
+        // Suppress unused variable warning.
+        let _ = write;
+    }
+
+    #[test]
+    fn sample_and_record_updates_io_bytes_metrics() {
+        let tmp = tempdir().expect("tempdir should be created");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root should be created");
+
+        let config = Config {
+            storage_root,
+            database_url: "sqlite:///:memory:".to_string(),
+            disk_space_warning_mb: 0,
+            disk_space_critical_mb: 0,
+            disk_space_fatal_mb: 0,
+            ..Config::default()
+        };
+
+        let metrics = crate::global_metrics();
+        metrics.system.disk_io_read_bytes.set(0);
+        metrics.system.disk_io_write_bytes.set(0);
+
+        let _sample = sample_and_record(&config);
+
+        // On Linux, the I/O gauges should have been updated.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                metrics.system.disk_io_read_bytes.load() > 0,
+                "disk_io_read_bytes should be updated after sample_and_record on Linux"
+            );
+        }
     }
 }
