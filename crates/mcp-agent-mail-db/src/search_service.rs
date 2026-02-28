@@ -64,6 +64,7 @@ use mcp_agent_mail_core::SearchMode;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "hybrid")]
 use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "hybrid")]
 use std::path::PathBuf;
 #[cfg(feature = "hybrid")]
@@ -322,6 +323,138 @@ fn generate_zero_result_guidance(
 fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
     let bridge = crate::search_v3::get_bridge()?;
     Some(bridge.search(query))
+}
+
+fn detail_matches_query_filters(
+    query: &SearchQuery,
+    detail: &crate::queries::ThreadMessageRow,
+    product_project_ids: Option<&HashSet<i64>>,
+) -> bool {
+    if let Some(project_id) = query.project_id
+        && detail.project_id != project_id
+    {
+        return false;
+    }
+    if let Some(allowed_projects) = product_project_ids
+        && !allowed_projects.contains(&detail.project_id)
+    {
+        return false;
+    }
+    if let Some(agent_name) = query.agent_name.as_deref()
+        && !detail.from.eq_ignore_ascii_case(agent_name)
+    {
+        return false;
+    }
+    if let Some(thread_id) = query.thread_id.as_deref()
+        && detail.thread_id.as_deref() != Some(thread_id)
+    {
+        return false;
+    }
+    if let Some(ack_required) = query.ack_required
+        && (detail.ack_required != 0) != ack_required
+    {
+        return false;
+    }
+    if !query.importance.is_empty() {
+        let Some(level) = crate::search_planner::Importance::parse(&detail.importance) else {
+            return false;
+        };
+        if !query.importance.contains(&level) {
+            return false;
+        }
+    }
+    if let Some(min_ts) = query.time_range.min_ts
+        && detail.created_ts < min_ts
+    {
+        return false;
+    }
+    if let Some(max_ts) = query.time_range.max_ts
+        && detail.created_ts > max_ts
+    {
+        return false;
+    }
+    true
+}
+
+async fn canonicalize_message_results(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    raw_results: Vec<SearchResult>,
+) -> Outcome<Vec<SearchResult>, DbError> {
+    if query.doc_kind != DocKind::Message || raw_results.is_empty() {
+        return Outcome::Ok(raw_results);
+    }
+
+    let mut deduped = Vec::with_capacity(raw_results.len());
+    let mut seen_ids = HashSet::with_capacity(raw_results.len());
+    for result in raw_results {
+        if seen_ids.insert(result.id) {
+            deduped.push(result);
+        }
+    }
+
+    let ids: Vec<i64> = deduped.iter().map(|r| r.id).collect();
+    let details = match crate::queries::get_messages_details_by_ids(cx, pool, &ids).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let details_by_id: HashMap<i64, crate::queries::ThreadMessageRow> =
+        details.into_iter().map(|row| (row.id, row)).collect();
+
+    let product_project_ids = if let Some(product_id) = query.product_id {
+        let projects = match crate::queries::list_product_projects(cx, pool, product_id).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        Some(
+            projects
+                .into_iter()
+                .filter_map(|project| project.id)
+                .collect::<HashSet<i64>>(),
+        )
+    } else {
+        None
+    };
+
+    let mut canonical = Vec::with_capacity(deduped.len());
+    let mut dropped_missing = 0usize;
+    let mut dropped_filter_mismatch = 0usize;
+    for mut result in deduped {
+        let Some(detail) = details_by_id.get(&result.id) else {
+            dropped_missing += 1;
+            continue;
+        };
+        if !detail_matches_query_filters(query, detail, product_project_ids.as_ref()) {
+            dropped_filter_mismatch += 1;
+            continue;
+        }
+
+        result.project_id = Some(detail.project_id);
+        result.title = detail.subject.clone();
+        result.body = detail.body_md.clone();
+        result.importance = Some(detail.importance.clone());
+        result.ack_required = Some(detail.ack_required != 0);
+        result.created_ts = Some(detail.created_ts);
+        result.thread_id = detail.thread_id.clone();
+        result.from_agent = Some(detail.from.clone());
+        canonical.push(result);
+    }
+
+    if dropped_missing > 0 || dropped_filter_mismatch > 0 {
+        tracing::warn!(
+            dropped_missing,
+            dropped_filter_mismatch,
+            kept = canonical.len(),
+            "search canonicalization dropped stale or out-of-scope lexical candidates"
+        );
+    }
+
+    Outcome::Ok(canonical)
 }
 
 /// Serialized bootstrap state for Tantivy bridge initialization in non-server surfaces.
@@ -2578,6 +2711,13 @@ pub async fn execute_search(
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
         if let Some(raw_results) = try_tantivy_search(query) {
+            let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await
+            {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
             } else {
@@ -2616,42 +2756,12 @@ pub async fn execute_search(
             {
                 raw_results = bridge.search(query, query.effective_limit());
             }
-
-            let missing_ids: Vec<i64> = raw_results
-                .iter()
-                .filter(|r| r.title.is_empty())
-                .map(|r| r.id)
-                .collect();
-
-            if !missing_ids.is_empty() {
-                match crate::queries::get_messages_details_by_ids(cx, pool, &missing_ids).await {
-                    Outcome::Ok(details) => {
-                        let details_map: std::collections::HashMap<
-                            i64,
-                            crate::queries::ThreadMessageRow,
-                        > = details.into_iter().map(|d| (d.id, d)).collect();
-
-                        for r in &mut raw_results {
-                            if r.title.is_empty()
-                                && let Some(d) = details_map.get(&r.id)
-                            {
-                                r.title = d.subject.clone();
-                                r.body = d.body_md.clone();
-                                r.importance = Some(d.importance.clone());
-                                r.ack_required = Some(d.ack_required != 0);
-                                r.created_ts = Some(d.created_ts);
-                                r.thread_id = d.thread_id.clone();
-                                r.from_agent = Some(d.from.clone());
-                                r.project_id = Some(d.project_id);
-                            }
-                        }
-                    }
-                    Outcome::Err(e) => {
-                        tracing::warn!("failed to hydrate semantic search results: {e}");
-                    }
-                    _ => {}
-                }
-            }
+            raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
 
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
@@ -2731,43 +2841,12 @@ pub async fn execute_search(
                 audit.two_tier_refinement_failed = telemetry.refinement_error.is_some();
                 audit.two_tier_fast_only = telemetry.fast_only_mode;
             }
-
-            // Hydrate missing details for semantic-only results (which lack body/title in the index)
-            let missing_ids: Vec<i64> = raw_results
-                .iter()
-                .filter(|r| r.title.is_empty())
-                .map(|r| r.id)
-                .collect();
-
-            if !missing_ids.is_empty() {
-                match crate::queries::get_messages_details_by_ids(cx, pool, &missing_ids).await {
-                    Outcome::Ok(details) => {
-                        let details_map: std::collections::HashMap<
-                            i64,
-                            crate::queries::ThreadMessageRow,
-                        > = details.into_iter().map(|d| (d.id, d)).collect();
-
-                        for r in &mut raw_results {
-                            if r.title.is_empty()
-                                && let Some(d) = details_map.get(&r.id)
-                            {
-                                r.title = d.subject.clone();
-                                r.body = d.body_md.clone();
-                                r.importance = Some(d.importance.clone());
-                                r.ack_required = Some(d.ack_required != 0);
-                                r.created_ts = Some(d.created_ts);
-                                r.thread_id = d.thread_id.clone();
-                                r.from_agent = Some(d.from.clone());
-                                r.project_id = Some(d.project_id);
-                            }
-                        }
-                    }
-                    Outcome::Err(e) => {
-                        tracing::warn!("failed to hydrate semantic search results: {e}");
-                    }
-                    _ => {}
-                }
-            }
+            raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, rerank_audit.as_ref()))
             } else {
@@ -3053,6 +3132,127 @@ mod tests {
         assert!(opts.scope_ctx.is_none());
         assert!(opts.redaction_policy.is_none());
         assert!(!opts.track_telemetry);
+    }
+
+    fn detail_row(
+        id: i64,
+        project_id: i64,
+        from: &str,
+        thread_id: Option<&str>,
+        importance: &str,
+        ack_required: i64,
+        created_ts: i64,
+    ) -> crate::queries::ThreadMessageRow {
+        crate::queries::ThreadMessageRow {
+            id,
+            project_id,
+            sender_id: 1,
+            thread_id: thread_id.map(std::borrow::ToOwned::to_owned),
+            subject: "subject".to_string(),
+            body_md: "body".to_string(),
+            importance: importance.to_string(),
+            ack_required,
+            created_ts,
+            attachments: "[]".to_string(),
+            from: from.to_string(),
+        }
+    }
+
+    #[test]
+    fn detail_filter_enforces_project_and_product_scope() {
+        let detail = detail_row(1, 10, "BlueLake", Some("br-100"), "urgent", 1, 1_000);
+
+        let query = SearchQuery {
+            project_id: Some(10),
+            product_id: Some(7),
+            ..Default::default()
+        };
+        let mut allowed = HashSet::new();
+        allowed.insert(10);
+        assert!(detail_matches_query_filters(&query, &detail, Some(&allowed)));
+
+        let mut disallowed = HashSet::new();
+        disallowed.insert(11);
+        assert!(!detail_matches_query_filters(
+            &query,
+            &detail,
+            Some(&disallowed)
+        ));
+
+        let wrong_project_query = SearchQuery {
+            project_id: Some(11),
+            ..Default::default()
+        };
+        assert!(!detail_matches_query_filters(
+            &wrong_project_query,
+            &detail,
+            None
+        ));
+    }
+
+    #[test]
+    fn detail_filter_enforces_sender_thread_and_ack() {
+        let detail = detail_row(2, 1, "BlueLake", Some("br-200"), "high", 1, 2_000);
+        let query = SearchQuery {
+            agent_name: Some("bluelake".to_string()),
+            thread_id: Some("br-200".to_string()),
+            ack_required: Some(true),
+            ..Default::default()
+        };
+        assert!(detail_matches_query_filters(&query, &detail, None));
+
+        let wrong_thread_query = SearchQuery {
+            thread_id: Some("br-201".to_string()),
+            ..query.clone()
+        };
+        assert!(!detail_matches_query_filters(&wrong_thread_query, &detail, None));
+
+        let ack_mismatch_query = SearchQuery {
+            ack_required: Some(false),
+            ..query
+        };
+        assert!(!detail_matches_query_filters(
+            &ack_mismatch_query,
+            &detail,
+            None
+        ));
+    }
+
+    #[test]
+    fn detail_filter_enforces_importance_and_time_range() {
+        let detail = detail_row(3, 2, "RedPeak", None, "normal", 0, 5_000);
+        let query = SearchQuery {
+            importance: vec![Importance::Normal],
+            time_range: crate::search_planner::TimeRange {
+                min_ts: Some(4_000),
+                max_ts: Some(6_000),
+            },
+            ..Default::default()
+        };
+        assert!(detail_matches_query_filters(&query, &detail, None));
+
+        let wrong_importance_query = SearchQuery {
+            importance: vec![Importance::Urgent],
+            ..query.clone()
+        };
+        assert!(!detail_matches_query_filters(
+            &wrong_importance_query,
+            &detail,
+            None
+        ));
+
+        let outside_time_query = SearchQuery {
+            time_range: crate::search_planner::TimeRange {
+                min_ts: Some(6_001),
+                max_ts: None,
+            },
+            ..query
+        };
+        assert!(!detail_matches_query_filters(
+            &outside_time_query,
+            &detail,
+            None
+        ));
     }
 
     // ── Zero-result guidance tests ──────────────────────────────────

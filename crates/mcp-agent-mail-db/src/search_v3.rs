@@ -15,7 +15,7 @@ use crate::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilter, SearchResults};
 use sqlmodel_core::Value;
-use tantivy::Index;
+use tantivy::{Index, Term};
 
 use crate::DbConn;
 use crate::search_planner::{
@@ -333,10 +333,10 @@ fn add_indexable_message(
     handles: &FieldHandles,
     msg: &IndexableMessage,
 ) -> Result<(), String> {
-    #[allow(clippy::cast_sign_loss)]
-    let id_u64 = msg.id as u64;
-    #[allow(clippy::cast_sign_loss)]
-    let project_id_u64 = msg.project_id as u64;
+    let id_u64 =
+        u64::try_from(msg.id).map_err(|_| format!("message id must be non-negative: {}", msg.id))?;
+    let project_id_u64 = u64::try_from(msg.project_id)
+        .map_err(|_| format!("project id must be non-negative: {}", msg.project_id))?;
 
     writer
         .add_document(tantivy::doc!(
@@ -354,6 +354,17 @@ fn add_indexable_message(
         .map_err(|e| format!("Tantivy add_document error: {e}"))?;
 
     Ok(())
+}
+
+fn upsert_indexable_message(
+    writer: &mut tantivy::IndexWriter,
+    handles: &FieldHandles,
+    msg: &IndexableMessage,
+) -> Result<(), String> {
+    let id_u64 =
+        u64::try_from(msg.id).map_err(|_| format!("message id must be non-negative: {}", msg.id))?;
+    writer.delete_term(Term::from_field_u64(handles.id, id_u64));
+    add_indexable_message(writer, handles, msg)
 }
 
 fn refresh_index_health_metrics(bridge: &TantivyBridge) {
@@ -404,7 +415,7 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
         .index()
         .writer(15_000_000)
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
-    add_indexable_message(&mut writer, handles, msg)?;
+    upsert_indexable_message(&mut writer, handles, msg)?;
 
     writer
         .commit()
@@ -440,7 +451,7 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
 
     for msg in messages {
-        add_indexable_message(&mut writer, handles, msg)?;
+        upsert_indexable_message(&mut writer, handles, msg)?;
     }
 
     writer
@@ -462,10 +473,11 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 ///
 /// Uses a sync `DbConn` (FrankenSQLite) to scan the messages table joined with
 /// agents and projects, then batch-indexes everything with a single writer.
-/// Skips documents that are already in the index (idempotent via doc-count
-/// watermark).
+/// The index is rebuilt from scratch on each backfill to guarantee that stale
+/// or duplicate message documents cannot survive DB resets, migrations, or
+/// interrupted runs.
 ///
-/// Returns `(indexed_count, skipped_count)`.
+/// Returns `(indexed_count, skipped_count)` where `skipped_count` is always 0.
 pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
     const COMMIT_EVERY_BATCHES: usize = 8;
@@ -494,57 +506,14 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let conn = DbConn::open_file(db_path)
         .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
 
-    // Count messages in DB when the backend supports aggregate COUNT semantics.
-    // FrankenSQLite builds without COUNT() support can still backfill safely:
-    // we just skip the up-to-date fast path and proceed with paged indexing.
-    let db_count = match conn.query_sync("SELECT COUNT(id) AS cnt FROM messages", &[]) {
-        Ok(rows) => rows
-            .first()
-            .and_then(|r| r.get_named::<i64>("cnt").ok())
-            .filter(|v| *v >= 0),
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                "backfill: COUNT(id) unavailable; continuing without up-to-date skip fast path"
-            );
-            None
-        }
-    };
-
-    if let Some(db_count) = db_count {
-        #[allow(clippy::cast_sign_loss)]
-        let db_count_u64 = db_count as u64;
-
-        // If the index already has at least as many docs as the DB, skip.
-        // Guard: when db_count is 0 but the index has docs, the DB may be degraded
-        // (e.g. freshly created, post-corruption recovery, or malformed).
-        // In that case, do NOT skip -- log a warning and proceed to revalidate.
-        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/12
-        if existing_count >= db_count_u64 {
-            if db_count_u64 == 0 && existing_count > 0 {
-                tracing::warn!(
-                    existing_count,
-                    db_count,
-                    "backfill: db_count is 0 but index has docs; DB may be degraded — rebuilding index"
-                );
-                // Fall through to full backfill to avoid stale index.
-            } else {
-                tracing::info!(
-                    existing_count,
-                    db_count,
-                    "backfill: index already up-to-date, skipping"
-                );
-                #[allow(clippy::cast_possible_truncation)]
-                return Ok((0, db_count_u64 as usize));
-            }
-        }
-    }
-
     let mut writer = bridge
         .index()
         .writer(15_000_000)
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
     let handles = bridge.handles();
+    writer
+        .delete_all_documents()
+        .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
 
     // Paged reads avoid loading the full mailbox into memory during startup.
     // Keep this query JOIN-free to avoid parity-cert fallback overhead on
@@ -616,24 +585,19 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         }
     }
 
-    if pending_batches > 0 {
+    if pending_batches > 0 || total_indexed == 0 {
         writer
             .commit()
             .map_err(|e| format!("Tantivy commit error: {e}"))?;
     }
 
-    if total_indexed > 0 {
-        refresh_index_health_metrics(&bridge);
-        crate::search_service::invalidate_search_cache(
-            crate::search_cache::InvalidationTrigger::IndexUpdate,
-        );
-    }
+    refresh_index_health_metrics(&bridge);
+    crate::search_service::invalidate_search_cache(crate::search_cache::InvalidationTrigger::IndexUpdate);
 
     tracing::info!(
         total_indexed,
-        db_count = db_count.unwrap_or(-1),
         existing_count,
-        "backfill: Tantivy index populated from database"
+        "backfill: Tantivy index rebuilt from database"
     );
 
     Ok((total_indexed, 0))
@@ -1374,6 +1338,60 @@ mod tests {
         let results = bridge.search(&query);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn upsert_indexable_message_replaces_previous_document_by_id() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+
+        let first = make_indexable(99, "Legacy subject", "legacy token alpha");
+        let second = make_indexable(99, "Canonical subject", "canonical token beta");
+
+        upsert_indexable_message(&mut writer, handles, &first).unwrap();
+        upsert_indexable_message(&mut writer, handles, &second).unwrap();
+        writer.commit().unwrap();
+
+        let reader = bridge.index().reader().unwrap();
+        assert_eq!(
+            reader.searcher().num_docs(),
+            1,
+            "upsert must leave exactly one live document per id"
+        );
+
+        let beta_query = PlannerQuery {
+            text: "canonical token".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let beta_results = bridge.search(&beta_query);
+        assert_eq!(beta_results.len(), 1);
+        assert_eq!(beta_results[0].id, 99);
+        assert_eq!(beta_results[0].title, "Canonical subject");
+
+        let legacy_query = PlannerQuery {
+            text: "legacy token".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let legacy_results = bridge.search(&legacy_query);
+        assert!(legacy_results.is_empty(), "legacy document should be replaced");
+    }
+
+    #[test]
+    fn upsert_indexable_message_rejects_negative_id() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+
+        let mut invalid = make_indexable(1, "x", "y");
+        invalid.id = -1;
+
+        let result = upsert_indexable_message(&mut writer, handles, &invalid);
+        assert!(result.is_err());
     }
 
     #[test]

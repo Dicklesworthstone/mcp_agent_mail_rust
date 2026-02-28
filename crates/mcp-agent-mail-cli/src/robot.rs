@@ -728,13 +728,12 @@ impl RobotSubcommand {
 use mcp_agent_mail_db::DbConn;
 
 /// Resolve a project by slug or human_key.
-///
-/// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
 fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliError> {
+    let key = key.trim();
     // Try slug first
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE slug LIKE ?",
+            "SELECT id, slug FROM projects WHERE lower(slug) = lower(?)",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
@@ -748,7 +747,7 @@ fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliEr
     // Try human_key
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE human_key LIKE ?",
+            "SELECT id, slug FROM projects WHERE human_key = ?",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
@@ -792,8 +791,6 @@ fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), C
 }
 
 /// Resolve agent ID from --agent flag or AGENT_MAIL_AGENT/AGENT_NAME env vars.
-///
-/// Note: Uses `LIKE` instead of `=` for robust parity across SQLite backends.
 fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Option<(i64, String)> {
     let name = flag
         .map(str::trim)
