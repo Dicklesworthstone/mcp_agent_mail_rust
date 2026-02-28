@@ -725,8 +725,8 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
 }
 
 fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
-    // Only initialize if V3 (Lexical/Hybrid) or Shadow mode is enabled.
-    // This avoids creating the index directory if the user sticks to Legacy FTS5.
+    // Only initialize when lexical-capable modes are active.
+    // This avoids creating the index directory when lexical retrieval is disabled.
     let rollout = &config.search_rollout;
     let uses_v3 = rollout.engine.uses_lexical()
         || rollout.surface_overrides.values().any(|e| e.uses_lexical());

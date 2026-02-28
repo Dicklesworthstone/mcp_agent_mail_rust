@@ -204,14 +204,6 @@ pub(crate) fn derive_search_diagnostics(
         remediation_hints: Vec::new(),
     };
 
-    if explain.used_like_fallback || explain.method.eq_ignore_ascii_case("like_fallback") {
-        diagnostics.degraded = true;
-        diagnostics.fallback_mode = Some("like_fallback".to_string());
-        diagnostics.remediation_hints.push(
-            "FTS syntax was not usable; simplify operators or use quoted phrases.".to_string(),
-        );
-    }
-
     if let Some(outcome) = explain_facet_value(explain, "rerank_outcome") {
         if let Some(tier) = parse_budget_tier_from_rerank_outcome(outcome) {
             diagnostics.degraded = true;
@@ -607,16 +599,13 @@ pub(crate) fn parse_time_range_with_aliases(
     Ok(mcp_agent_mail_db::search_planner::TimeRange { min_ts, max_ts })
 }
 
-/// Full-text search over message subjects and bodies.
+/// Search over message subjects and bodies using the unified Search V3 service.
 ///
-/// Supports FTS5 syntax:
-/// - Phrases: "build plan"
-/// - Prefix: migrat*
-/// - Boolean: plan AND users
+/// Query parser supports phrase, prefix, and boolean operators.
 ///
 /// # Parameters
 /// - `project_key`: Project identifier
-/// - `query`: FTS5 query string
+/// - `query`: Search query string
 /// - `limit`: Max results (default: 20)
 /// - `offset`: Pagination offset (default: 0)
 /// - `ranking`: Ranking mode: "relevance" (default) or "recency"
@@ -628,7 +617,7 @@ pub(crate) fn parse_time_range_with_aliases(
 /// - `date_from`, `after`, `since`: Aliases of `date_start`
 /// - `date_to`, `before`, `until`: Aliases of `date_end`
 /// - `explain`: Include query plan explain metadata (default: false)
-/// - `diagnostics`: Optional degraded-mode metadata for budget/fallback/timeout signals
+/// - `diagnostics`: Optional degraded-mode metadata for budget/timeout signals
 ///
 /// # Returns
 /// List of matching message summaries
@@ -638,7 +627,7 @@ pub(crate) fn parse_time_range_with_aliases(
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Full-text search over subject and body for a project.\n\nTips\n----\n- SQLite FTS5 syntax supported: phrases (\"build plan\"), prefix (mig*), boolean (plan AND users)\n- Results are ordered by bm25 score (best matches first) unless ranking=\"recency\"\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    FTS5 query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (BM25, default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`diagnostics` is present when degraded-mode signals are detected (fallback, budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
+    description = "Search over subject and body for a project using the unified Search V3 service.\n\nTips\n----\n- Query parser supports phrases (\"build plan\"), prefix (mig*), and boolean operators (plan AND users)\n- Results default to relevance ranking; set `ranking=\"recency\"` for newest-first\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`diagnostics` is present when degraded-mode signals are detected (budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
 )]
 pub async fn search_messages(
     ctx: &McpContext,
@@ -1297,13 +1286,13 @@ mod tests {
     }
 
     #[test]
-    fn derive_search_diagnostics_detects_like_fallback() {
+    fn derive_search_diagnostics_detects_rerank_timeout() {
         let explain = mcp_agent_mail_db::search_planner::QueryExplain {
-            method: "like_fallback".to_string(),
+            method: "hybrid_v3".to_string(),
             normalized_query: Some("broken query".to_string()),
-            used_like_fallback: true,
-            facet_count: 0,
-            facets_applied: Vec::new(),
+            used_like_fallback: false,
+            facet_count: 1,
+            facets_applied: vec!["rerank_outcome:timeout".to_string()],
             sql: "SELECT ...".to_string(),
             scope_policy: "unrestricted".to_string(),
             denied_count: 0,
@@ -1311,13 +1300,7 @@ mod tests {
         };
         let diagnostics = derive_search_diagnostics(Some(&explain)).expect("diagnostics");
         assert!(diagnostics.degraded);
-        assert_eq!(diagnostics.fallback_mode.as_deref(), Some("like_fallback"));
-        assert!(
-            diagnostics
-                .remediation_hints
-                .iter()
-                .any(|hint| hint.contains("FTS syntax"))
-        );
+        assert_eq!(diagnostics.fallback_mode.as_deref(), Some("rerank_timeout"));
     }
 
     #[test]
