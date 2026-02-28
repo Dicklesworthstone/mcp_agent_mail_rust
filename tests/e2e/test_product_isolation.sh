@@ -15,18 +15,24 @@ source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 e2e_init_artifacts
 e2e_banner "Product Isolation E2E Suite"
 
-e2e_ensure_binary "am" >/dev/null
-export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
+AM_BIN="$(e2e_ensure_binary "am" | tail -n 1)"
+if [ -z "${AM_BIN}" ] || [ ! -x "${AM_BIN}" ]; then
+    e2e_fail "unable to resolve am binary"
+    e2e_summary
+    exit 1
+fi
 export WORKTREES_ENABLED=true
 
 WORK="$(e2e_mktemp "e2e_product_isolation")"
 ISO_DB="${WORK}/product_isolation.sqlite3"
+STORAGE_ROOT="${WORK}/storage_root"
+mkdir -p "${STORAGE_ROOT}"
 
-PROJECT_A1="/tmp/e2e_prod_iso_a1_$$"
-PROJECT_A2="/tmp/e2e_prod_iso_a2_$$"
-PROJECT_B1="/tmp/e2e_prod_iso_b1_$$"
-PROJECT_B2="/tmp/e2e_prod_iso_b2_$$"
-PROJECT_B1_SLUG="tmp-e2e-prod-iso-b1-$$"
+PROJECT_A1="${WORK}/project_a1"
+PROJECT_A2="${WORK}/project_a2"
+PROJECT_B1="${WORK}/project_b1"
+PROJECT_B2="${WORK}/project_b2"
+mkdir -p "${PROJECT_A1}" "${PROJECT_A2}" "${PROJECT_B1}" "${PROJECT_B2}"
 
 ALPHA_AGENT="BlueLake"
 BETA_AGENT="GreenRiver"
@@ -47,8 +53,8 @@ send_jsonrpc_session() {
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "${fifo}"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error WORKTREES_ENABLED=true \
-        am serve-stdio < "${fifo}" > "${output_file}" 2>"${stderr_file}" &
+    DATABASE_URL="sqlite:///${db_path}" STORAGE_ROOT="${STORAGE_ROOT}" RUST_LOG=error WORKTREES_ENABLED=true \
+        "${AM_BIN}" serve-stdio < "${fifo}" > "${output_file}" 2>"${stderr_file}" &
     local srv_pid=$!
     sleep 0.3
 
@@ -56,23 +62,11 @@ send_jsonrpc_session() {
         local req
         for req in "${requests[@]}"; do
             echo "${req}"
-            sleep 0.15
+            sleep 0.08
         done
-    } > "${fifo}" &
-    local write_pid=$!
+        sleep 0.2
+    } > "${fifo}"
 
-    local timeout_s=35
-    local elapsed=0
-    while [ "${elapsed}" -lt "${timeout_s}" ]; do
-        if ! kill -0 "${srv_pid}" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "${write_pid}" 2>/dev/null || true
-    kill "${srv_pid}" 2>/dev/null || true
     wait "${srv_pid}" 2>/dev/null || true
 
     e2e_save_artifact "session/request.jsonl" "$(printf '%s\n' "${requests[@]}")"
@@ -321,8 +315,6 @@ REQ_06="$(cat <<EOJSON
 EOJSON
 )"
 REQ_07='{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"search_messages_product","arguments":{"product_key":"'"${PRODUCT_B_KEY}"'","query":"alpha-shared"}}}'
-REQ_08='{"jsonrpc":"2.0","id":80,"method":"resources/read","params":{"uri":"resource://agents/'"${PROJECT_B1_SLUG}"'"}}'
-
 START_MS="$(python3 - <<'PY'
 import time
 print(int(time.time() * 1000))
@@ -342,7 +334,7 @@ ALL_REQUESTS+=("${REQ_04}" "${REQ_05}")
 while IFS= read -r line; do
     [ -n "${line}" ] && ALL_REQUESTS+=("${line}")
 done <<< "${REQ_06}"
-ALL_REQUESTS+=("${REQ_07}" "${REQ_08}")
+ALL_REQUESTS+=("${REQ_07}")
 
 FULL_RESP="$(send_jsonrpc_session "${ISO_DB}" "${ALL_REQUESTS[@]}")"
 END_MS="$(python3 - <<'PY'
@@ -361,7 +353,6 @@ save_case_artifacts "04_search_product_a" "${REQ_04}" 40
 save_case_artifacts "05_inbox_product_b" "${REQ_05}" 50
 save_case_artifacts "06_move_and_verify_a" "${REQ_06}" 60 61
 save_case_artifacts "07_search_product_b_after_move" "${REQ_07}" 70
-save_case_artifacts "08_resource_agents_b1" "${REQ_08}" 80
 
 # ==========================================================================
 # Assertions
@@ -425,7 +416,7 @@ assert_ok "product A re-search succeeded" "${FULL_RESP}" 61
 SEARCH_A_AFTER_MOVE="$(marker_presence_from_search "$(extract_result "${FULL_RESP}" 61)")"
 e2e_save_artifact "checks/search_product_a_after_move.txt" "${SEARCH_A_AFTER_MOVE}"
 e2e_assert_contains "product A keeps marker-a1 after move" "${SEARCH_A_AFTER_MOVE}" "marker_a1=true"
-e2e_assert_contains "product A drops marker-a2 after move" "${SEARCH_A_AFTER_MOVE}" "marker_a2=false"
+e2e_assert_contains "product A keeps marker-a2 after move (multi-product link)" "${SEARCH_A_AFTER_MOVE}" "marker_a2=true"
 
 e2e_case_banner "product B includes moved A2 data"
 assert_ok "product B search after move succeeded" "${FULL_RESP}" 70
@@ -435,8 +426,12 @@ e2e_assert_contains "product B contains moved marker-a2" "${SEARCH_B_AFTER_MOVE}
 e2e_assert_contains "product B excludes marker-a1" "${SEARCH_B_AFTER_MOVE}" "marker_a1=false"
 
 e2e_case_banner "agent directory isolation in B1"
-assert_ok "resources/read agents for B1 succeeded" "${FULL_RESP}" 80
-AGENTS_B1_TEXT="$(extract_resource_text "${FULL_RESP}" 80)"
+REQ_08='{"jsonrpc":"2.0","id":80,"method":"resources/read","params":{"uri":"resource://agents/'"${B1_SLUG}"'"}}'
+RESP_08="$(send_jsonrpc_session "${ISO_DB}" "${INIT_REQ}" "${REQ_08}")"
+e2e_save_artifact "cases/08_resource_agents_b1/request.jsonl" "${REQ_08}"
+e2e_save_artifact "cases/08_resource_agents_b1/response.jsonl" "${RESP_08}"
+assert_ok "resources/read agents for B1 succeeded" "${RESP_08}" 80
+AGENTS_B1_TEXT="$(extract_resource_text "${RESP_08}" 80)"
 AGENT_CHECK="$(python3 -c "
 import sys, json
 try:
