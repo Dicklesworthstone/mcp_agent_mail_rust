@@ -46,6 +46,7 @@ resolve_am_binary() {
             return 0
         fi
     done
+    local built_bin
     if built_bin="$(e2e_ensure_binary "am" 2>/dev/null | tail -n 1)" && [ -x "${built_bin}" ]; then
         echo "${built_bin}"
         return 0
@@ -60,6 +61,10 @@ if [ -z "${AM_BIN}" ] || [ ! -x "${AM_BIN}" ]; then
     exit 1
 fi
 e2e_log "am binary: ${AM_BIN}"
+case "${AM_BIN}" in
+    "${E2E_PROJECT_ROOT}"/*|"${CARGO_TARGET_DIR}"/*) ;;
+    *) e2e_log "warning: using external am binary outside workspace: ${AM_BIN}" ;;
+esac
 
 WORK="$(e2e_mktemp "e2e_search")"
 SEARCH_DB="${WORK}/search_test.sqlite3"

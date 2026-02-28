@@ -55,6 +55,10 @@ if [ -z "${AM_BIN}" ] || [ ! -x "${AM_BIN}" ]; then
     exit 1
 fi
 e2e_log "am binary: ${AM_BIN}"
+case "${AM_BIN}" in
+    "${E2E_PROJECT_ROOT}"/*|"${CARGO_TARGET_DIR}"/*) ;;
+    *) e2e_log "warning: using external am binary outside workspace: ${AM_BIN}" ;;
+esac
 export WORKTREES_ENABLED=true
 
 WORK="$(e2e_mktemp "e2e_product_isolation")"

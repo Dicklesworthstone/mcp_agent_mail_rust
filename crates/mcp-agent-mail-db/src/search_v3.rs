@@ -16,7 +16,7 @@ use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilter, SearchResults};
 use sqlmodel_core::Value;
 use tantivy::Order;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::TermQuery;
 use tantivy::schema::IndexRecordOption;
 use tantivy::{Index, Term};
@@ -456,18 +456,20 @@ fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, Str
         .reader()
         .map_err(|e| format!("backfill index reader error: {e}"))?;
     let searcher = reader.searcher();
-    let count = u64::try_from(searcher.num_docs()).unwrap_or(u64::MAX);
+    let handles = bridge.handles();
+    let message_query = TermQuery::new(
+        Term::from_field_text(handles.doc_kind, "message"),
+        IndexRecordOption::Basic,
+    );
+    let count = searcher
+        .search(&message_query, &Count)
+        .map_err(|e| format!("backfill index count query failed: {e}"))?;
     if count == 0 {
         return Ok(MessageStats {
             count: 0,
             max_id: 0,
         });
     }
-    let handles = bridge.handles();
-    let message_query = TermQuery::new(
-        Term::from_field_text(handles.doc_kind, "message"),
-        IndexRecordOption::Basic,
-    );
     let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher
         .search(
             &message_query,
@@ -476,7 +478,10 @@ fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, Str
         .map_err(|e| format!("backfill index max-id query failed: {e}"))?;
     let max_id = top_docs.first().map(|(id, _)| *id).unwrap_or(0);
 
-    Ok(MessageStats { count, max_id })
+    Ok(MessageStats {
+        count: count as u64,
+        max_id,
+    })
 }
 
 fn choose_backfill_plan(
