@@ -309,7 +309,6 @@ dependencies = [
  "socket2",
  "tempfile",
  "thiserror",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "visibility",

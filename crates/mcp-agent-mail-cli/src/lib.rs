@@ -9738,6 +9738,7 @@ fn handle_doctor_check_with(
 
         // Check: Service running
         if service_registered {
+            use crate::service::ServiceBackend;
             let backend = service::LaunchAgentBackend;
             match backend.status() {
                 Ok(status) => {

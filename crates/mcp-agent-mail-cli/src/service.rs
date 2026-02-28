@@ -163,7 +163,6 @@ impl LaunchAgentBackend {
 
 impl SystemdUserBackend {
     fn unit_file_path() -> PathBuf {
-        use mcp_agent_mail_core::paths;
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from(".config"))
             .join("systemd")
@@ -185,8 +184,8 @@ impl WindowsTaskBackend {
 /// Generate macOS LaunchAgent plist XML content
 fn generate_launch_agent_plist(config: &ServiceConfig) -> String {
     let log_dir = &config.data_dir;
-    let stdout_log = log_dir.join("stdout.log").display();
-    let stderr_log = log_dir.join("stderr.log").display();
+    let stdout_log = log_dir.join("stdout.log");
+    let stderr_log = log_dir.join("stderr.log");
     let env_file = config.env_file.display();
     let binary = config.binary_path.display();
 
@@ -227,7 +226,7 @@ fn generate_launch_agent_plist(config: &ServiceConfig) -> String {
     <string>Background</string>
 </dict>
 </plist>"#,
-        config.service_label, binary, env_file, stdout_log, stderr_log
+        config.service_label, binary, env_file, stdout_log.display(), stderr_log.display()
     )
 }
 
@@ -319,7 +318,7 @@ impl ServiceBackend for LaunchAgentBackend {
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(501);
 
-        let label = format!("gui/{}/{}", uid, Self::service_label());
+        let _label = format!("gui/{}/{}", uid, Self::service_label());
 
         // Query launchctl for service status
         let output = Command::new("launchctl")
@@ -686,7 +685,7 @@ pub fn install_service(dry_run: bool, health_timeout: u64) -> crate::CliResult<(
 
 /// Perform health check on service endpoint with exponential backoff
 pub fn perform_health_check(host: &str, port: u16, path: &str, timeout_secs: u64) -> Result<u64, String> {
-    let url = format!("http://{}:{}{}", host, port, path);
+    let _url = format!("http://{}:{}{}", host, port, path);
     let start = std::time::Instant::now();
     let deadline = start + std::time::Duration::from_secs(timeout_secs);
 
