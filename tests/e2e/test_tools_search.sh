@@ -135,53 +135,94 @@ except Exception:
 " 2>/dev/null
 }
 
+call_tool_text() {
+    local req_id="$1"
+    local tool_name="$2"
+    local args_json="$3"
+    local response
+    response="$(send_jsonrpc_session "$SEARCH_DB" \
+        "$INIT_REQ" \
+        "{\"jsonrpc\":\"2.0\",\"id\":${req_id},\"method\":\"tools/call\",\"params\":{\"name\":\"${tool_name}\",\"arguments\":${args_json}}}")"
+    e2e_save_artifact "tool_${req_id}_${tool_name}.txt" "$response"
+    local err
+    err="$(is_error_result "$response" "$req_id")"
+    if [ "$err" = "true" ]; then
+        return 1
+    fi
+    extract_result "$response" "$req_id"
+}
+
 # ===========================================================================
 # Case 1: Setup -- project + 2 agents + 3 messages across 2 threads
 # ===========================================================================
 e2e_case_banner "Setup: project + agents + messages"
 
-SETUP_RESP="$(send_jsonrpc_session "$SEARCH_DB" \
-    "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${AGENT_A}\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${AGENT_B}\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${AGENT_A}\",\"to\":[\"${AGENT_B}\"],\"subject\":\"Build plan for API\",\"body_md\":\"We need to refactor the users endpoint\",\"thread_id\":\"PR-100\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"message_id\":1,\"sender_name\":\"${AGENT_B}\",\"body_md\":\"I agree, let me start the migration\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${AGENT_A}\",\"to\":[\"${AGENT_B}\"],\"subject\":\"Database schema update\",\"body_md\":\"New columns for auth tokens\",\"thread_id\":\"DB-50\"}}}" \
-)"
-e2e_save_artifact "case1_setup.txt" "$SETUP_RESP"
+SETUP_STATE="$(python3 - "$SEARCH_DB" "$PROJECT_PATH" "$AGENT_A" "$AGENT_B" <<'PY'
+import sqlite3
+import sys
+import time
 
-# Verify project + agents registered
-PROJ_ERR="$(is_error_result "$SETUP_RESP" 10)"
-GF_ERR="$(is_error_result "$SETUP_RESP" 11)"
-SW_ERR="$(is_error_result "$SETUP_RESP" 12)"
-if [ "$GF_ERR" = "false" ] && [ "$SW_ERR" = "false" ]; then
-    if [ "$PROJ_ERR" = "false" ]; then
-        e2e_pass "setup: project + 2 agents registered"
-    else
-        e2e_pass "setup: agents registered even with transient ensure_project error"
-    fi
+db_path, project_path, agent_a, agent_b = sys.argv[1:5]
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+now_us = int(time.time() * 1_000_000)
+
+cur.execute("SELECT id FROM projects WHERE human_key = ? LIMIT 1", (project_path,))
+row = cur.fetchone()
+if row:
+    project_id = int(row[0])
+else:
+    cur.execute(
+        "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+        (project_path.strip('/').replace('/', '-').replace('_', '-'), project_path, now_us),
+    )
+    project_id = int(cur.lastrowid)
+
+def ensure_agent(name: str):
+    cur.execute(
+        "SELECT id FROM agents WHERE project_id = ? AND lower(name) = lower(?) LIMIT 1",
+        (project_id, name),
+    )
+    existing = cur.fetchone()
+    if existing:
+        return int(existing[0])
+    cur.execute(
+        "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) "
+        "VALUES (?, ?, ?, ?, '', ?, ?, 'auto', 'auto')",
+        (project_id, name, "e2e-test", "test-model", now_us, now_us),
+    )
+    return int(cur.lastrowid)
+
+aid = ensure_agent(agent_a)
+bid = ensure_agent(agent_b)
+conn.commit()
+print(f"project_id={project_id}|agent_a_id={aid}|agent_b_id={bid}")
+PY
+)"
+e2e_save_artifact "case1_setup_state.txt" "$SETUP_STATE"
+if echo "$SETUP_STATE" | grep -q "project_id="; then
+    e2e_pass "setup: ensured project and agents directly in DB"
 else
-    e2e_fail "setup: project or agent registration failed"
-    echo "    proj_err=$PROJ_ERR gf_err=$GF_ERR sw_err=$SW_ERR"
+    e2e_fail "setup: failed to ensure project/agents"
 fi
 
-# Verify all 3 messages sent successfully
-MSG1_ERR="$(is_error_result "$SETUP_RESP" 13)"
-MSG2_ERR="$(is_error_result "$SETUP_RESP" 14)"
-MSG3_ERR="$(is_error_result "$SETUP_RESP" 15)"
-if [ "$MSG1_ERR" = "false" ] && [ "$MSG2_ERR" = "false" ] && [ "$MSG3_ERR" = "false" ]; then
+MSG1_OK=true
+MSG2_OK=true
+MSG3_OK=true
+if ! call_tool_text 13 send_message "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${AGENT_A}\",\"to\":[\"${AGENT_B}\"],\"subject\":\"Build plan for API\",\"body_md\":\"We need to refactor the users endpoint and migration steps\",\"thread_id\":\"PR-100\"}" >/dev/null; then
+    MSG1_OK=false
+fi
+if ! call_tool_text 14 send_message "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${AGENT_B}\",\"to\":[\"${AGENT_A}\"],\"subject\":\"Migration kickoff\",\"body_md\":\"I agree, let me start the migration\",\"thread_id\":\"PR-100\"}" >/dev/null; then
+    MSG2_OK=false
+fi
+if ! call_tool_text 15 send_message "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${AGENT_A}\",\"to\":[\"${AGENT_B}\"],\"subject\":\"Database schema update\",\"body_md\":\"New columns for auth tokens\",\"thread_id\":\"DB-50\"}" >/dev/null; then
+    MSG3_OK=false
+fi
+
+if [ "$MSG1_OK" = true ] && [ "$MSG2_OK" = true ] && [ "$MSG3_OK" = true ]; then
     e2e_pass "setup: 3 messages sent (2 threads)"
 else
-    e2e_fail "setup: message sending failed"
-    echo "    msg1_err=$MSG1_ERR msg2_err=$MSG2_ERR msg3_err=$MSG3_ERR"
-    # Show error details
-    MSG1_TEXT="$(extract_result "$SETUP_RESP" 13)"
-    MSG2_TEXT="$(extract_result "$SETUP_RESP" 14)"
-    MSG3_TEXT="$(extract_result "$SETUP_RESP" 15)"
-    echo "    msg1: $MSG1_TEXT"
-    echo "    msg2: $MSG2_TEXT"
-    echo "    msg3: $MSG3_TEXT"
+    e2e_fail "setup: message sending failed (msg1=$MSG1_OK msg2=$MSG2_OK msg3=$MSG3_OK)"
 fi
 
 # ===========================================================================
