@@ -12,7 +12,8 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    DocKind, RankingMode, RecoverySuggestion, SearchCursor, SearchQuery, SearchResponse,
+    DocKind, RankingMode, RecoverySuggestion, ScopePolicy, SearchCursor, SearchQuery,
+    SearchResponse,
     SearchResult, ZeroResultGuidance,
 };
 use crate::search_scope::{
@@ -2619,6 +2620,40 @@ fn lexical_bridge_unavailable_error(engine: SearchEngine, query: &SearchQuery) -
     ))
 }
 
+/// Scope-aware discriminator for query-cache keying.
+///
+/// This prevents cross-scope cache collisions for identical query text/facets
+/// (e.g., different product scopes with the same `query` string).
+fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    query.product_id.hash(&mut hasher);
+    query.project_id.hash(&mut hasher);
+    query.doc_kind.hash(&mut hasher);
+
+    match &query.scope {
+        ScopePolicy::Unrestricted => {
+            "unrestricted".hash(&mut hasher);
+        }
+        ScopePolicy::CallerScoped { caller_agent } => {
+            "caller_scoped".hash(&mut hasher);
+            caller_agent.hash(&mut hasher);
+        }
+        ScopePolicy::ProjectSet {
+            allowed_project_ids,
+        } => {
+            "project_set".hash(&mut hasher);
+            let mut sorted = allowed_project_ids.clone();
+            sorted.sort_unstable();
+            sorted.hash(&mut hasher);
+        }
+    }
+
+    hasher.finish()
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Core execution
 // ────────────────────────────────────────────────────────────────────
@@ -2647,12 +2682,15 @@ pub async fn execute_search(
             .search_engine
             .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
         let mode = engine_to_search_mode(engine_mode);
-        // Cursor-based pagination: hash cursor string into offset for cache key
-        // differentiation. Different cursors = different result pages.
+        // Cursor-based pagination: hash cursor token into offset proxy.
+        // Also fold in scope discriminator so product/project scope variants of
+        // the same query never collide in cache.
+        let scope_discriminator = cache_scope_discriminator(query);
         let offset_proxy = query.cursor.as_ref().map_or(0_usize, |c| {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             c.hash(&mut h);
+            scope_discriminator.hash(&mut h);
             // Truncation is intentional: this is a hash-based discriminator,
             // not a precise offset. Losing high bits on 32-bit is fine.
             #[allow(clippy::cast_possible_truncation)]
@@ -2660,6 +2698,14 @@ pub async fn execute_search(
                 h.finish() as usize
             }
         });
+        let offset_proxy = if query.cursor.is_none() {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                scope_discriminator as usize
+            }
+        } else {
+            offset_proxy
+        };
         QueryCacheKey::new(
             &query.text,
             mode,
@@ -3132,6 +3178,50 @@ mod tests {
         assert!(opts.scope_ctx.is_none());
         assert!(opts.redaction_policy.is_none());
         assert!(!opts.track_telemetry);
+    }
+
+    #[test]
+    fn cache_scope_discriminator_differs_by_product_id() {
+        let q1 = SearchQuery {
+            text: "alpha-shared".to_string(),
+            doc_kind: DocKind::Message,
+            product_id: Some(10),
+            ..Default::default()
+        };
+        let q2 = SearchQuery {
+            text: "alpha-shared".to_string(),
+            doc_kind: DocKind::Message,
+            product_id: Some(20),
+            ..Default::default()
+        };
+        assert_ne!(
+            cache_scope_discriminator(&q1),
+            cache_scope_discriminator(&q2),
+            "cache scope discriminator must differ across product scopes"
+        );
+    }
+
+    #[test]
+    fn cache_scope_discriminator_project_set_is_order_invariant() {
+        let q1 = SearchQuery {
+            text: "shared".to_string(),
+            scope: ScopePolicy::ProjectSet {
+                allowed_project_ids: vec![1, 2, 3],
+            },
+            ..Default::default()
+        };
+        let q2 = SearchQuery {
+            text: "shared".to_string(),
+            scope: ScopePolicy::ProjectSet {
+                allowed_project_ids: vec![3, 1, 2],
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            cache_scope_discriminator(&q1),
+            cache_scope_discriminator(&q2),
+            "project-set discriminator should be deterministic regardless of input ordering"
+        );
     }
 
     fn detail_row(
