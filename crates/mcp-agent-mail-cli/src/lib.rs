@@ -2093,23 +2093,38 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
 
     TRACING_INIT.call_once(|| {
         let filter = if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(default_release_log_filter())
+            })
         } else if suppress_runtime_logs_for_tui {
             // Prevent tracing output from corrupting the interactive TUI.
             tracing_subscriber::EnvFilter::new("off")
         } else {
-            tracing_subscriber::EnvFilter::new("info")
+            tracing_subscriber::EnvFilter::new(default_release_log_filter())
         };
 
         // Ignore double-init errors when tests or host processes already set a subscriber.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
+            .with_writer(std::io::stderr)
             .with_target(false)
             .with_ansi(crate::output::is_tty())
             .compact()
             .try_init();
     });
+}
+
+fn default_release_log_filter() -> &'static str {
+    concat!(
+        "info,",
+        "fsqlite_core::connection=warn,",
+        "fsqlite_mvcc::observability=warn,",
+        "fsqlite_mvcc::gc=warn,",
+        "fsqlite_mvcc::rebase=warn,",
+        "fsqlite_wal::checkpoint_executor=warn,",
+        "fsqlite_vdbe::jit=warn,",
+        "fsqlite_vdbe::engine=warn",
+    )
 }
 
 fn env_var_is_truthy(name: &str) -> bool {

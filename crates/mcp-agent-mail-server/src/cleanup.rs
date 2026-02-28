@@ -72,7 +72,14 @@ fn cleanup_loop(config: &Config) {
     let interval =
         std::time::Duration::from_secs(config.file_reservations_cleanup_interval_seconds.max(5));
 
-    let pool_config = DbPoolConfig::from_env();
+    let mut pool_config = DbPoolConfig::from_env();
+    pool_config.database_url.clone_from(&config.database_url);
+    pool_config.min_connections = 1;
+    pool_config.max_connections = 1;
+    pool_config.warmup_connections = 0;
+    // HTTP/TUI startup already runs readiness_check with migrations before
+    // this worker starts, so keep the worker path lean.
+    pool_config.run_migrations = false;
     let pool = match create_pool(&pool_config) {
         Ok(p) => p,
         Err(e) => {

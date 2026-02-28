@@ -1340,9 +1340,11 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
-    // Startup probes already performed the first integrity verification.
+    // readiness_check() already performed the first integrity verification.
     // Avoid immediately repeating the same expensive check in the guard loop.
-    integrity_guard::note_startup_integrity_probe_completed();
+    if config.integrity_check_on_startup {
+        integrity_guard::note_startup_integrity_probe_completed();
+    }
     integrity_guard::start(config);
     disk_monitor::start(config);
     start_advisory_consistency_probe(config);
@@ -1414,9 +1416,11 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
-    // Startup probes already performed the first integrity verification.
+    // readiness_check() already performed the first integrity verification.
     // Avoid immediately repeating the same expensive check in the guard loop.
-    integrity_guard::note_startup_integrity_probe_completed();
+    if config.integrity_check_on_startup {
+        integrity_guard::note_startup_integrity_probe_completed();
+    }
     integrity_guard::start(config);
     disk_monitor::start(config);
     start_advisory_consistency_probe(config);
@@ -6013,6 +6017,12 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
         warmup_connections: 0,
     };
     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
+    if config.integrity_check_on_startup
+        && !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)
+    {
+        pool.run_startup_integrity_check()
+            .map_err(|e| format!("startup integrity check failed: {e}"))?;
+    }
     let cx = Cx::for_testing();
     let conn = match block_on(pool.acquire(&cx)) {
         asupersync::Outcome::Ok(c) => c,

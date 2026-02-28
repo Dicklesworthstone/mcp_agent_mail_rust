@@ -41,6 +41,19 @@ fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {
     parse_am_interface_mode(env::var("AM_INTERFACE_MODE").ok().as_deref())
 }
 
+fn default_mcp_log_filter() -> &'static str {
+    concat!(
+        "info,",
+        "fsqlite_core::connection=warn,",
+        "fsqlite_mvcc::observability=warn,",
+        "fsqlite_mvcc::gc=warn,",
+        "fsqlite_mvcc::rebase=warn,",
+        "fsqlite_wal::checkpoint_executor=warn,",
+        "fsqlite_vdbe::jit=warn,",
+        "fsqlite_vdbe::engine=warn",
+    )
+}
+
 #[derive(Parser)]
 #[command(name = "mcp-agent-mail")]
 #[command(
@@ -351,8 +364,13 @@ fn main() {
     }
 
     // MCP mode: initialize logging and proceed with the server binary behavior.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_mcp_log_filter()));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
 
     let cli = Cli::parse();
 

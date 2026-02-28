@@ -487,6 +487,7 @@ fn probe_database(config: &Config) -> ProbeResult {
 /// logs a warning and allows startup to continue.
 ///
 /// Skipped when `INTEGRITY_CHECK_ON_STARTUP=false` or for in-memory databases.
+#[allow(dead_code)]
 fn probe_integrity(config: &Config) -> ProbeResult {
     if !config.integrity_check_on_startup {
         return ProbeResult::Ok { name: "integrity" };
@@ -498,7 +499,10 @@ fn probe_integrity(config: &Config) -> ProbeResult {
 
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
+        min_connections: 1,
+        max_connections: 1,
         run_migrations: false,
+        warmup_connections: 0,
         ..DbPoolConfig::default()
     };
 
@@ -538,6 +542,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
 /// 1. Restore from a healthy `.bak` / `.backup-*` / `.recovery*` backup
 /// 2. Reconstruct from the Git archive (recovers messages + agents)
 /// 3. Reinitialize an empty database (last resort)
+#[allow(dead_code)]
 fn attempt_probe_recovery(config: &Config) -> ProbeResult {
     let Some(db_path) = sqlite_file_path_from_database_url(&config.database_url) else {
         return ProbeResult::Fail(ProbeFailure {
@@ -778,7 +783,6 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
         probe_http_path(config),
         probe_auth(config),
         probe_database(config),
-        probe_integrity(config),
         probe_storage_root(config),
         probe_port(config),
         probe_fd_limit(config),
@@ -964,8 +968,9 @@ mod tests {
     fn run_startup_probes_returns_results() {
         let config = default_config();
         let report = run_startup_probes(&config);
-        // Should have 7 critical probes (consistency is now background/advisory).
-        assert_eq!(report.results.len(), 7);
+        // Should have 6 critical probes (integrity now runs in readiness_check;
+        // consistency is background/advisory).
+        assert_eq!(report.results.len(), 6);
     }
 
     #[test]
