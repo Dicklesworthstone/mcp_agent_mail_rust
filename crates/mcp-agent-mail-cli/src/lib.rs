@@ -2282,11 +2282,7 @@ fn handle_service(action: service::ServiceCommand) -> CliResult<()> {
         service::ServiceCommand::Install {
             dry_run,
             health_timeout,
-        } => {
-            eprintln!("service install: dry_run={}, health_timeout={}", dry_run, health_timeout);
-            eprintln!("TODO: implement am service install");
-            Err(CliError::NotImplemented("am service install"))
-        }
+        } => service::install_service(dry_run, health_timeout),
         service::ServiceCommand::Uninstall => {
             eprintln!("TODO: implement am service uninstall");
             Err(CliError::NotImplemented("am service uninstall"))

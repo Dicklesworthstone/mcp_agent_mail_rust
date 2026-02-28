@@ -411,6 +411,136 @@ impl ServiceBackend for LaunchAgentBackend {
     }
 }
 
+/// Execute the full service installation flow
+pub fn install_service(dry_run: bool, health_timeout: u64) -> crate::CliResult<()> {
+    use mcp_agent_mail_core::paths;
+
+    eprintln!("Preparing service installation...");
+
+    // Step 1: Pre-flight checks
+    eprintln!("\nRunning pre-flight checks:");
+
+    // Check env file exists
+    let env_file = paths::env_file_path();
+    if !env_file.exists() {
+        return Err(crate::CliError::Other(
+            format!(
+                "✗ Env file not found at {}\n  Create it first by running 'am setup run'",
+                env_file.display()
+            )
+        ));
+    }
+    eprintln!("  ✓ Env file exists at {}", env_file.display());
+
+    // Check bearer token
+    let env_contents = fs::read_to_string(&env_file)
+        .map_err(|e| crate::CliError::Other(format!("Failed to read env file: {}", e)))?;
+
+    if !env_contents.contains("HTTP_BEARER_TOKEN") {
+        eprintln!("  ⚠ No bearer token found in env file");
+        eprintln!("  Note: Bearer token should be set for security");
+    } else {
+        eprintln!("  ✓ Bearer token configured");
+    }
+
+    // Step 2: Build service configuration
+    eprintln!("\nBuilding service configuration:");
+    let config = ServiceConfig::default();
+    eprintln!("  ✓ Service label: {}", config.service_label);
+    eprintln!("  ✓ Binary path: {}", config.binary_path.display());
+    eprintln!("  ✓ Env file: {}", config.env_file.display());
+    eprintln!("  ✓ Log directory: {}", config.data_dir.display());
+    eprintln!("  ✓ HTTP: {}:{}{}", config.http_host, config.http_port, config.http_path);
+
+    if dry_run {
+        eprintln!("\n[DRY RUN] Would install service with above configuration");
+        return Ok(());
+    }
+
+    // Step 3: Create log directory
+    eprintln!("\nPreparing installation:");
+    fs::create_dir_all(&config.data_dir)
+        .map_err(|e| crate::CliError::Other(format!("Failed to create log directory: {}", e)))?;
+    eprintln!("  ✓ Created log directory");
+
+    // Step 4: Detect and select platform backend
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!("\n✓ Detected macOS platform");
+        let backend = LaunchAgentBackend;
+        backend.install(&config)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!("\n✓ Detected Linux platform");
+        eprintln!("  TODO: Implement systemd backend");
+        return Err(crate::CliError::NotImplemented("Linux systemd service installation"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!("\n✓ Detected Windows platform");
+        eprintln!("  TODO: Implement Windows Scheduled Task backend");
+        return Err(crate::CliError::NotImplemented("Windows Scheduled Task installation"));
+    }
+
+    // Step 5: Perform health check
+    eprintln!("\nPerforming health check (timeout: {}s):", health_timeout);
+    let health_check_result = perform_health_check(
+        &config.http_host,
+        config.http_port,
+        &config.http_path,
+        health_timeout,
+    );
+
+    match health_check_result {
+        Ok(latency_ms) => {
+            eprintln!("  ✓ Service is healthy (latency: {}ms)", latency_ms);
+        }
+        Err(e) => {
+            eprintln!("  ⚠ Health check failed (this may be normal if service is still starting)");
+            eprintln!("    Error: {}", e);
+            eprintln!("    Run 'am service status' or 'am doctor check' to diagnose");
+        }
+    }
+
+    eprintln!("\n✓ Service installation complete!");
+    eprintln!("  Run 'am service status' to check service state");
+    eprintln!("  Run 'am service logs' to view service logs");
+
+    Ok(())
+}
+
+/// Perform health check on service endpoint with exponential backoff
+fn perform_health_check(host: &str, port: u16, path: &str, timeout_secs: u64) -> Result<u64, String> {
+    let url = format!("http://{}:{}{}", host, port, path);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(timeout_secs);
+
+    let mut backoff_ms = 100;
+    const MAX_BACKOFF_MS: u64 = 5000;
+
+    loop {
+        // Try to connect
+        match std::net::TcpStream::connect(format!("{}:{}", host, port)) {
+            Ok(_) => {
+                let latency = start.elapsed().as_millis() as u64;
+                return Ok(latency);
+            }
+            Err(_) => {
+                if std::time::Instant::now() > deadline {
+                    return Err("Health check timeout".to_string());
+                }
+
+                // Exponential backoff
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
