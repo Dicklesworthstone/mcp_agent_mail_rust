@@ -368,18 +368,16 @@ pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<Pe
                  ON latest.tool_name = s.tool_name AND latest.max_ts = s.collected_ts \
                ORDER BY s.calls DESC, s.tool_name ASC \
                LIMIT ?";
-    let rows = conn
-        .query_sync(sql, &[Value::BigInt(limit_i64)])
-        .or_else(|err| {
+    let rows = match conn.query_sync(sql, &[Value::BigInt(limit_i64)]) {
+        Ok(rows) => rows,
+        Err(err) if is_missing_metrics_table_error(&err) => {
             // Fast path avoids DDL on every read; recover lazily when schema is missing.
-            if is_missing_metrics_table_error(&err) {
-                ensure_metrics_schema(&conn);
-                conn.query_sync(sql, &[Value::BigInt(limit_i64)])
-            } else {
-                Err(err)
-            }
-        })
-        .unwrap_or_default();
+            ensure_metrics_schema(&conn);
+            conn.query_sync(sql, &[Value::BigInt(limit_i64)])
+                .unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    };
     rows.iter().filter_map(decode_metric_row).collect()
 }
 
@@ -389,18 +387,15 @@ pub fn persisted_metric_store_size(database_url: &str) -> u64 {
         return 0;
     };
     let sql = format!("SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}");
-    let rows = conn
-        .query_sync(&sql, &[])
-        .or_else(|err| {
+    let rows = match conn.query_sync(&sql, &[]) {
+        Ok(rows) => rows,
+        Err(err) if is_missing_metrics_table_error(&err) => {
             // Fast path avoids DDL on every read; recover lazily when schema is missing.
-            if is_missing_metrics_table_error(&err) {
-                ensure_metrics_schema(&conn);
-                conn.query_sync(&sql, &[])
-            } else {
-                Err(err)
-            }
-        })
-        .unwrap_or_default();
+            ensure_metrics_schema(&conn);
+            conn.query_sync(&sql, &[]).unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    };
     rows.into_iter()
         .next()
         .and_then(|row| row.get_named::<i64>("c").ok())

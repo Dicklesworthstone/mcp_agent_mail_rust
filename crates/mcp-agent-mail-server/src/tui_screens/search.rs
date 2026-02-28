@@ -2409,7 +2409,8 @@ impl MailScreen for SearchCockpitScreen {
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         // ── Dirty-state gated data ingestion ────────────────────────
         let current_gen = state.data_generation();
-        let _dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+        // Search is purely user-driven (debounce-gated), so we track
+        // the generation for baseline continuity but do not gate on it.
 
         self.ui_phase = (tick_count % 16) as u8;
         if self.search_dirty {
@@ -3309,14 +3310,14 @@ fn render_query_bar(
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
     let content_inner = if inner.width > 2 {
         Rect::new(
             inner.x.saturating_add(1),
@@ -3496,7 +3497,6 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
 
     let text = "AND/OR: error AND deploy\n\
 Quotes: \"build failed\"\n\
@@ -3662,13 +3662,13 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
     let block = Block::bordered()
         .title("Query Lab")
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border_dim));
+        .border_style(Style::default().fg(tp.panel_border_dim))
+        .style(Style::default().bg(tp.panel_bg));
     let lab_inner = block.inner(lab_area);
     block.render(lab_area, frame);
     if lab_inner.height == 0 || lab_inner.width == 0 {
         return;
     }
-    fill_rect(frame, lab_inner, tp.panel_bg);
 
     let mut rows: Vec<String> = Vec::new();
     let q = screen.query_input.value().trim();
@@ -3901,14 +3901,14 @@ fn render_results(
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
     let content = if inner.width > 2 {
         Rect::new(
             inner.x.saturating_add(1),
@@ -4336,14 +4336,14 @@ fn render_detail(
     let block = Block::bordered()
         .title("Detail")
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    fill_rect(frame, inner, tp.panel_bg);
 
     let (content_inner, scrollbar_area) = if inner.width > 6 {
         (

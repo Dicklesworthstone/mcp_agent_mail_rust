@@ -2084,19 +2084,20 @@ fn handle_default_launch() -> CliResult<()> {
         });
     }
 
-    apply_release_logging_defaults();
-
     // Interactive: full server launch experience (setup self-heal + port check + serve)
     handle_serve_http(None, None, None, false, false)
 }
 
-fn apply_release_logging_defaults() {
+fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
     TRACING_INIT.call_once(|| {
         let filter = if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        } else if suppress_runtime_logs_for_tui {
+            // Prevent tracing output from corrupting the interactive TUI.
+            tracing_subscriber::EnvFilter::new("off")
         } else {
             tracing_subscriber::EnvFilter::new("info")
         };
@@ -2686,10 +2687,38 @@ fn query_table_count(conn: &mcp_agent_mail_db::DbConn, table: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn query_preflight_banner_stats_batched(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> Option<PreflightBannerStats> {
+    let sql = "SELECT \
+               (SELECT COUNT(*) FROM projects) AS projects_count, \
+               (SELECT COUNT(*) FROM agents) AS agents_count, \
+               (SELECT COUNT(*) FROM messages) AS messages_count, \
+               (SELECT COUNT(*) FROM file_reservations) AS reservations_count, \
+               (SELECT COUNT(*) FROM agent_links) AS links_count";
+    let row = conn.query_sync(sql, &[]).ok()?.into_iter().next()?;
+    let read_count = |key: &str| {
+        row.get_named::<i64>(key)
+            .ok()
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0)
+    };
+    Some(PreflightBannerStats {
+        projects: read_count("projects_count"),
+        agents: read_count("agents_count"),
+        messages: read_count("messages_count"),
+        file_reservations: read_count("reservations_count"),
+        contact_links: read_count("links_count"),
+    })
+}
+
 fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
     let Ok(conn) = open_db_sync_with_database_url(database_url) else {
         return PreflightBannerStats::default();
     };
+    if let Some(stats) = query_preflight_banner_stats_batched(&conn) {
+        return stats;
+    }
     PreflightBannerStats {
         projects: query_table_count(&conn, "projects"),
         agents: query_table_count(&conn, "agents"),
@@ -2751,12 +2780,12 @@ fn handle_serve_http(
     no_auth: bool,
     no_tui: bool,
 ) -> CliResult<()> {
-    apply_release_logging_defaults();
-
     let mut config = build_http_config(host, port, path, no_auth);
     if no_tui {
         config.tui_enabled = false;
     }
+    let suppress_runtime_logs_for_tui = config.tui_enabled && crate::output::is_tty();
+    apply_release_logging_defaults(suppress_runtime_logs_for_tui);
     if let Err(e) = run_setup_self_heal_for_server(&config) {
         output::warn(&format!(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
@@ -20573,6 +20602,58 @@ mod tests {
         if let Some(parent) = relative_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn query_preflight_banner_stats_batched_reads_expected_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("preflight_banner.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY)")
+            .expect("create projects");
+        conn.execute_raw("CREATE TABLE agents(id INTEGER PRIMARY KEY)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create messages");
+        conn.execute_raw("CREATE TABLE file_reservations(id INTEGER PRIMARY KEY)")
+            .expect("create file_reservations");
+        conn.execute_raw("CREATE TABLE agent_links(id INTEGER PRIMARY KEY)")
+            .expect("create agent_links");
+
+        conn.execute_raw("INSERT INTO projects(id) VALUES (1), (2)")
+            .expect("seed projects");
+        conn.execute_raw("INSERT INTO agents(id) VALUES (1)")
+            .expect("seed agents");
+        conn.execute_raw("INSERT INTO messages(id) VALUES (1), (2), (3)")
+            .expect("seed messages");
+        conn.execute_raw("INSERT INTO file_reservations(id) VALUES (1)")
+            .expect("seed file_reservations");
+        conn.execute_raw("INSERT INTO agent_links(id) VALUES (1), (2)")
+            .expect("seed agent_links");
+
+        let stats =
+            query_preflight_banner_stats_batched(&conn).expect("batched preflight stats query");
+        assert_eq!(stats.projects, 2);
+        assert_eq!(stats.agents, 1);
+        assert_eq!(stats.messages, 3);
+        assert_eq!(stats.file_reservations, 1);
+        assert_eq!(stats.contact_links, 2);
+    }
+
+    #[test]
+    fn query_preflight_banner_stats_batched_returns_none_on_missing_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("preflight_banner_missing.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY)")
+            .expect("create projects");
+        // Intentionally omit the other required tables to trigger a graceful
+        // batched-query miss so callers can fallback to per-table probes.
+        assert!(query_preflight_banner_stats_batched(&conn).is_none());
     }
 
     #[test]

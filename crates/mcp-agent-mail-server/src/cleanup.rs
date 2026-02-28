@@ -275,7 +275,7 @@ fn check_filesystem_activity(
         return false;
     }
 
-    let pattern = path_pattern.trim();
+    let pattern = path_pattern.trim().trim_start_matches('/');
     if pattern.is_empty() {
         return false;
     }
@@ -331,6 +331,11 @@ fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_u
         return false;
     }
 
+    let pattern = path_pattern.trim().trim_start_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
+
     // Use git log with the path pattern directly (git handles pathspecs including globs).
     // This is vastly more efficient than spawning a git process per matched file.
     let Ok(output) = std::process::Command::new("git")
@@ -341,7 +346,7 @@ fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_u
             "-1",
             "--format=%ct",
             "--",
-            path_pattern,
+            pattern,
         ])
         .output()
     else {
@@ -367,7 +372,7 @@ fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_u
 /// use globbing; otherwise treat as a literal path.
 #[cfg(test)]
 fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf> {
-    let pattern = pattern.trim();
+    let pattern = pattern.trim().trim_start_matches('/');
     if pattern.is_empty() {
         return Vec::new();
     }

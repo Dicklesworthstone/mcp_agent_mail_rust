@@ -1020,14 +1020,14 @@ impl ThreadExplorerScreen {
         let block = Block::bordered()
             .title(title.as_str())
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+            .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+            .style(Style::default().bg(tp.panel_bg));
         let inner = block.inner(area);
         block.render(area, frame);
 
         if inner.width < 4 || inner.height < 4 {
             return;
         }
-        clear_rect(frame, inner, tp.panel_bg);
 
         let mermaid_messages = self.thread_mermaid_messages();
         let source = generate_thread_flow_mermaid(&mermaid_messages);
@@ -2124,15 +2124,14 @@ fn render_thread_list(
     let block = Block::bordered()
         .title(title.as_str())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    // Clear interior cells each frame to avoid stale glyphs from previous layouts.
-    clear_rect(frame, inner, tp.panel_bg);
 
     // Use full inner area to maximize density and reduce wasted space.
     let content_inner = if inner.width >= THREAD_LIST_SIDE_PADDING_MIN_WIDTH {
@@ -2487,15 +2486,14 @@ fn render_thread_detail(
     let block = Block::bordered()
         .title(title.as_str())
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)))
+        .style(Style::default().bg(tp.panel_bg));
     let inner = block.inner(area);
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    // Clear interior cells each frame to avoid stale tree/border glyph artifacts.
-    clear_rect(frame, inner, tp.panel_bg);
     // Use full inner area to maximize density and reduce wasted space.
     let content_inner = if inner.width >= THREAD_DETAIL_SIDE_PADDING_MIN_WIDTH {
         Rect::new(
