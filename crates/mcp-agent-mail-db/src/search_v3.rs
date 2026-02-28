@@ -16,7 +16,7 @@ use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilter, SearchResults};
 use sqlmodel_core::Value;
 use tantivy::Order;
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::TopDocs;
 use tantivy::query::TermQuery;
 use tantivy::schema::IndexRecordOption;
 use tantivy::{Index, Term};
@@ -337,8 +337,8 @@ fn add_indexable_message(
     handles: &FieldHandles,
     msg: &IndexableMessage,
 ) -> Result<(), String> {
-    let id_u64 =
-        u64::try_from(msg.id).map_err(|_| format!("message id must be non-negative: {}", msg.id))?;
+    let id_u64 = u64::try_from(msg.id)
+        .map_err(|_| format!("message id must be non-negative: {}", msg.id))?;
     let project_id_u64 = u64::try_from(msg.project_id)
         .map_err(|_| format!("project id must be non-negative: {}", msg.project_id))?;
 
@@ -365,8 +365,8 @@ fn upsert_indexable_message(
     handles: &FieldHandles,
     msg: &IndexableMessage,
 ) -> Result<(), String> {
-    let id_u64 =
-        u64::try_from(msg.id).map_err(|_| format!("message id must be non-negative: {}", msg.id))?;
+    let id_u64 = u64::try_from(msg.id)
+        .map_err(|_| format!("message id must be non-negative: {}", msg.id))?;
     writer.delete_term(Term::from_field_u64(handles.id, id_u64));
     add_indexable_message(writer, handles, msg)
 }
@@ -456,15 +456,18 @@ fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, Str
         .reader()
         .map_err(|e| format!("backfill index reader error: {e}"))?;
     let searcher = reader.searcher();
+    let count = u64::try_from(searcher.num_docs()).unwrap_or(u64::MAX);
+    if count == 0 {
+        return Ok(MessageStats {
+            count: 0,
+            max_id: 0,
+        });
+    }
     let handles = bridge.handles();
     let message_query = TermQuery::new(
         Term::from_field_text(handles.doc_kind, "message"),
         IndexRecordOption::Basic,
     );
-
-    let count = searcher
-        .search(&message_query, &Count)
-        .map_err(|e| format!("backfill index count query failed: {e}"))?;
     let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher
         .search(
             &message_query,
@@ -473,13 +476,14 @@ fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, Str
         .map_err(|e| format!("backfill index max-id query failed: {e}"))?;
     let max_id = top_docs.first().map(|(id, _)| *id).unwrap_or(0);
 
-    Ok(MessageStats {
-        count: count as u64,
-        max_id,
-    })
+    Ok(MessageStats { count, max_id })
 }
 
-fn choose_backfill_plan(conn: &DbConn, db: MessageStats, index: MessageStats) -> Result<BackfillPlan, String> {
+fn choose_backfill_plan(
+    conn: &DbConn,
+    db: MessageStats,
+    index: MessageStats,
+) -> Result<BackfillPlan, String> {
     if db.count == 0 {
         return Ok(if index.count == 0 {
             BackfillPlan::Skip
@@ -722,7 +726,9 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     }
 
     refresh_index_health_metrics(&bridge);
-    crate::search_service::invalidate_search_cache(crate::search_cache::InvalidationTrigger::IndexUpdate);
+    crate::search_service::invalidate_search_cache(
+        crate::search_cache::InvalidationTrigger::IndexUpdate,
+    );
 
     match plan {
         BackfillPlan::Incremental { start_after_id } => tracing::info!(
@@ -1519,7 +1525,10 @@ mod tests {
             ..Default::default()
         };
         let legacy_results = bridge.search(&legacy_query);
-        assert!(legacy_results.is_empty(), "legacy document should be replaced");
+        assert!(
+            legacy_results.is_empty(),
+            "legacy document should be replaced"
+        );
     }
 
     #[test]
