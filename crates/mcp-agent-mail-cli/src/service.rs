@@ -411,6 +411,178 @@ impl ServiceBackend for LaunchAgentBackend {
     }
 }
 
+/// Generate systemd user service unit file content
+fn generate_systemd_unit(config: &ServiceConfig) -> String {
+    format!(
+        r#"[Unit]
+Description=MCP Agent Mail Service
+Documentation=https://github.com/joyshmitz/mcp_agent_mail_rust
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={} serve-http --no-tui --no-reuse-running --env-file {}
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-agent-mail
+
+[Install]
+WantedBy=default.target
+"#,
+        config.binary_path.display(),
+        config.env_file.display()
+    )
+}
+
+#[cfg(target_os = "linux")]
+impl ServiceBackend for SystemdUserBackend {
+    fn install(&self, config: &ServiceConfig) -> crate::CliResult<()> {
+        use std::fs;
+
+        // Check and set XDG_RUNTIME_DIR if needed
+        if std::env::var("XDG_RUNTIME_DIR").is_err() {
+            let uid = std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1000);
+            let runtime_dir = format!("/run/user/{}", uid);
+            if std::path::Path::new(&runtime_dir).exists() {
+                std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+                eprintln!("  ℹ Set XDG_RUNTIME_DIR={}", runtime_dir);
+            }
+        }
+
+        let unit_file_path = Self::unit_file_path();
+
+        // Create systemd config directory if needed
+        if let Some(parent) = unit_file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Create log directory
+        fs::create_dir_all(&config.data_dir)?;
+
+        // Generate systemd unit file content
+        let unit_content = generate_systemd_unit(config);
+
+        // Write unit file
+        mcp_agent_mail_core::paths::write_file_atomic(&unit_file_path, unit_content.as_bytes(), 0o644)?;
+
+        eprintln!("  ✓ Created systemd unit file at {}", unit_file_path.display());
+
+        // Reload systemd user daemon
+        Command::new("systemctl")
+            .args(&["--user", "daemon-reload"])
+            .output()
+            .map_err(|e| {
+                crate::CliError::Other(format!(
+                    "Failed to reload systemd daemon: {}. Make sure systemd is available.",
+                    e
+                ))
+            })?;
+
+        eprintln!("  ✓ Reloaded systemd user daemon");
+
+        // Enable the service
+        Command::new("systemctl")
+            .args(&["--user", "enable", Self::service_name()])
+            .output()
+            .map_err(|e| crate::CliError::Other(format!("Failed to enable service: {}", e)))?;
+
+        eprintln!("  ✓ Enabled service with systemctl");
+
+        // Start the service
+        Command::new("systemctl")
+            .args(&["--user", "start", Self::service_name()])
+            .output()
+            .map_err(|e| crate::CliError::Other(format!("Failed to start service: {}", e)))?;
+
+        eprintln!("  ✓ Started service");
+
+        // Enable linger for user session persistence
+        let _ = Command::new("loginctl")
+            .args(&["enable-linger"])
+            .output();
+
+        eprintln!("  ✓ Enabled user session linger (service persists across logins)");
+
+        Ok(())
+    }
+
+    fn uninstall(&self) -> crate::CliResult<()> {
+        use std::fs;
+
+        let unit_file_path = Self::unit_file_path();
+
+        // Stop the service
+        let _ = Command::new("systemctl")
+            .args(&["--user", "stop", Self::service_name()])
+            .output();
+
+        // Disable the service
+        let _ = Command::new("systemctl")
+            .args(&["--user", "disable", Self::service_name()])
+            .output();
+
+        // Remove unit file
+        let _ = fs::remove_file(&unit_file_path);
+
+        // Reload systemd daemon
+        let _ = Command::new("systemctl")
+            .args(&["--user", "daemon-reload"])
+            .output();
+
+        eprintln!("✓ Service uninstalled");
+
+        Ok(())
+    }
+
+    fn status(&self) -> crate::CliResult<ServiceStatus> {
+        // Query systemctl for service status
+        let output = Command::new("systemctl")
+            .args(&["--user", "is-active", Self::service_name()])
+            .output()
+            .map_err(|e| crate::CliError::Other(format!("Failed to query systemctl: {}", e)))?;
+
+        let status_str = String::from_utf8_lossy(&output.stdout);
+        let is_running = status_str.trim() == "active";
+
+        Ok(ServiceStatus {
+            status: if is_running { "running".to_string() } else { "stopped".to_string() },
+            pid: None,
+            uptime_secs: None,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            installed_at: None,
+            health: None,
+            error: None,
+        })
+    }
+
+    fn restart(&self) -> crate::CliResult<()> {
+        // Use systemctl restart which handles graceful shutdown
+        Command::new("systemctl")
+            .args(&["--user", "restart", Self::service_name()])
+            .output()
+            .map_err(|e| crate::CliError::Other(format!("Failed to restart service: {}", e)))?;
+
+        eprintln!("✓ Service restarted");
+
+        Ok(())
+    }
+
+    fn log_paths(&self) -> crate::CliResult<Vec<PathBuf>> {
+        // Linux systemd uses journal, not file paths
+        // Return empty vector to indicate journal usage
+        Ok(vec![])
+    }
+}
+
 /// Execute the full service installation flow
 pub fn install_service(dry_run: bool, health_timeout: u64) -> crate::CliResult<()> {
     use mcp_agent_mail_core::paths;
@@ -474,8 +646,8 @@ pub fn install_service(dry_run: bool, health_timeout: u64) -> crate::CliResult<(
     #[cfg(target_os = "linux")]
     {
         eprintln!("\n✓ Detected Linux platform");
-        eprintln!("  TODO: Implement systemd backend");
-        return Err(crate::CliError::NotImplemented("Linux systemd service installation"));
+        let backend = SystemdUserBackend;
+        backend.install(&config)?;
     }
 
     #[cfg(target_os = "windows")]
@@ -585,8 +757,42 @@ pub fn status_service(json: bool) -> crate::CliResult<()> {
 
     #[cfg(target_os = "linux")]
     {
-        eprintln!("TODO: Implement Linux systemd status");
-        Err(crate::CliError::NotImplemented("Linux service status"))
+        let backend = SystemdUserBackend;
+        let status = backend.status()?;
+
+        if json {
+            // Output JSON format
+            let json_output = serde_json::json!({
+                "status": status.status,
+                "pid": status.pid,
+                "uptime_secs": status.uptime_secs,
+                "version": status.version,
+                "installed_at": status.installed_at,
+                "health": status.health,
+            });
+            println!("{}", json_output.to_string());
+        } else {
+            // Human-readable output
+            println!("Service: mcp-agent-mail");
+            println!("Status:  {}", status.status);
+            if let Some(pid) = status.pid {
+                println!("PID:     {}", pid);
+            }
+            if let Some(uptime) = status.uptime_secs {
+                println!("Uptime:  {} seconds", uptime);
+            }
+            println!("Version: {}", status.version);
+            if let Some(installed_at) = &status.installed_at {
+                println!("Installed: {}", installed_at);
+            }
+            if let Some(health) = status.health {
+                println!("Health:  {}", if health { "✓ healthy" } else { "✗ unhealthy" });
+            }
+            if let Some(error) = &status.error {
+                println!("Error:   {}", error);
+            }
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
@@ -610,8 +816,10 @@ pub fn restart_service() -> crate::CliResult<()> {
 
     #[cfg(target_os = "linux")]
     {
-        eprintln!("TODO: Implement Linux systemd restart");
-        Err(crate::CliError::NotImplemented("Linux service restart"))
+        let backend = SystemdUserBackend;
+        backend.restart()?;
+        eprintln!("Service restarted successfully");
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
@@ -635,8 +843,10 @@ pub fn uninstall_service() -> crate::CliResult<()> {
 
     #[cfg(target_os = "linux")]
     {
-        eprintln!("TODO: Implement Linux systemd uninstall");
-        Err(crate::CliError::NotImplemented("Linux service uninstall"))
+        let backend = SystemdUserBackend;
+        backend.uninstall()?;
+        eprintln!("Service uninstalled successfully");
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
