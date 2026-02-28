@@ -74,6 +74,157 @@ remediation hints and exits. Probes check:
 - **database**: URL must be valid and database reachable
 - **sqlite-integrity**: `PRAGMA quick_check` must pass
 
+## 2.5. Service Management (Step 14 of PR 2)
+
+### Background
+
+`am service` commands automate cross-platform service registration and lifecycle management.
+
+- **macOS**: LaunchAgent via `launchctl` at `~/Library/LaunchAgents/com.mcp-agent-mail.server.plist`
+- **Linux**: systemd --user at `~/.config/systemd/user/mcp-agent-mail.service`
+- **Windows**: Scheduled Task via PowerShell (future release)
+
+Service automatically starts on boot and restarts on crash (but NOT on clean shutdown).
+
+### Installation
+
+```bash
+# Automatic (post-install via install.sh, or manual):
+am service install
+
+# Show what will be generated:
+am service install --dry-run
+
+# Custom health check timeout (default 30s):
+am service install --health-timeout 60
+```
+
+Pre-flight checks:
+- ✓ Env file exists at `~/.config/mcp-agent-mail/env` (or legacy `~/.mcp_agent_mail/.env`)
+- ✓ Bearer token present in env file
+- ✓ HTTP port bindable
+
+### Status & Health
+
+```bash
+# Human-readable status:
+am service status
+
+# Machine-readable (JSON):
+am service status --json
+
+# Output includes: status, PID, uptime, version, health, installed date
+```
+
+### Logs
+
+```bash
+# Last 50 lines (default):
+am service logs
+
+# Last 100 lines:
+am service logs --lines 100
+
+# Live tail (Ctrl+C to stop):
+am service logs --follow
+```
+
+**macOS**: Reads from log files in `~/.local/state/mcp-agent-mail/logs/`
+**Linux**: Uses `journalctl --user -u mcp-agent-mail.service`
+
+### Operations
+
+```bash
+# Graceful restart (stop with SIGTERM, wait 10s, force kill, restart):
+am service restart
+
+# Stop and remove service:
+am service uninstall
+
+# Then re-install if needed:
+am service install
+```
+
+### Health Verification
+
+```bash
+# Full diagnostic check (includes service checks):
+am doctor check
+
+# Output includes:
+# - service_registered: Plist/unit file exists
+# - service_running: Service is active
+# - service_health: Health endpoint responds
+# - env_file_permissions: Env file has 600 permissions
+```
+
+### Configuration
+
+Service uses environment variables from `~/.config/mcp-agent-mail/env`:
+
+```bash
+# Required
+HTTP_BEARER_TOKEN=<token>
+
+# Optional (with defaults)
+HTTP_HOST=127.0.0.1         # Default: localhost only
+HTTP_PORT=8765              # Default: MCP port
+HTTP_PATH=/mcp/             # Default: MCP path
+DATABASE_URL=sqlite://...   # Default: ~/.local/share/mcp-agent-mail/storage.sqlite3
+```
+
+Change any value in env file, then run:
+```bash
+am service restart
+```
+
+### Troubleshooting
+
+**Service won't start:**
+```bash
+am doctor check          # Full diagnostics
+am service logs          # View error messages
+```
+
+**Port already in use:**
+```bash
+# Check what's using port 8765:
+lsof -i :8765
+
+# Or use different port (in env file):
+echo "HTTP_PORT=9000" >> ~/.config/mcp-agent-mail/env
+am service restart
+```
+
+**Env file permissions issue:**
+```bash
+# Verify 600 permissions:
+ls -la ~/.config/mcp-agent-mail/env
+
+# Fix if needed:
+chmod 600 ~/.config/mcp-agent-mail/env
+```
+
+### Migration from Manual Setup
+
+If you have an existing manual plist/systemd setup:
+
+1. Stop the old service:
+   ```bash
+   # macOS (old)
+   launchctl bootout gui/$(id -u) com.mcp-agent-mail
+
+   # Linux (old)
+   systemctl --user stop mcp-agent-mail
+   ```
+
+2. Run the installer:
+   ```bash
+   am service install
+   ```
+
+The installer automatically detects and backs up existing configurations.
+
 ## 3. Keyboard Controls
 
 ### Global (always active)
