@@ -329,7 +329,7 @@ pub struct IndexableMessage {
 }
 
 fn add_indexable_message(
-    writer: &mut tantivy::IndexWriter,
+    writer: &tantivy::IndexWriter,
     handles: &FieldHandles,
     msg: &IndexableMessage,
 ) -> Result<(), String> {
@@ -357,7 +357,7 @@ fn add_indexable_message(
 }
 
 fn upsert_indexable_message(
-    writer: &mut tantivy::IndexWriter,
+    writer: &tantivy::IndexWriter,
     handles: &FieldHandles,
     msg: &IndexableMessage,
 ) -> Result<(), String> {
@@ -471,13 +471,14 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 
 /// Backfill the Tantivy index with all messages from the database.
 ///
-/// Uses a sync `DbConn` (FrankenSQLite) to scan the messages table joined with
+/// Uses a sync `DbConn` (`FrankenSQLite`) to scan the messages table joined with
 /// agents and projects, then batch-indexes everything with a single writer.
 /// The index is rebuilt from scratch on each backfill to guarantee that stale
 /// or duplicate message documents cannot survive DB resets, migrations, or
 /// interrupted runs.
 ///
 /// Returns `(indexed_count, skipped_count)` where `skipped_count` is always 0.
+#[allow(clippy::too_many_lines)]
 pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
     const COMMIT_EVERY_BATCHES: usize = 8;
