@@ -446,7 +446,7 @@ impl MailExplorerScreen {
         };
 
         let text_filter = self.search_input.value().trim().to_string();
-        let text_match_ids = match self.resolve_text_filter_message_ids(&text_filter) {
+        let text_match_ids = match Self::resolve_text_filter_message_ids(&text_filter) {
             Ok(ids) => ids,
             Err(e) => {
                 self.last_error = Some(e);
@@ -506,7 +506,6 @@ impl MailExplorerScreen {
     }
 
     fn resolve_text_filter_message_ids(
-        &self,
         text_filter: &str,
     ) -> Result<Option<std::collections::HashSet<i64>>, String> {
         if text_filter.is_empty() {
@@ -521,11 +520,13 @@ impl MailExplorerScreen {
             .map_err(|e| format!("search filter runtime init failed: {e}"))?;
         let cx = asupersync::Cx::for_request();
 
-        let mut query = mcp_agent_mail_db::search_planner::SearchQuery::default();
-        query.text = text_filter.to_string();
-        query.doc_kind = mcp_agent_mail_db::search_planner::DocKind::Message;
-        query.ranking = mcp_agent_mail_db::search_planner::RankingMode::Recency;
-        query.limit = Some(MAX_TEXT_FILTER_IDS);
+        let query = mcp_agent_mail_db::search_planner::SearchQuery {
+            text: text_filter.to_string(),
+            doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
+            ranking: mcp_agent_mail_db::search_planner::RankingMode::Recency,
+            limit: Some(MAX_TEXT_FILTER_IDS),
+            ..Default::default()
+        };
 
         match runtime.block_on(async {
             mcp_agent_mail_db::search_service::execute_search_simple(&cx, &pool, &query).await

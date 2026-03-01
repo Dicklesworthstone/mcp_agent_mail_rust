@@ -1829,6 +1829,7 @@ impl MailScreen for ThreadExplorerScreen {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Fetch thread summaries grouped by `thread_id`, sorted by last activity.
+#[allow(clippy::too_many_lines)]
 fn fetch_threads(
     conn: &DbConn,
     filter: &str,
@@ -1982,11 +1983,13 @@ fn resolve_text_filter_thread_ids(filter: &str) -> Option<HashSet<String>> {
     };
     let cx = asupersync::Cx::for_request();
 
-    let mut query = mcp_agent_mail_db::search_planner::SearchQuery::default();
-    query.text = trimmed.to_string();
-    query.doc_kind = mcp_agent_mail_db::search_planner::DocKind::Message;
-    query.ranking = mcp_agent_mail_db::search_planner::RankingMode::Recency;
-    query.limit = Some(MAX_THREAD_FILTER_IDS);
+    let query = mcp_agent_mail_db::search_planner::SearchQuery {
+        text: trimmed.to_string(),
+        doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
+        ranking: mcp_agent_mail_db::search_planner::RankingMode::Recency,
+        limit: Some(MAX_THREAD_FILTER_IDS),
+        ..Default::default()
+    };
 
     let outcome = runtime.block_on(async {
         mcp_agent_mail_db::search_service::execute_search_simple(&cx, &pool, &query).await

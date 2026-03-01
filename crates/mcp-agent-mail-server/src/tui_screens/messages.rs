@@ -1380,7 +1380,7 @@ impl MessageBrowserScreen {
                 let to_summary = if payload.to.is_empty() {
                     if let Some(first) = payload.cc.first() {
                         if payload.cc.len() == 1 {
-                            format!("cc: {}", first)
+                            format!("cc: {first}")
                         } else {
                             format!("cc: {} (+{})", first, payload.cc.len() - 1)
                         }
