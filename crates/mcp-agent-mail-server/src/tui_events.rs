@@ -13,6 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const DEFAULT_EVENT_RING_CAPACITY: usize = 10_000;
+/// Bounded scan window for low-severity-preferred eviction when the ring is full.
+///
+/// A tight bound prevents O(capacity) scans under sustained load while still
+/// biasing eviction toward low-severity entries near the oldest frontier.
+const LOW_SEVERITY_EVICT_SCAN_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1172,12 +1177,18 @@ impl EventRingBuffer {
         event.set_seq(seq);
         event.set_timestamp_if_unset(chrono::Utc::now().timestamp_micros());
         if inner.events.len() >= inner.capacity {
+            let scan_limit = inner.events.len().min(LOW_SEVERITY_EVICT_SCAN_LIMIT);
             let drop_idx = inner
                 .events
                 .iter()
+                .take(scan_limit)
                 .position(|existing| existing.severity() < EventSeverity::Info)
                 .unwrap_or(0);
-            let _ = inner.events.remove(drop_idx);
+            if drop_idx == 0 {
+                let _ = inner.events.pop_front();
+            } else {
+                let _ = inner.events.remove(drop_idx);
+            }
         }
         inner.events.push_back(event);
         inner.total_pushed = inner.total_pushed.saturating_add(1);
@@ -1260,6 +1271,19 @@ impl EventRingBuffer {
         Self::collect_events_since_seq(&inner.events, seq)
     }
 
+    /// Return up to `limit` events with sequence numbers greater than `seq`.
+    ///
+    /// Events are returned oldest-first so callers can advance cursors
+    /// monotonically without skipping intermediate records under backlog.
+    #[must_use]
+    pub fn events_since_seq_limited(&self, seq: u64, limit: usize) -> Vec<MailEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let inner = self.lock_inner();
+        Self::collect_events_since_seq_limited(&inner.events, seq, limit)
+    }
+
     #[must_use]
     pub fn try_events_since_seq(&self, seq: u64) -> Option<Vec<MailEvent>> {
         let inner = self.inner.try_lock().ok()?;
@@ -1301,6 +1325,35 @@ impl EventRingBuffer {
         }
         out.reverse();
         out
+    }
+
+    #[inline]
+    fn collect_events_since_seq_limited(
+        events: &VecDeque<MailEvent>,
+        seq: u64,
+        limit: usize,
+    ) -> Vec<MailEvent> {
+        // Steady-state pollers usually ask for events past the current tail.
+        // Fast-path that case to avoid scanning the entire ring on every tick.
+        if events.back().is_none_or(|event| event.seq() <= seq) {
+            return Vec::new();
+        }
+
+        // Iterate newest -> oldest so the common case (cursor near tail)
+        // exits quickly like `collect_events_since_seq`. Keep only the
+        // oldest `limit` unseen events in a bounded deque.
+        let mut selected_rev: VecDeque<MailEvent> =
+            VecDeque::with_capacity(limit.min(events.len()));
+        for event in events.iter().rev() {
+            if event.seq() <= seq {
+                break;
+            }
+            if selected_rev.len() == limit {
+                let _ = selected_rev.pop_front();
+            }
+            selected_rev.push_back(event.clone());
+        }
+        selected_rev.into_iter().rev().collect()
     }
 
     #[must_use]
@@ -2121,6 +2174,26 @@ mod tests {
         let since = ring.events_since_seq(4);
         let since_seqs: Vec<u64> = since.iter().map(MailEvent::seq).collect();
         assert_eq!(since_seqs, vec![5, 6]);
+    }
+
+    #[test]
+    fn events_since_seq_limited_preserves_order_and_limit() {
+        let ring = EventRingBuffer::with_capacity(10);
+        for idx in 0..6 {
+            let _ = ring.push(sample_http(&format!("/limited/{idx}"), 200));
+        }
+
+        let first_batch = ring.events_since_seq_limited(2, 2);
+        let first_seqs: Vec<u64> = first_batch.iter().map(MailEvent::seq).collect();
+        assert_eq!(first_seqs, vec![3, 4]);
+
+        let second_batch = ring.events_since_seq_limited(4, 2);
+        let second_seqs: Vec<u64> = second_batch.iter().map(MailEvent::seq).collect();
+        assert_eq!(second_seqs, vec![5, 6]);
+
+        assert!(ring.events_since_seq_limited(6, 2).is_empty());
+        assert!(ring.events_since_seq_limited(10, 2).is_empty());
+        assert!(ring.events_since_seq_limited(2, 0).is_empty());
     }
 
     #[test]

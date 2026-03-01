@@ -173,6 +173,13 @@ pub enum RemoteTerminalEvent {
     Resize { cols: u16, rows: u16 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteTerminalQueueStats {
+    pub depth: usize,
+    pub dropped_oldest_total: u64,
+    pub resize_coalesced_total: u64,
+}
+
 /// Shared snapshot for mouse drag-and-drop of messages across TUI screens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageDragSnapshot {
@@ -211,6 +218,8 @@ pub struct TuiSharedState {
     db_stats: Mutex<DbStatSnapshot>,
     sparkline_data: AtomicSparkline,
     remote_terminal_events: Mutex<VecDeque<RemoteTerminalEvent>>,
+    remote_terminal_dropped_oldest: AtomicU64,
+    remote_terminal_resize_coalesced: AtomicU64,
     message_drag: Mutex<Option<MessageDragSnapshot>>,
     keyboard_move: Mutex<Option<KeyboardMoveSnapshot>>,
     server_control_tx: Mutex<Option<Sender<ServerControlMsg>>>,
@@ -247,6 +256,8 @@ impl TuiSharedState {
             remote_terminal_events: Mutex::new(VecDeque::with_capacity(
                 REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY,
             )),
+            remote_terminal_dropped_oldest: AtomicU64::new(0),
+            remote_terminal_resize_coalesced: AtomicU64::new(0),
             message_drag: Mutex::new(None),
             keyboard_move: Mutex::new(None),
             server_control_tx: Mutex::new(None),
@@ -295,6 +306,11 @@ impl TuiSharedState {
     #[must_use]
     pub fn events_since(&self, seq: u64) -> Vec<MailEvent> {
         self.events.events_since_seq(seq)
+    }
+
+    #[must_use]
+    pub fn events_since_limited(&self, seq: u64, limit: usize) -> Vec<MailEvent> {
+        self.events.events_since_seq_limited(seq, limit)
     }
 
     #[must_use]
@@ -433,8 +449,39 @@ impl TuiSharedState {
             .remote_terminal_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Resize bursts are common during browser-driven tab traversal and only
+        // the latest dimensions matter. Coalesce tail resize events in-place
+        // to reduce queue pressure without dropping semantic input.
+        if let RemoteTerminalEvent::Resize { cols, rows } = event {
+            if let Some(RemoteTerminalEvent::Resize {
+                cols: last_cols,
+                rows: last_rows,
+            }) = queue.back_mut()
+            {
+                *last_cols = cols;
+                *last_rows = rows;
+                self.remote_terminal_resize_coalesced
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+
+            let dropped_oldest = if queue.len() >= REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY {
+                let _ = queue.pop_front();
+                self.remote_terminal_dropped_oldest
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                false
+            };
+            queue.push_back(RemoteTerminalEvent::Resize { cols, rows });
+            return dropped_oldest;
+        }
+
         let dropped_oldest = if queue.len() >= REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY {
             let _ = queue.pop_front();
+            self.remote_terminal_dropped_oldest
+                .fetch_add(1, Ordering::Relaxed);
             true
         } else {
             false
@@ -462,6 +509,22 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    #[must_use]
+    pub fn remote_terminal_queue_stats(&self) -> RemoteTerminalQueueStats {
+        let depth = self
+            .remote_terminal_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        RemoteTerminalQueueStats {
+            depth,
+            dropped_oldest_total: self.remote_terminal_dropped_oldest.load(Ordering::Relaxed),
+            resize_coalesced_total: self
+                .remote_terminal_resize_coalesced
+                .load(Ordering::Relaxed),
+        }
     }
 
     #[must_use]
@@ -634,6 +697,9 @@ mod tests {
         assert_eq!(recent[0].kind(), MailEventKind::HttpRequest);
         assert_eq!(recent[1].kind(), MailEventKind::ToolCallStart);
         assert_eq!(state.events_since(1).len(), 1);
+        let limited = state.events_since_limited(0, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].kind(), MailEventKind::HttpRequest);
     }
 
     #[test]
@@ -1012,6 +1078,78 @@ mod tests {
             REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY
         );
         assert_eq!(dropped, 32);
+        let stats = state.remote_terminal_queue_stats();
+        assert_eq!(stats.depth, REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY);
+        assert_eq!(stats.dropped_oldest_total, 32);
+        assert_eq!(stats.resize_coalesced_total, 0);
+    }
+
+    #[test]
+    fn remote_terminal_resize_events_coalesce_tail() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        assert!(
+            !state.push_remote_terminal_event(RemoteTerminalEvent::Resize { cols: 80, rows: 24 })
+        );
+        assert!(
+            !state.push_remote_terminal_event(RemoteTerminalEvent::Resize {
+                cols: 120,
+                rows: 42,
+            })
+        );
+
+        let stats = state.remote_terminal_queue_stats();
+        assert_eq!(stats.depth, 1);
+        assert_eq!(stats.dropped_oldest_total, 0);
+        assert_eq!(stats.resize_coalesced_total, 1);
+
+        let drained = state.drain_remote_terminal_events(8);
+        assert_eq!(
+            drained,
+            vec![RemoteTerminalEvent::Resize {
+                cols: 120,
+                rows: 42
+            }]
+        );
+    }
+
+    #[test]
+    fn remote_terminal_resize_coalescing_preserves_prior_key_event() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        assert!(!state.push_remote_terminal_event(RemoteTerminalEvent::Key {
+            key: "j".to_string(),
+            modifiers: 0,
+        }));
+        assert!(
+            !state.push_remote_terminal_event(RemoteTerminalEvent::Resize { cols: 90, rows: 30 })
+        );
+        assert!(
+            !state.push_remote_terminal_event(RemoteTerminalEvent::Resize {
+                cols: 100,
+                rows: 31,
+            })
+        );
+
+        let drained = state.drain_remote_terminal_events(8);
+        assert_eq!(
+            drained,
+            vec![
+                RemoteTerminalEvent::Key {
+                    key: "j".to_string(),
+                    modifiers: 0,
+                },
+                RemoteTerminalEvent::Resize {
+                    cols: 100,
+                    rows: 31
+                },
+            ]
+        );
+        let stats = state.remote_terminal_queue_stats();
+        assert_eq!(stats.depth, 0);
+        assert_eq!(stats.resize_coalesced_total, 1);
     }
 
     #[test]

@@ -81,6 +81,7 @@ const SCREEN_TRANSITION_TICKS: u8 = 2;
 const TOAST_ENTRANCE_TICKS: u8 = 3;
 const TOAST_EXIT_TICKS: u8 = 2;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
+const HOUSEKEEPING_EVENTS_PER_TICK: usize = 192;
 const MAX_DEFERRED_ACTIONS_PER_TICK: usize = 64;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
@@ -3371,8 +3372,28 @@ impl MailAppModel {
             };
         }
 
+        // Drain browser-ingress events first so bursty local state maintenance
+        // cannot starve interactive traversal input.
+        let mut remote_cmds = Vec::new();
+        let remote_events = self
+            .state
+            .drain_remote_terminal_events(REMOTE_EVENTS_PER_TICK);
+        for remote_event in remote_events {
+            if let Some(event) = remote_terminal_event_to_event(remote_event) {
+                let cmd = self.update(MailMsg::Terminal(event));
+                if matches!(cmd, Cmd::Quit) {
+                    return Cmd::quit();
+                }
+                remote_cmds.push(cmd);
+            }
+        }
+
         // Generate toasts from new high-priority events and track reservations.
-        let new_events = self.state.events_since(self.last_toast_seq);
+        // Process a bounded batch each housekeeping tick so large backlogs
+        // cannot monopolize the frame and delay input handling.
+        let new_events = self
+            .state
+            .events_since_limited(self.last_toast_seq, HOUSEKEEPING_EVENTS_PER_TICK);
         for event in &new_events {
             self.last_toast_seq = event.seq().max(self.last_toast_seq);
 
@@ -3464,22 +3485,6 @@ impl MailAppModel {
         // Side-effects (toast, navigation) are applied inside
         // `dispatch_execute_operation`.
         let deferred_cmd = self.drain_deferred_confirmed_action();
-
-        // Drain browser-ingress events and process them through the
-        // same terminal handling path as local input.
-        let mut remote_cmds = Vec::new();
-        let remote_events = self
-            .state
-            .drain_remote_terminal_events(REMOTE_EVENTS_PER_TICK);
-        for remote_event in remote_events {
-            if let Some(event) = remote_terminal_event_to_event(remote_event) {
-                let cmd = self.update(MailMsg::Terminal(event));
-                if matches!(cmd, Cmd::Quit) {
-                    return Cmd::quit();
-                }
-                remote_cmds.push(cmd);
-            }
-        }
 
         let mut all_cmds = vec![deferred_cmd];
         all_cmds.extend(remote_cmds);
@@ -7313,6 +7318,59 @@ mod tests {
         assert_eq!(model.active_screen(), MailScreenId::Messages);
     }
 
+    #[test]
+    fn housekeeping_event_processing_is_bounded_per_tick() {
+        let config = Config::default();
+        let total_events = HOUSEKEEPING_EVENTS_PER_TICK + 17;
+        let state = TuiSharedState::with_event_capacity(&config, total_events + 8);
+        let mut model = MailAppModel::new(Arc::clone(&state));
+
+        for idx in 0..total_events {
+            assert!(state.push_event(MailEvent::http_request(
+                "GET",
+                format!("/burst/{idx}"),
+                500,
+                1,
+                "127.0.0.1",
+            )));
+        }
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert_eq!(model.last_toast_seq, HOUSEKEEPING_EVENTS_PER_TICK as u64);
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert_eq!(model.last_toast_seq, total_events as u64);
+    }
+
+    #[test]
+    fn tick_drains_remote_events_even_with_event_backlog() {
+        let config = Config::default();
+        let state = TuiSharedState::with_event_capacity(&config, HOUSEKEEPING_EVENTS_PER_TICK * 3);
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+
+        for idx in 0..(HOUSEKEEPING_EVENTS_PER_TICK * 2) {
+            assert!(state.push_event(MailEvent::http_request(
+                "GET",
+                format!("/queue/{idx}"),
+                500,
+                1,
+                "127.0.0.1",
+            )));
+        }
+
+        let _ = state.push_remote_terminal_event(RemoteTerminalEvent::Key {
+            key: "2".to_string(),
+            modifiers: 0,
+        });
+
+        let cmd = model.update(MailMsg::Terminal(Event::Tick));
+        assert!(!matches!(cmd, Cmd::Quit));
+        assert_eq!(state.remote_terminal_queue_len(), 0);
+        assert_eq!(model.active_screen(), MailScreenId::Messages);
+        assert_eq!(model.last_toast_seq, HOUSEKEEPING_EVENTS_PER_TICK as u64);
+    }
+
     // ── Reducer edge-case tests ──────────────────────────────────
 
     #[test]
@@ -10701,6 +10759,9 @@ mod tests {
         screen.panic_on_tick = true;
         model.set_screen(MailScreenId::ArchiveBrowser, Box::new(screen));
 
+        // ArchiveBrowser wraps adjacent to Dashboard in the circular tab order,
+        // so select a non-adjacent active screen before validating background cadence.
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
         for _ in 0..(BACKGROUND_SCREEN_TICK_DIVISOR - 1) {
             let _ = model.update(MailMsg::Terminal(Event::Tick));
         }
