@@ -43,7 +43,13 @@ fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {
 
 fn default_mcp_log_filter() -> &'static str {
     concat!(
-        "info,",
+        "warn,",
+        "mcp_agent_mail=info,",
+        "mcp_agent_mail_server=info,",
+        "mcp_agent_mail_core=info,",
+        "mcp_agent_mail_db=info,",
+        "mcp_agent_mail_storage=info,",
+        "mcp_agent_mail_tools=info,",
         "fsqlite_core::connection=warn,",
         "fsqlite_mvcc::observability=warn,",
         "fsqlite_mvcc::gc=warn,",
