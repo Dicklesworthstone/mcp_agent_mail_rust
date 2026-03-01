@@ -4,8 +4,9 @@
 
 use crate::DbConn;
 use asupersync::{Cx, Outcome};
-use sqlmodel_core::{Connection, Error as SqlError};
+use sqlmodel_core::{Connection, Error as SqlError, Value};
 use sqlmodel_schema::{Migration, MigrationRunner, MigrationStatus};
+use std::time::Duration;
 
 // Schema creation SQL - no runtime dependencies needed
 
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 CREATE INDEX IF NOT EXISTS idx_projects_slug ON projects(slug);
 CREATE INDEX IF NOT EXISTS idx_projects_human_key ON projects(human_key);
+CREATE INDEX IF NOT EXISTS idx_projects_created_id_desc ON projects(created_at DESC, id DESC);
 
 -- Products table
 CREATE TABLE IF NOT EXISTS products (
@@ -55,6 +57,7 @@ CREATE TABLE IF NOT EXISTS agents (
     UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name);
+CREATE INDEX IF NOT EXISTS idx_agents_last_active_id_desc ON agents(last_active_ts DESC, id DESC);
 
 -- Messages table
 CREATE TABLE IF NOT EXISTS messages (
@@ -76,6 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance);
 CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts);
 CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_msg_project_importance_created ON messages(project_id, importance, created_ts);
+CREATE INDEX IF NOT EXISTS idx_messages_ack_required_id ON messages(ack_required, id);
 
 -- Message recipients (many-to-many)
 CREATE TABLE IF NOT EXISTS message_recipients (
@@ -89,6 +93,7 @@ CREATE TABLE IF NOT EXISTS message_recipients (
 CREATE INDEX IF NOT EXISTS idx_message_recipients_agent ON message_recipients(agent_id);
 CREATE INDEX IF NOT EXISTS idx_message_recipients_agent_message ON message_recipients(agent_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_mr_agent_ack ON message_recipients(agent_id, ack_ts);
+CREATE INDEX IF NOT EXISTS idx_mr_ack_message ON message_recipients(ack_ts, message_id);
 
 -- File reservations table
 CREATE TABLE IF NOT EXISTS file_reservations (
@@ -105,6 +110,7 @@ CREATE TABLE IF NOT EXISTS file_reservations (
 CREATE INDEX IF NOT EXISTS idx_file_reservations_project_released_expires ON file_reservations(project_id, released_ts, expires_ts);
 CREATE INDEX IF NOT EXISTS idx_file_reservations_project_agent_released ON file_reservations(project_id, agent_id, released_ts);
 CREATE INDEX IF NOT EXISTS idx_file_reservations_expires_ts ON file_reservations(expires_ts);
+CREATE INDEX IF NOT EXISTS idx_file_reservations_released_expires_id ON file_reservations(released_ts, expires_ts, id, project_id);
 
 -- Agent links (contact relationships)
 CREATE TABLE IF NOT EXISTS agent_links (
@@ -127,6 +133,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_links_b_project ON agent_links(b_project_id
 CREATE INDEX IF NOT EXISTS idx_agent_links_status ON agent_links(status);
 CREATE INDEX IF NOT EXISTS idx_al_a_agent_status ON agent_links(a_project_id, a_agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_al_b_agent_status ON agent_links(b_project_id, b_agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_agent_links_updated_id_desc ON agent_links(updated_ts DESC, id DESC);
 
 -- Project sibling suggestions
 CREATE TABLE IF NOT EXISTS project_sibling_suggestions (
@@ -218,6 +225,7 @@ PRAGMA journal_size_limit = 67108864;
 /// Database-wide initialization PRAGMAs (applied once per sqlite file).
 pub const PRAGMA_DB_INIT_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
+PRAGMA busy_timeout = 60000;
 PRAGMA journal_mode = WAL;
 ";
 
@@ -227,6 +235,7 @@ PRAGMA journal_mode = WAL;
 /// and malformed-image scenarios when the server process is terminated abruptly.
 pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
+PRAGMA busy_timeout = 60000;
 PRAGMA journal_mode = 'DELETE';
 ";
 
@@ -1053,6 +1062,66 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v13: Poller and startup read-path index accelerators ────────────
+    //
+    // These indexes target frequent startup/TUI read patterns with large
+    // mailboxes, reducing sort and scan work without changing semantics.
+    migrations.push(Migration::new(
+        "v13_idx_projects_created_id_desc".to_string(),
+        "index projects by created_at desc + id desc for recent project snapshots".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_projects_created_id_desc \
+         ON projects(created_at DESC, id DESC)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v13_idx_agents_last_active_id_desc".to_string(),
+        "index agents by last_active_ts desc + id desc for activity leaderboard".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_agents_last_active_id_desc \
+         ON agents(last_active_ts DESC, id DESC)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v13_idx_agent_links_updated_id_desc".to_string(),
+        "index agent links by updated_ts desc + id desc for contacts view".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_agent_links_updated_id_desc \
+         ON agent_links(updated_ts DESC, id DESC)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v13_idx_messages_ack_required_id".to_string(),
+        "index messages by ack_required + id for ack pending joins".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_messages_ack_required_id \
+         ON messages(ack_required, id)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v13_idx_mr_ack_message".to_string(),
+        "index message_recipients by ack_ts + message_id for ack pending joins".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_mr_ack_message \
+         ON message_recipients(ack_ts, message_id)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v13_idx_file_reservations_released_expires_id".to_string(),
+        "index file_reservations by released/expires/id/project for active reservation scans"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_file_reservations_released_expires_id \
+         ON file_reservations(released_ts, expires_ts, id, project_id)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v13_analyze_after_poller_indexes".to_string(),
+        "run ANALYZE after poller/startup index additions".to_string(),
+        "ANALYZE".to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -1291,18 +1360,295 @@ async fn enforce_base_mode_cleanup_async<C: Connection>(
     Outcome::Ok(())
 }
 
+const MIGRATION_DDL_LOCK_RETRIES: usize = 8;
+const MIGRATION_RUN_LOCK_RETRIES: usize = 8;
+
+#[must_use]
+fn is_retryable_migration_lock_error(error: &SqlError) -> bool {
+    let lower = error.to_string().to_ascii_lowercase();
+    lower.contains("database is busy")
+        || lower.contains("database is locked")
+        || lower.contains("busy")
+        || lower.contains("locked")
+        || lower.contains("page_lock_busy")
+        || lower.contains("write conflict")
+        || lower.contains("mvcc")
+}
+
+#[must_use]
+fn migration_retry_delay(retry_index: usize) -> Duration {
+    let exponent = u32::try_from(retry_index.min(4)).unwrap_or(4);
+    Duration::from_millis(8_u64.saturating_mul(1_u64 << exponent))
+}
+
+async fn execute_migration_ddl_with_lock_retry<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    sql: &str,
+    operation: &str,
+) -> Outcome<(), SqlError> {
+    let mut retries = 0usize;
+    loop {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => return Outcome::Ok(()),
+            Outcome::Err(err) => {
+                if retries >= MIGRATION_DDL_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
+                {
+                    return Outcome::Err(err);
+                }
+                let delay = migration_retry_delay(retries);
+                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                tracing::warn!(
+                    operation,
+                    error = %err,
+                    retry = retries + 1,
+                    max_retries = MIGRATION_DDL_LOCK_RETRIES,
+                    delay_ms,
+                    "base migration step hit lock/busy error; retrying"
+                );
+                std::thread::sleep(delay);
+                retries += 1;
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+}
+
+async fn has_applied_migration_id<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    id: &str,
+) -> Outcome<bool, SqlError> {
+    let sql = format!("SELECT 1 AS present FROM {MIGRATIONS_TABLE_NAME} WHERE id = $1 LIMIT 1");
+    let params = [Value::Text(id.to_string())];
+    match conn.query(cx, &sql, &params).await {
+        Outcome::Ok(rows) => Outcome::Ok(!rows.is_empty()),
+        Outcome::Err(err) => Outcome::Err(err),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+async fn migration_table_row_count<C: Connection>(cx: &Cx, conn: &C) -> Outcome<i64, SqlError> {
+    let sql = format!("SELECT COUNT(*) AS cnt FROM {MIGRATIONS_TABLE_NAME}");
+    match conn.query(cx, &sql, &[]).await {
+        Outcome::Ok(rows) => {
+            let count = rows
+                .first()
+                .and_then(|row| {
+                    row.get_named::<i64>("cnt")
+                        .ok()
+                        .or_else(|| row.get_as::<i64>(0).ok())
+                })
+                .unwrap_or(0);
+            Outcome::Ok(count)
+        }
+        Outcome::Err(err) => Outcome::Err(err),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+async fn migration_set_is_complete<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    expected: &[Migration],
+) -> Outcome<bool, SqlError> {
+    let expected_len = i64::try_from(expected.len()).unwrap_or(i64::MAX);
+    let Some(latest_id) = expected.last().map(|m| m.id.clone()) else {
+        return Outcome::Ok(true);
+    };
+
+    let has_latest = match has_applied_migration_id(cx, conn, &latest_id).await {
+        Outcome::Ok(value) => value,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if !has_latest {
+        return Outcome::Ok(false);
+    }
+    let applied_count = match migration_table_row_count(cx, conn).await {
+        Outcome::Ok(value) => value,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    Outcome::Ok(applied_count >= expected_len)
+}
+
+async fn run_migrations<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    base_mode: bool,
+) -> Outcome<Vec<String>, SqlError> {
+    let runner = if base_mode {
+        migration_runner_base()
+    } else {
+        migration_runner()
+    };
+    let status = match runner.status(cx, conn).await {
+        Outcome::Ok(status) => status,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let migrations = if base_mode {
+        schema_migrations_base()
+    } else {
+        schema_migrations()
+    };
+    let mut applied = Vec::new();
+    for (id, migration_status) in status {
+        if migration_status != MigrationStatus::Pending {
+            continue;
+        }
+        let already_applied = match has_applied_migration_id(cx, conn, &id).await {
+            Outcome::Ok(value) => value,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        if already_applied {
+            continue;
+        }
+        let Some(migration) = migrations.iter().find(|candidate| candidate.id == id) else {
+            continue;
+        };
+        match run_single_migration_with_lock_retry(cx, conn, migration).await {
+            Outcome::Ok(()) => applied.push(id),
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+    Outcome::Ok(applied)
+}
+
+async fn rollback_migration_txn_quietly<C: Connection>(cx: &Cx, conn: &C) {
+    let _ = conn.execute(cx, "ROLLBACK", &[]).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_single_migration_with_lock_retry<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    migration: &Migration,
+) -> Outcome<(), SqlError> {
+    let record_sql = format!(
+        "INSERT OR IGNORE INTO {MIGRATIONS_TABLE_NAME} (id, description, applied_at) VALUES ($1, $2, $3)"
+    );
+    let mut retries = 0usize;
+    loop {
+        match conn.execute(cx, "BEGIN IMMEDIATE", &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => {
+                if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
+                {
+                    return Outcome::Err(err);
+                }
+                if retries == 0 {
+                    tracing::warn!(
+                        migration_id = %migration.id,
+                        max_retries = MIGRATION_RUN_LOCK_RETRIES,
+                        "migration lock contention on BEGIN IMMEDIATE; retrying"
+                    );
+                }
+                std::thread::sleep(migration_retry_delay(retries));
+                retries += 1;
+                continue;
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+
+        match conn.execute(cx, &migration.up, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
+                {
+                    return Outcome::Err(err);
+                }
+                std::thread::sleep(migration_retry_delay(retries));
+                retries += 1;
+                continue;
+            }
+            Outcome::Cancelled(reason) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                return Outcome::Cancelled(reason);
+            }
+            Outcome::Panicked(payload) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                return Outcome::Panicked(payload);
+            }
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+            .unwrap_or(i64::MAX);
+        let record_params = [
+            Value::Text(migration.id.clone()),
+            Value::Text(migration.description.clone()),
+            Value::BigInt(now),
+        ];
+        match conn.execute(cx, &record_sql, &record_params).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
+                {
+                    return Outcome::Err(err);
+                }
+                std::thread::sleep(migration_retry_delay(retries));
+                retries += 1;
+                continue;
+            }
+            Outcome::Cancelled(reason) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                return Outcome::Cancelled(reason);
+            }
+            Outcome::Panicked(payload) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                return Outcome::Panicked(payload);
+            }
+        }
+
+        match conn.execute(cx, "COMMIT", &[]).await {
+            Outcome::Ok(_) => return Outcome::Ok(()),
+            Outcome::Err(err) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
+                {
+                    return Outcome::Err(err);
+                }
+                std::thread::sleep(migration_retry_delay(retries));
+                retries += 1;
+            }
+            Outcome::Cancelled(reason) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                return Outcome::Cancelled(reason);
+            }
+            Outcome::Panicked(payload) => {
+                rollback_migration_txn_quietly(cx, conn).await;
+                return Outcome::Panicked(payload);
+            }
+        }
+    }
+}
+
 pub async fn init_migrations_table<C: Connection>(cx: &Cx, conn: &C) -> Outcome<(), SqlError> {
-    // Ensure duplicate inserts are ignored. Under concurrency, multiple connections may
-    // attempt to record the same migration id; `ON CONFLICT IGNORE` prevents that from
-    // becoming a fatal error during startup.
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE_NAME} (
-            id TEXT PRIMARY KEY ON CONFLICT IGNORE,
+            id TEXT PRIMARY KEY,
             description TEXT NOT NULL,
             applied_at INTEGER NOT NULL
         )"
     );
-    conn.execute(cx, &sql, &[]).await.map(|_| ())
+    execute_migration_ddl_with_lock_retry(cx, conn, &sql, "init migrations table").await
 }
 
 pub async fn migration_status<C: Connection>(
@@ -1325,11 +1671,22 @@ pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
-    let applied = match migration_runner().migrate(cx, conn).await {
-        Outcome::Ok(applied) => applied,
+    let expected = schema_migrations();
+    let already_complete = match migration_set_is_complete(cx, conn, &expected).await {
+        Outcome::Ok(value) => value,
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let applied = if already_complete {
+        Vec::new()
+    } else {
+        match run_migrations(cx, conn, false).await {
+            Outcome::Ok(applied) => applied,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
     };
     match ensure_inbox_stats_insert_trigger_compat(cx, conn).await {
         Outcome::Ok(()) => Outcome::Ok(applied),
@@ -1354,12 +1711,24 @@ pub async fn migrate_to_latest_base<C: Connection>(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
-    let applied = match migration_runner_base().migrate(cx, conn).await {
-        Outcome::Ok(applied) => applied,
+    let expected = schema_migrations_base();
+    let already_complete = match migration_set_is_complete(cx, conn, &expected).await {
+        Outcome::Ok(value) => value,
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    let applied = if already_complete {
+        Vec::new()
+    } else {
+        match run_migrations(cx, conn, true).await {
+            Outcome::Ok(applied) => applied,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    };
+
     match enforce_base_mode_cleanup_async(cx, conn).await {
         Outcome::Ok(()) => {}
         Outcome::Err(e) => return Outcome::Err(e),

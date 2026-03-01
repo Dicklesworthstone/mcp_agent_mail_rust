@@ -422,10 +422,7 @@ fn parse_and_insert_message(
     // remain consistent with DB row IDs.
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/9
     let thread_id_val = thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
-    let canonical_id = msg
-        .get("id")
-        .and_then(|v| v.as_i64())
-        .filter(|&id| id > 0);
+    let canonical_id = msg.get("id").and_then(|v| v.as_i64()).filter(|&id| id > 0);
 
     let message_id = if let Some(cid) = canonical_id {
         conn.execute_sync(

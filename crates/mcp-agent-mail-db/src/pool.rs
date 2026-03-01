@@ -702,7 +702,9 @@ impl DbPool {
 
         let mut project_slugs_by_id: HashMap<i64, String> = HashMap::new();
         if !project_ids.is_empty() {
-            let placeholders = std::iter::repeat_n("?", project_ids.len()).collect::<Vec<_>>().join(", ");
+            let placeholders = std::iter::repeat_n("?", project_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!("SELECT id, slug FROM projects WHERE id IN ({placeholders})");
             let params = project_ids
                 .iter()
@@ -728,7 +730,9 @@ impl DbPool {
 
         let mut sender_names_by_id: HashMap<i64, String> = HashMap::new();
         if !sender_ids.is_empty() {
-            let placeholders = std::iter::repeat_n("?", sender_ids.len()).collect::<Vec<_>>().join(", ");
+            let placeholders = std::iter::repeat_n("?", sender_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!("SELECT id, name FROM agents WHERE id IN ({placeholders})");
             let params = sender_ids
                 .iter()
@@ -873,14 +877,51 @@ static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<OnceCell<()
     OnceLock::new();
 static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<String, Weak<Pool<DbConn>>>>> = OnceLock::new();
 
+#[must_use]
+fn normalize_sqlite_identity_path(path: &str) -> String {
+    if path == ":memory:" {
+        return path.to_string();
+    }
+    let as_path = Path::new(path);
+    if let Ok(canonical) = std::fs::canonicalize(as_path) {
+        return canonical.to_string_lossy().into_owned();
+    }
+    if as_path.is_absolute() {
+        return as_path.to_string_lossy().into_owned();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        return cwd.join(as_path).to_string_lossy().into_owned();
+    }
+    path.to_string()
+}
+
+#[must_use]
+fn pool_cache_key(config: &DbPoolConfig) -> String {
+    let identity = config.sqlite_path().map_or_else(
+        |_| config.database_url.clone(),
+        |parsed| {
+            let resolved = resolve_sqlite_path_with_absolute_fallback(&parsed);
+            normalize_sqlite_identity_path(&resolved)
+        },
+    );
+    format!(
+        "{identity}|min={}|max={}|acquire_ms={}|lifetime_ms={}",
+        config.min_connections,
+        config.max_connections,
+        config.acquire_timeout_ms,
+        config.max_lifetime_ms
+    )
+}
+
 fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
+    let gate_key = normalize_sqlite_identity_path(sqlite_path);
     let gates = SQLITE_INIT_GATES
         .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
 
     // Fast path: read lock for existing gate (concurrent readers).
     {
         let guard = gates.read();
-        if let Some(gate) = guard.get(sqlite_path) {
+        if let Some(gate) = guard.get(&gate_key) {
             return Arc::clone(gate);
         }
     }
@@ -888,11 +929,11 @@ fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
     // Slow path: write lock to create a new gate (rare, once per SQLite file).
     let mut guard = gates.write();
     // Double-check after acquiring write lock.
-    if let Some(gate) = guard.get(sqlite_path) {
+    if let Some(gate) = guard.get(&gate_key) {
         return Arc::clone(gate);
     }
     let gate = Arc::new(OnceCell::new());
-    guard.insert(sqlite_path.to_string(), Arc::clone(&gate));
+    guard.insert(gate_key, Arc::clone(&gate));
     gate
 }
 
@@ -904,17 +945,27 @@ async fn run_sqlite_init_once(
 ) -> Outcome<(), SqlError> {
     let mig_conn = match open_sqlite_file_with_lock_retry(sqlite_path) {
         Ok(conn) => conn,
-        Err(err) => return Outcome::Err(err),
+        Err(err) => {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=open_file failed: {err}"
+            )));
+        }
     };
 
     if let Err(err) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
-        return Outcome::Err(err);
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite init stage=base_pragmas failed: {err}"
+        )));
     }
 
     if run_migrations {
         match schema::migrate_to_latest_base(cx, &mig_conn).await {
             Outcome::Ok(_) => {}
-            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=migrate_to_latest_base failed: {err}"
+                )));
+            }
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
@@ -924,7 +975,9 @@ async fn run_sqlite_init_once(
     // These can be reintroduced by historical/full migration paths and have
     // caused post-crash rowid/index mismatch failures.
     if let Err(err) = schema::enforce_runtime_fts_cleanup(&mig_conn) {
-        return Outcome::Err(err);
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite init stage=enforce_runtime_fts_cleanup failed: {err}"
+        )));
     }
 
     // Switch to WAL journal mode AFTER migrations complete.
@@ -1658,17 +1711,18 @@ pub fn ensure_sqlite_file_healthy_with_archive(
 /// Get (or create) a cached pool for the given config.
 ///
 /// Uses a read-first / write-on-miss pattern so concurrent callers sharing
-/// the same database URL only take a shared read lock (zero contention on
-/// the hot path).  The write lock is only held briefly when creating a new
-/// pool — typically once per unique URL during startup.
+/// the same effective pool signature only take a shared read lock (zero
+/// contention on the hot path). The write lock is only held briefly when
+/// creating a new pool.
 pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     let cache =
         POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+    let cache_key = pool_cache_key(config);
 
     // Fast path: shared read lock for existing live pool (concurrent readers).
     {
         let guard = cache.read();
-        if let Some(pool) = guard.get(&config.database_url)
+        if let Some(pool) = guard.get(&cache_key)
             && let Some(shared_pool) = pool.upgrade()
         {
             return DbPool::from_shared_pool(config, shared_pool);
@@ -1679,15 +1733,15 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     // evict dead weak entries left after all callers dropped a pool.
     let mut guard = cache.write();
     // Double-check after acquiring write lock — another thread may have won the race.
-    if let Some(pool) = guard.get(&config.database_url) {
+    if let Some(pool) = guard.get(&cache_key) {
         if let Some(shared_pool) = pool.upgrade() {
             return DbPool::from_shared_pool(config, shared_pool);
         }
-        guard.remove(&config.database_url);
+        guard.remove(&cache_key);
     }
 
     let pool = DbPool::new(config)?;
-    guard.insert(config.database_url.clone(), Arc::downgrade(&pool.pool));
+    guard.insert(cache_key, Arc::downgrade(&pool.pool));
     drop(guard);
     Ok(pool)
 }
@@ -2500,9 +2554,9 @@ mod tests {
         assert_eq!(refs[2].message_id, 3);
     }
 
-    /// Verify `get_or_create_pool` returns the same pool for the same URL.
+    /// Verify `get_or_create_pool` returns the same pool for the same cache key.
     #[test]
-    fn get_or_create_pool_caches_by_url() {
+    fn get_or_create_pool_caches_by_config_signature() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("cache_test.db");
         let config = DbPoolConfig {
@@ -2516,7 +2570,36 @@ mod tests {
         // Both should point to the same underlying pool (Arc identity).
         assert!(
             Arc::ptr_eq(&pool1.pool, &pool2.pool),
-            "get_or_create_pool should return the same Arc<Pool> for the same URL"
+            "get_or_create_pool should return the same Arc<Pool> for the same cache key"
+        );
+    }
+
+    /// Verify distinct pool sizing does not alias to the same cached pool.
+    #[test]
+    fn get_or_create_pool_keeps_small_startup_pools_isolated_from_runtime_pools() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache_shape_test.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+
+        let startup_cfg = DbPoolConfig {
+            database_url: database_url.clone(),
+            min_connections: 1,
+            max_connections: 1,
+            ..Default::default()
+        };
+        let runtime_cfg = DbPoolConfig {
+            database_url,
+            min_connections: 25,
+            max_connections: 100,
+            ..Default::default()
+        };
+
+        let startup_pool = get_or_create_pool(&startup_cfg).expect("startup pool");
+        let runtime_pool = get_or_create_pool(&runtime_cfg).expect("runtime pool");
+
+        assert!(
+            !Arc::ptr_eq(&startup_pool.pool, &runtime_pool.pool),
+            "pool cache must not alias startup/worker tiny pools with runtime pool sizing"
         );
     }
 
