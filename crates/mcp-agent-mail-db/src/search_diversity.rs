@@ -302,8 +302,8 @@ fn would_violate_caps(
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
-    use crate::search_fusion::FusionExplain;
     use crate::search_candidates::CandidateSource;
+    use crate::search_fusion::FusionExplain;
 
     fn make_hit(doc_id: i64, score: f64) -> FusedHit {
         FusedHit {

@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use mcp_agent_mail_core::DocKind;
 use crate::search_error::{SearchError, SearchResult};
+use mcp_agent_mail_core::DocKind;
 
 // ────────────────────────────────────────────────────────────────────
 // Types

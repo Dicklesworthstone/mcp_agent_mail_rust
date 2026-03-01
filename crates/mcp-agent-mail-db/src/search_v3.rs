@@ -382,29 +382,15 @@ fn refresh_index_health_metrics(bridge: &TantivyBridge) {
         .update_index_health(index_size_bytes, doc_count);
 }
 
-fn lookup_cached_text(
-    conn: &DbConn,
-    cache: &mut HashMap<i64, String>,
-    key: i64,
-    sql: &str,
-) -> Result<String, String> {
-    if let Some(value) = cache.get(&key) {
-        return Ok(value.clone());
-    }
-    let rows = conn
-        .query_sync(sql, &[Value::BigInt(key)])
-        .map_err(|e| format!("backfill lookup failed: {e}"))?;
-    let value = rows
-        .first()
-        .and_then(|r| r.get_named::<String>("value").ok())
-        .unwrap_or_default();
-    cache.insert(key, value.clone());
-    Ok(value)
-}
-
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct MessageStats {
     count: u64,
+    max_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MessageWatermark {
+    sequence: u64,
     max_id: u64,
 }
 
@@ -415,10 +401,124 @@ enum BackfillPlan {
     FullRebuild,
 }
 
+const BACKFILL_STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BackfillDbFingerprint {
+    len_bytes: u64,
+    modified_micros: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct IndexMetaFingerprint {
+    len_bytes: u64,
+    modified_micros: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackfillState {
+    schema_version: u32,
+    db_path: String,
+    db_fingerprint: BackfillDbFingerprint,
+    db_stats: MessageStats,
+    #[serde(default)]
+    message_watermark: MessageWatermark,
+    #[serde(default)]
+    index_meta_fingerprint: Option<IndexMetaFingerprint>,
+    index_stats: MessageStats,
+    updated_at_micros: i64,
+}
+
+fn backfill_state_path(bridge: &TantivyBridge) -> PathBuf {
+    bridge.index_dir().join("backfill_state.json")
+}
+
+fn current_unix_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|dur| i64::try_from(dur.as_micros()).ok())
+        .unwrap_or(0)
+}
+
+fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerprint> {
+    if db_path == ":memory:" {
+        return None;
+    }
+    let metadata = std::fs::metadata(db_path).ok()?;
+    let modified_micros = metadata
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|dur| i64::try_from(dur.as_micros()).ok())
+        .unwrap_or(0);
+    Some(BackfillDbFingerprint {
+        len_bytes: metadata.len(),
+        modified_micros,
+    })
+}
+
+fn index_meta_fingerprint(bridge: &TantivyBridge) -> Option<IndexMetaFingerprint> {
+    let metadata = std::fs::metadata(bridge.index_dir().join("meta.json")).ok()?;
+    let modified_micros = metadata
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|dur| i64::try_from(dur.as_micros()).ok())
+        .unwrap_or(0);
+    Some(IndexMetaFingerprint {
+        len_bytes: metadata.len(),
+        modified_micros,
+    })
+}
+
+fn read_backfill_state(bridge: &TantivyBridge) -> Option<BackfillState> {
+    let path = backfill_state_path(bridge);
+    let raw = std::fs::read_to_string(path).ok()?;
+    let state = serde_json::from_str::<BackfillState>(&raw).ok()?;
+    (state.schema_version == BACKFILL_STATE_SCHEMA_VERSION).then_some(state)
+}
+
+fn write_backfill_state(
+    bridge: &TantivyBridge,
+    db_path: &str,
+    fingerprint: BackfillDbFingerprint,
+    db_stats: MessageStats,
+    message_watermark: MessageWatermark,
+    index_meta_fingerprint: Option<IndexMetaFingerprint>,
+    index_stats: MessageStats,
+) {
+    let path = backfill_state_path(bridge);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let state = BackfillState {
+        schema_version: BACKFILL_STATE_SCHEMA_VERSION,
+        db_path: db_path.to_string(),
+        db_fingerprint: fingerprint,
+        db_stats,
+        message_watermark,
+        index_meta_fingerprint,
+        index_stats,
+        updated_at_micros: current_unix_micros(),
+    };
+    let Ok(payload) = serde_json::to_string_pretty(&state) else {
+        return;
+    };
+    let _ = std::fs::write(path, payload);
+}
+
 fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
+    // Keep COUNT and MAX in separate scalar subqueries; FrankensQLite rejects
+    // mixed aggregate/non-aggregate projections in one SELECT.
     let rows = conn
         .query_sync(
-            "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+            "SELECT \
+             (SELECT COUNT(*) FROM messages) AS count, \
+             (SELECT COALESCE(MAX(id), 0) FROM messages) AS max_id",
             &[],
         )
         .map_err(|e| format!("backfill stats query failed: {e}"))?;
@@ -433,6 +533,47 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
         count: u64::try_from(count_i64).unwrap_or(0),
         max_id: u64::try_from(max_id_i64).unwrap_or(0),
     })
+}
+
+fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
+    let max_id_rows = conn
+        .query_sync("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
+        .map_err(|e| format!("backfill watermark max-id query failed: {e}"))?;
+    let max_id = max_id_rows
+        .first()
+        .and_then(|row| row.get_named::<i64>("max_id").ok())
+        .and_then(|v| u64::try_from(v.max(0)).ok())
+        .unwrap_or(0);
+
+    let sequence = conn
+        .query_sync(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'messages' LIMIT 1",
+            &[],
+        )
+        .ok()
+        .and_then(|rows| {
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("seq").ok())
+        })
+        .and_then(|v| u64::try_from(v.max(0)).ok())
+        // Fallback for legacy/malformed sqlite_sequence: max_id still gives a
+        // monotonic watermark for append-only message IDs.
+        .unwrap_or(max_id);
+
+    Ok(MessageWatermark { sequence, max_id })
+}
+
+fn fetch_id_text_map(conn: &DbConn, sql: &str) -> Result<HashMap<i64, String>, String> {
+    let rows = conn
+        .query_sync(sql, &[])
+        .map_err(|e| format!("backfill map query failed: {e}"))?;
+    let mut out = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let id = row.get_named::<i64>("id").unwrap_or(0);
+        let value = row.get_named::<String>("value").unwrap_or_default();
+        out.insert(id, value);
+    }
+    Ok(out)
 }
 
 fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String> {
@@ -479,7 +620,7 @@ fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, Str
     let max_id = top_docs.first().map(|(id, _)| *id).unwrap_or(0);
 
     Ok(MessageStats {
-        count: count as u64,
+        count: u64::try_from(count).unwrap_or(u64::MAX),
         max_id,
     })
 }
@@ -621,8 +762,49 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     };
     let db_path = &db_path_owned;
 
+    let db_fingerprint = sqlite_file_backfill_fingerprint(db_path);
+    let initial_index_fingerprint = index_meta_fingerprint(&bridge);
+    if let (Some(fingerprint), Some(state)) = (db_fingerprint, read_backfill_state(&bridge))
+        && state.db_path == *db_path
+        && state.db_fingerprint == fingerprint
+    {
+        if state.index_meta_fingerprint == initial_index_fingerprint {
+            tracing::info!(
+                db_count = state.db_stats.count,
+                db_max_id = state.db_stats.max_id,
+                index_count = state.index_stats.count,
+                index_max_id = state.index_stats.max_id,
+                "backfill: sqlite/index meta fingerprints unchanged, skipping"
+            );
+            refresh_index_health_metrics(&bridge);
+            return Ok((
+                0,
+                usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
+            ));
+        }
+    }
+
     let conn = DbConn::open_file(db_path)
         .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
+
+    let message_watermark = fetch_db_message_watermark(&conn)?;
+    let current_index_fingerprint = index_meta_fingerprint(&bridge);
+    if let Some(state) = read_backfill_state(&bridge)
+        && state.db_path == *db_path
+        && state.message_watermark == message_watermark
+        && state.index_meta_fingerprint == current_index_fingerprint
+    {
+        tracing::info!(
+            message_seq = message_watermark.sequence,
+            message_max_id = message_watermark.max_id,
+            "backfill: message watermark unchanged, skipping"
+        );
+        refresh_index_health_metrics(&bridge);
+        return Ok((
+            0,
+            usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
+        ));
+    }
 
     let db_stats = fetch_db_message_stats(&conn)?;
     let index_stats = fetch_index_message_stats(&bridge)?;
@@ -636,6 +818,17 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
             index_max_id = index_stats.max_id,
             "backfill: Tantivy index already up-to-date, skipping"
         );
+        if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
+            write_backfill_state(
+                &bridge,
+                db_path,
+                fingerprint,
+                db_stats,
+                message_watermark,
+                current_index_fingerprint,
+                index_stats,
+            );
+        }
         refresh_index_health_metrics(&bridge);
         return Ok((0, usize::try_from(db_stats.count).unwrap_or(usize::MAX)));
     }
@@ -660,8 +853,8 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                WHERE id > ? \
                ORDER BY id \
                LIMIT ?";
-    let mut sender_name_cache: HashMap<i64, String> = HashMap::new();
-    let mut project_slug_cache: HashMap<i64, String> = HashMap::new();
+    let sender_name_map = fetch_id_text_map(&conn, "SELECT id, name AS value FROM agents")?;
+    let project_slug_map = fetch_id_text_map(&conn, "SELECT id, slug AS value FROM projects")?;
 
     let mut last_id = match plan {
         BackfillPlan::Incremental { start_after_id } => start_after_id,
@@ -683,18 +876,11 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         for row in &rows {
             let project_id = row.get_as::<i64>(1).unwrap_or(0);
             let sender_id = row.get_as::<i64>(2).unwrap_or(0);
-            let project_slug = lookup_cached_text(
-                &conn,
-                &mut project_slug_cache,
-                project_id,
-                "SELECT slug AS value FROM projects WHERE id = ? LIMIT 1",
-            )?;
-            let sender_name = lookup_cached_text(
-                &conn,
-                &mut sender_name_cache,
-                sender_id,
-                "SELECT name AS value FROM agents WHERE id = ? LIMIT 1",
-            )?;
+            let project_slug = project_slug_map
+                .get(&project_id)
+                .cloned()
+                .unwrap_or_default();
+            let sender_name = sender_name_map.get(&sender_id).cloned().unwrap_or_default();
             let msg = IndexableMessage {
                 id: row.get_as::<i64>(0).unwrap_or(0),
                 project_id,
@@ -734,6 +920,22 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     crate::search_service::invalidate_search_cache(
         crate::search_cache::InvalidationTrigger::IndexUpdate,
     );
+
+    let final_index_stats = fetch_index_message_stats(&bridge).unwrap_or(MessageStats {
+        count: db_stats.count,
+        max_id: db_stats.max_id,
+    });
+    if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
+        write_backfill_state(
+            &bridge,
+            db_path,
+            fingerprint,
+            db_stats,
+            message_watermark,
+            index_meta_fingerprint(&bridge),
+            final_index_stats,
+        );
+    }
 
     match plan {
         BackfillPlan::Incremental { start_after_id } => tracing::info!(

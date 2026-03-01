@@ -13,8 +13,7 @@ use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
     DocKind, RankingMode, RecoverySuggestion, ScopePolicy, SearchCursor, SearchQuery,
-    SearchResponse,
-    SearchResult, ZeroResultGuidance,
+    SearchResponse, SearchResult, ZeroResultGuidance,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -3259,7 +3258,11 @@ mod tests {
         };
         let mut allowed = HashSet::new();
         allowed.insert(10);
-        assert!(detail_matches_query_filters(&query, &detail, Some(&allowed)));
+        assert!(detail_matches_query_filters(
+            &query,
+            &detail,
+            Some(&allowed)
+        ));
 
         let mut disallowed = HashSet::new();
         disallowed.insert(11);
@@ -3295,7 +3298,11 @@ mod tests {
             thread_id: Some("br-201".to_string()),
             ..query.clone()
         };
-        assert!(!detail_matches_query_filters(&wrong_thread_query, &detail, None));
+        assert!(!detail_matches_query_filters(
+            &wrong_thread_query,
+            &detail,
+            None
+        ));
 
         let ack_mismatch_query = SearchQuery {
             ack_required: Some(false),

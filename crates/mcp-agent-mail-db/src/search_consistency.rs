@@ -10,10 +10,10 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use mcp_agent_mail_core::DocChange;
 use crate::search_engine::{DocumentSource, IndexHealth, IndexLifecycle, IndexStats};
 use crate::search_error::SearchResult;
 use crate::search_index_layout::{IndexCheckpoint, IndexLayout, IndexScope, SchemaHash};
+use mcp_agent_mail_core::DocChange;
 
 // ── Consistency check types ──────────────────────────────────────────────────
 
@@ -500,8 +500,8 @@ pub fn repair_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_agent_mail_core::{DocKind, Document};
     use crate::search_engine::IndexHealth;
+    use mcp_agent_mail_core::{DocKind, Document};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};

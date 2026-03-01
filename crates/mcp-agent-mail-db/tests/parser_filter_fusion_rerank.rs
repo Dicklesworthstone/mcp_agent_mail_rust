@@ -17,18 +17,18 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use mcp_agent_mail_db::search_fusion::{RrfConfig, fuse_rrf, fuse_rrf_default};
-use mcp_agent_mail_db::search_candidates::{
-    CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode,
-    CandidateSource, PreparedCandidate, QueryClass, prepare_candidates,
-};
 use mcp_agent_mail_core::{DateRange, ImportanceFilter, SearchFilter, SearchMode};
 use mcp_agent_mail_core::{
     ExplainComposerConfig, ExplainReasonCode, ExplainStage, ExplainVerbosity, ScoreFactor,
     StageScoreInput, compose_explain_report, compose_hit_explanation, redact_hit_explanation,
 };
 use mcp_agent_mail_db::query_assistance::{SanitizedQuery, extract_terms, sanitize_query};
+use mcp_agent_mail_db::search_candidates::{
+    CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, CandidateSource,
+    PreparedCandidate, QueryClass, prepare_candidates,
+};
 use mcp_agent_mail_db::search_filter_compiler::{active_filter_count, has_active_filters};
+use mcp_agent_mail_db::search_fusion::{RrfConfig, fuse_rrf, fuse_rrf_default};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Section 1: Parser edge cases

@@ -24,6 +24,8 @@ use tantivy::{Index, TantivyDocument};
 use mcp_agent_mail_core::HighlightRange;
 
 #[cfg(feature = "tantivy-engine")]
+use crate::tantivy_schema::FieldHandles;
+#[cfg(feature = "tantivy-engine")]
 use mcp_agent_mail_core::DocKind;
 #[cfg(feature = "tantivy-engine")]
 use mcp_agent_mail_core::SearchMode;
@@ -33,8 +35,6 @@ use mcp_agent_mail_core::{
     ScoreFactor, SearchHit, SearchResults, StageScoreInput, compose_explain_report,
     compose_hit_explanation,
 };
-#[cfg(feature = "tantivy-engine")]
-use crate::tantivy_schema::FieldHandles;
 
 // ── Snippet generation ──────────────────────────────────────────────────────
 

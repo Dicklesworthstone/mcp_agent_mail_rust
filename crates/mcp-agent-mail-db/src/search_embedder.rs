@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::search_canonical::{CanonPolicy, canonicalize_and_hash};
-use mcp_agent_mail_core::DocKind;
 use crate::search_error::{SearchError, SearchResult};
+use mcp_agent_mail_core::DocKind;
 
 // ────────────────────────────────────────────────────────────────────
 // Embedding types

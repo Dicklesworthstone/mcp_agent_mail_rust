@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use mcp_agent_mail_core::{DocChange, DocKind, Document};
 use mcp_agent_mail_db::search_consistency::{
     ConsistencyConfig, NoProgress, ReindexConfig, Severity, check_consistency, full_reindex,
     repair_if_needed,
 };
-use mcp_agent_mail_core::{DocChange, DocKind, Document};
 use mcp_agent_mail_db::search_engine::{DocumentSource, IndexHealth, IndexLifecycle, IndexStats};
 use mcp_agent_mail_db::search_error::{SearchError, SearchResult};
 use mcp_agent_mail_db::search_index_layout::{

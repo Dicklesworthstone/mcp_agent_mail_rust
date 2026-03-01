@@ -452,8 +452,8 @@ mod tests {
     #[cfg(feature = "tantivy-engine")]
     mod tantivy_tests {
         use super::super::*;
-        use mcp_agent_mail_core::DateRange;
         use crate::tantivy_schema::{build_schema, register_tokenizer};
+        use mcp_agent_mail_core::DateRange;
         use tantivy::collector::TopDocs;
         use tantivy::doc;
         use tantivy::schema::Value;

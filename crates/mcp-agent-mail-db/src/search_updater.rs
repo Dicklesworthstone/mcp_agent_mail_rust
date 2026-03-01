@@ -8,12 +8,12 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use mcp_agent_mail_core::{DocChange, DocKind};
 use crate::search_engine::IndexLifecycle;
 use crate::search_envelope::{
     AgentRow, MessageRow, ProjectRow, agent_to_envelope, message_to_envelope, project_to_envelope,
 };
 use crate::search_error::SearchResult;
+use mcp_agent_mail_core::{DocChange, DocKind};
 
 /// Configuration for the incremental index updater
 #[derive(Debug, Clone)]
@@ -227,8 +227,8 @@ pub fn deduplicate_changes(changes: Vec<DocChange>) -> Vec<DocChange> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_agent_mail_core::Document;
     use crate::search_engine::{IndexHealth, IndexStats};
+    use mcp_agent_mail_core::Document;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -14,8 +14,8 @@ use std::time::Duration;
 use mcp_agent_mail_core::SearchMode;
 use mcp_agent_mail_core::{
     ExplainComposerConfig, ExplainReasonCode, ExplainReport, ExplainStage, ExplainVerbosity,
-    ScoreFactor, SearchResults, StageScoreInput, compose_explain_report,
-    compose_hit_explanation, redact_hit_explanation, redact_report_for_docs,
+    ScoreFactor, SearchResults, StageScoreInput, compose_explain_report, compose_hit_explanation,
+    redact_hit_explanation, redact_report_for_docs,
 };
 use mcp_agent_mail_db::query_assistance::{
     AppliedFilterHint, DidYouMeanHint, QueryAssistance, parse_query_assistance,

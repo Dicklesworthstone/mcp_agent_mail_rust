@@ -422,10 +422,10 @@ mod tests {
     use tracing::{Event, Id, Metadata, Subscriber, span, subscriber::Interest};
 
     use super::*;
-    use mcp_agent_mail_core::DocKind;
     use crate::search_two_tier::{
         TwoTierConfig, TwoTierEmbedder, TwoTierEntry, TwoTierIndex, TwoTierSearcher,
     };
+    use mcp_agent_mail_core::DocKind;
 
     #[test]
     fn test_init_metrics_captured() {

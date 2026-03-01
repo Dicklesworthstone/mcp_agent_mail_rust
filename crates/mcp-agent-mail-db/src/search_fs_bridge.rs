@@ -98,7 +98,9 @@ pub fn from_fs_config(config: &FsTwoTierConfig) -> crate::search_two_tier::TwoTi
 /// Domain-specific fields (`doc_kind`, `project_id`) are set to defaults;
 /// callers should enrich them from the document store.
 #[must_use]
-pub fn from_fs_scored_result(result: &FsScoredResult) -> Option<crate::search_two_tier::ScoredResult> {
+pub fn from_fs_scored_result(
+    result: &FsScoredResult,
+) -> Option<crate::search_two_tier::ScoredResult> {
     let doc_id: u64 = result.doc_id.parse().ok()?;
     Some(crate::search_two_tier::ScoredResult {
         idx: 0,
@@ -111,7 +113,9 @@ pub fn from_fs_scored_result(result: &FsScoredResult) -> Option<crate::search_tw
 
 /// Convert a batch of frankensearch `ScoredResult`s, skipping unparseable IDs.
 #[must_use]
-pub fn from_fs_scored_results(results: &[FsScoredResult]) -> Vec<crate::search_two_tier::ScoredResult> {
+pub fn from_fs_scored_results(
+    results: &[FsScoredResult],
+) -> Vec<crate::search_two_tier::ScoredResult> {
     results.iter().filter_map(from_fs_scored_result).collect()
 }
 
@@ -142,7 +146,9 @@ pub fn to_fs_scored_result(result: &crate::search_two_tier::ScoredResult) -> FsS
 #[must_use]
 pub const fn to_fs_model_tier(tier: crate::search_embedder::ModelTier) -> FsModelTier {
     match tier {
-        crate::search_embedder::ModelTier::Hash | crate::search_embedder::ModelTier::Fast => FsModelTier::Fast,
+        crate::search_embedder::ModelTier::Hash | crate::search_embedder::ModelTier::Fast => {
+            FsModelTier::Fast
+        }
         crate::search_embedder::ModelTier::Quality => FsModelTier::Quality,
     }
 }
@@ -269,7 +275,9 @@ pub fn map_fs_error(err: frankensearch::SearchError) -> crate::search_error::Sea
             ))
         }
         frankensearch::SearchError::EmbeddingFailed { model, source } => {
-            crate::search_error::SearchError::Internal(format!("embedding failed ({model}): {source}"))
+            crate::search_error::SearchError::Internal(format!(
+                "embedding failed ({model}): {source}"
+            ))
         }
         frankensearch::SearchError::Cancelled { phase, reason } => {
             crate::search_error::SearchError::Timeout(format!("{phase}: {reason}"))

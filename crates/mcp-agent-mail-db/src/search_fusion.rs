@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::search_candidates::{CandidateSource, PreparedCandidate};
 #[cfg(feature = "hybrid")]
 use crate::search_fs_bridge::{FsRrfConfig, FsScoredResult, FsVectorHit, fs, fs_rrf_fuse};
-use crate::search_candidates::{CandidateSource, PreparedCandidate};
 
 /// Default RRF constant (k).
 ///

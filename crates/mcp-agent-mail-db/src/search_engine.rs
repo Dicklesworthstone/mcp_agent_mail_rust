@@ -5,10 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use mcp_agent_mail_core::{DocChange, DocId, Document};
 use crate::search_error::SearchResult;
 use mcp_agent_mail_core::SearchQuery;
 use mcp_agent_mail_core::SearchResults;
+use mcp_agent_mail_core::{DocChange, DocId, Document};
 
 /// Health status of a search index
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -32,11 +32,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::search_canonical::{CanonPolicy, canonicalize_and_hash};
-use mcp_agent_mail_core::DocKind;
 use crate::search_embedder::{Embedder, EmbeddingResult, ModelTier};
 use crate::search_engine::IndexLifecycle;
 use crate::search_error::SearchResult;
 use crate::search_vector_index::{IndexEntry, VectorIndex, VectorMetadata};
+use mcp_agent_mail_core::DocKind;
 
 // ────────────────────────────────────────────────────────────────────
 // Configuration

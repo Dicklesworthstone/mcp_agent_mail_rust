@@ -10,8 +10,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use half::f16;
 use mcp_agent_mail_core::DocKind;
 use mcp_agent_mail_db::search_two_tier::{
-    TwoTierConfig, TwoTierEntry, TwoTierIndex, blend_scores, dot_product_f16_simd,
-    normalize_scores,
+    TwoTierConfig, TwoTierEntry, TwoTierIndex, blend_scores, dot_product_f16_simd, normalize_scores,
 };
 use std::hint::black_box;
 

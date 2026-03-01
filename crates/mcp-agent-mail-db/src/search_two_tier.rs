@@ -497,11 +497,7 @@ impl TwoTierIndex {
 
             entries.push(TwoTierEntry {
                 doc_id,
-                doc_kind: self
-                    .doc_kinds
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(DocKind::Message),
+                doc_kind: self.doc_kinds.get(idx).copied().unwrap_or(DocKind::Message),
                 project_id: self.project_ids.get(idx).copied().flatten(),
                 fast_embedding: fast_embedding.to_vec(),
                 quality_embedding: quality_embedding.to_vec(),

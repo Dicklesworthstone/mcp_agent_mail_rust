@@ -375,7 +375,9 @@ impl TwoTierContext {
     pub fn embed_fast(&self, query: &str) -> SearchResult<Vec<f32>> {
         get_fast_embedder()
             .ok_or_else(|| {
-                crate::search_error::SearchError::ModeUnavailable("fast embedder unavailable".into())
+                crate::search_error::SearchError::ModeUnavailable(
+                    "fast embedder unavailable".into(),
+                )
             })?
             .embed(query)
     }
@@ -401,7 +403,9 @@ impl TwoTierEmbedder for FastEmbedderWrapper {
     fn embed(&self, text: &str) -> SearchResult<Vec<f32>> {
         get_fast_embedder()
             .ok_or_else(|| {
-                crate::search_error::SearchError::ModeUnavailable("fast embedder unavailable".into())
+                crate::search_error::SearchError::ModeUnavailable(
+                    "fast embedder unavailable".into(),
+                )
             })?
             .embed(text)
     }
