@@ -118,8 +118,23 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
 
     let migration_ts = crate::now_micros();
     for migration in &base_migrations {
-        // Execute the migration SQL (ignore errors from IF NOT EXISTS / IF EXISTS).
-        let _ = conn.execute_raw(&migration.up);
+        // Execute migration SQL. We tolerate only duplicate/exists-style
+        // idempotency errors; anything else indicates a broken reconstruction.
+        if let Err(e) = conn.execute_raw(&migration.up) {
+            let err_text = e.to_string();
+            if is_reconstruct_benign_migration_error(&err_text) {
+                tracing::debug!(
+                    migration_id = %migration.id,
+                    error = %err_text,
+                    "reconstruct migration produced benign idempotency error; continuing"
+                );
+            } else {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct: apply migration {}: {e}",
+                    migration.id
+                )));
+            }
+        }
         // Record it as applied.
         conn.execute_sync(
             &format!(
@@ -209,6 +224,14 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
 
     tracing::info!(%stats, "database reconstruction from archive complete");
     Ok(stats)
+}
+
+#[must_use]
+fn is_reconstruct_benign_migration_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("already exists")
+        || lower.contains("duplicate column name")
+        || lower.contains("duplicate index name")
 }
 
 /// Walk `agents/{name}/profile.json` and insert agent rows.
@@ -760,6 +783,25 @@ fn extract_id_from_rows(rows: &[sqlmodel_core::Row]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconstruct_benign_migration_error_detection() {
+        assert!(is_reconstruct_benign_migration_error(
+            "table projects already exists"
+        ));
+        assert!(is_reconstruct_benign_migration_error(
+            "duplicate column name: foo"
+        ));
+        assert!(is_reconstruct_benign_migration_error(
+            "duplicate index name: idx_messages_created_ts"
+        ));
+        assert!(!is_reconstruct_benign_migration_error(
+            "near \"CREATE\": syntax error"
+        ));
+        assert!(!is_reconstruct_benign_migration_error(
+            "no such table: agents"
+        ));
+    }
 
     #[test]
     fn extract_json_frontmatter_basic() {

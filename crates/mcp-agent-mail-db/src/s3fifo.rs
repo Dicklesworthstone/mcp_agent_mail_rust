@@ -153,9 +153,15 @@ where
             if let Some(pos) = self.ghost.iter().position(|k| k == &key) {
                 self.ghost.remove(pos);
             }
-            self.evict_main_if_full();
-            self.main.push_back(key.clone());
-            self.index.insert(key, Node::Main { value, freq: 0 });
+            if self.main_capacity == 0 {
+                self.evict_small_if_full();
+                self.small.push_back(key.clone());
+                self.index.insert(key, Node::Small { value, freq: 0 });
+            } else {
+                self.evict_main_if_full();
+                self.main.push_back(key.clone());
+                self.index.insert(key, Node::Main { value, freq: 0 });
+            }
             return;
         }
 
@@ -225,9 +231,15 @@ where
             };
 
             if freq >= 1 {
-                self.evict_main_if_full();
-                self.main.push_back(key.clone());
-                self.index.insert(key, Node::Main { value, freq: 0 });
+                if self.main_capacity == 0 {
+                    self.evict_ghost_if_full();
+                    self.ghost.push_back(key.clone());
+                    self.index.insert(key, Node::Ghost);
+                } else {
+                    self.evict_main_if_full();
+                    self.main.push_back(key.clone());
+                    self.index.insert(key, Node::Main { value, freq: 0 });
+                }
             } else {
                 self.evict_ghost_if_full();
                 self.ghost.push_back(key.clone());
@@ -241,6 +253,13 @@ where
     /// Items with `freq >= 1` get reinserted at tail with freq reset.
     /// Others are permanently evicted.
     fn evict_main_if_full(&mut self) {
+        if self.main_capacity == 0 {
+            while let Some(key) = self.main.pop_front() {
+                self.index.remove(&key);
+            }
+            return;
+        }
+
         let mut budget = self.main.len() + 1;
         while self.main.len() >= self.main_capacity && budget > 0 {
             budget -= 1;
@@ -672,13 +691,13 @@ mod tests {
         assert_eq!(cache.get(&"a"), Some(&1));
         assert_eq!(cache.len(), 1);
 
-        // Inserting "b" evicts "a" from small. Since freq=1, "a" attempts
-        // promotion to main (cap=0), which may cause len to temporarily
-        // exceed 1. This is a known edge case with capacity=1.
+        // Inserting "b" evicts "a" from small. Even if "a" was hot (freq=1),
+        // cap=1 must never admit a live main entry.
         cache.insert("b", 2);
         assert_eq!(cache.get(&"b"), Some(&2));
-        // "a" may be in main (promoted) or evicted, depending on budget loop
-        assert!(!cache.is_empty());
+        assert_eq!(cache.main_len(), 0, "main queue must stay empty at cap=1");
+        assert_eq!(cache.len(), 1, "live entries must stay within capacity");
+        assert!(!cache.contains_key(&"a"));
     }
 
     #[test]

@@ -514,11 +514,13 @@ fn write_backfill_state(
 fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
     // Keep COUNT and MAX in separate scalar subqueries; FrankensQLite rejects
     // mixed aggregate/non-aggregate projections in one SELECT.
+    // Also avoid wrapping MAX() with COALESCE() because FrankensQLite's current
+    // aggregate planner can classify that shape as mixed aggregate/non-aggregate.
     let rows = conn
         .query_sync(
             "SELECT \
              (SELECT COUNT(*) FROM messages) AS count, \
-             (SELECT COALESCE(MAX(id), 0) FROM messages) AS max_id",
+             (SELECT MAX(id) FROM messages) AS max_id",
             &[],
         )
         .map_err(|e| format!("backfill stats query failed: {e}"))?;
@@ -537,7 +539,7 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
 
 fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
     let max_id_rows = conn
-        .query_sync("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
+        .query_sync("SELECT MAX(id) AS max_id FROM messages", &[])
         .map_err(|e| format!("backfill watermark max-id query failed: {e}"))?;
     let max_id = max_id_rows
         .first()
@@ -1699,8 +1701,8 @@ mod tests {
         let first = make_indexable(99, "Legacy subject", "legacy token alpha");
         let second = make_indexable(99, "Canonical subject", "canonical token beta");
 
-        upsert_indexable_message(&mut writer, handles, &first).unwrap();
-        upsert_indexable_message(&mut writer, handles, &second).unwrap();
+        upsert_indexable_message(&writer, handles, &first).unwrap();
+        upsert_indexable_message(&writer, handles, &second).unwrap();
         writer.commit().unwrap();
 
         let reader = bridge.index().reader().unwrap();
@@ -1738,12 +1740,12 @@ mod tests {
     fn upsert_indexable_message_rejects_negative_id() {
         let bridge = TantivyBridge::in_memory();
         let handles = bridge.handles();
-        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        let writer = bridge.index().writer(15_000_000).unwrap();
 
         let mut invalid = make_indexable(1, "x", "y");
         invalid.id = -1;
 
-        let result = upsert_indexable_message(&mut writer, handles, &invalid);
+        let result = upsert_indexable_message(&writer, handles, &invalid);
         assert!(result.is_err());
     }
 
@@ -1906,6 +1908,34 @@ mod tests {
         let url = format!("sqlite:///{db_path}");
         let result = backfill_from_db(&url);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fetch_db_message_watermark_handles_empty_messages_without_coalesce() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            &[],
+        )
+        .expect("create messages");
+
+        let watermark = fetch_db_message_watermark(&conn).expect("watermark query");
+        assert_eq!(watermark.max_id, 0);
+        assert_eq!(watermark.sequence, 0);
+    }
+
+    #[test]
+    fn fetch_db_message_stats_handles_empty_messages_without_coalesce() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            &[],
+        )
+        .expect("create messages");
+
+        let stats = fetch_db_message_stats(&conn).expect("stats query");
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.max_id, 0);
     }
 
     // ── Batch indexing edge-case tests ──────────────────────────────────────

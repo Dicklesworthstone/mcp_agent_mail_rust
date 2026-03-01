@@ -51,38 +51,43 @@ pub fn update_message_thread_id(
     Ok(true)
 }
 
-/// Dispatch a message from the first available project (TUI context).
-///
-/// Handles project resolution, sender auto-registration (for overseer),
-/// message insertion, and recipient linking in a single transaction.
-pub fn dispatch_root_message(
-    conn: &DbConn,
-    sender_name: &str,
-    subject: &str,
-    body_md: &str,
-    importance: &str,
-    thread_id: Option<&str>,
-    recipients: &[(String, String)], // (name, kind)
-) -> Result<i64, DbError> {
-    use crate::timestamps::now_micros;
+fn begin_sync_write_tx(conn: &DbConn) -> Result<(), DbError> {
+    conn.execute_sync("BEGIN IMMEDIATE", &[])
+        .map(|_| ())
+        .map_err(|e| DbError::Sqlite(e.to_string()))
+}
 
-    // 1. Resolve project (first available)
+fn commit_sync_write_tx(conn: &DbConn) -> Result<(), DbError> {
+    conn.execute_sync("COMMIT", &[])
+        .map(|_| ())
+        .map_err(|e| DbError::Sqlite(e.to_string()))
+}
+
+fn rollback_sync_write_tx(conn: &DbConn) {
+    let _ = conn.execute_sync("ROLLBACK", &[]);
+}
+
+fn resolve_root_project_id(conn: &DbConn) -> Result<i64, DbError> {
     let project_row = conn
         .query_sync("SELECT id FROM projects ORDER BY id LIMIT 1", &[])
         .map_err(|e| DbError::Sqlite(e.to_string()))?
         .into_iter()
         .next();
 
-    let project_id = project_row
+    project_row
         .and_then(|r| r.get_named::<i64>("id").ok())
         .ok_or_else(|| DbError::NotFound {
             entity: "Project",
             identifier: "any".into(),
-        })?;
+        })
+}
 
-    let now = now_micros();
-
-    // 2. Resolve or auto-register sender
+fn resolve_or_create_sender_id(
+    conn: &DbConn,
+    project_id: i64,
+    sender_name: &str,
+    now: i64,
+) -> Result<i64, DbError> {
     let sender_rows = conn
         .query_sync(
             "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
@@ -93,44 +98,54 @@ pub fn dispatch_root_message(
         )
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-    let sender_id = if let Some(row) = sender_rows.into_iter().next() {
-        row.get_named::<i64>("id").unwrap_or(0)
-    } else {
-        // Auto-register
-        conn.execute_sync(
-            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
-             VALUES (?1, ?2, 'tui-overseer', 'human', 'Human operator via TUI', ?3, ?4)",
+    if let Some(row) = sender_rows.into_iter().next() {
+        return row
+            .get_named::<i64>("id")
+            .map_err(|_| DbError::Internal("Failed to decode sender ID".into()));
+    }
+
+    conn.execute_sync(
+        "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+         VALUES (?1, ?2, 'tui-overseer', 'human', 'Human operator via TUI', ?3, ?4)",
+        &[
+            Value::BigInt(project_id),
+            Value::Text(sender_name.to_string()),
+            Value::BigInt(now),
+            Value::BigInt(now),
+        ],
+    )
+    .map_err(|e| DbError::Sqlite(e.to_string()))?;
+
+    let rows = conn
+        .query_sync(
+            "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
             &[
                 Value::BigInt(project_id),
                 Value::Text(sender_name.to_string()),
-                Value::BigInt(now),
-                Value::BigInt(now),
             ],
-        ).map_err(|e| DbError::Sqlite(e.to_string()))?;
+        )
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-        // Re-query ID
-        let rows = conn
-            .query_sync(
-                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
-                &[
-                    Value::BigInt(project_id),
-                    Value::Text(sender_name.to_string()),
-                ],
-            )
-            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+    rows.into_iter()
+        .next()
+        .and_then(|r| r.get_named::<i64>("id").ok())
+        .ok_or_else(|| DbError::Internal("Failed to resolve sender ID after insert".into()))
+}
 
-        rows.into_iter()
-            .next()
-            .and_then(|r| r.get_named::<i64>("id").ok())
-            .unwrap_or(0)
-    };
-
-    if sender_id == 0 {
-        return Err(DbError::Internal("Failed to resolve sender ID".into()));
-    }
-
-    // 3. Insert Message
-    let thread_id_val = thread_id.map_or(Value::Null, |t| Value::Text(t.to_string()));
+fn insert_root_message(
+    conn: &DbConn,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    importance: &str,
+    thread_id: Option<&str>,
+    now: i64,
+) -> Result<i64, DbError> {
+    let thread_id_val = thread_id
+        .map(str::trim)
+        .filter(|tid| !tid.is_empty())
+        .map_or(Value::Null, |tid| Value::Text(tid.to_string()));
 
     conn.execute_sync(
         "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, created_ts) \
@@ -150,16 +165,24 @@ pub fn dispatch_root_message(
     let msg_rows = conn
         .query_sync("SELECT last_insert_rowid() AS id", &[])
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
-
-    let msg_id = msg_rows
+    msg_rows
         .into_iter()
         .next()
         .and_then(|r| r.get_named::<i64>("id").ok())
-        .ok_or_else(|| DbError::Internal("Message insert returned no ID".into()))?;
+        .ok_or_else(|| DbError::Internal("Message insert returned no ID".into()))
+}
 
-    // 4. Insert Recipients
+fn insert_message_recipients(
+    conn: &DbConn,
+    project_id: i64,
+    msg_id: i64,
+    recipients: &[(String, String)],
+) -> Result<(), DbError> {
+    use std::collections::HashSet;
+
+    let mut inserted_recipient_ids: HashSet<i64> = HashSet::new();
+
     for (name, kind) in recipients {
-        // Resolve recipient ID
         let rec_rows = conn
             .query_sync(
                 "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
@@ -169,19 +192,61 @@ pub fn dispatch_root_message(
 
         if let Some(row) = rec_rows.into_iter().next()
             && let Ok(aid) = row.get_named::<i64>("id")
+            && inserted_recipient_ids.insert(aid)
         {
-            let _ = conn.execute_sync(
+            conn.execute_sync(
                 "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, ?3)",
                 &[
                     Value::BigInt(msg_id),
                     Value::BigInt(aid),
                     Value::Text(kind.clone()),
                 ],
-            );
+            )
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
         }
     }
 
-    Ok(msg_id)
+    Ok(())
+}
+
+/// Dispatch a message from the first available project (TUI context).
+///
+/// Handles project resolution, sender auto-registration (for overseer),
+/// message insertion, and recipient linking in a single transaction.
+pub fn dispatch_root_message(
+    conn: &DbConn,
+    sender_name: &str,
+    subject: &str,
+    body_md: &str,
+    importance: &str,
+    thread_id: Option<&str>,
+    recipients: &[(String, String)], // (name, kind)
+) -> Result<i64, DbError> {
+    use crate::timestamps::now_micros;
+
+    let project_id = resolve_root_project_id(conn)?;
+    begin_sync_write_tx(conn)?;
+
+    let dispatch_result = (|| -> Result<i64, DbError> {
+        let now = now_micros();
+        let sender_id = resolve_or_create_sender_id(conn, project_id, sender_name, now)?;
+        let msg_id = insert_root_message(
+            conn, project_id, sender_id, subject, body_md, importance, thread_id, now,
+        )?;
+        insert_message_recipients(conn, project_id, msg_id, recipients)?;
+        Ok(msg_id)
+    })();
+
+    match dispatch_result {
+        Ok(msg_id) => {
+            commit_sync_write_tx(conn)?;
+            Ok(msg_id)
+        }
+        Err(err) => {
+            rollback_sync_write_tx(conn);
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +517,36 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_root_message_trims_thread_id() {
+        let conn = test_conn();
+        let _pid = insert_project(&conn);
+
+        let msg_id = dispatch_root_message(
+            &conn,
+            "Agent",
+            "Thread trim test",
+            "Body",
+            "normal",
+            Some("  br-100  "),
+            &[],
+        )
+        .unwrap();
+
+        let rows = conn
+            .query_sync(
+                "SELECT thread_id FROM messages WHERE id = ?",
+                &[Value::BigInt(msg_id)],
+            )
+            .unwrap();
+        let thread_id = rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.get_named::<String>("thread_id").ok())
+            .unwrap();
+        assert_eq!(thread_id, "br-100");
+    }
+
+    #[test]
     fn dispatch_root_message_without_thread_id() {
         let conn = test_conn();
         let _pid = insert_project(&conn);
@@ -508,6 +603,46 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_root_message_duplicate_recipient_inserted_once() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let _sender = insert_agent(&conn, pid, "Sender");
+        let _r1 = insert_agent(&conn, pid, "Recipient1");
+
+        let msg_id = dispatch_root_message(
+            &conn,
+            "Sender",
+            "Duplicate recipient",
+            "Body",
+            "normal",
+            None,
+            &[
+                ("Recipient1".to_string(), "to".to_string()),
+                ("Recipient1".to_string(), "cc".to_string()),
+            ],
+        )
+        .unwrap();
+
+        let rows = conn
+            .query_sync(
+                "SELECT kind FROM message_recipients WHERE message_id = ? ORDER BY kind",
+                &[Value::BigInt(msg_id)],
+            )
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "duplicate recipients should be de-duplicated"
+        );
+        let kind = rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.get_named::<String>("kind").ok())
+            .unwrap();
+        assert_eq!(kind, "to", "first occurrence should win");
+    }
+
+    #[test]
     fn dispatch_root_message_unknown_recipient_skipped() {
         let conn = test_conn();
         let _pid = insert_project(&conn);
@@ -536,6 +671,51 @@ mod tests {
             .and_then(|r| r.get_named::<i64>("cnt").ok())
             .unwrap();
         assert_eq!(cnt, 0, "unknown recipient should be silently skipped");
+    }
+
+    #[test]
+    fn dispatch_root_message_recipient_insert_error_rolls_back_message() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let _sender = insert_agent(&conn, pid, "Sender");
+        let _recipient = insert_agent(&conn, pid, "Recipient1");
+
+        conn.execute_raw(
+            "CREATE TRIGGER fail_message_recipient_insert \
+             BEFORE INSERT ON message_recipients \
+             BEGIN \
+                 SELECT RAISE(ABORT, 'forced recipient insert failure'); \
+             END;",
+        )
+        .expect("install failing recipient trigger");
+
+        let err = dispatch_root_message(
+            &conn,
+            "Sender",
+            "Rollback recipient error",
+            "Body",
+            "normal",
+            None,
+            &[("Recipient1".to_string(), "to".to_string())],
+        )
+        .expect_err("recipient insert should fail when table is missing");
+        assert!(matches!(err, DbError::Sqlite(_)));
+
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE subject = 'Rollback recipient error'",
+                &[],
+            )
+            .unwrap();
+        let cnt = rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.get_named::<i64>("cnt").ok())
+            .unwrap();
+        assert_eq!(
+            cnt, 0,
+            "message insert should roll back on recipient failure"
+        );
     }
 
     #[test]

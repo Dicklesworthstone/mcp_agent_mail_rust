@@ -355,7 +355,7 @@ async fn count_inbound(
             "m.project_id = ?2".to_string(),
         ];
         let mut params: Vec<Value> = vec![Value::BigInt(aid), Value::BigInt(pid)];
-        apply_filters(&mut conditions, &mut params, query);
+        apply_filters(&mut conditions, &mut params, query, true);
         let where_clause = conditions.join(" AND ");
 
         let sql = format!(
@@ -404,7 +404,7 @@ async fn count_outbound(
             "m.project_id = ?2".to_string(),
         ];
         let mut params: Vec<Value> = vec![Value::BigInt(aid), Value::BigInt(pid)];
-        apply_filters(&mut conditions, &mut params, query);
+        apply_filters(&mut conditions, &mut params, query, false);
         let where_clause = conditions.join(" AND ");
 
         let sql = format!(
@@ -458,7 +458,7 @@ async fn fetch_inbound(
         ];
         let mut params: Vec<Value> = vec![Value::BigInt(aid), Value::BigInt(pid)];
 
-        apply_filters(&mut conditions, &mut params, query);
+        apply_filters(&mut conditions, &mut params, query, true);
 
         let where_clause = conditions.join(" AND ");
 
@@ -528,7 +528,7 @@ async fn fetch_outbound(
         ];
         let mut params: Vec<Value> = vec![Value::BigInt(aid), Value::BigInt(pid)];
 
-        apply_filters(&mut conditions, &mut params, query);
+        apply_filters(&mut conditions, &mut params, query, false);
 
         let where_clause = conditions.join(" AND ");
 
@@ -570,7 +570,12 @@ async fn fetch_outbound(
 // Internal: filter application
 // ────────────────────────────────────────────────────────────────────
 
-fn apply_filters(conditions: &mut Vec<String>, params: &mut Vec<Value>, query: &ExplorerQuery) {
+fn apply_filters(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Value>,
+    query: &ExplorerQuery,
+    inbound: bool,
+) {
     let mut idx = params.len() + 1;
 
     // Importance filter
@@ -590,10 +595,33 @@ fn apply_filters(conditions: &mut Vec<String>, params: &mut Vec<Value>, query: &
 
     // Ack filter
     match query.ack_filter {
-        AckFilter::PendingAck | AckFilter::Acknowledged => {
+        AckFilter::All => {}
+        AckFilter::PendingAck => {
             conditions.push("m.ack_required = 1".to_string());
+            if inbound {
+                conditions.push("r.ack_ts IS NULL".to_string());
+            } else {
+                // Outbound rows do not carry per-recipient ack state.
+                conditions.push("0".to_string());
+            }
         }
-        AckFilter::All | AckFilter::Unread => {}
+        AckFilter::Acknowledged => {
+            conditions.push("m.ack_required = 1".to_string());
+            if inbound {
+                conditions.push("r.ack_ts IS NOT NULL".to_string());
+            } else {
+                // Outbound rows do not carry per-recipient ack state.
+                conditions.push("0".to_string());
+            }
+        }
+        AckFilter::Unread => {
+            if inbound {
+                conditions.push("r.read_ts IS NULL".to_string());
+            } else {
+                // Outbound rows do not carry per-recipient read state.
+                conditions.push("0".to_string());
+            }
+        }
     }
 
     // Text filter (LIKE fallback)
@@ -993,7 +1021,7 @@ mod tests {
             importance_filter: vec!["high".to_string(), "urgent".to_string()],
             ..Default::default()
         };
-        apply_filters(&mut conditions, &mut params, &query);
+        apply_filters(&mut conditions, &mut params, &query, true);
         assert_eq!(conditions.len(), 2);
         assert!(conditions[1].contains("m.importance IN"));
         assert_eq!(params.len(), 3); // 1 original + 2 importance
@@ -1007,7 +1035,7 @@ mod tests {
             text_filter: "hello%world".to_string(),
             ..Default::default()
         };
-        apply_filters(&mut conditions, &mut params, &query);
+        apply_filters(&mut conditions, &mut params, &query, true);
         assert_eq!(conditions.len(), 2);
         assert!(conditions[1].contains("LIKE"));
         // Check that % was escaped
@@ -1127,8 +1155,9 @@ mod tests {
             ack_filter: AckFilter::PendingAck,
             ..Default::default()
         };
-        apply_filters(&mut conditions, &mut params, &query);
+        apply_filters(&mut conditions, &mut params, &query, true);
         assert!(conditions.iter().any(|c| c.contains("m.ack_required = 1")));
+        assert!(conditions.iter().any(|c| c.contains("r.ack_ts IS NULL")));
     }
 
     #[test]
@@ -1139,22 +1168,38 @@ mod tests {
             ack_filter: AckFilter::Acknowledged,
             ..Default::default()
         };
-        apply_filters(&mut conditions, &mut params, &query);
+        apply_filters(&mut conditions, &mut params, &query, true);
         assert!(conditions.iter().any(|c| c.contains("m.ack_required = 1")));
+        assert!(
+            conditions
+                .iter()
+                .any(|c| c.contains("r.ack_ts IS NOT NULL"))
+        );
     }
 
     #[test]
-    fn apply_filters_unread_is_noop() {
+    fn apply_filters_unread_adds_read_condition() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
         let query = ExplorerQuery {
             ack_filter: AckFilter::Unread,
             ..Default::default()
         };
-        apply_filters(&mut conditions, &mut params, &query);
-        // Unread filter doesn't add SQL conditions (filtered post-query)
-        assert_eq!(conditions.len(), 1);
+        apply_filters(&mut conditions, &mut params, &query, true);
+        assert!(conditions.iter().any(|c| c.contains("r.read_ts IS NULL")));
         assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn apply_filters_outbound_ack_filter_returns_no_rows() {
+        let mut conditions = vec!["m.sender_id = ?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::BigInt(1)];
+        let query = ExplorerQuery {
+            ack_filter: AckFilter::PendingAck,
+            ..Default::default()
+        };
+        apply_filters(&mut conditions, &mut params, &query, false);
+        assert!(conditions.iter().any(|c| c == "0"));
     }
 
     #[test]
@@ -1165,7 +1210,7 @@ mod tests {
             text_filter: "hello_world".to_string(),
             ..Default::default()
         };
-        apply_filters(&mut conditions, &mut params, &query);
+        apply_filters(&mut conditions, &mut params, &query, true);
         if let Value::Text(ref s) = params[1] {
             assert!(
                 s.contains("hello\\_world"),
@@ -1185,7 +1230,7 @@ mod tests {
             text_filter: "auth".to_string(),
             ..Default::default()
         };
-        apply_filters(&mut conditions, &mut params, &query);
+        apply_filters(&mut conditions, &mut params, &query, true);
         // Should have: base + importance IN + LIKE
         assert_eq!(conditions.len(), 3);
         assert!(conditions[1].contains("m.importance IN"));
@@ -1199,7 +1244,7 @@ mod tests {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
         let query = ExplorerQuery::default();
-        apply_filters(&mut conditions, &mut params, &query);
+        apply_filters(&mut conditions, &mut params, &query, true);
         assert_eq!(conditions.len(), 1);
         assert_eq!(params.len(), 1);
     }
