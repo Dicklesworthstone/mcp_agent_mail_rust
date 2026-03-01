@@ -724,6 +724,92 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         .build()
 }
 
+static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+const DEFAULT_STARTUP_SEARCH_BACKFILL_DELAY_SECS: u64 = 8;
+
+struct StartupSearchBackfillResetGuard;
+
+impl Drop for StartupSearchBackfillResetGuard {
+    fn drop(&mut self) {
+        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
+    match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
+        Ok((indexed, _skipped)) if indexed > 0 => {
+            tracing::info!(
+                indexed,
+                "[startup-search] backfilled messages into Tantivy index"
+            );
+        }
+        Ok(_) => {} // nothing to backfill or already up-to-date
+        Err(err) => {
+            tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
+            if recover_startup_search_backfill_db(config, &err) {
+                match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
+                    Ok((indexed, _)) if indexed > 0 => {
+                        tracing::warn!(
+                            indexed,
+                            "[startup-search] backfill succeeded after sqlite auto-recovery"
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "[startup-search] backfill completed after sqlite auto-recovery"
+                        );
+                    }
+                    Err(retry_err) => {
+                        tracing::warn!(
+                            "[startup-search] backfill retry failed after sqlite auto-recovery: {retry_err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[must_use]
+fn startup_search_backfill_delay_secs() -> u64 {
+    env_u64_or_default(
+        "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS",
+        DEFAULT_STARTUP_SEARCH_BACKFILL_DELAY_SECS,
+    )
+}
+
+fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
+    if STARTUP_SEARCH_BACKFILL_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let thread_config = config.clone();
+    let fallback_config = config.clone();
+    let spawn = std::thread::Builder::new()
+        .name("am-search-backfill".to_string())
+        .spawn(move || {
+            let _reset_guard = StartupSearchBackfillResetGuard;
+            let delay_secs = startup_search_backfill_delay_secs();
+            if delay_secs > 0 {
+                tracing::info!(
+                    delay_secs,
+                    "[startup-search] delaying backfill to prioritize startup responsiveness"
+                );
+                std::thread::sleep(Duration::from_secs(delay_secs));
+            }
+            run_startup_search_backfill(&thread_config);
+        });
+
+    if let Err(err) = spawn {
+        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+        tracing::warn!(
+            error = %err,
+            "[startup-search] failed to spawn background backfill worker; running inline"
+        );
+        run_startup_search_backfill(&fallback_config);
+    }
+}
+
 fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
     // Only initialize when lexical-capable modes are active.
     // This avoids creating the index directory when lexical retrieval is disabled.
@@ -742,39 +828,10 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
                 "[startup-search] initialized search v3 bridge at {}",
                 index_dir.display()
             );
-            // Backfill existing messages into the Tantivy index.
-            match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
-                Ok((indexed, _skipped)) if indexed > 0 => {
-                    tracing::info!(
-                        indexed,
-                        "[startup-search] backfilled messages into Tantivy index"
-                    );
-                }
-                Ok(_) => {} // nothing to backfill or already up-to-date
-                Err(err) => {
-                    tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
-                    if recover_startup_search_backfill_db(config, &err) {
-                        match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
-                            Ok((indexed, _)) if indexed > 0 => {
-                                tracing::warn!(
-                                    indexed,
-                                    "[startup-search] backfill succeeded after sqlite auto-recovery"
-                                );
-                            }
-                            Ok(_) => {
-                                tracing::warn!(
-                                    "[startup-search] backfill completed after sqlite auto-recovery"
-                                );
-                            }
-                            Err(retry_err) => {
-                                tracing::warn!(
-                                    "[startup-search] backfill retry failed after sqlite auto-recovery: {retry_err}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            // Backfill on a dedicated worker to keep first-render startup latency low.
+            // Search tool semantics remain robust: this is idempotent and retries with
+            // auto-recovery on recoverable sqlite failures.
+            spawn_startup_search_backfill(config);
         }
         Err(err) => {
             tracing::warn!(
@@ -1400,9 +1457,10 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
-    // Run one readiness init pass before any TUI screen opens raw sync DB
-    // handles; this guarantees schema migrations have been applied first.
-    readiness_check(config).map_err(std::io::Error::other)?;
+    // Run a fast readiness init pass before any TUI screen opens raw sync DB
+    // handles; this guarantees schema migrations have been applied first
+    // without blocking first render on integrity verification.
+    readiness_check_quick(config).map_err(std::io::Error::other)?;
 
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -1416,11 +1474,8 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
-    // readiness_check() already performed the first integrity verification.
-    // Avoid immediately repeating the same expensive check in the guard loop.
-    if config.integrity_check_on_startup {
-        integrity_guard::note_startup_integrity_probe_completed();
-    }
+    // TUI startup uses quick readiness (migrations + connectivity only). Let
+    // the background integrity guard run its immediate quick cycle.
     integrity_guard::start(config);
     disk_monitor::start(config);
     start_advisory_consistency_probe(config);
@@ -2496,12 +2551,12 @@ impl StartupDashboard {
     #[allow(clippy::too_many_lines)]
     fn spawn_console_input_worker(self: &Arc<Self>) {
         const INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
-        const INPUT_DRAIN_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+        const INPUT_DRAIN_POLL_TIMEOUT: Duration = Duration::from_millis(6);
         const INPUT_ERROR_BACKOFF: Duration = Duration::from_millis(25);
         const INPUT_EMPTY_READY_STREAK_LIMIT: usize = 8;
-        const INPUT_EMPTY_READY_BACKOFF: Duration = Duration::from_millis(2);
-        const INPUT_DRAIN_CAP_STREAK_LIMIT: usize = 3;
-        const INPUT_DRAIN_CAP_BACKOFF: Duration = Duration::from_millis(1);
+        const INPUT_EMPTY_READY_BACKOFF: Duration = Duration::from_millis(8);
+        const INPUT_DRAIN_CAP_STREAK_LIMIT: usize = 1;
+        const INPUT_DRAIN_CAP_BACKOFF: Duration = Duration::from_millis(6);
 
         if !lock_mutex(&self.console_layout).interactive_enabled || !std::io::stdin().is_terminal()
         {
@@ -2624,8 +2679,6 @@ impl StartupDashboard {
                         if drain_cap_streak >= INPUT_DRAIN_CAP_STREAK_LIMIT {
                             std::thread::sleep(INPUT_DRAIN_CAP_BACKOFF);
                             drain_cap_streak = 0;
-                        } else {
-                            std::thread::yield_now();
                         }
                     } else {
                         drain_cap_streak = 0;
@@ -4230,7 +4283,7 @@ impl HttpState {
                 if !matches!(req.method, Http1Method::Get) {
                     return Some(self.error_response(req, 405, "Method Not Allowed"));
                 }
-                if let Err(err) = readiness_check(&self.config) {
+                if let Err(err) = readiness_check_quick(&self.config) {
                     return Some(self.error_response(req, 503, &err));
                 }
                 return Some(self.json_response(req, 200, &serde_json::json!({"status":"ready"})));
@@ -5998,7 +6051,155 @@ fn map_asupersync_err(err: &asupersync::Error) -> std::io::Error {
     std::io::Error::other(format!("asupersync error: {err}"))
 }
 
+const STARTUP_INTEGRITY_CACHE_SCHEMA_VERSION: u32 = 1;
+const STARTUP_INTEGRITY_CACHE_TTL_SECS_DEFAULT: u64 = 6 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct StartupIntegrityFingerprint {
+    schema_version: i64,
+    user_version: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StartupIntegrityCacheEntry {
+    schema_version: u32,
+    sqlite_path: String,
+    fingerprint: StartupIntegrityFingerprint,
+    checked_at_micros: i64,
+}
+
+fn startup_integrity_cache_ttl_secs() -> u64 {
+    std::env::var("AM_STARTUP_INTEGRITY_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(STARTUP_INTEGRITY_CACHE_TTL_SECS_DEFAULT, |secs| {
+            secs.max(60)
+        })
+}
+
+fn startup_integrity_now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|dur| i64::try_from(dur.as_micros()).ok())
+        .unwrap_or(0)
+}
+
+fn startup_integrity_cache_path(
+    config: &mcp_agent_mail_core::Config,
+) -> Option<std::path::PathBuf> {
+    if !config.storage_root.is_dir() {
+        return None;
+    }
+    Some(
+        config
+            .storage_root
+            .join("diagnostics")
+            .join("startup_integrity_cache.json"),
+    )
+}
+
+fn read_pragma_i64(
+    conn: &mcp_agent_mail_db::DbConn,
+    pragma_sql: &str,
+    column: &str,
+) -> Option<i64> {
+    let rows = conn.query_sync(pragma_sql, &[]).ok()?;
+    let row = rows.first()?;
+    row.get_named::<i64>(column)
+        .ok()
+        .or_else(|| row.get_as::<i64>(0).ok())
+}
+
+fn sqlite_startup_fingerprint(
+    conn: &mcp_agent_mail_db::DbConn,
+    database_url: &str,
+) -> Option<(String, StartupIntegrityFingerprint)> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+    let sqlite_path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)?;
+    let schema_version = read_pragma_i64(conn, "PRAGMA schema_version", "schema_version")?;
+    let user_version = read_pragma_i64(conn, "PRAGMA user_version", "user_version").unwrap_or(0);
+    Some((
+        sqlite_path.to_string_lossy().into_owned(),
+        StartupIntegrityFingerprint {
+            schema_version,
+            user_version,
+        },
+    ))
+}
+
+fn read_startup_integrity_cache(
+    config: &mcp_agent_mail_core::Config,
+) -> Option<StartupIntegrityCacheEntry> {
+    let cache_path = startup_integrity_cache_path(config)?;
+    let raw = std::fs::read_to_string(cache_path).ok()?;
+    serde_json::from_str::<StartupIntegrityCacheEntry>(&raw).ok()
+}
+
+fn write_startup_integrity_cache(
+    config: &mcp_agent_mail_core::Config,
+    sqlite_path: &str,
+    fingerprint: StartupIntegrityFingerprint,
+) {
+    let Some(cache_path) = startup_integrity_cache_path(config) else {
+        return;
+    };
+    let Some(parent) = cache_path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let entry = StartupIntegrityCacheEntry {
+        schema_version: STARTUP_INTEGRITY_CACHE_SCHEMA_VERSION,
+        sqlite_path: sqlite_path.to_string(),
+        fingerprint,
+        checked_at_micros: startup_integrity_now_micros(),
+    };
+    let Ok(payload) = serde_json::to_string_pretty(&entry) else {
+        return;
+    };
+    let _ = std::fs::write(cache_path, payload);
+}
+
+fn startup_integrity_cache_is_fresh(
+    config: &mcp_agent_mail_core::Config,
+    sqlite_path: &str,
+    fingerprint: StartupIntegrityFingerprint,
+) -> bool {
+    let Some(cache) = read_startup_integrity_cache(config) else {
+        return false;
+    };
+    if cache.schema_version != STARTUP_INTEGRITY_CACHE_SCHEMA_VERSION {
+        return false;
+    }
+    if cache.sqlite_path != sqlite_path || cache.fingerprint != fingerprint {
+        return false;
+    }
+    let now = startup_integrity_now_micros();
+    if now <= 0 || cache.checked_at_micros <= 0 {
+        return false;
+    }
+    let age_micros = now.saturating_sub(cache.checked_at_micros);
+    let age_secs = u64::try_from(age_micros).unwrap_or(0) / 1_000_000;
+    age_secs <= startup_integrity_cache_ttl_secs()
+}
+
 fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
+    readiness_check_with_integrity(config, true)
+}
+
+fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
+    readiness_check_with_integrity(config, false)
+}
+
+fn readiness_check_with_integrity(
+    config: &mcp_agent_mail_core::Config,
+    run_integrity_check: bool,
+) -> Result<(), String> {
     let pool_timeout_ms = config
         .database_pool_timeout
         .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
@@ -6017,12 +6218,6 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
         warmup_connections: 0,
     };
     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
-    if config.integrity_check_on_startup
-        && !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)
-    {
-        pool.run_startup_integrity_check()
-            .map_err(|e| format!("startup integrity check failed: {e}"))?;
-    }
     let cx = Cx::for_testing();
     let conn = match block_on(pool.acquire(&cx)) {
         asupersync::Outcome::Ok(c) => c,
@@ -6034,6 +6229,31 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     };
     conn.query_sync("SELECT 1", &[])
         .map_err(|e| e.to_string())?;
+    let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
+    drop(conn);
+
+    let skip_startup_integrity =
+        startup_integrity_fingerprint
+            .as_ref()
+            .is_some_and(|(sqlite_path, fingerprint)| {
+                startup_integrity_cache_is_fresh(config, sqlite_path, *fingerprint)
+            });
+    if run_integrity_check
+        && config.integrity_check_on_startup
+        && !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)
+    {
+        if skip_startup_integrity {
+            tracing::debug!(
+                "startup integrity quick-check skipped (schema fingerprint unchanged and cache is fresh)"
+            );
+        } else {
+            pool.run_startup_integrity_check()
+                .map_err(|e| format!("startup integrity check failed: {e}"))?;
+            if let Some((sqlite_path, fingerprint)) = startup_integrity_fingerprint {
+                write_startup_integrity_cache(config, &sqlite_path, fingerprint);
+            }
+        }
+    }
     Ok(())
 }
 

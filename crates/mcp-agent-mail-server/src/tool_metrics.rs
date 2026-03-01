@@ -86,6 +86,7 @@ pub fn shutdown() {
 
 fn metrics_loop(config: &Config) {
     let interval = std::time::Duration::from_secs(config.tool_metrics_emit_interval_seconds.max(5));
+    let startup_delay = interval.min(std::time::Duration::from_secs(8));
     let mut conn = open_metrics_connection(&config.database_url);
     if let Some(db) = conn.as_ref() {
         ensure_metrics_schema(db);
@@ -96,6 +97,16 @@ fn metrics_loop(config: &Config) {
         interval_secs = interval.as_secs(),
         "tool metrics emit worker started"
     );
+
+    if startup_delay > std::time::Duration::ZERO {
+        info!(
+            startup_delay_secs = startup_delay.as_secs(),
+            "tool metrics worker startup delay engaged"
+        );
+        if sleep_with_shutdown(startup_delay) {
+            return;
+        }
+    }
 
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
@@ -188,6 +199,19 @@ fn metrics_loop(config: &Config) {
         }
         tick_index = tick_index.saturating_add(1);
     }
+}
+
+fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if SHUTDOWN.load(Ordering::Acquire) {
+            return true;
+        }
+        let chunk = remaining.min(std::time::Duration::from_secs(1));
+        std::thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    false
 }
 
 fn open_metrics_connection(database_url: &str) -> Option<DbConn> {

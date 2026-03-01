@@ -273,7 +273,7 @@ impl TuiSharedState {
         // Give important events a few non-blocking retries, then drop instead of
         // risking transport stalls while the UI thread is rendering.
         for _ in 0..3 {
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(2));
             if self.events.try_push(event.clone()).is_some() {
                 return true;
             }
@@ -1251,7 +1251,10 @@ mod tests {
         let fresh = crate::tui_screens::DataGeneration::default();
         let flags = crate::tui_screens::dirty_since(&stale, &fresh);
         assert!(flags.events, "stale→fresh: events should be dirty");
-        assert!(flags.console_log, "stale→fresh: console_log should be dirty");
+        assert!(
+            flags.console_log,
+            "stale→fresh: console_log should be dirty"
+        );
         assert!(flags.db_stats, "stale→fresh: db_stats should be dirty");
         assert!(flags.requests, "stale→fresh: requests should be dirty");
         assert!(flags.any(), "stale→fresh: any() must be true");

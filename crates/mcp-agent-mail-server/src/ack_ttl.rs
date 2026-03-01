@@ -65,6 +65,7 @@ pub fn shutdown() {
 
 fn ack_ttl_loop(config: &Config) {
     let interval = std::time::Duration::from_secs(config.ack_ttl_scan_interval_seconds.max(5));
+    let startup_delay = interval.min(std::time::Duration::from_secs(8));
 
     let mut pool_config = DbPoolConfig::from_env();
     pool_config.database_url.clone_from(&config.database_url);
@@ -89,6 +90,16 @@ fn ack_ttl_loop(config: &Config) {
         escalation_mode = %config.ack_escalation_mode,
         "ACK TTL scan worker started"
     );
+
+    if startup_delay > std::time::Duration::ZERO {
+        info!(
+            startup_delay_secs = startup_delay.as_secs(),
+            "ACK TTL worker startup delay engaged"
+        );
+        if sleep_with_shutdown(startup_delay) {
+            return;
+        }
+    }
 
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
@@ -121,6 +132,19 @@ fn ack_ttl_loop(config: &Config) {
             remaining = remaining.saturating_sub(chunk);
         }
     }
+}
+
+fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if SHUTDOWN.load(Ordering::Acquire) {
+            return true;
+        }
+        let chunk = remaining.min(std::time::Duration::from_secs(1));
+        std::thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    false
 }
 
 /// Run a single ACK TTL scan cycle.

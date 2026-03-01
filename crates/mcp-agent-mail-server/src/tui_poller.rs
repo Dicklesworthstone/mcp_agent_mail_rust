@@ -11,13 +11,12 @@ use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE;
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
 use mcp_agent_mail_db::{
@@ -182,15 +181,12 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn fetch_counts_with_reservation_count(&self, reservation_count: u64) -> DbSnapshotCounts {
-        let reservation_count_sql = "SELECT \
+        let core_counts_sql = "SELECT \
              (SELECT COUNT(*) FROM projects) AS projects_count, \
              (SELECT COUNT(*) FROM agents) AS agents_count, \
              (SELECT COUNT(*) FROM messages) AS messages_count, \
-             (SELECT COUNT(*) FROM agent_links) AS contacts_count, \
-             (SELECT COUNT(*) FROM message_recipients \
-               WHERE ack_ts IS NULL \
-                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)) AS ack_pending_count";
-        let batched_rows = match self.conn.query_sync(reservation_count_sql, &[]) {
+             (SELECT COUNT(*) FROM agent_links) AS contacts_count";
+        let batched_rows = match self.conn.query_sync(core_counts_sql, &[]) {
             Ok(rows) => Some(rows),
             Err(err) => {
                 self.handle_query_error(&err);
@@ -213,11 +209,12 @@ impl<'a> DbStatQueryBatcher<'a> {
                     messages: read_count("messages_count"),
                     file_reservations: reservation_count,
                     contact_links: read_count("contacts_count"),
-                    ack_pending: read_count("ack_pending_count"),
+                    ack_pending: 0,
                 }
             });
 
-        if let Some(counts) = batched {
+        if let Some(mut counts) = batched {
+            counts.ack_pending = self.fetch_ack_pending_count().unwrap_or(0);
             return counts;
         }
 
@@ -242,15 +239,23 @@ impl<'a> DbStatQueryBatcher<'a> {
             contact_links: self
                 .run_count_query("SELECT COUNT(*) AS c FROM agent_links", &[])
                 .unwrap_or(0),
-            ack_pending: self
-                .run_count_query(
-                    "SELECT COUNT(*) AS c FROM message_recipients \
-                     WHERE ack_ts IS NULL \
-                       AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)",
-                    &[],
-                )
-                .unwrap_or(0),
+            ack_pending: self.fetch_ack_pending_count().unwrap_or(0),
         }
+    }
+
+    fn fetch_ack_pending_count(&self) -> Option<u64> {
+        self.run_count_query(
+            "SELECT COALESCE(SUM(ack_pending_count), 0) AS c FROM inbox_stats",
+            &[],
+        )
+        .or_else(|| {
+            self.run_count_query(
+                "SELECT COUNT(*) AS c FROM message_recipients \
+                 WHERE ack_ts IS NULL \
+                   AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)",
+                &[],
+            )
+        })
     }
 
     fn run_count_query(&self, sql: &str, params: &[Value]) -> Option<u64> {
@@ -315,12 +320,20 @@ pub struct DbPoller {
     database_url: String,
     interval: Duration,
     stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+}
+
+struct PollerConnectionState {
+    conn: DbConn,
+    sqlite_path: String,
+    last_data_version: Option<i64>,
 }
 
 /// Handle returned by [`DbPoller::start`].
 pub struct DbPollerHandle {
     join: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl DbPoller {
@@ -333,6 +346,7 @@ impl DbPoller {
             database_url,
             interval: poll_interval_from_env(),
             stop: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new((Mutex::new(()), Condvar::new())),
         }
     }
 
@@ -347,6 +361,7 @@ impl DbPoller {
     #[must_use]
     pub fn start(self) -> DbPollerHandle {
         let stop = Arc::clone(&self.stop);
+        let wake = Arc::clone(&self.wake);
         let join = thread::Builder::new()
             .name("tui-db-poller".into())
             .spawn(move || {
@@ -356,6 +371,7 @@ impl DbPoller {
         DbPollerHandle {
             join: Some(join),
             stop,
+            wake,
         }
     }
 
@@ -367,12 +383,21 @@ impl DbPoller {
             .checked_sub(HEALTH_PULSE_HEARTBEAT_INTERVAL)
             .unwrap_or(now);
         let mut panic_recovery_active = false;
+        let mut connection_state: Option<PollerConnectionState> = None;
 
         while !self.stop.load(Ordering::Relaxed) {
             // Fetch fresh snapshot
             let snapshot = if let Ok(snapshot) =
-                catch_optional_panic(|| fetch_db_stats(&self.database_url))
-            {
+                catch_optional_panic(std::panic::AssertUnwindSafe(|| {
+                    if connection_state.is_none() {
+                        connection_state = open_poller_connection_state(&self.database_url);
+                    }
+                    if let Some(state) = connection_state.as_mut() {
+                        fetch_db_stats_with_connection(state, &prev)
+                    } else {
+                        None
+                    }
+                })) {
                 if panic_recovery_active {
                     tracing::info!(
                         "tui-db-poller recovered after a panic; resuming normal polling"
@@ -401,15 +426,23 @@ impl DbPoller {
                     last_health_emit = Instant::now();
                 }
                 prev = snapshot;
+            } else {
+                connection_state = None;
             }
 
-            // Sleep in small increments so we notice shutdown quickly
-            let mut remaining = self.interval;
-            let tick = Duration::from_millis(100);
-            while remaining > Duration::ZERO && !self.stop.load(Ordering::Relaxed) {
-                let sleep = remaining.min(tick);
-                thread::sleep(sleep);
-                remaining = remaining.saturating_sub(sleep);
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Block until the next interval or an explicit stop wakeup.
+            let (lock, cvar) = &*self.wake;
+            let guard = match lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let _ = cvar.wait_timeout(guard, self.interval);
+            if self.stop.load(Ordering::Relaxed) {
+                break;
             }
         }
     }
@@ -419,6 +452,7 @@ impl DbPollerHandle {
     /// Signal the poller to stop and wait for the thread to exit.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.wake.1.notify_all();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -427,6 +461,7 @@ impl DbPollerHandle {
     /// Signal stop without waiting.
     pub fn signal_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.wake.1.notify_all();
     }
 
     /// Wait for the thread to exit (call after `signal_stop`).
@@ -512,9 +547,41 @@ fn maybe_attempt_sqlite_recovery(sqlite_path: &str, reason: &str) {
 /// Opens a fresh sync connection, runs aggregate queries, and returns
 /// the snapshot.  On any error, returns `None` so callers can keep the
 /// previous snapshot instead of clearing existing data.
+#[cfg(test)]
 fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
     let (conn, sqlite_path) = open_sync_connection_with_path(database_url)?;
     Some(DbStatQueryBatcher::new_with_path(&conn, &sqlite_path).fetch_snapshot())
+}
+
+fn open_poller_connection_state(database_url: &str) -> Option<PollerConnectionState> {
+    let (conn, sqlite_path) = open_sync_connection_with_path(database_url)?;
+    Some(PollerConnectionState {
+        conn,
+        sqlite_path,
+        last_data_version: None,
+    })
+}
+
+fn fetch_db_stats_with_connection(
+    state: &mut PollerConnectionState,
+    previous: &DbStatSnapshot,
+) -> Option<DbStatSnapshot> {
+    let data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
+    if let Some(version) = data_version
+        && state
+            .last_data_version
+            .is_some_and(|previous_version| previous_version == version)
+    {
+        if previous.timestamp_micros > 0 {
+            let mut snapshot = previous.clone();
+            snapshot.timestamp_micros = now_micros();
+            return Some(snapshot);
+        }
+    }
+    let snapshot =
+        DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot();
+    state.last_data_version = data_version;
+    Some(snapshot)
 }
 
 /// Open a sync `SQLite` connection from a database URL (public for compose dispatch).
@@ -564,6 +631,25 @@ fn open_sync_connection_with_path(database_url: &str) -> Option<(DbConn, String)
             } else {
                 None
             }
+        }
+    }
+}
+
+fn query_data_version(conn: &DbConn, sqlite_path: Option<&str>) -> Option<i64> {
+    match conn.query_sync("PRAGMA data_version", &[]) {
+        Ok(rows) => rows.first().and_then(|row| {
+            row.get_named::<i64>("data_version")
+                .ok()
+                .or_else(|| row.get_as::<i64>(0).ok())
+        }),
+        Err(err) => {
+            let message = err.to_string();
+            if is_sqlite_recovery_error_message(&message)
+                && let Some(path) = sqlite_path
+            {
+                maybe_attempt_sqlite_recovery(path, &message);
+            }
+            None
         }
     }
 }
@@ -913,12 +999,13 @@ const RESERVATION_LEGACY_SCAN_SQL: &str = "SELECT \
    fr.released_ts AS raw_released_ts \
  FROM file_reservations fr \
  LEFT JOIN projects p ON p.id = fr.project_id \
- LEFT JOIN agents a ON a.id = fr.agent_id \
- ORDER BY fr.id ASC";
+ LEFT JOIN agents a ON a.id = fr.agent_id";
 
 static RESERVATION_ACTIVE_FAST_SQL: OnceLock<String> = OnceLock::new();
+static RESERVATION_ACTIVE_FAST_COUNTS_SQL: OnceLock<String> = OnceLock::new();
+const RESERVATION_ACTIVE_FAST_PREDICATE: &str = "released_ts IS NULL OR released_ts <= 0";
 
-fn reservation_active_fast_sql() -> &'static str {
+fn reservation_active_fast_snapshots_sql() -> &'static str {
     RESERVATION_ACTIVE_FAST_SQL
         .get_or_init(|| {
             format!(
@@ -935,8 +1022,24 @@ fn reservation_active_fast_sql() -> &'static str {
                  FROM file_reservations fr \
                  LEFT JOIN projects p ON p.id = fr.project_id \
                  LEFT JOIN agents a ON a.id = fr.agent_id \
-                 WHERE ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
-                 ORDER BY fr.id ASC"
+                 WHERE ({RESERVATION_ACTIVE_FAST_PREDICATE}) AND expires_ts > ? \
+                 ORDER BY fr.expires_ts ASC, fr.id ASC \
+                 LIMIT {MAX_RESERVATIONS}"
+            )
+        })
+        .as_str()
+}
+
+fn reservation_active_fast_counts_sql() -> &'static str {
+    RESERVATION_ACTIVE_FAST_COUNTS_SQL
+        .get_or_init(|| {
+            format!(
+                "SELECT \
+                   fr.project_id AS raw_project_id, \
+                   COUNT(*) AS active_count \
+                 FROM file_reservations fr \
+                 WHERE ({RESERVATION_ACTIVE_FAST_PREDICATE}) AND expires_ts > ? \
+                 GROUP BY fr.project_id"
             )
         })
         .as_str()
@@ -976,17 +1079,32 @@ fn reservation_scan_mode(conn: &DbConn, sqlite_path: Option<&str>) -> Reservatio
 fn detect_reservation_scan_mode(conn: &DbConn) -> ReservationScanMode {
     // Conservative policy: if detection is uncertain, keep legacy full-scan
     // semantics so we never drop active reservations from the UI.
-    let Some(declared_text) = file_reservations_expires_declared_text(conn) else {
+    let Some(expires_declared_text) = file_reservations_expires_declared_text(conn) else {
         return ReservationScanMode::FullLegacy;
     };
-    if declared_text {
+    if expires_declared_text {
         return ReservationScanMode::FullLegacy;
     }
 
-    let Some(has_text_values) = file_reservations_contains_text_expires_values(conn) else {
+    let Some(released_declared_text) = file_reservations_released_declared_text(conn) else {
         return ReservationScanMode::FullLegacy;
     };
-    if has_text_values {
+    if released_declared_text {
+        return ReservationScanMode::FullLegacy;
+    }
+
+    let Some(expires_has_text_values) = file_reservations_contains_text_expires_values(conn) else {
+        return ReservationScanMode::FullLegacy;
+    };
+    if expires_has_text_values {
+        return ReservationScanMode::FullLegacy;
+    }
+
+    let Some(released_has_text_values) = file_reservations_contains_text_released_values(conn)
+    else {
+        return ReservationScanMode::FullLegacy;
+    };
+    if released_has_text_values {
         ReservationScanMode::FullLegacy
     } else {
         ReservationScanMode::ActiveFast
@@ -1023,6 +1141,36 @@ fn file_reservations_contains_text_expires_values(conn: &DbConn) -> Option<bool>
     .map(|rows| !rows.is_empty())
 }
 
+fn file_reservations_released_declared_text(conn: &DbConn) -> Option<bool> {
+    let rows = conn
+        .query_sync("PRAGMA table_info(file_reservations)", &[])
+        .ok()?;
+    for row in rows {
+        let Ok(name) = row.get_named::<String>("name") else {
+            continue;
+        };
+        if name != "released_ts" {
+            continue;
+        }
+        let declared = row.get_named::<String>("type").ok().unwrap_or_default();
+        let upper = declared.to_ascii_uppercase();
+        return Some(upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB"));
+    }
+    None
+}
+
+fn file_reservations_contains_text_released_values(conn: &DbConn) -> Option<bool> {
+    conn.query_sync(
+        "SELECT 1 AS has_text \
+         FROM file_reservations \
+         WHERE typeof(released_ts) = 'text' \
+         LIMIT 1",
+        &[],
+    )
+    .ok()
+    .map(|rows| !rows.is_empty())
+}
+
 #[allow(clippy::too_many_lines)]
 fn fetch_reservation_snapshot_bundle(
     conn: &DbConn,
@@ -1030,10 +1178,11 @@ fn fetch_reservation_snapshot_bundle(
     sqlite_path: Option<&str>,
 ) -> ReservationSnapshotBundle {
     let scan_mode = reservation_scan_mode(conn, sqlite_path);
+    if scan_mode == ReservationScanMode::ActiveFast {
+        return fetch_reservation_snapshot_bundle_fast(conn, now);
+    }
     let rows = match scan_mode {
-        ReservationScanMode::ActiveFast => {
-            conn.query_sync(reservation_active_fast_sql(), &[Value::BigInt(now)])
-        }
+        ReservationScanMode::ActiveFast => unreachable!("handled by fast-path early return"),
         ReservationScanMode::FullLegacy => conn.query_sync(RESERVATION_LEGACY_SCAN_SQL, &[]),
     };
     let rows = match rows {
@@ -1115,6 +1264,101 @@ fn fetch_reservation_snapshot_bundle(
 
     let mut snapshots: Vec<_> = snapshots.into_iter().map(|entry| entry.snapshot).collect();
     snapshots.sort_by_key(|snapshot| (snapshot.expires_ts, snapshot.id));
+    ReservationSnapshotBundle {
+        active_count,
+        active_counts_by_project,
+        snapshots,
+    }
+}
+
+fn fetch_reservation_snapshot_bundle_fast(conn: &DbConn, now: i64) -> ReservationSnapshotBundle {
+    let count_rows =
+        match conn.query_sync(reservation_active_fast_counts_sql(), &[Value::BigInt(now)]) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::debug!(
+                    mode = ?ReservationScanMode::ActiveFast,
+                    error = ?err,
+                    "tui_poller.fetch_reservation_snapshots count query failed"
+                );
+                return ReservationSnapshotBundle::default();
+            }
+        };
+
+    let mut active_count = 0_u64;
+    let mut active_counts_by_project: HashMap<i64, u64> = HashMap::new();
+    for row in count_rows {
+        let Some(project_id) = parse_raw_i64(&row, "raw_project_id") else {
+            continue;
+        };
+        let count = row
+            .get_named::<i64>("active_count")
+            .ok()
+            .and_then(|value| u64::try_from(value.max(0)).ok())
+            .unwrap_or(0);
+        if count == 0 {
+            continue;
+        }
+        active_counts_by_project.insert(project_id, count);
+        active_count = active_count.saturating_add(count);
+    }
+
+    if MAX_RESERVATIONS == 0 || active_count == 0 {
+        return ReservationSnapshotBundle {
+            active_count,
+            active_counts_by_project,
+            snapshots: Vec::new(),
+        };
+    }
+
+    let snapshot_rows = match conn.query_sync(
+        reservation_active_fast_snapshots_sql(),
+        &[Value::BigInt(now)],
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::debug!(
+                mode = ?ReservationScanMode::ActiveFast,
+                error = ?err,
+                "tui_poller.fetch_reservation_snapshots snapshot query failed"
+            );
+            return ReservationSnapshotBundle {
+                active_count,
+                active_counts_by_project,
+                snapshots: Vec::new(),
+            };
+        }
+    };
+
+    let mut snapshots = Vec::with_capacity(snapshot_rows.len().min(MAX_RESERVATIONS));
+    for row in snapshot_rows {
+        let Some(id) = parse_raw_i64(&row, "id") else {
+            continue;
+        };
+        let Some(path_pattern) = row.get_named::<String>("path_pattern").ok() else {
+            continue;
+        };
+        snapshots.push(ReservationSnapshot {
+            id,
+            project_slug: row
+                .get_named::<String>("project_slug")
+                .ok()
+                .unwrap_or_else(|| "[unknown-project]".to_string()),
+            agent_name: row
+                .get_named::<String>("agent_name")
+                .ok()
+                .unwrap_or_else(|| "[unknown-agent]".to_string()),
+            path_pattern,
+            exclusive: row
+                .get_named::<i64>("exclusive")
+                .ok()
+                .is_none_or(|value| value != 0),
+            granted_ts: parse_raw_ts(&row, "raw_created_ts"),
+            expires_ts: parse_raw_ts(&row, "raw_expires_ts"),
+            released_ts: None,
+        });
+    }
+
     ReservationSnapshotBundle {
         active_count,
         active_counts_by_project,
@@ -1224,6 +1468,7 @@ impl SnapshotDelta {
 mod tests {
     use super::*;
     use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE;
 
     const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000; // 2100-01-01T00:00:00Z
 

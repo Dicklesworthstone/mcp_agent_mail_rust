@@ -61,6 +61,7 @@ pub fn shutdown() {
 
 fn retention_loop(config: &Config) {
     let interval = std::time::Duration::from_secs(config.retention_report_interval_seconds.max(60));
+    let startup_delay = interval.min(std::time::Duration::from_secs(10));
 
     info!(
         interval_secs = interval.as_secs(),
@@ -69,6 +70,16 @@ fn retention_loop(config: &Config) {
         storage_root = %config.storage_root.display(),
         "retention/quota report worker started"
     );
+
+    if startup_delay > std::time::Duration::ZERO {
+        info!(
+            startup_delay_secs = startup_delay.as_secs(),
+            "retention/quota worker startup delay engaged"
+        );
+        if sleep_with_shutdown(startup_delay) {
+            return;
+        }
+    }
 
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
@@ -104,6 +115,19 @@ fn retention_loop(config: &Config) {
             remaining = remaining.saturating_sub(chunk);
         }
     }
+}
+
+fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if SHUTDOWN.load(Ordering::Acquire) {
+            return true;
+        }
+        let chunk = remaining.min(std::time::Duration::from_secs(1));
+        std::thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    false
 }
 
 /// Summary of a retention/quota report cycle.

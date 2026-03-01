@@ -54,7 +54,10 @@ impl PortStatus {
 }
 
 /// Default timeout for health check connections.
-const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// Keep this short to avoid multi-second startup stalls when probing a port
+/// occupied by an unrelated process that accepts TCP but does not speak HTTP.
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Check the status of a port: free, occupied by Agent Mail, or occupied by another process.
 ///

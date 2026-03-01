@@ -2030,16 +2030,11 @@ impl MailAppModel {
     fn drain_deferred_confirmed_action(&mut self) -> Cmd<MailMsg> {
         // Drain a bounded batch so a noisy producer cannot monopolize one frame.
         let mut cmds = Vec::new();
-        let mut hit_cap = false;
         while let Ok((operation, context)) = self.action_rx.try_recv() {
             cmds.push(self.dispatch_execute_operation(&operation, &context));
             if cmds.len() >= MAX_DEFERRED_ACTIONS_PER_TICK {
-                hit_cap = true;
                 break;
             }
-        }
-        if hit_cap {
-            cmds.push(Cmd::msg(MailMsg::HousekeepingTick));
         }
         match cmds.len() {
             0 => Cmd::none(),
@@ -11411,7 +11406,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_deferred_action_limits_batch_and_schedules_follow_up_tick() {
+    fn drain_deferred_action_limits_batch_without_immediate_reschedule() {
         let mut model = test_model();
         for idx in 0..=MAX_DEFERRED_ACTIONS_PER_TICK {
             model
@@ -11423,11 +11418,7 @@ mod tests {
         let cmd = model.drain_deferred_confirmed_action();
         match cmd {
             Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), MAX_DEFERRED_ACTIONS_PER_TICK + 1);
-                assert!(
-                    matches!(cmds.last(), Some(Cmd::Msg(MailMsg::HousekeepingTick))),
-                    "last command should request another housekeeping pass"
-                );
+                assert_eq!(cmds.len(), MAX_DEFERRED_ACTIONS_PER_TICK);
             }
             other => panic!("expected Cmd::Batch, got: {other:?}"),
         }
