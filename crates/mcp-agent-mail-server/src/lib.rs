@@ -4320,12 +4320,15 @@ impl HttpState {
                     dropped_oldest += 1;
                 }
             }
+            let queue_stats = state.remote_terminal_queue_stats();
             let payload = serde_json::json!({
                 "status": "accepted",
                 "accepted": accepted,
                 "ignored": parsed.ignored,
                 "dropped_oldest": dropped_oldest,
-                "queue_depth": state.remote_terminal_queue_len(),
+                "queue_depth": queue_stats.depth,
+                "queue_dropped_oldest_total": queue_stats.dropped_oldest_total,
+                "queue_resize_coalesced_total": queue_stats.resize_coalesced_total,
             });
             return Some(self.json_response(req, 202, &payload));
         }
@@ -7783,6 +7786,8 @@ mod tests {
         assert_eq!(body["accepted"], 2);
         assert_eq!(body["ignored"], 1);
         assert_eq!(body["dropped_oldest"], 0);
+        assert_eq!(body["queue_dropped_oldest_total"], 0);
+        assert_eq!(body["queue_resize_coalesced_total"], 0);
         assert_eq!(body["status"], "accepted");
 
         let queued = shared.drain_remote_terminal_events(8);
@@ -7802,6 +7807,49 @@ mod tests {
             }
         ));
 
+        set_tui_state_handle(None);
+    }
+
+    #[test]
+    fn mail_ws_input_coalesces_resize_bursts() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config.clone());
+        let shared = tui_bridge::TuiSharedState::new(&config);
+        set_tui_state_handle(None);
+        set_tui_state_handle(Some(Arc::clone(&shared)));
+
+        let mut req = make_request(Http1Method::Post, "/mail/ws-input", &[]);
+        req.body = br#"{
+            "events": [
+                {"type":"Resize","data":{"cols":120,"rows":40}},
+                {"type":"Resize","data":{"cols":121,"rows":41}},
+                {"type":"Resize","data":{"cols":122,"rows":42}}
+            ]
+        }"#
+        .to_vec();
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 202);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("accepted json");
+        assert_eq!(body["accepted"], 3);
+        assert_eq!(body["ignored"], 0);
+        assert_eq!(body["dropped_oldest"], 0);
+        assert_eq!(body["queue_depth"], 1);
+        assert_eq!(body["queue_dropped_oldest_total"], 0);
+        assert_eq!(body["queue_resize_coalesced_total"], 2);
+        assert_eq!(body["status"], "accepted");
+
+        let queued = shared.drain_remote_terminal_events(8);
+        assert_eq!(
+            queued,
+            vec![tui_bridge::RemoteTerminalEvent::Resize {
+                cols: 122,
+                rows: 42
+            }]
+        );
         set_tui_state_handle(None);
     }
 
