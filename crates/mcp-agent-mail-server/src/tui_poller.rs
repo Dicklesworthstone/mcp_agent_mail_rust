@@ -566,15 +566,18 @@ fn fetch_db_stats_with_connection(
     state: &mut PollerConnectionState,
     previous: &DbStatSnapshot,
 ) -> Option<DbStatSnapshot> {
+    let now = now_micros();
     let data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
+    let must_refresh_for_expiry = reservation_state_requires_time_refresh(previous, now);
     if let Some(version) = data_version
         && state
             .last_data_version
             .is_some_and(|previous_version| previous_version == version)
+        && !must_refresh_for_expiry
     {
         if previous.timestamp_micros > 0 {
             let mut snapshot = previous.clone();
-            snapshot.timestamp_micros = now_micros();
+            snapshot.timestamp_micros = now;
             return Some(snapshot);
         }
     }
@@ -582,6 +585,23 @@ fn fetch_db_stats_with_connection(
         DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot();
     state.last_data_version = data_version;
     Some(snapshot)
+}
+
+fn reservation_state_requires_time_refresh(previous: &DbStatSnapshot, now_micros: i64) -> bool {
+    if previous.file_reservations == 0 {
+        return false;
+    }
+    // If we know active reservations exist but have no snapshot rows (e.g. prior
+    // fallback/truncation), force a fresh query so expiry-driven counts stay
+    // correct even when PRAGMA data_version is unchanged.
+    if previous.reservation_snapshots.is_empty() {
+        return true;
+    }
+    previous
+        .reservation_snapshots
+        .iter()
+        .filter(|snapshot| !snapshot.is_released())
+        .any(|snapshot| snapshot.expires_ts > 0 && snapshot.expires_ts <= now_micros)
 }
 
 /// Open a sync `SQLite` connection from a database URL (public for compose dispatch).
@@ -1878,6 +1898,52 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    #[test]
+    fn reservation_state_requires_time_refresh_when_expiry_due() {
+        let mut snapshot = DbStatSnapshot {
+            file_reservations: 1,
+            reservation_snapshots: vec![ReservationSnapshot {
+                id: 1,
+                project_slug: "proj".to_string(),
+                agent_name: "agent".to_string(),
+                path_pattern: "src/**".to_string(),
+                exclusive: true,
+                granted_ts: 10,
+                expires_ts: 100,
+                released_ts: None,
+            }],
+            ..DbStatSnapshot::default()
+        };
+
+        assert!(
+            !reservation_state_requires_time_refresh(&snapshot, 99),
+            "should not force refresh before expiry"
+        );
+        assert!(
+            reservation_state_requires_time_refresh(&snapshot, 100),
+            "should force refresh once reservation reaches expiry"
+        );
+
+        snapshot.reservation_snapshots[0].released_ts = Some(90);
+        assert!(
+            !reservation_state_requires_time_refresh(&snapshot, 100),
+            "released reservations should not force refresh"
+        );
+    }
+
+    #[test]
+    fn reservation_state_requires_time_refresh_when_snapshot_missing() {
+        let snapshot = DbStatSnapshot {
+            file_reservations: 2,
+            reservation_snapshots: Vec::new(),
+            ..DbStatSnapshot::default()
+        };
+        assert!(
+            reservation_state_requires_time_refresh(&snapshot, now_micros()),
+            "active reservation count without rows must force refresh"
+        );
     }
 
     #[test]
