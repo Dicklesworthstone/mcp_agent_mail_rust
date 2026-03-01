@@ -3360,6 +3360,7 @@ impl MailAppModel {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_housekeeping_tick(&mut self, elapsed_tick: Duration) -> Cmd<MailMsg> {
         if let Some(mut transition) = self.screen_transition {
             transition.ticks_remaining = transition.ticks_remaining.saturating_sub(1);

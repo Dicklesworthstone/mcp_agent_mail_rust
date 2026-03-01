@@ -330,24 +330,24 @@ fn check_filesystem_activity(
             ])
             .output();
 
-        if let Ok(output) = git_ls {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    let file_path = workspace.join(line);
-                    if let Ok(metadata) = file_path.metadata()
-                        && let Ok(modified) = metadata.modified()
-                    {
-                        let mtime_us = modified
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-                        if now_us.saturating_sub(mtime_us) <= grace_us {
-                            return true;
-                        }
+        if let Ok(output) = git_ls
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let file_path = workspace.join(line);
+                if let Ok(metadata) = file_path.metadata()
+                    && let Ok(modified) = metadata.modified()
+                {
+                    let mtime_us = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
+                    if now_us.saturating_sub(mtime_us) <= grace_us {
+                        return true;
                     }
                 }
-                return false;
             }
+            return false;
         }
 
         // Fallback: unbounded glob (slow, but works outside git repos)

@@ -1221,13 +1221,10 @@ fn render_search(
             ..Default::default()
         };
 
-        let resp = match block_on_outcome(
+        let resp = block_on_outcome(
             cx,
             mcp_agent_mail_db::search_service::execute_search_simple(cx, pool, &search_query),
-        ) {
-            Ok(resp) => resp,
-            Err(e) => return Err(e),
-        };
+        )?;
 
         let web_results: Vec<WebSearchResult> = resp
             .results

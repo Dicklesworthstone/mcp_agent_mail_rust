@@ -736,10 +736,10 @@ fn read_fd_soft_limit() -> Option<u64> {
                 // Format: "Max open files            1024                 1048576              files"
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 // The soft limit is the 4th token (0-indexed: 3)
-                if parts.len() >= 5 {
-                    if let Ok(soft) = parts[3].parse::<u64>() {
-                        return Some(soft);
-                    }
+                if parts.len() >= 5
+                    && let Ok(soft) = parts[3].parse::<u64>()
+                {
+                    return Some(soft);
                 }
             }
         }
@@ -752,7 +752,7 @@ fn read_fd_soft_limit() -> Option<u64> {
 
 /// Check effective file descriptor limit and warn if too low for burst workloads.
 ///
-/// See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/18
+/// See: <https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/18>
 fn probe_fd_limit(_config: &Config) -> ProbeResult {
     if let Some(soft_limit) = read_fd_soft_limit() {
         if soft_limit < MIN_RECOMMENDED_NOFILE {

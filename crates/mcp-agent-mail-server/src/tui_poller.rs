@@ -392,11 +392,9 @@ impl DbPoller {
                     if connection_state.is_none() {
                         connection_state = open_poller_connection_state(&self.database_url);
                     }
-                    if let Some(state) = connection_state.as_mut() {
-                        fetch_db_stats_with_connection(state, &prev)
-                    } else {
-                        None
-                    }
+                    connection_state
+                        .as_mut()
+                        .map(|state| fetch_db_stats_with_connection(state, &prev))
                 })) {
                 if panic_recovery_active {
                     tracing::info!(
@@ -436,11 +434,13 @@ impl DbPoller {
 
             // Block until the next interval or an explicit stop wakeup.
             let (lock, cvar) = &*self.wake;
-            let guard = match lock.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let _ = cvar.wait_timeout(guard, self.interval);
+            let _ = cvar.wait_timeout(
+                match lock.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                },
+                self.interval,
+            );
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -565,7 +565,7 @@ fn open_poller_connection_state(database_url: &str) -> Option<PollerConnectionSt
 fn fetch_db_stats_with_connection(
     state: &mut PollerConnectionState,
     previous: &DbStatSnapshot,
-) -> Option<DbStatSnapshot> {
+) -> DbStatSnapshot {
     let now = now_micros();
     let data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
     let must_refresh_for_expiry = reservation_state_requires_time_refresh(previous, now);
@@ -574,17 +574,16 @@ fn fetch_db_stats_with_connection(
             .last_data_version
             .is_some_and(|previous_version| previous_version == version)
         && !must_refresh_for_expiry
+        && previous.timestamp_micros > 0
     {
-        if previous.timestamp_micros > 0 {
-            let mut snapshot = previous.clone();
-            snapshot.timestamp_micros = now;
-            return Some(snapshot);
-        }
+        let mut snapshot = previous.clone();
+        snapshot.timestamp_micros = now;
+        return snapshot;
     }
     let snapshot =
         DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot();
     state.last_data_version = data_version;
-    Some(snapshot)
+    snapshot
 }
 
 fn reservation_state_requires_time_refresh(previous: &DbStatSnapshot, now_micros: i64) -> bool {

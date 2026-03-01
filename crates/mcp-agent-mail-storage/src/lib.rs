@@ -2982,7 +2982,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
     }
 
     fn maybe_cleanup_lock(path: &Path, result: &mut HealResult) {
-        if !path.extension().is_some_and(|e| e == "lock") {
+        if path.extension().is_none_or(|e| e != "lock") {
             return;
         }
 
