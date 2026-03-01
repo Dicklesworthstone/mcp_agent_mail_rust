@@ -343,7 +343,10 @@ mod tests {
     #[test]
     fn normalize_collapses_dot_dot() {
         assert_eq!(normalize_pattern("src/../docs/readme.md"), "docs/readme.md");
-        assert_eq!(normalize_pattern("app/models/../../api/users.py"), "api/users.py");
+        assert_eq!(
+            normalize_pattern("app/models/../../api/users.py"),
+            "api/users.py"
+        );
         assert_eq!(normalize_pattern("../evil"), "evil");
         assert_eq!(normalize_pattern("../../evil"), "evil");
     }

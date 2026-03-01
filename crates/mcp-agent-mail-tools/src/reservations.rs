@@ -116,7 +116,9 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
         ));
     }
     // 3. Absolute paths (check original pattern for this one, as normalize_pattern strips leading slash)
-    if (pattern.trim().starts_with('/') && !pattern.trim().starts_with("//")) || std::path::Path::new(pattern.trim()).is_absolute() {
+    if (pattern.trim().starts_with('/') && !pattern.trim().starts_with("//"))
+        || std::path::Path::new(pattern.trim()).is_absolute()
+    {
         return Some(format!(
             "Pattern '{pattern}' looks like an absolute path. \
              Reservations should use project-relative paths like 'src/module.py'."

@@ -341,29 +341,42 @@ fn read_env_file_token(path: &Path) -> Option<String> {
 
 /// Save the bearer token to a .env file (create or update).
 pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupError> {
-    let content = if env_path.exists() {
-        let existing = std::fs::read_to_string(env_path)?;
-        let mut found = false;
-        let updated: Vec<String> = existing
-            .lines()
-            .map(|line| {
-                if line.trim_start().starts_with("HTTP_BEARER_TOKEN=") {
-                    found = true;
-                    format!("HTTP_BEARER_TOKEN={token}")
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect();
-        if found {
-            updated.join("\n") + "\n"
-        } else {
-            let sep = if existing.ends_with('\n') { "" } else { "\n" };
-            format!("{existing}{sep}HTTP_BEARER_TOKEN={token}\n")
-        }
+    let existing_content = if env_path.exists() {
+        Some(std::fs::read_to_string(env_path)?)
     } else {
-        format!("HTTP_BEARER_TOKEN={token}\n")
+        None
     };
+
+    let content = existing_content.as_deref().map_or_else(
+        || format!("HTTP_BEARER_TOKEN={token}\n"),
+        |existing| {
+            let mut found = false;
+            let updated: Vec<String> = existing
+                .lines()
+                .map(|line| {
+                    if line.trim_start().starts_with("HTTP_BEARER_TOKEN=") {
+                        found = true;
+                        format!("HTTP_BEARER_TOKEN={token}")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect();
+            if found {
+                updated.join("\n") + "\n"
+            } else {
+                let sep = if existing.ends_with('\n') { "" } else { "\n" };
+                format!("{existing}{sep}HTTP_BEARER_TOKEN={token}\n")
+            }
+        },
+    );
+
+    if existing_content
+        .as_deref()
+        .is_some_and(|existing| existing == content)
+    {
+        return Ok(());
+    }
 
     if let Some(parent) = env_path.parent() {
         std::fs::create_dir_all(parent)?;

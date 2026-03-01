@@ -2092,13 +2092,14 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
     TRACING_INIT.call_once(|| {
-        let filter = if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
+        let filter = if suppress_runtime_logs_for_tui {
+            // Never emit tracing lines while the interactive TUI owns stdout/stderr.
+            // This prevents log spam from corrupting alternate-screen rendering.
+            tracing_subscriber::EnvFilter::new("off")
+        } else if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new(default_release_log_filter())
             })
-        } else if suppress_runtime_logs_for_tui {
-            // Prevent tracing output from corrupting the interactive TUI.
-            tracing_subscriber::EnvFilter::new("off")
         } else {
             tracing_subscriber::EnvFilter::new(default_release_log_filter())
         };
@@ -2116,7 +2117,13 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
 
 fn default_release_log_filter() -> &'static str {
     concat!(
-        "info,",
+        "warn,",
+        "mcp_agent_mail_cli=info,",
+        "mcp_agent_mail_server=info,",
+        "mcp_agent_mail_core=info,",
+        "mcp_agent_mail_db=info,",
+        "mcp_agent_mail_storage=info,",
+        "mcp_agent_mail_tools=info,",
         "fsqlite_core::connection=warn,",
         "fsqlite_mvcc::observability=warn,",
         "fsqlite_mvcc::gc=warn,",
@@ -2693,12 +2700,44 @@ struct PreflightBannerStats {
 fn query_preflight_banner_stats_batched(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> Option<PreflightBannerStats> {
+    query_preflight_banner_stats_from_sqlite_sequence(conn)
+        .or_else(|| query_preflight_banner_stats_from_max_ids(conn))
+}
+
+fn query_preflight_banner_stats_from_sqlite_sequence(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> Option<PreflightBannerStats> {
     let sql = "SELECT \
-               (SELECT COUNT(*) FROM projects) AS projects_count, \
-               (SELECT COUNT(*) FROM agents) AS agents_count, \
-               (SELECT COUNT(*) FROM messages) AS messages_count, \
-               (SELECT COUNT(*) FROM file_reservations) AS reservations_count, \
-               (SELECT COUNT(*) FROM agent_links) AS links_count";
+               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'projects'), 0) AS projects_count, \
+               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'agents'), 0) AS agents_count, \
+               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'messages'), 0) AS messages_count, \
+               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'file_reservations'), 0) AS reservations_count, \
+               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'agent_links'), 0) AS links_count";
+    let row = conn.query_sync(sql, &[]).ok()?.into_iter().next()?;
+    let read_count = |key: &str| {
+        row.get_named::<i64>(key)
+            .ok()
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0)
+    };
+    Some(PreflightBannerStats {
+        projects: read_count("projects_count"),
+        agents: read_count("agents_count"),
+        messages: read_count("messages_count"),
+        file_reservations: read_count("reservations_count"),
+        contact_links: read_count("links_count"),
+    })
+}
+
+fn query_preflight_banner_stats_from_max_ids(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> Option<PreflightBannerStats> {
+    let sql = "SELECT \
+               COALESCE((SELECT MAX(id) FROM projects), 0) AS projects_count, \
+               COALESCE((SELECT MAX(id) FROM agents), 0) AS agents_count, \
+               COALESCE((SELECT MAX(id) FROM messages), 0) AS messages_count, \
+               COALESCE((SELECT MAX(id) FROM file_reservations), 0) AS reservations_count, \
+               COALESCE((SELECT MAX(id) FROM agent_links), 0) AS links_count";
     let row = conn.query_sync(sql, &[]).ok()?.into_iter().next()?;
     let read_count = |key: &str| {
         row.get_named::<i64>(key)
@@ -2827,9 +2866,300 @@ fn handle_serve_http(
 }
 
 fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
-    handle_setup(build_setup_run_command_for_http_server(config))
+    use mcp_agent_mail_core::setup;
+
+    let project_dir = std::env::current_dir().unwrap_or_default();
+    let env_file = project_dir.join(".env");
+    let resolved_token = setup::resolve_token(None, &env_file);
+    let agent_name = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
+    let skip_hooks = agent_name.is_empty();
+
+    let mut target_agents = load_self_heal_target_agents(config, &project_dir, &resolved_token)
+        .unwrap_or_else(|| detect_installed_setup_agents());
+
+    if target_agents.is_empty() {
+        return Ok(());
+    }
+
+    // Keep deterministic target ordering for cache/fingerprint stability.
+    target_agents.sort_by_key(|platform| platform.slug());
+    target_agents.dedup();
+
+    let project_slug = if skip_hooks {
+        String::new()
+    } else {
+        resolve_project_identity(&project_dir.display().to_string()).slug
+    };
+
+    let params = setup::SetupParams {
+        host: config.http_host.clone(),
+        port: config.http_port,
+        path: config.http_path.clone(),
+        token: resolved_token.clone(),
+        project_dir: project_dir.clone(),
+        agents: Some(target_agents.clone()),
+        dry_run: false,
+        skip_user_config: false,
+        skip_hooks,
+        project_slug,
+        agent_name,
+    };
+
+    let expected_static_cache = SetupSelfHealCache {
+        schema_version: SETUP_SELF_HEAL_CACHE_VERSION,
+        project_dir: project_dir.display().to_string(),
+        server_url: params.server_url(),
+        token_fingerprint: token_fingerprint(&resolved_token),
+        target_agents: target_agents
+            .iter()
+            .map(|platform| platform.slug().to_string())
+            .collect(),
+        skip_user_config: params.skip_user_config,
+        skip_hooks: params.skip_hooks,
+        file_fingerprints: Vec::new(),
+    };
+
+    let existing_cache = read_setup_self_heal_cache(config, &project_dir);
+    let mut computed_fingerprints: Option<Vec<SetupSelfHealFileFingerprint>> = None;
+    let mut build_expected_full_cache = || {
+        let fingerprints = computed_fingerprints
+            .get_or_insert_with(|| {
+                collect_setup_self_heal_file_fingerprints(&params, &target_agents)
+            })
+            .clone();
+        let mut cache = expected_static_cache.clone();
+        cache.file_fingerprints = fingerprints;
+        cache
+    };
+
+    let static_match = existing_cache
+        .as_ref()
+        .is_some_and(|cache| cache.matches_static(&expected_static_cache));
+    if static_match {
+        let expected_cache = build_expected_full_cache();
+        if existing_cache
+            .as_ref()
+            .is_some_and(|cache| cache.matches_full(&expected_cache))
+        {
+            return Ok(());
+        }
+    }
+
+    let statuses = setup::check_status(&params);
+    let status_ok = statuses.iter().all(|status| {
+        !status.config_files.is_empty()
+            && status
+                .config_files
+                .iter()
+                .all(|file| file.exists && file.has_server_entry && file.url_matches)
+    });
+
+    if status_ok && static_match {
+        let expected_cache = build_expected_full_cache();
+        write_setup_self_heal_cache(config, &project_dir, &expected_cache);
+        return Ok(());
+    }
+
+    setup::save_token_to_env_file(&env_file, &resolved_token)
+        .map_err(|e| CliError::Other(format!("setup self-heal token save failed: {e}")))?;
+
+    let results = setup::run_setup(&params);
+    let failed: Vec<String> = results
+        .iter()
+        .flat_map(|result| result.actions.iter())
+        .filter_map(|action| match &action.outcome {
+            setup::ActionOutcome::Failed(reason) => {
+                Some(format!("{} ({reason})", action.file_path))
+            }
+            _ => None,
+        })
+        .collect();
+    if !failed.is_empty() {
+        return Err(CliError::Other(format!(
+            "setup self-heal failed for {} file(s): {}",
+            failed.len(),
+            failed.join(", ")
+        )));
+    }
+
+    let mut refreshed_cache = expected_static_cache;
+    refreshed_cache.file_fingerprints =
+        collect_setup_self_heal_file_fingerprints(&params, &target_agents);
+    write_setup_self_heal_cache(config, &project_dir, &refreshed_cache);
+    Ok(())
 }
 
+const SETUP_SELF_HEAL_CACHE_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SetupSelfHealFileFingerprint {
+    path: String,
+    exists: bool,
+    len: u64,
+    modified_micros: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SetupSelfHealCache {
+    schema_version: u32,
+    project_dir: String,
+    server_url: String,
+    token_fingerprint: String,
+    target_agents: Vec<String>,
+    skip_user_config: bool,
+    skip_hooks: bool,
+    #[serde(default)]
+    file_fingerprints: Vec<SetupSelfHealFileFingerprint>,
+}
+
+impl SetupSelfHealCache {
+    fn matches_static(&self, expected: &Self) -> bool {
+        self.schema_version == expected.schema_version
+            && self.project_dir == expected.project_dir
+            && self.server_url == expected.server_url
+            && self.token_fingerprint == expected.token_fingerprint
+            && self.target_agents == expected.target_agents
+            && self.skip_user_config == expected.skip_user_config
+            && self.skip_hooks == expected.skip_hooks
+    }
+
+    fn matches_full(&self, expected: &Self) -> bool {
+        self.matches_static(expected) && self.file_fingerprints == expected.file_fingerprints
+    }
+}
+
+fn collect_setup_self_heal_file_fingerprints(
+    params: &mcp_agent_mail_core::setup::SetupParams,
+    target_agents: &[mcp_agent_mail_core::setup::AgentPlatform],
+) -> Vec<SetupSelfHealFileFingerprint> {
+    use mcp_agent_mail_core::setup::ConfigContent;
+
+    let mut paths = std::collections::BTreeSet::new();
+    for platform in target_agents {
+        for action in platform.config_actions(params) {
+            if matches!(action.content, ConfigContent::HooksMerge { .. }) {
+                continue;
+            }
+            paths.insert(action.file_path);
+        }
+    }
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let path_str = path.display().to_string();
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    let modified_micros = meta
+                        .modified()
+                        .ok()
+                        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|value| value.as_micros())
+                        .and_then(|value| i64::try_from(value).ok())
+                        .unwrap_or(0);
+                    SetupSelfHealFileFingerprint {
+                        path: path_str,
+                        exists: true,
+                        len: meta.len(),
+                        modified_micros,
+                    }
+                }
+                Err(_) => SetupSelfHealFileFingerprint {
+                    path: path_str,
+                    exists: false,
+                    len: 0,
+                    modified_micros: 0,
+                },
+            }
+        })
+        .collect()
+}
+
+fn detect_installed_setup_agents() -> Vec<mcp_agent_mail_core::setup::AgentPlatform> {
+    let detect_opts = AgentDetectOptions {
+        only_connectors: None,
+        include_undetected: false,
+        root_overrides: Vec::new(),
+    };
+    match mcp_agent_mail_core::detect_installed_agents(&detect_opts) {
+        Ok(report) => {
+            let mut platforms = Vec::new();
+            for entry in &report.installed_agents {
+                if !entry.detected {
+                    continue;
+                }
+                if let Some(platform) =
+                    mcp_agent_mail_core::setup::AgentPlatform::from_slug(&entry.slug)
+                    && !platforms.contains(&platform)
+                {
+                    platforms.push(platform);
+                }
+            }
+            platforms
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn token_fingerprint(token: &str) -> String {
+    // Deterministic non-cryptographic fingerprint to avoid storing raw secrets.
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in token.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+fn setup_self_heal_cache_path(config: &Config, project_dir: &Path) -> PathBuf {
+    let key = token_fingerprint(&project_dir.display().to_string());
+    config
+        .storage_root
+        .join(".setup-self-heal")
+        .join(format!("{key}.json"))
+}
+
+fn read_setup_self_heal_cache(config: &Config, project_dir: &Path) -> Option<SetupSelfHealCache> {
+    let path = setup_self_heal_cache_path(config, project_dir);
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<SetupSelfHealCache>(&content).ok()
+}
+
+fn load_self_heal_target_agents(
+    config: &Config,
+    project_dir: &Path,
+    token: &str,
+) -> Option<Vec<mcp_agent_mail_core::setup::AgentPlatform>> {
+    let cache = read_setup_self_heal_cache(config, project_dir)?;
+    if cache.schema_version != SETUP_SELF_HEAL_CACHE_VERSION {
+        return None;
+    }
+    if cache.project_dir != project_dir.display().to_string() {
+        return None;
+    }
+    if cache.token_fingerprint != token_fingerprint(token) {
+        return None;
+    }
+    cache
+        .target_agents
+        .iter()
+        .map(|slug| mcp_agent_mail_core::setup::AgentPlatform::from_slug(slug))
+        .collect()
+}
+
+fn write_setup_self_heal_cache(config: &Config, project_dir: &Path, cache: &SetupSelfHealCache) {
+    let path = setup_self_heal_cache_path(config, project_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string(cache) {
+        let _ = std::fs::write(path, content);
+    }
+}
+
+#[allow(dead_code)]
 fn build_setup_run_command_for_http_server(config: &Config) -> SetupCommand {
     let project_dir = std::env::current_dir().unwrap_or_default();
     SetupCommand::Run {
@@ -3793,16 +4123,18 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                     Err(_) => Vec::new(),
                 };
 
-            // Resolve project identity for hooks
-            let pdir_str = pdir.display().to_string();
-            let identity = resolve_project_identity(&pdir_str);
-            let project_slug = identity.slug.clone();
-
             // Use detected agent name (required for hooks)
             let agent_name_val = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
 
             // Auto-skip hooks if agent_name is empty (hooks generate malformed commands without it)
             let no_hooks = no_hooks || agent_name_val.is_empty();
+            let project_slug = if no_hooks {
+                String::new()
+            } else {
+                // Resolve project identity only when hooks are enabled.
+                let pdir_str = pdir.display().to_string();
+                resolve_project_identity(&pdir_str).slug
+            };
 
             // Filter agents: if explicit --agent provided, use that; otherwise use detected
             let target_agents = match agents {
@@ -20764,6 +21096,34 @@ mod tests {
         // Intentionally omit the other required tables to trigger a graceful
         // batched-query miss so callers can fallback to per-table probes.
         assert!(query_preflight_banner_stats_batched(&conn).is_none());
+    }
+
+    #[test]
+    fn query_preflight_banner_stats_batched_uses_max_id_fast_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("preflight_banner_sparse.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY)")
+            .expect("create projects");
+        conn.execute_raw("CREATE TABLE agents(id INTEGER PRIMARY KEY)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create messages");
+        conn.execute_raw("CREATE TABLE file_reservations(id INTEGER PRIMARY KEY)")
+            .expect("create file_reservations");
+        conn.execute_raw("CREATE TABLE agent_links(id INTEGER PRIMARY KEY)")
+            .expect("create agent_links");
+
+        conn.execute_raw("INSERT INTO messages(id) VALUES (1), (100)")
+            .expect("seed sparse messages");
+
+        let stats =
+            query_preflight_banner_stats_batched(&conn).expect("batched preflight stats query");
+        assert_eq!(stats.messages, 100);
+        assert_eq!(stats.projects, 0);
+        assert_eq!(stats.agents, 0);
     }
 
     #[test]
