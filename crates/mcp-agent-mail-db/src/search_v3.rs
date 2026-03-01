@@ -617,7 +617,7 @@ fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, Str
             &TopDocs::with_limit(1).order_by_fast_field::<u64>("id", Order::Desc),
         )
         .map_err(|e| format!("backfill index max-id query failed: {e}"))?;
-    let max_id = top_docs.first().map(|(id, _)| *id).unwrap_or(0);
+    let max_id = top_docs.first().map_or(0, |(id, _)| *id);
 
     Ok(MessageStats {
         count: u64::try_from(count).unwrap_or(u64::MAX),
@@ -679,7 +679,7 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
         .index()
         .writer(15_000_000)
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
-    upsert_indexable_message(&mut writer, handles, msg)?;
+    upsert_indexable_message(&writer, handles, msg)?;
 
     writer
         .commit()
@@ -715,7 +715,7 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
 
     for msg in messages {
-        upsert_indexable_message(&mut writer, handles, msg)?;
+        upsert_indexable_message(&writer, handles, msg)?;
     }
 
     writer
@@ -767,21 +767,20 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     if let (Some(fingerprint), Some(state)) = (db_fingerprint, read_backfill_state(&bridge))
         && state.db_path == *db_path
         && state.db_fingerprint == fingerprint
+        && state.index_meta_fingerprint == initial_index_fingerprint
     {
-        if state.index_meta_fingerprint == initial_index_fingerprint {
-            tracing::info!(
-                db_count = state.db_stats.count,
-                db_max_id = state.db_stats.max_id,
-                index_count = state.index_stats.count,
-                index_max_id = state.index_stats.max_id,
-                "backfill: sqlite/index meta fingerprints unchanged, skipping"
-            );
-            refresh_index_health_metrics(&bridge);
-            return Ok((
-                0,
-                usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
-            ));
-        }
+        tracing::info!(
+            db_count = state.db_stats.count,
+            db_max_id = state.db_stats.max_id,
+            index_count = state.index_stats.count,
+            index_max_id = state.index_stats.max_id,
+            "backfill: sqlite/index meta fingerprints unchanged, skipping"
+        );
+        refresh_index_health_metrics(&bridge);
+        return Ok((
+            0,
+            usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
+        ));
     }
 
     let conn = DbConn::open_file(db_path)
@@ -894,7 +893,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                     .unwrap_or_else(|_| "normal".to_string()),
                 created_ts: row.get_as::<i64>(7).unwrap_or(0),
             };
-            add_indexable_message(&mut writer, handles, &msg)?;
+            add_indexable_message(&writer, handles, &msg)?;
             total_indexed += 1;
             if msg.id > last_id {
                 last_id = msg.id;
@@ -921,10 +920,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         crate::search_cache::InvalidationTrigger::IndexUpdate,
     );
 
-    let final_index_stats = fetch_index_message_stats(&bridge).unwrap_or(MessageStats {
-        count: db_stats.count,
-        max_id: db_stats.max_id,
-    });
+    let final_index_stats = fetch_index_message_stats(&bridge).unwrap_or(db_stats);
     if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
         write_backfill_state(
             &bridge,

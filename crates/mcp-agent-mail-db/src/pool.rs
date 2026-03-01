@@ -21,6 +21,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
+#[derive(Clone)]
+struct SampledMessage {
+    id: i64,
+    project_id: i64,
+    sender_id: i64,
+    subject: String,
+    created_ts_iso: String,
+}
+
 /// Default pool configuration values — sized for 1000+ concurrent agents.
 ///
 /// ## Sizing rationale
@@ -611,6 +620,7 @@ impl DbPool {
     /// Returns lightweight refs that the storage layer can use to verify
     /// archive file presence. Opens a dedicated connection (outside the pool)
     /// so this works even if the pool isn't fully started yet.
+    #[allow(clippy::too_many_lines)]
     pub fn sample_recent_message_refs(&self, limit: i64) -> DbResult<Vec<ConsistencyMessageRef>> {
         if self.sqlite_path == ":memory:" {
             return Ok(Vec::new());
@@ -638,15 +648,6 @@ impl DbPool {
 
         if message_rows.is_empty() {
             return Ok(Vec::new());
-        }
-
-        #[derive(Clone)]
-        struct SampledMessage {
-            id: i64,
-            project_id: i64,
-            sender_id: i64,
-            subject: String,
-            created_ts_iso: String,
         }
 
         let mut sampled: Vec<SampledMessage> = Vec::with_capacity(message_rows.len());

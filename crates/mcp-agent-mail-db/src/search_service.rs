@@ -435,12 +435,12 @@ async fn canonicalize_message_results(
         }
 
         result.project_id = Some(detail.project_id);
-        result.title = detail.subject.clone();
-        result.body = detail.body_md.clone();
+        result.title.clone_from(&detail.subject);
+        result.body.clone_from(&detail.body_md);
         result.importance = Some(detail.importance.clone());
         result.ack_required = Some(detail.ack_required != 0);
         result.created_ts = Some(detail.created_ts);
-        result.thread_id = detail.thread_id.clone();
+        result.thread_id.clone_from(&detail.thread_id);
         result.from_agent = Some(detail.from.clone());
         canonical.push(result);
     }
@@ -2646,7 +2646,9 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
             "project_set".hash(&mut hasher);
             let mut sorted = allowed_project_ids.clone();
             sorted.sort_unstable();
-            sorted.hash(&mut hasher);
+            for project_id in sorted {
+                project_id.hash(&mut hasher);
+            }
         }
     }
 
