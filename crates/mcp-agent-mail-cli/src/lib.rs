@@ -2128,6 +2128,9 @@ fn default_release_log_filter() -> &'static str {
         "fsqlite_mvcc::observability=warn,",
         "fsqlite_mvcc::gc=warn,",
         "fsqlite_mvcc::rebase=warn,",
+        "mvcc=warn,",
+        "checkpoint=warn,",
+        "fsqlite.storage_wiring=warn,",
         "fsqlite_wal::checkpoint_executor=warn,",
         "fsqlite_vdbe::jit=warn,",
         "fsqlite_vdbe::engine=warn",
@@ -2732,12 +2735,15 @@ fn query_preflight_banner_stats_from_sqlite_sequence(
 fn query_preflight_banner_stats_from_max_ids(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> Option<PreflightBannerStats> {
+    // Avoid wrapping MAX() with COALESCE() to stay on FrankensQLite's
+    // fast aggregate path and avoid mixed aggregate/non-aggregate planner
+    // edge-cases that can force an expensive COUNT(*) fallback.
     let sql = "SELECT \
-               COALESCE((SELECT MAX(id) FROM projects), 0) AS projects_count, \
-               COALESCE((SELECT MAX(id) FROM agents), 0) AS agents_count, \
-               COALESCE((SELECT MAX(id) FROM messages), 0) AS messages_count, \
-               COALESCE((SELECT MAX(id) FROM file_reservations), 0) AS reservations_count, \
-               COALESCE((SELECT MAX(id) FROM agent_links), 0) AS links_count";
+               (SELECT MAX(id) FROM projects) AS projects_count, \
+               (SELECT MAX(id) FROM agents) AS agents_count, \
+               (SELECT MAX(id) FROM messages) AS messages_count, \
+               (SELECT MAX(id) FROM file_reservations) AS reservations_count, \
+               (SELECT MAX(id) FROM agent_links) AS links_count";
     let row = conn.query_sync(sql, &[]).ok()?.into_iter().next()?;
     let read_count = |key: &str| {
         row.get_named::<i64>(key)
@@ -2875,7 +2881,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     let skip_hooks = agent_name.is_empty();
 
     let mut target_agents = load_self_heal_target_agents(config, &project_dir, &resolved_token)
-        .unwrap_or_else(|| detect_installed_setup_agents());
+        .unwrap_or_else(detect_installed_setup_agents);
 
     if target_agents.is_empty() {
         return Ok(());
@@ -11637,6 +11643,14 @@ mod tests {
             cursor = &cursor[next..];
         }
         None
+    }
+
+    #[test]
+    fn default_release_log_filter_includes_fsqlite_noise_suppressors() {
+        let filter = default_release_log_filter();
+        assert!(filter.contains("mvcc=warn"));
+        assert!(filter.contains("checkpoint=warn"));
+        assert!(filter.contains("fsqlite.storage_wiring=warn"));
     }
 
     #[test]

@@ -41,7 +41,7 @@ fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {
     parse_am_interface_mode(env::var("AM_INTERFACE_MODE").ok().as_deref())
 }
 
-fn default_mcp_log_filter() -> &'static str {
+const fn default_mcp_log_filter() -> &'static str {
     concat!(
         "warn,",
         "mcp_agent_mail=info,",
@@ -54,6 +54,9 @@ fn default_mcp_log_filter() -> &'static str {
         "fsqlite_mvcc::observability=warn,",
         "fsqlite_mvcc::gc=warn,",
         "fsqlite_mvcc::rebase=warn,",
+        "mvcc=warn,",
+        "checkpoint=warn,",
+        "fsqlite.storage_wiring=warn,",
         "fsqlite_wal::checkpoint_executor=warn,",
         "fsqlite_vdbe::jit=warn,",
         "fsqlite_vdbe::engine=warn",
@@ -557,6 +560,14 @@ fn render_cli_mode_denial(command: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_mcp_log_filter_includes_fsqlite_noise_suppressors() {
+        let filter = default_mcp_log_filter();
+        assert!(filter.contains("mvcc=warn"));
+        assert!(filter.contains("checkpoint=warn"));
+        assert!(filter.contains("fsqlite.storage_wiring=warn"));
+    }
 
     #[test]
     fn normalize_http_path_handles_presets_and_custom_paths() {
