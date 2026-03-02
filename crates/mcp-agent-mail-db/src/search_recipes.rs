@@ -658,11 +658,7 @@ mod tests {
     use super::*;
 
     fn open_test_db() -> DbConn {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let id = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let uri = format!("file:test_recipes_{id}?mode=memory&cache=shared");
-        let conn = DbConn::open_file(&uri).expect("open in-memory db");
+        let conn = DbConn::open_memory().expect("open in-memory db");
         // Run v8 recipe migrations
         for mig in recipe_migrations() {
             conn.execute_sync(&mig.up, &[])
