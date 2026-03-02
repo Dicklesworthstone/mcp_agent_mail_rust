@@ -1,0 +1,23 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        coreutils \
+        curl \
+        git \
+        python3 \
+        sqlite3 \
+        tar \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . /workspace
+
+# This image is a harness for tests/e2e/test_migration.sh.
+# Provide AM_E2E_MIGRATION_AM_BIN / AM_E2E_MIGRATION_SERVER_BIN if needed.
+ENTRYPOINT ["bash", "tests/e2e/test_migration.sh"]

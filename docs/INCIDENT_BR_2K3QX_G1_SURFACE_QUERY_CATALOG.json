@@ -1,0 +1,462 @@
+{
+  "schema_version": "1.0.0",
+  "catalog_id": "br-2k3qx.7.1.surface-query-catalog",
+  "generated_at_utc": "2026-03-02T07:12:00Z",
+  "generated_by": "GrayTern",
+  "project": "/data/projects/mcp_agent_mail_rust",
+  "scope": "TUI screens, /mail routes, system-health/operator entrypoints, robot command families",
+  "source_anchors": [
+    "crates/mcp-agent-mail-server/src/tui_screens/mod.rs:613",
+    "crates/mcp-agent-mail-server/src/tui_app.rs:1139",
+    "crates/mcp-agent-mail-server/src/tui_poller.rs:677",
+    "crates/mcp-agent-mail-server/src/lib.rs:4122",
+    "crates/mcp-agent-mail-server/src/mail_ui.rs:28",
+    "crates/mcp-agent-mail-server/src/tui_screens/system_health.rs:1365",
+    "crates/mcp-agent-mail-cli/src/robot.rs:565",
+    "crates/mcp-agent-mail-cli/src/robot.rs:2971"
+  ],
+  "tui_surfaces": [
+    {
+      "surface_id": "tui.dashboard",
+      "display_name": "Dashboard",
+      "visible_fields": ["projects", "agents", "messages", "contacts", "file_reservations", "request sparkline", "recent event stream"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/dashboard.rs",
+      "backing_query_paths": [
+        "state.db_stats_snapshot() (dashboard.rs:461)",
+        "state.recent_events(...) (dashboard.rs:2292)",
+        "DbStatSnapshot feeder: tui_poller::fetch_db_stats_with_connection (tui_poller.rs:565)"
+      ],
+      "expected_scope_keys": ["database_url", "storage_root", "transport_mode", "auth_enabled"]
+    },
+    {
+      "surface_id": "tui.messages",
+      "display_name": "Messages",
+      "visible_fields": ["subject", "body_md", "thread_id", "importance", "ack_required", "sender", "recipient summary", "project slug"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/messages.rs",
+      "backing_query_paths": [
+        "fetch_recent_messages(...) SQL (messages.rs:3146)",
+        "fetch_message_entry_by_id(...) SQL (messages.rs:1218)",
+        "project/recipient helper SQL (messages.rs:3268, messages.rs:3322, messages.rs:3394)"
+      ],
+      "expected_scope_keys": ["project_filter", "show_project", "limit", "search/filter state"]
+    },
+    {
+      "surface_id": "tui.threads",
+      "display_name": "Threads",
+      "visible_fields": ["thread_id", "subject", "participants", "message count", "detail messages", "load older state"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/threads.rs",
+      "backing_query_paths": [
+        "fetch_threads(...) SQL (threads.rs:1833)",
+        "fetch_thread_message_count(...) SQL (threads.rs:2020)",
+        "fetch_thread_messages_paginated(...) SQL (threads.rs:2034)"
+      ],
+      "expected_scope_keys": ["text filter", "page_size", "loaded_message_count", "thread_id"]
+    },
+    {
+      "surface_id": "tui.agents",
+      "display_name": "Agents",
+      "visible_fields": ["agent name", "program", "last active", "rendered vs raw row counts"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/agents.rs",
+      "backing_query_paths": [
+        "state.db_stats_snapshot().agents_list (agents.rs:238)",
+        "screen diagnostics emission (agents.rs:281)",
+        "Db source: fetch_agents_list(...) SQL (tui_poller.rs:677)"
+      ],
+      "expected_scope_keys": ["sort column", "sort direction", "filter text", "db_stats generation"]
+    },
+    {
+      "surface_id": "tui.search",
+      "display_name": "Search",
+      "visible_fields": ["query", "facets", "result rows", "score", "degraded diagnostics"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/search.rs",
+      "backing_query_paths": [
+        "message search SQL branch (search.rs:1594)",
+        "agent search SQL branch (search.rs:1615)",
+        "project search SQL branch (search.rs:1635)",
+        "query execution helpers (search.rs:2977, search.rs:3068, search.rs:3103)"
+      ],
+      "expected_scope_keys": ["scope", "doc kind", "importance", "ack filter", "sort", "mode"]
+    },
+    {
+      "surface_id": "tui.reservations",
+      "display_name": "Reservations",
+      "visible_fields": ["path_pattern", "exclusive", "holder", "ttl", "conflict/expiry indicators"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/reservations.rs",
+      "backing_query_paths": [
+        "state.db_stats_snapshot().reservation_snapshots (reservations.rs:1541)",
+        "fallback DB refresh (reservations.rs:590)",
+        "Db source: fetch_reservation_snapshot_bundle(_fast) (tui_poller.rs:1194, tui_poller.rs:1293)"
+      ],
+      "expected_scope_keys": ["now_micros", "active/released semantics", "filter preset", "conflict mode"]
+    },
+    {
+      "surface_id": "tui.tool_metrics",
+      "display_name": "Tool Metrics",
+      "visible_fields": ["tool name", "calls", "errors", "avg/p95/p99 latency", "evidence lanes"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/tool_metrics.rs",
+      "backing_query_paths": [
+        "load_latest_persisted_metrics(...) (tool_metrics.rs:482)",
+        "event/request/db dirty gating (tool_metrics.rs:1408, tool_metrics.rs:1421)"
+      ],
+      "expected_scope_keys": ["database_url", "refresh cadence", "tool filter profile"]
+    },
+    {
+      "surface_id": "tui.system_health",
+      "display_name": "System Health",
+      "visible_fields": ["endpoint", "web_ui_url", "auth status", "probe results", "path diagnostics", "recent screen diagnostics"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/system_health.rs",
+      "backing_query_paths": [
+        "diagnostics_worker_loop -> run_diagnostics (system_health.rs:1297, system_health.rs:1365)",
+        "emit_screen_diagnostic(...) (system_health.rs:1328)",
+        "recent_system_health_diagnostics(...) (system_health.rs:122)"
+      ],
+      "expected_scope_keys": ["endpoint path", "auth/token presence", "localhost unauth policy", "transport base"]
+    },
+    {
+      "surface_id": "tui.timeline",
+      "display_name": "Timeline",
+      "visible_fields": ["event/commit entries", "kind", "source", "timestamp", "filter preset state"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/timeline.rs",
+      "backing_query_paths": [
+        "state.events_since(...) through EventRing (timeline screen)",
+        "refresh_commit_entries(...) storage-backed commit refresh (timeline.rs:929)",
+        "db snapshot consumed for summary slices (timeline.rs:990)"
+      ],
+      "expected_scope_keys": ["since", "kind", "source", "timeline mode", "preset"]
+    },
+    {
+      "surface_id": "tui.projects",
+      "display_name": "Projects",
+      "visible_fields": ["slug", "human_key", "agent_count", "message_count", "reservation_count", "raw/rendered diagnostics"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/projects.rs",
+      "backing_query_paths": [
+        "state.db_stats_snapshot().projects_list (projects.rs:78)",
+        "screen diagnostics emission (projects.rs:110)",
+        "Db source: fetch_projects_list_with_reservation_counts(...) (tui_poller.rs:706)"
+      ],
+      "expected_scope_keys": ["sort", "filter", "db_stats generation"]
+    },
+    {
+      "surface_id": "tui.contacts",
+      "display_name": "Contacts",
+      "visible_fields": ["from agent", "to agent", "status", "reason", "graph/table mode"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/contacts.rs",
+      "backing_query_paths": [
+        "state.db_stats_snapshot().contacts_list (contacts.rs:179)",
+        "graph overlay built from recent events (contacts.rs:214)",
+        "Db source: fetch_contacts_list(...) SQL (tui_poller.rs:802)"
+      ],
+      "expected_scope_keys": ["view mode", "event window", "sort/filter state"]
+    },
+    {
+      "surface_id": "tui.explorer",
+      "display_name": "Explorer",
+      "visible_fields": ["inbound/outbound message rows", "importance", "ack status", "pressure board"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/explorer.rs",
+      "backing_query_paths": [
+        "fetch_inbound(...) SQL (explorer.rs:687, explorer.rs:728)",
+        "fetch_outbound(...) SQL (explorer.rs:753, explorer.rs:778)",
+        "pressure board SQL (explorer.rs:580, explorer.rs:617, explorer.rs:655)"
+      ],
+      "expected_scope_keys": ["direction", "ack filter", "agent/project filters", "text match ids"]
+    },
+    {
+      "surface_id": "tui.analytics",
+      "display_name": "Analytics",
+      "visible_fields": ["anomaly cards", "confidence", "severity", "recommended actions"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/analytics.rs",
+      "backing_query_paths": [
+        "refresh_feed(...) from state + persisted metrics (analytics.rs:202)",
+        "load_latest_persisted_metrics(...) (analytics.rs:707)"
+      ],
+      "expected_scope_keys": ["anomaly thresholds", "event window", "tool metrics snapshot"]
+    },
+    {
+      "surface_id": "tui.attachments",
+      "display_name": "Attachments",
+      "visible_fields": ["attachment type", "size", "sender", "subject", "message_id", "project"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/attachments.rs",
+      "backing_query_paths": [
+        "load_attachments(...) SQL (attachments.rs:229, attachments.rs:235)",
+        "query_sync(...) execution (attachments.rs:247)"
+      ],
+      "expected_scope_keys": ["project context", "reload interval", "search/filter text"]
+    },
+    {
+      "surface_id": "tui.archive_browser",
+      "display_name": "Archive Browser",
+      "visible_fields": ["archive tree entries", "selected path", "file preview", "refresh state"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/archive_browser.rs",
+      "backing_query_paths": [
+        "refresh_entries(...) storage/archive traversal (archive_browser.rs:266)",
+        "load_preview(...) file read (archive_browser.rs:402)",
+        "db snapshot used for context (archive_browser.rs:275)"
+      ],
+      "expected_scope_keys": ["storage_root", "project slug", "path filter"]
+    }
+  ],
+  "mail_http_surfaces": [
+    {
+      "surface_id": "http.health.liveness",
+      "route": "GET /healthz and GET /health/liveness",
+      "visible_fields": ["status: alive"],
+      "backing_module": "crates/mcp-agent-mail-server/src/lib.rs",
+      "backing_query_paths": ["handle_special_routes health-liveness branch (lib.rs:4283)"],
+      "expected_scope_keys": ["no auth required", "method GET"]
+    },
+    {
+      "surface_id": "http.health.readiness",
+      "route": "GET /health and GET /health/readiness",
+      "visible_fields": ["status: ready or error detail"],
+      "backing_module": "crates/mcp-agent-mail-server/src/lib.rs",
+      "backing_query_paths": ["readiness_check_quick gate (lib.rs:4289)"],
+      "expected_scope_keys": ["no auth required", "method GET"]
+    },
+    {
+      "surface_id": "http.mail.dispatch",
+      "route": "GET/POST /mail and /mail/*",
+      "visible_fields": ["HTML pages or JSON API payloads", "route-specific errors"],
+      "backing_module": "crates/mcp-agent-mail-server/src/lib.rs",
+      "backing_query_paths": [
+        "handle_mail_dispatch(...) (lib.rs:4419)",
+        "mail_ui::dispatch(...) (mail_ui.rs:28)"
+      ],
+      "expected_scope_keys": ["bearer auth enforced before non-health dispatch", "method", "path", "query"]
+    },
+    {
+      "surface_id": "http.mail.ws_input",
+      "route": "POST /mail/ws-input",
+      "visible_fields": ["accepted", "ignored", "dropped_oldest", "queue_depth"],
+      "backing_module": "crates/mcp-agent-mail-server/src/lib.rs",
+      "backing_query_paths": ["remote terminal event ingest branch (lib.rs:4312)"],
+      "expected_scope_keys": ["TUI state active", "method POST"]
+    },
+    {
+      "surface_id": "http.mail.ws_state",
+      "route": "GET /mail/ws-state",
+      "visible_fields": ["polled TUI state payload"],
+      "backing_module": "crates/mcp-agent-mail-server/src/lib.rs",
+      "backing_query_paths": ["tui_ws_state::poll_payload(...) (lib.rs:4343)"],
+      "expected_scope_keys": ["method GET", "query limit/cursor", "no websocket upgrade"]
+    },
+    {
+      "surface_id": "http.mail.api.locks",
+      "route": "GET /mail/api/locks",
+      "visible_fields": ["lock status collection"],
+      "backing_module": "crates/mcp-agent-mail-server/src/lib.rs",
+      "backing_query_paths": ["mcp_agent_mail_storage::collect_lock_status(...) (lib.rs:4367)"],
+      "expected_scope_keys": ["method GET", "auth context"]
+    },
+    {
+      "surface_id": "http.mail.unified_inbox_html",
+      "route": "GET /mail and GET /mail/unified-inbox",
+      "visible_fields": ["cross-project inbox rows", "importance filter", "limit"],
+      "backing_module": "crates/mcp-agent-mail-server/src/mail_ui.rs",
+      "backing_query_paths": ["render_unified_inbox(...) -> queries::list_projects/list_agents/fetch_inbox (mail_ui.rs:41, mail_ui.rs:564)"],
+      "expected_scope_keys": ["limit", "filter_importance"]
+    },
+    {
+      "surface_id": "http.mail.project_routes",
+      "route": "GET /mail/{project}/...",
+      "visible_fields": ["project page", "search", "inbox", "thread", "message", "attachments", "file reservations"],
+      "backing_module": "crates/mcp-agent-mail-server/src/mail_ui.rs",
+      "backing_query_paths": [
+        "dispatch_project_route(...) (mail_ui.rs:1454)",
+        "render_inbox/render_thread/render_message branches (mail_ui.rs:1497, mail_ui.rs:1514, mail_ui.rs:1507)"
+      ],
+      "expected_scope_keys": ["project_slug", "agent_name", "thread_id", "message_id", "limit/page", "method"]
+    },
+    {
+      "surface_id": "http.mail.api.unified_inbox_json",
+      "route": "GET /mail/api/unified-inbox",
+      "visible_fields": ["messages[] JSON", "optional projects[]"],
+      "backing_module": "crates/mcp-agent-mail-server/src/mail_ui.rs",
+      "backing_query_paths": ["render_api_unified_inbox(...) (mail_ui.rs:1560)"],
+      "expected_scope_keys": ["limit", "include_projects", "project/agent iteration"]
+    },
+    {
+      "surface_id": "http.mail.api.project_agents",
+      "route": "GET /mail/api/projects/{project}/agents",
+      "visible_fields": ["agents[] JSON"],
+      "backing_module": "crates/mcp-agent-mail-server/src/mail_ui.rs",
+      "backing_query_paths": ["render_api_project_agents(...) (mail_ui.rs:1629)"],
+      "expected_scope_keys": ["project_slug", "method GET"]
+    },
+    {
+      "surface_id": "http.mail.archive_routes",
+      "route": "GET /mail/archive/*",
+      "visible_fields": ["guide", "activity", "timeline", "browser", "network", "time-travel snapshots"],
+      "backing_module": "crates/mcp-agent-mail-server/src/mail_ui.rs",
+      "backing_query_paths": [
+        "render_archive_route(...) dispatcher (mail_ui.rs:1661)",
+        "archive browser file route parser (mail_ui.rs:1693)",
+        "storage-backed archive helpers (mail_ui.rs:1647, mail_ui.rs:1656)"
+      ],
+      "expected_scope_keys": ["project", "path", "timestamp", "agent", "limit"]
+    }
+  ],
+  "system_health_operator_entrypoints": [
+    {
+      "entrypoint_id": "system_health.endpoint_banner",
+      "visible_fields": ["endpoint", "web_ui_url", "auth enabled", "token presence/len", "remote tailscale URL"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/system_health.rs",
+      "backing_query_paths": [
+        "ConfigSnapshot usage in render text mode (system_health.rs:333)",
+        "remote URL derivation via build_remote_url (system_health.rs:1370)"
+      ],
+      "expected_scope_keys": ["http_host", "http_port", "http_path", "http_bearer_token", "tailscale"]
+    },
+    {
+      "entrypoint_id": "system_health.path_probe_matrix",
+      "visible_fields": ["configured path result", "mcp/api alias probe results", "status and remediation"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/system_health.rs",
+      "backing_query_paths": [
+        "run_diagnostics(...) path list + probe execution (system_health.rs:1365, system_health.rs:1411)",
+        "auth/path findings classifier (system_health.rs:1483, system_health.rs:1561)"
+      ],
+      "expected_scope_keys": ["configured_path", "auth_enabled", "localhost_unauth_allowed", "token_present"]
+    },
+    {
+      "entrypoint_id": "system_health.screen_diag_feed",
+      "visible_fields": ["recent screen diagnostics raw/rendered/dropped counts", "db path context", "transport/auth flags"],
+      "backing_module": "crates/mcp-agent-mail-server/src/tui_screens/system_health.rs",
+      "backing_query_paths": [
+        "recent_system_health_diagnostics(...) (system_health.rs:122)",
+        "emit_screen_diagnostic(...) into shared state (system_health.rs:1328)"
+      ],
+      "expected_scope_keys": ["screen name", "scope", "query_params", "db_url", "storage_root", "transport_mode"]
+    }
+  ],
+  "robot_command_families": [
+    {
+      "family": "situational_awareness",
+      "commands": [
+        {
+          "name": "status",
+          "builder": "build_status",
+          "dispatch_anchor": "robot.rs:2977",
+          "query_path_anchor": "status helpers + DB lookups (robot.rs:812+)"
+        },
+        {
+          "name": "inbox",
+          "builder": "build_inbox",
+          "dispatch_anchor": "robot.rs:3025",
+          "query_path_anchor": "message_recipients/messages joins and priority synthesis (robot.rs:1158+)"
+        },
+        {
+          "name": "timeline",
+          "builder": "build_timeline",
+          "dispatch_anchor": "robot.rs:3450",
+          "query_path_anchor": "timeline query synthesis (robot.rs:1278+)"
+        },
+        {
+          "name": "overview",
+          "builder": "build_overview",
+          "dispatch_anchor": "robot.rs:3476",
+          "query_path_anchor": "projects rollup (robot.rs:2352+)"
+        }
+      ],
+      "expected_scope_keys": ["project", "agent", "limit", "since", "format"]
+    },
+    {
+      "family": "context_discovery",
+      "commands": [
+        {
+          "name": "thread",
+          "builder": "build_thread",
+          "dispatch_anchor": "robot.rs:3082",
+          "query_path_anchor": "thread/message retrieval SQL (robot.rs:1688+)"
+        },
+        {
+          "name": "search",
+          "builder": "build_search",
+          "dispatch_anchor": "robot.rs:3108",
+          "query_path_anchor": "search query builder + filters (robot.rs:1992+)"
+        },
+        {
+          "name": "message",
+          "builder": "build_message",
+          "dispatch_anchor": "robot.rs:3100",
+          "query_path_anchor": "message detail + adjacent/thread counts (robot.rs:1613+)"
+        },
+        {
+          "name": "navigate",
+          "builder": "build_navigate",
+          "dispatch_anchor": "robot.rs:3626",
+          "query_path_anchor": "resource URI resolution branches (robot.rs:2798+)"
+        }
+      ],
+      "expected_scope_keys": ["project", "thread_id", "message_id", "query", "kind", "importance", "since", "format"]
+    },
+    {
+      "family": "monitoring_analytics",
+      "commands": [
+        {
+          "name": "reservations",
+          "builder": "build_reservations",
+          "dispatch_anchor": "robot.rs:3129",
+          "query_path_anchor": "file_reservation scans/conflict checks (robot.rs:2436+)"
+        },
+        {
+          "name": "metrics",
+          "builder": "tool_metrics_snapshot",
+          "dispatch_anchor": "robot.rs:3155",
+          "query_path_anchor": "in-memory metrics aggregate (robot.rs:3156)"
+        },
+        {
+          "name": "health",
+          "builder": "inline health probes",
+          "dispatch_anchor": "robot.rs:3266",
+          "query_path_anchor": "DB probe SELECT 1 + db health/backpressure/disk probes (robot.rs:3274, robot.rs:3321)"
+        },
+        {
+          "name": "analytics",
+          "builder": "build_analytics",
+          "dispatch_anchor": "robot.rs:3497",
+          "query_path_anchor": "agent idle/ack/reservation anomaly synthesis (robot.rs:2547+)"
+        }
+      ],
+      "expected_scope_keys": ["project", "agent", "conflicts", "expiring", "health thresholds", "format"]
+    },
+    {
+      "family": "entity_views",
+      "commands": [
+        {
+          "name": "agents",
+          "builder": "build_agents",
+          "dispatch_anchor": "robot.rs:3524",
+          "query_path_anchor": "agents roster SQL (robot.rs:2612+)"
+        },
+        {
+          "name": "contacts",
+          "builder": "build_contacts",
+          "dispatch_anchor": "robot.rs:3540",
+          "query_path_anchor": "agent_links joins (robot.rs:2670+)"
+        },
+        {
+          "name": "projects",
+          "builder": "build_projects",
+          "dispatch_anchor": "robot.rs:3556",
+          "query_path_anchor": "projects aggregate SQL (robot.rs:2713+)"
+        },
+        {
+          "name": "attachments",
+          "builder": "inline attachments SQL",
+          "dispatch_anchor": "robot.rs:3570",
+          "query_path_anchor": "messages+agents attachments query (robot.rs:3576)"
+        }
+      ],
+      "expected_scope_keys": ["project", "active", "sort", "format"]
+    }
+  ],
+  "known_gaps": [
+    {
+      "gap_id": "g1.pending.a2",
+      "description": "Need A2 final per-screen diagnostics payload (dashboard/messages/threads) to fully bind raw/rendered mismatch probes to this catalog."
+    },
+    {
+      "gap_id": "g1.pending.route-auth-validation",
+      "description": "Need post-fix evidence for /mail route auth-order behavior to convert current route/auth findings from incident evidence to passing contract assertions."
+    }
+  ]
+}
