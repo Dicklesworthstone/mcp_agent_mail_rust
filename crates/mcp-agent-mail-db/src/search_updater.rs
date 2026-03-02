@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::search_engine::IndexLifecycle;
@@ -60,6 +61,8 @@ pub struct IncrementalUpdater {
     pending: Mutex<PendingState>,
 }
 
+static UPDATER_LOCK_POISON_LOGGED: AtomicBool = AtomicBool::new(false);
+
 struct PendingState {
     changes: VecDeque<DocChange>,
     last_flush: Instant,
@@ -86,12 +89,24 @@ impl IncrementalUpdater {
         }
     }
 
+    fn lock_pending_state(&self) -> std::sync::MutexGuard<'_, PendingState> {
+        match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                if !UPDATER_LOCK_POISON_LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::error!("incremental updater mutex poisoned; recovering state");
+                }
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Enqueue a raw document change for later application.
     ///
     /// Returns `true` if the change was accepted, `false` if dropped due to
     /// backpressure.
     pub fn enqueue(&self, change: DocChange) -> bool {
-        let mut state = self.pending.lock().expect("updater lock poisoned");
+        let mut state = self.lock_pending_state();
         if state.changes.len() >= self.config.backpressure_threshold {
             state.stats.total_dropped += 1;
             return false;
@@ -137,7 +152,7 @@ impl IncrementalUpdater {
     /// Check if a flush is needed (batch full or interval elapsed)
     #[must_use]
     pub fn should_flush(&self) -> bool {
-        let state = self.pending.lock().expect("updater lock poisoned");
+        let state = self.lock_pending_state();
         if state.changes.is_empty() {
             return false;
         }
@@ -148,7 +163,7 @@ impl IncrementalUpdater {
     /// Get current statistics
     #[must_use]
     pub fn stats(&self) -> UpdaterStats {
-        let guard = self.pending.lock().expect("updater lock poisoned");
+        let guard = self.lock_pending_state();
         let mut result = guard.stats.clone();
         result.pending_count = guard.changes.len();
         result
@@ -162,7 +177,7 @@ impl IncrementalUpdater {
     /// Returns `SearchError` if the backend fails to apply changes.
     pub fn flush(&self, backend: &dyn IndexLifecycle) -> SearchResult<usize> {
         let changes: Vec<DocChange> = {
-            let mut state = self.pending.lock().expect("updater lock poisoned");
+            let mut state = self.lock_pending_state();
             state.changes.drain(..).collect()
         };
 
@@ -170,24 +185,55 @@ impl IncrementalUpdater {
             return Ok(0);
         }
 
+        let total_changes = changes.len();
         let start = Instant::now();
-        let applied = backend.update_incremental(&changes)?;
+        let applied = match backend.update_incremental(&changes) {
+            Ok(applied) => applied,
+            Err(err) => {
+                {
+                    let mut state = self.lock_pending_state();
+                    // Preserve ordering: failed batch must be replayed ahead of any
+                    // newer changes enqueued while backend.update_incremental ran.
+                    for change in changes.into_iter().rev() {
+                        state.changes.push_front(change);
+                    }
+                }
+                return Err(err);
+            }
+        };
+        let applied_clamped = applied.min(total_changes);
+        if applied > total_changes {
+            tracing::warn!(
+                reported = applied,
+                total = total_changes,
+                "incremental updater backend reported applied changes beyond input batch; clamping"
+            );
+        }
+
+        // Preserve any unapplied tail (partial success) in original order.
+        if applied_clamped < total_changes {
+            let mut state = self.lock_pending_state();
+            for change in changes.iter().skip(applied_clamped).rev() {
+                state.changes.push_front(change.clone());
+            }
+        }
+
         let duration = start.elapsed();
 
         {
-            let mut state = self.pending.lock().expect("updater lock poisoned");
+            let mut state = self.lock_pending_state();
             state.last_flush = Instant::now();
-            state.stats.total_applied += applied as u64;
+            state.stats.total_applied += applied_clamped as u64;
             state.stats.flush_count += 1;
             state.stats.last_flush_duration = Some(duration);
         }
 
-        Ok(applied)
+        Ok(applied_clamped)
     }
 
     /// Drain pending changes without applying them (for testing or shutdown)
     pub fn drain(&self) -> Vec<DocChange> {
-        let mut state = self.pending.lock().expect("updater lock poisoned");
+        let mut state = self.lock_pending_state();
         state.changes.drain(..).collect()
     }
 }
@@ -690,6 +736,35 @@ mod tests {
         }
     }
 
+    struct PartialLifecycle {
+        applied_per_call: usize,
+    }
+
+    impl IndexLifecycle for PartialLifecycle {
+        fn rebuild(&self) -> SearchResult<IndexStats> {
+            Ok(IndexStats {
+                docs_indexed: 0,
+                docs_removed: 0,
+                elapsed_ms: 0,
+                warnings: Vec::new(),
+            })
+        }
+
+        fn update_incremental(&self, changes: &[DocChange]) -> SearchResult<usize> {
+            Ok(self.applied_per_call.min(changes.len()))
+        }
+
+        fn health(&self) -> IndexHealth {
+            IndexHealth {
+                ready: true,
+                doc_count: 0,
+                size_bytes: None,
+                last_updated_ts: None,
+                status_message: "partial".to_owned(),
+            }
+        }
+    }
+
     #[test]
     fn flush_propagates_backend_error() {
         let updater = IncrementalUpdater::new();
@@ -699,10 +774,10 @@ mod tests {
         let result = updater.flush(&backend);
         assert!(result.is_err());
 
-        // Changes were drained even though backend failed
+        // Failed batches are re-queued for a later retry.
         let stats = updater.stats();
-        assert_eq!(stats.pending_count, 0);
-        // But total_applied was NOT incremented (error path)
+        assert_eq!(stats.pending_count, 1);
+        // total_applied/flush_count are unchanged on error.
         assert_eq!(stats.total_applied, 0);
         assert_eq!(stats.flush_count, 0);
     }
@@ -1024,11 +1099,86 @@ mod tests {
         updater.on_message_upsert(&sample_message_row());
         assert!(updater.flush(&failing_backend).is_err());
 
-        // Queue was drained despite error — enqueue more and flush to good backend
+        // Failed batch stays queued; enqueue more and flush to healthy backend.
         updater.on_agent_upsert(&sample_agent_row());
         let applied = updater.flush(&good_backend).unwrap();
-        assert_eq!(applied, 1);
-        assert_eq!(updater.stats().total_applied, 1);
+        assert_eq!(applied, 2);
+        assert_eq!(updater.stats().total_applied, 2);
         assert_eq!(updater.stats().flush_count, 1);
+    }
+
+    #[test]
+    fn flush_backend_error_requeues_batch_in_original_order() {
+        let updater = IncrementalUpdater::new();
+        let failing_backend = FailingLifecycle;
+
+        updater.on_message_delete(11);
+        updater.on_agent_delete(22);
+
+        assert!(updater.flush(&failing_backend).is_err());
+
+        let drained = updater.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(
+            drained[0],
+            DocChange::Delete {
+                id: 11,
+                kind: DocKind::Message
+            }
+        ));
+        assert!(matches!(
+            drained[1],
+            DocChange::Delete {
+                id: 22,
+                kind: DocKind::Agent
+            }
+        ));
+    }
+
+    #[test]
+    fn flush_partial_success_requeues_unapplied_tail_in_order() {
+        let updater = IncrementalUpdater::new();
+        let backend = PartialLifecycle {
+            applied_per_call: 1,
+        };
+
+        assert!(updater.enqueue(DocChange::Delete {
+            id: 11,
+            kind: DocKind::Message,
+        }));
+        assert!(updater.enqueue(DocChange::Delete {
+            id: 22,
+            kind: DocKind::Agent,
+        }));
+        assert!(updater.enqueue(DocChange::Delete {
+            id: 33,
+            kind: DocKind::Project,
+        }));
+
+        let applied = updater
+            .flush(&backend)
+            .expect("partial flush should succeed");
+        assert_eq!(applied, 1);
+
+        let remaining = updater.drain();
+        assert_eq!(remaining.len(), 2);
+        assert!(matches!(
+            remaining[0],
+            DocChange::Delete {
+                id: 22,
+                kind: DocKind::Agent
+            }
+        ));
+        assert!(matches!(
+            remaining[1],
+            DocChange::Delete {
+                id: 33,
+                kind: DocKind::Project
+            }
+        ));
+
+        let stats = updater.stats();
+        assert_eq!(stats.total_applied, 1);
+        assert_eq!(stats.flush_count, 1);
     }
 }

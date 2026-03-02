@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::search_canonical::{CanonPolicy, canonicalize_and_hash};
@@ -37,6 +37,56 @@ use crate::search_engine::IndexLifecycle;
 use crate::search_error::SearchResult;
 use crate::search_vector_index::{IndexEntry, VectorIndex, VectorMetadata};
 use mcp_agent_mail_core::DocKind;
+
+fn log_poisoned_lock_recovery(lock_name: &'static str) {
+    static POISON_LOGGED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let seen = POISON_LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    match seen.lock() {
+        Ok(mut entries) => {
+            if entries.insert(lock_name) {
+                tracing::error!(
+                    target: "search.semantic",
+                    lock = lock_name,
+                    "recovering from poisoned lock; continuing with inner state"
+                );
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                target: "search.semantic",
+                lock = lock_name,
+                "recovering from poisoned lock; poison tracking lock unavailable"
+            );
+        }
+    }
+}
+
+fn mutex_lock_or_recover<'a, T>(
+    lock_name: &'static str,
+    lock: &'a Mutex<T>,
+) -> std::sync::MutexGuard<'a, T> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log_poisoned_lock_recovery(lock_name);
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn rwlock_write_or_recover<'a, T>(
+    lock_name: &'static str,
+    lock: &'a RwLock<T>,
+) -> std::sync::RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log_poisoned_lock_recovery(lock_name);
+            poisoned.into_inner()
+        }
+    }
+}
 
 // ────────────────────────────────────────────────────────────────────
 // Configuration
@@ -280,7 +330,7 @@ impl EmbeddingQueue {
     /// Returns `true` if the request was accepted, `false` if dropped due to
     /// backpressure.
     pub fn enqueue(&self, request: EmbeddingRequest) -> bool {
-        let mut state = self.pending.lock().expect("queue lock poisoned");
+        let mut state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
 
         // Check backpressure
         let total_pending = state.queue.len() + state.retry_queue.len();
@@ -331,7 +381,7 @@ impl EmbeddingQueue {
     /// Enqueue a request for retry (goes to retry queue).
     pub fn enqueue_retry(&self, mut request: EmbeddingRequest) {
         request.retries += 1;
-        let mut state = self.pending.lock().expect("queue lock poisoned");
+        let mut state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
         let key = request.dedup_key();
         if state.dedup.contains(&key) {
             state.stats.total_deduped += 1;
@@ -356,7 +406,7 @@ impl EmbeddingQueue {
     ///
     /// Retry queue is drained first, then main queue.
     pub fn drain_batch(&self, batch_size: usize) -> Vec<EmbeddingRequest> {
-        let mut state = self.pending.lock().expect("queue lock poisoned");
+        let mut state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
         let mut batch = Vec::with_capacity(batch_size);
         let now = Instant::now();
 
@@ -390,21 +440,21 @@ impl EmbeddingQueue {
     /// Check if the queue is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        let state = self.pending.lock().expect("queue lock poisoned");
+        let state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
         state.queue.is_empty() && state.retry_queue.is_empty()
     }
 
     /// Get current queue length (main + retry).
     #[must_use]
     pub fn len(&self) -> usize {
-        let state = self.pending.lock().expect("queue lock poisoned");
+        let state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
         state.queue.len() + state.retry_queue.len()
     }
 
     /// Get queue statistics.
     #[must_use]
     pub fn stats(&self) -> QueueStats {
-        let state = self.pending.lock().expect("queue lock poisoned");
+        let state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
         QueueStats {
             pending_count: state.queue.len(),
             retry_count: state.retry_queue.len(),
@@ -597,23 +647,7 @@ impl EmbeddingJobRunner {
             Err(e) => {
                 // Batch failed, mark all as retryable
                 for req in batch {
-                    if req.retries < self.config.max_retries {
-                        self.queue.enqueue_retry(req.clone());
-                        result.retryable += 1;
-                        result.details.push(JobResult::Retryable {
-                            doc_id: req.doc_id,
-                            doc_kind: req.doc_kind,
-                            error: e.to_string(),
-                            retries: req.retries + 1,
-                        });
-                    } else {
-                        result.failed += 1;
-                        result.details.push(JobResult::Failed {
-                            doc_id: req.doc_id,
-                            doc_kind: req.doc_kind,
-                            error: e.to_string(),
-                        });
-                    }
+                    self.push_retry_or_failure(&req, e.to_string(), &mut result);
                 }
                 result.elapsed = start.elapsed();
                 self.metrics.record_batch(&result);
@@ -621,35 +655,76 @@ impl EmbeddingJobRunner {
             }
         };
 
-        // Process each embedding
-        let mut index = self.index.write().expect("index lock poisoned");
+        // Process each embedding. Defensive mismatch handling keeps queue semantics
+        // robust even if an embedder returns fewer/more vectors than requested.
+        let mut index = rwlock_write_or_recover("semantic.embedding_index", &self.index);
+        let mut embeddings_iter = embeddings.into_iter();
 
-        for (req, embedding) in batch.iter().zip(embeddings.into_iter()) {
+        for req in &batch {
+            let Some(embedding) = embeddings_iter.next() else {
+                self.push_retry_or_failure(
+                    req,
+                    "embedder returned fewer vectors than requested".to_owned(),
+                    &mut result,
+                );
+                continue;
+            };
+
             match self.process_single(&mut index, req, embedding) {
-                Ok(job_result) => {
-                    match &job_result {
-                        JobResult::Success { .. } => result.succeeded += 1,
-                        JobResult::Retryable { .. } => result.retryable += 1,
-                        JobResult::Failed { .. } => result.failed += 1,
-                        JobResult::Skipped { .. } => result.skipped += 1,
-                    }
-                    result.details.push(job_result);
-                }
-                Err(e) => {
-                    result.failed += 1;
-                    result.details.push(JobResult::Failed {
-                        doc_id: 0,
-                        doc_kind: DocKind::Message,
-                        error: e.to_string(),
-                    });
-                }
+                Ok(job_result) => Self::record_job_result(&mut result, job_result),
+                Err(e) => self.push_retry_or_failure(req, e.to_string(), &mut result),
             }
+        }
+
+        let extra_embeddings = embeddings_iter.count();
+        if extra_embeddings > 0 {
+            tracing::warn!(
+                extra_embeddings,
+                requested = batch.len(),
+                "embedder returned more vectors than requested; dropping extras"
+            );
         }
 
         result.elapsed = start.elapsed();
         self.metrics.record_batch(&result);
 
         Ok(result)
+    }
+
+    fn push_retry_or_failure(
+        &self,
+        req: &EmbeddingRequest,
+        error: String,
+        result: &mut BatchResult,
+    ) {
+        if req.retries < self.config.max_retries {
+            self.queue.enqueue_retry(req.clone());
+            result.retryable += 1;
+            result.details.push(JobResult::Retryable {
+                doc_id: req.doc_id,
+                doc_kind: req.doc_kind,
+                error,
+                retries: req.retries + 1,
+            });
+            return;
+        }
+
+        result.failed += 1;
+        result.details.push(JobResult::Failed {
+            doc_id: req.doc_id,
+            doc_kind: req.doc_kind,
+            error,
+        });
+    }
+
+    fn record_job_result(result: &mut BatchResult, job_result: JobResult) {
+        match &job_result {
+            JobResult::Success { .. } => result.succeeded += 1,
+            JobResult::Retryable { .. } => result.retryable += 1,
+            JobResult::Failed { .. } => result.failed += 1,
+            JobResult::Skipped { .. } => result.skipped += 1,
+        }
+        result.details.push(job_result);
     }
 
     /// Process a single embedding request.
@@ -782,7 +857,8 @@ impl IndexRefreshWorker {
 
             // Process pending work
             if self.run_cycle() > 0 {
-                *self.last_refresh.lock().expect("last_refresh lock") = Some(Instant::now());
+                *mutex_lock_or_recover("semantic.last_refresh", &self.last_refresh) =
+                    Some(Instant::now());
             }
 
             // Sleep in small increments for responsive shutdown
@@ -807,7 +883,7 @@ impl IndexRefreshWorker {
     /// Get the last refresh time.
     #[must_use]
     pub fn last_refresh(&self) -> Option<Instant> {
-        *self.last_refresh.lock().expect("last_refresh lock")
+        *mutex_lock_or_recover("semantic.last_refresh", &self.last_refresh)
     }
 
     /// Process one bounded refresh cycle.
@@ -971,6 +1047,51 @@ mod tests {
             }
 
             texts.iter().map(|text| self.embed(text)).collect()
+        }
+
+        fn model_info(&self) -> &ModelInfo {
+            &self.info
+        }
+    }
+
+    #[derive(Debug)]
+    struct ShortBatchEmbedder {
+        info: ModelInfo,
+    }
+
+    impl ShortBatchEmbedder {
+        fn new(dimension: usize) -> Self {
+            Self {
+                info: ModelInfo::new(
+                    "short-batch",
+                    "Short Batch",
+                    ModelTier::Fast,
+                    dimension,
+                    4096,
+                )
+                .with_available(true),
+            }
+        }
+    }
+
+    impl Embedder for ShortBatchEmbedder {
+        fn embed(&self, text: &str) -> SearchResult<EmbeddingResult> {
+            Ok(EmbeddingResult::new(
+                vec![0.25_f32; self.info.dimension],
+                self.info.id.clone(),
+                ModelTier::Fast,
+                Duration::from_millis(1),
+                crate::search_canonical::content_hash(text),
+            ))
+        }
+
+        fn embed_batch(&self, texts: &[&str]) -> SearchResult<Vec<EmbeddingResult>> {
+            let keep = texts.len().saturating_sub(1);
+            texts
+                .iter()
+                .take(keep)
+                .map(|text| self.embed(text))
+                .collect()
         }
 
         fn model_info(&self) -> &ModelInfo {
@@ -1205,6 +1326,42 @@ mod tests {
         assert_eq!(snapshot.total_retryable, 1);
         assert_eq!(snapshot.total_succeeded, 1);
         assert_eq!(snapshot.total_failed, 0);
+    }
+
+    #[test]
+    fn runner_retries_when_embed_batch_returns_too_few_vectors() {
+        let config = EmbeddingJobConfig {
+            batch_size: 4,
+            max_retries: 1,
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(ShortBatchEmbedder::new(4));
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 4,
+            ..Default::default()
+        })));
+
+        assert!(queue.enqueue(make_request(101)));
+        assert!(queue.enqueue(make_request(102)));
+
+        let runner = EmbeddingJobRunner::new(config, queue.clone(), embedder, index);
+        let result = runner
+            .process_batch()
+            .expect("batch with short embedder output should complete");
+
+        assert_eq!(result.succeeded, 1);
+        assert_eq!(result.retryable, 1);
+        assert_eq!(result.failed, 0);
+        assert!(
+            result
+                .details
+                .iter()
+                .any(|detail| matches!(detail, JobResult::Retryable { doc_id: 102, .. })),
+            "missing-vector retry should preserve document identity"
+        );
+        assert_eq!(queue.stats().retry_count, 1);
     }
 
     // ── BatchResult ──

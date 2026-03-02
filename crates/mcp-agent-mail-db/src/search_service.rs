@@ -81,6 +81,59 @@ static SEARCH_CACHE: OnceLock<Arc<QueryCache<ScopedSearchResponse>>> = OnceLock:
 /// Global warm worker for tracking search resource readiness.
 static WARM_WORKER: OnceLock<Arc<WarmWorker>> = OnceLock::new();
 
+#[cfg(feature = "hybrid")]
+fn log_poisoned_rwlock_recovery(lock_name: &'static str) {
+    static POISON_LOGGED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let seen = POISON_LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    match seen.lock() {
+        Ok(mut entries) => {
+            if entries.insert(lock_name) {
+                tracing::error!(
+                    target: "search.semantic",
+                    lock = lock_name,
+                    "recovering from poisoned RwLock; continuing with inner state"
+                );
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                target: "search.semantic",
+                lock = lock_name,
+                "recovering from poisoned RwLock; poison tracking lock unavailable"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn read_guard_or_recover<'a, T>(
+    lock_name: &'static str,
+    lock: &'a RwLock<T>,
+) -> std::sync::RwLockReadGuard<'a, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log_poisoned_rwlock_recovery(lock_name);
+            poisoned.into_inner()
+        }
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn write_guard_or_recover<'a, T>(
+    lock_name: &'static str,
+    lock: &'a RwLock<T>,
+) -> std::sync::RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log_poisoned_rwlock_recovery(lock_name);
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// Get or initialize the global search cache.
 fn global_search_cache() -> &'static Arc<QueryCache<ScopedSearchResponse>> {
     SEARCH_CACHE.get_or_init(|| Arc::new(QueryCache::new(CacheConfig::from_env())))
@@ -376,11 +429,81 @@ fn detail_matches_query_filters(
     true
 }
 
+fn raw_result_matches_query_filters(
+    query: &SearchQuery,
+    result: &SearchResult,
+    product_project_ids: Option<&HashSet<i64>>,
+) -> bool {
+    if let Some(project_id) = query.project_id
+        && result.project_id != Some(project_id)
+    {
+        return false;
+    }
+    if let Some(allowed_projects) = product_project_ids {
+        let Some(pid) = result.project_id else {
+            return false;
+        };
+        if !allowed_projects.contains(&pid) {
+            return false;
+        }
+    }
+    if let Some(agent_name) = query.agent_name.as_deref() {
+        let Some(from_agent) = result.from_agent.as_deref() else {
+            return false;
+        };
+        if !from_agent.eq_ignore_ascii_case(agent_name) {
+            return false;
+        }
+    }
+    if let Some(thread_id) = query.thread_id.as_deref()
+        && result.thread_id.as_deref() != Some(thread_id)
+    {
+        return false;
+    }
+    if let Some(ack_required) = query.ack_required {
+        let Some(raw_ack) = result.ack_required else {
+            return false;
+        };
+        if raw_ack != ack_required {
+            return false;
+        }
+    }
+    if !query.importance.is_empty() {
+        let Some(raw_importance) = result.importance.as_deref() else {
+            return false;
+        };
+        let Some(level) = crate::search_planner::Importance::parse(raw_importance) else {
+            return false;
+        };
+        if !query.importance.contains(&level) {
+            return false;
+        }
+    }
+    if let Some(min_ts) = query.time_range.min_ts {
+        let Some(raw_ts) = result.created_ts else {
+            return false;
+        };
+        if raw_ts < min_ts {
+            return false;
+        }
+    }
+    if let Some(max_ts) = query.time_range.max_ts {
+        let Some(raw_ts) = result.created_ts else {
+            return false;
+        };
+        if raw_ts > max_ts {
+            return false;
+        }
+    }
+    true
+}
+
 async fn canonicalize_message_results(
     cx: &Cx,
     pool: &DbPool,
     query: &SearchQuery,
     raw_results: Vec<SearchResult>,
+    preserve_unresolved_hits: bool,
 ) -> Outcome<Vec<SearchResult>, DbError> {
     if query.doc_kind != DocKind::Message || raw_results.is_empty() {
         return Outcome::Ok(raw_results);
@@ -426,7 +549,13 @@ async fn canonicalize_message_results(
     let mut dropped_filter_mismatch = 0usize;
     for mut result in deduped {
         let Some(detail) = details_by_id.get(&result.id) else {
-            dropped_missing += 1;
+            if preserve_unresolved_hits
+                && raw_result_matches_query_filters(query, &result, product_project_ids.as_ref())
+            {
+                canonical.push(result);
+            } else {
+                dropped_missing += 1;
+            }
             continue;
         };
         if !detail_matches_query_filters(query, detail, product_project_ids.as_ref()) {
@@ -458,11 +587,19 @@ async fn canonicalize_message_results(
 }
 
 /// Serialized bootstrap state for Tantivy bridge initialization in non-server surfaces.
-static LEXICAL_BRIDGE_BOOTSTRAP_STATE: OnceLock<Mutex<Option<Result<(), String>>>> =
+///
+/// Keyed by SQLite path to avoid cross-database contamination in test and
+/// multi-project local contexts that share one process.
+static LEXICAL_BRIDGE_BOOTSTRAP_STATE: OnceLock<Mutex<HashMap<String, Result<(), String>>>> =
     OnceLock::new();
+static LEXICAL_BRIDGE_BACKFILL_STATE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-fn lexical_bootstrap_state() -> &'static Mutex<Option<Result<(), String>>> {
-    LEXICAL_BRIDGE_BOOTSTRAP_STATE.get_or_init(|| Mutex::new(None))
+fn lexical_bootstrap_state() -> &'static Mutex<HashMap<String, Result<(), String>>> {
+    LEXICAL_BRIDGE_BOOTSTRAP_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lexical_backfill_state() -> &'static Mutex<HashSet<String>> {
+    LEXICAL_BRIDGE_BACKFILL_STATE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn map_bridge_bootstrap_error(err: &str) -> DbError {
@@ -474,17 +611,48 @@ fn map_bridge_bootstrap_error(err: &str) -> DbError {
 /// The MCP server initializes this at startup, but local surfaces can invoke
 /// search without server bootstrap. This helper makes bridge availability
 /// deterministic and removes SQL fallback dependence.
-fn ensure_lexical_bridge_initialized() -> Result<(), DbError> {
-    if crate::search_v3::get_bridge().is_some() {
-        return Ok(());
+fn lexical_backfill_database_url(pool: &DbPool) -> String {
+    let sqlite_path = pool.sqlite_path();
+    if sqlite_path == ":memory:" {
+        "sqlite:///:memory:".to_string()
+    } else {
+        format!("sqlite:///{sqlite_path}")
     }
+}
 
+fn has_run_lexical_backfill(sqlite_key: &str) -> Result<bool, DbError> {
+    let backfill_state = lexical_backfill_state();
+    let state = backfill_state
+        .lock()
+        .map_err(|_| DbError::Sqlite("search backfill state lock poisoned".to_string()))?;
+    Ok(state.contains(sqlite_key))
+}
+
+fn mark_lexical_backfill_ran(sqlite_key: &str) -> Result<(), DbError> {
+    let backfill_state = lexical_backfill_state();
+    let mut state = backfill_state
+        .lock()
+        .map_err(|_| DbError::Sqlite("search backfill state lock poisoned".to_string()))?;
+    state.insert(sqlite_key.to_string());
+    Ok(())
+}
+
+fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
+    let sqlite_key = pool.sqlite_path().to_string();
+    let db_url = lexical_backfill_database_url(pool);
+    crate::search_v3::backfill_from_db(&db_url).map_err(|err| map_bridge_bootstrap_error(&err))?;
+    mark_lexical_backfill_ran(&sqlite_key)?;
+    Ok(())
+}
+
+fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
+    let sqlite_key = pool.sqlite_path().to_string();
     let state_lock = lexical_bootstrap_state();
     {
         let state = state_lock
             .lock()
             .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?;
-        if let Some(result) = state.as_ref() {
+        if let Some(result) = state.get(&sqlite_key) {
             return result
                 .clone()
                 .map_err(|err| map_bridge_bootstrap_error(&err));
@@ -494,8 +662,10 @@ fn ensure_lexical_bridge_initialized() -> Result<(), DbError> {
     let config = mcp_agent_mail_core::Config::get();
     let index_dir = config.storage_root.join("search_index");
     let result = (|| {
-        crate::search_v3::init_bridge(&index_dir)?;
-        let (_indexed, _skipped) = crate::search_v3::backfill_from_db(&config.database_url)?;
+        if crate::search_v3::get_bridge().is_none() {
+            crate::search_v3::init_bridge(&index_dir)?;
+            run_lexical_backfill_for_pool(pool).map_err(|err| err.to_string())?;
+        }
         Ok(())
     })();
 
@@ -503,7 +673,7 @@ fn ensure_lexical_bridge_initialized() -> Result<(), DbError> {
         let mut state = state_lock
             .lock()
             .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?;
-        *state = Some(result.clone());
+        state.insert(sqlite_key, result.clone());
     }
 
     result.map_err(|err| map_bridge_bootstrap_error(&err))
@@ -641,22 +811,22 @@ impl SemanticBridge {
 
     /// Get a reference to the vector index (for reads).
     pub fn index(&self) -> std::sync::RwLockReadGuard<'_, VectorIndex> {
-        self.index.read().expect("vector index lock poisoned")
+        read_guard_or_recover("semantic.vector_index", &self.index)
     }
 
     /// Get a mutable reference to the vector index (for writes).
     pub fn index_mut(&self) -> std::sync::RwLockWriteGuard<'_, VectorIndex> {
-        self.index.write().expect("vector index lock poisoned")
+        write_guard_or_recover("semantic.vector_index", &self.index)
     }
 
     /// Get a reference to the model registry.
     pub fn registry(&self) -> std::sync::RwLockReadGuard<'_, ModelRegistry> {
-        self.registry.read().expect("model registry lock poisoned")
+        read_guard_or_recover("semantic.model_registry", &self.registry)
     }
 
     /// Get a mutable reference to the model registry (for registering embedders).
     pub fn registry_mut(&self) -> std::sync::RwLockWriteGuard<'_, ModelRegistry> {
-        self.registry.write().expect("model registry lock poisoned")
+        write_guard_or_recover("semantic.model_registry", &self.registry)
     }
 
     /// Check if the bridge has any real embedder (beyond hash fallback).
@@ -763,7 +933,16 @@ impl SemanticBridge {
 impl Drop for SemanticBridge {
     fn drop(&mut self) {
         self.refresh_worker.shutdown();
-        let join = self.worker.lock().expect("worker lock poisoned").take();
+        let join = match self.worker.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => {
+                tracing::warn!(
+                    target: "search.semantic",
+                    "worker lock poisoned during shutdown; recovering and continuing"
+                );
+                poisoned.into_inner().take()
+            }
+        };
         if let Some(join) = join {
             let _ = join.join();
         }
@@ -1257,12 +1436,12 @@ impl TwoTierBridge {
 
     /// Get the two-tier index (for reads).
     pub fn index(&self) -> std::sync::RwLockReadGuard<'_, TwoTierIndex> {
-        self.index.read().expect("two-tier index lock poisoned")
+        read_guard_or_recover("semantic.two_tier_index", &self.index)
     }
 
     /// Get a mutable reference to the index (for writes).
     pub fn index_mut(&self) -> std::sync::RwLockWriteGuard<'_, TwoTierIndex> {
-        self.index.write().expect("two-tier index lock poisoned")
+        write_guard_or_recover("semantic.two_tier_index", &self.index)
     }
 
     fn update_index_metrics(&self) {
@@ -2683,13 +2862,17 @@ pub async fn execute_search(
             .search_engine
             .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
         let mode = engine_to_search_mode(engine_mode);
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut discriminator_hasher = DefaultHasher::new();
+        cache_scope_discriminator(query).hash(&mut discriminator_hasher);
+        pool.sqlite_path().hash(&mut discriminator_hasher);
+        let scope_discriminator = discriminator_hasher.finish();
         // Cursor-based pagination: hash cursor token into offset proxy.
         // Also fold in scope discriminator so product/project scope variants of
         // the same query never collide in cache.
-        let scope_discriminator = cache_scope_discriminator(query);
         let offset_proxy = query.cursor.as_ref().map_or(0_usize, |c| {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut h = DefaultHasher::new();
             c.hash(&mut h);
             scope_discriminator.hash(&mut h);
             // Truncation is intentional: this is a hash-based discriminator,
@@ -2734,17 +2917,87 @@ pub async fn execute_search(
     let engine = options
         .search_engine
         .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
-    #[allow(deprecated)]
-    let engine = match engine {
-        SearchEngine::Legacy | SearchEngine::Shadow => SearchEngine::Lexical,
-        other => other,
-    };
     let assistance = query_assistance_payload(query);
+
+    #[allow(deprecated)]
+    if matches!(engine, SearchEngine::Legacy | SearchEngine::Shadow) {
+        let limit = query.effective_limit();
+        let raw_results = if let Some(project_id) = query.project_id {
+            match crate::queries::search_messages(cx, pool, project_id, &query.text, limit).await {
+                Outcome::Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                    })
+                    .collect(),
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
+        } else {
+            match crate::queries::search_messages_global(cx, pool, &query.text, limit).await {
+                Outcome::Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(row.project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                    })
+                    .collect(),
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
+        };
+        let explain = if query.explain {
+            Some(build_v3_query_explain(query, engine, None))
+        } else {
+            None
+        };
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if options.track_telemetry {
+            record_query("search_service_legacy_sql", latency_us);
+        }
+        global_metrics()
+            .search
+            .record_legacy_query(latency_us, false);
+        let resp = finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
+        if let Outcome::Ok(ref val) = resp {
+            cache.put(cache_key, val.clone());
+        }
+        return resp;
+    }
 
     if matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
-    ) && let Err(err) = ensure_lexical_bridge_initialized()
+    ) && let Err(err) = ensure_lexical_bridge_initialized(pool)
     {
         let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
         record_legacy_error_metrics(
@@ -2757,14 +3010,41 @@ pub async fn execute_search(
 
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
-        if let Some(raw_results) = try_tantivy_search(query) {
-            let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await
-            {
-                Outcome::Ok(results) => results,
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+        let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
+        if let Some(mut raw_results) = try_tantivy_search(query) {
+            if raw_results.is_empty() {
+                if !explicit_lexical {
+                    let sqlite_key = pool.sqlite_path().to_string();
+                    let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
+                        Ok(v) => v,
+                        Err(err) => return Outcome::Err(err),
+                    };
+                    if !backfill_ran {
+                        if let Err(err) = run_lexical_backfill_for_pool(pool) {
+                            let latency_us =
+                                u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+                            record_legacy_error_metrics(
+                                "search_service_lexical_backfill",
+                                latency_us,
+                                options.track_telemetry,
+                            );
+                            return Outcome::Err(err);
+                        }
+                        if let Some(rerun_results) = try_tantivy_search(query) {
+                            raw_results = rerun_results;
+                        }
+                    }
+                }
+            }
+            let raw_results =
+                match canonicalize_message_results(cx, pool, query, raw_results, explicit_lexical)
+                    .await
+                {
+                    Outcome::Ok(results) => results,
+                    Outcome::Err(err) => return Outcome::Err(err),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                };
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
             } else {
@@ -2803,12 +3083,13 @@ pub async fn execute_search(
             {
                 raw_results = bridge.search(query, query.effective_limit());
             }
-            raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+            raw_results =
+                match canonicalize_message_results(cx, pool, query, raw_results, false).await {
+                    Outcome::Ok(results) => results,
+                    Outcome::Err(err) => return Outcome::Err(err),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                };
 
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
@@ -2888,12 +3169,13 @@ pub async fn execute_search(
                 audit.two_tier_refinement_failed = telemetry.refinement_error.is_some();
                 audit.two_tier_fast_only = telemetry.fast_only_mode;
             }
-            raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+            raw_results =
+                match canonicalize_message_results(cx, pool, query, raw_results, false).await {
+                    Outcome::Ok(results) => results,
+                    Outcome::Err(err) => return Outcome::Err(err),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                };
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, rerank_audit.as_ref()))
             } else {
@@ -4582,5 +4864,29 @@ mod tests {
             guidance.summary.contains("suggestion"),
             "summary should mention suggestions"
         );
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn rwlock_helpers_recover_poisoned_locks() {
+        let lock = std::sync::Arc::new(std::sync::RwLock::new(7_u64));
+        let worker = std::sync::Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let _guard = worker.write().expect("write lock");
+            panic!("poison semantic lock");
+        })
+        .join();
+
+        let read_guard = super::read_guard_or_recover("test.poison", &lock);
+        assert_eq!(*read_guard, 7);
+        drop(read_guard);
+
+        let mut write_guard = super::write_guard_or_recover("test.poison", &lock);
+        *write_guard = 9;
+        drop(write_guard);
+
+        let read_guard = super::read_guard_or_recover("test.poison", &lock);
+        assert_eq!(*read_guard, 9);
+        drop(read_guard);
     }
 }

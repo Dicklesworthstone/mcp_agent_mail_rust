@@ -28,7 +28,7 @@ use mcp_agent_mail_core::config::{SearchEngine, SearchRolloutConfig, SearchShado
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -174,7 +174,7 @@ pub struct ShadowMetrics {
     /// Sum of overlap percentages (for computing average).
     overlap_sum: AtomicU64,
     /// Sum of latency deltas (for computing average).
-    latency_delta_sum: AtomicU64,
+    latency_delta_sum: AtomicI64,
 }
 
 impl ShadowMetrics {
@@ -193,13 +193,20 @@ impl ShadowMetrics {
         if comparison.v3_had_error {
             self.v3_error_count.fetch_add(1, Ordering::Relaxed);
         }
-        // Store overlap as fixed-point (pct * 10000)
-        let overlap_fp = (comparison.result_overlap_pct * 10000.0) as u64;
+        // Store overlap as fixed-point (pct * 10000), clamping malformed values.
+        let overlap = if comparison.result_overlap_pct.is_finite() {
+            comparison.result_overlap_pct.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let overlap_fp = (overlap * 10000.0) as u64;
         self.overlap_sum.fetch_add(overlap_fp, Ordering::Relaxed);
-        // Store latency delta with offset to handle negatives
-        let latency_offset = (comparison.latency_delta_ms + 1_000_000) as u64;
-        self.latency_delta_sum
-            .fetch_add(latency_offset, Ordering::Relaxed);
+        // Sum latency with saturation to avoid wraparound under extreme values.
+        let _ =
+            self.latency_delta_sum
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(comparison.latency_delta_ms))
+                });
     }
 
     /// Get snapshot of current metrics.
@@ -221,9 +228,8 @@ impl ShadowMetrics {
         };
 
         let avg_latency_delta = if total > 0 {
-            #[allow(clippy::cast_possible_wrap)]
-            let result = (latency_sum as i64 / total as i64) - 1_000_000;
-            result
+            let avg = i128::from(latency_sum) / i128::from(total);
+            avg.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
         } else {
             0
         };
@@ -759,6 +765,46 @@ mod tests {
         assert_eq!(snap.total_comparisons, 2);
         assert_eq!(snap.equivalent_count, 1);
         assert!((snap.equivalent_pct - 50.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn shadow_metrics_handles_large_negative_latency_delta_without_wrap() {
+        let m = ShadowMetrics::new();
+        let cmp = ShadowComparison {
+            result_overlap_pct: 1.0,
+            rank_correlation: 1.0,
+            latency_delta_ms: -1_500_000,
+            v3_had_error: false,
+            v3_error_message: None,
+            legacy_result_count: 1,
+            v3_result_count: 1,
+            query_text: "large-negative-latency".to_string(),
+            timestamp_us: chrono::Utc::now().timestamp_micros(),
+        };
+        m.record(&cmp);
+        let snap = m.snapshot();
+        assert_eq!(snap.total_comparisons, 1);
+        assert_eq!(snap.avg_latency_delta_ms, -1_500_000);
+    }
+
+    #[test]
+    fn shadow_metrics_clamps_non_finite_overlap() {
+        let m = ShadowMetrics::new();
+        let cmp = ShadowComparison {
+            result_overlap_pct: f64::NAN,
+            rank_correlation: 0.0,
+            latency_delta_ms: 0,
+            v3_had_error: false,
+            v3_error_message: None,
+            legacy_result_count: 0,
+            v3_result_count: 0,
+            query_text: "nan-overlap".to_string(),
+            timestamp_us: chrono::Utc::now().timestamp_micros(),
+        };
+        m.record(&cmp);
+        let snap = m.snapshot();
+        assert_eq!(snap.total_comparisons, 1);
+        assert!((snap.avg_overlap_pct - 0.0).abs() < 1e-10);
     }
 
     // ── ShadowMetricsSnapshot serde ─────────────────────────────────────
