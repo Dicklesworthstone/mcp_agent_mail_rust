@@ -106,12 +106,25 @@ mcp_call() {
 {"jsonrpc":"2.0","id":${call_id},"method":"tools/call","params":{"name":"${tool_name}","arguments":${args_json}}}
 EOF
 )
+    local case_id
+    case_id="rpc_${tool_name}_${BASHPID}_${call_id}_${RANDOM}"
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local response_file="${case_dir}/response.json"
+    local rpc_rc=0
 
-    curl -sf -X POST "$MCP_URL" \
-        -H "Content-Type: application/json" \
-        -d "$payload" \
-        --max-time 30 \
-        2>/dev/null || echo '{"error":"curl_timeout"}'
+    e2e_mark_case_start "${case_id}"
+    set +e
+    e2e_rpc_call_raw "${case_id}" "${MCP_URL}" "${payload}"
+    rpc_rc=$?
+    set -e
+
+    if [ -f "${response_file}" ]; then
+        cat "${response_file}"
+    elif [ "${rpc_rc}" -ne 0 ]; then
+        printf '{"error":"rpc_transport_or_http_failure","case_id":"%s","tool":"%s"}\n' "${case_id}" "${tool_name}"
+    else
+        echo "{}"
+    fi
 }
 
 # Send MCP tool call, return just exit code (0=ok, 1=error)

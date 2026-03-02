@@ -144,6 +144,7 @@ except Exception:
 # Setup: Create project + register two agents
 # ===========================================================================
 e2e_case_banner "Setup: project + two agents (RedFox, SilverWolf)"
+e2e_mark_case_start "setup_project_agents"
 
 SETUP_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -165,6 +166,7 @@ fi
 # Case 1: send_message with thread + ack_required
 # ===========================================================================
 e2e_case_banner "send_message: RedFox → SilverWolf"
+e2e_mark_case_start "case01_send_message"
 
 SEND_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -193,6 +195,7 @@ fi
 # Case 2: fetch_inbox for SilverWolf
 # ===========================================================================
 e2e_case_banner "fetch_inbox: SilverWolf sees the message"
+e2e_mark_case_start "case02_fetch_inbox"
 
 INBOX_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -239,6 +242,7 @@ e2e_assert_contains "thread_id=PR-42" "$INBOX_CHECK" "thread_id=PR-42"
 # Case 3: fetch_inbox with limit=0 returns validation error
 # ===========================================================================
 e2e_case_banner "fetch_inbox with limit=0 returns validation error"
+e2e_mark_case_start "case03_fetch_inbox_limit_zero"
 
 EMPTY_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -257,6 +261,7 @@ fi
 # Case 4: acknowledge_message
 # ===========================================================================
 e2e_case_banner "acknowledge_message: SilverWolf acks"
+e2e_mark_case_start "case04_acknowledge_message"
 
 ACK_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -277,6 +282,7 @@ fi
 # Case 5: reply_message
 # ===========================================================================
 e2e_case_banner "reply_message: SilverWolf replies"
+e2e_mark_case_start "case05_reply_message"
 
 REPLY_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -311,6 +317,7 @@ fi
 # Case 6: mark_message_read
 # ===========================================================================
 e2e_case_banner "mark_message_read: RedFox marks reply as read"
+e2e_mark_case_start "case06_mark_message_read"
 
 READ_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -331,6 +338,7 @@ fi
 # Case 7: send_message with empty body
 # ===========================================================================
 e2e_case_banner "send_message with empty body"
+e2e_mark_case_start "case07_send_empty_body"
 
 EMPTY_BODY_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -351,6 +359,7 @@ fi
 # Case 8: fetch_inbox for RedFox (sees reply from SilverWolf)
 # ===========================================================================
 e2e_case_banner "fetch_inbox: RedFox sees reply from SilverWolf"
+e2e_mark_case_start "case08_fetch_inbox_reply"
 
 RF_INBOX_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \

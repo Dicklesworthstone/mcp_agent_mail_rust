@@ -189,6 +189,12 @@ is_known_rch_remote_dep_mismatch() {
         || {
             grep -Fq "/dp/frankensqlite/crates/fsqlite-planner/src/lib.rs" "${out_file}" \
                 && grep -Fq "cannot explicitly borrow within an implicitly-borrowing pattern" "${out_file}"
+        } \
+        || {
+            grep -Fq "/dp/asupersync/src/http/h1/http_client.rs" "${out_file}" \
+                && grep -Fq "this method takes 3 arguments but 2 arguments were supplied" "${out_file}" \
+                && grep -Fq "/dp/asupersync/src/tls/connector.rs" "${out_file}" \
+                && grep -Fq "no method named \`now\` found for reference \`&cx::cx::Cx\`" "${out_file}"
         }
 }
 
@@ -253,6 +259,7 @@ run_render_case() {
 
     scenario_diag_begin "${case_id}"
     e2e_case_banner "${case_id}"
+    e2e_mark_case_start "case01_caseid"
     e2e_log "description: ${description}"
     e2e_log "fixture payload: ${fixture_payload}"
     e2e_log "expected rendering: ${expected_render}"
@@ -336,7 +343,7 @@ run_render_case() {
             tail -n 120 "${out_file}" 2>/dev/null || true
         fi
 
-        if [ "${_SUITE_STOP_REMAINING}" -eq 0 ] && grep -q "error: could not compile \`" "${out_file}"; then
+        if [ "${_SUITE_STOP_REMAINING}" -eq 0 ] && grep -Fq "error: could not compile" "${out_file}"; then
             _SUITE_STOP_REMAINING=1
             _SUITE_STOP_REASON_CODE="SKIP_SYSTEMIC_COMPILE_FAILURE"
             _SUITE_STOP_REASON="skipped after systemic compile failure in earlier case"
@@ -430,6 +437,7 @@ run_render_case \
 # Case 10 (composite): 100+ tree build path + render budget gate.
 scenario_diag_begin "case10_tree_perf_budget"
 e2e_case_banner "case10_tree_perf_budget"
+e2e_mark_case_start "case02_case10treeperfbudget"
 e2e_log "description: large thread-tree render/build performance envelope"
 e2e_log "tree structure: 100-message chain and per-screen render budget enforcement"
 e2e_save_artifact "case10_fixture.txt" "Tree fixture: 100-message chain + screen render budget gate."
