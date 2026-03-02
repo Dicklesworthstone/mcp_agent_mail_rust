@@ -205,8 +205,8 @@ fn emit_route(
             }
         }
         Ok(None) => {} // Route not matched, skip silently.
-        Err((_status, _msg)) => {
-            // Non-fatal: the entity may simply have no data.
+        Err((_status, msg)) => {
+            tracing::warn!(path = %path, error = %msg, "route failed during static export");
         }
     }
 }

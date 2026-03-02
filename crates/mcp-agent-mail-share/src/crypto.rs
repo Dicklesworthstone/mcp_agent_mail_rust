@@ -219,6 +219,11 @@ pub fn verify_bundle(
 }
 
 fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> PathBuf {
+    // Reject path traversal attempts to prevent reading files outside the bundle.
+    if relative_path.contains("..") || relative_path.starts_with('/') {
+        return bundle_root.join("__invalid_path__");
+    }
+
     // Historical manifests store SRI paths relative to `viewer/` (e.g. `vendor/foo.js`),
     // while some tooling may emit bundle-root relative paths. Accept either.
     let direct = bundle_root.join(relative_path);

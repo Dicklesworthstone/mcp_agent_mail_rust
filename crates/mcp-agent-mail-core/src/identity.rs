@@ -280,7 +280,27 @@ fn read_discovery_yaml(base_dir: &Path) -> DiscoveryInfo {
         let mut parts = trimmed.splitn(2, ':');
         let key = parts.next().unwrap_or("").trim();
         let mut value = parts.next().unwrap_or("").trim().to_string();
-        if let Some(comment_idx) = value.find('#') {
+        // Strip inline comments, but only outside quotes.
+        // YAML treats `#` as a comment marker in unquoted context when it is
+        // preceded by whitespace, or when the value starts with `#`.
+        let trimmed_val = value.trim();
+        let is_quoted = (trimmed_val.starts_with('"') && trimmed_val.ends_with('"'))
+            || (trimmed_val.starts_with('\'') && trimmed_val.ends_with('\''));
+        if !is_quoted
+            && let Some(comment_idx) = value.char_indices().find_map(|(idx, ch)| {
+                if ch != '#' {
+                    return None;
+                }
+                if idx == 0 {
+                    return Some(idx);
+                }
+                value[..idx]
+                    .chars()
+                    .last()
+                    .filter(|c| c.is_whitespace())
+                    .map(|_| idx)
+            })
+        {
             value.truncate(comment_idx);
         }
         value = value
@@ -860,6 +880,30 @@ mod tests {
         .expect("write");
         let info = read_discovery_yaml(tmp.path());
         assert_eq!(info.project_uid.as_deref(), Some("uid123"));
+    }
+
+    #[test]
+    fn read_discovery_yaml_comment_only_value_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".agent-mail.yaml"),
+            "project_uid: # no uid yet\n",
+        )
+        .expect("write");
+        let info = read_discovery_yaml(tmp.path());
+        assert!(info.project_uid.is_none());
+    }
+
+    #[test]
+    fn read_discovery_yaml_preserves_unspaced_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".agent-mail.yaml"),
+            "project_uid: org/repo#dev\n",
+        )
+        .expect("write");
+        let info = read_discovery_yaml(tmp.path());
+        assert_eq!(info.project_uid.as_deref(), Some("org/repo#dev"));
     }
 
     #[test]

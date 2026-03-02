@@ -895,8 +895,9 @@ impl FileLock {
         }
         #[cfg(not(unix))]
         {
-            // Without inode comparison we cannot confirm identity; be conservative
-            Ok(false)
+            // Without inode comparison we cannot detect the rename-under-flock race.
+            // Accept the lock; flock itself provides mutual exclusion.
+            Ok(true)
         }
     }
 
@@ -6385,14 +6386,18 @@ fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
             .unwrap_or_default(),
     );
     let tmp_path = parent.join(&tmp_name);
-    let mut f = fs::File::create(&tmp_path)?;
-    f.write_all(data)?;
-    f.sync_data()?;
-    fs::rename(&tmp_path, path).map_err(|e| {
-        // Best-effort cleanup of the temp file on rename failure
+    let result = (|| {
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(data)?;
+        f.sync_data()?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // Best-effort cleanup of the temp file on any failure
         let _ = fs::remove_file(&tmp_path);
-        e.into()
-    })
+    }
+    result
 }
 
 /// ISO 8601 timestamp for the current time.

@@ -629,9 +629,8 @@ fn render_unified_inbox(
                 });
             }
         }
-        if messages.len() >= limit {
-            break;
-        }
+        // Do not break early: messages from later projects may be newer.
+        // Sorting and truncation happen after the loop.
     }
     messages.sort_by(|a, b| b.created.cmp(&a.created));
     messages.truncate(limit);

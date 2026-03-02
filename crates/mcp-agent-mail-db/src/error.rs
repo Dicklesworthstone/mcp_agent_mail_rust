@@ -151,8 +151,10 @@ impl DbError {
 pub fn is_lock_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("database is locked")
+        || lower.contains("database table is locked")
+        || lower.contains("database schema is locked")
         || lower.contains("database is busy")
-        || lower.contains("locked")
+        || lower.contains("locked by another process")
         || lower.contains("unable to open database")
         || lower.contains("disk i/o error")
         || is_mvcc_conflict(msg)
@@ -378,6 +380,8 @@ mod tests {
     fn lock_error_patterns() {
         assert!(is_lock_error("database is locked"));
         assert!(is_lock_error("Database Is Locked")); // case-insensitive
+        assert!(is_lock_error("database table is locked: messages"));
+        assert!(is_lock_error("database schema is locked"));
         assert!(is_lock_error("database is busy"));
         assert!(is_lock_error("file locked by another process"));
         assert!(is_lock_error("unable to open database file"));
@@ -388,6 +392,7 @@ mod tests {
     fn not_lock_error() {
         assert!(!is_lock_error("syntax error"));
         assert!(!is_lock_error("table not found"));
+        assert!(!is_lock_error("unlocked and healthy"));
         assert!(!is_lock_error(""));
     }
 

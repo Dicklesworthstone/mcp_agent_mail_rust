@@ -2221,7 +2221,16 @@ effective_free_bytes={free}"
                 )
                 .await,
             )
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "contact enforcement: list_thread_messages failed (fail-open): {e}"
+                );
+                mcp_agent_mail_core::global_metrics()
+                    .tools
+                    .contact_enforcement_bypass_total
+                    .inc();
+                Vec::new()
+            });
             let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
             for row in &thread_rows {
                 auto_ok_names.insert(row.from.clone());
@@ -2236,7 +2245,16 @@ effective_free_bytes={free}"
                 )
                 .await,
             )
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "contact enforcement: list_message_recipient_names failed (fail-open): {e}"
+                );
+                mcp_agent_mail_core::global_metrics()
+                    .tools
+                    .contact_enforcement_bypass_total
+                    .inc();
+                Vec::new()
+            });
             for name in recipients {
                 auto_ok_names.insert(name);
             }
@@ -2245,7 +2263,14 @@ effective_free_bytes={free}"
         let reservations = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
         )
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!("contact enforcement: get_active_reservations failed (fail-open): {e}");
+            mcp_agent_mail_core::global_metrics()
+                .tools
+                .contact_enforcement_bypass_total
+                .inc();
+            Vec::new()
+        });
         let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
             HashMap::with_capacity(reservations.len());
         for res in reservations {

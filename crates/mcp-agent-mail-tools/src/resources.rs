@@ -2996,7 +2996,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
             &pool,
             project_id,
             agent_id,
-            limit * 5,
+            limit.saturating_mul(5),
         )
         .await,
     )?;
@@ -3117,7 +3117,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
             &pool,
             project_id,
             agent_id,
-            limit * 5,
+            limit.saturating_mul(5),
         )
         .await,
     )?;

@@ -440,8 +440,8 @@ fn value_as_i64(value: &Value) -> Option<i64> {
         Value::Int(n) => Some(i64::from(*n)),
         Value::SmallInt(n) => Some(i64::from(*n)),
         Value::TinyInt(n) => Some(i64::from(*n)),
-        Value::Float(f) => Some(*f as i64),
-        Value::Double(d) => Some(*d as i64),
+        Value::Float(f) if f.is_finite() => Some(*f as i64),
+        Value::Double(d) if d.is_finite() => Some(*d as i64),
         Value::Text(s) => s.parse::<i64>().ok(),
         _ => None,
     }
@@ -1333,7 +1333,7 @@ pub async fn get_agents_by_ids(
 
     let cache = crate::cache::read_cache();
     for id in agent_ids {
-        if let Some(cached) = cache.get_agent_by_id(*id) {
+        if let Some(cached) = cache.get_agent_by_id_scoped(pool.sqlite_path(), *id) {
             out.push(cached);
         } else {
             missing_ids.push(*id);
@@ -5365,7 +5365,7 @@ pub async fn get_reservations_by_ids(
 
     let mut out = Vec::with_capacity(ids.len());
 
-    for chunk in ids.chunks(1) {
+    for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
         let placeholders = placeholders(chunk.len());
         let sql = format!(
             "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \

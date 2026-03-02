@@ -404,7 +404,9 @@ fn parse_attachments_json(value: &str) -> Vec<Value> {
 /// Recursively scrub secrets in a JSON structure.
 /// Returns `(scrubbed_value, secret_replacement_count, keys_removed_count)`.
 fn scrub_structure(value: &Value, depth: usize) -> (Value, i64, i64) {
-    if depth > 20 {
+    // Cap recursion at a high hard limit to avoid stack blow-ups on malicious
+    // payloads while still scrubbing realistically deep JSON structures.
+    if depth > 256 {
         return (value.clone(), 0, 0);
     }
     match value {
@@ -613,6 +615,25 @@ mod tests {
             root["metadata"]["events"][0]["payload"].as_str(),
             Some("[REDACTED]")
         );
+    }
+
+    #[test]
+    fn scrub_structure_scrubs_secrets_deeper_than_20_levels() {
+        let mut nested = serde_json::json!("ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        for _ in 0..25 {
+            nested = serde_json::json!({ "nested": nested });
+        }
+        let input: Value = serde_json::json!([{ "metadata": nested }]);
+
+        let (result, replacements, keys_removed) = scrub_structure(&input, 0);
+        assert_eq!(replacements, 1);
+        assert_eq!(keys_removed, 0);
+
+        let mut cursor = &result[0]["metadata"];
+        for _ in 0..25 {
+            cursor = &cursor["nested"];
+        }
+        assert_eq!(cursor.as_str(), Some("[REDACTED]"));
     }
 
     #[test]

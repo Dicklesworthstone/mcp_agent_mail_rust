@@ -9260,6 +9260,98 @@ fn discover_archive_git_repos(storage_root: &Path) -> Vec<PathBuf> {
     repos
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpAgentMailEntryKind {
+    Rust,
+    Python,
+    Unknown,
+}
+
+fn parse_json_or_json5(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .or_else(|| json5::from_str::<serde_json::Value>(text).ok())
+}
+
+fn find_mcp_agent_mail_entry(doc: &serde_json::Value) -> Option<&serde_json::Value> {
+    const SERVER_CONTAINER_KEYS: &[&str] = &["mcpServers", "servers", "mcp", "mcp_servers"];
+    const SERVER_ENTRY_KEYS: &[&str] = &["mcp-agent-mail", "agent-mail"];
+
+    let root = doc.as_object()?;
+    for container_key in SERVER_CONTAINER_KEYS {
+        let Some(container) = root
+            .get(*container_key)
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for entry_key in SERVER_ENTRY_KEYS {
+            if let Some(entry) = container.get(*entry_key) {
+                return Some(entry);
+            }
+        }
+    }
+    None
+}
+
+fn classify_mcp_agent_mail_entry(
+    entry: &serde_json::Value,
+    rust_binary: &Path,
+) -> McpAgentMailEntryKind {
+    let Some(entry_obj) = entry.as_object() else {
+        return McpAgentMailEntryKind::Unknown;
+    };
+
+    let command = entry_obj
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let command_lower = command.to_ascii_lowercase();
+
+    let args_lower = entry_obj
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+
+    let rust_binary_str = rust_binary.to_string_lossy();
+    let command_name = Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+
+    let is_rust_command = command == rust_binary_str
+        || matches!(
+            command_name.as_str(),
+            "mcp-agent-mail" | "mcp-agent-mail.exe"
+        );
+    if is_rust_command {
+        return McpAgentMailEntryKind::Rust;
+    }
+
+    let combined = format!("{command_lower} {args_lower}");
+    let has_legacy_marker = combined.contains("mcp_agent_mail")
+        || combined.contains("run_server_with_token")
+        || combined.contains("run_server");
+    let looks_python_launcher = combined.contains("python")
+        || command_name == "uv"
+        || command_name == "uvx"
+        || command_name == "bash"
+        || command_name == "sh";
+    if has_legacy_marker && looks_python_launcher {
+        return McpAgentMailEntryKind::Python;
+    }
+
+    McpAgentMailEntryKind::Unknown
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -9818,26 +9910,35 @@ fn handle_doctor_check_with(
             for loc in &existing {
                 match std::fs::read_to_string(&loc.config_path) {
                     Ok(content) => {
-                        let has_rust = content.contains("mcp-agent-mail")
-                            && (content.contains(".local/bin/mcp-agent-mail")
-                                || content.contains(&rust_binary.to_string_lossy().to_string()));
-                        let has_python = content.contains("mcp_agent_mail")
-                            && (content.contains("python")
-                                || content.contains("run_server")
-                                || content.contains("uvx")
-                                || content.contains("uv run"));
-
-                        if has_rust {
-                            pointing_to_rust += 1;
-                        } else if has_python {
-                            pointing_to_python += 1;
-                            detail_parts.push(format!(
-                                "{} ({}) → Python",
-                                loc.tool.slug(),
-                                loc.config_path.display()
-                            ));
-                        } else {
+                        let Some(doc) = parse_json_or_json5(&content) else {
+                            parse_errors += 1;
+                            continue;
+                        };
+                        let Some(entry) = find_mcp_agent_mail_entry(&doc) else {
                             missing_entry += 1;
+                            continue;
+                        };
+
+                        match classify_mcp_agent_mail_entry(entry, &rust_binary) {
+                            McpAgentMailEntryKind::Rust => {
+                                pointing_to_rust += 1;
+                            }
+                            McpAgentMailEntryKind::Python => {
+                                pointing_to_python += 1;
+                                detail_parts.push(format!(
+                                    "{} ({}) → Python",
+                                    loc.tool.slug(),
+                                    loc.config_path.display()
+                                ));
+                            }
+                            McpAgentMailEntryKind::Unknown => {
+                                missing_entry += 1;
+                                detail_parts.push(format!(
+                                    "{} ({}) → entry present but unclassified",
+                                    loc.tool.slug(),
+                                    loc.config_path.display()
+                                ));
+                            }
                         }
                     }
                     Err(_) => {
@@ -11795,6 +11896,67 @@ mod tests {
             cfg.server_urls,
             vec!["http://127.0.0.1:8765/custom/path/".to_string()]
         );
+    }
+
+    #[test]
+    fn classify_mcp_agent_mail_entry_accepts_relative_rust_command() {
+        let doc = parse_json_or_json5(
+            r#"{
+                "mcpServers": {
+                    "mcp-agent-mail": {
+                        "command": "mcp-agent-mail",
+                        "args": []
+                    }
+                }
+            }"#,
+        )
+        .expect("valid config");
+        let entry = find_mcp_agent_mail_entry(&doc).expect("entry present");
+        let kind =
+            classify_mcp_agent_mail_entry(entry, Path::new("/home/test/.local/bin/mcp-agent-mail"));
+        assert_eq!(kind, McpAgentMailEntryKind::Rust);
+    }
+
+    #[test]
+    fn classify_mcp_agent_mail_entry_ignores_unrelated_python_servers() {
+        let doc = parse_json_or_json5(
+            r#"{
+                "mcpServers": {
+                    "mcp-agent-mail": {
+                        "command": "mcp-agent-mail",
+                        "args": []
+                    },
+                    "legacy-other": {
+                        "command": "python",
+                        "args": ["-m", "mcp_agent_mail"]
+                    }
+                }
+            }"#,
+        )
+        .expect("valid config");
+        let entry = find_mcp_agent_mail_entry(&doc).expect("entry present");
+        let kind =
+            classify_mcp_agent_mail_entry(entry, Path::new("/home/test/.local/bin/mcp-agent-mail"));
+        assert_eq!(kind, McpAgentMailEntryKind::Rust);
+    }
+
+    #[test]
+    fn classify_mcp_agent_mail_entry_detects_python_launcher() {
+        let doc = parse_json_or_json5(
+            r#"{
+                "mcpServers": {
+                    "mcp-agent-mail": {
+                        "command": "python3",
+                        "args": ["-m", "mcp_agent_mail", "serve-http"]
+                    }
+                }
+            }"#,
+        )
+        .expect("valid config");
+        let entry = find_mcp_agent_mail_entry(&doc).expect("entry present");
+        let kind =
+            classify_mcp_agent_mail_entry(entry, Path::new("/home/test/.local/bin/mcp-agent-mail"));
+        assert_eq!(kind, McpAgentMailEntryKind::Python);
     }
 
     #[test]
