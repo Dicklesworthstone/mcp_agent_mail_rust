@@ -89,6 +89,9 @@ SilverFox:
 # Claude Code / AI agent ephemeral files
 .claude/
 
+# MCP config files (contain local bearer tokens — never commit)
+*.mcp.json
+
 # MCP config backup files (auto-generated during config updates)
 *.mcp.json.*.bak
 
