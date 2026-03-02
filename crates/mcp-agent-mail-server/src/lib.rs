@@ -425,20 +425,27 @@ fn query_delta(
 fn add_tool<T: fastmcp::ToolHandler + 'static>(
     server: fastmcp_server::ServerBuilder,
     config: &mcp_agent_mail_core::Config,
-    tool_name: &str,
-    cluster: &str,
+    tool_name: &'static str,
+    cluster: &'static str,
     tool: T,
 ) -> fastmcp_server::ServerBuilder {
     if config.should_expose_tool(tool_name, cluster) {
-        let tool_index = mcp_agent_mail_tools::tool_index(tool_name)
-            .unwrap_or_else(|| panic!("Tool name missing from TOOL_CLUSTER_MAP: {tool_name}"));
-        // Resolve the static tool name from TOOL_CLUSTER_MAP for event emission
-        let static_name = mcp_agent_mail_tools::TOOL_CLUSTER_MAP[tool_index].0;
-        server.tool(InstrumentedTool {
-            tool_index,
-            tool_name: static_name,
-            inner: tool,
-        })
+        if let Some(tool_index) = mcp_agent_mail_tools::tool_index(tool_name) {
+            // Resolve the static tool name from TOOL_CLUSTER_MAP for event emission
+            let static_name = mcp_agent_mail_tools::TOOL_CLUSTER_MAP[tool_index].0;
+            server.tool(InstrumentedTool {
+                tool_index,
+                tool_name: static_name,
+                inner: tool,
+            })
+        } else {
+            tracing::error!(
+                tool = tool_name,
+                cluster,
+                "tool missing from TOOL_CLUSTER_MAP; registering without instrumentation"
+            );
+            server.tool(tool)
+        }
     } else {
         server
     }
@@ -1498,12 +1505,12 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         .spawn(move || {
             let rt = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
-                .expect("build supervisor runtime");
+                .map_err(|err| std::io::Error::other(format!("build supervisor runtime: {err}")))?;
             rt.block_on(async move {
                 run_http_server_supervisor_thread(server_config, &supervisor_state, &server_ctl_rx)
             })
         })
-        .expect("spawn HTTP supervisor thread");
+        .map_err(|err| std::io::Error::other(format!("spawn HTTP supervisor thread: {err}")))?;
 
     let startup_watchdog = TuiSpinWatchdog::start(&tui_state);
 
@@ -1660,7 +1667,7 @@ fn spawn_http_server_instance(
     let join = std::thread::Builder::new()
         .name("mcp-http-server".into())
         .spawn(move || run_http_server_thread(config_for_thread, ready_tx))
-        .expect("spawn HTTP server thread");
+        .map_err(|err| std::io::Error::other(format!("spawn HTTP server thread: {err}")))?;
 
     let ready = ready_rx
         .recv_timeout(Duration::from_secs(5))

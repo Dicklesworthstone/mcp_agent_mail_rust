@@ -1234,6 +1234,9 @@ pub struct MailAppModel {
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
+    /// Last terminal dimensions dispatched to screens. Duplicate resize events
+    /// are suppressed to avoid redundant invalidation/repaint churn.
+    last_dispatched_resize: Option<(u16, u16)>,
     accessibility: crate::tui_persist::AccessibilitySettings,
     macro_engine: MacroEngine,
     /// Tracks active reservations for expiry warnings.
@@ -1360,6 +1363,7 @@ impl MailAppModel {
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
             tick_count: 0,
+            last_dispatched_resize: None,
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
             macro_engine: MacroEngine::new(),
             reservation_tracker: HashMap::new(),
@@ -1531,6 +1535,14 @@ impl MailAppModel {
             content.width,
             content.height.saturating_add(2),
         )
+    }
+
+    fn should_forward_resize(&mut self, width: u16, height: u16) -> bool {
+        if self.last_dispatched_resize == Some((width, height)) {
+            return false;
+        }
+        self.last_dispatched_resize = Some((width, height));
+        true
     }
 
     fn handle_help_overlay_mouse(&mut self, event: &Event) -> bool {
@@ -3539,6 +3551,12 @@ impl Model for MailAppModel {
 
             // ── Terminal events (key, mouse, resize, etc.) ─────────
             MailMsg::Terminal(ref event) => {
+                if let Event::Resize { width, height } = *event
+                    && !self.should_forward_resize(width, height)
+                {
+                    return Cmd::none();
+                }
+
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                     && Self::is_inspector_toggle_key(key)
@@ -6505,6 +6523,7 @@ mod tests {
     use mcp_agent_mail_core::Config;
     use serde::Serialize;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::sync::mpsc;
 
     /// Serializes tests that rely on the global [`PALETTE_DB_CACHE`] singleton.
@@ -10640,6 +10659,33 @@ mod tests {
         }
     }
 
+    struct ResizeCountingScreen {
+        updates: Rc<RefCell<Vec<(u16, u16)>>>,
+    }
+
+    impl ResizeCountingScreen {
+        fn new(updates: Rc<RefCell<Vec<(u16, u16)>>>) -> Self {
+            Self { updates }
+        }
+    }
+
+    impl MailScreen for ResizeCountingScreen {
+        fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+            if let Event::Resize { width, height } = *event {
+                self.updates.borrow_mut().push((width, height));
+            }
+            Cmd::none()
+        }
+
+        fn view(&self, _frame: &mut ftui::Frame<'_>, _area: Rect, _state: &TuiSharedState) {}
+
+        fn tick(&mut self, _tick_count: u64, _state: &TuiSharedState) {}
+
+        fn title(&self) -> &'static str {
+            "ResizeCounting"
+        }
+    }
+
     #[test]
     fn error_boundary_view_catches_panic() {
         let mut model = test_model();
@@ -10813,6 +10859,61 @@ mod tests {
                 .borrow()
                 .contains_key(&MailScreenId::Messages),
             "message screen should be accelerated by urgent bypass cadence"
+        );
+    }
+
+    #[test]
+    fn duplicate_resize_event_is_suppressed_before_screen_update() {
+        let mut model = test_model();
+        let updates = Rc::new(RefCell::new(Vec::new()));
+        model.set_screen(
+            MailScreenId::Messages,
+            Box::new(ResizeCountingScreen::new(Rc::clone(&updates))),
+        );
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        let _ = model.update(MailMsg::Terminal(Event::Resize {
+            width: 120,
+            height: 40,
+        }));
+        let _ = model.update(MailMsg::Terminal(Event::Resize {
+            width: 120,
+            height: 40,
+        }));
+
+        assert_eq!(updates.borrow().as_slice(), &[(120, 40)]);
+    }
+
+    #[test]
+    fn changed_resize_dimensions_are_forwarded() {
+        let mut model = test_model();
+        let updates = Rc::new(RefCell::new(Vec::new()));
+        model.set_screen(
+            MailScreenId::Messages,
+            Box::new(ResizeCountingScreen::new(Rc::clone(&updates))),
+        );
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        let _ = model.update(MailMsg::Terminal(Event::Resize {
+            width: 120,
+            height: 40,
+        }));
+        let _ = model.update(MailMsg::Terminal(Event::Resize {
+            width: 121,
+            height: 40,
+        }));
+        let _ = model.update(MailMsg::Terminal(Event::Resize {
+            width: 121,
+            height: 40,
+        }));
+        let _ = model.update(MailMsg::Terminal(Event::Resize {
+            width: 121,
+            height: 41,
+        }));
+
+        assert_eq!(
+            updates.borrow().as_slice(),
+            &[(120, 40), (121, 40), (121, 41)]
         );
     }
 

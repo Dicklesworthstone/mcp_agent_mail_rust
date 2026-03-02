@@ -387,9 +387,11 @@ impl TuiSharedState {
     }
 
     pub fn update_config_snapshot(&self, snapshot: ConfigSnapshot) {
-        if let Ok(mut guard) = self.config_snapshot.lock() {
-            *guard = snapshot;
-        }
+        let mut guard = self
+            .config_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = snapshot;
     }
 
     /// Snapshot the active message drag state, if any.
@@ -397,15 +399,17 @@ impl TuiSharedState {
     pub fn message_drag_snapshot(&self) -> Option<MessageDragSnapshot> {
         self.message_drag
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Replace the active message drag state.
     pub fn set_message_drag_snapshot(&self, drag: Option<MessageDragSnapshot>) {
-        if let Ok(mut guard) = self.message_drag.lock() {
-            *guard = drag;
-        }
+        let mut guard = self
+            .message_drag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = drag;
     }
 
     /// Clear any active message drag state.
@@ -418,15 +422,17 @@ impl TuiSharedState {
     pub fn keyboard_move_snapshot(&self) -> Option<KeyboardMoveSnapshot> {
         self.keyboard_move
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Replace the active keyboard move marker.
     pub fn set_keyboard_move_snapshot(&self, marker: Option<KeyboardMoveSnapshot>) {
-        if let Ok(mut guard) = self.keyboard_move.lock() {
-            *guard = marker;
-        }
+        let mut guard = self
+            .keyboard_move
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = marker;
     }
 
     /// Clear any active keyboard move marker.
@@ -435,9 +441,11 @@ impl TuiSharedState {
     }
 
     pub fn set_server_control_sender(&self, tx: Sender<ServerControlMsg>) {
-        if let Ok(mut guard) = self.server_control_tx.lock() {
-            *guard = Some(tx);
-        }
+        let mut guard = self
+            .server_control_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(tx);
     }
 
     /// Queue a remote terminal event from browser ingress.
@@ -531,8 +539,9 @@ impl TuiSharedState {
     pub fn try_send_server_control(&self, msg: ServerControlMsg) -> bool {
         self.server_control_tx
             .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
             .is_some_and(|tx| tx.send(msg).is_ok())
     }
 
@@ -1078,10 +1087,10 @@ mod tests {
             REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY
         );
         assert_eq!(dropped, 32);
-        let stats = state.remote_terminal_queue_stats();
-        assert_eq!(stats.depth, REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY);
-        assert_eq!(stats.dropped_oldest_total, 32);
-        assert_eq!(stats.resize_coalesced_total, 0);
+        let queue_stats = state.remote_terminal_queue_stats();
+        assert_eq!(queue_stats.depth, REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY);
+        assert_eq!(queue_stats.dropped_oldest_total, 32);
+        assert_eq!(queue_stats.resize_coalesced_total, 0);
     }
 
     #[test]
@@ -1099,10 +1108,10 @@ mod tests {
             })
         );
 
-        let stats = state.remote_terminal_queue_stats();
-        assert_eq!(stats.depth, 1);
-        assert_eq!(stats.dropped_oldest_total, 0);
-        assert_eq!(stats.resize_coalesced_total, 1);
+        let queue_stats = state.remote_terminal_queue_stats();
+        assert_eq!(queue_stats.depth, 1);
+        assert_eq!(queue_stats.dropped_oldest_total, 0);
+        assert_eq!(queue_stats.resize_coalesced_total, 1);
 
         let drained = state.drain_remote_terminal_events(8);
         assert_eq!(
@@ -1147,9 +1156,9 @@ mod tests {
                 },
             ]
         );
-        let stats = state.remote_terminal_queue_stats();
-        assert_eq!(stats.depth, 0);
-        assert_eq!(stats.resize_coalesced_total, 1);
+        let queue_stats = state.remote_terminal_queue_stats();
+        assert_eq!(queue_stats.depth, 0);
+        assert_eq!(queue_stats.resize_coalesced_total, 1);
     }
 
     #[test]

@@ -15,8 +15,9 @@ use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros,
-    queries::{self, list_unacknowledged_messages},
+    queries::{self, list_overdue_unacknowledged_messages},
 };
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
@@ -39,26 +40,44 @@ pub fn start(config: &Config) {
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if worker
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+        && let Some(stale) = worker.take()
+    {
+        let _ = stale.join();
+    }
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
-        *worker = Some(
-            std::thread::Builder::new()
-                .name("ack-ttl-scan".into())
-                .spawn(move || {
-                    ack_ttl_loop(&config);
-                })
-                .expect("failed to spawn ACK TTL scan worker"),
-        );
+        match std::thread::Builder::new()
+            .name("ack-ttl-scan".into())
+            .spawn(move || {
+                ack_ttl_loop(&config);
+            }) {
+            Ok(handle) => {
+                *worker = Some(handle);
+            }
+            Err(err) => {
+                drop(worker);
+                warn!(
+                    error = %err,
+                    "failed to spawn ACK TTL scan worker; continuing without ACK TTL background scans"
+                );
+                return;
+            }
+        }
     }
+    drop(worker);
 }
 
 /// Signal the worker to stop.
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
-    if let Ok(mut worker) = WORKER.lock()
-        && let Some(handle) = worker.take()
-    {
+    let mut worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
 }
@@ -101,13 +120,15 @@ fn ack_ttl_loop(config: &Config) {
         }
     }
 
+    let mut previously_overdue: HashSet<OverdueAckKey> = HashSet::new();
+
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
             info!("ACK TTL scan worker shutting down");
             return;
         }
 
-        match run_ack_ttl_cycle(config, &pool) {
+        match run_ack_ttl_cycle_with_state(config, &pool, &mut previously_overdue) {
             Ok((scanned, overdue)) => {
                 if overdue > 0 {
                     info!(
@@ -150,30 +171,56 @@ fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
 /// Run a single ACK TTL scan cycle.
 ///
 /// Returns `(scanned, overdue_count)`.
+#[cfg(test)]
 fn run_ack_ttl_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), String> {
+    let mut previously_overdue = HashSet::new();
+    run_ack_ttl_cycle_with_state(config, pool, &mut previously_overdue)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct OverdueAckKey {
+    message_id: i64,
+    agent_id: i64,
+}
+
+fn run_ack_ttl_cycle_with_state(
+    config: &Config,
+    pool: &DbPool,
+    previously_overdue: &mut HashSet<OverdueAckKey>,
+) -> Result<(usize, usize), String> {
     let cx = Cx::for_testing();
     let now = now_micros();
     let ttl_us = i64::try_from(config.ack_ttl_seconds)
         .unwrap_or(1800)
         .saturating_mul(1_000_000);
+    let overdue_before_ts = now.saturating_sub(ttl_us);
 
-    // Get all unacknowledged messages.
-    let rows = match block_on(async { list_unacknowledged_messages(&cx, pool).await }) {
+    let rows = match block_on(async {
+        list_overdue_unacknowledged_messages(&cx, pool, overdue_before_ts).await
+    }) {
         Outcome::Ok(r) => r,
         other => return Err(format!("failed to list unacked messages: {other:?}")),
     };
 
     let scanned = rows.len();
     let mut overdue = 0usize;
+    let mut currently_overdue: HashSet<OverdueAckKey> = HashSet::with_capacity(rows.len());
 
     for row in &rows {
-        let age_micros = now - row.created_ts;
-        if age_micros < ttl_us {
-            continue; // Not yet overdue.
+        let key = OverdueAckKey {
+            message_id: row.message_id,
+            agent_id: row.agent_id,
+        };
+        currently_overdue.insert(key);
+        overdue = overdue.saturating_add(1);
+
+        // Suppress duplicate log/escalation spam for rows that remain overdue
+        // across consecutive scan intervals.
+        if previously_overdue.contains(&key) {
+            continue;
         }
 
-        overdue += 1;
-        let age_seconds = age_micros / 1_000_000;
+        let age_seconds = now.saturating_sub(row.created_ts) / 1_000_000;
 
         // Log the overdue warning (matches legacy structlog + rich panel).
         warn!(
@@ -192,6 +239,7 @@ fn run_ack_ttl_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), S
         }
     }
 
+    *previously_overdue = currently_overdue;
     Ok((scanned, overdue))
 }
 
@@ -219,7 +267,7 @@ fn escalate(
     // Build the inbox path pattern from the created_ts timestamp.
     let ts_secs = row.created_ts / 1_000_000;
     let dt = chrono::DateTime::from_timestamp(ts_secs, 0)
-        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
     let y_dir = dt.format("%Y").to_string();
     let m_dir = dt.format("%m").to_string();
 
@@ -262,6 +310,23 @@ fn escalate(
 
     // Create the file reservation.
     let ttl_s = i64::try_from(config.ack_escalation_claim_ttl_seconds).unwrap_or(3600);
+    let has_existing = match block_on(async {
+        // Only treat *active* matching reservations as dedupe candidates.
+        // Historical released/expired rows must not block new escalation claims.
+        queries::list_file_reservations(cx, pool, row.project_id, true).await
+    }) {
+        Outcome::Ok(existing) => existing.into_iter().any(|reservation| {
+            reservation.agent_id == holder_agent_id
+                && reservation.path_pattern == pattern
+                && reservation.reason == "ack-overdue"
+                && (reservation.exclusive != 0) == config.ack_escalation_claim_exclusive
+        }),
+        _ => false,
+    };
+    if has_existing {
+        return Ok(());
+    }
+
     match block_on(async {
         queries::create_file_reservations(
             cx,
@@ -485,8 +550,137 @@ mod tests {
         config.ack_escalation_enabled = false;
 
         let (scanned, overdue) = run_ack_ttl_cycle(&config, &pool).expect("run cycle");
-        assert_eq!(scanned, 1);
+        assert_eq!(scanned, 0);
         assert_eq!(overdue, 0);
+    }
+
+    #[test]
+    fn ack_ttl_stateful_cycle_escalates_newly_overdue_only_once() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_exclusive = true;
+        config.ack_escalation_claim_holder_name.clear();
+
+        let mut previously_overdue = std::collections::HashSet::new();
+
+        let (first_scanned, first_overdue) =
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut previously_overdue)
+                .expect("first cycle");
+        assert_eq!(first_scanned, 1);
+        assert_eq!(first_overdue, 1);
+
+        let (second_scanned, second_overdue) =
+            run_ack_ttl_cycle_with_state(&config, &pool, &mut previously_overdue)
+                .expect("second cycle");
+        assert_eq!(second_scanned, 1);
+        assert_eq!(second_overdue, 1);
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 1);
+    }
+
+    #[test]
+    fn ack_ttl_escalation_is_idempotent_across_worker_restarts() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_exclusive = true;
+        config.ack_escalation_claim_holder_name.clear();
+
+        // First run with fresh in-memory state.
+        let mut first_state = std::collections::HashSet::new();
+        run_ack_ttl_cycle_with_state(&config, &pool, &mut first_state).expect("first cycle");
+
+        // Simulate process restart: fresh state map, same overdue row still exists.
+        let mut second_state = std::collections::HashSet::new();
+        run_ack_ttl_cycle_with_state(&config, &pool, &mut second_state).expect("second cycle");
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 1);
+    }
+
+    #[test]
+    fn escalation_reacquires_after_prior_matching_claim_was_released() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_exclusive = true;
+        config.ack_escalation_claim_holder_name.clear();
+
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("first escalate");
+
+        let first = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(first.len(), 1);
+        let first_id = first[0].id.expect("first reservation id");
+        assert!(first_id > 0, "unexpected reservation id: {first_id}");
+        assert!(
+            first[0].released_ts.is_none(),
+            "new escalation reservation unexpectedly pre-released: {:?}",
+            first[0]
+        );
+
+        let release_ids = [first_id];
+        match block_on(async {
+            queries::release_reservations(
+                &cx,
+                &pool,
+                unacked.project_id,
+                unacked.agent_id,
+                None,
+                Some(&release_ids),
+            )
+            .await
+        }) {
+            Outcome::Ok(released) => assert_eq!(released.len(), 1),
+            other => panic!("release_reservations failed: {other:?}"),
+        }
+
+        // Same overdue row should reacquire after the prior reservation is released.
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("second escalate");
+
+        let all_rows = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(
+            all_rows.len(),
+            2,
+            "released historical rows must not block new escalation claims"
+        );
+
+        let active_rows = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, true).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations(active_only) failed: {other:?}"),
+        };
+        assert_eq!(active_rows.len(), 1);
     }
 
     #[test]

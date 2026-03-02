@@ -300,7 +300,10 @@ impl ArchiveBrowserScreen {
         }
 
         // Build flattened visible tree
-        let root = self.archive_root.as_ref().unwrap();
+        let Some(root) = self.archive_root.as_ref() else {
+            self.entries.clear();
+            return;
+        };
         let mut entries = Vec::new();
         Self::scan_directory(root, root, 0, &self.filter, &mut entries);
         self.entries = entries;

@@ -35,26 +35,44 @@ pub fn start(config: &Config) {
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if worker
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+        && let Some(stale) = worker.take()
+    {
+        let _ = stale.join();
+    }
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
-        *worker = Some(
-            std::thread::Builder::new()
-                .name("retention-quota".into())
-                .spawn(move || {
-                    retention_loop(&config);
-                })
-                .expect("failed to spawn retention/quota worker"),
-        );
+        match std::thread::Builder::new()
+            .name("retention-quota".into())
+            .spawn(move || {
+                retention_loop(&config);
+            }) {
+            Ok(handle) => {
+                *worker = Some(handle);
+            }
+            Err(err) => {
+                drop(worker);
+                warn!(
+                    error = %err,
+                    "failed to spawn retention/quota worker; continuing without retention background scans"
+                );
+                return;
+            }
+        }
     }
+    drop(worker);
 }
 
 /// Signal the worker to stop.
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
-    if let Ok(mut worker) = WORKER.lock()
-        && let Some(handle) = worker.take()
-    {
+    let mut worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
 }

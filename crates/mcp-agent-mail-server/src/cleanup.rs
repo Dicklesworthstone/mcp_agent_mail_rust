@@ -21,6 +21,7 @@ use mcp_agent_mail_db::{
         release_reservations_by_ids,
     },
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,26 +45,44 @@ pub fn start(config: &Config) {
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if worker
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+        && let Some(stale) = worker.take()
+    {
+        let _ = stale.join();
+    }
     if worker.is_none() {
         let config = config.clone();
         SHUTDOWN.store(false, Ordering::Release);
-        *worker = Some(
-            std::thread::Builder::new()
-                .name("file-res-cleanup".into())
-                .spawn(move || {
-                    cleanup_loop(&config);
-                })
-                .expect("failed to spawn file reservation cleanup worker"),
-        );
+        match std::thread::Builder::new()
+            .name("file-res-cleanup".into())
+            .spawn(move || {
+                cleanup_loop(&config);
+            }) {
+            Ok(handle) => {
+                *worker = Some(handle);
+            }
+            Err(err) => {
+                drop(worker);
+                warn!(
+                    error = %err,
+                    "failed to spawn file reservation cleanup worker; continuing without cleanup background scans"
+                );
+                return;
+            }
+        }
     }
+    drop(worker);
 }
 
 /// Signal the worker to stop and wait for it to finish.
 pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
-    if let Ok(mut worker) = WORKER.lock()
-        && let Some(handle) = worker.take()
-    {
+    let mut worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
 }
@@ -228,38 +247,59 @@ fn detect_and_release_stale(
         return Ok(Vec::new());
     }
 
+    // Project workspace is identical for every reservation in this cycle.
+    let workspace = match block_on(async { queries::get_project_by_id(cx, pool, project_id).await })
+    {
+        Outcome::Ok(project) => Some(std::path::PathBuf::from(project.human_key)),
+        _ => None,
+    };
+
+    // Many reservations share the same agent and/or path pattern. Cache activity
+    // checks within a cycle to avoid repeated DB + git process work.
+    let mut inactive_agent_cache: HashMap<i64, bool> = HashMap::new();
+    let mut recent_mail_cache: HashMap<i64, bool> = HashMap::new();
+    let mut recent_path_activity_cache: HashMap<String, bool> = HashMap::new();
     let mut stale_ids = Vec::new();
 
     for res in &active {
-        // Get agent info to check last_active_ts.
-        let Outcome::Ok(agent) =
-            block_on(async { queries::get_agent_by_id(cx, pool, res.agent_id).await })
-        else {
-            continue; // Skip if agent lookup fails.
-        };
-
-        // Check agent inactivity.
-        let agent_inactive = (now - agent.last_active_ts) > inactivity_us;
+        // Check agent inactivity, cached by agent id.
+        let agent_inactive = inactive_agent_cache
+            .get(&res.agent_id)
+            .copied()
+            .unwrap_or_else(|| {
+                let computed = match block_on(async {
+                    queries::get_agent_by_id(cx, pool, res.agent_id).await
+                }) {
+                    Outcome::Ok(agent) => now.saturating_sub(agent.last_active_ts) > inactivity_us,
+                    _ => false, // Skip stale classification when agent lookup fails.
+                };
+                inactive_agent_cache.insert(res.agent_id, computed);
+                computed
+            });
         if !agent_inactive {
             continue; // Agent is recently active, not stale.
         }
 
-        // Check mail activity grace period.
-        let last_mail = match block_on(async {
-            get_agent_last_mail_activity(cx, pool, res.agent_id, project_id).await
-        }) {
-            Outcome::Ok(ts) => ts,
-            _ => None,
-        };
-        let recent_mail = last_mail.is_some_and(|ts| (now - ts) <= grace_us);
+        // Check mail activity grace period, cached by agent id.
+        let recent_mail = recent_mail_cache
+            .get(&res.agent_id)
+            .copied()
+            .unwrap_or_else(|| {
+                let last_mail = match block_on(async {
+                    get_agent_last_mail_activity(cx, pool, res.agent_id, project_id).await
+                }) {
+                    Outcome::Ok(ts) => ts,
+                    _ => None,
+                };
+                let computed = last_mail.is_some_and(|ts| now.saturating_sub(ts) <= grace_us);
+                recent_mail_cache.insert(res.agent_id, computed);
+                computed
+            });
         if recent_mail {
             continue; // Recent mail activity, not stale.
         }
 
-        // Check filesystem activity for matched paths.
-        let Outcome::Ok(project) =
-            block_on(async { queries::get_project_by_id(cx, pool, project_id).await })
-        else {
+        let Some(workspace) = workspace.as_deref() else {
             // Can't determine filesystem activity; treat as stale based on agent+mail.
             if let Some(id) = res.id {
                 stale_ids.push(id);
@@ -267,14 +307,23 @@ fn detect_and_release_stale(
             continue;
         };
 
-        let workspace = Path::new(&project.human_key);
-        let recent_fs = check_filesystem_activity(workspace, &res.path_pattern, now, grace_us);
-        if recent_fs {
-            continue;
-        }
-
-        let recent_git = check_git_activity(workspace, &res.path_pattern, now, grace_us);
-        if recent_git {
+        // Check filesystem/git activity, cached by path pattern.
+        let has_recent_path_activity = recent_path_activity_cache
+            .get(&res.path_pattern)
+            .copied()
+            .unwrap_or_else(|| {
+                let recent_fs =
+                    check_filesystem_activity(workspace, &res.path_pattern, now, grace_us);
+                let recent_git = if recent_fs {
+                    false
+                } else {
+                    check_git_activity(workspace, &res.path_pattern, now, grace_us)
+                };
+                let computed = recent_fs || recent_git;
+                recent_path_activity_cache.insert(res.path_pattern.clone(), computed);
+                computed
+            });
+        if has_recent_path_activity {
             continue;
         }
 
@@ -872,7 +921,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(repo)
-            .arg("init")
+            .args(["init", "-b", "main"])
             .status()
             .expect("git init should run");
         assert!(status.success(), "git init should succeed");

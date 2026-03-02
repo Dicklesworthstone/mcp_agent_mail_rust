@@ -1342,7 +1342,8 @@ fn compute_stats(entries: &[DisplayEntry]) -> ExplorerStats {
         if let Some(ref tid) = e.thread_id {
             threads.insert(tid.as_str());
         }
-        agents.insert(e.sender_name.as_str());
+        collect_agent_names(&mut agents, &e.sender_name);
+        collect_agent_names(&mut agents, &e.to_agents);
 
         if e.direction == Direction::Inbound {
             inbound += 1;
@@ -1365,6 +1366,15 @@ fn compute_stats(entries: &[DisplayEntry]) -> ExplorerStats {
         unique_threads: threads.len(),
         unique_projects: projects.len(),
         unique_agents: agents.len(),
+    }
+}
+
+fn collect_agent_names<'a>(agents: &mut std::collections::HashSet<&'a str>, names_csv: &'a str) {
+    for raw in names_csv.split(',') {
+        let name = raw.trim();
+        if !name.is_empty() {
+            agents.insert(name);
+        }
     }
 }
 
@@ -2065,6 +2075,15 @@ mod tests {
         let stats = compute_stats(&[e1, e2]);
         assert_eq!(stats.unread_count, 1);
         assert_eq!(stats.pending_ack_count, 1);
+    }
+
+    #[test]
+    fn compute_stats_counts_multiple_recipient_agents() {
+        let mut e = test_entry(1, 100, Direction::Outbound);
+        e.sender_name = "BlueLake".to_string();
+        e.to_agents = "GreenCastle, RedFox, BlueLake".to_string();
+        let stats = compute_stats(&[e]);
+        assert_eq!(stats.unique_agents, 3);
     }
 
     #[test]
