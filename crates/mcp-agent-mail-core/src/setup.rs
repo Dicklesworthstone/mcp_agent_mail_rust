@@ -381,12 +381,25 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
     if let Some(parent) = env_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(env_path, content)?;
 
+    // Create file atomically with restricted permissions to avoid TOCTOU race
+    // where the file is briefly world-readable between creation and chmod.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(env_path)?;
+        f.write_all(content.as_bytes())?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(env_path, content)?;
     }
 
     Ok(())
