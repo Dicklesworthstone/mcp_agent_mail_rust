@@ -382,6 +382,13 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(env_path, content)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
     Ok(())
 }
 
