@@ -14,6 +14,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, env_value};
 use mcp_agent_mail_server::startup_checks::{self, PortStatus};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Directive;
 
 /// Runtime interface mode selector for the `mcp-agent-mail` binary.
 ///
@@ -61,6 +62,54 @@ const fn default_mcp_log_filter() -> &'static str {
         "fsqlite_vdbe::jit=warn,",
         "fsqlite_vdbe::engine=warn",
     )
+}
+
+const fn noisy_dependency_log_clamp_directives() -> [&'static str; 13] {
+    [
+        "fsqlite=warn",
+        "fsqlite_core=warn",
+        "fsqlite_mvcc=warn",
+        "fsqlite_wal=warn",
+        "fsqlite_vdbe=warn",
+        "mvcc=warn",
+        "checkpoint=warn",
+        "fsqlite.storage_wiring=warn",
+        "fsqlite_wal::checkpoint_executor=warn",
+        "fsqlite_vdbe::jit=warn",
+        "fsqlite_vdbe::engine=warn",
+        "jit_compile=error",
+        "execute_statement_dispatch=error",
+    ]
+}
+
+fn allow_noisy_dependency_logs() -> bool {
+    env::var("AM_ALLOW_NOISY_DEP_LOGS").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn build_mcp_log_filter(suppress_runtime_logs_for_tui: bool) -> EnvFilter {
+    let mut filter = if suppress_runtime_logs_for_tui {
+        EnvFilter::new("off")
+    } else {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(default_mcp_log_filter()))
+    };
+    if suppress_runtime_logs_for_tui {
+        return filter;
+    }
+    if allow_noisy_dependency_logs() {
+        return filter;
+    }
+    for raw in noisy_dependency_log_clamp_directives() {
+        if let Ok(directive) = raw.parse::<Directive>() {
+            filter = filter.add_directive(directive);
+        }
+    }
+    filter
 }
 
 #[derive(Parser)]
@@ -372,16 +421,18 @@ fn main() {
         ));
     }
 
+    let cli = Cli::parse();
+
     // MCP mode: initialize logging and proceed with the server binary behavior.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_mcp_log_filter()));
+    let suppress_runtime_logs_for_tui =
+        matches!(cli.command, Some(Commands::Serve { no_tui: false, .. }))
+            && std::io::stdout().is_terminal();
+    let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
-
-    let cli = Cli::parse();
 
     // Load configuration and stamp interface mode (binary-level, per ADR-001).
     let mut config = Config::from_env();
@@ -567,6 +618,15 @@ mod tests {
         assert!(filter.contains("mvcc=warn"));
         assert!(filter.contains("checkpoint=warn"));
         assert!(filter.contains("fsqlite.storage_wiring=warn"));
+    }
+
+    #[test]
+    fn noisy_dependency_log_clamp_directives_cover_known_spam_targets() {
+        let directives = noisy_dependency_log_clamp_directives();
+        assert!(directives.contains(&"jit_compile=error"));
+        assert!(directives.contains(&"execute_statement_dispatch=error"));
+        assert!(directives.contains(&"mvcc=warn"));
+        assert!(directives.contains(&"checkpoint=warn"));
     }
 
     #[test]

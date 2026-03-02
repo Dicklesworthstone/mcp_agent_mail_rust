@@ -239,7 +239,7 @@ fn init_git_repo(path: &Path) {
     std::fs::create_dir_all(path).expect("create git repo dir");
     let out = Command::new("git")
         .current_dir(path)
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .output()
         .expect("git init");
     assert!(
@@ -341,7 +341,7 @@ fn guard_install_status_uninstall_smoke() {
     // Guard expects a git repo (hooks dir lives under .git/hooks by default).
     let git = Command::new("git")
         .current_dir(&repo)
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .output()
         .expect("git init");
     assert!(

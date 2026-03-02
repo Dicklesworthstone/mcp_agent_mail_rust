@@ -2092,17 +2092,7 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
     TRACING_INIT.call_once(|| {
-        let filter = if suppress_runtime_logs_for_tui {
-            // Never emit tracing lines while the interactive TUI owns stdout/stderr.
-            // This prevents log spam from corrupting alternate-screen rendering.
-            tracing_subscriber::EnvFilter::new("off")
-        } else if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(default_release_log_filter())
-            })
-        } else {
-            tracing_subscriber::EnvFilter::new(default_release_log_filter())
-        };
+        let filter = build_release_log_filter(suppress_runtime_logs_for_tui);
 
         // Ignore double-init errors when tests or host processes already set a subscriber.
         let _ = tracing_subscriber::fmt()
@@ -2113,6 +2103,31 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
             .compact()
             .try_init();
     });
+}
+
+fn build_release_log_filter(suppress_runtime_logs_for_tui: bool) -> tracing_subscriber::EnvFilter {
+    let mut filter = if suppress_runtime_logs_for_tui {
+        // Never emit tracing lines while the interactive TUI owns stdout/stderr.
+        // This prevents log spam from corrupting alternate-screen rendering.
+        tracing_subscriber::EnvFilter::new("off")
+    } else if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_release_log_filter()))
+    } else {
+        tracing_subscriber::EnvFilter::new(default_release_log_filter())
+    };
+
+    if suppress_runtime_logs_for_tui || allow_noisy_dependency_logs() {
+        return filter;
+    }
+
+    for raw in noisy_dependency_log_clamp_directives() {
+        if let Ok(directive) = raw.parse::<tracing_subscriber::filter::Directive>() {
+            filter = filter.add_directive(directive);
+        }
+    }
+
+    filter
 }
 
 fn default_release_log_filter() -> &'static str {
@@ -2133,8 +2148,32 @@ fn default_release_log_filter() -> &'static str {
         "fsqlite.storage_wiring=warn,",
         "fsqlite_wal::checkpoint_executor=warn,",
         "fsqlite_vdbe::jit=warn,",
-        "fsqlite_vdbe::engine=warn",
+        "fsqlite_vdbe::engine=warn,",
+        "jit_compile=error,",
+        "execute_statement_dispatch=error",
     )
+}
+
+const fn noisy_dependency_log_clamp_directives() -> [&'static str; 13] {
+    [
+        "fsqlite=warn",
+        "fsqlite_core=warn",
+        "fsqlite_mvcc=warn",
+        "fsqlite_wal=warn",
+        "fsqlite_vdbe=warn",
+        "mvcc=warn",
+        "checkpoint=warn",
+        "fsqlite.storage_wiring=warn",
+        "fsqlite_wal::checkpoint_executor=warn",
+        "fsqlite_vdbe::jit=warn",
+        "fsqlite_vdbe::engine=warn",
+        "jit_compile=error",
+        "execute_statement_dispatch=error",
+    ]
+}
+
+fn allow_noisy_dependency_logs() -> bool {
+    env_var_is_truthy("AM_ALLOW_NOISY_DEP_LOGS")
 }
 
 fn env_var_is_truthy(name: &str) -> bool {
@@ -2760,18 +2799,6 @@ fn query_preflight_banner_stats_from_max_ids(
     })
 }
 
-fn query_table_count(conn: &mcp_agent_mail_db::DbConn, table: &str) -> u64 {
-    let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
-    conn.query_sync(&sql, &[])
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<i64>("cnt").ok())
-        })
-        .and_then(|count| u64::try_from(count).ok())
-        .unwrap_or(0)
-}
-
 fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
@@ -2783,21 +2810,13 @@ fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
     if sqlite_path != ":memory:" && !Path::new(&sqlite_path).exists() {
         return PreflightBannerStats::default();
     }
-    // Keep startup stats on FrankenSQLite while avoiding schema/migration work.
-    // We only need read-only counts for banner rendering.
-    let Ok((conn, _opened_path)) = open_sqlite_with_fallback(&sqlite_path) else {
+    // Keep startup stats on the fastest possible path: banner counts are purely
+    // cosmetic, so do not trigger fallback probing or sqlite auto-recovery here.
+    // The real readiness/server startup path still performs full recovery checks.
+    let Ok(conn) = mcp_agent_mail_db::DbConn::open_file(&sqlite_path) else {
         return PreflightBannerStats::default();
     };
-    if let Some(stats) = query_preflight_banner_stats_batched(&conn) {
-        return stats;
-    }
-    PreflightBannerStats {
-        projects: query_table_count(&conn, "projects"),
-        agents: query_table_count(&conn, "agents"),
-        messages: query_table_count(&conn, "messages"),
-        file_reservations: query_table_count(&conn, "file_reservations"),
-        contact_links: query_table_count(&conn, "agent_links"),
-    }
+    query_preflight_banner_stats_batched(&conn).unwrap_or_default()
 }
 
 fn emit_pre_tui_startup_banner(config: &Config) {
@@ -11651,6 +11670,15 @@ mod tests {
         assert!(filter.contains("mvcc=warn"));
         assert!(filter.contains("checkpoint=warn"));
         assert!(filter.contains("fsqlite.storage_wiring=warn"));
+        assert!(filter.contains("jit_compile=error"));
+        assert!(filter.contains("execute_statement_dispatch=error"));
+    }
+
+    #[test]
+    fn noisy_dependency_log_clamp_directives_include_known_spam_targets() {
+        let directives = noisy_dependency_log_clamp_directives();
+        assert!(directives.contains(&"jit_compile=error"));
+        assert!(directives.contains(&"execute_statement_dispatch=error"));
     }
 
     #[test]
@@ -19076,8 +19104,7 @@ mod tests {
         std::fs::create_dir_all(&target_human_key).unwrap();
 
         let git_init = std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
+            .args(["init", "-q", "-b", "main"])
             .current_dir(&repo_root)
             .status()
             .unwrap();
@@ -21108,7 +21135,7 @@ mod tests {
         conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY)")
             .expect("create projects");
         // Intentionally omit the other required tables to trigger a graceful
-        // batched-query miss so callers can fallback to per-table probes.
+        // batched-query miss so callers can fall back to default zero stats.
         assert!(query_preflight_banner_stats_batched(&conn).is_none());
     }
 

@@ -116,9 +116,9 @@ pub fn resolve_project(conn: &mcp_agent_mail_db::DbConn, key: &str) -> CliResult
 
     if let Some(row) = rows.first() {
         return Ok(ResolvedProject {
-            id: row.get_named("id").unwrap_or(0),
-            slug: row.get_named("slug").unwrap_or_default(),
-            human_key: row.get_named("human_key").unwrap_or_default(),
+            id: require_i64_column(row, "id", "projects")?,
+            slug: require_text_column(row, "slug", "projects")?,
+            human_key: require_text_column(row, "human_key", "projects")?,
         });
     }
 
@@ -132,9 +132,9 @@ pub fn resolve_project(conn: &mcp_agent_mail_db::DbConn, key: &str) -> CliResult
 
     if let Some(row) = rows.first() {
         return Ok(ResolvedProject {
-            id: row.get_named("id").unwrap_or(0),
-            slug: row.get_named("slug").unwrap_or_default(),
-            human_key: row.get_named("human_key").unwrap_or_default(),
+            id: require_i64_column(row, "id", "projects")?,
+            slug: require_text_column(row, "slug", "projects")?,
+            human_key: require_text_column(row, "human_key", "projects")?,
         });
     }
 
@@ -171,8 +171,8 @@ pub fn resolve_agent(
 
     if let Some(row) = rows.first() {
         return Ok(ResolvedAgent {
-            id: row.get_named("id").unwrap_or(0),
-            name: row.get_named("name").unwrap_or_default(),
+            id: require_i64_column(row, "id", "agents")?,
+            name: require_text_column(row, "name", "agents")?,
             project_id,
         });
     }
@@ -253,6 +253,30 @@ pub fn resolve_bool(primary: bool, negated: bool, default: bool) -> bool {
 
 fn open_conn(cfg: &DbPoolConfig) -> CliResult<mcp_agent_mail_db::DbConn> {
     crate::open_db_sync_with_database_url(&cfg.database_url)
+}
+
+fn require_i64_column(
+    row: &sqlmodel_core::Row,
+    column: &'static str,
+    table: &'static str,
+) -> CliResult<i64> {
+    row.get_named(column).map_err(|_| {
+        CliError::Other(format!(
+            "invalid {table} row: missing or non-integer `{column}` column"
+        ))
+    })
+}
+
+fn require_text_column(
+    row: &sqlmodel_core::Row,
+    column: &'static str,
+    table: &'static str,
+) -> CliResult<String> {
+    row.get_named(column).map_err(|_| {
+        CliError::Other(format!(
+            "invalid {table} row: missing or non-text `{column}` column"
+        ))
+    })
 }
 
 // ── Async runtime helper ────────────────────────────────────────────────

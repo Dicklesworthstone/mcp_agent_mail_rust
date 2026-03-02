@@ -1634,7 +1634,7 @@ pub fn run_default_gates(runner_config: &GateRunnerConfig) -> GateReport {
 /// # Returns
 /// A `GateReport` with all results and summary.
 pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig) -> GateReport {
-    use std::sync::{Arc, Mutex};
+    use std::collections::HashSet;
     use std::thread;
 
     let total = gates.len();
@@ -1658,56 +1658,68 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
         })
         .collect();
 
-    let results: Arc<Mutex<Vec<(usize, GateResult)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut indexed_results: Vec<(usize, GateResult)> = Vec::with_capacity(total);
 
     // Phase 1: Run compile gates in parallel
     eprintln!("Phase 1: Running compile gates in parallel...");
     {
-        let handles: Vec<_> = compile_gates
+        let handles: Vec<(usize, GateConfig, thread::JoinHandle<GateResult>)> = compile_gates
             .iter()
             .map(|(idx, gate)| {
                 if let Some(callback) = runner_config.on_gate_start {
                     callback(&gate.name, *idx, total);
                 }
                 let gate = (*gate).clone();
+                let gate_for_thread = gate.clone();
                 let config = runner_config.clone();
                 let idx = *idx;
-                let results = Arc::clone(&results);
-                thread::spawn(move || {
-                    eprintln!("  [{}] Starting: {}", idx + 1, gate.name);
-                    let result = run_gate(&gate, &config);
+                let handle = thread::spawn(move || {
+                    eprintln!("  [{}] Starting: {}", idx + 1, gate_for_thread.name);
+                    let result = run_gate(&gate_for_thread, &config);
                     if let Some(callback) = config.on_gate_complete {
                         callback(&result);
                     }
                     eprintln!(
                         "  [{}] Finished: {} - {}",
                         idx + 1,
-                        gate.name,
+                        gate_for_thread.name,
                         result.status.as_str()
                     );
-                    let mut locked = results.lock().unwrap();
-                    locked.push((idx, result));
-                })
+                    result
+                });
+                (idx, gate, handle)
             })
             .collect();
 
         // Wait for all compile gates to complete
-        for handle in handles {
-            let _ = handle.join();
+        for (idx, gate, handle) in handles {
+            let result = match handle.join() {
+                Ok(result) => result,
+                Err(_) => {
+                    let failure = GateResult::fail_simple(
+                        &gate,
+                        Duration::from_secs(0),
+                        "gate worker thread panicked",
+                    );
+                    if let Some(callback) = runner_config.on_gate_complete {
+                        callback(&failure);
+                    }
+                    failure
+                }
+            };
+            indexed_results.push((idx, result));
         }
     }
 
     // Check if compile phase failed - if so, skip remaining gates
-    let compile_failed = {
-        let locked = results.lock().unwrap();
-        locked.iter().any(|(_, r)| r.status == GateStatus::Fail)
-    };
+    let compile_failed = indexed_results
+        .iter()
+        .any(|(_, r)| r.status == GateStatus::Fail);
 
     // Phase 2: Run remaining gates in parallel (if compile passed)
     if compile_failed {
         eprintln!("Phase 2: Skipping remaining gates due to compile failures...");
         // Add skip results for remaining gates
-        let mut locked = results.lock().unwrap();
         for (idx, gate) in &other_gates {
             if let Some(callback) = runner_config.on_gate_start {
                 callback(&gate.name, *idx, total);
@@ -1716,61 +1728,82 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
             if let Some(callback) = runner_config.on_gate_complete {
                 callback(&result);
             }
-            locked.push((*idx, result));
+            indexed_results.push((*idx, result));
         }
     } else {
         eprintln!(
             "Phase 2: Running remaining {} gates in parallel...",
             other_gates.len()
         );
-        let handles: Vec<_> = other_gates
+        let handles: Vec<(usize, GateConfig, thread::JoinHandle<GateResult>)> = other_gates
             .iter()
             .map(|(idx, gate)| {
                 if let Some(callback) = runner_config.on_gate_start {
                     callback(&gate.name, *idx, total);
                 }
                 let gate = (*gate).clone();
+                let gate_for_thread = gate.clone();
                 let config = runner_config.clone();
                 let idx = *idx;
-                let results = Arc::clone(&results);
-                thread::spawn(move || {
-                    eprintln!("  [{}] Starting: {}", idx + 1, gate.name);
-                    let result = run_gate(&gate, &config);
+                let handle = thread::spawn(move || {
+                    eprintln!("  [{}] Starting: {}", idx + 1, gate_for_thread.name);
+                    let result = run_gate(&gate_for_thread, &config);
                     if let Some(callback) = config.on_gate_complete {
                         callback(&result);
                     }
                     eprintln!(
                         "  [{}] Finished: {} - {}",
                         idx + 1,
-                        gate.name,
+                        gate_for_thread.name,
                         result.status.as_str()
                     );
-                    let mut locked = results.lock().unwrap();
-                    locked.push((idx, result));
-                })
+                    result
+                });
+                (idx, gate, handle)
             })
             .collect();
 
         // Wait for all gates to complete
-        for handle in handles {
-            let _ = handle.join();
+        for (idx, gate, handle) in handles {
+            let result = match handle.join() {
+                Ok(result) => result,
+                Err(_) => {
+                    let failure = GateResult::fail_simple(
+                        &gate,
+                        Duration::from_secs(0),
+                        "gate worker thread panicked",
+                    );
+                    if let Some(callback) = runner_config.on_gate_complete {
+                        callback(&failure);
+                    }
+                    failure
+                }
+            };
+            indexed_results.push((idx, result));
+        }
+    }
+
+    // Ensure we always return one result per gate (never panic on internal runner faults).
+    let seen: HashSet<usize> = indexed_results.iter().map(|(idx, _)| *idx).collect();
+    if seen.len() != total {
+        for (idx, gate) in gates.iter().enumerate() {
+            if !seen.contains(&idx) {
+                let failure = GateResult::fail_simple(
+                    gate,
+                    Duration::from_secs(0),
+                    "gate result missing due to runner internal fault",
+                );
+                if let Some(callback) = runner_config.on_gate_complete {
+                    callback(&failure);
+                }
+                indexed_results.push((idx, failure));
+            }
         }
     }
 
     // Sort results by original gate order
-    let mut final_results: Vec<_> = {
-        let locked = results.lock().unwrap();
-        locked.clone()
-    };
-    final_results.sort_by_key(|(idx, _)| *idx);
-    let results: Vec<GateResult> = final_results.into_iter().map(|(_, r)| r).collect();
-
-    // Verify we have all gates
-    assert_eq!(
-        results.len(),
-        total,
-        "parallel run must produce same number of results"
-    );
+    indexed_results.sort_by_key(|(idx, _)| *idx);
+    let results: Vec<GateResult> = indexed_results.into_iter().map(|(_, r)| r).collect();
 
     GateReport::new_with_gate_configs(runner_config.mode, results, gates)
 }
