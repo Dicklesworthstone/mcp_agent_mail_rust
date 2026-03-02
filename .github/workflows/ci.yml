@@ -592,6 +592,73 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # ── Incident regression gates (br-2k3qx non-regression) ────────────
+  incident-regression-gates:
+    name: Incident Regression Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries
+        run: |
+          cargo build -p mcp-agent-mail-cli
+          cargo build -p mcp-agent-mail
+
+      - name: Run CI Oracle Gate
+        id: oracle
+        run: |
+          set -uo pipefail
+          GATE_DIR="tests/artifacts/ci_oracle_gate/$(date -u '+%Y%m%d_%H%M%S')"
+          mkdir -p "${GATE_DIR}"
+          echo "GATE_DIR=${GATE_DIR}" >> "${GITHUB_ENV}"
+
+          GATE_RC=0
+          scripts/ci_oracle_gate.sh \
+            --mode deterministic \
+            --output-dir "${GATE_DIR}" \
+            --robot-timeout-secs 10 \
+            --verbose || GATE_RC=$?
+
+          echo "GATE_RC=${GATE_RC}" >> "${GITHUB_ENV}"
+
+          # Exit 2 (WARN) is acceptable — only exit 1 is a gate failure
+          if [ "${GATE_RC}" -eq 1 ]; then
+            echo "Oracle gate FAIL — proceeding to regression classification"
+          elif [ "${GATE_RC}" -eq 2 ]; then
+            echo "Oracle gate WARN — whitelisted mismatches only"
+          elif [ "${GATE_RC}" -eq 0 ]; then
+            echo "Oracle gate PASS"
+          else
+            echo "Oracle gate unexpected exit: ${GATE_RC}"
+          fi
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_incident.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Verify incident regression categories
+        if: always()
+        run: |
+          set -euo pipefail
+          GATE_DIR="${GATE_DIR:-tests/artifacts/ci_oracle_gate/latest}"
+          python3 scripts/verify_incident_gates.py "${GATE_DIR}"
+
+      - name: Upload incident gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-regression-gate-artifacts
+          path: tests/artifacts/ci_oracle_gate/
+          retention-days: 14
+          if-no-files-found: ignore
+
   # ── Help snapshots (golden contract drift detection) ────────────────
   snapshots:
     name: Help Snapshots
@@ -639,7 +706,7 @@ jobs:
     name: Skip Guard
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [test, mode-matrix, native-command-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, snapshots]
+    needs: [test, mode-matrix, native-command-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, incident-regression-gates, snapshots]
     if: always()
     steps:
       - name: Verify all required jobs passed
@@ -652,6 +719,7 @@ jobs:
           echo "  perf-security: ${{ needs.perf-security.result }}"
           echo "  e2e-dual-mode: ${{ needs.e2e-dual-mode.result }}"
           echo "  search-v3-e2e: ${{ needs.search-v3-e2e.result }}"
+          echo "  incident-regression-gates: ${{ needs.incident-regression-gates.result }}"
           echo "  snapshots: ${{ needs.snapshots.result }}"
 
           FAILED=0
@@ -663,6 +731,7 @@ jobs:
             "${{ needs.perf-security.result }}" \
             "${{ needs.e2e-dual-mode.result }}" \
             "${{ needs.search-v3-e2e.result }}" \
+            "${{ needs.incident-regression-gates.result }}" \
             "${{ needs.snapshots.result }}"; do
             if [ "$result" != "success" ]; then
               echo "FAIL: job result = $result"

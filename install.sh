@@ -432,6 +432,8 @@ PYTHON_DB_FOUND=0
 PYTHON_DB_PATH=""
 PYTHON_DB_MIGRATED_PATH=""
 MIGRATED_BEARER_TOKEN=""
+RUST_DB_PATH=""
+PYTHON_ALIAS_DISPLACED_COUNT=0
 
 # T1.1: Detect Python am alias in shell rc files
 detect_python_alias() {
@@ -442,11 +444,28 @@ detect_python_alias() {
   PYTHON_ALIAS_KIND=""
   PYTHON_ALIAS_HAS_MARKERS=0
 
-  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile")
+  local rc_files=(
+    "$HOME/.zshrc"
+    "$HOME/.zprofile"
+    "$HOME/.zshenv"
+    "$HOME/.zlogin"
+    "$HOME/.bashrc"
+    "$HOME/.bash_profile"
+    "$HOME/.profile"
+    "$HOME/.aliases"
+    "$HOME/.zsh_aliases"
+    "$HOME/.config/zsh/.zshrc"
+    "$HOME/.config/zsh/aliases.zsh"
+  )
   # Fish uses different syntax; check config.fish too
   local fish_config="$HOME/.config/fish/config.fish"
   if [ -f "$fish_config" ]; then
     rc_files+=("$fish_config")
+  fi
+  if [ -d "$HOME/.config/fish/conf.d" ]; then
+    while IFS= read -r fish_file; do
+      [ -n "$fish_file" ] && rc_files+=("$fish_file")
+    done < <(find "$HOME/.config/fish/conf.d" -maxdepth 1 -type f -name "*.fish" 2>/dev/null | sort || true)
   fi
 
   for rc in "${rc_files[@]}"; do
@@ -548,15 +567,19 @@ detect_python_binary() {
       fi
     fi
 
-    # Check shebang or content for Python references
+    # Check shebang/content for Python references, but only for text files.
+    # Reading compiled binaries into command substitution can emit warnings
+    # like "ignored null byte in input" on macOS bash.
     if [ -f "$am_path" ] && [ -r "$am_path" ]; then
-      local first_lines
-      first_lines=$(head -5 "$am_path" 2>/dev/null || true)
-      if echo "$first_lines" | grep -qiE "python|#!/.*python"; then
-        PYTHON_BINARY_FOUND=1
-        PYTHON_BINARY_PATH="$am_path"
-        verbose "detect_python_binary:found script_path=${PYTHON_BINARY_PATH}"
-        return 0
+      if LC_ALL=C grep -Iq . "$am_path" 2>/dev/null; then
+        if head -5 "$am_path" 2>/dev/null | LC_ALL=C grep -qiE "python|#!/.*python"; then
+          PYTHON_BINARY_FOUND=1
+          PYTHON_BINARY_PATH="$am_path"
+          verbose "detect_python_binary:found script_path=${PYTHON_BINARY_PATH}"
+          return 0
+        fi
+      else
+        verbose "detect_python_binary:skip_binary path=${am_path}"
       fi
     fi
 
@@ -580,6 +603,32 @@ detect_python_binary() {
     verbose "detect_python_binary:found importable=${PYTHON_BINARY_PATH}"
   fi
   if [ "$PYTHON_BINARY_FOUND" -eq 0 ]; then verbose "detect_python_binary:not_found"; fi
+}
+
+# Copy a SQLite database as a consistent snapshot.
+# Prefer sqlite3 .backup to safely include WAL content and avoid torn copies.
+copy_sqlite_snapshot() {
+  local src_db="$1"
+  local dest_db="$2"
+
+  rm -f "$dest_db" "${dest_db}-wal" "${dest_db}-shm" 2>/dev/null || true
+
+  if command -v sqlite3 >/dev/null 2>&1; then
+    local tmp_db escaped_tmp
+    tmp_db="${dest_db}.tmp.$$"
+    escaped_tmp=$(printf "%s" "$tmp_db" | sed "s/'/''/g")
+    rm -f "$tmp_db" 2>/dev/null || true
+    if sqlite3 "$src_db" ".timeout 5000" ".backup '$escaped_tmp'" >/dev/null 2>&1; then
+      mv -f "$tmp_db" "$dest_db"
+      return 0
+    fi
+    verbose "copy_sqlite_snapshot:fallback_copy reason=sqlite3_backup_failed src=${src_db} dest=${dest_db}"
+    rm -f "$tmp_db" 2>/dev/null || true
+  fi
+
+  cp -p "$src_db" "$dest_db"
+  [ -f "${src_db}-wal" ] && cp -p "${src_db}-wal" "${dest_db}-wal"
+  [ -f "${src_db}-shm" ] && cp -p "${src_db}-shm" "${dest_db}-shm"
 }
 
 # T1.3: Detect Python virtualenv and git clone
@@ -679,18 +728,35 @@ detect_python() {
 }
 
 # T1.4: Displace Python alias (comment out with backup)
-displace_python_alias() {
+displace_single_python_alias() {
   [ "$PYTHON_ALIAS_FOUND" -eq 0 ] && return 0
 
   local rc="$PYTHON_ALIAS_FILE"
   [ -z "$rc" ] && return 0
   [ -f "$rc" ] || return 0
+  if [ ! -r "$rc" ]; then
+    warn "Cannot read shell config file: $rc"
+    return 1
+  fi
+  if [ ! -w "$rc" ]; then
+    warn "Cannot modify shell config file (not writable): $rc"
+    return 1
+  fi
+  local rc_dir
+  rc_dir=$(dirname "$rc")
+  if [ ! -w "$rc_dir" ]; then
+    warn "Cannot write alongside shell config file (directory not writable): $rc_dir"
+    return 1
+  fi
 
   # Create timestamped backup
   local timestamp
   timestamp=$(date +%Y%m%d_%H%M%S)
-  local backup="${rc}.bak.mcp-agent-mail-${timestamp}"
-  cp -p "$rc" "$backup"
+  local backup="${rc}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
+  if ! cp -p "$rc" "$backup"; then
+    warn "Failed to create backup before modifying alias file: $backup"
+    return 1
+  fi
   verbose "displace_python_alias:backup rc=${rc} backup=${backup}"
   info "Backed up $rc -> $backup"
 
@@ -773,7 +839,11 @@ displace_python_alias() {
   chmod --reference="$rc" "$tmpfile" 2>/dev/null || chmod "$(stat -f '%A' "$rc" 2>/dev/null || echo 644)" "$tmpfile" 2>/dev/null || true
 
   # Atomic rename
-  mv "$tmpfile" "$rc"
+  if ! mv "$tmpfile" "$rc"; then
+    warn "Failed to atomically replace shell config file: $rc"
+    rm -f "$tmpfile" 2>/dev/null || true
+    return 1
+  fi
   if command -v diff >/dev/null 2>&1; then
     local diff_out
     diff_out=$(diff -u "$backup" "$rc" 2>/dev/null || true)
@@ -785,6 +855,120 @@ displace_python_alias() {
   fi
   ok "Python alias disabled in $rc"
   ok "Backup at $backup"
+}
+
+displace_python_alias() {
+  local pass=0
+  local max_passes=32
+  local displaced=0
+
+  PYTHON_ALIAS_DISPLACED_COUNT=0
+
+  while [ "$pass" -lt "$max_passes" ]; do
+    detect_python_alias
+    [ "$PYTHON_ALIAS_FOUND" -eq 1 ] || break
+
+    if ! displace_single_python_alias; then
+      warn "Failed to disable one of the detected 'am' alias/function entries."
+      break
+    fi
+
+    displaced=$((displaced + 1))
+    pass=$((pass + 1))
+  done
+
+  PYTHON_ALIAS_DISPLACED_COUNT="$displaced"
+
+  detect_python_alias
+  if [ "$PYTHON_ALIAS_FOUND" -eq 1 ]; then
+    warn "Could not fully disable all 'am' alias/function definitions."
+    warn "Remaining entry: ${PYTHON_ALIAS_FILE}:${PYTHON_ALIAS_LINE}"
+    return 1
+  fi
+
+  if [ "$PYTHON_ALIAS_DISPLACED_COUNT" -gt 0 ]; then
+    warn "If this shell already loaded an old 'am' alias/function, clear it now:"
+    warn "  unalias am 2>/dev/null || true"
+    warn "  unset -f am 2>/dev/null || true"
+    warn "  hash -r 2>/dev/null || true"
+  fi
+
+  return 0
+}
+
+# Displace a legacy am launcher binary/script that appears earlier in PATH
+# than the freshly installed Rust binary. This is especially important when a
+# Python virtualenv prepends its own `am` script.
+displace_python_binary() {
+  local candidates=()
+  local seen=""
+  local displaced_count=0
+
+  if [ "$PYTHON_BINARY_FOUND" -eq 1 ] && [ -n "$PYTHON_BINARY_PATH" ]; then
+    case "$PYTHON_BINARY_PATH" in
+      python\ *|python3\ *|*"-m mcp_agent_mail"*)
+        verbose "displace_python_binary:skip non-file launcher=${PYTHON_BINARY_PATH}"
+        ;;
+      *)
+        candidates+=("$PYTHON_BINARY_PATH")
+        ;;
+    esac
+  fi
+  if [ -n "${PYTHON_VENV_PATH:-}" ]; then
+    candidates+=("$PYTHON_VENV_PATH/bin/am")
+  fi
+  if [ "$PYTHON_CLONE_FOUND" -eq 1 ] && [ -n "${PYTHON_CLONE_PATH:-}" ]; then
+    candidates+=("$PYTHON_CLONE_PATH/.venv/bin/am")
+    candidates+=("$PYTHON_CLONE_PATH/venv/bin/am")
+  fi
+
+  local bin_path
+  for bin_path in "${candidates[@]}"; do
+    [ -n "$bin_path" ] || continue
+    case "$seen" in
+      *"|$bin_path|"*) continue;;
+    esac
+    seen="${seen}|${bin_path}|"
+
+    [ "$bin_path" = "$DEST/$BIN_CLI" ] && continue
+    [ "$bin_path" = "$DEST/am" ] && continue
+    [ -e "$bin_path" ] || continue
+
+    local bin_dir
+    bin_dir=$(dirname "$bin_path")
+    if [ ! -w "$bin_dir" ] || [ ! -w "$bin_path" ]; then
+      warn "Cannot displace legacy am launcher (not writable): $bin_path"
+      return 1
+    fi
+
+    local timestamp backup tmpfile
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup="${bin_path}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
+    if ! cp -p "$bin_path" "$backup"; then
+      warn "Failed to backup legacy am launcher before displacement: $bin_path"
+      return 1
+    fi
+
+    tmpfile="${bin_path}.tmp.mcp-agent-mail.$$"
+    cat > "$tmpfile" <<EOF
+#!/usr/bin/env bash
+exec "$DEST/$BIN_CLI" "\$@"
+EOF
+    chmod 0755 "$tmpfile"
+    if ! mv "$tmpfile" "$bin_path"; then
+      warn "Failed to replace legacy am launcher at: $bin_path"
+      rm -f "$tmpfile" 2>/dev/null || true
+      return 1
+    fi
+
+    ok "Legacy am launcher displaced at $bin_path"
+    ok "Backup at $backup"
+    displaced_count=$((displaced_count + 1))
+  done
+
+  if [ "$displaced_count" -eq 0 ]; then
+    verbose "displace_python_binary:no_displacements"
+  fi
 }
 
 # T1.5: Stop running Python server processes
@@ -823,6 +1007,35 @@ resolve_database_path() {
   PYTHON_DB_FOUND=0
   PYTHON_DB_PATH=""
   RUST_STORAGE_ROOT="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
+  RUST_DB_PATH=""
+
+  # If a Rust config already exists, prefer its DB/storage target so import
+  # lands where `am` will actually read after installation.
+  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  if [ -f "$rust_env" ]; then
+    local cfg_db_url cfg_db_path cfg_storage_root
+    cfg_db_url=$(grep -E '^[[:space:]]*DATABASE_URL=' "$rust_env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+    if [ -n "$cfg_db_url" ]; then
+      cfg_db_path=$(echo "$cfg_db_url" | sed -n 's|^sqlite[^:]*:///||p')
+      cfg_db_path="${cfg_db_path/#\~/$HOME}"
+      if [ -n "$cfg_db_path" ] && [ "$cfg_db_path" != ":memory:" ] && [ "$cfg_db_path" != "/:memory:" ]; then
+        case "$cfg_db_path" in
+          /*) RUST_DB_PATH="$cfg_db_path";;
+        esac
+      fi
+    fi
+    if [ -z "$RUST_DB_PATH" ]; then
+      cfg_storage_root=$(grep -E '^[[:space:]]*STORAGE_ROOT=' "$rust_env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+      if [ -n "$cfg_storage_root" ]; then
+        cfg_storage_root="${cfg_storage_root/#\~/$HOME}"
+        case "$cfg_storage_root" in
+          /*) RUST_STORAGE_ROOT="$cfg_storage_root";;
+        esac
+      fi
+    fi
+  fi
+  [ -z "$RUST_DB_PATH" ] && RUST_DB_PATH="$RUST_STORAGE_ROOT/storage.sqlite3"
+  RUST_STORAGE_ROOT="$(dirname "$RUST_DB_PATH")"
 
   # Candidate paths where Python might have stored the database
   local candidates=()
@@ -902,7 +1115,7 @@ resolve_database_path() {
   info "Found Python database at: $PYTHON_DB_PATH"
 
   # Determine if the DB is already in the Rust storage root
-  local rust_db="$RUST_STORAGE_ROOT/storage.sqlite3"
+  local rust_db="$RUST_DB_PATH"
   local abs_python_db
   abs_python_db=$(cd "$(dirname "$PYTHON_DB_PATH")" 2>/dev/null && echo "$(pwd)/$(basename "$PYTHON_DB_PATH")")
   local abs_rust_db
@@ -917,17 +1130,19 @@ resolve_database_path() {
   mkdir -p "$RUST_STORAGE_ROOT"
 
   if [ -f "$rust_db" ] && [ -s "$rust_db" ]; then
-    # Rust DB already exists — don't overwrite
-    info "Rust database already exists at $rust_db"
-    info "Python database preserved at $PYTHON_DB_PATH"
-    info "To migrate manually: am migrate-python-db $PYTHON_DB_PATH"
+    local rust_backup_ts rust_backup
+    rust_backup_ts=$(date -u +%Y%m%dT%H%M%SZ)
+    rust_backup="${rust_db}.pre-python-import-${rust_backup_ts}"
+    copy_sqlite_snapshot "$rust_db" "$rust_backup"
+    ok "Backed up existing Rust database to $rust_backup"
+    copy_sqlite_snapshot "$PYTHON_DB_PATH" "$rust_db"
+    ok "Replaced Rust database with Python snapshot at $rust_db"
+    export DATABASE_URL="sqlite+aiosqlite:///$rust_db"
+    PYTHON_DB_MIGRATED_PATH="$rust_db"
     return 0
   fi
 
-  cp -p "$PYTHON_DB_PATH" "$rust_db"
-  # Also copy WAL/SHM files if present
-  [ -f "${PYTHON_DB_PATH}-wal" ] && cp -p "${PYTHON_DB_PATH}-wal" "${rust_db}-wal"
-  [ -f "${PYTHON_DB_PATH}-shm" ] && cp -p "${PYTHON_DB_PATH}-shm" "${rust_db}-shm"
+  copy_sqlite_snapshot "$PYTHON_DB_PATH" "$rust_db"
   ok "Copied Python database to $rust_db"
 
   # Set DATABASE_URL so Rust binary finds it
@@ -939,6 +1154,9 @@ resolve_database_path() {
 # Python .env may live in clone dir or storage root. Rust reads the same
 # env vars but DATABASE_URL format differs (no aiosqlite prefix).
 migrate_env_config() {
+  [ -z "${RUST_STORAGE_ROOT:-}" ] && RUST_STORAGE_ROOT="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
+  [ -z "${RUST_DB_PATH:-}" ] && RUST_DB_PATH="$RUST_STORAGE_ROOT/storage.sqlite3"
+
   # Find Python .env file
   local env_file=""
   local candidates=()
@@ -968,6 +1186,13 @@ migrate_env_config() {
 
   # Don't overwrite if Rust config already exists
   if [ -f "$rust_env" ]; then
+    if [ -z "${MIGRATED_BEARER_TOKEN:-}" ]; then
+      MIGRATED_BEARER_TOKEN=$(grep -E '^[[:space:]]*HTTP_BEARER_TOKEN=' "$rust_env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+      MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN%\"}"
+      MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN#\"}"
+      MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN%\'}"
+      MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN#\'}"
+    fi
     info "Rust config already exists at $rust_env — preserving"
     return 0
   fi
@@ -978,6 +1203,8 @@ migrate_env_config() {
   local compat_vars="HTTP_HOST HTTP_PORT HTTP_PATH HTTP_BEARER_TOKEN STORAGE_ROOT DATABASE_URL TUI_ENABLED LLM_ENABLED LLM_DEFAULT_MODEL WORKTREES_ENABLED"
   # Python-only vars to skip
   local skip_pattern="^(SQLALCHEMY_|ALEMBIC_|UVICORN_|ASYNC_)"
+  local seen_database_url=0
+  local seen_storage_root=0
 
   local tmpfile="${rust_env}.tmp.$$"
   {
@@ -1003,25 +1230,61 @@ migrate_env_config() {
 
       # Transform DATABASE_URL: strip aiosqlite prefix, resolve path
       if [ "$key" = "DATABASE_URL" ]; then
-        # Strip sqlite+aiosqlite:/// prefix → just the file path
-        local db_path
-        db_path=$(echo "$val" | sed 's|^sqlite[+a-z]*:///||')
-        # If relative path, make it relative to storage root
-        case "$db_path" in
-          /*) echo "DATABASE_URL=sqlite:///$db_path";;
-          *)  echo "DATABASE_URL=sqlite:///$RUST_STORAGE_ROOT/$db_path";;
-        esac
+        seen_database_url=1
+        echo "DATABASE_URL=sqlite:///$RUST_DB_PATH"
         continue
+      fi
+
+      if [ "$key" = "STORAGE_ROOT" ]; then
+        seen_storage_root=1
+        echo "STORAGE_ROOT=$RUST_STORAGE_ROOT"
+        continue
+      fi
+
+      if [ "$key" = "HTTP_BEARER_TOKEN" ] && [ -z "${MIGRATED_BEARER_TOKEN:-}" ]; then
+        MIGRATED_BEARER_TOKEN="$val"
+        MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN%\"}"
+        MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN#\"}"
+        MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN%\'}"
+        MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN#\'}"
       fi
 
       # Pass through compatible vars as-is
       echo "$line"
     done < "$env_file"
+
+    if [ "$seen_database_url" -eq 0 ]; then
+      echo "DATABASE_URL=sqlite:///$RUST_DB_PATH"
+    fi
+    if [ "$seen_storage_root" -eq 0 ]; then
+      echo "STORAGE_ROOT=$RUST_STORAGE_ROOT"
+    fi
   } > "$tmpfile"
 
   mv "$tmpfile" "$rust_env"
   chmod 600 "$rust_env"  # Restrict access (may contain tokens)
   ok "Migrated .env config to $rust_env"
+}
+
+resolve_migrated_bearer_token() {
+  if [ -n "${MIGRATED_BEARER_TOKEN:-}" ]; then
+    printf '%s' "$MIGRATED_BEARER_TOKEN"
+    return 0
+  fi
+
+  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  if [ -f "$rust_env" ]; then
+    local token
+    token=$(grep -E '^[[:space:]]*HTTP_BEARER_TOKEN=' "$rust_env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+    token="${token%\"}"
+    token="${token#\"}"
+    token="${token%\'}"
+    token="${token#\'}"
+    printf '%s' "$token"
+    return 0
+  fi
+
+  printf ''
 }
 
 # T2.3: Atomic binary installation (crash-safe)
@@ -1059,36 +1322,39 @@ preflight_checks() {
 
 maybe_add_path() {
   verbose "maybe_add_path:start path=${PATH} dest=${DEST} easy=${EASY}"
+  local dest_in_path=0
+  local updated=0
   case ":$PATH:" in
-    *:"$DEST":*)
-      verbose "maybe_add_path:dest_already_in_path"
-      return 0
-      ;;
-    *)
-      if [ "$EASY" -eq 1 ]; then
-        UPDATED=0
-        for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-          if [ -e "$rc" ] && [ -w "$rc" ]; then
-            if ! grep -F "$DEST" "$rc" >/dev/null 2>&1; then
-              echo "export PATH=\"$DEST:\$PATH\"" >> "$rc"
-              verbose "maybe_add_path:appended rc=${rc} export PATH=\"$DEST:\$PATH\""
-            fi
-            UPDATED=1
-          fi
-        done
-        if [ "$UPDATED" -eq 1 ]; then
-          warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use am / mcp-agent-mail"
-          verbose "maybe_add_path:updated_shell_rc=1"
-        else
-          warn "Add $DEST to PATH to use am / mcp-agent-mail"
-          verbose "maybe_add_path:updated_shell_rc=0"
-        fi
-      else
-        warn "Add $DEST to PATH to use am / mcp-agent-mail"
-        verbose "maybe_add_path:easy_mode_disabled_no_update"
-      fi
-    ;;
+    *:"$DEST":*) dest_in_path=1 ;;
   esac
+
+  if [ "$EASY" -eq 1 ]; then
+    for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+      if [ -e "$rc" ] && [ -w "$rc" ]; then
+        if ! grep -F "export PATH=\"$DEST:\$PATH\"" "$rc" >/dev/null 2>&1; then
+          echo "export PATH=\"$DEST:\$PATH\"" >> "$rc"
+          verbose "maybe_add_path:appended rc=${rc} export PATH=\"$DEST:\$PATH\""
+          updated=1
+        fi
+      fi
+    done
+    if [ "$updated" -eq 1 ]; then
+      warn "PATH precedence updated in ~/.zshrc/.bashrc; restart shell to use Rust am/mcp-agent-mail"
+      verbose "maybe_add_path:updated_shell_rc=1"
+    elif [ "$dest_in_path" -eq 0 ]; then
+      warn "Add $DEST to PATH to use am / mcp-agent-mail"
+      verbose "maybe_add_path:updated_shell_rc=0"
+    else
+      verbose "maybe_add_path:path_already_configured"
+    fi
+  else
+    if [ "$dest_in_path" -eq 0 ]; then
+      warn "Add $DEST to PATH to use am / mcp-agent-mail"
+      verbose "maybe_add_path:easy_mode_disabled_no_update"
+    else
+      verbose "maybe_add_path:path_present_no_easy_mode"
+    fi
+  fi
   verbose "maybe_add_path:done"
 }
 
@@ -1442,14 +1708,20 @@ update_mcp_configs() {
   verbose "update_mcp_configs:start binary=${binary_path} cli=${am_cli}"
 
   # Check that setup subcommand exists (graceful degradation for older builds)
-  if ! "$am_cli" setup --help >/dev/null 2>&1; then
+  if ! AM_INTERFACE_MODE=cli "$am_cli" setup --help >/dev/null 2>&1; then
     verbose "update_mcp_configs:skip reason=no_setup_subcommand"
     return 0
   fi
 
   set +e
   local setup_out
-  setup_out=$("$am_cli" setup run --yes --no-hooks 2>&1)
+  local setup_token
+  setup_token="$(resolve_migrated_bearer_token)"
+  if [ -n "$setup_token" ]; then
+    setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 2>&1)
+  else
+    setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 2>&1)
+  fi
   local setup_rc=$?
   set -e
 
@@ -2356,7 +2628,16 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
 
   if [ "$MIGRATE_PYTHON" -eq 1 ]; then
     stop_python_server
-    displace_python_alias
+    if ! displace_python_alias; then
+      err "Failed to fully displace legacy 'am' alias/function definitions."
+      err "Please remove remaining alias/function manually, then rerun installer."
+      exit 1
+    fi
+    if ! displace_python_binary; then
+      err "Failed to displace legacy 'am' launcher in PATH."
+      err "Please remove or rename the legacy launcher manually, then rerun installer."
+      exit 1
+    fi
     resolve_database_path
     migrate_env_config
   fi
@@ -2428,11 +2709,13 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   migration_end=0
   migration_seconds=0
   migration_output=""
+  migration_output_fallback=""
   migration_before_counts=""
   migration_after_counts=""
+  migration_has_unresolved_warnings=0
   migration_before_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
   migration_start=$(date +%s)
-  if migration_output=$(DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate 2>&1); then
+  if migration_output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
     migration_end=$(date +%s)
     migration_seconds=$((migration_end - migration_start))
     migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
@@ -2442,16 +2725,60 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "migration:output ${line}"
     done <<< "$migration_output"
-    ok "Database schema migrated"
+    if printf "%s\n" "$migration_output" | grep -qiE "database still contains TEXT timestamps|migration completed with errors|migration needed: run"; then
+      migration_has_unresolved_warnings=1
+    fi
+    if [ "$migration_has_unresolved_warnings" -eq 1 ]; then
+      ok "Database schema migrated"
+      warn "Database migration completed with unresolved warnings."
+      warn "Review migration output with --verbose and retry if needed:"
+      warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
+    else
+      ok "Database schema migrated"
+    fi
+  elif migration_output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+    migration_end=$(date +%s)
+    migration_seconds=$((migration_end - migration_start))
+    migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+    verbose "migration:ok_fallback duration_s=${migration_seconds} db=${PYTHON_DB_MIGRATED_PATH}"
+    verbose "migration:row_counts_before ${migration_before_counts}"
+    verbose "migration:row_counts_after ${migration_after_counts}"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:output_primary ${line}"
+    done <<< "$migration_output"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:output_fallback ${line}"
+    done <<< "$migration_output_fallback"
+    if printf "%s\n%s\n" "$migration_output" "$migration_output_fallback" | grep -qiE "database still contains TEXT timestamps|migration completed with errors|migration needed: run"; then
+      migration_has_unresolved_warnings=1
+    fi
+    if [ "$migration_has_unresolved_warnings" -eq 1 ]; then
+      ok "Database schema migrated"
+      warn "Database migration completed with unresolved warnings."
+      warn "Review migration output with --verbose and retry if needed:"
+      warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
+    else
+      ok "Database schema migrated"
+    fi
   else
+    first_error_line=""
+    retry_error_line=""
     migration_end=$(date +%s)
     migration_seconds=$((migration_end - migration_start))
     verbose "migration:failed duration_s=${migration_seconds} db=${PYTHON_DB_MIGRATED_PATH}"
     verbose "migration:row_counts_before ${migration_before_counts}"
     while IFS= read -r line; do
-      [ -n "$line" ] && verbose "migration:output ${line}"
+      [ -n "$line" ] && verbose "migration:output_primary ${line}"
     done <<< "$migration_output"
-    warn "Database migration had issues (you can retry with: am migrate)"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:output_fallback ${line}"
+    done <<< "$migration_output_fallback"
+    first_error_line=$(printf "%s\n" "$migration_output" | head -1)
+    retry_error_line=$(printf "%s\n" "$migration_output_fallback" | head -1)
+    [ -n "$first_error_line" ] && warn "Primary migration error: $first_error_line"
+    [ -n "$retry_error_line" ] && warn "Fallback migration error: $retry_error_line"
+    warn "Database migration had issues. Retry with:"
+    warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
   fi
 fi
 

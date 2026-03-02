@@ -449,6 +449,140 @@ fi
 set -e
 
 # ===========================================================================
+# Case 15: Installer migration remains robust with binary PATH entries + MCP mode env
+# ===========================================================================
+e2e_case_banner "Installer migration: no null-byte warning and CLI-mode override"
+
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  e2e_skip "sqlite3 unavailable; skipping installer migration robustness case"
+else
+  INSTALL_HOME="$(mktemp -d "${TMPDIR:-/tmp}/fresh_install_migrate.XXXXXX")"
+  INSTALL_DEST="${INSTALL_HOME}/.local/bin"
+  LEGACY_BIN_DIR="${INSTALL_HOME}/legacy_bin"
+  LEGACY_CLONE="${INSTALL_HOME}/legacy_python_clone"
+  LEGACY_DB="${LEGACY_CLONE}/storage.sqlite3"
+  LEGACY_STORAGE="${INSTALL_HOME}/.mcp_agent_mail_git_mailbox_repo"
+  INSTALL_RUN_DIR="${INSTALL_HOME}/project"
+  INSTALL_ART_STAGE="${INSTALL_HOME}/artifact"
+  INSTALL_ART_PATH="${INSTALL_HOME}/mcp-agent-mail-test.tar.xz"
+  INSTALL_STDOUT_FILE="${INSTALL_HOME}/install_stdout.txt"
+  INSTALL_STDERR_FILE="${INSTALL_HOME}/install_stderr.txt"
+  INSTALL_SH="${SCRIPT_DIR}/../../install.sh"
+
+  mkdir -p "$INSTALL_DEST" "$LEGACY_BIN_DIR" "$LEGACY_CLONE" "$LEGACY_STORAGE" "$INSTALL_ART_STAGE" "$INSTALL_RUN_DIR"
+
+  # Fake executable with NUL bytes to exercise PATH probing safely.
+  printf '\177ELF\000\001\002python-probe' > "${LEGACY_BIN_DIR}/am"
+  chmod +x "${LEGACY_BIN_DIR}/am"
+
+  cat > "${LEGACY_CLONE}/pyproject.toml" <<'EOF'
+[project]
+name = "mcp_agent_mail"
+version = "0.0.0"
+EOF
+
+  cat > "${INSTALL_HOME}/.zshrc" <<EOF
+alias am='cd "${LEGACY_CLONE}" && python3 -m mcp_agent_mail'
+EOF
+  cat > "${INSTALL_HOME}/.aliases" <<'EOF'
+alias am='python3 -m mcp_agent_mail'
+EOF
+  cat > "${INSTALL_HOME}/.zprofile" <<EOF
+am() {
+  cd "${LEGACY_CLONE}"
+  python3 -m mcp_agent_mail "\$@"
+}
+EOF
+  mkdir -p "${INSTALL_HOME}/.config/fish/conf.d"
+  cat > "${INSTALL_HOME}/.config/fish/conf.d/legacy_am.fish" <<'EOF'
+function am
+  python3 -m mcp_agent_mail $argv
+end
+EOF
+  cat > "${INSTALL_HOME}/.bashrc" <<'EOF'
+# baseline bashrc
+EOF
+
+  sqlite3 "${LEGACY_DB}" <<'SQL'
+CREATE TABLE IF NOT EXISTS projects (
+  id INTEGER PRIMARY KEY,
+  slug TEXT NOT NULL,
+  human_key TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+INSERT INTO projects (id, slug, human_key, created_at)
+VALUES (1, 'legacy-install-smoke', '/tmp/legacy-install-smoke', '2026-03-01 12:34:56.123456');
+SQL
+
+  cat > "${LEGACY_CLONE}/.env" <<EOF
+DATABASE_URL=sqlite+aiosqlite:///${LEGACY_DB}
+STORAGE_ROOT=${LEGACY_CLONE}
+HTTP_BEARER_TOKEN=test-token
+EOF
+
+  cp "$SERVER_BIN" "${INSTALL_ART_STAGE}/mcp-agent-mail"
+  cp "$CLI_BIN" "${INSTALL_ART_STAGE}/am"
+  chmod +x "${INSTALL_ART_STAGE}/mcp-agent-mail" "${INSTALL_ART_STAGE}/am"
+  tar -cJf "${INSTALL_ART_PATH}" -C "${INSTALL_ART_STAGE}" am mcp-agent-mail
+
+  INSTALL_VERSION="$("$CLI_BIN" --version 2>/dev/null | awk '{print $2}' | head -1)"
+  INSTALL_VERSION="${INSTALL_VERSION#v}"
+  [ -n "${INSTALL_VERSION}" ] || INSTALL_VERSION="0.0.0"
+
+  set +e
+  (
+    cd "${INSTALL_RUN_DIR}"
+    HOME="${INSTALL_HOME}" \
+    PATH="${LEGACY_BIN_DIR}:/usr/bin:/bin" \
+    STORAGE_ROOT="${LEGACY_STORAGE}" \
+    AM_INTERFACE_MODE="mcp" \
+    AM_INSTALL_SKIP_MCP_SETUP="1" \
+    bash "${INSTALL_SH}" \
+      --version "v${INSTALL_VERSION}" \
+      --artifact-url "file://${INSTALL_ART_PATH}" \
+      --dest "${INSTALL_DEST}" \
+      --offline \
+      --no-verify \
+      --no-gum \
+      --easy-mode
+  ) >"${INSTALL_STDOUT_FILE}" 2>"${INSTALL_STDERR_FILE}"
+  INSTALL_RC=$?
+  set -e
+
+  INSTALL_STDOUT="$(cat "${INSTALL_STDOUT_FILE}" 2>/dev/null || true)"
+  INSTALL_STDERR="$(cat "${INSTALL_STDERR_FILE}" 2>/dev/null || true)"
+  e2e_save_artifact "case_15_install_stdout.txt" "${INSTALL_STDOUT}"
+  e2e_save_artifact "case_15_install_stderr.txt" "${INSTALL_STDERR}"
+
+  e2e_assert_exit_code "installer exits cleanly with AM_INTERFACE_MODE=mcp" "0" "${INSTALL_RC}"
+  e2e_assert_not_contains "installer avoids null-byte PATH probe warning" "${INSTALL_STDERR}" "ignored null byte in input"
+  e2e_assert_contains "installer migration completed in CLI override mode" "${INSTALL_STDOUT}" "Database schema migrated"
+  e2e_assert_contains "installer emits current-shell alias cleanup hint" "${INSTALL_STDOUT}" "unalias am"
+
+  MIGRATED_DB="${LEGACY_STORAGE}/storage.sqlite3"
+  e2e_assert_file_exists "migrated DB exists after installer run" "${MIGRATED_DB}"
+  MIGRATED_DB_READ_OK="$(sqlite3 "${MIGRATED_DB}" "SELECT 1;" 2>/dev/null || true)"
+  e2e_assert_eq "migrated DB remains readable" "1" "${MIGRATED_DB_READ_OK}"
+
+  for rc in \
+    "${INSTALL_HOME}/.zshrc" \
+    "${INSTALL_HOME}/.aliases" \
+    "${INSTALL_HOME}/.zprofile" \
+    "${INSTALL_HOME}/.config/fish/conf.d/legacy_am.fish"
+  do
+    ACTIVE_ALIAS_COUNT="$(awk '
+      /^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\(\))/ && $0 !~ /^[[:space:]]*#/ {
+        c++
+      }
+      END { print c+0 }
+    ' "${rc}" 2>/dev/null)"
+    e2e_assert_eq "legacy am alias/function disabled in $(basename "${rc}")" "0" "${ACTIVE_ALIAS_COUNT}"
+  done
+
+  rm -rf "${INSTALL_HOME}" 2>/dev/null || true
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 e2e_summary
