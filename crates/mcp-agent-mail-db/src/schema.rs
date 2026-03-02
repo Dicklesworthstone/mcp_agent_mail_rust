@@ -2570,9 +2570,11 @@ mod tests {
             &[],
         ).expect("create messages table");
         conn.execute_sync(
-            "INSERT INTO messages (project_id, sender_id, thread_id, subject, body_md, importance, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            &[Value::BigInt(1), Value::BigInt(1), Value::Text("t1".to_string()), Value::Text("Hi".to_string()), Value::Text("body".to_string()), Value::Text("urgent".to_string()), Value::BigInt(200)],
-        ).expect("insert message");
+            "INSERT INTO messages (project_id, sender_id, thread_id, subject, body_md, importance, created_ts) \
+             VALUES (1, 1, 't1', 'Hi', 'body', 'urgent', 200)",
+            &[],
+        )
+        .expect("insert message");
 
         conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'to', read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
@@ -2609,8 +2611,7 @@ mod tests {
             applied.iter().any(|id| id == "v4_idx_mr_agent_ack"),
             "v4_idx_mr_agent_ack should be applied: {applied:?}"
         );
-
-        // Verify queries using the new indexes work with data.
+        // Verify representative queries over indexed columns still work.
         let rows = conn
             .query_sync(
                 "SELECT agent_id FROM message_recipients WHERE agent_id = 1 AND ack_ts IS NULL",

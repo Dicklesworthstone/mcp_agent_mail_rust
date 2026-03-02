@@ -989,10 +989,10 @@ pub async fn register_agent(
         Value::BigInt(now),
     ];
 
-    if let Some(td) = task_description {
-        normalize_sets.push("task_description = ?");
-        normalize_base_params.push(Value::Text(td.to_string()));
-    }
+    // Keep behavior consistent with insert path: omitted task_description clears
+    // to empty string instead of preserving stale content.
+    normalize_sets.push("task_description = ?");
+    normalize_base_params.push(Value::Text(task_description.unwrap_or_default().to_string()));
     if let Some(ap) = attachments_policy {
         normalize_sets.push("attachments_policy = ?");
         normalize_base_params.push(Value::Text(ap.to_string()));
@@ -1439,7 +1439,8 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
         }
     }
 
-    // Batch UPDATE using VALUES CTE: 1 prepare/execute per chunk instead of per-agent.
+    // Batch UPDATE using VALUES CTE without UPDATE ... FROM so it remains
+    // compatible with FrankenSQLite's VDBE codegen path.
     // SQLite parameter limit is 999; 2 params per row → max 499 per chunk.
     let entries: Vec<_> = pending.iter().collect();
 
@@ -1447,8 +1448,11 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
         let placeholders = std::iter::repeat_n("(?,?)", chunk.len()).collect::<Vec<_>>();
         let sql = format!(
             "WITH batch(agent_id, new_ts) AS (VALUES {}) \
-             UPDATE agents SET last_active_ts = MAX(agents.last_active_ts, batch.new_ts) \
-             FROM batch WHERE agents.id = batch.agent_id",
+             UPDATE agents \
+             SET last_active_ts = MAX(last_active_ts, ( \
+                 SELECT b.new_ts FROM batch b WHERE b.agent_id = agents.id \
+             )) \
+             WHERE id IN (SELECT agent_id FROM batch)",
             placeholders.join(",")
         );
         let mut params = Vec::with_capacity(chunk.len() * 2);
@@ -5934,11 +5938,11 @@ mod tests {
 
     #[test]
     fn release_reservation_chunk_plan_none_within_bind_limits() {
-        assert_eq!(release_reservation_chunk_plan(100, 100), None);
+        assert_eq!(release_reservation_chunk_plan(64, 64), None);
         assert_eq!(
             release_reservation_chunk_plan(
-                MAX_RELEASE_RESERVATION_FILTER_ITEMS / 2,
-                MAX_RELEASE_RESERVATION_FILTER_ITEMS / 2
+                MAX_RELEASE_RESERVATION_CHUNK_ITEMS,
+                MAX_RELEASE_RESERVATION_CHUNK_ITEMS
             ),
             None
         );
