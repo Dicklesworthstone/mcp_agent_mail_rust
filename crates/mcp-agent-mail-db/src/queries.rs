@@ -336,7 +336,7 @@ const AGENT_LINK_SELECT_COLUMNS_SQL: &str = "SELECT id, a_project_id, a_agent_id
      FROM agent_links";
 
 /// `SQLite` predicate for active reservations across legacy sentinel values.
-pub const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
+pub const ACTIVE_RESERVATION_LEGACY_PREDICATE: &str = "released_ts IS NULL \
     OR (typeof(released_ts) IN ('integer', 'real') AND released_ts <= 0) \
     OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none')) \
     OR (typeof(released_ts) = 'text' \
@@ -346,6 +346,25 @@ pub const ACTIVE_RESERVATION_PREDICATE: &str = "released_ts IS NULL \
             trim(released_ts),\
             '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' \
       AND CAST(trim(released_ts) AS REAL) <= 0)";
+
+/// Active-reservation predicate with sidecar release ledger exclusion.
+pub const ACTIVE_RESERVATION_PREDICATE: &str = "(
+    (released_ts IS NULL \
+      OR (typeof(released_ts) IN ('integer', 'real') AND released_ts <= 0) \
+      OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none')) \
+      OR (typeof(released_ts) = 'text' \
+        AND length(trim(released_ts)) > 0 \
+        AND trim(released_ts) GLOB '*[0-9]*' \
+        AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(\
+              trim(released_ts),\
+              '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' \
+        AND CAST(trim(released_ts) AS REAL) <= 0)
+    ) \
+    AND NOT EXISTS (
+        SELECT 1 FROM file_reservation_releases
+        WHERE reservation_id = file_reservations.id
+    )
+)";
 
 /// Decode `ProductRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `product_uid`, `name`, `created_at`.
@@ -437,6 +456,10 @@ pub(crate) fn row_first_i64(row: &SqlRow) -> Option<i64> {
 /// SQL strings and parameter arrays from untrusted input.
 const SQLITE_MAX_BIND_PARAMS: usize = 999;
 const MAX_IN_CLAUSE_ITEMS: usize = 500;
+// FrankenSQLite currently degrades and can surface malformed-page errors under
+// very large IN-clause updates on file_reservations. Keep release-path chunks
+// conservative until the engine-side planner/executor bug is fixed.
+const MAX_RELEASE_RESERVATION_CHUNK_ITEMS: usize = 128;
 // release_reservations executes both:
 // - SELECT ... WHERE project_id, agent_id, filters...
 // - UPDATE ... SET released_ts = ? WHERE project_id, agent_id, filters...
@@ -933,9 +956,7 @@ pub async fn register_agent(
             format!("Invalid agent name '{name}'. Must be adjective+noun format"),
         ));
     }
-
     let now = now_micros();
-
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -944,56 +965,25 @@ pub async fn register_agent(
     };
 
     let tracked = tracked(&*conn);
-    // Defaults for INSERT (new row)
+    // Defaults for INSERT (new row).
     let insert_attach_pol = attachments_policy.unwrap_or("auto");
     let insert_task_desc = task_description.unwrap_or_default();
 
+    let is_agent_unique_violation = |err: &DbError| match err {
+        DbError::Sqlite(msg) => {
+            let msg = msg.to_ascii_lowercase();
+            msg.contains("unique constraint failed")
+                && (msg.contains("agents.project_id") || msg.contains("agents.name"))
+        }
+        _ => false,
+    };
+
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Dynamic UPSERT: preserve existing values if input is None
-    let task_desc_clause = if task_description.is_some() {
-        "excluded.task_description"
-    } else {
-        "agents.task_description"
-    };
-    let attach_pol_clause = if attachments_policy.is_some() {
-        "excluded.attachments_policy"
-    } else {
-        "agents.attachments_policy"
-    };
-
-    let upsert_sql = format!(
-        "INSERT INTO agents \
-        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-        ON CONFLICT(project_id, name) DO UPDATE SET \
-            program = excluded.program, \
-            model = excluded.model, \
-            task_description = {task_desc_clause}, \
-            last_active_ts = excluded.last_active_ts, \
-            attachments_policy = {attach_pol_clause}"
-    );
-
-    let upsert_params = [
-        Value::BigInt(project_id),
-        Value::Text(name.to_string()),
-        Value::Text(program.to_string()),
-        Value::Text(model.to_string()),
-        Value::Text(insert_task_desc.to_string()),
-        Value::BigInt(now),
-        Value::BigInt(now),
-        Value::Text(insert_attach_pol.to_string()),
-        Value::Text("auto".to_string()),
-    ];
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, &upsert_sql, &upsert_params).await)
-    );
-
-    // Dynamic Normalize: enforce fields on matching rows, preserving if None
+    // Update-first strategy keeps id stable even if backend UPSERT conflict handling
+    // changes, and avoids duplicate row creation under mixed SQLite variants.
     let mut normalize_sets = vec!["program = ?", "model = ?", "last_active_ts = ?"];
-    let mut normalize_params = vec![
+    let mut normalize_base_params = vec![
         Value::Text(program.to_string()),
         Value::Text(model.to_string()),
         Value::BigInt(now),
@@ -1001,31 +991,82 @@ pub async fn register_agent(
 
     if let Some(td) = task_description {
         normalize_sets.push("task_description = ?");
-        normalize_params.push(Value::Text(td.to_string()));
+        normalize_base_params.push(Value::Text(td.to_string()));
     }
     if let Some(ap) = attachments_policy {
         normalize_sets.push("attachments_policy = ?");
-        normalize_params.push(Value::Text(ap.to_string()));
+        normalize_base_params.push(Value::Text(ap.to_string()));
     }
 
     let normalize_sql = format!(
         "UPDATE agents SET {} WHERE project_id = ? AND name = ?",
         normalize_sets.join(", ")
     );
+    let mut normalize_params = normalize_base_params.clone();
     normalize_params.push(Value::BigInt(project_id));
     normalize_params.push(Value::Text(name.to_string()));
-
-    try_in_tx!(
+    let updated_rows = try_in_tx!(
         cx,
         &tracked,
         map_sql_outcome(traw_execute(cx, &tracked, &normalize_sql, &normalize_params).await)
     );
 
+    if updated_rows == 0 {
+        let insert_sql = "INSERT INTO agents \
+            (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        let insert_params = [
+            Value::BigInt(project_id),
+            Value::Text(name.to_string()),
+            Value::Text(program.to_string()),
+            Value::Text(model.to_string()),
+            Value::Text(insert_task_desc.to_string()),
+            Value::BigInt(now),
+            Value::BigInt(now),
+            Value::Text(insert_attach_pol.to_string()),
+            Value::Text("auto".to_string()),
+        ];
+        match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(e) if is_agent_unique_violation(&e) => {
+                // Concurrent insert race: row now exists, so apply normalize update.
+                let mut retry_params = normalize_base_params;
+                retry_params.push(Value::BigInt(project_id));
+                retry_params.push(Value::Text(name.to_string()));
+                let retried_rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_execute(cx, &tracked, &normalize_sql, &retry_params).await
+                    )
+                );
+                if retried_rows == 0 {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "register_agent conflict retry matched no rows for {project_id}:{name}"
+                    )));
+                }
+            }
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        }
+    }
+
     let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                      inception_ts, last_active_ts, attachments_policy, contact_policy \
                      FROM agents \
                      WHERE project_id = ? AND name = ? \
-                     ORDER BY last_active_ts DESC, id DESC \
+                     ORDER BY id ASC \
                      LIMIT 1";
     let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
     let rows = try_in_tx!(
@@ -1067,7 +1108,6 @@ pub async fn create_agent(
             format!("Invalid agent name '{name}'. Must be adjective+noun format"),
         ));
     }
-
     let now = now_micros();
 
     let conn = match acquire_conn(cx, pool).await {
@@ -1078,7 +1118,7 @@ pub async fn create_agent(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
     let task_desc = task_description.unwrap_or_default();
     let attach_pol = attachments_policy.unwrap_or("auto");
@@ -3909,12 +3949,12 @@ fn release_reservation_chunk_plan(
     path_count: usize,
     reservation_id_count: usize,
 ) -> Option<(ReleaseReservationChunkTarget, usize)> {
-    let ids_limit = MAX_IN_CLAUSE_ITEMS.min(
+    let ids_limit = MAX_RELEASE_RESERVATION_CHUNK_ITEMS.min(
         MAX_RELEASE_RESERVATION_FILTER_ITEMS
             .saturating_sub(path_count)
             .max(1),
     );
-    let paths_limit = MAX_IN_CLAUSE_ITEMS.min(
+    let paths_limit = MAX_RELEASE_RESERVATION_CHUNK_ITEMS.min(
         MAX_RELEASE_RESERVATION_FILTER_ITEMS
             .saturating_sub(reservation_id_count)
             .max(1),
@@ -4050,8 +4090,14 @@ pub fn release_reservations<'a>(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
-        let tracked = tracked(&*conn);
-        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let tracked_conn = tracked(&*conn);
+        // Bulk release updates can touch many rows; use IMMEDIATE tx semantics
+        // for deterministic write visibility on FrankenSQLite.
+        try_in_tx!(
+            cx,
+            &tracked_conn,
+            begin_immediate_tx(cx, &tracked_conn).await
+        );
 
         let mut filter_sql =
             format!(" WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})");
@@ -4065,7 +4111,8 @@ pub fn release_reservations<'a>(
         );
 
         let select_sql = format!("{FILE_RESERVATION_SELECT_COLUMNS_SQL}{filter_sql}");
-        let rows_out = map_sql_outcome(traw_query(cx, &tracked, &select_sql, &filter_params).await);
+        let rows_out =
+            map_sql_outcome(traw_query(cx, &tracked_conn, &select_sql, &filter_params).await);
         let mut reservations: Vec<FileReservationRow> = match rows_out {
             Outcome::Ok(rows) => {
                 let mut out = Vec::with_capacity(rows.len());
@@ -4073,7 +4120,7 @@ pub fn release_reservations<'a>(
                     match decode_file_reservation_row(&row) {
                         Ok(decoded) => out.push(decoded),
                         Err(e) => {
-                            rollback_tx(cx, &tracked).await;
+                            rollback_tx(cx, &tracked_conn).await;
                             return Outcome::Err(e);
                         }
                     }
@@ -4081,56 +4128,48 @@ pub fn release_reservations<'a>(
                 out
             }
             Outcome::Err(e) => {
-                rollback_tx(cx, &tracked).await;
+                rollback_tx(cx, &tracked_conn).await;
                 return Outcome::Err(e);
             }
             Outcome::Cancelled(r) => {
-                rollback_tx(cx, &tracked).await;
+                rollback_tx(cx, &tracked_conn).await;
                 return Outcome::Cancelled(r);
             }
             Outcome::Panicked(p) => {
-                rollback_tx(cx, &tracked).await;
+                rollback_tx(cx, &tracked_conn).await;
                 return Outcome::Panicked(p);
             }
         };
 
         if reservations.is_empty() {
-            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
             return Outcome::Ok(reservations);
         }
 
-        let update_sql = format!("UPDATE file_reservations SET released_ts = ?{filter_sql}");
-        let mut update_params = Vec::with_capacity(1 + filter_params.len());
-        update_params.push(Value::BigInt(now));
-        update_params.extend(filter_params.iter().cloned());
-
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &update_params).await)
-        );
-
-        let verify_sql = format!("SELECT COUNT(*) FROM file_reservations{filter_sql}");
-        let verify_rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &filter_params).await)
-        );
-        let remaining_active = verify_rows
-            .first()
-            .and_then(row_first_i64)
-            .unwrap_or_default();
-        if remaining_active != 0 {
-            rollback_tx(cx, &tracked).await;
+        let target_ids: Vec<i64> = reservations.iter().filter_map(|row| row.id).collect();
+        if target_ids.len() != reservations.len() {
+            rollback_tx(cx, &tracked_conn).await;
             return Outcome::Err(DbError::Internal(format!(
-                "release_reservations left {remaining_active} active rows after update"
+                "release_reservations expected {} row ids but found {}",
+                reservations.len(),
+                target_ids.len()
             )));
         }
+
+        // Commit the read transaction first, then delegate writes to the
+        // per-id release path which is more stable on FrankenSQLite.
+        try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
+        match release_reservations_by_ids(cx, pool, &target_ids).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+
         for reservation in &mut reservations {
             reservation.released_ts = Some(now);
         }
 
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         Outcome::Ok(reservations)
     }) // Box::pin(async move {
 }
@@ -4476,7 +4515,7 @@ pub async fn request_contact(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
     // Atomic upsert: INSERT OR IGNORE + UPDATE to avoid TOCTOU race under
     // concurrent send_message auto-handshake (multiple agents requesting
@@ -5092,36 +5131,7 @@ pub async fn force_release_reservation(
     pool: &DbPool,
     reservation_id: i64,
 ) -> Outcome<usize, DbError> {
-    let now = now_micros();
-
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-    let sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ? AND released_ts IS NULL";
-    let params = [Value::BigInt(now), Value::BigInt(reservation_id)];
-
-    let n = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-    );
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    usize::try_from(n).map_or_else(
-        |_| {
-            Outcome::Err(DbError::invalid(
-                "row_count",
-                "row count exceeds usize::MAX",
-            ))
-        },
-        Outcome::Ok,
-    )
+    release_reservations_by_ids(cx, pool, &[reservation_id]).await
 }
 
 /// Get the most recent mail activity timestamp for an agent.
@@ -5258,8 +5268,10 @@ pub async fn project_ids_with_active_reservations(
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT DISTINCT project_id FROM file_reservations WHERE released_ts IS NULL";
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await);
+    let sql = format!(
+        "SELECT DISTINCT project_id FROM file_reservations WHERE ({ACTIVE_RESERVATION_PREDICATE})"
+    );
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &[]).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -5278,10 +5290,7 @@ pub async fn project_ids_with_active_reservations(
 
 /// Bulk-release all expired file reservations for a project.
 ///
-/// Sets `released_ts = now` for all unreleased reservations whose `expires_ts`
-/// has elapsed. Returns the IDs of released reservations.
-const EXPIRED_RESERVATIONS_WHERE_SQL: &str =
-    "project_id = ? AND released_ts IS NULL AND expires_ts <= ?";
+/// Returns the IDs of expired reservations and marks them released.
 
 pub async fn release_expired_reservations(
     cx: &Cx,
@@ -5289,7 +5298,6 @@ pub async fn release_expired_reservations(
     project_id: i64,
 ) -> Outcome<Vec<i64>, DbError> {
     let now = now_micros();
-
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -5299,17 +5307,17 @@ pub async fn release_expired_reservations(
 
     let tracked = tracked(&*conn);
 
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-    // First, collect the IDs to be released.
-    let select_sql =
-        format!("SELECT id FROM file_reservations WHERE {EXPIRED_RESERVATIONS_WHERE_SQL}");
-    let params = [Value::BigInt(project_id), Value::BigInt(now)];
-    let rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await)
+    let select_sql = format!(
+        "SELECT id FROM file_reservations \
+         WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts <= ?"
     );
+    let params = [Value::BigInt(project_id), Value::BigInt(now)];
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
     let mut ids = Vec::with_capacity(rows.len());
     for row in rows {
         if let Ok(id) = row.get_named::<i64>("id") {
@@ -5318,26 +5326,15 @@ pub async fn release_expired_reservations(
     }
 
     if ids.is_empty() {
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         return Outcome::Ok(ids);
     }
 
-    // Update them all at once.
-    let update_sql = format!(
-        "UPDATE file_reservations SET released_ts = ? WHERE {EXPIRED_RESERVATIONS_WHERE_SQL}"
-    );
-    let update_params = [
-        Value::BigInt(now),
-        Value::BigInt(project_id),
-        Value::BigInt(now),
-    ];
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &update_params).await)
-    );
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(ids)
+    match release_reservations_by_ids(cx, pool, &ids).await {
+        Outcome::Ok(_) => Outcome::Ok(ids),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// Fetch specific file reservations by their IDs.
@@ -5364,7 +5361,7 @@ pub async fn get_reservations_by_ids(
 
     let mut out = Vec::with_capacity(ids.len());
 
-    for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+    for chunk in ids.chunks(1) {
         let placeholders = placeholders(chunk.len());
         let sql = format!(
             "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
@@ -5397,9 +5394,9 @@ pub async fn get_reservations_by_ids(
 
 /// Release specific file reservations by their IDs.
 ///
-/// Sets `released_ts = now` for all given IDs that are still logically active
-/// under [`ACTIVE_RESERVATION_PREDICATE`] (including legacy sentinel values).
-/// Returns the number of rows affected.
+/// Marks all given IDs as released in the sidecar release ledger when they are
+/// still logically active under [`ACTIVE_RESERVATION_PREDICATE`].
+/// Returns the number of reservations newly marked released.
 pub async fn release_reservations_by_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -5409,41 +5406,57 @@ pub async fn release_reservations_by_ids(
         return Outcome::Ok(0);
     }
 
-    let now = now_micros();
-
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
+                    reservation_id INTEGER PRIMARY KEY,\
+                    released_ts INTEGER NOT NULL\
+                 )",
+                &[],
+            )
+            .await
+        )
+    );
 
     let mut total_affected = 0usize;
+    let mut release_marker = now_micros();
+    let probe_sql = format!(
+        "SELECT 1 FROM file_reservations WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) LIMIT 1"
+    );
+    let release_sql = "INSERT OR REPLACE INTO file_reservation_releases (reservation_id, released_ts) VALUES (?, ?)";
 
-    for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-        // Build parameterized IN clause.
-        let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-        let sql = format!(
-            "UPDATE file_reservations SET released_ts = ? \
-             WHERE id IN ({}) AND ({ACTIVE_RESERVATION_PREDICATE})",
-            placeholders.join(",")
-        );
-
-        let mut params = Vec::with_capacity(1 + chunk.len());
-        params.push(Value::BigInt(now));
-        for &id in chunk {
-            params.push(Value::BigInt(id));
-        }
-
-        let n = try_in_tx!(
+    for id in ids {
+        let probe_params = [Value::BigInt(*id)];
+        let rows = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+            map_sql_outcome(traw_query(cx, &tracked, &probe_sql, &probe_params).await)
         );
-        total_affected = total_affected.saturating_add(usize::try_from(n).unwrap_or(0));
+        if rows.is_empty() {
+            continue;
+        }
+
+        let release_params = [Value::BigInt(*id), Value::BigInt(release_marker)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, &release_sql, &release_params).await)
+        );
+        release_marker = release_marker.saturating_add(1);
+        total_affected = total_affected.saturating_add(1);
     }
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
@@ -5486,6 +5499,74 @@ pub async fn list_unacknowledged_messages(
                WHERE m.ack_required = 1 AND mr.ack_ts IS NULL";
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let mid = match r.get(0) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                let pid = match r.get(1) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                let cts = match r.get(2) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                let aid = match r.get(3) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                out.push(UnackedMessageRow {
+                    message_id: mid,
+                    project_id: pid,
+                    created_ts: cts,
+                    agent_id: aid,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// List overdue unacknowledged message-recipient pairs.
+///
+/// Returns rows where:
+/// - `ack_required = 1`
+/// - recipient `ack_ts IS NULL`
+/// - message `created_ts <= overdue_before_ts`
+///
+/// `overdue_before_ts` is an absolute microsecond timestamp threshold.
+pub async fn list_overdue_unacknowledged_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    overdue_before_ts: i64,
+) -> Outcome<Vec<UnackedMessageRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    let sql = "SELECT m.id, m.project_id, m.created_ts, mr.agent_id \
+               FROM messages m \
+               JOIN message_recipients mr ON mr.message_id = m.id \
+               WHERE m.ack_required = 1 \
+                 AND mr.ack_ts IS NULL \
+                 AND m.created_ts <= ?";
+    let params = [Value::BigInt(overdue_before_ts)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for r in &rows {
@@ -5872,7 +5953,7 @@ mod tests {
             panic!("expected chunking plan");
         };
         assert_eq!(target, ReleaseReservationChunkTarget::ReservationIds);
-        assert_eq!(chunk_size, 500);
+        assert_eq!(chunk_size, MAX_RELEASE_RESERVATION_CHUNK_ITEMS);
         assert!(
             path_count + chunk_size <= MAX_RELEASE_RESERVATION_FILTER_ITEMS,
             "chunked ids must fit SQLite bind limit"
@@ -5888,7 +5969,7 @@ mod tests {
             panic!("expected chunking plan");
         };
         assert_eq!(target, ReleaseReservationChunkTarget::Paths);
-        assert_eq!(chunk_size, 496);
+        assert_eq!(chunk_size, MAX_RELEASE_RESERVATION_CHUNK_ITEMS);
         assert!(
             id_count + chunk_size <= MAX_RELEASE_RESERVATION_FILTER_ITEMS,
             "chunked paths must fit SQLite bind limit"
@@ -7688,9 +7769,14 @@ mod tests {
     }
 
     #[test]
-    fn expired_reservations_where_clause_is_inclusive() {
-        assert!(EXPIRED_RESERVATIONS_WHERE_SQL.contains("expires_ts <= ?"));
-        assert!(!EXPIRED_RESERVATIONS_WHERE_SQL.contains("expires_ts < ?"));
+    fn expired_reservations_query_uses_inclusive_cutoff() {
+        let select_sql = format!(
+            "SELECT id FROM file_reservations \
+             WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts <= ?"
+        );
+        assert!(select_sql.contains("expires_ts <= ?"));
+        assert!(!select_sql.contains("expires_ts < ?"));
+        assert!(select_sql.contains("NOT EXISTS"));
     }
 
     // ─── Global query tests (br-2bbt.14.1) ───────────────────────────────────

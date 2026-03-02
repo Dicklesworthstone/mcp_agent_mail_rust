@@ -27,6 +27,7 @@ use mcp_agent_mail_db::search_scope::{
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
 use mcp_agent_mail_db::search_v3::{get_bridge, init_bridge};
 use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig};
+use sqlmodel_core::{Connection, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
 use tantivy::doc;
@@ -197,6 +198,43 @@ fn set_reservation_released_ts(pool: &DbPool, reservation_id: i64, released_ts: 
             .expect("update released_ts");
         }
     });
+}
+
+/// Update a reservation's `released_ts` to a text sentinel via raw SQL.
+fn set_reservation_released_ts_text(pool: &DbPool, reservation_id: i64, released_ts: &str) {
+    let escaped = released_ts.replace('\'', "''");
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET released_ts = '{escaped}' WHERE id = {reservation_id}"
+            ))
+            .expect("update released_ts text");
+        }
+    });
+}
+
+fn count_release_ledger_rows(pool: &DbPool) -> i64 {
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            let rows = conn
+                .query(&cx, "SELECT COUNT(*) FROM file_reservation_releases", &[])
+                .await
+                .into_result()
+                .expect("query release ledger count");
+            rows.first()
+                .and_then(|row| row.get(0))
+                .and_then(|value| match value {
+                    Value::BigInt(n) => Some(*n),
+                    Value::Int(n) => Some(i64::from(*n)),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        }
+    })
 }
 
 // =============================================================================
@@ -979,6 +1017,167 @@ fn release_reservations_large_id_filter_handles_many_rows() {
 }
 
 #[test]
+fn release_reservations_by_ids_large_handles_many_rows() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+
+    let paths: Vec<String> = (0..1100)
+        .map(|idx| format!("src/generated/by_ids_{idx}.rs"))
+        .collect();
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let expected = path_refs.len();
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &path_refs,
+            3600,
+            true,
+            "bulk-by-ids-release-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("bulk reserve failed: {other:?}"),
+        }
+    });
+    assert_eq!(created.len(), expected, "expected all reservations created");
+
+    let release_ids: Vec<i64> = created
+        .iter()
+        .map(|row| row.id.expect("created reservation id"))
+        .collect();
+
+    let pool3 = pool.clone();
+    let affected = block_on(|cx| async move {
+        match queries::release_reservations_by_ids(&cx, &pool3, &release_ids).await {
+            Outcome::Ok(count) => count,
+            other => panic!("bulk release_reservations_by_ids failed: {other:?}"),
+        }
+    });
+    assert_eq!(
+        affected, expected,
+        "expected all reservations released via release_reservations_by_ids"
+    );
+    let ledger_rows = count_release_ledger_rows(&pool);
+
+    let pool4 = pool.clone();
+    let active =
+        block_on(|cx| async move { queries::get_active_reservations(&cx, &pool4, pid).await });
+    match active {
+        Outcome::Ok(rows) => assert!(
+            rows.is_empty(),
+            "all reservations should be inactive (ledger_rows={ledger_rows}, active_len={})",
+            rows.len()
+        ),
+        other => panic!("active reservation check failed: {other:?}"),
+    }
+}
+
+#[test]
+fn create_file_reservations_large_handles_many_rows() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+
+    let paths: Vec<String> = (0..1100)
+        .map(|idx| format!("src/generated/create_only_{idx}.rs"))
+        .collect();
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let expected = path_refs.len();
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &path_refs,
+            3600,
+            true,
+            "bulk-create-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("bulk reserve failed: {other:?}"),
+        }
+    });
+    assert_eq!(created.len(), expected, "expected all reservations created");
+
+    let pool3 = pool.clone();
+    let active =
+        block_on(|cx| async move { queries::get_active_reservations(&cx, &pool3, pid).await });
+    match active {
+        Outcome::Ok(rows) => assert_eq!(rows.len(), expected, "all rows should be active"),
+        other => panic!("active reservation check failed: {other:?}"),
+    }
+}
+
+#[test]
+fn release_reservations_by_ids_partial_large_set_remains_stable() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+
+    let paths: Vec<String> = (0..1100)
+        .map(|idx| format!("src/generated/partial_{idx}.rs"))
+        .collect();
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &path_refs,
+            3600,
+            true,
+            "bulk-partial-release-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("bulk reserve failed: {other:?}"),
+        }
+    });
+
+    let release_ids: Vec<i64> = created
+        .iter()
+        .take(10)
+        .map(|row| row.id.expect("created reservation id"))
+        .collect();
+
+    let pool3 = pool.clone();
+    let affected = block_on(|cx| async move {
+        match queries::release_reservations_by_ids(&cx, &pool3, &release_ids).await {
+            Outcome::Ok(count) => count,
+            other => panic!("partial release_reservations_by_ids failed: {other:?}"),
+        }
+    });
+    assert!(
+        affected <= 10,
+        "rows_affected can under-report; expected <= 10, got {affected}"
+    );
+
+    let pool4 = pool.clone();
+    let active =
+        block_on(|cx| async move { queries::get_active_reservations(&cx, &pool4, pid).await });
+    match active {
+        Outcome::Ok(rows) => assert_eq!(rows.len(), 1090, "ten rows should be released"),
+        other => panic!("active reservation check failed: {other:?}"),
+    }
+}
+
+#[test]
 fn release_reservations_by_ids_releases_legacy_sentinel_rows() {
     let (pool, _dir) = make_pool();
     let pid = setup_project(&pool);
@@ -1026,6 +1225,97 @@ fn release_reservations_by_ids_releases_legacy_sentinel_rows() {
         Outcome::Ok(rows) => assert!(rows.is_empty(), "legacy sentinel row should be inactive"),
         other => panic!("active reservation check failed: {other:?}"),
     }
+}
+
+#[test]
+fn release_reservations_by_ids_releases_legacy_text_sentinel_rows() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &["legacy/text-sentinel.rs"],
+            3600,
+            true,
+            "legacy-text-sentinel-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("reserve failed: {other:?}"),
+        }
+    });
+    let reservation_id = created
+        .first()
+        .and_then(|row| row.id)
+        .expect("created reservation id");
+
+    // Simulate legacy text sentinel rows that are logically active.
+    set_reservation_released_ts_text(&pool, reservation_id, "none");
+
+    let pool3 = pool.clone();
+    let affected = block_on(|cx| async move {
+        match queries::release_reservations_by_ids(&cx, &pool3, &[reservation_id]).await {
+            Outcome::Ok(count) => count,
+            other => panic!("release_reservations_by_ids failed: {other:?}"),
+        }
+    });
+    assert_eq!(affected, 1, "legacy text sentinel row should be released");
+
+    let pool4 = pool.clone();
+    let active =
+        block_on(|cx| async move { queries::get_active_reservations(&cx, &pool4, pid).await });
+    match active {
+        Outcome::Ok(rows) => assert!(rows.is_empty(), "legacy text sentinel should be inactive"),
+        other => panic!("active reservation check failed: {other:?}"),
+    }
+}
+
+#[test]
+fn release_reservations_by_ids_skips_already_released_rows() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &["legacy/already-released.rs"],
+            3600,
+            true,
+            "already-released-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("reserve failed: {other:?}"),
+        }
+    });
+    let reservation_id = created
+        .first()
+        .and_then(|row| row.id)
+        .expect("created reservation id");
+
+    set_reservation_released_ts(&pool, reservation_id, mcp_agent_mail_db::now_micros());
+
+    let pool3 = pool.clone();
+    let affected = block_on(|cx| async move {
+        match queries::release_reservations_by_ids(&cx, &pool3, &[reservation_id]).await {
+            Outcome::Ok(count) => count,
+            other => panic!("release_reservations_by_ids failed: {other:?}"),
+        }
+    });
+    assert_eq!(affected, 0, "already released row should be skipped");
 }
 
 #[test]

@@ -1074,10 +1074,21 @@ fn urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
     let Some(expected) = parse_http_url_for_status(expected_url) else {
         return false;
     };
+    let actual_host = normalize_status_url_host(&actual.host);
+    let expected_host = normalize_status_url_host(&expected.host);
+
     actual.scheme == expected.scheme
-        && actual.host.eq_ignore_ascii_case(&expected.host)
+        && actual_host.eq_ignore_ascii_case(expected_host)
         && actual.port == expected.port
         && actual.path == expected.path
+}
+
+fn normalize_status_url_host(host: &str) -> &str {
+    if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
+        "127.0.0.1"
+    } else {
+        host
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2057,6 +2068,29 @@ mod tests {
         let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
         assert!(has_server);
         assert!(url_matches);
+    }
+
+    #[test]
+    fn check_config_file_treats_loopback_host_aliases_as_equivalent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.json");
+        let content = merge_mcp_server(
+            None,
+            "mcpServers",
+            "mcp-agent-mail",
+            json!({"url": "http://localhost:8765/api/"}),
+        )
+        .unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
+        assert!(has_server);
+        assert!(url_matches);
+
+        assert!(urls_match_for_status(
+            "http://[::1]:8765/mcp/",
+            "http://127.0.0.1:8765/mcp/"
+        ));
     }
 
     #[test]

@@ -132,17 +132,22 @@ fn resolve_or_create_sender_id(
         .ok_or_else(|| DbError::Internal("Failed to resolve sender ID after insert".into()))
 }
 
+struct RootMessageInput<'a> {
+    subject: &'a str,
+    body_md: &'a str,
+    importance: &'a str,
+    thread_id: Option<&'a str>,
+}
+
 fn insert_root_message(
     conn: &DbConn,
     project_id: i64,
     sender_id: i64,
-    subject: &str,
-    body_md: &str,
-    importance: &str,
-    thread_id: Option<&str>,
     now: i64,
+    message: &RootMessageInput<'_>,
 ) -> Result<i64, DbError> {
-    let thread_id_val = thread_id
+    let thread_id_val = message
+        .thread_id
         .map(str::trim)
         .filter(|tid| !tid.is_empty())
         .map_or(Value::Null, |tid| Value::Text(tid.to_string()));
@@ -153,9 +158,9 @@ fn insert_root_message(
         &[
             Value::BigInt(project_id),
             Value::BigInt(sender_id),
-            Value::Text(subject.to_string()),
-            Value::Text(body_md.to_string()),
-            Value::Text(importance.to_string()),
+            Value::Text(message.subject.to_string()),
+            Value::Text(message.body_md.to_string()),
+            Value::Text(message.importance.to_string()),
             thread_id_val,
             Value::BigInt(now),
         ],
@@ -230,9 +235,13 @@ pub fn dispatch_root_message(
     let dispatch_result = (|| -> Result<i64, DbError> {
         let now = now_micros();
         let sender_id = resolve_or_create_sender_id(conn, project_id, sender_name, now)?;
-        let msg_id = insert_root_message(
-            conn, project_id, sender_id, subject, body_md, importance, thread_id, now,
-        )?;
+        let message_input = RootMessageInput {
+            subject,
+            body_md,
+            importance,
+            thread_id,
+        };
+        let msg_id = insert_root_message(conn, project_id, sender_id, now, &message_input)?;
         insert_message_recipients(conn, project_id, msg_id, recipients)?;
         Ok(msg_id)
     })();

@@ -157,7 +157,12 @@ def _mk_run_dir() -> Path:
 
 def _init_git_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "-C", str(path), "init"], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(path), "init", "-b", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     return path
 
 

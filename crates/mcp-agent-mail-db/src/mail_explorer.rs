@@ -626,7 +626,11 @@ fn apply_filters(
 
     // Text filter (LIKE fallback)
     if !query.text_filter.is_empty() {
-        let escaped = query.text_filter.replace('%', "\\%").replace('_', "\\_");
+        let escaped = query
+            .text_filter
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         params.push(Value::Text(format!("%{escaped}%")));
         conditions.push(format!(
             "(m.subject LIKE ?{idx} ESCAPE '\\' OR m.body_md LIKE ?{idx} ESCAPE '\\')"
@@ -793,7 +797,8 @@ fn compute_stats(entries: &[ExplorerEntry]) -> ExplorerStats {
         if let Some(ref tid) = e.thread_id {
             threads.insert(tid.clone());
         }
-        agents.insert(e.sender_name.clone());
+        collect_agent_names(&mut agents, &e.sender_name);
+        collect_agent_names(&mut agents, &e.to_agents);
 
         if e.direction == Direction::Inbound {
             inbound += 1;
@@ -816,6 +821,15 @@ fn compute_stats(entries: &[ExplorerEntry]) -> ExplorerStats {
         unique_threads: threads.len(),
         unique_projects: projects.len(),
         unique_agents: agents.len(),
+    }
+}
+
+fn collect_agent_names(agents: &mut std::collections::HashSet<String>, names_csv: &str) {
+    for raw in names_csv.split(',') {
+        let name = raw.trim();
+        if !name.is_empty() {
+            agents.insert(name.to_string());
+        }
     }
 }
 
@@ -1222,6 +1236,25 @@ mod tests {
     }
 
     #[test]
+    fn apply_filters_text_escapes_backslash() {
+        let mut conditions = vec!["r.agent_id = ?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::BigInt(1)];
+        let query = ExplorerQuery {
+            text_filter: r"folder\name".to_string(),
+            ..Default::default()
+        };
+        apply_filters(&mut conditions, &mut params, &query, true);
+        if let Value::Text(ref s) = params[1] {
+            assert!(
+                s.contains(r"folder\\name"),
+                "backslash should be escaped for LIKE/ESCAPE: {s}"
+            );
+        } else {
+            panic!("expected text param");
+        }
+    }
+
+    #[test]
     fn apply_filters_combined_importance_and_text() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
@@ -1283,7 +1316,16 @@ mod tests {
         let stats = compute_stats(&[e1, e2, e3]);
         assert_eq!(stats.unique_projects, 2); // 10, 20
         assert_eq!(stats.unique_threads, 2); // t1, t2
-        assert_eq!(stats.unique_agents, 2); // RedFox, BlueLake
+        assert_eq!(stats.unique_agents, 3); // RedFox, BlueLake, OtherAgent
+    }
+
+    #[test]
+    fn compute_stats_parses_multiple_recipient_agents() {
+        let mut e = test_entry(1, 100, Direction::Outbound);
+        e.sender_name = "BlueLake".to_string();
+        e.to_agents = "GreenCastle, RedFox, BlueLake".to_string();
+        let stats = compute_stats(&[e]);
+        assert_eq!(stats.unique_agents, 3);
     }
 
     #[test]

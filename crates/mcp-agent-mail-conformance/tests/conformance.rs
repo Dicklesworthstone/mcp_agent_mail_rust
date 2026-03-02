@@ -415,7 +415,7 @@ fn setup_fixture_env() -> FixtureEnv {
         std::fs::create_dir_all(&repo_dir).expect("create fixture repo dir");
         if !repo_dir.join(".git").exists() {
             std::process::Command::new("git")
-                .args(["init", "--quiet"])
+                .args(["init", "--quiet", "-b", "main"])
                 .current_dir(&repo_dir)
                 .status()
                 .expect("git init");

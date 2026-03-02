@@ -112,6 +112,13 @@ CREATE INDEX IF NOT EXISTS idx_file_reservations_project_agent_released ON file_
 CREATE INDEX IF NOT EXISTS idx_file_reservations_expires_ts ON file_reservations(expires_ts);
 CREATE INDEX IF NOT EXISTS idx_file_reservations_released_expires_id ON file_reservations(released_ts, expires_ts, id, project_id);
 
+-- File reservation release ledger (avoids mutating hot reservation rows in-place)
+CREATE TABLE IF NOT EXISTS file_reservation_releases (
+    reservation_id INTEGER PRIMARY KEY REFERENCES file_reservations(id),
+    released_ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_reservation_releases_ts ON file_reservation_releases(released_ts);
+
 -- Agent links (contact relationships)
 CREATE TABLE IF NOT EXISTS agent_links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1119,6 +1126,19 @@ pub fn schema_migrations() -> Vec<Migration> {
         "v13_analyze_after_poller_indexes".to_string(),
         "run ANALYZE after poller/startup index additions".to_string(),
         "ANALYZE".to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v14_create_file_reservation_releases".to_string(),
+        "create sidecar release ledger for file_reservations".to_string(),
+        "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
+            reservation_id INTEGER PRIMARY KEY REFERENCES file_reservations(id),\
+            released_ts INTEGER NOT NULL\
+        );\
+        CREATE INDEX IF NOT EXISTS idx_file_reservation_releases_ts \
+            ON file_reservation_releases(released_ts);"
+            .to_string(),
         String::new(),
     ));
 

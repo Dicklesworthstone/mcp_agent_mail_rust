@@ -1349,11 +1349,18 @@ mod tests {
     }
 
     fn run_git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("git must run");
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir);
+        if args.first().is_some_and(|arg| *arg == "init")
+            && !args.contains(&"-b")
+            && !args.contains(&"--bare")
+        {
+            cmd.args(["init", "-b", "main"]);
+            cmd.args(&args[1..]);
+        } else {
+            cmd.args(args);
+        }
+        let out = cmd.output().expect("git must run");
         assert!(
             out.status.success(),
             "git {:?} failed: {}{}",
@@ -1364,11 +1371,18 @@ mod tests {
     }
 
     fn run_git_stdout(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("git must run");
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir);
+        if args.first().is_some_and(|arg| *arg == "init")
+            && !args.contains(&"-b")
+            && !args.contains(&"--bare")
+        {
+            cmd.args(["init", "-b", "main"]);
+            cmd.args(&args[1..]);
+        } else {
+            cmd.args(args);
+        }
+        let out = cmd.output().expect("git must run");
         assert!(
             out.status.success(),
             "git {:?} failed: {}{}",

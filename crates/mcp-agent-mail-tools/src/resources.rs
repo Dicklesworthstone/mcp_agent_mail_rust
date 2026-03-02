@@ -3378,7 +3378,7 @@ mod reservation_activity_tests {
         std::fs::create_dir_all(root.join("src")).expect("create src dir");
         std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").expect("write file");
 
-        run_git(root, &["init"]);
+        run_git(root, &["init", "-b", "main"]);
         run_git(root, &["config", "user.email", "test@example.com"]);
         run_git(root, &["config", "user.name", "Test User"]);
         run_git(root, &["add", "."]);

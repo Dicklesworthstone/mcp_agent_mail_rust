@@ -135,7 +135,7 @@ fn contact_enforcement_db_outage_fail_open() {
 
     // Initialize git repo in project dir (needed for archive writes)
     std::process::Command::new("git")
-        .args(["init", "--quiet"])
+        .args(["init", "--quiet", "-b", "main"])
         .current_dir(&project_dir)
         .status()
         .expect("git init");
@@ -447,7 +447,7 @@ fn contact_enforcement_outage_counter_atomicity() {
     let project_key = project_dir.to_str().unwrap();
 
     std::process::Command::new("git")
-        .args(["init", "--quiet"])
+        .args(["init", "--quiet", "-b", "main"])
         .current_dir(&project_dir)
         .status()
         .expect("git init");
