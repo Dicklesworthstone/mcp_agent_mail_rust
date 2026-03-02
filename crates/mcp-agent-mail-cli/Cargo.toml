@@ -16,6 +16,7 @@ path = "src/main.rs"
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
+json5.workspace = true
 ftui.workspace = true
 ftui-runtime = { workspace = true, features = ["stdio-capture"] }
 thiserror.workspace = true

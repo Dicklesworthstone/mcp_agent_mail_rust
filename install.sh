@@ -579,7 +579,7 @@ detect_python_binary() {
     PYTHON_BINARY_PATH="python -m mcp_agent_mail"
     verbose "detect_python_binary:found importable=${PYTHON_BINARY_PATH}"
   fi
-  [ "$PYTHON_BINARY_FOUND" -eq 0 ] && verbose "detect_python_binary:not_found"
+  if [ "$PYTHON_BINARY_FOUND" -eq 0 ]; then verbose "detect_python_binary:not_found"; fi
 }
 
 # T1.3: Detect Python virtualenv and git clone
@@ -863,7 +863,7 @@ resolve_database_path() {
   for env_file in "${env_files[@]}"; do
     if [ -f "$env_file" ]; then
       local db_url
-      db_url=$(grep -E '^DATABASE_URL=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2-)
+      db_url=$(grep -E '^DATABASE_URL=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- || true)
       if [ -n "$db_url" ]; then
         local env_path
         env_path=$(echo "$db_url" | sed -n 's|^sqlite[^:]*:///||p')
