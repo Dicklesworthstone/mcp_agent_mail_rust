@@ -18,6 +18,7 @@ use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::mail_explorer::{AckFilter, Direction, ExplorerStats, GroupMode, SortMode};
@@ -46,6 +47,18 @@ const DEBOUNCE_TICKS: u8 = 1;
 
 /// Default SLA threshold for overdue acks: 30 minutes in microseconds.
 const ACK_SLA_THRESHOLD_MICROS: i64 = 30 * 60 * 1_000_000;
+
+#[derive(Debug, Clone)]
+struct DetailBodyCache {
+    message_id: i64,
+    body_hash: u64,
+    theme_key: &'static str,
+    rendered: Text<'static>,
+}
+
+thread_local! {
+    static DETAIL_BODY_CACHE: RefCell<Option<DetailBodyCache>> = const { RefCell::new(None) };
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Focus and filter rail
@@ -1370,6 +1383,12 @@ fn importance_rank(imp: &str) -> u8 {
     }
 }
 
+fn stable_hash<T: Hash>(value: T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn sort_entries(entries: &mut [DisplayEntry], mode: SortMode) {
     match mode {
         SortMode::DateDesc => entries.sort_by_key(|e| std::cmp::Reverse(e.created_ts)),
@@ -1749,11 +1768,31 @@ fn render_detail(
     lines.push(Line::raw(String::new()));
     lines.push(Line::raw("--- Body ---"));
 
-    let md_theme = crate::tui_theme::markdown_theme();
-    let rendered = crate::tui_markdown::render_body(&entry.body_md, &md_theme);
-    for line in rendered.lines() {
-        lines.push(line.clone());
-    }
+    let body_hash = stable_hash(entry.body_md.as_bytes());
+    let theme_key = crate::tui_theme::current_theme_env_value();
+    DETAIL_BODY_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        let is_miss = cache.as_ref().is_none_or(|cached| {
+            cached.message_id != entry.message_id
+                || cached.body_hash != body_hash
+                || cached.theme_key != theme_key
+        });
+        if is_miss {
+            let md_theme = crate::tui_theme::markdown_theme();
+            let rendered = crate::tui_markdown::render_body(&entry.body_md, &md_theme);
+            *cache = Some(DetailBodyCache {
+                message_id: entry.message_id,
+                body_hash,
+                theme_key,
+                rendered,
+            });
+        }
+        if let Some(cached) = cache.as_ref() {
+            for line in cached.rendered.lines() {
+                lines.push(line.clone());
+            }
+        }
+    });
 
     let visible_height = usize::from(content_inner.height).max(1);
     let max_scroll = lines.len().saturating_sub(visible_height);

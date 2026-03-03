@@ -1393,7 +1393,18 @@ fn fetch_reservation_snapshot_bundle_fast(conn: &DbConn, now: i64) -> Reservatio
 /// background poller snapshot is unavailable or stale.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
-    fetch_reservation_snapshot_bundle(conn, now_micros(), None).snapshots
+    fetch_reservation_snapshots_with_path(conn, None)
+}
+
+/// Fetch active file reservations with an optional `SQLite` path cache key.
+///
+/// Passing `sqlite_path` enables reservation scan-mode cache reuse so fallback
+/// callers don't repeatedly re-detect schema compatibility.
+pub(crate) fn fetch_reservation_snapshots_with_path(
+    conn: &DbConn,
+    sqlite_path: Option<&str>,
+) -> Vec<ReservationSnapshot> {
+    fetch_reservation_snapshot_bundle(conn, now_micros(), sqlite_path).snapshots
 }
 
 /// Read `CONSOLE_POLL_INTERVAL_MS` from environment, default 2000ms.
@@ -2765,6 +2776,7 @@ mod tests {
     // ── B6: Count/List Consistency Contract ──────────────────────────
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn agents_list_cap_is_explicit_and_bounded() {
         // Documents the contract: MAX_AGENTS caps the list the poller
         // delivers to screens. Screens can detect capping by comparing
@@ -2780,6 +2792,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn projects_list_cap_is_explicit_and_bounded() {
         // Same contract for projects.
         assert!(

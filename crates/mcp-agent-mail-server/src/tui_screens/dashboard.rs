@@ -42,6 +42,7 @@ use ftui_widgets::sparkline::Sparkline;
 
 /// Max event log entries kept in scroll-back.
 const EVENT_LOG_CAPACITY: usize = 2000;
+const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
 const SHIMMER_WINDOW_MICROS: i64 = 500_000;
 const SHIMMER_MAX_ROWS: usize = 5;
 const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
@@ -454,7 +455,7 @@ impl DashboardScreen {
 
     /// Ingest new events from the ring buffer.
     fn ingest_events(&mut self, state: &TuiSharedState) {
-        let new_events = state.events_since(self.last_seq);
+        let new_events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &new_events {
             self.last_seq = event.seq().max(self.last_seq);
             if let Some(preview) = RecentMessagePreview::from_event(event) {
@@ -6634,7 +6635,7 @@ mod tests {
     #[test]
     fn format_duration_hours() {
         assert_eq!(
-            format_duration(std::time::Duration::from_secs(7380)),
+            format_duration(std::time::Duration::from_mins(123)),
             "2h 3m"
         );
     }

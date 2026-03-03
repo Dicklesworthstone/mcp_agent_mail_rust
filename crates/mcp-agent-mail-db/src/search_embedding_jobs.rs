@@ -438,8 +438,23 @@ impl EmbeddingQueue {
             .is_none_or(|next_due| next_due <= now);
         if scan_retry_queue {
             let mut deferred_retry = VecDeque::with_capacity(state.retry_queue.len());
+            let mut next_retry_due_at: Option<Instant> = None;
             while let Some(req) = state.retry_queue.pop_front() {
                 if batch.len() >= batch_size {
+                    next_retry_due_at =
+                        Some(next_retry_due_at.map_or(req.next_attempt_at, |current| {
+                            current.min(req.next_attempt_at)
+                        }));
+                    if let Some(tail_min) = state
+                        .retry_queue
+                        .iter()
+                        .map(|pending| pending.next_attempt_at)
+                        .min()
+                    {
+                        next_retry_due_at = Some(
+                            next_retry_due_at.map_or(tail_min, |current| current.min(tail_min)),
+                        );
+                    }
                     deferred_retry.push_back(req);
                     deferred_retry.append(&mut state.retry_queue);
                     break;
@@ -448,11 +463,15 @@ impl EmbeddingQueue {
                     state.dedup.remove(&req.dedup_key());
                     batch.push(req);
                 } else {
+                    next_retry_due_at =
+                        Some(next_retry_due_at.map_or(req.next_attempt_at, |current| {
+                            current.min(req.next_attempt_at)
+                        }));
                     deferred_retry.push_back(req);
                 }
             }
             state.retry_queue = deferred_retry;
-            Self::recompute_next_retry_due(&mut state);
+            state.next_retry_due_at = next_retry_due_at;
         }
 
         // Then main queue

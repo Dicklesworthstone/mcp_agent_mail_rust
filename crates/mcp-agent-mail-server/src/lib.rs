@@ -2048,7 +2048,7 @@ fn runtime_output_mode(config: &mcp_agent_mail_core::Config) -> RuntimeOutputMod
     }
 }
 
-const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
+const JWKS_CACHE_TTL: Duration = Duration::from_mins(1);
 const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
@@ -3891,9 +3891,10 @@ fn fetch_dashboard_db_stats_cached(
     }
 
     *conn_state = dashboard_open_connection(database_url);
-    conn_state
-        .as_ref()
-        .map_or_else(DashboardDbStats::default, fetch_dashboard_db_stats_from_conn)
+    conn_state.as_ref().map_or_else(
+        DashboardDbStats::default,
+        fetch_dashboard_db_stats_from_conn,
+    )
 }
 
 fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
@@ -3918,16 +3919,16 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
         .unwrap_or_default();
 
     DashboardDbStats {
-        projects: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM projects"),
-        agents: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM agents"),
-        messages: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages"),
+        projects: dashboard_count(conn, "SELECT COUNT(*) AS c FROM projects"),
+        agents: dashboard_count(conn, "SELECT COUNT(*) AS c FROM agents"),
+        messages: dashboard_count(conn, "SELECT COUNT(*) AS c FROM messages"),
         file_reservations: dashboard_count(
-            &conn,
+            conn,
             "SELECT COUNT(*) AS c FROM file_reservations WHERE released_ts IS NULL",
         ),
-        contact_links: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM agent_links"),
+        contact_links: dashboard_count(conn, "SELECT COUNT(*) AS c FROM agent_links"),
         ack_pending: dashboard_count(
-            &conn,
+            conn,
             "SELECT COUNT(*) AS c FROM message_recipients mr \
              JOIN messages m ON m.id = mr.message_id \
              WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
@@ -5432,7 +5433,7 @@ fn extract_arg_str(arguments: Option<&serde_json::Value>, keys: &[&str]) -> Opti
 }
 
 fn normalize_project_value(value: String) -> String {
-    if value.starts_with('/') {
+    if std::path::Path::new(&value).is_absolute() {
         mcp_agent_mail_db::queries::generate_slug(&value)
     } else {
         value
@@ -11928,7 +11929,7 @@ mod tests {
         {
             let mut cache = state.jwks_cache.lock().unwrap();
             *cache = Some(JwksCacheEntry {
-                fetched_at: Instant::now().checked_sub(Duration::from_secs(120)).unwrap(),
+                fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
                 jwks: Arc::clone(&jwks),
             });
         }
@@ -11967,7 +11968,7 @@ mod tests {
             {
                 let mut cache = state.jwks_cache.lock().unwrap();
                 *cache = Some(JwksCacheEntry {
-                    fetched_at: Instant::now().checked_sub(Duration::from_secs(120)).unwrap(),
+                    fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
                     jwks: Arc::clone(&old_jwks),
                 });
             }
@@ -15396,7 +15397,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *cache = Some(JwksCacheEntry {
             // 2 minutes in the past — well beyond the 60s TTL.
-            fetched_at: Instant::now().checked_sub(Duration::from_secs(120)).unwrap(),
+            fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
             jwks: Arc::new(jwks.clone()),
         });
     }
@@ -16125,8 +16126,7 @@ mod tests {
             .headers
             .iter()
             .find(|(k, _)| k == "content-type")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         assert!(
             content_type.contains("text/html"),
             "unauthorized /mail must return HTML, got: {content_type}"
@@ -16158,8 +16158,7 @@ mod tests {
             .headers
             .iter()
             .find(|(k, _)| k == "content-type")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         assert!(
             content_type.contains("application/json"),
             "unauthorized /mcp must return JSON, got: {content_type}"
@@ -16199,8 +16198,7 @@ mod tests {
             .headers
             .iter()
             .find(|(k, _)| k == "content-type")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         assert!(
             content_type.contains("application/json"),
             "unauthorized /mail/api/* must return JSON, got: {content_type}"
@@ -16283,8 +16281,7 @@ mod tests {
             .headers
             .iter()
             .find(|(k, _)| k == "content-type")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         assert!(
             content_type.contains("text/html"),
             "/mail/dashboard unauthorized must return HTML, got: {content_type}"

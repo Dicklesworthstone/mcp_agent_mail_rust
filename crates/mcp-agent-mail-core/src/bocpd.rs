@@ -283,7 +283,7 @@ impl BocpdDetector {
 
         // Update sufficient statistics.
         let mut new_stats = Vec::with_capacity(new_log_run_dist.len());
-        new_stats.push(self.prior.update(x));
+        new_stats.push(self.prior.clone());
         for s in &self.stats {
             new_stats.push(s.update(x));
         }

@@ -1770,9 +1770,7 @@ fn build_message(
                             .and_then(|v| v.as_u64())
                             .or_else(|| a.get("size").and_then(|v| v.as_u64()))
                             .map(|bytes| bytes.to_string())
-                            .or_else(|| {
-                                a.get("size").and_then(|v| v.as_str()).map(str::to_string)
-                            })
+                            .or_else(|| a.get("size").and_then(|v| v.as_str()).map(str::to_string))
                             .unwrap_or_else(|| "unknown".to_string()),
                         mime_type: a
                             .get("media_type")

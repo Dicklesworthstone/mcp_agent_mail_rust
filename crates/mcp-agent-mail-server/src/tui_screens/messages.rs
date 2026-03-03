@@ -6,6 +6,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -965,6 +966,27 @@ impl QuickReplyFormState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct MessageDetailRenderCache {
+    message_id: i64,
+    width: u16,
+    body_hash: u64,
+    theme_key: &'static str,
+    rendered: Text<'static>,
+}
+
+#[derive(Debug, Clone)]
+struct QuickReplyPreviewCache {
+    body_hash: u64,
+    width: u16,
+    theme_key: &'static str,
+    rendered: Text<'static>,
+}
+
+thread_local! {
+    static QUICK_REPLY_PREVIEW_CACHE: RefCell<Option<QuickReplyPreviewCache>> = const { RefCell::new(None) };
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // MessageBrowserScreen
 // ──────────────────────────────────────────────────────────────────────
@@ -1030,8 +1052,7 @@ pub struct MessageBrowserScreen {
     /// Message compose modal state (when active).
     compose_form: Option<ComposeFormState>,
     /// Cache for rendered message body with inline images:
-    /// (`message_id`, `width`, `rendered_content`).
-    detail_cache: RefCell<Option<(i64, u16, String)>>,
+    detail_cache: RefCell<Option<MessageDetailRenderCache>>,
     /// On-disk path for persisted screen filter presets.
     filter_presets_path: PathBuf,
     /// Preset store loaded from `filter_presets_path`.
@@ -3916,6 +3937,12 @@ fn estimate_message_detail_lines(entry: &MessageEntry, width: u16) -> usize {
     count
 }
 
+fn stable_hash<T: Hash>(value: T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn render_detail_panel(
     frame: &mut Frame<'_>,
@@ -3923,7 +3950,7 @@ fn render_detail_panel(
     entry: Option<&MessageEntry>,
     scroll: usize,
     focused: bool,
-    cache: &RefCell<Option<(i64, u16, String)>>,
+    cache: &RefCell<Option<MessageDetailRenderCache>>,
 ) {
     let detail_title = entry.map_or_else(
         || "Detail".to_string(),
@@ -4037,36 +4064,46 @@ fn render_detail_panel(
 
     let body_text = {
         let width = content_inner.width;
+        let body_hash = stable_hash(msg.body_md.as_bytes());
+        let theme_key = crate::tui_theme::current_theme_env_value();
         let mut cached = cache.borrow_mut();
 
-        let cached_body = if let Some((id, w, ref body)) = *cached {
-            if id == msg.id && w == width {
-                Some(body.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let body_str = cached_body.unwrap_or_else(|| {
-            let mut body_md = msg.body_md.clone();
-            let image_block = build_inline_image_block(&msg.body_md, width);
-            if !image_block.is_empty() {
-                body_md.push_str("\n\n");
-                body_md.push_str(&image_block);
-            }
-            *cached = Some((msg.id, width, body_md.clone()));
-            body_md
-        });
-
-        let markdown_body = if looks_like_json(&body_str) {
-            format!("```json\n{}\n```", body_str.trim_end())
-        } else {
-            body_str
-        };
-        let md_theme = crate::tui_theme::markdown_theme();
-        crate::tui_markdown::render_body(&markdown_body, &md_theme)
+        cached
+            .as_ref()
+            .and_then(|cached| {
+                if cached.message_id == msg.id
+                    && cached.width == width
+                    && cached.body_hash == body_hash
+                    && cached.theme_key == theme_key
+                {
+                    Some(cached.rendered.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                let mut body_md = msg.body_md.clone();
+                let image_block = build_inline_image_block(&msg.body_md, width);
+                if !image_block.is_empty() {
+                    body_md.push_str("\n\n");
+                    body_md.push_str(&image_block);
+                }
+                let markdown_body = if looks_like_json(&body_md) {
+                    format!("```json\n{}\n```", body_md.trim_end())
+                } else {
+                    body_md
+                };
+                let md_theme = crate::tui_theme::markdown_theme();
+                let rendered = crate::tui_markdown::render_body(&markdown_body, &md_theme);
+                *cached = Some(MessageDetailRenderCache {
+                    message_id: msg.id,
+                    width,
+                    body_hash,
+                    theme_key,
+                    rendered: rendered.clone(),
+                });
+                rendered
+            })
     };
 
     for line in body_text.lines() {
@@ -4654,9 +4691,31 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
                 .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
             cursor_y = cursor_y.saturating_add(1);
         } else {
-            let md_theme = crate::tui_theme::markdown_theme();
-            let rendered =
-                crate::tui_markdown::render_body(&form.context.original_body_md, &md_theme);
+            let body_hash = stable_hash(form.context.original_body_md.as_bytes());
+            let width = inner.width;
+            let theme_key = crate::tui_theme::current_theme_env_value();
+            let rendered = QUICK_REPLY_PREVIEW_CACHE.with(|cache_cell| {
+                let mut cache = cache_cell.borrow_mut();
+                let miss = cache.as_ref().is_none_or(|cached| {
+                    cached.body_hash != body_hash
+                        || cached.width != width
+                        || cached.theme_key != theme_key
+                });
+                if miss {
+                    let md_theme = crate::tui_theme::markdown_theme();
+                    let rendered =
+                        crate::tui_markdown::render_body(&form.context.original_body_md, &md_theme);
+                    *cache = Some(QuickReplyPreviewCache {
+                        body_hash,
+                        width,
+                        theme_key,
+                        rendered,
+                    });
+                }
+                cache
+                    .as_ref()
+                    .map_or_else(Text::default, |cached| cached.rendered.clone())
+            });
             let preview_lines: Vec<Line<'static>> = rendered
                 .lines()
                 .iter()

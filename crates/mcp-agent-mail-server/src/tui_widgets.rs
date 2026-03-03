@@ -7223,11 +7223,11 @@ mod tests {
     fn throughput_empty_buffer_returns_no_data() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let mut provider =
-            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         assert_eq!(provider.series_count(), 1);
         assert_eq!(provider.series_label(0), "calls/sec");
-        let points = provider.data_points(0, Duration::from_secs(60));
+        let points = provider.data_points(0, Duration::from_mins(1));
         assert!(points.is_empty());
         let (lo, hi) = provider.y_range();
         assert_eq!(lo, 0.0);
@@ -7239,9 +7239,9 @@ mod tests {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let _ = ring.push(tool_call_end_at(5_000_000, 10));
         let mut provider =
-            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let points = provider.data_points(0, Duration::from_secs(60));
+        let points = provider.data_points(0, Duration::from_mins(1));
         assert_eq!(points.len(), 1);
         assert!(
             (points[0].1 - 1.0).abs() < f64::EPSILON,
@@ -7257,9 +7257,9 @@ mod tests {
         let _ = ring.push(tool_call_end_at(5_200_000, 20));
         let _ = ring.push(tool_call_end_at(5_800_000, 30));
         let mut provider =
-            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let points = provider.data_points(0, Duration::from_secs(60));
+        let points = provider.data_points(0, Duration::from_mins(1));
         assert_eq!(points.len(), 1);
         assert!(
             (points[0].1 - 3.0).abs() < f64::EPSILON,
@@ -7275,9 +7275,9 @@ mod tests {
         let _ = ring.push(tool_call_end_at(1_500_000, 10));
         let _ = ring.push(tool_call_end_at(3_000_000, 10));
         let mut provider =
-            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let points = provider.data_points(0, Duration::from_secs(60));
+        let points = provider.data_points(0, Duration::from_mins(1));
         // Should have bucket at 1M (count=2), gap at 2M (count=0), bucket at 3M (count=1)
         assert!(
             points.len() >= 2,
@@ -7292,9 +7292,9 @@ mod tests {
         let _ = ring.push(message_sent_at(1_000_000));
         let _ = ring.push(agent_registered_at(2_000_000));
         let mut provider =
-            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let points = provider.data_points(0, Duration::from_secs(60));
+        let points = provider.data_points(0, Duration::from_mins(1));
         assert!(
             points.is_empty(),
             "non-ToolCallEnd events should be ignored"
@@ -7306,15 +7306,15 @@ mod tests {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let _ = ring.push(tool_call_end_at(1_000_000, 10));
         let mut provider =
-            ThroughputProvider::new(ring.clone(), Granularity::OneSecond, Duration::from_secs(60));
+            ThroughputProvider::new(ring.clone(), Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let points1 = provider.data_points(0, Duration::from_secs(60));
+        let points1 = provider.data_points(0, Duration::from_mins(1));
         assert_eq!(points1.len(), 1);
 
         // Push more events and refresh again
         let _ = ring.push(tool_call_end_at(5_000_000, 20));
         provider.refresh();
-        let points2 = provider.data_points(0, Duration::from_secs(60));
+        let points2 = provider.data_points(0, Duration::from_mins(1));
         assert!(
             points2.len() > points1.len(),
             "incremental refresh should add new data"
@@ -7328,10 +7328,10 @@ mod tests {
         let _ = ring.push(tool_call_end_at(1_000_000, 10));
         let _ = ring.push(tool_call_end_at(4_000_000, 10));
         let mut provider =
-            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         // Should have buckets at 1M, 2M (gap=0), 3M (gap=0), 4M
-        let points = provider.data_points(0, Duration::from_secs(60));
+        let points = provider.data_points(0, Duration::from_mins(1));
         assert!(
             points.len() >= 4,
             "should have gap-filled buckets, got {}",
@@ -7348,13 +7348,13 @@ mod tests {
     fn latency_empty_buffer() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let mut provider =
-            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         assert_eq!(provider.series_count(), 3);
         assert_eq!(provider.series_label(0), "P50");
         assert_eq!(provider.series_label(1), "P95");
         assert_eq!(provider.series_label(2), "P99");
-        let points = provider.data_points(0, Duration::from_secs(60));
+        let points = provider.data_points(0, Duration::from_mins(1));
         assert!(points.is_empty());
     }
 
@@ -7363,11 +7363,11 @@ mod tests {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let _ = ring.push(tool_call_end_at(1_000_000, 42));
         let mut provider =
-            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let p50 = provider.data_points(0, Duration::from_secs(60));
-        let p95 = provider.data_points(1, Duration::from_secs(60));
-        let p99 = provider.data_points(2, Duration::from_secs(60));
+        let p50 = provider.data_points(0, Duration::from_mins(1));
+        let p95 = provider.data_points(1, Duration::from_mins(1));
+        let p99 = provider.data_points(2, Duration::from_mins(1));
         assert_eq!(p50.len(), 1);
         assert!((p50[0].1 - 42.0).abs() < f64::EPSILON);
         assert!((p95[0].1 - 42.0).abs() < f64::EPSILON);
@@ -7382,11 +7382,11 @@ mod tests {
             let _ = ring.push(tool_call_end_at(1_000_000, i));
         }
         let mut provider =
-            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let p50 = provider.data_points(0, Duration::from_secs(60));
-        let p95 = provider.data_points(1, Duration::from_secs(60));
-        let p99 = provider.data_points(2, Duration::from_secs(60));
+        let p50 = provider.data_points(0, Duration::from_mins(1));
+        let p95 = provider.data_points(1, Duration::from_mins(1));
+        let p99 = provider.data_points(2, Duration::from_mins(1));
         assert_eq!(p50.len(), 1);
         // P50 should be ~50, P95 ~95, P99 ~99
         assert!(
@@ -7411,9 +7411,9 @@ mod tests {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let _ = ring.push(tool_call_end_at(1_000_000, 0));
         let mut provider =
-            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let p50 = provider.data_points(0, Duration::from_secs(60));
+        let p50 = provider.data_points(0, Duration::from_mins(1));
         assert_eq!(p50.len(), 1);
         assert!((p50[0].1).abs() < f64::EPSILON, "zero duration = P50 of 0");
     }
@@ -7426,10 +7426,10 @@ mod tests {
         let _ = ring.push(tool_call_end_at(1_100_000, 1));
         let _ = ring.push(tool_call_end_at(1_200_000, 10_000));
         let mut provider =
-            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let p50 = provider.data_points(0, Duration::from_secs(60));
-        let p99 = provider.data_points(2, Duration::from_secs(60));
+        let p50 = provider.data_points(0, Duration::from_mins(1));
+        let p99 = provider.data_points(2, Duration::from_mins(1));
         assert!(p50[0].1 < p99[0].1, "P50 should be less than P99");
     }
 
@@ -7454,7 +7454,7 @@ mod tests {
     fn resource_empty_buffer() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let mut provider =
-            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         assert_eq!(provider.series_count(), 4);
         assert_eq!(provider.series_label(0), "projects");
@@ -7462,7 +7462,7 @@ mod tests {
         assert_eq!(provider.series_label(2), "messages");
         assert_eq!(provider.series_label(3), "reservations");
         for i in 0..4 {
-            assert!(provider.data_points(i, Duration::from_secs(60)).is_empty());
+            assert!(provider.data_points(i, Duration::from_mins(1)).is_empty());
         }
     }
 
@@ -7471,12 +7471,12 @@ mod tests {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let _ = ring.push(health_pulse_at(1_000_000, 3, 5, 100, 2));
         let mut provider =
-            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let projects = provider.data_points(0, Duration::from_secs(60));
-        let agents = provider.data_points(1, Duration::from_secs(60));
-        let messages = provider.data_points(2, Duration::from_secs(60));
-        let reservations = provider.data_points(3, Duration::from_secs(60));
+        let projects = provider.data_points(0, Duration::from_mins(1));
+        let agents = provider.data_points(1, Duration::from_mins(1));
+        let messages = provider.data_points(2, Duration::from_mins(1));
+        let reservations = provider.data_points(3, Duration::from_mins(1));
         assert_eq!(projects.len(), 1);
         assert!((projects[0].1 - 3.0).abs() < f64::EPSILON);
         assert!((agents[0].1 - 5.0).abs() < f64::EPSILON);
@@ -7491,9 +7491,9 @@ mod tests {
         let _ = ring.push(health_pulse_at(1_000_000, 1, 1, 1, 1));
         let _ = ring.push(health_pulse_at(1_500_000, 10, 20, 30, 40));
         let mut provider =
-            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
-        let projects = provider.data_points(0, Duration::from_secs(60));
+        let projects = provider.data_points(0, Duration::from_mins(1));
         assert_eq!(projects.len(), 1);
         assert!(
             (projects[0].1 - 10.0).abs() < f64::EPSILON,
@@ -7508,11 +7508,11 @@ mod tests {
         let _ = ring.push(tool_call_end_at(1_000_000, 10));
         let _ = ring.push(message_sent_at(2_000_000));
         let mut provider =
-            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         for i in 0..4 {
             assert!(
-                provider.data_points(i, Duration::from_secs(60)).is_empty(),
+                provider.data_points(i, Duration::from_mins(1)).is_empty(),
                 "series {i} should be empty for non-health events"
             );
         }
@@ -7524,7 +7524,7 @@ mod tests {
     fn heatmap_provider_empty_buffer() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let mut provider =
-            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         assert_eq!(provider.series_count(), EVENT_KIND_COUNT);
         let (cols, rows, grid) = provider.heatmap_grid();
@@ -7537,7 +7537,7 @@ mod tests {
     fn heatmap_provider_event_kind_labels() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let provider =
-            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         assert_eq!(provider.series_label(0), "ToolStart");
         assert_eq!(provider.series_label(1), "ToolEnd");
         assert_eq!(provider.series_label(2), "MsgSent");
@@ -7553,7 +7553,7 @@ mod tests {
         let _ = ring.push(tool_call_end_at(1_100_000, 20));
         let _ = ring.push(message_sent_at(1_200_000));
         let mut provider =
-            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         let (cols, rows, grid) = provider.heatmap_grid();
         assert_eq!(cols, 1);
@@ -7580,7 +7580,7 @@ mod tests {
         let _ = ring.push(tool_call_end_at(1_000_000, 10));
         let _ = ring.push(message_sent_at(3_000_000));
         let mut provider =
-            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         let (cols, _rows, grid) = provider.heatmap_grid();
         // Should have buckets at 1M, 2M (gap), 3M = 3 columns
@@ -7602,7 +7602,7 @@ mod tests {
         let _ = ring.push(agent_registered_at(1_000_000));
         let _ = ring.push(agent_registered_at(4_000_000));
         let mut provider =
-            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
         provider.refresh();
         let (cols, _rows, grid) = provider.heatmap_grid();
         // Should have 4 columns: 1M, 2M (gap), 3M (gap), 4M
@@ -7639,13 +7639,13 @@ mod tests {
         let _ = ring.push(health_pulse_at(1_000_000, 2, 4, 10, 1));
 
         let mut throughput =
-            ThroughputProvider::new(ring.clone(), Granularity::OneSecond, Duration::from_secs(60));
+            ThroughputProvider::new(ring.clone(), Granularity::OneSecond, Duration::from_mins(1));
         let mut latency =
-            LatencyProvider::new(ring.clone(), Granularity::OneSecond, Duration::from_secs(60));
+            LatencyProvider::new(ring.clone(), Granularity::OneSecond, Duration::from_mins(1));
         let mut resource =
-            ResourceProvider::new(ring.clone(), Granularity::OneSecond, Duration::from_secs(60));
+            ResourceProvider::new(ring.clone(), Granularity::OneSecond, Duration::from_mins(1));
         let mut heatmap =
-            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_mins(1));
 
         throughput.refresh();
         latency.refresh();
@@ -7653,18 +7653,18 @@ mod tests {
         heatmap.refresh();
 
         // Each provider should have processed its relevant events
-        assert_eq!(throughput.data_points(0, Duration::from_secs(60)).len(), 1);
-        assert_eq!(latency.data_points(0, Duration::from_secs(60)).len(), 1);
-        assert_eq!(resource.data_points(0, Duration::from_secs(60)).len(), 1);
+        assert_eq!(throughput.data_points(0, Duration::from_mins(1)).len(), 1);
+        assert_eq!(latency.data_points(0, Duration::from_mins(1)).len(), 1);
+        assert_eq!(resource.data_points(0, Duration::from_mins(1)).len(), 1);
         // Heatmap has a bucket for the timestamp, so all series return 1 point.
         // ToolStart (idx 0) should have value 0.0, ToolEnd (idx 1) should have value 1.0.
-        let ts_points = heatmap.data_points(0, Duration::from_secs(60));
+        let ts_points = heatmap.data_points(0, Duration::from_mins(1));
         assert_eq!(ts_points.len(), 1);
         assert!(
             (ts_points[0].1).abs() < f64::EPSILON,
             "ToolStart count should be 0"
         );
-        let tool_end_points = heatmap.data_points(1, Duration::from_secs(60));
+        let tool_end_points = heatmap.data_points(1, Duration::from_mins(1));
         assert_eq!(tool_end_points.len(), 1);
         assert!(
             (tool_end_points[0].1 - 1.0).abs() < f64::EPSILON,
@@ -7705,9 +7705,9 @@ mod tests {
         // Event in next 5-second bucket
         let _ = ring.push(tool_call_end_at(10_000_000, 40));
         let mut provider =
-            ThroughputProvider::new(ring, Granularity::FiveSeconds, Duration::from_secs(300));
+            ThroughputProvider::new(ring, Granularity::FiveSeconds, Duration::from_mins(5));
         provider.refresh();
-        let points = provider.data_points(0, Duration::from_secs(300));
+        let points = provider.data_points(0, Duration::from_mins(5));
         assert_eq!(points.len(), 2, "should have 2 five-second buckets");
         assert!(
             (points[0].1 - 3.0).abs() < f64::EPSILON,

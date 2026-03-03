@@ -341,7 +341,8 @@ pub fn render_tool_call_start(
 
     // Title
     let title = format!(" {primary}\u{1f527} TOOL CALL{RESET} {text}{tool_name}{RESET} ");
-    let title_vis = 14 + tool_name.len(); // " 🔧 TOOL CALL {tool_name} " (leading + trailing spaces)
+    // " 🔧 TOOL CALL {tool_name} " — use display_width for the emoji (may be 2-wide)
+    let title_vis = 1 + ftui::text::display_width("\u{1f527}") + 10 + 1 + tool_name.len() + 1;
     let pad = w.saturating_sub(title_vis);
     lines.push(format!(
         "{secondary_b}\u{2551}{title}{}{secondary_b}\u{2551}{RESET}",

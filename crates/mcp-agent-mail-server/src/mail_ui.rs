@@ -451,9 +451,8 @@ mod route_hardening_tests {
         // Valid slug format passes validation (may then 404 on project lookup).
         let result = dispatch_project_route("/my-project_1", "GET", "", &cx, &pool, "");
         // Should not be a 400 — either Ok or a different error from DB lookup.
-        match result {
-            Err((400, _)) => panic!("valid slug should not be rejected as 400"),
-            _ => {} // Ok(None), Ok(Some), or Err(404/500) are all acceptable
+        if let Err((400, _)) = result {
+            panic!("valid slug should not be rejected as 400");
         }
     }
 
@@ -659,7 +658,7 @@ mod auth_route_hardening_regression_suite {
         let result = dispatch_project_route("/my-project/message/abc", "GET", "", &cx, &pool, "");
         // Non-numeric message IDs should gracefully fail (Ok(None) or Err(400/404)).
         match result {
-            Ok(None) | Err((400, _)) | Err((404, _)) => {} // acceptable
+            Ok(None) | Err((400 | 404, _)) => {} // acceptable
             other => panic!("non-numeric message id should fail gracefully, got {other:?}"),
         }
     }

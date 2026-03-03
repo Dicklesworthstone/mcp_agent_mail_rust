@@ -34,6 +34,7 @@ const ACTIVE_WINDOW_MICROS: i64 = 60 * 1_000_000;
 const IDLE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
 /// Max sparkline history samples.
 const SPARKLINE_CAP: usize = 30;
+const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
 
 /// An agent row with computed fields.
 #[derive(Debug, Clone)]
@@ -369,7 +370,7 @@ impl AgentsScreen {
     }
 
     fn ingest_events(&mut self, state: &TuiSharedState) {
-        let events = state.events_since(self.last_seq);
+        let events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &events {
             self.last_seq = event.seq().max(self.last_seq);
             match event {

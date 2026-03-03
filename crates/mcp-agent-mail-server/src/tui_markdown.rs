@@ -127,7 +127,8 @@ pub fn render_message_body_blockquote(
     if body_excerpt.trim().is_empty() {
         return None;
     }
-    let quoted = format!("> {}", body_excerpt.replace('\n', "\n> "));
+    let trimmed_excerpt = body_excerpt.trim_end_matches('\n');
+    let quoted = format!("> {}", trimmed_excerpt.replace('\n', "\n> "));
     Some(render_body(&quoted, theme))
 }
 
@@ -158,10 +159,14 @@ fn prepare_body_for_render(body_md: &str) -> String {
 /// if truncation occurred.
 #[must_use]
 fn truncate_str(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
         s.to_string()
+    } else if max_chars <= 3 {
+        // Not enough room for any content plus "..."; just take max_chars raw chars.
+        s.chars().take(max_chars).collect()
     } else {
-        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        let truncated: String = s.chars().take(max_chars - 3).collect();
         format!("{truncated}...")
     }
 }
@@ -689,6 +694,7 @@ Thanks!";
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn snapshot_golden_regression_matrix() {
         struct Case {
             scenario_id: &'static str,
@@ -1019,8 +1025,30 @@ Thanks!";
     #[test]
     fn truncate_str_truncates_long_strings() {
         let result = truncate_str("hello world foo bar", 10);
-        assert!(result.len() <= 10);
+        assert!(result.chars().count() <= 10);
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_handles_tiny_max_chars() {
+        // max_chars < 3: no room for "..." suffix, just take raw chars.
+        assert_eq!(truncate_str("hello", 2), "he");
+        assert_eq!(truncate_str("hello", 1), "h");
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_str_boundary_at_three() {
+        // max_chars == 3 with a long string: should return "..." or raw 3 chars.
+        let result = truncate_str("hello", 3);
+        assert!(result.chars().count() <= 3);
+    }
+
+    #[test]
+    fn truncate_str_multibyte() {
+        // Ensure char-level (not byte-level) truncation for non-ASCII.
+        let result = truncate_str("\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}", 4);
+        assert!(result.chars().count() <= 4);
     }
 
     #[test]
@@ -1048,7 +1076,7 @@ Thanks!";
 
     // ── C5: Markdown fidelity regression fixtures ─────────────────
 
-    /// Verify render_message_body preserves GFM table structure.
+    /// Verify `render_message_body` preserves GFM table structure.
     #[test]
     fn c5_message_body_table_fidelity() {
         let md = "| Agent | Status |\n|-------|--------|\n| Blue  | Ready  |\n| Red   | Busy   |";
@@ -1060,7 +1088,7 @@ Thanks!";
         assert!(text.contains("Red"), "table cell content preserved");
     }
 
-    /// Verify render_message_body preserves links and their text.
+    /// Verify `render_message_body` preserves links and their text.
     #[test]
     fn c5_message_body_link_fidelity() {
         let md = "See the [deployment guide](https://example.com/deploy) for steps.";
@@ -1071,7 +1099,7 @@ Thanks!";
         assert!(text.contains("steps"), "surrounding text preserved");
     }
 
-    /// Verify render_message_body preserves blockquote content.
+    /// Verify `render_message_body` preserves blockquote content.
     #[test]
     fn c5_message_body_blockquote_fidelity() {
         let md = "> Important: the migration is scheduled for midnight.";
@@ -1082,7 +1110,7 @@ Thanks!";
         assert!(text.contains("midnight"), "blockquote content preserved");
     }
 
-    /// Verify render_message_body preserves task list items.
+    /// Verify `render_message_body` preserves task list items.
     #[test]
     fn c5_message_body_task_list_fidelity() {
         let md = "- [x] Tests pass\n- [ ] Deploy to staging\n- [ ] Monitor metrics";
@@ -1097,7 +1125,7 @@ Thanks!";
         assert!(text.contains("Monitor metrics"), "unchecked task preserved");
     }
 
-    /// Verify render_message_body_preview strips markdown but keeps content.
+    /// Verify `render_message_body_preview` strips markdown but keeps content.
     #[test]
     fn c5_preview_strips_formatting_preserves_content() {
         let md = "## Update\n\n**Build** is `green`. See [CI](https://ci.example.com).";
@@ -1114,7 +1142,7 @@ Thanks!";
         assert!(!text.contains("##"), "heading syntax stripped from preview");
     }
 
-    /// Verify render_message_body_blockquote wraps multi-line content correctly.
+    /// Verify `render_message_body_blockquote` wraps multi-line content correctly.
     #[test]
     fn c5_blockquote_multiline_fidelity() {
         let body = "Line one\nLine two\nLine three";
@@ -1126,7 +1154,7 @@ Thanks!";
     }
 
     /// Verify sanitization strips script but preserves surrounding content
-    /// through the full render_message_body pipeline.
+    /// through the full `render_message_body` pipeline.
     #[test]
     fn c5_sanitization_preserves_surrounding_content() {
         let md = "Before\n\n<script>evil()</script>\n\nMiddle\n\n<img onerror=x src=y>\n\nAfter";
@@ -1166,6 +1194,7 @@ Thanks!";
     /// Comprehensive regression matrix exercising `render_message_body()` (the
     /// canonical pipeline with JSON detection) across all GFM element types.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn c5_canonical_pipeline_regression_matrix() {
         struct Case {
             id: &'static str,

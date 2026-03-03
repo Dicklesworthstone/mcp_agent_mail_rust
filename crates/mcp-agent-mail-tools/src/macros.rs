@@ -94,7 +94,7 @@ pub async fn macro_start_session(
     inbox_limit: Option<i32>,
 ) -> McpResult<String> {
     // Validate human_key is absolute
-    if !human_key.starts_with('/') {
+    if !std::path::Path::new(&human_key).is_absolute() {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             "human_key must be an absolute path (e.g., '/data/projects/backend')",
@@ -817,12 +817,13 @@ mod tests {
 
     #[test]
     fn absolute_path_check_for_human_key() {
+        use std::path::Path;
         // This tests the same validation logic used in macro_start_session
-        assert!("/data/projects/test".starts_with('/'));
-        assert!("/".starts_with('/'));
-        assert!(!"data/projects/test".starts_with('/'));
-        assert!(!"./test".starts_with('/'));
-        assert!(!"".starts_with('/'));
+        assert!(Path::new("/data/projects/test").is_absolute());
+        assert!(Path::new("/").is_absolute());
+        assert!(!Path::new("data/projects/test").is_absolute());
+        assert!(!Path::new("./test").is_absolute());
+        assert!(!Path::new("").is_absolute());
     }
 
     // -----------------------------------------------------------------------
@@ -1117,23 +1118,17 @@ mod tests {
 
     #[test]
     fn human_key_absolute_path_variations() {
+        use std::path::Path;
         // Valid absolute paths
-        assert!("/data/projects/test".starts_with('/'));
-        assert!("/".starts_with('/'));
-        assert!("/a/b/c/d/e/f".starts_with('/'));
+        assert!(Path::new("/data/projects/test").is_absolute());
+        assert!(Path::new("/").is_absolute());
+        assert!(Path::new("/a/b/c/d/e/f").is_absolute());
 
         // Invalid relative paths
-        assert!(!"data/projects/test".starts_with('/'));
-        assert!(!"./test".starts_with('/'));
-        assert!(!"../parent".starts_with('/'));
-        assert!(!"~/.config".starts_with('/')); // tilde is not /
-    }
-
-    #[test]
-    fn human_key_windows_paths_are_relative() {
-        // Windows-style paths should be considered relative
-        assert!(!"C:\\Users\\test".starts_with('/'));
-        assert!(!"D:/projects/foo".starts_with('/'));
+        assert!(!Path::new("data/projects/test").is_absolute());
+        assert!(!Path::new("./test").is_absolute());
+        assert!(!Path::new("../parent").is_absolute());
+        assert!(!Path::new("~/.config").is_absolute()); // tilde is not an absolute path
     }
 
     // -----------------------------------------------------------------------

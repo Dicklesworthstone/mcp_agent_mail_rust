@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
 use mcp_agent_mail_server::tui_events::{
     AgentSummary, ContactSummary, DbStatSnapshot, ProjectSummary,
@@ -32,7 +32,7 @@ use mcp_agent_mail_server::tui_screens::MailScreen;
 // ── Fixture environment ─────────────────────────────────────────────────
 
 struct SeededEnv {
-    _tmp: tempfile::TempDir,
+    _tmp_dir: tempfile::TempDir,
     db_path: PathBuf,
 }
 
@@ -41,7 +41,10 @@ impl SeededEnv {
     fn new() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("e1_truth.sqlite3");
-        let env = Self { _tmp: tmp, db_path };
+        let env = Self {
+            _tmp_dir: tmp,
+            db_path,
+        };
         let conn = env.init_conn();
         env.seed(&conn);
         drop(conn);
@@ -50,8 +53,7 @@ impl SeededEnv {
 
     /// Open connection and initialise schema (first open only).
     fn init_conn(&self) -> DbConn {
-        let conn =
-            DbConn::open_file(self.db_path.display().to_string()).expect("open sqlite db");
+        let conn = DbConn::open_file(self.db_path.display().to_string()).expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
         conn
@@ -77,6 +79,7 @@ impl SeededEnv {
     }
 
     /// Seed 3 projects, 6 agents, 20 messages across 4 threads, 3 contact links.
+    #[allow(clippy::unused_self, clippy::too_many_lines)]
     fn seed(&self, conn: &DbConn) {
         let base_ts: i64 = 1_704_067_200_000_000; // 2024-01-01T00:00:00Z
 
@@ -121,7 +124,7 @@ impl SeededEnv {
                     SqlValue::Text(model.to_string()),
                     SqlValue::Text("E1 truthfulness fixture agent".to_string()),
                     SqlValue::BigInt(base_ts),
-                    SqlValue::BigInt(base_ts + 3600_000_000),
+                    SqlValue::BigInt(base_ts + 3_600_000_000),
                     SqlValue::Text("auto".to_string()),
                     SqlValue::Text("auto".to_string()),
                 ],
@@ -130,7 +133,12 @@ impl SeededEnv {
         }
 
         // Messages (20 across 4 threads, with real body_md)
-        let threads = ["thread-alpha", "thread-beta", "thread-gamma", "thread-delta"];
+        let threads = [
+            "thread-alpha",
+            "thread-beta",
+            "thread-gamma",
+            "thread-delta",
+        ];
         for i in 1..=20_i64 {
             let sender = agents[((i - 1) as usize) % agents.len()];
             let recipient = agents[(i as usize) % agents.len()];
@@ -202,6 +210,7 @@ impl SeededEnv {
     }
 
     /// Build a `DbStatSnapshot` that reflects the seeded data for poller-fed screens.
+    #[allow(clippy::unused_self, clippy::too_many_lines)]
     fn db_stat_snapshot(&self) -> DbStatSnapshot {
         let base_ts: i64 = 1_704_067_200_000_000;
         DbStatSnapshot {
@@ -215,32 +224,32 @@ impl SeededEnv {
                 AgentSummary {
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
-                    last_active_ts: base_ts + 3600_000_000,
+                    last_active_ts: base_ts + 3_600_000_000,
                 },
                 AgentSummary {
                     name: "BlueBear".to_string(),
                     program: "codex".to_string(),
-                    last_active_ts: base_ts + 3600_000_000,
+                    last_active_ts: base_ts + 3_600_000_000,
                 },
                 AgentSummary {
                     name: "GreenOwl".to_string(),
                     program: "claude-code".to_string(),
-                    last_active_ts: base_ts + 3600_000_000,
+                    last_active_ts: base_ts + 3_600_000_000,
                 },
                 AgentSummary {
                     name: "GoldEagle".to_string(),
                     program: "gemini".to_string(),
-                    last_active_ts: base_ts + 3600_000_000,
+                    last_active_ts: base_ts + 3_600_000_000,
                 },
                 AgentSummary {
                     name: "SilverWolf".to_string(),
                     program: "claude-code".to_string(),
-                    last_active_ts: base_ts + 3600_000_000,
+                    last_active_ts: base_ts + 3_600_000_000,
                 },
                 AgentSummary {
                     name: "CopperRobin".to_string(),
                     program: "codex".to_string(),
-                    last_active_ts: base_ts + 3600_000_000,
+                    last_active_ts: base_ts + 3_600_000_000,
                 },
             ],
             projects_list: vec![
@@ -249,7 +258,7 @@ impl SeededEnv {
                     slug: "alpha-proj".to_string(),
                     human_key: "/tmp/alpha".to_string(),
                     agent_count: 2,
-                    message_count: 7,
+                    message_count: 8, // agents[0..=1] (project 1) send at i=1,2,7,8,13,14,19,20
                     reservation_count: 0,
                     created_at: base_ts,
                 },
@@ -258,7 +267,7 @@ impl SeededEnv {
                     slug: "beta-proj".to_string(),
                     human_key: "/tmp/beta".to_string(),
                     agent_count: 2,
-                    message_count: 7,
+                    message_count: 6, // agents[2..=3] (project 2) send at i=3,4,9,10,15,16
                     reservation_count: 0,
                     created_at: base_ts,
                 },
@@ -364,7 +373,10 @@ fn mismatch_msg(surface: &str, field: &str, expected: &str, observed: &str) -> S
 fn build_diagnostic_artifact(
     env: &SeededEnv,
     state: &TuiSharedState,
-    screens_checked: &[(&str, Option<&mcp_agent_mail_server::tui_bridge::ScreenDiagnosticSnapshot>)],
+    screens_checked: &[(
+        &str,
+        Option<&mcp_agent_mail_server::tui_bridge::ScreenDiagnosticSnapshot>,
+    )],
 ) -> String {
     let conn = env.open_conn();
 
@@ -393,18 +405,22 @@ fn build_diagnostic_artifact(
     // Per-screen diagnostic dumps
     let mut screen_dumps = Vec::new();
     for (name, diag) in screens_checked {
-        let dump = if let Some(d) = diag {
-            format!(
-                "    {{\"screen\":\"{name}\",\"scope\":\"{}\",\"raw_count\":{},\"rendered_count\":{},\"dropped_count\":{},\"query_params\":\"{}\",\"db_url\":\"{}\",\"transport_mode\":\"{}\",\"auth_enabled\":{}}}",
-                d.scope, d.raw_count, d.rendered_count, d.dropped_count,
-                d.query_params.replace('\"', "\\\""),
-                d.db_url.replace('\"', "\\\""),
-                d.transport_mode,
-                d.auth_enabled
-            )
-        } else {
-            format!("    {{\"screen\":\"{name}\",\"status\":\"no_diagnostic_emitted\"}}")
-        };
+        let dump = diag.as_ref().map_or_else(
+            || format!("    {{\"screen\":\"{name}\",\"status\":\"no_diagnostic_emitted\"}}"),
+            |d| {
+                format!(
+                    "    {{\"screen\":\"{name}\",\"scope\":\"{}\",\"raw_count\":{},\"rendered_count\":{},\"dropped_count\":{},\"query_params\":\"{}\",\"db_url\":\"{}\",\"transport_mode\":\"{}\",\"auth_enabled\":{}}}",
+                    d.scope,
+                    d.raw_count,
+                    d.rendered_count,
+                    d.dropped_count,
+                    d.query_params.replace('\"', "\\\""),
+                    d.db_url.replace('\"', "\\\""),
+                    d.transport_mode,
+                    d.auth_enabled
+                )
+            },
+        );
         screen_dumps.push(dump);
     }
 
@@ -412,7 +428,12 @@ fn build_diagnostic_artifact(
     let all_diags = state.screen_diagnostics_since(0);
     let diag_log_lines: Vec<String> = all_diags
         .iter()
-        .map(|(seq, d)| format!("    \"[seq={seq}] {}\"", d.to_log_line().replace('\"', "\\\"")))
+        .map(|(seq, d)| {
+            format!(
+                "    \"[seq={seq}] {}\"",
+                d.to_log_line().replace('\"', "\\\"")
+            )
+        })
         .collect();
 
     format!(
@@ -445,7 +466,10 @@ fn build_diagnostic_artifact(
 fn emit_diagnostic_artifact(
     env: &SeededEnv,
     state: &TuiSharedState,
-    screens_checked: &[(&str, Option<&mcp_agent_mail_server::tui_bridge::ScreenDiagnosticSnapshot>)],
+    screens_checked: &[(
+        &str,
+        Option<&mcp_agent_mail_server::tui_bridge::ScreenDiagnosticSnapshot>,
+    )],
     artifact_dir: Option<&std::path::Path>,
 ) {
     let artifact = build_diagnostic_artifact(env, state, screens_checked);
@@ -456,7 +480,7 @@ fn emit_diagnostic_artifact(
 
     if let Some(dir) = artifact_dir {
         let path = dir.join("truthfulness_diagnostic.json");
-        if let Ok(()) = std::fs::create_dir_all(dir) {
+        if matches!(std::fs::create_dir_all(dir), Ok(())) {
             let _ = std::fs::write(&path, &artifact);
             eprintln!("Artifact written to: {}", path.display());
         }
@@ -465,7 +489,7 @@ fn emit_diagnostic_artifact(
 
 // ── E1 Tests: Poller-fed screens (diagnostics-verified) ─────────────────
 
-/// Agents screen emits diagnostic with raw_count > 0 when seeded data delivered.
+/// Agents screen emits diagnostic with `raw_count` > 0 when seeded data delivered.
 #[test]
 fn e1_agents_truthful_when_seeded() {
     use mcp_agent_mail_server::tui_screens::agents::AgentsScreen;
@@ -492,7 +516,8 @@ fn e1_agents_truthful_when_seeded() {
         mismatch_msg("agents", "raw_count", ">0", &diag.raw_count.to_string())
     );
     assert_eq!(
-        diag.raw_count, 6,
+        diag.raw_count,
+        6,
         "{}",
         mismatch_msg("agents", "raw_count", "6", &diag.raw_count.to_string())
     );
@@ -508,7 +533,7 @@ fn e1_agents_truthful_when_seeded() {
     );
 }
 
-/// Projects screen emits diagnostic with raw_count > 0 when seeded data delivered.
+/// Projects screen emits diagnostic with `raw_count` > 0 when seeded data delivered.
 #[test]
 fn e1_projects_truthful_when_seeded() {
     use mcp_agent_mail_server::tui_screens::projects::ProjectsScreen;
@@ -535,13 +560,14 @@ fn e1_projects_truthful_when_seeded() {
         mismatch_msg("projects", "raw_count", ">0", &diag.raw_count.to_string())
     );
     assert_eq!(
-        diag.raw_count, 3,
+        diag.raw_count,
+        3,
         "{}",
         mismatch_msg("projects", "raw_count", "3", &diag.raw_count.to_string())
     );
 }
 
-/// Contacts screen emits diagnostic with raw_count > 0 when seeded data delivered.
+/// Contacts screen emits diagnostic with `raw_count` > 0 when seeded data delivered.
 #[test]
 fn e1_contacts_truthful_when_seeded() {
     use mcp_agent_mail_server::tui_screens::contacts::ContactsScreen;
@@ -568,7 +594,8 @@ fn e1_contacts_truthful_when_seeded() {
         mismatch_msg("contacts", "raw_count", ">0", &diag.raw_count.to_string())
     );
     assert_eq!(
-        diag.raw_count, 3,
+        diag.raw_count,
+        3,
         "{}",
         mismatch_msg("contacts", "raw_count", "3", &diag.raw_count.to_string())
     );
@@ -576,7 +603,7 @@ fn e1_contacts_truthful_when_seeded() {
 
 // ── E1 Tests: Direct-DB screens (diagnostics-verified) ──────────────────
 
-/// Messages screen emits diagnostic with raw_count > 0 when seeded DB has messages.
+/// Messages screen emits diagnostic with `raw_count` > 0 when seeded DB has messages.
 #[test]
 fn e1_messages_truthful_when_seeded() {
     use mcp_agent_mail_server::tui_screens::messages::MessageBrowserScreen;
@@ -612,7 +639,7 @@ fn e1_messages_truthful_when_seeded() {
     );
 }
 
-/// Threads screen emits diagnostic with raw_count > 0 from seeded DB.
+/// Threads screen emits diagnostic with `raw_count` > 0 from seeded DB.
 #[test]
 fn e1_threads_truthful_when_seeded() {
     use mcp_agent_mail_server::tui_screens::threads::ThreadExplorerScreen;
@@ -646,7 +673,7 @@ fn e1_threads_truthful_when_seeded() {
     );
 }
 
-/// Explorer screen connects to seeded DB without db_context_unavailable.
+/// Explorer screen connects to seeded DB without `db_context_unavailable`.
 #[test]
 fn e1_explorer_connects_to_seeded_db() {
     use mcp_agent_mail_server::tui_screens::explorer::MailExplorerScreen;
@@ -680,16 +707,11 @@ fn e1_explorer_connects_to_seeded_db() {
     assert!(
         !has_unavailable,
         "{}",
-        mismatch_msg(
-            "explorer",
-            "db_unavailable_diagnostic",
-            "none",
-            "found"
-        )
+        mismatch_msg("explorer", "db_unavailable_diagnostic", "none", "found")
     );
 }
 
-/// Search screen connects to seeded DB without db_context_unavailable.
+/// Search screen connects to seeded DB without `db_context_unavailable`.
 #[test]
 fn e1_search_connects_to_seeded_db() {
     use mcp_agent_mail_server::tui_screens::search::SearchCockpitScreen;
@@ -713,7 +735,7 @@ fn e1_search_connects_to_seeded_db() {
     );
 }
 
-/// Attachments screen connects to seeded DB without db_context_unavailable.
+/// Attachments screen connects to seeded DB without `db_context_unavailable`.
 #[test]
 fn e1_attachments_connects_to_seeded_db() {
     use mcp_agent_mail_server::tui_screens::attachments::AttachmentExplorerScreen;
@@ -750,7 +772,8 @@ fn e1_agent_count_poller_matches_db() {
 
     let snap = env.db_stat_snapshot();
     assert_eq!(
-        snap.agents, db_count as u64,
+        snap.agents,
+        db_count as u64,
         "{}",
         mismatch_msg(
             "cross_surface",
@@ -783,7 +806,8 @@ fn e1_project_count_poller_matches_db() {
 
     let snap = env.db_stat_snapshot();
     assert_eq!(
-        snap.projects, db_count as u64,
+        snap.projects,
+        db_count as u64,
         "{}",
         mismatch_msg(
             "cross_surface",
@@ -818,7 +842,8 @@ fn e1_thread_count_matches_seed() {
         .unwrap_or(0);
 
     assert_eq!(
-        distinct_threads, 4,
+        distinct_threads,
+        4,
         "{}",
         mismatch_msg(
             "cross_surface",
@@ -829,21 +854,18 @@ fn e1_thread_count_matches_seed() {
     );
 }
 
-/// All seeded messages have non-empty body_md (no placeholders in DB).
+/// All seeded messages have non-empty `body_md` (no placeholders in DB).
 #[test]
 fn e1_all_messages_have_body_content() {
     let env = SeededEnv::new();
     env.validate_seed();
 
     let conn = env.open_conn();
-    let empty_body = count_where(
-        &conn,
-        "messages",
-        "body_md IS NULL OR body_md = ''",
-    );
+    let empty_body = count_where(&conn, "messages", "body_md IS NULL OR body_md = ''");
 
     assert_eq!(
-        empty_body, 0,
+        empty_body,
+        0,
         "{}",
         mismatch_msg(
             "fixture_invariant",
@@ -854,21 +876,18 @@ fn e1_all_messages_have_body_content() {
     );
 }
 
-/// All seeded messages have body_md containing real markdown (not placeholder text).
+/// All seeded messages have `body_md` containing real markdown (not placeholder text).
 #[test]
 fn e1_message_bodies_contain_real_markdown() {
     let env = SeededEnv::new();
     env.validate_seed();
 
     let conn = env.open_conn();
-    let has_md = count_where(
-        &conn,
-        "messages",
-        "body_md LIKE '%real markdown%'",
-    );
+    let has_md = count_where(&conn, "messages", "body_md LIKE '%real markdown%'");
 
     assert_eq!(
-        has_md, 20,
+        has_md,
+        20,
         "{}",
         mismatch_msg(
             "fixture_invariant",
@@ -881,7 +900,7 @@ fn e1_message_bodies_contain_real_markdown() {
 
 // ── E3 Tests: Thread Integrity (list + detail + counts) ──────────────────
 
-/// Thread list diagnostic raw_count matches distinct thread_id count in DB.
+/// Thread list diagnostic `raw_count` matches distinct `thread_id` count in DB.
 #[test]
 fn e3_thread_list_cardinality_matches_db() {
     use mcp_agent_mail_server::tui_screens::threads::ThreadExplorerScreen;
@@ -893,8 +912,7 @@ fn e3_thread_list_cardinality_matches_db() {
     let mut screen = ThreadExplorerScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "threads")
-        .expect("threads diagnostic should be emitted");
+    let diag = find_diagnostic(&state, "threads").expect("threads diagnostic should be emitted");
 
     let conn = env.open_conn();
     let rows = conn
@@ -914,7 +932,8 @@ fn e3_thread_list_cardinality_matches_db() {
         .unwrap_or(0);
 
     assert_eq!(
-        diag.raw_count, db_thread_count,
+        diag.raw_count,
+        db_thread_count,
         "{}",
         mismatch_msg(
             "e3_threads",
@@ -925,7 +944,7 @@ fn e3_thread_list_cardinality_matches_db() {
     );
 }
 
-/// Thread list rendered_count matches raw_count when no filter is active.
+/// Thread list `rendered_count` matches `raw_count` when no filter is active.
 #[test]
 fn e3_thread_list_no_filter_renders_all() {
     use mcp_agent_mail_server::tui_screens::threads::ThreadExplorerScreen;
@@ -937,11 +956,11 @@ fn e3_thread_list_no_filter_renders_all() {
     let mut screen = ThreadExplorerScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "threads")
-        .expect("threads diagnostic should be emitted");
+    let diag = find_diagnostic(&state, "threads").expect("threads diagnostic should be emitted");
 
     assert_eq!(
-        diag.rendered_count, diag.raw_count,
+        diag.rendered_count,
+        diag.raw_count,
         "{}",
         mismatch_msg(
             "e3_threads",
@@ -952,7 +971,7 @@ fn e3_thread_list_no_filter_renders_all() {
     );
 }
 
-/// Each seeded thread_id has the expected message distribution.
+/// Each seeded `thread_id` has the expected message distribution.
 #[test]
 fn e3_thread_message_distribution() {
     let env = SeededEnv::new();
@@ -986,7 +1005,8 @@ fn e3_thread_message_distribution() {
             })
             .unwrap_or(0);
         assert_eq!(
-            actual, expected_count,
+            actual,
+            expected_count,
             "{}",
             mismatch_msg(
                 "e3_thread_distribution",
@@ -998,7 +1018,7 @@ fn e3_thread_message_distribution() {
     }
 }
 
-/// Thread list diagnostic does NOT indicate db_unavailable.
+/// Thread list diagnostic does NOT indicate `db_unavailable`.
 #[test]
 fn e3_thread_list_not_db_unavailable() {
     use mcp_agent_mail_server::tui_screens::threads::ThreadExplorerScreen;
@@ -1066,7 +1086,7 @@ fn e3_thread_messages_have_distinct_senders() {
 
 // ── E6 Tests: CI Failure Diagnostics Artifacts ──────────────────────────
 
-/// The emit_diagnostic_artifact function must produce valid JSON with db_truth section.
+/// The `emit_diagnostic_artifact` function must produce valid JSON with `db_truth` section.
 #[test]
 fn e6_artifact_emits_db_truth_counts() {
     use mcp_agent_mail_server::tui_screens::agents::AgentsScreen;
@@ -1086,7 +1106,7 @@ fn e6_artifact_emits_db_truth_counts() {
     let agents_diag = find_diagnostic(&state, "agents");
     let projects_diag = find_diagnostic(&state, "projects");
 
-    let artifact_dir = env._tmp.path().join("artifacts");
+    let artifact_dir = env._tmp_dir.path().join("artifacts");
 
     emit_diagnostic_artifact(
         &env,
@@ -1126,7 +1146,7 @@ fn e6_artifact_emits_db_truth_counts() {
     );
 }
 
-/// Artifact db_truth counts must match actual DB contents.
+/// Artifact `db_truth` counts must match actual DB contents.
 #[test]
 fn e6_artifact_db_truth_matches_reality() {
     use mcp_agent_mail_server::tui_screens::agents::AgentsScreen;
@@ -1140,7 +1160,7 @@ fn e6_artifact_db_truth_matches_reality() {
     let mut agents = AgentsScreen::new();
     agents.tick(0, &state);
 
-    let artifact_dir = env._tmp.path().join("artifacts_truth");
+    let artifact_dir = env._tmp_dir.path().join("artifacts_truth");
 
     emit_diagnostic_artifact(
         &env,
@@ -1172,7 +1192,7 @@ fn e6_artifact_db_truth_matches_reality() {
     );
 }
 
-/// Artifact screen_diagnostics must include per-screen entries for each checked screen.
+/// Artifact `screen_diagnostics` must include per-screen entries for each checked screen.
 #[test]
 fn e6_artifact_includes_per_screen_diagnostics() {
     use mcp_agent_mail_server::tui_screens::agents::AgentsScreen;
@@ -1192,7 +1212,7 @@ fn e6_artifact_includes_per_screen_diagnostics() {
     let mut contacts = ContactsScreen::new();
     contacts.tick(0, &state);
 
-    let artifact_dir = env._tmp.path().join("artifacts_screens");
+    let artifact_dir = env._tmp_dir.path().join("artifacts_screens");
 
     emit_diagnostic_artifact(
         &env,
@@ -1223,22 +1243,19 @@ fn e6_artifact_includes_per_screen_diagnostics() {
     );
 }
 
-/// Artifact must handle missing diagnostics gracefully (no_diagnostic_emitted marker).
+/// Artifact must handle missing diagnostics gracefully (`no_diagnostic_emitted` marker).
 #[test]
 fn e6_artifact_handles_missing_diagnostics() {
     let env = SeededEnv::new();
     let state = env.state();
 
-    let artifact_dir = env._tmp.path().join("artifacts_missing");
+    let artifact_dir = env._tmp_dir.path().join("artifacts_missing");
 
     // Pass screens that never ticked → no diagnostics
     emit_diagnostic_artifact(
         &env,
         &state,
-        &[
-            ("agents", None),
-            ("explorer", None),
-        ],
+        &[("agents", None), ("explorer", None)],
         Some(&artifact_dir),
     );
 
@@ -1252,7 +1269,7 @@ fn e6_artifact_handles_missing_diagnostics() {
     );
 }
 
-/// Artifact diagnostic_log section must contain log lines from screens that ticked.
+/// Artifact `diagnostic_log` section must contain log lines from screens that ticked.
 #[test]
 fn e6_artifact_diagnostic_log_populated() {
     use mcp_agent_mail_server::tui_screens::agents::AgentsScreen;
@@ -1266,7 +1283,7 @@ fn e6_artifact_diagnostic_log_populated() {
     let mut agents = AgentsScreen::new();
     agents.tick(0, &state);
 
-    let artifact_dir = env._tmp.path().join("artifacts_log");
+    let artifact_dir = env._tmp_dir.path().join("artifacts_log");
 
     emit_diagnostic_artifact(
         &env,
@@ -1306,9 +1323,11 @@ fn e7_smoke_agents_non_empty() {
     let mut screen = AgentsScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "agents")
-        .expect("agents diagnostic should be emitted");
-    assert!(diag.raw_count > 0, "e7_smoke: agents raw_count should be > 0");
+    let diag = find_diagnostic(&state, "agents").expect("agents diagnostic should be emitted");
+    assert!(
+        diag.raw_count > 0,
+        "e7_smoke: agents raw_count should be > 0"
+    );
     assert!(
         diag.rendered_count > 0,
         "e7_smoke: agents rendered_count should be > 0"
@@ -1334,8 +1353,7 @@ fn e7_smoke_projects_non_empty() {
     let mut screen = ProjectsScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "projects")
-        .expect("projects diagnostic should be emitted");
+    let diag = find_diagnostic(&state, "projects").expect("projects diagnostic should be emitted");
     assert!(
         diag.raw_count > 0,
         "e7_smoke: projects raw_count should be > 0"
@@ -1358,8 +1376,7 @@ fn e7_smoke_threads_non_empty() {
     let mut screen = ThreadExplorerScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "threads")
-        .expect("threads diagnostic should be emitted");
+    let diag = find_diagnostic(&state, "threads").expect("threads diagnostic should be emitted");
     assert!(
         diag.raw_count >= 4,
         "e7_smoke: threads raw_count should be >= 4, got {}",
@@ -1379,8 +1396,7 @@ fn e7_smoke_messages_non_empty() {
     let mut screen = MessageBrowserScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "messages")
-        .expect("messages diagnostic should be emitted");
+    let diag = find_diagnostic(&state, "messages").expect("messages diagnostic should be emitted");
     assert!(
         diag.raw_count > 0,
         "e7_smoke: messages raw_count should be > 0, got {}",
@@ -1406,8 +1422,7 @@ fn e7_smoke_contacts_non_empty() {
     let mut screen = ContactsScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "contacts")
-        .expect("contacts diagnostic should be emitted");
+    let diag = find_diagnostic(&state, "contacts").expect("contacts diagnostic should be emitted");
     assert!(
         diag.raw_count > 0,
         "e7_smoke: contacts raw_count should be > 0"
@@ -1418,7 +1433,7 @@ fn e7_smoke_contacts_non_empty() {
     );
 }
 
-/// Smoke: dashboard renders without panic after db_stats and events injected.
+/// Smoke: dashboard renders without panic after `db_stats` and events injected.
 #[test]
 fn e7_smoke_dashboard_renders_with_data() {
     use mcp_agent_mail_server::tui_screens::dashboard::DashboardScreen;
@@ -1432,19 +1447,21 @@ fn e7_smoke_dashboard_renders_with_data() {
     // Push some events so the dashboard has data
     let base_ts: i64 = 1_704_067_200_000_000;
     for i in 1..=5_u64 {
-        let _ = state.push_event(mcp_agent_mail_server::tui_events::MailEvent::MessageReceived {
-            seq: i,
-            timestamp_micros: base_ts + (i as i64) * 60_000_000,
-            source: mcp_agent_mail_server::tui_events::EventSource::Mail,
-            redacted: false,
-            id: i as i64,
-            from: "RedFox".to_string(),
-            to: vec!["BlueBear".to_string()],
-            subject: format!("Test message {i}"),
-            thread_id: "thread-alpha".to_string(),
-            project: "alpha-proj".to_string(),
-            body_excerpt: format!("This is **real markdown** body for msg {i}"),
-        });
+        let _ = state.push_event(
+            mcp_agent_mail_server::tui_events::MailEvent::MessageReceived {
+                seq: i,
+                timestamp_micros: base_ts + (i as i64) * 60_000_000,
+                source: mcp_agent_mail_server::tui_events::EventSource::Mail,
+                redacted: false,
+                id: i as i64,
+                from: "RedFox".to_string(),
+                to: vec!["BlueBear".to_string()],
+                subject: format!("Test message {i}"),
+                thread_id: "thread-alpha".to_string(),
+                project: "alpha-proj".to_string(),
+                body_excerpt: format!("This is **real markdown** body for msg {i}"),
+            },
+        );
     }
 
     let mut screen = DashboardScreen::new();
@@ -1460,7 +1477,7 @@ fn e7_smoke_dashboard_renders_with_data() {
     );
 }
 
-/// Smoke: all direct-DB screens connect successfully (no db_unavailable).
+/// Smoke: all direct-DB screens connect successfully (no `db_unavailable`).
 #[test]
 fn e7_smoke_all_db_screens_connect() {
     use mcp_agent_mail_server::tui_screens::attachments::AttachmentExplorerScreen;
@@ -1508,7 +1525,7 @@ fn e7_smoke_all_db_screens_connect() {
     );
 }
 
-/// Smoke: message body_md in DB is real GFM content (not placeholder).
+/// Smoke: message `body_md` in DB is real GFM content (not placeholder).
 #[test]
 fn e7_smoke_message_bodies_are_real_gfm() {
     let env = SeededEnv::new();
@@ -1521,10 +1538,19 @@ fn e7_smoke_message_bodies_are_real_gfm() {
     let has_code = count_where(&conn, "messages", "body_md LIKE '%```rust%'");
     let has_list = count_where(&conn, "messages", "body_md LIKE '%- Item A%'");
 
-    assert_eq!(has_heading, 20, "e7_smoke: all messages should have headings");
+    assert_eq!(
+        has_heading, 20,
+        "e7_smoke: all messages should have headings"
+    );
     assert_eq!(has_bold, 20, "e7_smoke: all messages should have bold text");
-    assert_eq!(has_code, 20, "e7_smoke: all messages should have code blocks");
-    assert_eq!(has_list, 20, "e7_smoke: all messages should have list items");
+    assert_eq!(
+        has_code, 20,
+        "e7_smoke: all messages should have code blocks"
+    );
+    assert_eq!(
+        has_list, 20,
+        "e7_smoke: all messages should have list items"
+    );
 }
 
 /// Smoke: fixture entity counts form a consistent matrix.
@@ -1549,10 +1575,7 @@ fn e7_smoke_entity_count_matrix() {
 
     // Cross-entity invariants
     assert_eq!(agents / projects, 2, "e7_smoke: 2 agents per project");
-    assert_eq!(
-        recipients, messages,
-        "e7_smoke: one recipient per message"
-    );
+    assert_eq!(recipients, messages, "e7_smoke: one recipient per message");
 }
 
 // ── E8 Tests: Unit Invariant Suite for Truthfulness Contracts ─────────
@@ -1594,12 +1617,12 @@ fn e8_iso_rejects_malformed_without_panic() {
     let malformed = [
         "",
         "not-a-date",
-        "2024-13-01T00:00:00Z",         // month 13
-        "2024-01-32T00:00:00Z",         // day 32
-        "2024-01-01",                    // date only, no time
-        "12345",                         // integer-like string
+        "2024-13-01T00:00:00Z", // month 13
+        "2024-01-32T00:00:00Z", // day 32
+        "2024-01-01",           // date only, no time
+        "12345",                // integer-like string
         "null",
-        "2024-01-01T25:00:00Z",         // hour 25
+        "2024-01-01T25:00:00Z", // hour 25
     ];
     for input in malformed {
         assert!(
@@ -1615,10 +1638,10 @@ fn e8_timestamp_roundtrip_preserves_precision() {
     use mcp_agent_mail_db::{iso_to_micros, micros_to_iso};
 
     let test_values: &[i64] = &[
-        0,                                // epoch
-        1_704_067_200_000_000,           // 2024-01-01
-        1_704_067_200_123_456,           // with microseconds
-        -500_000,                        // pre-1970
+        0,                     // epoch
+        1_704_067_200_000_000, // 2024-01-01
+        1_704_067_200_123_456, // with microseconds
+        -500_000,              // pre-1970
     ];
     for &original in test_values {
         let iso = micros_to_iso(original);
@@ -1685,7 +1708,10 @@ fn e8_type_mismatch_does_not_silently_empty() {
             _ => None,
         })
         .unwrap_or(-1);
-    assert_eq!(cnt, 0, "e8: type mismatch should return count=0, not error or phantom rows");
+    assert_eq!(
+        cnt, 0,
+        "e8: type mismatch should return count=0, not error or phantom rows"
+    );
 }
 
 /// Empty result from a valid query is distinguishable from an error result.
@@ -1698,7 +1724,10 @@ fn e8_empty_result_from_valid_query_is_ok_empty() {
         "SELECT id FROM messages WHERE id = ?",
         &[SqlValue::BigInt(99999)],
     );
-    assert!(result.is_ok(), "e8: query with no matches should be Ok(empty), not Err");
+    assert!(
+        result.is_ok(),
+        "e8: query with no matches should be Ok(empty), not Err"
+    );
     assert!(
         result.unwrap().is_empty(),
         "e8: query with no matches should return empty Vec"
@@ -1707,7 +1736,7 @@ fn e8_empty_result_from_valid_query_is_ok_empty() {
 
 // -- E8.3: Context binding invariants ─────────────────────────────────
 
-/// TuiSharedState config_snapshot must preserve raw_database_url for DB connection.
+/// `TuiSharedState` `config_snapshot` must preserve `raw_database_url` for DB connection.
 #[test]
 fn e8_config_snapshot_preserves_raw_db_url() {
     let env = SeededEnv::new();
@@ -1723,7 +1752,7 @@ fn e8_config_snapshot_preserves_raw_db_url() {
     );
 }
 
-/// Screens that use ensure_db_conn() must get a valid connection from config.
+/// Screens that use `ensure_db_conn()` must get a valid connection from config.
 #[test]
 fn e8_messages_screen_connects_via_config() {
     use mcp_agent_mail_server::tui_screens::messages::MessageBrowserScreen;
@@ -1755,7 +1784,7 @@ fn e8_messages_screen_connects_via_config() {
 
 // -- E8.4: Count/list consistency invariants ──────────────────────────
 
-/// raw_count must equal DB truth for poller-fed screens.
+/// `raw_count` must equal DB truth for poller-fed screens.
 #[test]
 fn e8_agents_raw_count_equals_db_truth() {
     use mcp_agent_mail_server::tui_screens::agents::AgentsScreen;
@@ -1771,15 +1800,14 @@ fn e8_agents_raw_count_equals_db_truth() {
     let mut screen = AgentsScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "agents")
-        .expect("e8: agents diagnostic should be emitted");
+    let diag = find_diagnostic(&state, "agents").expect("e8: agents diagnostic should be emitted");
     assert_eq!(
         diag.raw_count, expected_agents,
         "e8: agents raw_count must equal agents_list.len()"
     );
 }
 
-/// rendered_count must equal raw_count when no filter is active.
+/// `rendered_count` must equal `raw_count` when no filter is active.
 #[test]
 fn e8_projects_rendered_equals_raw_no_filter() {
     use mcp_agent_mail_server::tui_screens::projects::ProjectsScreen;
@@ -1793,15 +1821,15 @@ fn e8_projects_rendered_equals_raw_no_filter() {
     let mut screen = ProjectsScreen::new();
     screen.tick(0, &state);
 
-    let diag = find_diagnostic(&state, "projects")
-        .expect("e8: projects diagnostic should be emitted");
+    let diag =
+        find_diagnostic(&state, "projects").expect("e8: projects diagnostic should be emitted");
     assert_eq!(
         diag.rendered_count, diag.raw_count,
         "e8: rendered_count must equal raw_count when no filter active"
     );
 }
 
-/// dropped_count must equal raw - rendered for all screens.
+/// `dropped_count` must equal raw - rendered for all screens.
 #[test]
 fn e8_dropped_count_consistent_across_screens() {
     use mcp_agent_mail_server::tui_screens::agents::AgentsScreen;
@@ -1834,11 +1862,11 @@ fn e8_dropped_count_consistent_across_screens() {
 
 // -- E8.5: Markdown renderer truthfulness invariants ──────────────────
 
-/// render_message_body must return Some for non-empty markdown bodies.
+/// `render_message_body` must return Some for non-empty markdown bodies.
 #[test]
 fn e8_markdown_non_empty_body_returns_some() {
-    use mcp_agent_mail_server::tui_markdown::render_message_body;
     use ftui_extras::markdown::MarkdownTheme;
+    use mcp_agent_mail_server::tui_markdown::render_message_body;
 
     let theme = MarkdownTheme::default();
 
@@ -1860,11 +1888,11 @@ fn e8_markdown_non_empty_body_returns_some() {
     }
 }
 
-/// render_message_body must return None ONLY for empty/whitespace bodies.
+/// `render_message_body` must return None ONLY for empty/whitespace bodies.
 #[test]
 fn e8_markdown_empty_body_returns_none() {
-    use mcp_agent_mail_server::tui_markdown::render_message_body;
     use ftui_extras::markdown::MarkdownTheme;
+    use mcp_agent_mail_server::tui_markdown::render_message_body;
 
     let theme = MarkdownTheme::default();
 
@@ -1877,14 +1905,19 @@ fn e8_markdown_empty_body_returns_none() {
     }
 }
 
-/// Body preview truncation must enforce max_chars limit.
+/// Body preview truncation must enforce `max_chars` limit.
 #[test]
 fn e8_preview_truncation_enforced() {
-    use mcp_agent_mail_server::tui_markdown::{render_message_body_preview, BODY_PREVIEW_MAX_CHARS};
+    use mcp_agent_mail_server::tui_markdown::{
+        BODY_PREVIEW_MAX_CHARS, render_message_body_preview,
+    };
 
     let long_body = "word ".repeat(200);
     let preview = render_message_body_preview(&long_body, BODY_PREVIEW_MAX_CHARS);
-    assert!(preview.is_some(), "e8: preview of non-empty body must be Some");
+    assert!(
+        preview.is_some(),
+        "e8: preview of non-empty body must be Some"
+    );
     let text = preview.unwrap();
     assert!(
         text.chars().count() <= BODY_PREVIEW_MAX_CHARS,
@@ -1900,13 +1933,25 @@ fn e8_json_auto_detection_contract() {
     use mcp_agent_mail_server::tui_markdown::looks_like_json;
 
     // Must detect
-    assert!(looks_like_json(r#"{"key":"value"}"#), "e8: must detect JSON object");
+    assert!(
+        looks_like_json(r#"{"key":"value"}"#),
+        "e8: must detect JSON object"
+    );
     assert!(looks_like_json("[1,2,3]"), "e8: must detect JSON array");
 
     // Must NOT detect
-    assert!(!looks_like_json("# heading"), "e8: must not detect markdown heading");
-    assert!(!looks_like_json("plain text"), "e8: must not detect plain text");
-    assert!(!looks_like_json("```json\n{}\n```"), "e8: must not detect already-fenced JSON");
+    assert!(
+        !looks_like_json("# heading"),
+        "e8: must not detect markdown heading"
+    );
+    assert!(
+        !looks_like_json("plain text"),
+        "e8: must not detect plain text"
+    );
+    assert!(
+        !looks_like_json("```json\n{}\n```"),
+        "e8: must not detect already-fenced JSON"
+    );
 }
 
 // -- E8.6: Seeded fixture data integrity invariants ───────────────────
@@ -1918,11 +1963,7 @@ fn e8_fixture_importance_values_valid() {
     env.validate_seed();
 
     let conn = env.open_conn();
-    let invalid = count_where(
-        &conn,
-        "messages",
-        "importance NOT IN ('urgent', 'normal')",
-    );
+    let invalid = count_where(&conn, "messages", "importance NOT IN ('urgent', 'normal')");
     assert_eq!(
         invalid, 0,
         "e8: all messages must have importance in {{urgent, normal}}"
@@ -1965,10 +2006,7 @@ fn e8_fixture_agent_names_unique() {
             &[],
         )
         .expect("query");
-    assert!(
-        rows.is_empty(),
-        "e8: agent names must be globally unique"
-    );
+    assert!(rows.is_empty(), "e8: agent names must be globally unique");
 }
 
 /// Seeded timestamps must be positive and chronologically ordered.
@@ -1979,26 +2017,32 @@ fn e8_fixture_timestamps_positive_and_ordered() {
 
     let conn = env.open_conn();
     let rows = conn
-        .query_sync(
-            "SELECT id, created_ts FROM messages ORDER BY id ASC",
-            &[],
-        )
+        .query_sync("SELECT id, created_ts FROM messages ORDER BY id ASC", &[])
         .expect("query");
 
     let mut prev_ts: i64 = 0;
     for row in &rows {
-        let id = row.get_by_name("id").and_then(|v| match v {
-            SqlValue::BigInt(n) => Some(*n),
-            SqlValue::Int(n) => Some(i64::from(*n)),
-            _ => None,
-        }).unwrap_or(0);
-        let ts = row.get_by_name("created_ts").and_then(|v| match v {
-            SqlValue::BigInt(n) => Some(*n),
-            SqlValue::Int(n) => Some(i64::from(*n)),
-            _ => None,
-        }).unwrap_or(0);
+        let id = row
+            .get_by_name("id")
+            .and_then(|v| match v {
+                SqlValue::BigInt(n) => Some(*n),
+                SqlValue::Int(n) => Some(i64::from(*n)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let ts = row
+            .get_by_name("created_ts")
+            .and_then(|v| match v {
+                SqlValue::BigInt(n) => Some(*n),
+                SqlValue::Int(n) => Some(i64::from(*n)),
+                _ => None,
+            })
+            .unwrap_or(0);
 
-        assert!(ts > 0, "e8: message {id} timestamp must be positive, got {ts}");
+        assert!(
+            ts > 0,
+            "e8: message {id} timestamp must be positive, got {ts}"
+        );
         assert!(
             ts >= prev_ts,
             "e8: message {id} timestamp {ts} must be >= previous {prev_ts}"
@@ -2033,7 +2077,10 @@ fn h5_artifact_is_valid_json() {
     let parsed: serde_json::Value =
         serde_json::from_str(&json_str).expect("h5: artifact must be valid JSON");
 
-    assert!(parsed.is_object(), "h5: artifact root must be a JSON object");
+    assert!(
+        parsed.is_object(),
+        "h5: artifact root must be a JSON object"
+    );
     assert!(
         parsed.get("artifact_type").is_some(),
         "h5: artifact must have artifact_type"
@@ -2052,7 +2099,7 @@ fn h5_artifact_is_valid_json() {
     );
 }
 
-/// CI gate mismatch detection: raw_count == 0 with seeded data signals a false-empty
+/// CI gate mismatch detection: `raw_count` == 0 with seeded data signals a false-empty
 /// (the gate should flag this as a mismatch).
 #[test]
 fn h5_false_empty_is_detectable_from_diagnostic() {
@@ -2083,28 +2130,26 @@ fn h5_false_empty_is_detectable_from_diagnostic() {
     let env = SeededEnv::new();
     let conn = env.open_conn();
     let db_agent_count = count_table(&conn, "agents");
-    assert!(
-        db_agent_count > 0,
-        "h5: seeded DB must have agents"
-    );
+    assert!(db_agent_count > 0, "h5: seeded DB must have agents");
     assert_ne!(
         db_agent_count as u64, false_empty_diag.raw_count,
         "h5: false-empty must differ from DB truth (gate should flag this)"
     );
 }
 
-/// CI gate whitelist: whitelisted check_ids should be excluded from failure count.
+/// CI gate whitelist: whitelisted `check_ids` should be excluded from failure count.
 #[test]
+#[allow(clippy::const_is_empty, clippy::needless_collect)]
 fn h5_whitelist_excludes_known_mismatches() {
     // Simulate the gate's whitelist-filtering logic in Rust
-    let _all_check_ids = vec![
+    let _ = [
         "tui.agents:count",
         "tui.messages:count",
         "tui.threads:count",
         "tui.search:facets",
     ];
-    let mismatched_ids = vec!["tui.messages:count", "tui.search:facets"];
-    let whitelist = vec!["tui.search:facets"];
+    let mismatched_ids = ["tui.messages:count", "tui.search:facets"];
+    let whitelist = ["tui.search:facets"];
 
     let non_whitelisted: Vec<&&str> = mismatched_ids
         .iter()
@@ -2127,16 +2172,23 @@ fn h5_whitelist_excludes_known_mismatches() {
     } else {
         "FAIL"
     };
-    assert_eq!(verdict, "FAIL", "h5: gate must FAIL on non-whitelisted mismatches");
+    assert_eq!(
+        verdict, "FAIL",
+        "h5: gate must FAIL on non-whitelisted mismatches"
+    );
 
     // With all mismatches whitelisted, verdict should be WARN
-    let all_whitelisted = vec!["tui.messages:count", "tui.search:facets"];
+    let all_whitelisted = ["tui.messages:count", "tui.search:facets"];
     let remaining: Vec<&&str> = mismatched_ids
         .iter()
         .filter(|id| !all_whitelisted.contains(id))
         .collect();
     let verdict2 = if remaining.is_empty() {
-        if !mismatched_ids.is_empty() { "WARN" } else { "PASS" }
+        if mismatched_ids.is_empty() {
+            "PASS"
+        } else {
+            "WARN"
+        }
     } else {
         "FAIL"
     };
@@ -2144,7 +2196,11 @@ fn h5_whitelist_excludes_known_mismatches() {
 
     // With no mismatches, verdict should be PASS
     let no_mismatches: Vec<&str> = vec![];
-    let verdict3 = if no_mismatches.is_empty() { "PASS" } else { "FAIL" };
+    let verdict3 = if no_mismatches.is_empty() {
+        "PASS"
+    } else {
+        "FAIL"
+    };
     assert_eq!(verdict3, "PASS", "h5: no mismatches → PASS");
 }
 

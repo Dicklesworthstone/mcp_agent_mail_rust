@@ -1293,7 +1293,7 @@ fn render_remote_url_banner(frame: &mut Frame<'_>, area: Rect, snap: &Diagnostic
 }
 
 /// How often to re-probe Tailscale IP (avoid subprocess spam on every 3s cycle).
-const TAILSCALE_CACHE_TTL: Duration = Duration::from_secs(120);
+const TAILSCALE_CACHE_TTL: Duration = Duration::from_mins(2);
 
 fn diagnostics_worker_loop(
     state: &TuiSharedState,
@@ -2615,7 +2615,7 @@ mod tests {
 
     #[test]
     fn format_uptime_hours() {
-        assert_eq!(format_uptime(Duration::from_secs(7500)), "2h 5m");
+        assert_eq!(format_uptime(Duration::from_mins(125)), "2h 5m");
     }
 
     #[test]

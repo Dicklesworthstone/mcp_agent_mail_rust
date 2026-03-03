@@ -62,8 +62,8 @@
     },
     {
       "check": "stale_python_processes",
-      "detail": "Legacy Python processes detected; stop them to avoid conflicts: 3450234 rsync -az --stats --delete -e ssh -i /home/ubuntu/.ssh/contabo_vps_ed25519 -o StrictHostKeyChecking=accept-new -o BatchMode=yes --rsync-path mkdir -p /data/projects/frankenlibc/crates/frankenlibc-harness && rsync --exclude target/ --exclude target_*/ --exclude target-*/ --exclude .cargo-target/ --exclude .cargo-target-rusticmill/ --exclude .cargo-target-*/ --exclude *.rlib --exclude *.rmeta --exclude .git/objects/ --exclude node_modules/ --exclude .bun/ --exclude .npm/ --exclude .pnpm-store/ --exclude dist/ --exclude build/ --exclude .next/ --exclude .nuxt/ --exclude .turbo/ --exclude .parcel-cache/ --exclude .beads/ --exclude coverage/ --exclude .nyc_output/ --exclude perf.data --exclude perf.data.old --exclude perf_hsmm.data --exclude perf_hsmm.data.old --exclude tests/artifacts/ --exclude process_triage/ --exclude sample_sqlite_db_files/ --exclude legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/ --exclude .rch-target/ --exclude .rch-tmp/ --compress-choice=zstd --compress-level=3 /data/projects/frankenlibc/crates/frankenlibc-harness/ ubuntu@38.242.134.66:/data/projects/frankenlibc/crates/frankenlibc-harness",
-      "status": "warn"
+      "detail": "No legacy mcp_agent_mail Python processes detected",
+      "status": "ok"
     },
     {
       "check": "path_order",

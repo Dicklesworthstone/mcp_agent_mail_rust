@@ -301,7 +301,10 @@ fn wbq_enqueue_with_sender(
                         }
                         let remaining = deadline.saturating_duration_since(now);
                         std::thread::sleep(backoff.min(remaining));
-                        backoff = backoff.checked_mul(2).unwrap_or(max_backoff).min(max_backoff);
+                        backoff = backoff
+                            .checked_mul(2)
+                            .unwrap_or(max_backoff)
+                            .min(max_backoff);
                         cur = returned;
                     }
                 }
@@ -5392,7 +5395,7 @@ pub fn get_archive_tree(archive: &ProjectArchive, path: &str) -> Result<Vec<Tree
 /// Sanitize a browsable path to prevent directory traversal.
 fn sanitize_browse_path(path: &str) -> Result<String> {
     let normalized = path.replace('\\', "/");
-    if normalized.starts_with('/')
+    if std::path::Path::new(&normalized).is_absolute()
         || normalized.starts_with("..")
         || normalized.contains("/../")
         || normalized.ends_with("/..")
@@ -6318,7 +6321,7 @@ fn rel_path_cached(canonical_base: &Path, target: &Path) -> Result<String> {
 pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -> Result<PathBuf> {
     let normalized = raw_path.trim().replace('\\', "/");
 
-    if normalized.is_empty() || normalized.starts_with('/') {
+    if normalized.is_empty() || std::path::Path::new(&normalized).is_absolute() {
         return Err(StorageError::InvalidPath(
             "directory traversal not allowed".to_string(),
         ));

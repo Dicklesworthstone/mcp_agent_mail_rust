@@ -29,6 +29,7 @@ const COL_RESERVATIONS: usize = 4;
 const COL_CREATED: usize = 5;
 
 const SORT_LABELS: &[&str] = &["Slug", "Path", "Agents", "Msgs", "Reserv", "Created"];
+const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
 
 /// Activity recency thresholds (microseconds).
 const ACTIVE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
@@ -195,7 +196,7 @@ impl ProjectsScreen {
     }
 
     fn ingest_events(&mut self, state: &TuiSharedState) {
-        let events = state.events_since(self.last_seq);
+        let events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &events {
             self.last_seq = event.seq().max(self.last_seq);
             if let MailEvent::MessageSent {

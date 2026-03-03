@@ -38,8 +38,8 @@ use crate::models::{AgentRow, InboxStatsRow, ProjectRow};
 use crate::s3fifo::S3FifoCache;
 use mcp_agent_mail_core::{InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
 
-const PROJECT_TTL: Duration = Duration::from_secs(300);
-const AGENT_TTL: Duration = Duration::from_secs(300);
+const PROJECT_TTL: Duration = Duration::from_mins(5);
+const AGENT_TTL: Duration = Duration::from_mins(5);
 const INBOX_STATS_TTL: Duration = Duration::from_secs(30); // 30 sec (shorter: counters change often)
 const MAX_ENTRIES_PER_CATEGORY: usize = 16_384;
 /// Minimum interval between deferred touch flushes.
@@ -622,7 +622,9 @@ impl ReadCache {
                 has_remaining = true;
             }
         }
-        self.has_pending.store(has_remaining, Ordering::Release);
+        if has_remaining {
+            self.has_pending.store(true, Ordering::Release);
+        }
 
         let mut last = self.last_touch_flush.lock();
         *last = Instant::now();
@@ -931,7 +933,7 @@ mod tests {
             access_count: ADAPTIVE_TTL_THRESHOLD,
         };
 
-        let base = Duration::from_secs(60);
+        let base = Duration::from_mins(1);
         assert_eq!(entry_cold.effective_ttl(base), base);
         assert_eq!(entry_hot.effective_ttl(base), base * 2);
 
@@ -946,9 +948,9 @@ mod tests {
 
     #[test]
     fn expiration_uses_last_accessed_time() {
-        let base = Duration::from_secs(60);
+        let base = Duration::from_mins(1);
         let one_hour_ago = Instant::now()
-            .checked_sub(Duration::from_secs(3600))
+            .checked_sub(Duration::from_hours(1))
             .expect("one hour subtraction should be representable");
         let entry_hot = CacheEntry {
             value: 42_i32,

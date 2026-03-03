@@ -797,6 +797,7 @@ impl TuiSharedState {
                 }
             }
         }
+        drop(diagnostics);
         result
     }
 }

@@ -41,6 +41,7 @@ const COL_TTL: usize = 3;
 const COL_PROJECT: usize = 4;
 
 const SORT_LABELS: &[&str] = &["Agent", "Path", "Excl", "TTL", "Project"];
+const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
 /// Number of empty DB snapshots tolerated before pruning active rows.
 const EMPTY_SNAPSHOT_HOLD_CYCLES: u8 = 1;
 /// Minimum tick spacing between direct DB fallback probes.
@@ -402,7 +403,7 @@ impl ReservationsScreen {
 
     fn ingest_events(&mut self, state: &TuiSharedState) -> bool {
         let mut changed = false;
-        let events = state.events_since(self.last_seq);
+        let events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &events {
             self.last_seq = event.seq().max(self.last_seq);
             match event {
@@ -621,7 +622,8 @@ impl ReservationsScreen {
             }
         };
 
-        let rows = crate::tui_poller::fetch_reservation_snapshots(&conn);
+        let rows =
+            crate::tui_poller::fetch_reservation_snapshots_with_path(&conn, Some(path.as_str()));
         if rows.is_empty() {
             self.fallback_issue =
                 Some("Direct DB fallback returned no active reservation rows.".to_string());

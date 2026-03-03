@@ -36,6 +36,10 @@ static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
 
 const PROBE_CACHE_RETENTION_US: i64 = 6 * 60 * 60 * 1_000_000;
 
+fn normalize_path_pattern_key(path_pattern: &str) -> String {
+    path_pattern.trim().trim_start_matches('/').to_string()
+}
+
 #[derive(Debug, Default)]
 struct PathProbeCacheEntry {
     /// Upper bound (epoch micros) where filesystem activity is still known
@@ -352,20 +356,21 @@ fn detect_and_release_stale(
         };
 
         // Check filesystem/git activity, cached by path pattern.
+        let normalized_pattern = normalize_path_pattern_key(&res.path_pattern);
         let has_recent_path_activity = recent_path_activity_cache
-            .get(&res.path_pattern)
+            .get(&normalized_pattern)
             .copied()
             .unwrap_or_else(|| {
                 let computed = path_has_recent_activity_cached(
                     probe_cache,
                     workspace,
                     project_id,
-                    &res.path_pattern,
+                    &normalized_pattern,
                     git_head_oid.as_deref(),
                     now,
                     grace_us,
                 );
-                recent_path_activity_cache.insert(res.path_pattern.clone(), computed);
+                recent_path_activity_cache.insert(normalized_pattern.clone(), computed);
                 computed
             });
         if has_recent_path_activity {
@@ -398,7 +403,11 @@ fn path_has_recent_activity_cached(
     now_us: i64,
     grace_us: i64,
 ) -> bool {
-    let key = (project_id, path_pattern.to_string());
+    let normalized_pattern = normalize_path_pattern_key(path_pattern);
+    if normalized_pattern.is_empty() {
+        return false;
+    }
+    let key = (project_id, normalized_pattern.clone());
     let entry = cache.path_probes.entry(key).or_default();
     entry.last_used_us = now_us;
 
@@ -406,7 +415,7 @@ fn path_has_recent_activity_cached(
     if entry.fs_recent_until_us > now_us {
         return true;
     }
-    let recent_fs = check_filesystem_activity(workspace, path_pattern, now_us, grace_us);
+    let recent_fs = check_filesystem_activity(workspace, &normalized_pattern, now_us, grace_us);
     if recent_fs {
         entry.fs_recent_until_us = now_us.saturating_add(grace_us);
         return true;
@@ -422,7 +431,7 @@ fn path_has_recent_activity_cached(
 
     if entry.git_head_oid.as_deref() != Some(current_head) {
         entry.git_head_oid = Some(current_head.to_string());
-        entry.git_latest_commit_us = git_latest_commit_us(workspace, path_pattern);
+        entry.git_latest_commit_us = git_latest_commit_us(workspace, &normalized_pattern);
     }
     entry
         .git_latest_commit_us
@@ -440,7 +449,7 @@ fn check_filesystem_activity(
         return false;
     }
 
-    let pattern = path_pattern.trim().trim_start_matches('/');
+    let pattern = normalize_path_pattern_key(path_pattern);
     if pattern.is_empty() {
         return false;
     }
@@ -460,7 +469,7 @@ fn check_filesystem_activity(
                 "-o",
                 "--exclude-standard",
                 "--",
-                pattern,
+                &pattern,
             ])
             .output();
 
@@ -511,7 +520,7 @@ fn check_filesystem_activity(
             }
         }
     } else {
-        let candidate = workspace.join(pattern);
+        let candidate = workspace.join(&pattern);
         if candidate.exists()
             && let Ok(metadata) = candidate.metadata()
             && let Ok(modified) = metadata.modified()
@@ -555,7 +564,7 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
         return None;
     }
 
-    let pattern = path_pattern.trim().trim_start_matches('/');
+    let pattern = normalize_path_pattern_key(path_pattern);
     if pattern.is_empty() {
         return None;
     }
@@ -569,7 +578,7 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
             "-1",
             "--format=%ct",
             "--",
-            pattern,
+            &pattern,
         ])
         .output()
         .ok()?;
@@ -589,7 +598,7 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
 /// use globbing; otherwise treat as a literal path.
 #[cfg(test)]
 fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf> {
-    let pattern = pattern.trim().trim_start_matches('/');
+    let pattern = normalize_path_pattern_key(pattern);
     if pattern.is_empty() {
         return Vec::new();
     }
@@ -1066,6 +1075,36 @@ mod tests {
             !check_git_activity(repo, "tracked.rs", now + 10_000_000_000, 1_000_000),
             "old commit should fall outside a short grace window"
         );
+    }
+
+    #[test]
+    fn path_probe_cache_normalizes_leading_slash_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = now_micros();
+        let mut probe_cache = CleanupProbeCache::default();
+
+        let without_leading_slash = path_has_recent_activity_cached(
+            &mut probe_cache,
+            tmp.path(),
+            7,
+            "src/lib.rs",
+            None,
+            now,
+            1_000_000,
+        );
+        let with_leading_slash = path_has_recent_activity_cached(
+            &mut probe_cache,
+            tmp.path(),
+            7,
+            "/src/lib.rs",
+            None,
+            now,
+            1_000_000,
+        );
+
+        assert!(!without_leading_slash);
+        assert!(!with_leading_slash);
+        assert_eq!(probe_cache.path_probes.len(), 1);
     }
 
     #[test]

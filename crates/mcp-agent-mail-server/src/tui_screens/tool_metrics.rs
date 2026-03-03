@@ -48,6 +48,7 @@ const LATENCY_HISTORY: usize = 30;
 
 /// Max percentile samples kept for the global latency ribbon.
 const PERCENTILE_HISTORY: usize = 60;
+const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
 /// Reload persisted tool metrics every ~3s as a startup/live fallback.
 const PERSISTED_HYDRATE_INTERVAL_TICKS: u64 = 30;
 /// Chart transition duration for latency bars.
@@ -425,7 +426,7 @@ impl ToolMetricsScreen {
     }
 
     fn ingest_events(&mut self, state: &TuiSharedState) {
-        let events = state.events_since(self.last_seq);
+        let events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &events {
             self.last_seq = event.seq().max(self.last_seq);
             if let MailEvent::ToolCallEnd {

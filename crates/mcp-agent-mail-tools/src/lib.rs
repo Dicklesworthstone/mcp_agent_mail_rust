@@ -359,12 +359,13 @@ pub mod tool_util {
         }
 
         // Check read cache first (slug lookups only; ensure_project always hits DB)
-        if !raw_identifier.starts_with('/')
+        let is_absolute = std::path::Path::new(raw_identifier).is_absolute();
+        if !is_absolute
             && let Some(cached) = mcp_agent_mail_db::read_cache().get_project(raw_identifier)
         {
             return Ok(cached);
         }
-        let out = if raw_identifier.starts_with('/') {
+        let out = if is_absolute {
             mcp_agent_mail_db::queries::ensure_project(ctx.cx(), pool, raw_identifier).await
         } else {
             mcp_agent_mail_db::queries::get_project_by_slug(ctx.cx(), pool, raw_identifier).await

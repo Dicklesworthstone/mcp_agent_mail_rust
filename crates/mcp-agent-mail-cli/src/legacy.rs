@@ -2111,7 +2111,10 @@ mod tests {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../legacy_python_mcp_agent_mail_code/mcp_agent_mail/storage.sqlite3");
         if !fixture.exists() {
-            println!("skipping test: missing legacy fixture DB at {}", fixture.display());
+            println!(
+                "skipping test: missing legacy fixture DB at {}",
+                fixture.display()
+            );
             return;
         }
 

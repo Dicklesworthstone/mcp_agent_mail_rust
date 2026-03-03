@@ -44,6 +44,7 @@ use super::dashboard::{EventEntry, format_event};
 
 /// Max event entries retained in the timeline scroll-back.
 const TIMELINE_CAPACITY: usize = 5000;
+const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
 
 /// Page-up/down scroll amount in lines.
 const PAGE_SIZE: usize = 20;
@@ -447,7 +448,7 @@ impl TimelinePane {
 
     /// Ingest new events from the shared state ring buffer.
     pub fn ingest(&mut self, state: &TuiSharedState) {
-        let new_events = state.events_since(self.last_seq);
+        let new_events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &new_events {
             self.last_seq = event.seq().max(self.last_seq);
             self.total_ingested += 1;

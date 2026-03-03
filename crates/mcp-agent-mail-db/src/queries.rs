@@ -1035,19 +1035,13 @@ pub async fn register_agent(
                 let mut retry_params = normalize_base_params;
                 retry_params.push(Value::BigInt(project_id));
                 retry_params.push(Value::Text(name.to_string()));
-                let retried_rows = try_in_tx!(
+                let _retried_rows = try_in_tx!(
                     cx,
                     &tracked,
                     map_sql_outcome(
                         traw_execute(cx, &tracked, &normalize_sql, &retry_params).await
                     )
                 );
-                if retried_rows == 0 {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(DbError::Internal(format!(
-                        "register_agent conflict retry matched no rows for {project_id}:{name}"
-                    )));
-                }
             }
             Outcome::Err(e) => {
                 rollback_tx(cx, &tracked).await;
@@ -3562,36 +3556,41 @@ pub async fn mark_message_read(
         Value::BigInt(agent_id),
         Value::BigInt(message_id),
     ];
-    let rows = try_in_tx!(
+    try_in_tx!(
         cx,
         &tracked,
         map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
     );
-    if rows == 0 {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::not_found(
-            "MessageRecipient",
-            format!("{agent_id}:{message_id}"),
-        ));
-    }
 
     // Invalidate cached inbox stats (unread_count may have changed).
     crate::cache::read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
 
     // Read back the actual stored timestamp (may differ from `now` on
     // idempotent calls where COALESCE preserved the original value).
+    //
+    // We intentionally do not trust `rows_affected` from the UPDATE above:
+    // under some backend/runtime combinations, updates that clearly match
+    // a row can report 0. Existence is determined by this read-back query.
     let read_sql = "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
     let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
     let ts = match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-        Outcome::Ok(rows) => rows
-            .first()
-            .and_then(|r| r.get(0))
-            .and_then(|v| match v {
-                Value::BigInt(n) => Some(*n),
-                Value::Int(n) => Some(i64::from(*n)),
-                _ => None,
-            })
-            .unwrap_or(now),
+        Outcome::Ok(rows) => {
+            if rows.is_empty() {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::not_found(
+                    "MessageRecipient",
+                    format!("{agent_id}:{message_id}"),
+                ));
+            }
+            rows.first()
+                .and_then(|r| r.get(0))
+                .and_then(|v| match v {
+                    Value::BigInt(n) => Some(*n),
+                    Value::Int(n) => Some(i64::from(*n)),
+                    _ => None,
+                })
+                .unwrap_or(now)
+        }
         Outcome::Err(e) => {
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(e);
@@ -4499,7 +4498,7 @@ pub async fn list_unreleased_file_reservations(
 // =============================================================================
 
 /// Request contact (create pending link)
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn request_contact(
     cx: &Cx,
     pool: &DbPool,
@@ -4573,17 +4572,11 @@ pub async fn request_contact(
                     Value::BigInt(to_project_id),
                     Value::BigInt(to_agent_id),
                 ];
-                let updated_rows = try_in_tx!(
+                let _updated_rows = try_in_tx!(
                     cx,
                     &tracked,
                     map_sql_outcome(traw_execute(cx, &tracked, refresh_sql, &refresh_params).await)
                 );
-                if updated_rows == 0 {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(DbError::Internal(
-                        "agent_links conflict refresh updated zero rows".to_string(),
-                    ));
-                }
             } else {
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Err(e);
@@ -5346,7 +5339,6 @@ pub async fn project_ids_with_active_reservations(
 /// Bulk-release all expired file reservations for a project.
 ///
 /// Returns the IDs of expired reservations and marks them released.
-
 pub async fn release_expired_reservations(
     cx: &Cx,
     pool: &DbPool,
@@ -5508,7 +5500,7 @@ pub async fn release_reservations_by_ids(
         try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, &release_sql, &release_params).await)
+            map_sql_outcome(traw_execute(cx, &tracked, release_sql, &release_params).await)
         );
         release_marker = release_marker.saturating_add(1);
         total_affected = total_affected.saturating_add(1);
@@ -6766,6 +6758,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn request_contact_refreshes_existing_pair_without_on_conflict_do_update() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -6785,6 +6778,7 @@ mod tests {
                 .into_result()
                 .expect("ensure project B");
             let project_a_id = project_a.id.expect("project A id");
+            #[allow(clippy::similar_names)]
             let project_b_id = project_b.id.expect("project B id");
 
             let from = register_agent(

@@ -2836,10 +2836,11 @@ impl MailAppModel {
             return; // Already open.
         }
         let mut cs = ComposeState::new();
-        // Populate agent list from recent events for recipient auto-complete.
+        // Populate agent list from a bounded recent event window so opening
+        // compose cannot trigger full-ring scans under large histories.
         let agents: Vec<String> = self
             .state
-            .events_since(0)
+            .recent_events(PALETTE_DYNAMIC_EVENT_SCAN)
             .iter()
             .filter_map(|e| {
                 if let crate::tui_events::MailEvent::AgentRegistered { name, .. } = e {
@@ -3407,12 +3408,27 @@ impl MailAppModel {
 
     /// Execute all remaining steps in a continuous-mode macro.
     fn execute_macro_steps(&mut self) -> Cmd<MailMsg> {
+        const MAX_MACRO_STEPS_PER_DISPATCH: usize = 2_048;
         let mut cmds = Vec::new();
+        let mut step_count = 0usize;
         loop {
+            if step_count >= MAX_MACRO_STEPS_PER_DISPATCH {
+                self.macro_engine
+                    .fail_playback("continuous playback step budget exceeded");
+                self.notifications.notify(
+                    Toast::new(format!(
+                        "Macro playback aborted after {MAX_MACRO_STEPS_PER_DISPATCH} steps (safety limit)."
+                    ))
+                    .icon(ToastIcon::Warning)
+                    .duration(Duration::from_secs(4)),
+                );
+                break;
+            }
             match self.macro_engine.next_step() {
                 Some((action_id, PlaybackMode::DryRun)) => {
                     // Dry run: just log, don't execute.
                     let _ = action_id;
+                    step_count = step_count.saturating_add(1);
                 }
                 Some((action_id, _)) => {
                     // Execute the action via the normal dispatch path.
@@ -3423,6 +3439,7 @@ impl MailAppModel {
                         break;
                     }
                     cmds.push(self.dispatch_palette_action_from_macro(&action_id));
+                    step_count = step_count.saturating_add(1);
                 }
                 None => break,
             }
@@ -9718,7 +9735,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("focus target")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.notifications.tick(Duration::from_millis(16));
         assert_eq!(model.notifications.visible_count(), 1);
@@ -9791,7 +9808,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(60)),
+                    .duration(Duration::from_mins(1)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -10109,7 +10126,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("test")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.notifications.tick(Duration::from_millis(16));
         assert_eq!(model.notifications.visible_count(), 1);
@@ -10145,7 +10162,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(60)),
+                    .duration(Duration::from_mins(1)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -10170,7 +10187,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(60)),
+                    .duration(Duration::from_mins(1)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -10190,7 +10207,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(60)),
+                    .duration(Duration::from_mins(1)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -10214,7 +10231,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("only one")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.notifications.tick(Duration::from_millis(16));
         model.toast_focus_index = Some(0);
@@ -10369,7 +10386,7 @@ mod tests {
     #[test]
     fn focus_highlight_noop_when_index_out_of_bounds() {
         let mut queue = NotificationQueue::new(QueueConfig::default());
-        queue.notify(Toast::new("test").duration(Duration::from_secs(60)));
+        queue.notify(Toast::new("test").duration(Duration::from_mins(1)));
         queue.tick(Duration::from_millis(16));
         assert_eq!(queue.visible_count(), 1);
 
@@ -10383,7 +10400,7 @@ mod tests {
     #[test]
     fn focus_highlight_renders_hint_text() {
         let mut queue = NotificationQueue::new(QueueConfig::default());
-        queue.notify(Toast::new("test toast").duration(Duration::from_secs(60)));
+        queue.notify(Toast::new("test toast").duration(Duration::from_mins(1)));
         queue.tick(Duration::from_millis(16));
         assert_eq!(queue.visible_count(), 1);
 
@@ -11364,7 +11381,7 @@ mod tests {
         model.notifications.notify(
             ftui_widgets::Toast::new("test")
                 .icon(ftui_widgets::ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.toast_focus_index = Some(0);
 
@@ -12317,7 +12334,7 @@ mod tests {
         model.notifications.notify(
             ftui_widgets::Toast::new("test")
                 .icon(ftui_widgets::ToastIcon::Info)
-                .duration(Duration::from_secs(60)),
+                .duration(Duration::from_mins(1)),
         );
         model.toast_focus_index = Some(0);
         assert_eq!(model.topmost_overlay(), OverlayLayer::ToastFocus);

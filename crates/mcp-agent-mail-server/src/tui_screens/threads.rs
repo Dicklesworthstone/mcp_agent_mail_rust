@@ -386,6 +386,19 @@ struct MermaidPanelCache {
     buffer: Buffer,
 }
 
+#[derive(Debug, Clone)]
+struct PreviewBodyCache {
+    message_id: i64,
+    body_hash: u64,
+    expanded: bool,
+    theme_key: &'static str,
+    rendered: Option<Text<'static>>,
+}
+
+thread_local! {
+    static PREVIEW_BODY_CACHE: RefCell<Option<PreviewBodyCache>> = const { RefCell::new(None) };
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Focus state
 // ──────────────────────────────────────────────────────────────────────
@@ -3288,36 +3301,59 @@ fn render_thread_detail(
     }
     preview_lines.push(Line::raw(String::new()));
 
-    let md_theme = crate::tui_theme::markdown_theme();
-    match crate::tui_markdown::render_message_body(&selected_message.body_md, &md_theme) {
-        Some(rendered) => {
-            if expanded_message_ids.contains(&selected_message.id) {
-                for line in rendered.lines() {
-                    preview_lines.push(line.clone());
-                }
-            } else {
-                let lines: Vec<Line<'static>> = rendered
-                    .lines()
-                    .iter()
-                    .filter(|line| !line.to_plain_text().trim().is_empty())
-                    .cloned()
-                    .collect();
-                if lines.is_empty() {
-                    preview_lines.push(Line::raw("(empty)"));
-                } else {
-                    for line in lines.iter().take(THREAD_COLLAPSED_PREVIEW_LINES) {
+    let expanded = expanded_message_ids.contains(&selected_message.id);
+    let body_hash = stable_hash(selected_message.body_md.as_bytes());
+    let theme_key = crate::tui_theme::current_theme_env_value();
+    PREVIEW_BODY_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        let is_miss = cache.as_ref().is_none_or(|cached| {
+            cached.message_id != selected_message.id
+                || cached.body_hash != body_hash
+                || cached.expanded != expanded
+                || cached.theme_key != theme_key
+        });
+        if is_miss {
+            let md_theme = crate::tui_theme::markdown_theme();
+            let rendered =
+                crate::tui_markdown::render_message_body(&selected_message.body_md, &md_theme);
+            *cache = Some(PreviewBodyCache {
+                message_id: selected_message.id,
+                body_hash,
+                expanded,
+                theme_key,
+                rendered,
+            });
+        }
+        match cache.as_ref().and_then(|cached| cached.rendered.as_ref()) {
+            Some(rendered) => {
+                if expanded {
+                    for line in rendered.lines() {
                         preview_lines.push(line.clone());
                     }
-                    if lines.len() > THREAD_COLLAPSED_PREVIEW_LINES {
-                        preview_lines.push(Line::styled("…", crate::tui_theme::text_hint(&tp)));
+                } else {
+                    let lines: Vec<Line<'static>> = rendered
+                        .lines()
+                        .iter()
+                        .filter(|line| !line.to_plain_text().trim().is_empty())
+                        .cloned()
+                        .collect();
+                    if lines.is_empty() {
+                        preview_lines.push(Line::raw("(empty)"));
+                    } else {
+                        for line in lines.iter().take(THREAD_COLLAPSED_PREVIEW_LINES) {
+                            preview_lines.push(line.clone());
+                        }
+                        if lines.len() > THREAD_COLLAPSED_PREVIEW_LINES {
+                            preview_lines.push(Line::styled("…", crate::tui_theme::text_hint(&tp)));
+                        }
                     }
                 }
             }
+            None => {
+                preview_lines.push(Line::raw("(empty)"));
+            }
         }
-        None => {
-            preview_lines.push(Line::raw("(empty)"));
-        }
-    }
+    });
 
     let scroll_rows = u16::try_from(scroll).unwrap_or(u16::MAX);
     Paragraph::new(Text::from_lines(preview_lines))
