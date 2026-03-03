@@ -2550,12 +2550,12 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
             "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
              importance, ack_required, created_ts, attachments \
              FROM messages \
-             WHERE sender_id = ? AND project_id = ? AND created_ts > ? \
-             ORDER BY created_ts DESC LIMIT ?"
+             WHERE project_id = ? AND sender_id = ? AND created_ts > ? \
+             ORDER BY created_ts + 0 DESC LIMIT ?"
                 .to_string(),
             vec![
-                Value::BigInt(agent_id),
                 Value::BigInt(project_id),
+                Value::BigInt(agent_id),
                 Value::BigInt(ts),
                 Value::BigInt(limit_i64),
             ],
@@ -2565,12 +2565,12 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
             "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
              importance, ack_required, created_ts, attachments \
              FROM messages \
-             WHERE sender_id = ? AND project_id = ? \
-             ORDER BY created_ts DESC LIMIT ?"
+             WHERE project_id = ? AND sender_id = ? \
+             ORDER BY created_ts + 0 DESC LIMIT ?"
                 .to_string(),
             vec![
-                Value::BigInt(agent_id),
                 Value::BigInt(project_id),
+                Value::BigInt(agent_id),
                 Value::BigInt(limit_i64),
             ],
         )
@@ -4072,7 +4072,7 @@ mod resource_shape_tests {
                         .await
                         .expect("outbox");
                 let outbox_value = parse_json(&outbox_payload);
-                println!("OUTBOX PAYLOAD: {}", outbox_payload);
+                
                 assert_eq!(outbox_value["count"], 1);
                 assert_eq!(
                     outbox_value["messages"][0]["subject"],

@@ -1,0 +1,491 @@
+//! Canonical per-pane agent identity file contract.
+//!
+//! Resolves the diverging conventions described in mcp_agent_mail#111:
+//!
+//! - Claude Code: `~/.claude/agent-mail/identity.$TMUX_PANE` (persistent, not project-scoped)
+//! - NTM #68: `/tmp/agent-mail-name.<hash>.<pane_id>` (project-scoped, ephemeral)
+//!
+//! The canonical contract:
+//!
+//! - **Path**: `~/.config/agent-mail/identity/<project_hash>/<pane_id>`
+//! - **Content**: Plain text file containing the agent name (trimmed, single line)
+//! - **Fallback**: Reads from both legacy paths for backwards compatibility
+//! - **Cleanup**: Stale identity files (panes that no longer exist) can be pruned
+//!
+//! All agent runtimes (Claude Code, NTM/Codex, Gemini, etc.) should converge on
+//! [`write_identity`] and [`resolve_identity`] as the single source of truth.
+
+use sha1::{Digest, Sha1};
+use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Top-level directory under `~/.config` for agent-mail pane identity files.
+const IDENTITY_DIR_NAME: &str = "agent-mail/identity";
+
+/// How many hex chars of the project hash to use in the directory name.
+const PROJECT_HASH_LEN: usize = 12;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Compute the canonical identity file path for a given project and tmux pane.
+///
+/// Returns `~/.config/agent-mail/identity/<project_hash>/<pane_id>`.
+/// The `project_key` is typically the absolute path to the project directory.
+/// The `pane_id` is the tmux pane identifier (e.g., `%0`, `%3`).
+#[must_use]
+pub fn canonical_identity_path(project_key: &str, pane_id: &str) -> PathBuf {
+    let base = config_base_dir();
+    let hash = project_hash(project_key);
+    let sanitized_pane = sanitize_pane_id(pane_id);
+    base.join(IDENTITY_DIR_NAME)
+        .join(hash)
+        .join(sanitized_pane)
+}
+
+/// Write an agent name to the canonical identity file for a pane.
+///
+/// Creates parent directories as needed. Returns the path written to on
+/// success, or an IO error on failure.
+///
+/// # Arguments
+/// - `project_key`: Absolute path to the project directory (used for hashing)
+/// - `pane_id`: Tmux pane identifier (e.g., `%0`)
+/// - `agent_name`: The agent name to write (e.g., `BlueLake`)
+pub fn write_identity(
+    project_key: &str,
+    pane_id: &str,
+    agent_name: &str,
+) -> std::io::Result<PathBuf> {
+    let path = canonical_identity_path(project_key, pane_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, format!("{}\n", agent_name.trim()))?;
+    Ok(path)
+}
+
+/// Resolve the agent name for a given project and tmux pane.
+///
+/// Checks the following locations in order:
+/// 1. Canonical path: `~/.config/agent-mail/identity/<project_hash>/<pane_id>`
+/// 2. Legacy Claude Code path: `~/.claude/agent-mail/identity.<pane_id>`
+/// 3. Legacy NTM path: `/tmp/agent-mail-name.<project_hash>.<pane_id>`
+///
+/// Returns `None` if no identity file is found or all are empty.
+#[must_use]
+pub fn resolve_identity(project_key: &str, pane_id: &str) -> Option<String> {
+    // 1. Canonical path
+    let canonical = canonical_identity_path(project_key, pane_id);
+    if let Some(name) = read_identity_file(&canonical) {
+        return Some(name);
+    }
+
+    // 2. Legacy Claude Code path: ~/.claude/agent-mail/identity.$TMUX_PANE
+    if let Some(home) = dirs::home_dir() {
+        let sanitized = sanitize_pane_id(pane_id);
+        let legacy_claude = home
+            .join(".claude")
+            .join("agent-mail")
+            .join(format!("identity.{sanitized}"));
+        if let Some(name) = read_identity_file(&legacy_claude) {
+            return Some(name);
+        }
+    }
+
+    // 3. Legacy NTM path: /tmp/agent-mail-name.<project_hash>.<pane_id>
+    let hash = project_hash(project_key);
+    let sanitized = sanitize_pane_id(pane_id);
+    let legacy_ntm = PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{sanitized}"));
+    if let Some(name) = read_identity_file(&legacy_ntm) {
+        return Some(name);
+    }
+
+    None
+}
+
+/// Resolve the agent name for the current tmux pane (reads `$TMUX_PANE`).
+///
+/// Convenience wrapper around [`resolve_identity`] that reads the pane ID
+/// from the environment. Returns `None` if `$TMUX_PANE` is not set.
+#[must_use]
+pub fn resolve_identity_current_pane(project_key: &str) -> Option<String> {
+    let pane_id = std::env::var("TMUX_PANE").ok();
+    resolve_identity_for_pane(project_key, pane_id.as_deref())
+}
+
+/// Write identity for the current tmux pane (reads `$TMUX_PANE`).
+///
+/// Returns `None` if `$TMUX_PANE` is not set, otherwise returns the
+/// write result.
+pub fn write_identity_current_pane(
+    project_key: &str,
+    agent_name: &str,
+) -> Option<std::io::Result<PathBuf>> {
+    let pane_id = std::env::var("TMUX_PANE").ok();
+    write_identity_for_pane(project_key, pane_id.as_deref(), agent_name)
+}
+
+/// Remove stale identity files for panes that no longer exist.
+///
+/// Queries `tmux list-panes -a -F '#{pane_id}'` to get active pane IDs,
+/// then removes any identity files under the given project hash directory
+/// whose names do not correspond to a live pane.
+///
+/// Returns the list of removed file paths.
+pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let base = config_base_dir();
+    let hash = project_hash(project_key);
+    let project_dir = base.join(IDENTITY_DIR_NAME).join(&hash);
+
+    if !project_dir.is_dir() {
+        return removed;
+    }
+
+    let live_panes = list_live_tmux_panes();
+
+    let entries = match std::fs::read_dir(&project_dir) {
+        Ok(e) => e,
+        Err(_) => return removed,
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+
+        // If tmux is not running (empty live_panes list), skip cleanup
+        // to avoid accidentally removing everything.
+        if live_panes.is_empty() {
+            break;
+        }
+
+        if !live_panes.contains(&name_str.to_string()) {
+            let path = entry.path();
+            if path.is_file() {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed.push(path);
+                }
+            }
+        }
+    }
+
+    removed
+}
+
+/// Clean up stale identities across all project hash directories.
+///
+/// Iterates over every `<project_hash>/` directory under the identity root
+/// and prunes files for dead panes. Returns all removed file paths.
+pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let base = config_base_dir();
+    let identity_root = base.join(IDENTITY_DIR_NAME);
+
+    if !identity_root.is_dir() {
+        return removed;
+    }
+
+    let live_panes = list_live_tmux_panes();
+    if live_panes.is_empty() {
+        // tmux not running or no panes — skip to avoid wiping everything
+        return removed;
+    }
+
+    let entries = match std::fs::read_dir(&identity_root) {
+        Ok(e) => e,
+        Err(_) => return removed,
+    };
+
+    for dir_entry in entries.flatten() {
+        let project_dir = dir_entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let files = match std::fs::read_dir(&project_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for file_entry in files.flatten() {
+            let file_name = file_entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if !live_panes.contains(&name_str.to_string()) {
+                let path = file_entry.path();
+                if path.is_file() {
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    removed
+}
+
+/// List all identity entries for a project (for diagnostic/debug use).
+///
+/// Returns `(pane_id, agent_name)` pairs from the canonical directory.
+#[must_use]
+pub fn list_identities(project_key: &str) -> Vec<(String, String)> {
+    let base = config_base_dir();
+    let hash = project_hash(project_key);
+    let project_dir = base.join(IDENTITY_DIR_NAME).join(hash);
+
+    if !project_dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let entries = match std::fs::read_dir(&project_dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+
+    for entry in entries.flatten() {
+        let pane_id = entry.file_name().to_string_lossy().to_string();
+        if let Some(name) = read_identity_file(&entry.path()) {
+            result.push((pane_id, name));
+        }
+    }
+
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Compute a truncated SHA-1 hex hash of the project key.
+fn project_hash(project_key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(project_key.as_bytes());
+    let digest = hasher.finalize();
+    let hex = format!("{digest:x}");
+    hex.chars().take(PROJECT_HASH_LEN).collect()
+}
+
+/// Sanitize a tmux pane ID for use as a filename.
+///
+/// Strips the leading `%` character and replaces any filesystem-unsafe
+/// characters with underscores. The `%` prefix is conventional in tmux
+/// (e.g., `%0`, `%3`) but not great for filenames.
+fn sanitize_pane_id(pane_id: &str) -> String {
+    let stripped = pane_id.strip_prefix('%').unwrap_or(pane_id);
+    let mut out = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+/// Read and trim the contents of an identity file. Returns `None` if the
+/// file doesn't exist or is empty.
+fn read_identity_file(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+#[must_use]
+fn resolve_identity_for_pane(project_key: &str, pane_id: Option<&str>) -> Option<String> {
+    let pane_id = pane_id?.trim();
+    if pane_id.is_empty() {
+        return None;
+    }
+    resolve_identity(project_key, pane_id)
+}
+
+fn write_identity_for_pane(
+    project_key: &str,
+    pane_id: Option<&str>,
+    agent_name: &str,
+) -> Option<std::io::Result<PathBuf>> {
+    let pane_id = pane_id?.trim();
+    if pane_id.is_empty() {
+        return None;
+    }
+    Some(write_identity(project_key, pane_id, agent_name))
+}
+
+/// Get the XDG-compatible config base directory (`~/.config`).
+fn config_base_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".config")
+    })
+}
+
+/// Query tmux for all live pane IDs (sanitized).
+///
+/// Returns an empty vec if tmux is not running or the command fails.
+fn list_live_tmux_panes() -> Vec<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_id}"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| sanitize_pane_id(l.trim()))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- project_hash --------------------------------------------------------
+
+    #[test]
+    fn project_hash_produces_expected_length() {
+        let h = project_hash("/data/projects/backend");
+        assert_eq!(h.len(), PROJECT_HASH_LEN);
+    }
+
+    #[test]
+    fn project_hash_deterministic() {
+        let a = project_hash("/data/projects/backend");
+        let b = project_hash("/data/projects/backend");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn project_hash_differs_for_different_projects() {
+        let a = project_hash("/data/projects/alpha");
+        let b = project_hash("/data/projects/beta");
+        assert_ne!(a, b);
+    }
+
+    // -- sanitize_pane_id ----------------------------------------------------
+
+    #[test]
+    fn sanitize_strips_percent() {
+        assert_eq!(sanitize_pane_id("%0"), "0");
+        assert_eq!(sanitize_pane_id("%123"), "123");
+    }
+
+    #[test]
+    fn sanitize_preserves_plain_id() {
+        assert_eq!(sanitize_pane_id("42"), "42");
+    }
+
+    #[test]
+    fn sanitize_replaces_unsafe_chars() {
+        assert_eq!(sanitize_pane_id("%foo/bar"), "foo_bar");
+    }
+
+    #[test]
+    fn sanitize_empty_returns_unknown() {
+        assert_eq!(sanitize_pane_id(""), "unknown");
+        assert_eq!(sanitize_pane_id("%"), "unknown");
+    }
+
+    // -- canonical_identity_path ---------------------------------------------
+
+    #[test]
+    fn canonical_path_has_expected_structure() {
+        let path = canonical_identity_path("/data/projects/backend", "%3");
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.contains("agent-mail/identity/"),
+            "missing identity dir: {path_str}"
+        );
+        assert!(path_str.ends_with("/3"), "expected pane id suffix: {path_str}");
+    }
+
+    #[test]
+    fn canonical_path_project_scoped() {
+        let a = canonical_identity_path("/data/projects/alpha", "%0");
+        let b = canonical_identity_path("/data/projects/beta", "%0");
+        assert_ne!(a, b, "different projects should produce different paths");
+    }
+
+    // -- write / resolve roundtrip -------------------------------------------
+
+    #[test]
+    fn write_then_resolve_roundtrip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Override config dir by writing directly to a temp path
+        let identity_dir = tmp.path().join("agent-mail/identity");
+        let hash = project_hash("/data/test-project");
+        let pane_dir = identity_dir.join(&hash);
+        std::fs::create_dir_all(&pane_dir).expect("create dirs");
+        let file_path = pane_dir.join("5");
+        std::fs::write(&file_path, "BlueLake\n").expect("write");
+
+        let name = read_identity_file(&file_path);
+        assert_eq!(name.as_deref(), Some("BlueLake"));
+    }
+
+    #[test]
+    fn read_identity_file_missing_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("nonexistent");
+        assert!(read_identity_file(&path).is_none());
+    }
+
+    #[test]
+    fn read_identity_file_empty_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("empty");
+        std::fs::write(&path, "  \n  ").expect("write");
+        assert!(read_identity_file(&path).is_none());
+    }
+
+    // -- list_identities (with real filesystem) ------------------------------
+
+    #[test]
+    fn list_identities_returns_entries() {
+        // This test uses the real filesystem via write_identity, so we need
+        // to use a unique project key to avoid collision.
+        let unique_key = format!("/tmp/test-pane-identity-{}", std::process::id());
+        let pane = "%99";
+        let _ = write_identity(&unique_key, pane, "RedFox");
+
+        let entries = list_identities(&unique_key);
+        assert!(
+            entries.iter().any(|(p, n)| p == "99" && n == "RedFox"),
+            "expected RedFox entry: {entries:?}"
+        );
+
+        // Cleanup: remove the file we created
+        let path = canonical_identity_path(&unique_key, pane);
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    // -- write_identity_current_pane -----------------------------------------
+
+    #[test]
+    fn current_pane_returns_none_when_no_tmux_pane_env() {
+        assert!(resolve_identity_for_pane("/data/test", None).is_none());
+        assert!(resolve_identity_for_pane("/data/test", Some("")).is_none());
+        assert!(resolve_identity_for_pane("/data/test", Some("   ")).is_none());
+    }
+}
