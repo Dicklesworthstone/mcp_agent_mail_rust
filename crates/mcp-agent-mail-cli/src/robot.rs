@@ -2647,7 +2647,17 @@ fn build_agents(
                     (SELECT COUNT(*) FROM messages m WHERE m.sender_id = a.id) AS msg_count
              FROM agents a
              WHERE a.project_id = ?
-             ORDER BY a.last_active_ts DESC",
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM agents newer
+                   WHERE newer.project_id = a.project_id
+                     AND newer.name = a.name COLLATE NOCASE
+                     AND (
+                         newer.last_active_ts > a.last_active_ts
+                         OR (newer.last_active_ts = a.last_active_ts AND newer.id > a.id)
+                     )
+               )
+             ORDER BY a.last_active_ts DESC, a.id DESC",
             &[Value::BigInt(project_id)],
         )
         .map_err(|e| CliError::Other(format!("agents query: {e}")))?;
@@ -5425,6 +5435,57 @@ mod tests {
             }
             other => panic!("unexpected navigate result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_agents_deduplicates_case_insensitive_names() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_agents_dedupe.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents table");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                sender_id INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create messages table");
+
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES
+                (1, 1, 'RubyPrairie', 'claude-code', 'opus-4.6', 1000),
+                (2, 1, 'rubyprairie', 'codex-cli', 'gpt-5', 2000),
+                (3, 1, 'JadePine', 'codex-cli', 'gpt-5', 1500)",
+            &empty,
+        )
+        .expect("insert agents");
+        conn.query_sync(
+            "INSERT INTO messages (id, sender_id) VALUES (10, 2), (20, 2), (30, 3)",
+            &empty,
+        )
+        .expect("insert messages");
+
+        let rows = build_agents(&conn, 1, false, None).expect("build agents");
+        assert_eq!(rows.len(), 2, "duplicate logical agent should be collapsed");
+        assert_eq!(rows[0].name, "rubyprairie");
+        assert_eq!(rows[0].program, "codex-cli");
+        assert_eq!(rows[0].msg_count, 2);
     }
 
     fn setup_robot_thread_message_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
