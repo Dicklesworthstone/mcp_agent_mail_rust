@@ -3915,6 +3915,108 @@ fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
     sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
 }
 
+fn sqlite_doctor_sanity_with_health_probe<F>(
+    db_path: &str,
+    mut health_probe: F,
+) -> CliResult<(bool, String)>
+where
+    F: FnMut(&Path) -> CliResult<bool>,
+{
+    let mut selected_path = PathBuf::from(db_path);
+    let mut used_absolute_fallback = false;
+
+    if !selected_path.exists() {
+        if let Some(absolute_candidate) = sqlite_absolute_candidate_path(db_path) {
+            selected_path = PathBuf::from(absolute_candidate);
+            used_absolute_fallback = true;
+        } else {
+            return Ok((
+                false,
+                format!("Database file does not exist: {}", selected_path.display()),
+            ));
+        }
+    }
+
+    let mut healthy = match health_probe(selected_path.as_path()) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_sqlite_recovery_error_message(&msg) {
+                false
+            } else {
+                return Err(CliError::Other(format!(
+                    "database health probe failed for {}: {msg}",
+                    selected_path.display()
+                )));
+            }
+        }
+    };
+
+    if !healthy
+        && !used_absolute_fallback
+        && let Some(absolute_candidate) = sqlite_absolute_candidate_path(db_path)
+        && absolute_candidate != db_path
+    {
+        let absolute_path = PathBuf::from(&absolute_candidate);
+        match health_probe(absolute_path.as_path()) {
+            Ok(true) => {
+                healthy = true;
+                selected_path = absolute_path;
+                used_absolute_fallback = true;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if !is_sqlite_recovery_error_message(&msg) {
+                    return Err(CliError::Other(format!(
+                        "database health probe failed for absolute fallback {}: {msg}",
+                        absolute_path.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    let file_size = selected_path.metadata().map(|m| m.len()).map_err(|e| {
+        CliError::Other(format!(
+            "cannot stat database file {}: {e}",
+            selected_path.display()
+        ))
+    })?;
+    if file_size == 0 {
+        return Ok((
+            false,
+            "Database file is 0 bytes (empty/corrupt)".to_string(),
+        ));
+    }
+
+    if healthy {
+        if used_absolute_fallback {
+            return Ok((
+                true,
+                format!(
+                    "quick_check OK via absolute fallback {} ({} bytes)",
+                    selected_path.display(),
+                    file_size
+                ),
+            ));
+        }
+        return Ok((true, format!("quick_check OK ({file_size} bytes)")));
+    }
+
+    Ok((
+        false,
+        format!(
+            "Health probes failed for {} (possible corruption)",
+            selected_path.display()
+        ),
+    ))
+}
+
+fn sqlite_doctor_file_sanity(db_path: &str) -> CliResult<(bool, String)> {
+    sqlite_doctor_sanity_with_health_probe(db_path, sqlite_file_is_healthy)
+}
+
 fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<(u8, std::time::SystemTime, PathBuf)> = Vec::new();
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -9311,13 +9413,35 @@ fn open_db_for_doctor_check(database_url: &str) -> CliResult<mcp_agent_mail_db::
         return mcp_agent_mail_db::DbConn::open_memory()
             .map_err(|e| CliError::Other(format!("cannot open in-memory database: {e}")));
     }
-    if !Path::new(&path).exists() {
-        return Err(CliError::Other(format!(
-            "database file does not exist: {path}"
-        )));
+    let mut candidate_path = path.clone();
+    if !Path::new(&candidate_path).exists() {
+        if let Some(absolute_candidate) = sqlite_absolute_candidate_path(&candidate_path) {
+            candidate_path = absolute_candidate;
+        } else {
+            return Err(CliError::Other(format!(
+                "database file does not exist: {candidate_path}"
+            )));
+        }
     }
-    mcp_agent_mail_db::DbConn::open_file(&path)
-        .map_err(|e| CliError::Other(format!("cannot open database: {e}")))
+
+    match mcp_agent_mail_db::DbConn::open_file(&candidate_path) {
+        Ok(conn) => Ok(conn),
+        Err(primary_err) => {
+            let primary_err_text = primary_err.to_string();
+            if let Some(fallback_path) =
+                sqlite_absolute_fallback_path(&candidate_path, &primary_err_text)
+            {
+                return mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
+                    CliError::Other(format!(
+                        "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} failed: {e}"
+                    ))
+                });
+            }
+            Err(CliError::Other(format!(
+                "cannot open database at {candidate_path}: {primary_err}"
+            )))
+        }
+    }
 }
 
 fn beads_issue_awareness_counts_from(
@@ -9630,72 +9754,46 @@ fn handle_doctor_check_with(
     let mut db_file_sanity_failed = false;
 
     // Check 1: Database accessible (non-mutating; avoid auto-recovery side effects).
-    let db_ok = {
-        let cfg = mcp_agent_mail_db::DbPoolConfig {
-            database_url: database_url.to_string(),
-            ..Default::default()
-        };
-        match cfg.sqlite_path() {
-            Ok(path) if path == ":memory:" => true,
-            Ok(path) => mcp_agent_mail_db::DbConn::open_file(&path)
-                .ok()
-                .and_then(|conn| conn.query_sync("SELECT 1 AS one", &[]).ok())
-                .is_some(),
-            Err(_) => false,
-        }
-    };
+    let db_ok = open_db_for_doctor_check(database_url)
+        .and_then(|conn| {
+            conn.query_sync("SELECT 1 AS one", &[])
+                .map(|_| ())
+                .map_err(|e| CliError::Other(format!("database probe failed: {e}")))
+        })
+        .is_ok();
     checks.push(serde_json::json!({
         "check": "database",
         "status": if db_ok { "ok" } else { "fail" },
         "detail": if db_ok { "SQLite database accessible" } else { "Cannot open database" },
     }));
 
-    // Check 1b: DB file sanity (non-zero size + PRAGMA quick_check)
+    // Check 1b: DB file sanity (non-zero size + sidecar-aware health probes)
     {
         let cfg = mcp_agent_mail_db::DbPoolConfig {
             database_url: database_url.to_string(),
             ..Default::default()
         };
         if let Ok(db_path) = cfg.sqlite_path() {
-            let path = std::path::Path::new(&db_path);
-            if db_path != ":memory:" && path.exists() {
-                let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
-                if file_size == 0 {
-                    db_file_sanity_failed = true;
-                    checks.push(serde_json::json!({
-                        "check": "db_file_sanity",
-                        "status": "fail",
-                        "detail": "Database file is 0 bytes (empty/corrupt)",
-                    }));
-                } else if let Ok(conn) = mcp_agent_mail_db::DbConn::open_file(&db_path) {
-                    let qc_ok = conn
-                        .query_sync("PRAGMA quick_check", &[])
-                        .ok()
-                        .and_then(|rows| {
-                            rows.first()
-                                .and_then(|r| r.get_named::<String>("quick_check").ok())
-                        })
-                        .map(|s| s == "ok")
-                        .unwrap_or(false);
-                    if !qc_ok {
-                        db_file_sanity_failed = true;
+            if db_path != ":memory:" {
+                match sqlite_doctor_file_sanity(&db_path) {
+                    Ok((qc_ok, detail)) => {
+                        if !qc_ok {
+                            db_file_sanity_failed = true;
+                        }
+                        checks.push(serde_json::json!({
+                            "check": "db_file_sanity",
+                            "status": if qc_ok { "ok" } else { "fail" },
+                            "detail": detail,
+                        }));
                     }
-                    checks.push(serde_json::json!({
-                        "check": "db_file_sanity",
-                        "status": if qc_ok { "ok" } else { "fail" },
-                        "detail": if qc_ok {
-                            format!("quick_check OK ({file_size} bytes)")
-                        } else {
-                            "PRAGMA quick_check failed (possible corruption)".to_string()
-                        },
-                    }));
-                } else {
-                    db_file_sanity_failed = true;
-                    checks.push(serde_json::json!({
-                        "check": "db_file_sanity",
-                        "status": "fail",
-                        "detail": "Cannot open database file for sanity check",
-                    }));
+                    Err(e) => {
+                        db_file_sanity_failed = true;
+                        checks.push(serde_json::json!({
+                            "check": "db_file_sanity",
+                            "status": "fail",
+                            "detail": format!("Database health probe error: {e}"),
+                        }));
+                    }
                 }
             }
         }
@@ -22553,6 +22651,107 @@ mod tests {
         if let Some(parent) = relative_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn doctor_check_uses_absolute_fallback_for_malformed_relative_database_url() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("doctor_fallback.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+
+        let absolute_conn =
+            mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("open absolute db");
+        absolute_conn
+            .execute_raw("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .expect("create seed");
+        drop(absolute_conn);
+
+        let relative_path = PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        if let Some(parent) = relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create relative parent");
+        }
+        std::fs::write(&relative_path, b"not-a-database").expect("write malformed relative db");
+
+        let db_url = format!("sqlite:///{}", relative_path.display());
+        let parsed = run_doctor_check_json(&db_url, dir.path());
+        let checks = parsed["checks"].as_array().expect("checks array");
+
+        let database = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("database"))
+            .expect("database check");
+        assert_eq!(database["status"], "ok");
+
+        let sanity = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("db_file_sanity"))
+            .expect("db_file_sanity check");
+        assert_eq!(sanity["status"], "ok");
+        let detail = sanity["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("absolute fallback"),
+            "db_file_sanity should mention absolute fallback, got: {detail}"
+        );
+
+        let _ = std::fs::remove_file(&relative_path);
+        if let Some(parent) = relative_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn doctor_check_uses_absolute_fallback_when_relative_database_path_is_missing() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("doctor_fallback_missing.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+
+        let absolute_conn =
+            mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("open absolute db");
+        absolute_conn
+            .execute_raw("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .expect("create seed");
+        drop(absolute_conn);
+
+        let relative_path = PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        if relative_path.exists() {
+            std::fs::remove_file(&relative_path).expect("remove stale relative file");
+        }
+        assert!(
+            !relative_path.exists(),
+            "relative sqlite path should be absent for this scenario"
+        );
+
+        let db_url = format!("sqlite:///{}", relative_path.display());
+        let parsed = run_doctor_check_json(&db_url, dir.path());
+        let checks = parsed["checks"].as_array().expect("checks array");
+
+        let database = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("database"))
+            .expect("database check");
+        assert_eq!(database["status"], "ok");
+
+        let sanity = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("db_file_sanity"))
+            .expect("db_file_sanity check");
+        assert_eq!(sanity["status"], "ok");
+        let detail = sanity["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("absolute fallback"),
+            "db_file_sanity should mention absolute fallback, got: {detail}"
+        );
+
+        assert!(
+            !relative_path.exists(),
+            "doctor check must remain non-mutating for missing relative path"
+        );
     }
 
     #[test]

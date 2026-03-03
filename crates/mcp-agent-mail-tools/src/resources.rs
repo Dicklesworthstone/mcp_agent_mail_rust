@@ -2583,20 +2583,20 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 
     let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i64 = row.get_named("id").unwrap_or(0);
-        let msg_project_id: i64 = row.get_named("project_id").unwrap_or(0);
-        let sender_id: i64 = row.get_named("sender_id").unwrap_or(0);
-        let thread_id: Option<String> = row.get_named("thread_id").ok();
-        let subject: String = row.get_named("subject").unwrap_or_default();
+        let id: i64 = row.get_as(0).unwrap_or(0);
+        let msg_project_id: i64 = row.get_as(1).unwrap_or(0);
+        let sender_id: i64 = row.get_as(2).unwrap_or(0);
+        let thread_id: Option<String> = row.get_as(3).ok();
+        let subject: String = row.get_as(4).unwrap_or_default();
         let body_md: String = if include_bodies {
-            row.get_named("body_md").unwrap_or_default()
+            row.get_as(5).unwrap_or_default()
         } else {
             String::new()
         };
-        let importance: String = row.get_named("importance").unwrap_or_default();
-        let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
-        let attachments_json: String = row.get_named("attachments").unwrap_or_default();
-        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+        let importance: String = row.get_as(6).unwrap_or_default();
+        let ack_required: i64 = row.get_as(7).unwrap_or(0);
+        let created_ts: i64 = row.get_as(8).unwrap_or(0);
+        let attachments_json: String = row.get_as(9).unwrap_or_default();
 
         // Get recipients for this message
         let recip_sql = "SELECT a.name, r.kind FROM message_recipients r \

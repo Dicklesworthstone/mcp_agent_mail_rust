@@ -141,7 +141,7 @@ fn contact_required_error(
     blocked_sorted.sort();
     blocked_sorted.dedup();
     let recipient_list = blocked_sorted.join(", ");
-    let sample_target = blocked_recipients.first().cloned().unwrap_or_default();
+    let sample_target = blocked_sorted.first().cloned().unwrap_or_default();
 
     let mut err_msg_parts = vec![
         format!("Contact approval required for recipients: {recipient_list}."),

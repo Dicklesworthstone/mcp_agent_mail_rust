@@ -117,7 +117,9 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
     }
     // 3. Absolute paths (check original pattern for this one, as normalize_pattern strips leading slash)
     let trimmed = pattern.trim();
-    if !trimmed.starts_with("//") && (trimmed.starts_with('/') || std::path::Path::new(trimmed).is_absolute()) {
+    if !trimmed.starts_with("//")
+        && (trimmed.starts_with('/') || std::path::Path::new(trimmed).is_absolute())
+    {
         return Some(format!(
             "Pattern '{pattern}' looks like an absolute path. \
              Reservations should use project-relative paths like 'src/module.py'."
@@ -961,7 +963,7 @@ pub async fn force_release_file_reservation(
             "reason": &reservation.reason,
             "created_ts": micros_to_iso(reservation.created_ts),
             "expires_ts": micros_to_iso(reservation.expires_ts),
-            "released_ts": now_iso,
+            "released_ts": now_iso.clone(),
         });
 
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -1100,7 +1102,7 @@ pub async fn force_release_file_reservation(
     // Build response matching Python format
     let response = serde_json::json!({
         "released": released_count,
-        "released_at": now_iso,
+        "released_at": &now_iso,
         "reservation": {
             "id": file_reservation_id,
             "agent": holder_agent.name,
@@ -1109,7 +1111,7 @@ pub async fn force_release_file_reservation(
             "reason": reservation.reason,
             "created_ts": micros_to_iso(reservation.created_ts),
             "expires_ts": micros_to_iso(reservation.expires_ts),
-            "released_ts": now_iso,
+            "released_ts": &now_iso,
             "stale_reasons": stale_reasons,
             "last_agent_activity_ts": micros_to_iso(holder_agent.last_active_ts),
             "last_mail_activity_ts": mail_activity.map(micros_to_iso),

@@ -1550,6 +1550,13 @@ async fn rollback_migration_txn_quietly<C: Connection>(cx: &Cx, conn: &C) {
     let _ = conn.execute(cx, "ROLLBACK", &[]).await;
 }
 
+fn migration_step_error(migration: &Migration, phase: &str, err: &SqlError) -> SqlError {
+    SqlError::Custom(format!(
+        "migration {} ({}) failed during {}: {}",
+        migration.id, migration.description, phase, err
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_single_migration_with_lock_retry<C: Connection>(
     cx: &Cx,
@@ -1566,7 +1573,7 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
             Outcome::Err(err) => {
                 if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
                 {
-                    return Outcome::Err(err);
+                    return Outcome::Err(migration_step_error(migration, "BEGIN IMMEDIATE", &err));
                 }
                 if retries == 0 {
                     tracing::warn!(
@@ -1589,7 +1596,11 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                 rollback_migration_txn_quietly(cx, conn).await;
                 if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
                 {
-                    return Outcome::Err(err);
+                    return Outcome::Err(migration_step_error(
+                        migration,
+                        "migration statement",
+                        &err,
+                    ));
                 }
                 std::thread::sleep(migration_retry_delay(retries));
                 retries += 1;
@@ -1621,7 +1632,11 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                 rollback_migration_txn_quietly(cx, conn).await;
                 if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
                 {
-                    return Outcome::Err(err);
+                    return Outcome::Err(migration_step_error(
+                        migration,
+                        "migration record insert",
+                        &err,
+                    ));
                 }
                 std::thread::sleep(migration_retry_delay(retries));
                 retries += 1;
@@ -1643,7 +1658,7 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                 rollback_migration_txn_quietly(cx, conn).await;
                 if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
                 {
-                    return Outcome::Err(err);
+                    return Outcome::Err(migration_step_error(migration, "COMMIT", &err));
                 }
                 std::thread::sleep(migration_retry_delay(retries));
                 retries += 1;
@@ -2500,6 +2515,144 @@ mod tests {
         assert!(
             link_created > 1_700_000_000_000_000,
             "product_project_links.created_at should be microseconds: {link_created}"
+        );
+    }
+
+    #[test]
+    fn migrate_to_latest_base_handles_sqlite_seeded_legacy_db() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        if Command::new("sqlite3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("legacy_seeded.sqlite3");
+
+        let seed_sql = r#"
+PRAGMA foreign_keys = OFF;
+
+CREATE TABLE IF NOT EXISTS projects (
+  id INTEGER PRIMARY KEY,
+  slug TEXT NOT NULL,
+  human_key TEXT NOT NULL,
+  created_at DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agents (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  program TEXT NOT NULL,
+  model TEXT NOT NULL,
+  task_description TEXT NOT NULL,
+  inception_ts DATETIME NOT NULL,
+  last_active_ts DATETIME NOT NULL,
+  attachments_policy TEXT NOT NULL DEFAULT 'auto',
+  contact_policy TEXT NOT NULL DEFAULT 'auto'
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  sender_id INTEGER NOT NULL,
+  thread_id TEXT,
+  subject TEXT NOT NULL,
+  body_md TEXT NOT NULL,
+  importance TEXT NOT NULL,
+  ack_required INTEGER NOT NULL,
+  created_ts DATETIME NOT NULL,
+  attachments TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE TABLE IF NOT EXISTS message_recipients (
+  message_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  read_ts DATETIME,
+  ack_ts DATETIME,
+  PRIMARY KEY (message_id, agent_id, kind)
+);
+
+CREATE TABLE IF NOT EXISTS file_reservations (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  path_pattern TEXT NOT NULL,
+  exclusive INTEGER NOT NULL,
+  reason TEXT,
+  created_ts DATETIME NOT NULL,
+  expires_ts DATETIME NOT NULL,
+  released_ts DATETIME
+);
+
+INSERT INTO projects (id, slug, human_key, created_at)
+VALUES (1, 'legacy-project', '/tmp/legacy-project', '2026-02-24 15:30:00.123456');
+
+INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+VALUES
+  (1, 1, 'LegacySender', 'python', 'legacy', 'sender', '2026-02-24 15:30:01', '2026-02-24 15:30:02', 'auto', 'auto'),
+  (2, 1, 'LegacyReceiver', 'python', 'legacy', 'receiver', '2026-02-24 15:31:01', '2026-02-24 15:31:02', 'auto', 'auto');
+
+INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+VALUES (1, 1, 1, 'br-28mgh.8.2', 'Legacy migration message', 'from python db', 'high', 1, '2026-02-24 15:32:00.654321', '[]');
+
+INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+VALUES (1, 2, 'to', NULL, NULL);
+
+INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00', '2026-12-24 15:33:00', NULL);
+"#;
+
+        let mut child = Command::new("sqlite3")
+            .arg(&db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sqlite3");
+        child
+            .stdin
+            .as_mut()
+            .expect("sqlite3 stdin")
+            .write_all(seed_sql.as_bytes())
+            .expect("write seed sql");
+        let output = child.wait_with_output().expect("wait sqlite3");
+        assert!(
+            output.status.success(),
+            "sqlite3 seed failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        let result = block_on({
+            let conn = &conn;
+            move |cx| async move { migrate_to_latest_base(&cx, conn).await.into_result() }
+        });
+        if let Err(err) = &result {
+            panic!("migrate_to_latest_base failed: {err}");
+        }
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) AS t FROM projects WHERE id = 1",
+                &[],
+            )
+            .expect("query projects");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("t")
+                .expect("projects.created_at type"),
+            "integer"
         );
     }
 
