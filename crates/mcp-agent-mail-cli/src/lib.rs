@@ -16381,6 +16381,24 @@ mod tests {
     }
 
     #[test]
+    fn create_db_backup_errors_when_source_database_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing.sqlite3");
+        assert!(!db_path.exists(), "test setup expects missing source db");
+
+        let err = create_db_backup(&db_path, Some(dir.path())).expect_err("backup should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("database file does not exist"),
+            "unexpected error message: {message}"
+        );
+        assert!(
+            !db_path.exists(),
+            "backup path should remain absent after failed backup attempt"
+        );
+    }
+
+    #[test]
     fn migrate_is_idempotent() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()

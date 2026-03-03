@@ -5975,6 +5975,24 @@ mod tests {
     }
 
     #[test]
+    fn set_cursor_from_results_click_ignores_bottom_border_row() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.results = (0..20)
+            .map(|idx| {
+                let mut entry = make_msg_entry();
+                entry.id = idx;
+                entry
+            })
+            .collect();
+        screen.last_results_area.set(Rect::new(0, 4, 40, 10));
+        screen.cursor = 0;
+
+        // Bottom border row in the bordered list area should be ignored.
+        screen.set_cursor_from_results_click(13);
+        assert_eq!(screen.cursor, 0);
+    }
+
+    #[test]
     fn importance_filter_string() {
         assert!(ImportanceFilter::Any.filter_string().is_none());
         assert_eq!(

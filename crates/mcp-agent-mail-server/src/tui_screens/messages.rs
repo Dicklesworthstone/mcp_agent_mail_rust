@@ -5895,6 +5895,31 @@ mod tests {
     }
 
     #[test]
+    fn set_cursor_from_results_click_ignores_bottom_border_row() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.results = (0..20)
+            .map(|idx| test_message_entry(idx, "thread-a", "Subject"))
+            .collect();
+        screen.last_results_area.set(Rect::new(0, 4, 40, 10));
+        screen.cursor = 0;
+
+        // Bottom border row in the bordered list area should be ignored.
+        screen.set_cursor_from_results_click(13);
+        assert_eq!(screen.cursor, 0);
+    }
+
+    #[test]
+    fn result_index_at_y_ignores_bottom_border_row() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.results = (0..20)
+            .map(|idx| test_message_entry(idx, "thread-a", "Subject"))
+            .collect();
+        screen.last_results_area.set(Rect::new(0, 4, 40, 10));
+
+        assert_eq!(screen.result_index_at_y(13), None);
+    }
+
+    #[test]
     fn mouse_drag_promotes_after_hold_delay() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();

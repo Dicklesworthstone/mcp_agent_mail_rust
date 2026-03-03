@@ -755,6 +755,7 @@ pub fn copy_python_database_to_rust(
                 python_db.display()
             ))
         })?;
+    drop(source_conn);
 
     // Copy main DB file
     std::fs::copy(python_db, &dest).map_err(|e| {
