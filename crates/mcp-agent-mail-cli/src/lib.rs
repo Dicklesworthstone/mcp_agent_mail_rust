@@ -9453,6 +9453,18 @@ fn detect_legacy_python_processes_from_ps(ps_output: &str) -> Vec<String> {
             continue;
         }
         let lowered = line.to_ascii_lowercase();
+
+        // Skip common false positives (like rsync exclusions or editors)
+        if lowered.contains("rsync")
+            || lowered.contains("grep")
+            || lowered.contains("nano")
+            || lowered.contains("vim")
+            || lowered.contains("nvim")
+            || lowered.contains("code ")
+        {
+            continue;
+        }
+
         let has_legacy_marker = lowered.contains("mcp_agent_mail")
             || lowered.contains("run_server_with_token")
             || lowered.contains("run_server");
@@ -14830,7 +14842,11 @@ mod tests {
 
     fn seed_mailbox_db(db_path: &Path) {
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open test sqlite db");
+            .unwrap_or_else(|e| panic!("seed_mailbox_db: open db at {}: {e}", db_path.display()));
+        // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
+        // any operation panics before COMMIT.
+        conn.execute_raw("BEGIN IMMEDIATE")
+            .unwrap_or_else(|e| panic!("seed_mailbox_db: BEGIN at {}: {e}", db_path.display()));
         conn.execute_raw(
             "CREATE TABLE projects (\
                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -14925,6 +14941,8 @@ mod tests {
             "INSERT INTO file_reservations (project_id, agent_id, path_pattern) VALUES (1, 1, 'src/*.rs')",
         )
         .unwrap();
+        conn.execute_raw("COMMIT")
+            .unwrap_or_else(|e| panic!("seed_mailbox_db: COMMIT at {}: {e}", db_path.display()));
     }
 
     fn seed_storage_root(storage_root: &Path) {
@@ -15320,10 +15338,20 @@ mod tests {
 
         let db_path = root.path().join("mailbox.sqlite3");
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open products test sqlite db");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "seed_products_cli_db: open db at {}: {e}",
+                    db_path.display()
+                )
+            });
         // Use base schema (no FTS5/triggers) because this DB will be opened
         // by FrankenConnection via the pool. FrankenConnection cannot read
         // database files containing FTS5 shadow table pages.
+        // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
+        // any operation panics before COMMIT.
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap_or_else(|e| {
+            panic!("seed_products_cli_db: BEGIN at {}: {e}", db_path.display())
+        });
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
@@ -15505,6 +15533,10 @@ mod tests {
             ],
         )
         .unwrap();
+
+        conn.execute_raw("COMMIT").unwrap_or_else(|e| {
+            panic!("seed_products_cli_db: COMMIT at {}: {e}", db_path.display())
+        });
 
         (db_path, proj_alpha_key, proj_beta_key, created_at_us)
     }
@@ -18606,7 +18638,20 @@ mod tests {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "seed_acks_and_reservations_db: open db at {}: {e}",
+                    db_path.display()
+                )
+            });
+        // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
+        // any operation panics before COMMIT.
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap_or_else(|e| {
+            panic!(
+                "seed_acks_and_reservations_db: BEGIN at {}: {e}",
+                db_path.display()
+            )
+        });
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
@@ -18743,6 +18788,13 @@ mod tests {
             ],
         )
         .unwrap();
+
+        conn.execute_raw("COMMIT").unwrap_or_else(|e| {
+            panic!(
+                "seed_acks_and_reservations_db: COMMIT at {}: {e}",
+                db_path.display()
+            )
+        });
 
         conn
     }
@@ -19274,7 +19326,13 @@ mod tests {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+            .unwrap_or_else(|e| {
+                panic!("seed_mail_status_db: open db at {}: {e}", db_path.display())
+            });
+        // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
+        // any operation panics before COMMIT.
+        conn.execute_raw("BEGIN IMMEDIATE")
+            .unwrap_or_else(|e| panic!("seed_mail_status_db: BEGIN at {}: {e}", db_path.display()));
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
@@ -19354,6 +19412,10 @@ mod tests {
             )
             .unwrap();
         }
+
+        conn.execute_raw("COMMIT").unwrap_or_else(|e| {
+            panic!("seed_mail_status_db: COMMIT at {}: {e}", db_path.display())
+        });
 
         conn
     }
@@ -19466,7 +19528,20 @@ mod tests {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "seed_projects_adopt_db: open db at {}: {e}",
+                    db_path.display()
+                )
+            });
+        // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
+        // any operation panics before COMMIT.
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap_or_else(|e| {
+            panic!(
+                "seed_projects_adopt_db: BEGIN at {}: {e}",
+                db_path.display()
+            )
+        });
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
@@ -19568,6 +19643,13 @@ mod tests {
             ],
         )
         .unwrap();
+
+        conn.execute_raw("COMMIT").unwrap_or_else(|e| {
+            panic!(
+                "seed_projects_adopt_db: COMMIT at {}: {e}",
+                db_path.display()
+            )
+        });
 
         conn
     }
