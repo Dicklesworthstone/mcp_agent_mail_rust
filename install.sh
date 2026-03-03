@@ -199,16 +199,22 @@ download_to_file() {
   local url="$1"
   local out="$2"
   local label="${3:-download}"
-  local start_ts end_ts duration_s size_bytes
+  local start_ts end_ts duration_s size_bytes rc=0
   start_ts=$(date +%s)
   verbose "${label}:start url=${url} out=${out}"
   if [ "$VERBOSE" -eq 1 ] && [ "$QUIET" -eq 0 ]; then
-    curl -fL --progress-bar "$url" -o "$out"
+    curl -fL --progress-bar "$url" -o "$out" || rc=$?
   else
-    curl -fsSL "$url" -o "$out"
+    curl -fsSL "$url" -o "$out" || rc=$?
   fi
   end_ts=$(date +%s)
   duration_s=$((end_ts - start_ts))
+  if [ "$rc" -ne 0 ]; then
+    # curl may leave behind an empty/partial file on failure — clean it up
+    rm -f "$out" 2>/dev/null || true
+    verbose "${label}:failed rc=${rc} duration_s=${duration_s}"
+    return "$rc"
+  fi
   size_bytes=$(wc -c < "$out" 2>/dev/null || echo 0)
   verbose "${label}:done bytes=${size_bytes} duration_s=${duration_s} out=${out}"
 }
@@ -2312,6 +2318,18 @@ verify_sigstore_bundle() {
     return 0
   fi
 
+  # Guard: verify the bundle file actually exists and is non-empty after download
+  if [ ! -f "$bundle_file" ]; then
+    warn "Sigstore bundle file missing after download; skipping signature verification"
+    verbose "verify_sigstore_bundle:file_missing_after_download path=${bundle_file}"
+    return 0
+  fi
+  if [ ! -s "$bundle_file" ]; then
+    warn "Sigstore bundle file is empty; skipping signature verification"
+    verbose "verify_sigstore_bundle:file_empty path=${bundle_file}"
+    return 0
+  fi
+
   if ! cosign verify-blob \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
@@ -2722,18 +2740,44 @@ if [ "$NO_CHECKSUM" -eq 1 ]; then
   warn "Verification skipped (--no-verify)"
 else
   if [ -z "$CHECKSUM" ]; then
-    [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
-    info "Fetching checksum from ${CHECKSUM_URL}"
     CHECKSUM_FILE="$TMP/checksum.sha256"
-    if ! download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download"; then
+    CHECKSUM_RESOLVED=0
+
+    # Strategy 1: per-artifact .sha256 sidecar (preferred)
+    if [ -z "$CHECKSUM_URL" ]; then
+      CHECKSUM_URL="${URL}.sha256"
+    fi
+    info "Fetching checksum from ${CHECKSUM_URL}"
+    if download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download" && [ -f "$CHECKSUM_FILE" ]; then
+      CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
+      if [ -n "$CHECKSUM" ]; then
+        CHECKSUM_RESOLVED=1
+        verbose "checksum:resolved_via_sidecar sha256=${CHECKSUM}"
+      fi
+    fi
+
+    # Strategy 2: consolidated SHA256SUMS file from release
+    if [ "$CHECKSUM_RESOLVED" -eq 0 ]; then
+      SHA256SUMS_URL="$(dirname "$URL")/SHA256SUMS"
+      SHA256SUMS_FILE="$TMP/SHA256SUMS"
+      verbose "checksum:trying_sha256sums url=${SHA256SUMS_URL}"
+      info "Trying consolidated checksum file SHA256SUMS"
+      if download_to_file "$SHA256SUMS_URL" "$SHA256SUMS_FILE" "sha256sums-download" && [ -f "$SHA256SUMS_FILE" ]; then
+        CHECKSUM=$(awk -v artifact="$TAR" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$SHA256SUMS_FILE")
+        if [ -n "$CHECKSUM" ]; then
+          CHECKSUM_RESOLVED=1
+          verbose "checksum:resolved_via_SHA256SUMS sha256=${CHECKSUM}"
+        else
+          verbose "checksum:SHA256SUMS_no_match artifact=${TAR}"
+          warn "SHA256SUMS file found but no entry for ${TAR}"
+        fi
+      fi
+    fi
+
+    if [ "$CHECKSUM_RESOLVED" -eq 0 ]; then
       warn "Checksum file not available; skipping verification"
       warn "Use --checksum <hex> to provide one manually"
       CHECKSUM=""
-    else
-      CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-      if [ -z "$CHECKSUM" ]; then
-        warn "Empty checksum file; skipping verification"
-      fi
     fi
   fi
 
@@ -2756,6 +2800,29 @@ fi
 
 info "Extracting"
 tar -xf "$TMP/$TAR" -C "$TMP"
+
+# Nested-archive detection: some releases accidentally nest a .tar.gz inside
+# the outer .tar.xz.  If we find one after the first extraction, unpack it too.
+shopt -s nullglob
+for nested in "$TMP"/*.tar.gz "$TMP"/mcp-agent-mail-*/*.tar.gz; do
+  if [ -f "$nested" ]; then
+    verbose "extract:nested_archive detected=${nested}"
+    warn "Nested archive detected (${nested##*/}); extracting inner archive"
+    tar -xzf "$nested" -C "$(dirname "$nested")"
+    rm -f "$nested"
+  fi
+done
+for nested in "$TMP"/*.tar.xz "$TMP"/mcp-agent-mail-*/*.tar.xz; do
+  # Skip the original download artifact itself
+  [ "$nested" = "$TMP/$TAR" ] && continue
+  if [ -f "$nested" ]; then
+    verbose "extract:nested_archive detected=${nested}"
+    warn "Nested archive detected (${nested##*/}); extracting inner archive"
+    tar -xJf "$nested" -C "$(dirname "$nested")"
+    rm -f "$nested"
+  fi
+done
+shopt -u nullglob
 
 # Find binaries in the extracted archive
 find_bin() {
@@ -2903,6 +2970,120 @@ collect_migration_counts() {
   echo "$summary"
 }
 
+sqlite_table_exists() {
+  local db_path="$1"
+  local table="$2"
+  local exists
+  exists=$(sqlite3 "$db_path" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='${table}' LIMIT 1;" 2>/dev/null || true)
+  [ "$exists" = "1" ]
+}
+
+sqlite_column_exists() {
+  local db_path="$1"
+  local table="$2"
+  local column="$3"
+  local exists
+  exists=$(sqlite3 "$db_path" "SELECT 1 FROM pragma_table_info('${table}') WHERE name='${column}' LIMIT 1;" 2>/dev/null || true)
+  [ "$exists" = "1" ]
+}
+
+sqlite_timestamp_fallback_migration() {
+  local db_path="$1"
+  SQLITE_FALLBACK_BACKUP_PATH=""
+
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    warn "sqlite3 is unavailable; cannot run installer fallback timestamp migration."
+    return 1
+  fi
+  if [ ! -f "$db_path" ]; then
+    warn "Fallback timestamp migration target not found: $db_path"
+    return 1
+  fi
+
+  local backup_ts backup_path
+  backup_ts=$(date -u +%Y%m%d_%H%M%S)
+  backup_path="${db_path}.bak.${backup_ts}"
+  if copy_sqlite_snapshot "$db_path" "$backup_path"; then
+    SQLITE_FALLBACK_BACKUP_PATH="$backup_path"
+    ok "Created fallback migration backup at $backup_path"
+  else
+    warn "Failed to create fallback migration backup at $backup_path"
+  fi
+
+  local sql_file updates
+  if command -v mktemp >/dev/null 2>&1; then
+    sql_file=$(mktemp "${TMPDIR:-/tmp}/am-sqlite-fallback.XXXXXX.sql")
+  else
+    sql_file="${TMPDIR:-/tmp}/am-sqlite-fallback.$$.$RANDOM.sql"
+    : > "$sql_file"
+  fi
+  updates=0
+
+  {
+    echo "PRAGMA busy_timeout=5000;"
+    echo "BEGIN IMMEDIATE;"
+  } > "$sql_file"
+
+  local timestamp_columns=(
+    "projects:created_at"
+    "agents:inception_ts"
+    "agents:last_active_ts"
+    "messages:created_ts"
+    "message_recipients:read_ts"
+    "message_recipients:ack_ts"
+    "file_reservations:created_ts"
+    "file_reservations:expires_ts"
+    "file_reservations:released_ts"
+    "agent_links:created_ts"
+    "agent_links:updated_ts"
+    "agent_links:expires_ts"
+    "products:created_at"
+    "product_project_links:created_at"
+  )
+  local pair table column
+  for pair in "${timestamp_columns[@]}"; do
+    table="${pair%%:*}"
+    column="${pair##*:}"
+    sqlite_table_exists "$db_path" "$table" || continue
+    sqlite_column_exists "$db_path" "$table" "$column" || continue
+    cat >> "$sql_file" <<SQL
+UPDATE ${table}
+SET ${column} =
+  CAST(strftime('%s', ${column}) AS INTEGER) * 1000000
+  + CASE
+      WHEN instr(${column}, '.') > 0
+      THEN CAST(substr(${column} || '000000', instr(${column}, '.') + 1, 6) AS INTEGER)
+      ELSE 0
+    END
+WHERE typeof(${column}) = 'text';
+SQL
+    updates=$((updates + 1))
+  done
+
+  echo "COMMIT;" >> "$sql_file"
+
+  if ! sqlite3 "$db_path" < "$sql_file" >/dev/null 2>&1; then
+    warn "sqlite3 fallback timestamp migration failed."
+    rm -f "$sql_file" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$sql_file" 2>/dev/null || true
+
+  # Ensure subsequent readers don't see stale sidecars from failed attempts.
+  rm -f "${db_path}-wal" "${db_path}-shm" 2>/dev/null || true
+
+  local integrity
+  integrity=$(sqlite3 "$db_path" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
+  if [ "$integrity" != "ok" ]; then
+    warn "sqlite3 fallback migration produced integrity_check='${integrity:-<empty>}'"
+    return 1
+  fi
+
+  verbose "migration:fallback_sqlite ok db=${db_path} update_statements=${updates} backup=${SQLITE_FALLBACK_BACKUP_PATH:-<none>}"
+  ok "Database schema migrated (sqlite3 fallback)"
+  return 0
+}
+
 # Run database migration if we copied a Python DB
 if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   info "Running database migration on copied Python database"
@@ -2914,6 +3095,21 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   migration_before_counts=""
   migration_after_counts=""
   migration_has_unresolved_warnings=0
+  migration_pristine_backup=""
+  SQLITE_FALLBACK_BACKUP_PATH=""
+  migration_restore_ok=0
+  migration_fallback_ok=0
+  migration_succeeded=0
+
+  migration_pristine_ts=$(date -u +%Y%m%d_%H%M%S)
+  migration_pristine_backup="${PYTHON_DB_MIGRATED_PATH}.pre-migrate.${migration_pristine_ts}"
+  if copy_sqlite_snapshot "$PYTHON_DB_MIGRATED_PATH" "$migration_pristine_backup"; then
+    verbose "migration:pristine_backup path=${migration_pristine_backup}"
+  else
+    migration_pristine_backup=""
+    warn "Failed to create pristine migration snapshot before am migrate."
+  fi
+
   migration_before_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
   migration_start=$(date +%s)
   if migration_output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
@@ -2937,6 +3133,7 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     else
       ok "Database schema migrated"
     fi
+    migration_succeeded=1
   elif migration_output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
     migration_end=$(date +%s)
     migration_seconds=$((migration_end - migration_start))
@@ -2961,6 +3158,7 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     else
       ok "Database schema migrated"
     fi
+    migration_succeeded=1
   else
     first_error_line=""
     retry_error_line=""
@@ -2978,8 +3176,39 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     retry_error_line=$(printf "%s\n" "$migration_output_fallback" | head -1)
     [ -n "$first_error_line" ] && warn "Primary migration error: $first_error_line"
     [ -n "$retry_error_line" ] && warn "Fallback migration error: $retry_error_line"
-    warn "Database migration had issues. Retry with:"
-    warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
+    if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
+      if copy_sqlite_snapshot "$migration_pristine_backup" "$PYTHON_DB_MIGRATED_PATH"; then
+        migration_restore_ok=1
+        warn "Restored database from pristine snapshot after failed am migrate."
+      else
+        warn "Failed to restore pristine snapshot after am migrate failure."
+      fi
+    fi
+
+    if [ "$migration_restore_ok" -eq 1 ] && sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
+      migration_fallback_ok=1
+      migration_succeeded=1
+      migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+      verbose "migration:row_counts_after_fallback ${migration_after_counts}"
+      if [ -n "${SQLITE_FALLBACK_BACKUP_PATH:-}" ]; then
+        ok "Database backup created at ${SQLITE_FALLBACK_BACKUP_PATH}"
+      fi
+    fi
+
+    if [ "$migration_fallback_ok" -eq 0 ]; then
+      warn "Database migration had issues. Retry with:"
+      warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
+    fi
+  fi
+
+  if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
+    if [ "$migration_succeeded" -eq 1 ]; then
+      rm -f "$migration_pristine_backup" "${migration_pristine_backup}-wal" "${migration_pristine_backup}-shm" 2>/dev/null || true
+      verbose "migration:pristine_backup_removed path=${migration_pristine_backup}"
+    else
+      warn "Preserving pristine migration snapshot for manual recovery:"
+      warn "  $migration_pristine_backup"
+    fi
   fi
 fi
 
