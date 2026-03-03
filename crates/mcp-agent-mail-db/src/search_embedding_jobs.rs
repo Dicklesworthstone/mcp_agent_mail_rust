@@ -329,7 +329,11 @@ impl EmbeddingQueue {
     }
 
     fn recompute_next_retry_due(state: &mut QueueState) {
-        state.next_retry_due_at = state.retry_queue.iter().map(|req| req.next_attempt_at).min();
+        state.next_retry_due_at = state
+            .retry_queue
+            .iter()
+            .map(|req| req.next_attempt_at)
+            .min();
     }
 
     /// Enqueue an embedding request.
@@ -435,7 +439,12 @@ impl EmbeddingQueue {
         if scan_retry_queue {
             let mut deferred_retry = VecDeque::with_capacity(state.retry_queue.len());
             while let Some(req) = state.retry_queue.pop_front() {
-                if batch.len() < batch_size && req.next_attempt_at <= now {
+                if batch.len() >= batch_size {
+                    deferred_retry.push_back(req);
+                    deferred_retry.append(&mut state.retry_queue);
+                    break;
+                }
+                if req.next_attempt_at <= now {
                     state.dedup.remove(&req.dedup_key());
                     batch.push(req);
                 } else {
@@ -466,6 +475,16 @@ impl EmbeddingQueue {
     pub fn is_empty(&self) -> bool {
         let state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
         state.queue.is_empty() && state.retry_queue.is_empty()
+    }
+
+    /// Check whether there is currently runnable work.
+    #[must_use]
+    pub fn has_ready_work(&self) -> bool {
+        let state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
+        !state.queue.is_empty()
+            || state
+                .next_retry_due_at
+                .is_some_and(|next_due| next_due <= Instant::now())
     }
 
     /// Get current queue length (main + retry).
@@ -797,6 +816,12 @@ impl EmbeddingJobRunner {
     pub fn has_work(&self) -> bool {
         !self.queue.is_empty()
     }
+
+    /// Check if there is currently ready work (not just delayed retries).
+    #[must_use]
+    pub fn has_ready_work(&self) -> bool {
+        self.queue.has_ready_work()
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -917,7 +942,7 @@ impl IndexRefreshWorker {
     pub fn run_cycle(&self) -> usize {
         let max_docs = self.config.max_docs_per_cycle.max(1);
         let mut processed = 0usize;
-        while self.runner.has_work() && processed < max_docs {
+        while self.runner.has_ready_work() && processed < max_docs {
             let remaining = max_docs.saturating_sub(processed).max(1);
             match self.runner.process_batch_limit(remaining) {
                 Ok(result) => {
