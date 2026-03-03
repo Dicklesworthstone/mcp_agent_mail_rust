@@ -285,6 +285,8 @@ struct QueueState {
     dedup: HashSet<(i64, DocKind)>,
     /// Requests pending retry
     retry_queue: VecDeque<EmbeddingRequest>,
+    /// Earliest retry eligibility timestamp in `retry_queue` (if any).
+    next_retry_due_at: Option<Instant>,
     /// Statistics
     stats: QueueStats,
 }
@@ -320,9 +322,14 @@ impl EmbeddingQueue {
                 queue: VecDeque::new(),
                 dedup: HashSet::new(),
                 retry_queue: VecDeque::new(),
+                next_retry_due_at: None,
                 stats: QueueStats::default(),
             }),
         }
+    }
+
+    fn recompute_next_retry_due(state: &mut QueueState) {
+        state.next_retry_due_at = state.retry_queue.iter().map(|req| req.next_attempt_at).min();
     }
 
     /// Enqueue an embedding request.
@@ -359,6 +366,7 @@ impl EmbeddingQueue {
                 .find(|pending| pending.dedup_key() == key)
             {
                 *existing = request;
+                Self::recompute_next_retry_due(&mut state);
                 state.stats.total_deduped += 1;
                 state.stats.pending_count = state.queue.len();
                 state.stats.retry_count = state.retry_queue.len();
@@ -397,7 +405,13 @@ impl EmbeddingQueue {
             .checked_add(delay)
             .unwrap_or_else(Instant::now);
         state.dedup.insert(key);
+        let due_at = request.next_attempt_at;
         state.retry_queue.push_back(request);
+        state.next_retry_due_at = Some(
+            state
+                .next_retry_due_at
+                .map_or(due_at, |current| current.min(due_at)),
+        );
         state.stats.pending_count = state.queue.len();
         state.stats.retry_count = state.retry_queue.len();
     }
@@ -406,21 +420,31 @@ impl EmbeddingQueue {
     ///
     /// Retry queue is drained first, then main queue.
     pub fn drain_batch(&self, batch_size: usize) -> Vec<EmbeddingRequest> {
+        if batch_size == 0 {
+            return Vec::new();
+        }
         let mut state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
         let mut batch = Vec::with_capacity(batch_size);
         let now = Instant::now();
 
-        // Drain retry queue first (priority)
-        let mut deferred_retry = VecDeque::with_capacity(state.retry_queue.len());
-        while let Some(req) = state.retry_queue.pop_front() {
-            if batch.len() < batch_size && req.next_attempt_at <= now {
-                state.dedup.remove(&req.dedup_key());
-                batch.push(req);
-            } else {
-                deferred_retry.push_back(req);
+        // Drain retry queue first (priority), but skip full retry-queue scans when
+        // no retry item is eligible yet.
+        let scan_retry_queue = state
+            .next_retry_due_at
+            .is_none_or(|next_due| next_due <= now);
+        if scan_retry_queue {
+            let mut deferred_retry = VecDeque::with_capacity(state.retry_queue.len());
+            while let Some(req) = state.retry_queue.pop_front() {
+                if batch.len() < batch_size && req.next_attempt_at <= now {
+                    state.dedup.remove(&req.dedup_key());
+                    batch.push(req);
+                } else {
+                    deferred_retry.push_back(req);
+                }
             }
+            state.retry_queue = deferred_retry;
+            Self::recompute_next_retry_due(&mut state);
         }
-        state.retry_queue = deferred_retry;
 
         // Then main queue
         while batch.len() < batch_size && !state.queue.is_empty() {
@@ -1221,6 +1245,21 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].doc_id, 1);
         assert_eq!(batch[0].retries, 1);
+    }
+
+    #[test]
+    fn queue_drain_batch_zero_is_noop() {
+        let config = EmbeddingJobConfig {
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
+        let queue = EmbeddingQueue::with_config(config);
+        assert!(queue.enqueue(make_request(1)));
+        queue.enqueue_retry(make_request(2));
+
+        let batch = queue.drain_batch(0);
+        assert!(batch.is_empty());
+        assert_eq!(queue.len(), 2);
     }
 
     // ── JobMetrics ──

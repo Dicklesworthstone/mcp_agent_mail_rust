@@ -34,6 +34,34 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
+const PROBE_CACHE_RETENTION_US: i64 = 6 * 60 * 60 * 1_000_000;
+
+#[derive(Debug, Default)]
+struct PathProbeCacheEntry {
+    /// Upper bound (epoch micros) where filesystem activity is still known
+    /// recent for this pattern.
+    fs_recent_until_us: i64,
+    /// Git HEAD seen when `git_latest_commit_us` was last computed.
+    git_head_oid: Option<String>,
+    /// Latest commit touching this path pattern at `git_head_oid`.
+    git_latest_commit_us: Option<i64>,
+    /// Last cycle timestamp where this entry was touched.
+    last_used_us: i64,
+}
+
+#[derive(Debug, Default)]
+struct CleanupProbeCache {
+    path_probes: HashMap<(i64, String), PathProbeCacheEntry>,
+}
+
+impl CleanupProbeCache {
+    fn prune_stale(&mut self, now_us: i64) {
+        self.path_probes.retain(|_, entry| {
+            now_us.saturating_sub(entry.last_used_us) <= PROBE_CACHE_RETENTION_US
+        });
+    }
+}
+
 /// Start the file reservation cleanup worker (if enabled).
 ///
 /// Must be called at most once. Subsequent calls are no-ops.
@@ -123,6 +151,8 @@ fn cleanup_loop(config: &Config) {
         }
     }
 
+    let mut probe_cache = CleanupProbeCache::default();
+
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
             info!("file reservation cleanup worker shutting down");
@@ -130,7 +160,7 @@ fn cleanup_loop(config: &Config) {
         }
 
         // Run one cleanup cycle, suppressing all errors (legacy: never crash server).
-        match run_cleanup_cycle(config, &pool) {
+        match run_cleanup_cycle_with_cache(config, &pool, &mut probe_cache) {
             Ok((projects_scanned, released)) => {
                 info!(
                     event = "file_reservations_cleanup",
@@ -173,7 +203,17 @@ fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
 /// Run a single cleanup cycle across all projects.
 ///
 /// Returns `(projects_scanned, total_released)`.
+#[cfg(test)]
 fn run_cleanup_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), String> {
+    let mut probe_cache = CleanupProbeCache::default();
+    run_cleanup_cycle_with_cache(config, pool, &mut probe_cache)
+}
+
+fn run_cleanup_cycle_with_cache(
+    config: &Config,
+    pool: &DbPool,
+    probe_cache: &mut CleanupProbeCache,
+) -> Result<(usize, usize), String> {
     let cx = Cx::for_testing();
 
     // Get all project IDs with active reservations.
@@ -195,7 +235,8 @@ fn run_cleanup_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), S
         total_released += expired_ids.len();
 
         // Phase 2: detect and release stale.
-        let stale_ids = detect_and_release_stale(config, pool, &cx, *pid).unwrap_or_default();
+        let stale_ids =
+            detect_and_release_stale(config, pool, &cx, *pid, probe_cache).unwrap_or_default();
         total_released += stale_ids.len();
 
         // Write archive artifacts for released reservations.
@@ -207,6 +248,7 @@ fn run_cleanup_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), S
         }
     }
 
+    probe_cache.prune_stale(now_micros());
     Ok((project_ids.len(), total_released))
 }
 
@@ -223,6 +265,7 @@ fn detect_and_release_stale(
     pool: &DbPool,
     cx: &Cx,
     project_id: i64,
+    probe_cache: &mut CleanupProbeCache,
 ) -> Result<Vec<i64>, String> {
     let inactivity_us = i64::try_from(config.file_reservation_inactivity_seconds)
         .unwrap_or(1800)
@@ -253,6 +296,9 @@ fn detect_and_release_stale(
         Outcome::Ok(project) => Some(std::path::PathBuf::from(project.human_key)),
         _ => None,
     };
+    let git_head_oid = workspace
+        .as_deref()
+        .and_then(git_head_oid_for_workspace);
 
     // Many reservations share the same agent and/or path pattern. Cache activity
     // checks within a cycle to avoid repeated DB + git process work.
@@ -312,14 +358,16 @@ fn detect_and_release_stale(
             .get(&res.path_pattern)
             .copied()
             .unwrap_or_else(|| {
-                let recent_fs =
-                    check_filesystem_activity(workspace, &res.path_pattern, now, grace_us);
-                let recent_git = if recent_fs {
-                    false
-                } else {
-                    check_git_activity(workspace, &res.path_pattern, now, grace_us)
-                };
-                let computed = recent_fs || recent_git;
+                let computed =
+                    path_has_recent_activity_cached(
+                        probe_cache,
+                        workspace,
+                        project_id,
+                        &res.path_pattern,
+                        git_head_oid.as_deref(),
+                        now,
+                        grace_us,
+                    );
                 recent_path_activity_cache.insert(res.path_pattern.clone(), computed);
                 computed
             });
@@ -342,6 +390,46 @@ fn detect_and_release_stale(
         Outcome::Ok(_) => Ok(stale_ids),
         other => Err(format!("failed to release stale reservations: {other:?}")),
     }
+}
+
+fn path_has_recent_activity_cached(
+    cache: &mut CleanupProbeCache,
+    workspace: &Path,
+    project_id: i64,
+    path_pattern: &str,
+    git_head_oid: Option<&str>,
+    now_us: i64,
+    grace_us: i64,
+) -> bool {
+    let key = (project_id, path_pattern.to_string());
+    let entry = cache.path_probes.entry(key).or_default();
+    entry.last_used_us = now_us;
+
+    // Filesystem side: only reuse known-positive activity through grace window.
+    if entry.fs_recent_until_us > now_us {
+        return true;
+    }
+    let recent_fs = check_filesystem_activity(workspace, path_pattern, now_us, grace_us);
+    if recent_fs {
+        entry.fs_recent_until_us = now_us.saturating_add(grace_us);
+        return true;
+    }
+    entry.fs_recent_until_us = 0;
+
+    // Git side: cache latest matching commit at a specific HEAD.
+    let Some(current_head) = git_head_oid else {
+        entry.git_head_oid = None;
+        entry.git_latest_commit_us = None;
+        return false;
+    };
+
+    if entry.git_head_oid.as_deref() != Some(current_head) {
+        entry.git_head_oid = Some(current_head.to_string());
+        entry.git_latest_commit_us = git_latest_commit_us(workspace, path_pattern);
+    }
+    entry
+        .git_latest_commit_us
+        .is_some_and(|commit_us| now_us.saturating_sub(commit_us) <= grace_us)
 }
 
 /// Check if any matched files have recent filesystem activity.
@@ -444,19 +532,40 @@ fn check_filesystem_activity(
 }
 
 /// Check if any matched files have recent git commit activity.
+#[cfg(test)]
 fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_us: i64) -> bool {
+    git_latest_commit_us(workspace, path_pattern)
+        .is_some_and(|commit_us| now_us.saturating_sub(commit_us) <= grace_us)
+}
+
+fn git_head_oid_for_workspace(workspace: &Path) -> Option<String> {
     if !workspace.exists() {
-        return false;
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .args(["-C", &workspace.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if head.is_empty() { None } else { Some(head) }
+}
+
+#[cfg(test)]
+fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
+    if !workspace.exists() {
+        return None;
     }
 
     let pattern = path_pattern.trim().trim_start_matches('/');
     if pattern.is_empty() {
-        return false;
+        return None;
     }
 
     // Use git log with the path pattern directly (git handles pathspecs including globs).
-    // This is vastly more efficient than spawning a git process per matched file.
-    let Ok(output) = std::process::Command::new("git")
+    let output = std::process::Command::new("git")
         .args([
             "-C",
             &workspace.to_string_lossy(),
@@ -467,21 +576,15 @@ fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_u
             pattern,
         ])
         .output()
-    else {
-        return false;
-    };
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Ok(commit_epoch) = stdout.trim().parse::<i64>() {
-            let commit_us = commit_epoch * 1_000_000;
-            if now_us.saturating_sub(commit_us) <= grace_us {
-                return true;
-            }
-        }
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-
-    false
+    let commit_epoch = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    Some(commit_epoch.saturating_mul(1_000_000))
 }
 
 /// Collect filesystem paths matching a reservation pattern.
@@ -979,8 +1082,15 @@ mod tests {
         config.file_reservation_inactivity_seconds = 86_400; // one day
         config.file_reservation_activity_grace_seconds = 900;
 
-        let released =
-            detect_and_release_stale(&config, &pool, &cx, project_id).expect("stale pass");
+        let mut probe_cache = CleanupProbeCache::default();
+        let released = detect_and_release_stale(
+            &config,
+            &pool,
+            &cx,
+            project_id,
+            &mut probe_cache,
+        )
+        .expect("stale pass");
         assert!(released.is_empty());
 
         let rows = match fastmcp_core::block_on(async {
@@ -1009,8 +1119,15 @@ mod tests {
         config.file_reservation_inactivity_seconds = 0;
         config.file_reservation_activity_grace_seconds = 0;
 
-        let released =
-            detect_and_release_stale(&config, &pool, &cx, project_id).expect("stale pass");
+        let mut probe_cache = CleanupProbeCache::default();
+        let released = detect_and_release_stale(
+            &config,
+            &pool,
+            &cx,
+            project_id,
+            &mut probe_cache,
+        )
+        .expect("stale pass");
         assert_eq!(released.len(), 1);
         assert_eq!(released[0], reservation_id);
 
