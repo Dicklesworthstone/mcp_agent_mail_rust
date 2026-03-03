@@ -1297,6 +1297,7 @@ mod tests {
         let base = std::env::temp_dir().join("migrate_test_copy_db");
         let src_dir = base.join("python");
         let dst_dir = base.join("rust_storage");
+        let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::create_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);
 
@@ -1321,16 +1322,6 @@ mod tests {
         assert!(dest.exists());
         assert_eq!(dest, dst_dir.join("storage.sqlite3"));
 
-        let dest_conn = DbConn::open_file(dest.display().to_string()).expect("open copied db");
-        let rows = dest_conn
-            .query_sync("SELECT value FROM marker LIMIT 1", &[])
-            .expect("query copied marker");
-        let marker: String = rows
-            .first()
-            .and_then(|row| row.get_named::<String>("value").ok())
-            .expect("copied marker value");
-        assert_eq!(marker, "python-source");
-
         let dest_wal = std::path::PathBuf::from(format!("{}-wal", dest.display()));
         let dest_shm = std::path::PathBuf::from(format!("{}-shm", dest.display()));
         assert!(
@@ -1341,6 +1332,16 @@ mod tests {
             !dest_shm.exists(),
             "destination should not include copied SHM sidecar"
         );
+
+        let dest_conn = DbConn::open_file(dest.display().to_string()).expect("open copied db");
+        let rows = dest_conn
+            .query_sync("SELECT value FROM marker LIMIT 1", &[])
+            .expect("query copied marker");
+        let marker: String = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("value").ok())
+            .expect("copied marker value");
+        assert_eq!(marker, "python-source");
 
         let _ = std::fs::remove_dir_all(&base);
     }

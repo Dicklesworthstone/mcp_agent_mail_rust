@@ -2970,6 +2970,43 @@ collect_migration_counts() {
   echo "$summary"
 }
 
+migration_count_value_from_summary() {
+  local summary="$1"
+  local table="$2"
+  if [ -z "$summary" ] || [ "$summary" = "sqlite3_unavailable" ]; then
+    echo "na"
+    return 0
+  fi
+  printf "%s" "$summary" | tr ';' '\n' | awk -F= -v key="$table" '
+    $1 == key { print $2; found=1; exit }
+    END { if (!found) print "na" }
+  '
+}
+
+migration_core_counts_preserved() {
+  local before_summary="$1"
+  local after_summary="$2"
+  local core_tables=(
+    projects
+    agents
+    messages
+    message_recipients
+    file_reservations
+  )
+  local table before after
+  for table in "${core_tables[@]}"; do
+    before=$(migration_count_value_from_summary "$before_summary" "$table")
+    after=$(migration_count_value_from_summary "$after_summary" "$table")
+    if [[ "$before" =~ ^[0-9]+$ ]] && [[ "$after" =~ ^[0-9]+$ ]]; then
+      if [ "$after" -lt "$before" ]; then
+        warn "Migration row count regressed for ${table}: before=${before} after=${after}"
+        return 1
+      fi
+    fi
+  done
+  return 0
+}
+
 sqlite_table_exists() {
   local db_path="$1"
   local table="$2"
@@ -3094,7 +3131,9 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   migration_output_fallback=""
   migration_before_counts=""
   migration_after_counts=""
+  migration_integrity=""
   migration_has_unresolved_warnings=0
+  migration_requires_fallback=0
   migration_pristine_backup=""
   SQLITE_FALLBACK_BACKUP_PATH=""
   migration_restore_ok=0
@@ -3125,6 +3164,9 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     if printf "%s\n" "$migration_output" | grep -qiE "database still contains TEXT timestamps|migration completed with errors|migration needed: run"; then
       migration_has_unresolved_warnings=1
     fi
+    if printf "%s\n" "$migration_output" | grep -qiE "schema migration hit sqlite engine instability|schema migration path was skipped due to backend instability"; then
+      migration_requires_fallback=1
+    fi
     if [ "$migration_has_unresolved_warnings" -eq 1 ]; then
       ok "Database schema migrated"
       warn "Database migration completed with unresolved warnings."
@@ -3149,6 +3191,9 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     done <<< "$migration_output_fallback"
     if printf "%s\n%s\n" "$migration_output" "$migration_output_fallback" | grep -qiE "database still contains TEXT timestamps|migration completed with errors|migration needed: run"; then
       migration_has_unresolved_warnings=1
+    fi
+    if printf "%s\n%s\n" "$migration_output" "$migration_output_fallback" | grep -qiE "schema migration hit sqlite engine instability|schema migration path was skipped due to backend instability"; then
+      migration_requires_fallback=1
     fi
     if [ "$migration_has_unresolved_warnings" -eq 1 ]; then
       ok "Database schema migrated"
@@ -3198,6 +3243,47 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     if [ "$migration_fallback_ok" -eq 0 ]; then
       warn "Database migration had issues. Retry with:"
       warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
+    fi
+  fi
+
+  if [ "$migration_succeeded" -eq 1 ]; then
+    migration_integrity=$(sqlite3 "$PYTHON_DB_MIGRATED_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
+    if [ "$migration_integrity" != "ok" ]; then
+      migration_requires_fallback=1
+      warn "am migrate produced integrity_check='${migration_integrity:-<empty>}'; forcing sqlite3 fallback."
+    fi
+    if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
+      migration_requires_fallback=1
+      warn "am migrate reduced core legacy row counts; forcing sqlite3 fallback."
+    fi
+  fi
+
+  if [ "$migration_succeeded" -eq 1 ] && [ "$migration_requires_fallback" -eq 1 ]; then
+    warn "Reverting to pristine snapshot and running sqlite3 fallback migration."
+    if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
+      if copy_sqlite_snapshot "$migration_pristine_backup" "$PYTHON_DB_MIGRATED_PATH"; then
+        migration_restore_ok=1
+        warn "Restored pristine migration snapshot before sqlite3 fallback."
+      else
+        migration_restore_ok=0
+        warn "Failed to restore pristine snapshot prior to sqlite3 fallback migration."
+      fi
+    else
+      migration_restore_ok=1
+      warn "Pristine migration snapshot missing; running sqlite3 fallback migration in-place."
+    fi
+
+    if [ "$migration_restore_ok" -eq 1 ] && sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
+      migration_fallback_ok=1
+      migration_succeeded=1
+      migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+      verbose "migration:row_counts_after_fallback ${migration_after_counts}"
+      if [ -n "${SQLITE_FALLBACK_BACKUP_PATH:-}" ]; then
+        ok "Database backup created at ${SQLITE_FALLBACK_BACKUP_PATH}"
+      fi
+    else
+      migration_succeeded=0
+      migration_fallback_ok=0
     fi
   fi
 

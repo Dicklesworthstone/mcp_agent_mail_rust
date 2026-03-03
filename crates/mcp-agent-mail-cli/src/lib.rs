@@ -16366,7 +16366,6 @@ mod tests {
 
         let backup = create_db_backup(&db_path, Some(dir.path())).expect("create backup");
         assert!(backup.exists());
-        assert_eq!(read_marker_db(&backup), "snapshot");
 
         let backup_wal = sqlite_sidecar_path(&backup, "-wal");
         let backup_shm = sqlite_sidecar_path(&backup, "-shm");
@@ -16378,6 +16377,8 @@ mod tests {
             !backup_shm.exists(),
             "backup should not carry SHM sidecar to avoid stale restore artifacts"
         );
+
+        assert_eq!(read_marker_db(&backup), "snapshot");
     }
 
     #[test]
@@ -23812,10 +23813,20 @@ mod tests {
             .expect("create table");
         drop(conn);
 
-        assert!(!sqlite_file_has_live_sidecars(&db_path));
+        // Ensure sidecars are actually removed before testing the "clean" state
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite3-shm"));
+
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let _ = std::fs::remove_file(PathBuf::from(wal_os));
 
         let mut shm_os = db_path.as_os_str().to_os_string();
         shm_os.push("-shm");
+        let _ = std::fs::remove_file(PathBuf::from(&shm_os));
+
+        assert!(!sqlite_file_has_live_sidecars(&db_path));
+
         std::fs::write(PathBuf::from(shm_os), b"live-sidecar").expect("write sidecar");
         assert!(sqlite_file_has_live_sidecars(&db_path));
     }
