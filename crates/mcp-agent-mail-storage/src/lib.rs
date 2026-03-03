@@ -208,6 +208,7 @@ const WBQ_CHANNEL_CAPACITY: usize = 8_192;
 const WBQ_DRAIN_BATCH_CAP: usize = 256;
 const WBQ_FLUSH_INTERVAL_MS: u64 = 100;
 const WBQ_ENQUEUE_TIMEOUT_MS: u64 = 100;
+const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
 
 static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 
@@ -279,9 +280,11 @@ fn wbq_enqueue_with_sender(
                 .wbq_fallbacks_total
                 .inc();
             // std::sync::mpsc::SyncSender does not expose a stable send_timeout; emulate with
-            // try_send + a short sleep until a deadline.
+            // try_send + bounded exponential backoff until a deadline.
             let deadline = Instant::now() + Duration::from_millis(WBQ_ENQUEUE_TIMEOUT_MS);
             let mut cur = msg;
+            let mut backoff = Duration::from_millis(1);
+            let max_backoff = Duration::from_millis(WBQ_ENQUEUE_MAX_BACKOFF_MS);
             loop {
                 match sender.try_send(cur) {
                     Ok(()) => {
@@ -292,10 +295,13 @@ fn wbq_enqueue_with_sender(
                         break WbqEnqueueResult::QueueUnavailable;
                     }
                     Err(std::sync::mpsc::TrySendError::Full(returned)) => {
-                        if Instant::now() >= deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
                             break WbqEnqueueResult::QueueUnavailable;
                         }
-                        std::thread::sleep(Duration::from_millis(1));
+                        let remaining = deadline.saturating_duration_since(now);
+                        std::thread::sleep(backoff.min(remaining));
+                        backoff = backoff.checked_mul(2).unwrap_or(max_backoff).min(max_backoff);
                         cur = returned;
                     }
                 }
@@ -1678,7 +1684,7 @@ impl CommitCoalescer {
         let (lock, cvar) = &*self.work_cv;
         {
             let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
-            *wake_tokens = wake_tokens.saturating_add(1);
+            *wake_tokens = wake_tokens.saturating_add(1).min(self.worker_count as u64);
         }
         cvar.notify_one();
     }
@@ -1695,7 +1701,9 @@ impl CommitCoalescer {
             {
                 let (lock, cvar) = &*self.work_cv;
                 let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
-                *wake_tokens = wake_tokens.saturating_add(self.worker_count as u64);
+                *wake_tokens = wake_tokens
+                    .saturating_add(self.worker_count as u64)
+                    .min(self.worker_count as u64);
                 cvar.notify_all();
             }
 
@@ -6476,7 +6484,11 @@ pub fn check_archive_consistency(
             &iso_filename
         };
 
-        let messages_dir = project_dir.join("archive").join("messages").join(&year).join(&month);
+        let messages_dir = project_dir
+            .join("archive")
+            .join("messages")
+            .join(&year)
+            .join(&month);
 
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
         // We check both the computed path and do a directory scan fallback

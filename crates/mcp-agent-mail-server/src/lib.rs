@@ -3864,16 +3864,39 @@ fn colorize_json_line(line: &str, key_color: &str, num_color: &str, ansi_off: &s
 }
 
 fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
+    let Some(conn) = dashboard_open_connection(database_url) else {
+        return DashboardDbStats::default();
+    };
+    fetch_dashboard_db_stats_from_conn(&conn)
+}
+
+fn dashboard_open_connection(database_url: &str) -> Option<DbConn> {
     let cfg = DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
     };
-    let Ok(path) = cfg.sqlite_path() else {
-        return DashboardDbStats::default();
-    };
-    let Ok(conn) = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path) else {
-        return DashboardDbStats::default();
-    };
+    let path = cfg.sqlite_path().ok()?;
+    mcp_agent_mail_db::open_sqlite_file_with_recovery(&path).ok()
+}
+
+fn fetch_dashboard_db_stats_cached(
+    database_url: &str,
+    conn_state: &mut Option<DbConn>,
+) -> DashboardDbStats {
+    if let Some(conn) = conn_state.as_ref() {
+        if conn.query_sync("SELECT 1 AS c", &[]).is_ok() {
+            return fetch_dashboard_db_stats_from_conn(conn);
+        }
+        *conn_state = None;
+    }
+
+    *conn_state = dashboard_open_connection(database_url);
+    conn_state
+        .as_ref()
+        .map_or_else(DashboardDbStats::default, fetch_dashboard_db_stats_from_conn)
+}
+
+fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     let agents_list = conn
         .query_sync(
             "SELECT name, program, last_active_ts FROM agents \
@@ -3913,7 +3936,7 @@ fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
     }
 }
 
-fn dashboard_count(conn: &mcp_agent_mail_db::DbConn, sql: &str) -> u64 {
+fn dashboard_count(conn: &DbConn, sql: &str) -> u64 {
     conn.query_sync(sql, &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())

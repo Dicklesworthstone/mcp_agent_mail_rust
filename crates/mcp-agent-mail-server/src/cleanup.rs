@@ -296,9 +296,7 @@ fn detect_and_release_stale(
         Outcome::Ok(project) => Some(std::path::PathBuf::from(project.human_key)),
         _ => None,
     };
-    let git_head_oid = workspace
-        .as_deref()
-        .and_then(git_head_oid_for_workspace);
+    let git_head_oid = workspace.as_deref().and_then(git_head_oid_for_workspace);
 
     // Many reservations share the same agent and/or path pattern. Cache activity
     // checks within a cycle to avoid repeated DB + git process work.
@@ -358,16 +356,15 @@ fn detect_and_release_stale(
             .get(&res.path_pattern)
             .copied()
             .unwrap_or_else(|| {
-                let computed =
-                    path_has_recent_activity_cached(
-                        probe_cache,
-                        workspace,
-                        project_id,
-                        &res.path_pattern,
-                        git_head_oid.as_deref(),
-                        now,
-                        grace_us,
-                    );
+                let computed = path_has_recent_activity_cached(
+                    probe_cache,
+                    workspace,
+                    project_id,
+                    &res.path_pattern,
+                    git_head_oid.as_deref(),
+                    now,
+                    grace_us,
+                );
                 recent_path_activity_cache.insert(res.path_pattern.clone(), computed);
                 computed
             });
@@ -553,7 +550,6 @@ fn git_head_oid_for_workspace(workspace: &Path) -> Option<String> {
     if head.is_empty() { None } else { Some(head) }
 }
 
-#[cfg(test)]
 fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
     if !workspace.exists() {
         return None;
@@ -1083,14 +1079,8 @@ mod tests {
         config.file_reservation_activity_grace_seconds = 900;
 
         let mut probe_cache = CleanupProbeCache::default();
-        let released = detect_and_release_stale(
-            &config,
-            &pool,
-            &cx,
-            project_id,
-            &mut probe_cache,
-        )
-        .expect("stale pass");
+        let released = detect_and_release_stale(&config, &pool, &cx, project_id, &mut probe_cache)
+            .expect("stale pass");
         assert!(released.is_empty());
 
         let rows = match fastmcp_core::block_on(async {
@@ -1120,14 +1110,8 @@ mod tests {
         config.file_reservation_activity_grace_seconds = 0;
 
         let mut probe_cache = CleanupProbeCache::default();
-        let released = detect_and_release_stale(
-            &config,
-            &pool,
-            &cx,
-            project_id,
-            &mut probe_cache,
-        )
-        .expect("stale pass");
+        let released = detect_and_release_stale(&config, &pool, &cx, project_id, &mut probe_cache)
+            .expect("stale pass");
         assert_eq!(released.len(), 1);
         assert_eq!(released[0], reservation_id);
 

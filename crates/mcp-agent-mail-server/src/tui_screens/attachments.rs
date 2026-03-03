@@ -1699,10 +1699,7 @@ mod tests {
         let att_diag = diags
             .iter()
             .find(|(_, d)| d.screen == "attachments" && d.scope.contains("db_unavailable"));
-        assert!(
-            att_diag.is_some(),
-            "should emit db_unavailable diagnostic"
-        );
+        assert!(att_diag.is_some(), "should emit db_unavailable diagnostic");
     }
 
     #[test]
@@ -1808,7 +1805,10 @@ mod tests {
         assert!(MediaFilter::Documents.matches("application/pdf"));
         assert!(MediaFilter::Documents.matches("text/plain"));
         assert!(MediaFilter::Documents.matches("text/html"));
-        assert!(MediaFilter::Documents.matches("application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+        assert!(
+            MediaFilter::Documents
+                .matches("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
         assert!(!MediaFilter::Documents.matches("image/png"));
         assert!(!MediaFilter::Documents.matches("audio/mp3"));
     }

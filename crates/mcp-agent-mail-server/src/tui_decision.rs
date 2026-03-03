@@ -1007,7 +1007,12 @@ mod tests {
     #[test]
     fn rapid_state_transitions_convergence() {
         let mut strategy = BayesianDiffStrategy::new();
-        let sequence = [stable_frame(), bursty_frame(), resize_frame(), degraded_frame()];
+        let sequence = [
+            stable_frame(),
+            bursty_frame(),
+            resize_frame(),
+            degraded_frame(),
+        ];
         for round in 0..50 {
             let frame = &sequence[round % 4];
             strategy.observe_with_ledger(frame, None);

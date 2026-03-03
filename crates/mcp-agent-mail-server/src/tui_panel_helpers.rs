@@ -89,8 +89,8 @@ pub fn render_empty_state(frame: &mut Frame<'_>, area: Rect, icon: &str, title: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ftui::layout::Rect;
     use ftui::GraphemePool;
+    use ftui::layout::Rect;
     use ftui_extras::theme::{ScopedThemeLock, ThemeId};
 
     #[test]
@@ -125,7 +125,13 @@ mod tests {
         let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_empty_state(&mut frame, Rect::new(0, 0, 80, 24), "M", "No Messages", "Send a message to get started");
+        render_empty_state(
+            &mut frame,
+            Rect::new(0, 0, 80, 24),
+            "M",
+            "No Messages",
+            "Send a message to get started",
+        );
     }
 
     #[test]
@@ -133,7 +139,13 @@ mod tests {
         let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(15, 3, &mut pool);
-        render_empty_state(&mut frame, Rect::new(0, 0, 15, 3), "M", "Empty", "hint text");
+        render_empty_state(
+            &mut frame,
+            Rect::new(0, 0, 15, 3),
+            "M",
+            "Empty",
+            "hint text",
+        );
     }
 
     #[test]
@@ -141,7 +153,13 @@ mod tests {
         let _guard = ScopedThemeLock::new(ThemeId::Darcula);
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(20, 5, &mut pool);
-        render_empty_state(&mut frame, Rect::new(0, 0, 20, 5), "S", "No Results", "Try a different query");
+        render_empty_state(
+            &mut frame,
+            Rect::new(0, 0, 20, 5),
+            "S",
+            "No Results",
+            "Try a different query",
+        );
     }
 
     #[test]
@@ -149,7 +167,13 @@ mod tests {
         let _guard = ScopedThemeLock::new(ThemeId::Darcula);
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(19, 5, &mut pool);
-        render_empty_state(&mut frame, Rect::new(0, 0, 19, 5), "S", "No Results", "hint");
+        render_empty_state(
+            &mut frame,
+            Rect::new(0, 0, 19, 5),
+            "S",
+            "No Results",
+            "hint",
+        );
     }
 
     #[test]
@@ -157,7 +181,13 @@ mod tests {
         let _guard = ScopedThemeLock::new(ThemeId::NordicFrost);
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(80, 4, &mut pool);
-        render_empty_state(&mut frame, Rect::new(0, 0, 80, 4), "!", "Warning", "something");
+        render_empty_state(
+            &mut frame,
+            Rect::new(0, 0, 80, 4),
+            "!",
+            "Warning",
+            "something",
+        );
     }
 
     #[test]
@@ -165,7 +195,13 @@ mod tests {
         let _guard = ScopedThemeLock::new(ThemeId::LumenLight);
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(200, 50, &mut pool);
-        render_empty_state(&mut frame, Rect::new(0, 0, 200, 50), "D", "No Data", "Data will appear here");
+        render_empty_state(
+            &mut frame,
+            Rect::new(0, 0, 200, 50),
+            "D",
+            "No Data",
+            "Data will appear here",
+        );
     }
 
     #[test]
@@ -173,7 +209,13 @@ mod tests {
         let _guard = ScopedThemeLock::new(ThemeId::Doom);
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(100, 40, &mut pool);
-        render_empty_state(&mut frame, Rect::new(10, 5, 60, 20), "I", "No Items", "Create an item to begin");
+        render_empty_state(
+            &mut frame,
+            Rect::new(10, 5, 60, 20),
+            "I",
+            "No Items",
+            "Create an item to begin",
+        );
     }
 
     #[test]

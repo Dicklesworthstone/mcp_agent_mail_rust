@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(CIRCUIT_SIGNAL.reset_duration(), Duration::from_secs(30));
         // LLM: threshold=3, reset=60s
         assert_eq!(CIRCUIT_LLM.threshold(), 3);
-        assert_eq!(CIRCUIT_LLM.reset_duration(), Duration::from_mins(1));
+        assert_eq!(CIRCUIT_LLM.reset_duration(), Duration::from_secs(60));
     }
 
     // -- Half-open rate limiting tests ---------------------------------------
@@ -1325,7 +1325,7 @@ mod tests {
 
     #[test]
     fn record_success_in_open_state_closes_circuit() {
-        let cb = CircuitBreaker::with_params(2, Duration::from_mins(5));
+        let cb = CircuitBreaker::with_params(2, Duration::from_secs(300));
         cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);

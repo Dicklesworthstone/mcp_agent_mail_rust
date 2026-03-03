@@ -623,7 +623,10 @@ impl MailExplorerScreen {
             self.pressure_dirty = false;
             self.db_context_unavailable = true;
             self.db_conn_attempted = false; // allow retry on next tick
-            self.emit_db_unavailable_diagnostic(state, "database connection unavailable (pressure)");
+            self.emit_db_unavailable_diagnostic(
+                state,
+                "database connection unavailable (pressure)",
+            );
             return;
         };
         self.db_context_unavailable = false;

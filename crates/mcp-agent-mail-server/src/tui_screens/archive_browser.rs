@@ -549,10 +549,7 @@ impl ArchiveBrowserScreen {
                 entry.metadata().map_or(0, |metadata| metadata.len())
             };
 
-            if !filter_lc.is_empty()
-                && !is_dir
-                && !name.to_lowercase().contains(&filter_lc)
-            {
+            if !filter_lc.is_empty() && !is_dir && !name.to_lowercase().contains(&filter_lc) {
                 continue;
             }
 
@@ -1476,10 +1473,7 @@ mod tests {
             sanitize_diagnostic_value("line1\nline2\rline3"),
             "line1 line2 line3"
         );
-        assert_eq!(
-            sanitize_diagnostic_value("a;b,c  d"),
-            "a b c d"
-        );
+        assert_eq!(sanitize_diagnostic_value("a;b,c  d"), "a b c d");
         assert_eq!(sanitize_diagnostic_value("  spaces  "), "spaces");
         assert_eq!(sanitize_diagnostic_value(""), "");
     }
@@ -1487,21 +1481,66 @@ mod tests {
     #[test]
     fn content_type_from_path_toml_yaml_binary() {
         use std::path::Path;
-        assert_eq!(ContentType::from_path(Path::new("config.toml")), ContentType::Toml);
-        assert_eq!(ContentType::from_path(Path::new("deploy.yml")), ContentType::Yaml);
-        assert_eq!(ContentType::from_path(Path::new("ci.yaml")), ContentType::Yaml);
-        assert_eq!(ContentType::from_path(Path::new("icon.png")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("photo.jpg")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("photo.jpeg")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("anim.gif")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("img.webp")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("data.sqlite3")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("store.db")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("data.sqlite")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("icon.ico")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("icon.bmp")), ContentType::Binary);
-        assert_eq!(ContentType::from_path(Path::new("no_ext")), ContentType::PlainText);
-        assert_eq!(ContentType::from_path(Path::new("script.sh")), ContentType::PlainText);
+        assert_eq!(
+            ContentType::from_path(Path::new("config.toml")),
+            ContentType::Toml
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("deploy.yml")),
+            ContentType::Yaml
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("ci.yaml")),
+            ContentType::Yaml
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("icon.png")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("photo.jpg")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("photo.jpeg")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("anim.gif")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("img.webp")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("data.sqlite3")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("store.db")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("data.sqlite")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("icon.ico")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("icon.bmp")),
+            ContentType::Binary
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("no_ext")),
+            ContentType::PlainText
+        );
+        assert_eq!(
+            ContentType::from_path(Path::new("script.sh")),
+            ContentType::PlainText
+        );
     }
 
     #[test]

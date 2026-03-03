@@ -260,7 +260,10 @@ where
             return;
         }
 
-        let mut budget = self.main.len() + 1;
+        // Max frequency is 3. In the absolute worst case where every item in main
+        // has freq=3, we would need to inspect each item up to 4 times to decrement
+        // its frequency to 0 and finally evict it.
+        let mut budget = self.main.len() * 4 + 1;
         while self.main.len() >= self.main_capacity && budget > 0 {
             budget -= 1;
             let Some(key) = self.main.pop_front() else {

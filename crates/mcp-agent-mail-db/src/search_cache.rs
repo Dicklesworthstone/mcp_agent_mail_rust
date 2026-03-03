@@ -751,7 +751,7 @@ mod tests {
     fn test_cache_lru_eviction() {
         let config = CacheConfig {
             max_entries: 2,
-            ttl: Duration::from_mins(5),
+            ttl: Duration::from_secs(300),
             enabled: true,
         };
         let cache: QueryCache<i64> = QueryCache::new(config);
@@ -852,7 +852,7 @@ mod tests {
     fn test_disabled_cache_get_always_returns_none() {
         let config = CacheConfig {
             max_entries: 100,
-            ttl: Duration::from_mins(5),
+            ttl: Duration::from_secs(300),
             enabled: false,
         };
         let cache: QueryCache<i64> = QueryCache::new(config);
@@ -868,7 +868,7 @@ mod tests {
     fn test_disabled_cache_put_is_noop() {
         let config = CacheConfig {
             max_entries: 100,
-            ttl: Duration::from_mins(5),
+            ttl: Duration::from_secs(300),
             enabled: false,
         };
         let cache: QueryCache<i64> = QueryCache::new(config);
@@ -888,7 +888,7 @@ mod tests {
     fn test_cache_entry_is_expired() {
         let entry = CacheEntry::new(42_i64);
         // Just created → not expired with 300s TTL
-        assert!(!entry.is_expired(Duration::from_mins(5)));
+        assert!(!entry.is_expired(Duration::from_secs(300)));
         // Expired with 0 TTL
         assert!(entry.is_expired(Duration::ZERO));
     }
@@ -970,7 +970,7 @@ mod tests {
     fn test_prune_expired_with_zero_ttl_clears_all() {
         let config = CacheConfig {
             max_entries: 100,
-            ttl: Duration::from_mins(5),
+            ttl: Duration::from_secs(300),
             enabled: true,
         };
         let cache: QueryCache<i64> = QueryCache::new(config);
@@ -1414,14 +1414,14 @@ mod tests {
     fn warm_worker_config_accessor() {
         let config = WarmWorkerConfig {
             warmup_on_startup: false,
-            warmup_timeout: Duration::from_mins(1),
+            warmup_timeout: Duration::from_secs(60),
             retry_on_failure: false,
             max_retries: 0,
         };
         let worker = WarmWorker::new(config);
         let got = worker.config();
         assert!(!got.warmup_on_startup);
-        assert_eq!(got.warmup_timeout, Duration::from_mins(1));
+        assert_eq!(got.warmup_timeout, Duration::from_secs(60));
     }
 
     // ── Constants ───────────────────────────────────────────────────

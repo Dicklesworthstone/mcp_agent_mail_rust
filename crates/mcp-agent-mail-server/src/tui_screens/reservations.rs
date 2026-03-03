@@ -3778,8 +3778,7 @@ mod tests {
 
     #[test]
     fn reservation_create_form_paths_skips_empty_lines() {
-        let mut form =
-            ReservationCreateFormState::new("proj".into(), "BlueLake".into());
+        let mut form = ReservationCreateFormState::new("proj".into(), "BlueLake".into());
         form.paths_input.set_text("src/**\n\n  \ntests/**\n");
         let paths = form.paths();
         assert_eq!(paths, vec!["src/**", "tests/**"]);
@@ -3787,8 +3786,7 @@ mod tests {
 
     #[test]
     fn reservation_create_form_custom_ttl_enabled() {
-        let mut form =
-            ReservationCreateFormState::new("proj".into(), "BlueLake".into());
+        let mut form = ReservationCreateFormState::new("proj".into(), "BlueLake".into());
         assert!(!form.custom_ttl_enabled());
         form.ttl_idx = RESERVATION_TTL_CUSTOM_INDEX;
         assert!(form.custom_ttl_enabled());

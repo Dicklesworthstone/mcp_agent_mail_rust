@@ -6634,7 +6634,7 @@ mod tests {
     #[test]
     fn format_duration_hours() {
         assert_eq!(
-            format_duration(std::time::Duration::from_mins(123)),
+            format_duration(std::time::Duration::from_secs(7380)),
             "2h 3m"
         );
     }
@@ -8061,7 +8061,12 @@ mod tests {
             "## Status\n\n- All tests passing\n- Coverage at 95%",
             "{\"build\":\"ok\",\"tests\":42}",
         ];
-        let placeholders = ["(empty body)", "(empty)", "no body", "message body unavailable"];
+        let placeholders = [
+            "(empty body)",
+            "(empty)",
+            "no body",
+            "message body unavailable",
+        ];
 
         for body in bodies {
             let blockquote = crate::tui_markdown::render_message_body_blockquote(body, &theme);

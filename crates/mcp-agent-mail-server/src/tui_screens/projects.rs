@@ -406,10 +406,9 @@ impl MailScreen for ProjectsScreen {
             );
 
         if self.db_context_unavailable {
-            let banner = Paragraph::new(
-                " Database context unavailable. Waiting for poller data...",
-            )
-            .style(Style::default().fg(tp.severity_error));
+            let banner =
+                Paragraph::new(" Database context unavailable. Waiting for poller data...")
+                    .style(Style::default().fg(tp.severity_error));
             let banner_area = Rect::new(area.x, area.y, area.width, 1);
             banner.render(banner_area, frame);
             return;

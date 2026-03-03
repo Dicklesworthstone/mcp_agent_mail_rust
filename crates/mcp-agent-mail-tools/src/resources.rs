@@ -3120,7 +3120,7 @@ struct ReservationPatternActivity {
     git_activity_micros: Option<i64>,
 }
 
-const RESERVATION_GLOB_MARKERS: &[char] = &['*', '?', '['];
+const RESERVATION_GLOB_MARKERS: &[char] = &['*', '?', '[', '{'];
 
 fn reservation_contains_glob(pattern: &str) -> bool {
     RESERVATION_GLOB_MARKERS

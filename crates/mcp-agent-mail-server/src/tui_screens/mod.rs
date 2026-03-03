@@ -1321,9 +1321,9 @@ mod tests {
     #[test]
     fn selection_state_toggle_returns_correct_membership() {
         let mut state = SelectionState::new();
-        assert!(state.toggle(42));  // select → true
+        assert!(state.toggle(42)); // select → true
         assert!(!state.toggle(42)); // deselect → false
-        assert!(state.toggle(42));  // re-select → true
+        assert!(state.toggle(42)); // re-select → true
     }
 
     #[test]
