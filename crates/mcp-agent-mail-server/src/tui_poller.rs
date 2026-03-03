@@ -1392,6 +1392,7 @@ fn fetch_reservation_snapshot_bundle_fast(conn: &DbConn, now: i64) -> Reservatio
 /// This is reused by the reservations screen as a direct fallback when the
 /// background poller snapshot is unavailable or stale.
 #[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
 pub(crate) fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
     fetch_reservation_snapshots_with_path(conn, None)
 }

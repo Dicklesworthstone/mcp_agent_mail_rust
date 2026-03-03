@@ -1357,7 +1357,11 @@ fn build_outbox_entries(
         let ack_status = if ack_required == 0 {
             "none".to_string()
         } else if recipient_count > 0 && acked_count >= recipient_count {
-            "acked".to_string()
+            "done".to_string()
+        } else if recipient_count > 0 && acked_count > 0 {
+            format!("partial ({acked_count}/{recipient_count})")
+        } else if acked_count > 0 {
+            format!("acked ({acked_count})")
         } else {
             "pending".to_string()
         };
@@ -5351,6 +5355,67 @@ mod tests {
                 assert_eq!(entries[0].subject, "sent by sender");
                 assert_eq!(entries[0].from, "Recipient");
                 assert_eq!(entries[0].priority, "sent");
+            }
+            other => panic!("unexpected navigate result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_outbox_partial_ack_shows_fractional_status() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_outbox_ack_test.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            &empty,
+        ).expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+            &empty,
+        ).expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, subject TEXT NOT NULL, thread_id TEXT, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, body_md TEXT)",
+            &empty,
+        ).expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, ack_ts INTEGER)",
+            &empty,
+        ).expect("create message_recipients");
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
+            &empty,
+        ).expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender'), (2, 1, 'RecipA'), (3, 1, 'RecipB')",
+            &empty,
+        ).expect("insert agents");
+
+        let now = mcp_agent_mail_db::now_micros();
+        // Message with ack_required and 2 recipients, only 1 acked
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md)
+             VALUES (10, 1, 1, 'ack test', 'th-1', 'normal', 1, ?, 'body')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now)],
+        ).expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (1, 10, 2, 'to', NULL, 999),
+                (2, 10, 3, 'to', NULL, NULL)",
+            &empty,
+        ).expect("insert recipients");
+
+        let (result, _action) =
+            build_navigate(&conn, "resource://outbox/Sender", 1, "proj", None).expect("navigate");
+
+        match result {
+            NavigateResult::Inbox { entries } => {
+                assert_eq!(entries.len(), 1, "should have one outbox entry");
+                assert_eq!(entries[0].ack_status, "partial (1/2)", "partial ack should show fractional status");
             }
             other => panic!("unexpected navigate result: {other:?}"),
         }

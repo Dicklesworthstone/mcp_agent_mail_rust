@@ -597,17 +597,30 @@ impl MailScreen for ContactsScreen {
         // ── Main content area ──────────────────────────────────────────
         let content_area = Rect::new(main_area.x, y, main_area.width, table_h);
         y += table_h;
+        let main_graph_visible = self.view_mode == ViewMode::Graph
+            && content_area.width >= GRAPH_MIN_WIDTH
+            && content_area.height >= GRAPH_MIN_HEIGHT;
+        let side_graph_visible = split.rects.len() >= 2
+            && is_table_mode
+            && self.detail_visible
+            && split.breakpoint >= Breakpoint::Xl
+            && split.rects[1].width >= GRAPH_MIN_WIDTH
+            && split.rects[1].height >= GRAPH_MIN_HEIGHT;
+        let needs_recent_events =
+            self.show_mermaid_panel || main_graph_visible || side_graph_visible;
+        let recent_events = needs_recent_events.then(|| state.recent_events(GRAPH_EVENTS_WINDOW));
+        let graph_metrics = (main_graph_visible || side_graph_visible).then(|| {
+            build_graph_flow_metrics(&self.contacts, recent_events.as_deref().unwrap_or(&[]))
+        });
 
         if self.show_mermaid_panel {
-            let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
-            self.render_mermaid_panel(frame, content_area, &recent_events);
-        } else if self.view_mode == ViewMode::Graph
-            && content_area.width >= GRAPH_MIN_WIDTH
-            && content_area.height >= GRAPH_MIN_HEIGHT
-        {
-            let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
-            let metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
-            self.render_graph(frame, content_area, &metrics);
+            if let Some(recent_events) = recent_events.as_deref() {
+                self.render_mermaid_panel(frame, content_area, recent_events);
+            }
+        } else if main_graph_visible {
+            if let Some(metrics) = graph_metrics.as_ref() {
+                self.render_graph(frame, content_area, metrics);
+            }
         } else {
             self.render_table(frame, content_area);
         }
@@ -623,10 +636,12 @@ impl MailScreen for ContactsScreen {
             let detail_area = split.rects[1];
             if split.breakpoint >= Breakpoint::Xl {
                 // On Xl: show graph visualization in the side panel
-                if detail_area.width >= GRAPH_MIN_WIDTH && detail_area.height >= GRAPH_MIN_HEIGHT {
-                    let graph_events = state.recent_events(GRAPH_EVENTS_WINDOW);
-                    let graph_metrics = build_graph_flow_metrics(&self.contacts, &graph_events);
-                    self.render_graph(frame, detail_area, &graph_metrics);
+                if side_graph_visible {
+                    if let Some(graph_metrics) = graph_metrics.as_ref() {
+                        self.render_graph(frame, detail_area, graph_metrics);
+                    } else {
+                        self.render_contact_detail_panel(frame, detail_area);
+                    }
                 } else {
                     self.render_contact_detail_panel(frame, detail_area);
                 }

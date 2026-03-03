@@ -395,9 +395,10 @@ pub fn full_reindex(
     let mut offset = 0;
     let mut total_applied = 0;
     let mut max_version: i64 = 0;
+    let batch_size = config.batch_size.max(1);
 
     loop {
-        let batch = source.fetch_all_batched(config.batch_size, offset)?;
+        let batch = source.fetch_all_batched(batch_size, offset)?;
         if batch.is_empty() {
             break;
         }
@@ -419,7 +420,7 @@ pub fn full_reindex(
         progress.on_progress(offset, total);
 
         // Stop if we got fewer than batch_size (no more data)
-        if batch_len < config.batch_size {
+        if batch_len < batch_size {
             break;
         }
     }

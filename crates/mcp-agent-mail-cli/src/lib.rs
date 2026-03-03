@@ -1530,6 +1530,26 @@ pub enum DoctorCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Attempt automatic remediation for detected issues.
+    ///
+    /// Runs all doctor checks, then fixes each fixable issue:
+    ///   - legacy_python_alias: comment out Python aliases in shell rc files
+    ///   - path_order: append ~/.local/bin to PATH in shell rc
+    ///   - mcp_config: update MCP configs to point to Rust binary
+    ///   - storage_root_git_index_lock: remove stale .git/index.lock files
+    ///   - guard_hooks: install pre-commit guard hooks
+    ///   - wal_mode: enable WAL journal mode
+    Fix {
+        /// Preview fixes without applying them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Auto-confirm all fixes (skip interactive prompts).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Output JSON (shorthand for machine-readable output).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3466,6 +3486,11 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
         DoctorCommand::Reconstruct { dry_run, yes, json } => {
             handle_doctor_reconstruct(dry_run, yes, json)
         }
+        DoctorCommand::Fix {
+            dry_run,
+            yes,
+            json,
+        } => handle_doctor_fix(dry_run, yes, json),
     }
 }
 
@@ -10496,6 +10521,616 @@ fn handle_doctor_check_with(
     Ok(())
 }
 
+// ── Doctor Fix ────────────────────────────────────────────────────────
+
+/// Fixable check IDs and their remediation logic.
+const FIXABLE_CHECKS: &[&str] = &[
+    "legacy_python_alias",
+    "path_order",
+    "mcp_config",
+    "storage_root_git_index_lock",
+    "guard_hooks",
+    "wal_mode",
+];
+
+/// Attempt to comment out a legacy Python `alias am=...` line in a shell rc file.
+/// Returns the path and line number that was commented out, or an error message.
+fn fix_legacy_alias_line(rc_path: &Path, line_no: usize) -> Result<String, String> {
+    let content = std::fs::read_to_string(rc_path)
+        .map_err(|e| format!("cannot read {}: {e}", rc_path.display()))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let idx = line_no.checked_sub(1).ok_or("invalid line number")?;
+    if idx >= lines.len() {
+        return Err(format!(
+            "line {line_no} out of range (file has {} lines)",
+            lines.len()
+        ));
+    }
+    let mut new_lines: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
+    new_lines[idx] = format!(
+        "# [am doctor fix {}] {}",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+        lines[idx]
+    );
+    let new_content = new_lines.join("\n");
+    // Preserve trailing newline if original had one.
+    let new_content = if content.ends_with('\n') {
+        format!("{new_content}\n")
+    } else {
+        new_content
+    };
+    std::fs::write(rc_path, new_content)
+        .map_err(|e| format!("cannot write {}: {e}", rc_path.display()))?;
+    Ok(format!(
+        "Commented out line {} in {}",
+        line_no,
+        rc_path.display()
+    ))
+}
+
+/// Append PATH export to the first available shell rc file.
+fn fix_path_order(home: &Path) -> Result<String, String> {
+    let install_dir = home.join(".local/bin");
+    let install_dir_str = install_dir.to_string_lossy();
+    let candidates = [".zshrc", ".bashrc", ".profile"];
+    for rc in candidates {
+        let rc_path = home.join(rc);
+        if rc_path.exists() {
+            let content = std::fs::read_to_string(&rc_path)
+                .map_err(|e| format!("cannot read {}: {e}", rc_path.display()))?;
+            // Don't add if already present.
+            if content.contains(&*install_dir_str) {
+                return Ok(format!(
+                    "{} already contains {}",
+                    rc_path.display(),
+                    install_dir_str
+                ));
+            }
+            let line = format!(
+                "\n# [am doctor fix {}] Added by am doctor fix\nexport PATH=\"{}:$PATH\"\n",
+                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                install_dir_str
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rc_path)
+                .map_err(|e| format!("cannot append to {}: {e}", rc_path.display()))?;
+            std::io::Write::write_all(&mut file, line.as_bytes())
+                .map_err(|e| format!("write failed: {e}"))?;
+            return Ok(format!(
+                "Appended PATH export to {}",
+                rc_path.display()
+            ));
+        }
+    }
+    Err("No shell rc file found to update".to_string())
+}
+
+/// Update an MCP config file to point `mcp-agent-mail` to the Rust binary.
+fn fix_mcp_config_entry(config_path: &Path, rust_binary: &Path) -> Result<String, String> {
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+    let mut doc: serde_json::Value = serde_json::from_str(&content)
+        .or_else(|_| json5::from_str(&content))
+        .map_err(|e| format!("cannot parse {}: {e}", config_path.display()))?;
+
+    let container_keys = ["mcpServers", "servers", "mcp", "mcp_servers"];
+    let entry_keys = ["mcp-agent-mail", "agent-mail"];
+    let rust_binary_str = rust_binary.to_string_lossy().to_string();
+
+    let mut updated = false;
+    for ck in &container_keys {
+        let Some(container) = doc.get_mut(*ck).and_then(serde_json::Value::as_object_mut) else {
+            continue;
+        };
+        for ek in &entry_keys {
+            let Some(entry) = container.get_mut(*ek).and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            entry.insert(
+                "command".to_string(),
+                serde_json::Value::String(rust_binary_str.clone()),
+            );
+            // Remove Python-specific args if present.
+            if let Some(args) = entry.get("args").and_then(serde_json::Value::as_array) {
+                let has_python_arg = args.iter().any(|a| {
+                    a.as_str()
+                        .is_some_and(|s| s.contains("mcp_agent_mail") || s.contains("python"))
+                });
+                if has_python_arg {
+                    entry.insert(
+                        "args".to_string(),
+                        serde_json::Value::Array(Vec::new()),
+                    );
+                }
+            }
+            updated = true;
+        }
+    }
+
+    if !updated {
+        return Err(format!(
+            "No mcp-agent-mail entry found in {}",
+            config_path.display()
+        ));
+    }
+
+    // Write back with pretty formatting, preserving backup.
+    let backup_path = config_path.with_extension("json.bak");
+    std::fs::copy(config_path, &backup_path)
+        .map_err(|e| format!("backup failed: {e}"))?;
+    let formatted =
+        serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize failed: {e}"))?;
+    std::fs::write(config_path, format!("{formatted}\n"))
+        .map_err(|e| format!("write failed: {e}"))?;
+    Ok(format!(
+        "Updated {} (backup: {})",
+        config_path.display(),
+        backup_path.display()
+    ))
+}
+
+fn handle_doctor_fix(dry_run: bool, _yes: bool, json: bool) -> CliResult<()> {
+    let config = Config::from_env();
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let storage_root = &config.storage_root;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let rust_binary = home.join(".local/bin/mcp-agent-mail");
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut fixed_count = 0u32;
+    let mut failed_count = 0u32;
+    let mut skipped_count = 0u32;
+
+    let mode_label = if dry_run { "would fix" } else { "fixing" };
+
+    // Fix 1: Legacy Python aliases in shell rc files.
+    {
+        let candidates = [
+            ".zshrc",
+            ".zprofile",
+            ".zshenv",
+            ".bashrc",
+            ".bash_profile",
+            ".profile",
+            ".config/fish/config.fish",
+        ];
+        let mut alias_fixes = Vec::new();
+        for rel in candidates {
+            let path = home.join(rel);
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (line_no, line_text) in detect_legacy_am_aliases_in_text(&content) {
+                alias_fixes.push((path.clone(), line_no, line_text));
+            }
+        }
+        if alias_fixes.is_empty() {
+            results.push(serde_json::json!({
+                "check": "legacy_python_alias",
+                "action": "skip",
+                "detail": "No legacy aliases found",
+            }));
+            skipped_count += 1;
+        } else {
+            for (path, line_no, line_text) in &alias_fixes {
+                if dry_run {
+                    ftui_runtime::ftui_eprintln!(
+                        "[dry-run] {mode_label}: comment out line {line_no} in {}: {line_text}",
+                        path.display()
+                    );
+                    results.push(serde_json::json!({
+                        "check": "legacy_python_alias",
+                        "action": "dry_run",
+                        "detail": format!("Would comment out line {} in {}", line_no, path.display()),
+                    }));
+                    skipped_count += 1;
+                } else {
+                    match fix_legacy_alias_line(path, *line_no) {
+                        Ok(msg) => {
+                            ftui_runtime::ftui_eprintln!("[fix] {msg}");
+                            results.push(serde_json::json!({
+                                "check": "legacy_python_alias",
+                                "action": "fixed",
+                                "detail": msg,
+                            }));
+                            fixed_count += 1;
+                        }
+                        Err(err) => {
+                            ftui_runtime::ftui_eprintln!("[fail] legacy_python_alias: {err}");
+                            results.push(serde_json::json!({
+                                "check": "legacy_python_alias",
+                                "action": "failed",
+                                "detail": err,
+                            }));
+                            failed_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fix 2: PATH order — add ~/.local/bin if missing.
+    {
+        let install_dir = home.join(".local/bin");
+        let install_dir_str = install_dir.to_string_lossy().to_string();
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let in_path = path_var.split(':').any(|d| {
+            let p = Path::new(d);
+            p == install_dir.as_path()
+                || p.canonicalize()
+                    .ok()
+                    .map(|c| {
+                        c == install_dir
+                            .canonicalize()
+                            .unwrap_or_else(|_| install_dir.clone())
+                    })
+                    .unwrap_or(false)
+        });
+
+        if in_path {
+            results.push(serde_json::json!({
+                "check": "path_order",
+                "action": "skip",
+                "detail": format!("{install_dir_str} already in PATH"),
+            }));
+            skipped_count += 1;
+        } else if dry_run {
+            ftui_runtime::ftui_eprintln!(
+                "[dry-run] {mode_label}: append {install_dir_str} to shell rc"
+            );
+            results.push(serde_json::json!({
+                "check": "path_order",
+                "action": "dry_run",
+                "detail": format!("Would append {install_dir_str} to shell rc"),
+            }));
+            skipped_count += 1;
+        } else {
+            match fix_path_order(&home) {
+                Ok(msg) => {
+                    ftui_runtime::ftui_eprintln!("[fix] {msg}");
+                    results.push(serde_json::json!({
+                        "check": "path_order",
+                        "action": "fixed",
+                        "detail": msg,
+                    }));
+                    fixed_count += 1;
+                }
+                Err(err) => {
+                    ftui_runtime::ftui_eprintln!("[fail] path_order: {err}");
+                    results.push(serde_json::json!({
+                        "check": "path_order",
+                        "action": "failed",
+                        "detail": err,
+                    }));
+                    failed_count += 1;
+                }
+            }
+        }
+    }
+
+    // Fix 3: MCP config — update entries pointing to Python.
+    {
+        use mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default;
+
+        let locations = detect_mcp_config_locations_default();
+        let existing: Vec<_> = locations.iter().filter(|l| l.exists).collect();
+        let mut any_python = false;
+
+        for loc in &existing {
+            let Ok(content) = std::fs::read_to_string(&loc.config_path) else {
+                continue;
+            };
+            let Some(doc) = parse_json_or_json5(&content) else {
+                continue;
+            };
+            let Some(entry) = find_mcp_agent_mail_entry(&doc) else {
+                continue;
+            };
+            if classify_mcp_agent_mail_entry(entry, &rust_binary) == McpAgentMailEntryKind::Python {
+                any_python = true;
+                if dry_run {
+                    ftui_runtime::ftui_eprintln!(
+                        "[dry-run] {mode_label}: update {} to point to Rust binary",
+                        loc.config_path.display()
+                    );
+                    results.push(serde_json::json!({
+                        "check": "mcp_config",
+                        "action": "dry_run",
+                        "detail": format!("Would update {}", loc.config_path.display()),
+                    }));
+                    skipped_count += 1;
+                } else {
+                    match fix_mcp_config_entry(&loc.config_path, &rust_binary) {
+                        Ok(msg) => {
+                            ftui_runtime::ftui_eprintln!("[fix] {msg}");
+                            results.push(serde_json::json!({
+                                "check": "mcp_config",
+                                "action": "fixed",
+                                "detail": msg,
+                            }));
+                            fixed_count += 1;
+                        }
+                        Err(err) => {
+                            ftui_runtime::ftui_eprintln!("[fail] mcp_config: {err}");
+                            results.push(serde_json::json!({
+                                "check": "mcp_config",
+                                "action": "failed",
+                                "detail": err,
+                            }));
+                            failed_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if !any_python {
+            results.push(serde_json::json!({
+                "check": "mcp_config",
+                "action": "skip",
+                "detail": "No Python-pointing MCP configs found",
+            }));
+            skipped_count += 1;
+        }
+    }
+
+    // Fix 4: Stale index.lock files in archive repos.
+    {
+        let archive_repos = if storage_root.exists() {
+            discover_archive_git_repos(storage_root)
+        } else {
+            Vec::new()
+        };
+        let lock_paths: Vec<PathBuf> = archive_repos
+            .iter()
+            .map(|repo| repo.join(".git").join("index.lock"))
+            .filter(|path| path.exists())
+            .collect();
+        if lock_paths.is_empty() {
+            results.push(serde_json::json!({
+                "check": "storage_root_git_index_lock",
+                "action": "skip",
+                "detail": "No stale index.lock files",
+            }));
+            skipped_count += 1;
+        } else {
+            for lock_path in &lock_paths {
+                if dry_run {
+                    ftui_runtime::ftui_eprintln!(
+                        "[dry-run] {mode_label}: remove {}",
+                        lock_path.display()
+                    );
+                    results.push(serde_json::json!({
+                        "check": "storage_root_git_index_lock",
+                        "action": "dry_run",
+                        "detail": format!("Would remove {}", lock_path.display()),
+                    }));
+                    skipped_count += 1;
+                } else {
+                    match std::fs::remove_file(lock_path) {
+                        Ok(()) => {
+                            let msg = format!("Removed {}", lock_path.display());
+                            ftui_runtime::ftui_eprintln!("[fix] {msg}");
+                            results.push(serde_json::json!({
+                                "check": "storage_root_git_index_lock",
+                                "action": "fixed",
+                                "detail": msg,
+                            }));
+                            fixed_count += 1;
+                        }
+                        Err(err) => {
+                            let msg = format!(
+                                "Cannot remove {}: {err}",
+                                lock_path.display()
+                            );
+                            ftui_runtime::ftui_eprintln!("[fail] {msg}");
+                            results.push(serde_json::json!({
+                                "check": "storage_root_git_index_lock",
+                                "action": "failed",
+                                "detail": msg,
+                            }));
+                            failed_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fix 5: Guard hooks — install if missing.
+    {
+        match std::env::current_dir() {
+            Ok(cwd) => match mcp_agent_mail_guard::guard_status(&cwd) {
+                Ok(status) if status.pre_commit_present && status.pre_push_present => {
+                    results.push(serde_json::json!({
+                        "check": "guard_hooks",
+                        "action": "skip",
+                        "detail": "Guard hooks already installed",
+                    }));
+                    skipped_count += 1;
+                }
+                Ok(_status) => {
+                    if dry_run {
+                        ftui_runtime::ftui_eprintln!(
+                            "[dry-run] {mode_label}: install guard hooks in current repo"
+                        );
+                        results.push(serde_json::json!({
+                            "check": "guard_hooks",
+                            "action": "dry_run",
+                            "detail": "Would install guard hooks",
+                        }));
+                        skipped_count += 1;
+                    } else {
+                        let project_slug = cwd
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+                        match mcp_agent_mail_guard::install_guard(
+                            project_slug,
+                            &cwd,
+                            None,
+                            true,
+                        ) {
+                            Ok(()) => {
+                                ftui_runtime::ftui_eprintln!(
+                                    "[fix] Installed guard hooks"
+                                );
+                                results.push(serde_json::json!({
+                                    "check": "guard_hooks",
+                                    "action": "fixed",
+                                    "detail": "Guard hooks installed",
+                                }));
+                                fixed_count += 1;
+                            }
+                            Err(err) => {
+                                let msg = format!("Cannot install guard hooks: {err}");
+                                ftui_runtime::ftui_eprintln!("[fail] {msg}");
+                                results.push(serde_json::json!({
+                                    "check": "guard_hooks",
+                                    "action": "failed",
+                                    "detail": msg,
+                                }));
+                                failed_count += 1;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    results.push(serde_json::json!({
+                        "check": "guard_hooks",
+                        "action": "skip",
+                        "detail": format!("Guard status unavailable: {err}"),
+                    }));
+                    skipped_count += 1;
+                }
+            },
+            Err(_) => {
+                results.push(serde_json::json!({
+                    "check": "guard_hooks",
+                    "action": "skip",
+                    "detail": "Current directory unavailable",
+                }));
+                skipped_count += 1;
+            }
+        }
+    }
+
+    // Fix 6: WAL mode — enable if not already on.
+    {
+        match open_db_for_doctor_check(&cfg.database_url) {
+            Ok(conn) => {
+                let wal_ok = conn
+                    .query_sync("PRAGMA journal_mode", &[])
+                    .ok()
+                    .and_then(|rows| {
+                        rows.first()
+                            .and_then(|r| r.get_named::<String>("journal_mode").ok())
+                    })
+                    .map(|m| m.eq_ignore_ascii_case("wal"))
+                    .unwrap_or(false);
+                if wal_ok {
+                    results.push(serde_json::json!({
+                        "check": "wal_mode",
+                        "action": "skip",
+                        "detail": "WAL mode already enabled",
+                    }));
+                    skipped_count += 1;
+                } else if dry_run {
+                    ftui_runtime::ftui_eprintln!(
+                        "[dry-run] {mode_label}: enable WAL journal mode"
+                    );
+                    results.push(serde_json::json!({
+                        "check": "wal_mode",
+                        "action": "dry_run",
+                        "detail": "Would enable WAL journal mode",
+                    }));
+                    skipped_count += 1;
+                } else {
+                    match conn.execute_raw("PRAGMA journal_mode=WAL") {
+                        Ok(_) => {
+                            ftui_runtime::ftui_eprintln!("[fix] Enabled WAL journal mode");
+                            results.push(serde_json::json!({
+                                "check": "wal_mode",
+                                "action": "fixed",
+                                "detail": "WAL journal mode enabled",
+                            }));
+                            fixed_count += 1;
+                        }
+                        Err(err) => {
+                            let msg = format!("Cannot enable WAL: {err}");
+                            ftui_runtime::ftui_eprintln!("[fail] {msg}");
+                            results.push(serde_json::json!({
+                                "check": "wal_mode",
+                                "action": "failed",
+                                "detail": msg,
+                            }));
+                            failed_count += 1;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                results.push(serde_json::json!({
+                    "check": "wal_mode",
+                    "action": "skip",
+                    "detail": "Database not accessible",
+                }));
+                skipped_count += 1;
+            }
+        }
+    }
+
+    // Output summary.
+    let payload = serde_json::json!({
+        "dry_run": dry_run,
+        "fixed": fixed_count,
+        "failed": failed_count,
+        "skipped": skipped_count,
+        "fixable_checks": FIXABLE_CHECKS,
+        "results": results,
+    });
+
+    if json {
+        output::emit_output(&payload, output::CliOutputFormat::Json, || {});
+    } else {
+        if dry_run {
+            ftui_runtime::ftui_println!("\nDoctor fix (dry-run):");
+        } else {
+            ftui_runtime::ftui_println!("\nDoctor fix:");
+        }
+        for r in payload["results"].as_array().into_iter().flatten() {
+            let icon = match r["action"].as_str().unwrap_or("") {
+                "fixed" => "FIXED",
+                "failed" => "FAIL",
+                "dry_run" => "DRY",
+                _ => "SKIP",
+            };
+            ftui_runtime::ftui_println!(
+                "  [{}] {} - {}",
+                icon,
+                r["check"].as_str().unwrap_or("?"),
+                r["detail"].as_str().unwrap_or("")
+            );
+        }
+        ftui_runtime::ftui_println!(
+            "\nSummary: {} fixed, {} failed, {} skipped",
+            fixed_count,
+            failed_count,
+            skipped_count
+        );
+
+        if failed_count > 0 {
+            return Err(CliError::ExitCode(1));
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_mail(action: MailCommand) -> CliResult<()> {
     match action {
         MailCommand::Status { .. } => {
@@ -11332,7 +11967,7 @@ async fn resolve_project_async(
     }
 
     // If it looks like an absolute path, auto-create it
-    if key.starts_with('/') {
+    if std::path::Path::new(key).is_absolute() {
         let proj = mcp_agent_mail_db::queries::ensure_project(cx, pool, key).await;
         return match proj {
             asupersync::Outcome::Ok(row) => Ok(row),
@@ -11407,7 +12042,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             // Validate human_key is absolute
-            if !human_key.starts_with('/') {
+            if !std::path::Path::new(&human_key).is_absolute() {
                 return Err(CliError::InvalidArgument(
                     "project key must be an absolute path (e.g. /data/projects/backend)".into(),
                 ));
@@ -16330,6 +16965,147 @@ mod tests {
             }
             _ => panic!("expected Doctor Reconstruct"),
         }
+    }
+
+    #[test]
+    fn clap_parses_doctor_fix_defaults() {
+        let cli = Cli::try_parse_from(["am", "doctor", "fix"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action: DoctorCommand::Fix { dry_run, yes, json },
+            } => {
+                assert!(!dry_run);
+                assert!(!yes);
+                assert!(!json);
+            }
+            _ => panic!("expected Doctor Fix"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_fix_all_flags() {
+        let cli =
+            Cli::try_parse_from(["am", "doctor", "fix", "--dry-run", "-y", "--json"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action: DoctorCommand::Fix { dry_run, yes, json },
+            } => {
+                assert!(dry_run);
+                assert!(yes);
+                assert!(json);
+            }
+            _ => panic!("expected Doctor Fix"),
+        }
+    }
+
+    #[test]
+    fn fix_legacy_alias_line_comments_out_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".zshrc");
+        std::fs::write(
+            &rc,
+            "# normal comment\nalias am=\"python -m mcp_agent_mail\"\nexport PATH=ok\n",
+        )
+        .unwrap();
+        let result = fix_legacy_alias_line(&rc, 2);
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&rc).unwrap();
+        assert!(
+            content.contains("# [am doctor fix"),
+            "should have comment prefix"
+        );
+        assert!(
+            content.contains("alias am="),
+            "original alias text should be preserved in comment"
+        );
+        // Line 1 and 3 should be untouched.
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "# normal comment");
+        assert_eq!(lines[2], "export PATH=ok");
+    }
+
+    #[test]
+    fn fix_legacy_alias_line_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".zshrc");
+        std::fs::write(&rc, "line1\nline2\n").unwrap();
+        let result = fix_legacy_alias_line(&rc, 5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fix_path_order_appends_to_rc() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".zshrc");
+        std::fs::write(&rc, "# my zshrc\n").unwrap();
+        let result = fix_path_order(dir.path());
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&rc).unwrap();
+        assert!(content.contains(".local/bin"), "should contain path addition");
+        assert!(
+            content.contains("export PATH="),
+            "should contain export statement"
+        );
+    }
+
+    #[test]
+    fn fix_path_order_skips_if_already_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".zshrc");
+        let local_bin = dir.path().join(".local/bin");
+        std::fs::write(&rc, format!("export PATH=\"{}:$PATH\"\n", local_bin.display())).unwrap();
+        let result = fix_path_order(dir.path());
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("already contains"));
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_updates_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp.json");
+        let rust_bin = dir.path().join("mcp-agent-mail");
+        std::fs::write(
+            &config,
+            r#"{"mcpServers": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"]}}}"#,
+        )
+        .unwrap();
+        let result = fix_mcp_config_entry(&config, &rust_bin);
+        assert!(result.is_ok(), "{result:?}");
+        // Check backup was created.
+        assert!(config.with_extension("json.bak").exists());
+        // Check command was updated.
+        let content = std::fs::read_to_string(&config).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let cmd = doc["mcpServers"]["mcp-agent-mail"]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(cmd, rust_bin.to_str().unwrap());
+        // Python args should be cleared.
+        let args = doc["mcpServers"]["mcp-agent-mail"]["args"]
+            .as_array()
+            .unwrap();
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_no_entry_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp.json");
+        let rust_bin = dir.path().join("mcp-agent-mail");
+        std::fs::write(&config, r#"{"mcpServers": {}}"#).unwrap();
+        let result = fix_mcp_config_entry(&config, &rust_bin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fixable_checks_constant_is_complete() {
+        assert_eq!(FIXABLE_CHECKS.len(), 6);
+        assert!(FIXABLE_CHECKS.contains(&"legacy_python_alias"));
+        assert!(FIXABLE_CHECKS.contains(&"path_order"));
+        assert!(FIXABLE_CHECKS.contains(&"mcp_config"));
+        assert!(FIXABLE_CHECKS.contains(&"storage_root_git_index_lock"));
+        assert!(FIXABLE_CHECKS.contains(&"guard_hooks"));
+        assert!(FIXABLE_CHECKS.contains(&"wal_mode"));
     }
 
     #[test]

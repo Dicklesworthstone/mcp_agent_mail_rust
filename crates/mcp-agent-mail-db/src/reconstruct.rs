@@ -670,12 +670,15 @@ fn extract_json_frontmatter(content: &str) -> Option<&str> {
 }
 
 /// Extract the body text after the frontmatter block.
+///
+/// Only strips leading blank lines; trailing whitespace is preserved
+/// so reconstructed bodies match the original archive content.
 fn extract_body_after_frontmatter(content: &str) -> Option<&str> {
     let end_marker = "\n---\n";
     let idx = content.find(end_marker)?;
     let after = &content[idx + end_marker.len()..];
-    // Skip leading blank lines
-    Some(after.trim())
+    // Skip leading blank lines only — preserve trailing whitespace
+    Some(after.trim_start_matches(['\n', '\r']))
 }
 
 fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -829,7 +832,37 @@ mod tests {
     fn extract_body_after_frontmatter_basic() {
         let content = "---json\n{}\n---\n\nThe body content.\n";
         let body = extract_body_after_frontmatter(content).expect("should extract");
-        assert_eq!(body, "The body content.");
+        // Trailing newline is preserved (no .trim() on body)
+        assert_eq!(body, "The body content.\n");
+    }
+
+    #[test]
+    fn extract_body_after_frontmatter_preserves_trailing_whitespace() {
+        let content = "---json\n{}\n---\n\nLine 1\n  indented\n\nLine 3\n";
+        let body = extract_body_after_frontmatter(content).expect("should extract");
+        assert_eq!(body, "Line 1\n  indented\n\nLine 3\n");
+    }
+
+    #[test]
+    fn extract_body_after_frontmatter_preserves_code_block() {
+        let content = "---json\n{}\n---\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n";
+        let body = extract_body_after_frontmatter(content).expect("should extract");
+        assert!(body.starts_with("```rust\n"));
+        assert!(body.ends_with("```\n"));
+    }
+
+    #[test]
+    fn extract_body_after_frontmatter_strips_leading_blank_lines() {
+        let content = "---json\n{}\n---\n\n\n\nBody after blanks.\n";
+        let body = extract_body_after_frontmatter(content).expect("should extract");
+        assert_eq!(body, "Body after blanks.\n");
+    }
+
+    #[test]
+    fn extract_body_after_frontmatter_preserves_leading_spaces() {
+        let content = "---json\n{}\n---\n\n    indented body\n";
+        let body = extract_body_after_frontmatter(content).expect("should extract");
+        assert_eq!(body, "    indented body\n");
     }
 
     #[test]

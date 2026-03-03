@@ -3396,7 +3396,8 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     let pool = get_db_pool()?;
 
     // Resolve project by slug or human key.
-    let project = if slug_str.starts_with('/') {
+    let is_absolute = std::path::Path::new(&slug_str).is_absolute();
+    let project = if is_absolute {
         resolve_project(ctx, &pool, &slug_str).await?
     } else {
         match mcp_agent_mail_db::queries::get_project_by_slug(ctx.cx(), &pool, &slug_str).await {

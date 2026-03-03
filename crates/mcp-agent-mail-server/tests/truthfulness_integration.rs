@@ -32,7 +32,7 @@ use mcp_agent_mail_server::tui_screens::MailScreen;
 // ── Fixture environment ─────────────────────────────────────────────────
 
 struct SeededEnv {
-    _tmp_dir: tempfile::TempDir,
+    tmp_dir: tempfile::TempDir,
     db_path: PathBuf,
 }
 
@@ -42,7 +42,7 @@ impl SeededEnv {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("e1_truth.sqlite3");
         let env = Self {
-            _tmp_dir: tmp,
+            tmp_dir: tmp,
             db_path,
         };
         let conn = env.init_conn();
@@ -1106,7 +1106,7 @@ fn e6_artifact_emits_db_truth_counts() {
     let agents_diag = find_diagnostic(&state, "agents");
     let projects_diag = find_diagnostic(&state, "projects");
 
-    let artifact_dir = env._tmp_dir.path().join("artifacts");
+    let artifact_dir = env.tmp_dir.path().join("artifacts");
 
     emit_diagnostic_artifact(
         &env,
@@ -1160,7 +1160,7 @@ fn e6_artifact_db_truth_matches_reality() {
     let mut agents = AgentsScreen::new();
     agents.tick(0, &state);
 
-    let artifact_dir = env._tmp_dir.path().join("artifacts_truth");
+    let artifact_dir = env.tmp_dir.path().join("artifacts_truth");
 
     emit_diagnostic_artifact(
         &env,
@@ -1212,7 +1212,7 @@ fn e6_artifact_includes_per_screen_diagnostics() {
     let mut contacts = ContactsScreen::new();
     contacts.tick(0, &state);
 
-    let artifact_dir = env._tmp_dir.path().join("artifacts_screens");
+    let artifact_dir = env.tmp_dir.path().join("artifacts_screens");
 
     emit_diagnostic_artifact(
         &env,
@@ -1249,7 +1249,7 @@ fn e6_artifact_handles_missing_diagnostics() {
     let env = SeededEnv::new();
     let state = env.state();
 
-    let artifact_dir = env._tmp_dir.path().join("artifacts_missing");
+    let artifact_dir = env.tmp_dir.path().join("artifacts_missing");
 
     // Pass screens that never ticked → no diagnostics
     emit_diagnostic_artifact(
@@ -1283,7 +1283,7 @@ fn e6_artifact_diagnostic_log_populated() {
     let mut agents = AgentsScreen::new();
     agents.tick(0, &state);
 
-    let artifact_dir = env._tmp_dir.path().join("artifacts_log");
+    let artifact_dir = env.tmp_dir.path().join("artifacts_log");
 
     emit_diagnostic_artifact(
         &env,

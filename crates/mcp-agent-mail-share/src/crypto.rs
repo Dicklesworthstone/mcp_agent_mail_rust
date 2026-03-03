@@ -220,7 +220,7 @@ pub fn verify_bundle(
 
 fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> PathBuf {
     // Reject path traversal attempts to prevent reading files outside the bundle.
-    if relative_path.contains("..") || relative_path.starts_with('/') {
+    if relative_path.contains("..") || std::path::Path::new(relative_path).is_absolute() {
         return bundle_root.join("__invalid_path__");
     }
 
