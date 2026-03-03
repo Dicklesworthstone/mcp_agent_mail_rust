@@ -85,3 +85,121 @@ pub fn render_empty_state(frame: &mut Frame<'_>, area: Rect, icon: &str, title: 
             );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ftui::layout::Rect;
+    use ftui::GraphemePool;
+    use ftui_extras::theme::{ScopedThemeLock, ThemeId};
+
+    #[test]
+    fn panel_block_returns_bordered_block_with_title() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let block = panel_block("Test Panel");
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(40, 10, &mut pool);
+        block.render(Rect::new(0, 0, 40, 10), &mut frame);
+    }
+
+    #[test]
+    fn panel_block_works_across_all_themes() {
+        let themes = [
+            ThemeId::CyberpunkAurora,
+            ThemeId::Darcula,
+            ThemeId::LumenLight,
+            ThemeId::NordicFrost,
+            ThemeId::Doom,
+        ];
+        for &theme in &themes {
+            let _guard = ScopedThemeLock::new(theme);
+            let block = panel_block("Themed");
+            let mut pool = GraphemePool::new();
+            let mut frame = Frame::new(30, 8, &mut pool);
+            block.render(Rect::new(0, 0, 30, 8), &mut frame);
+        }
+    }
+
+    #[test]
+    fn render_empty_state_normal_area() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        render_empty_state(&mut frame, Rect::new(0, 0, 80, 24), "M", "No Messages", "Send a message to get started");
+    }
+
+    #[test]
+    fn render_empty_state_small_area_fallback() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(15, 3, &mut pool);
+        render_empty_state(&mut frame, Rect::new(0, 0, 15, 3), "M", "Empty", "hint text");
+    }
+
+    #[test]
+    fn render_empty_state_minimum_width_boundary() {
+        let _guard = ScopedThemeLock::new(ThemeId::Darcula);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(20, 5, &mut pool);
+        render_empty_state(&mut frame, Rect::new(0, 0, 20, 5), "S", "No Results", "Try a different query");
+    }
+
+    #[test]
+    fn render_empty_state_just_below_width_threshold() {
+        let _guard = ScopedThemeLock::new(ThemeId::Darcula);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(19, 5, &mut pool);
+        render_empty_state(&mut frame, Rect::new(0, 0, 19, 5), "S", "No Results", "hint");
+    }
+
+    #[test]
+    fn render_empty_state_just_below_height_threshold() {
+        let _guard = ScopedThemeLock::new(ThemeId::NordicFrost);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(80, 4, &mut pool);
+        render_empty_state(&mut frame, Rect::new(0, 0, 80, 4), "!", "Warning", "something");
+    }
+
+    #[test]
+    fn render_empty_state_card_clamped_to_60_wide() {
+        let _guard = ScopedThemeLock::new(ThemeId::LumenLight);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(200, 50, &mut pool);
+        render_empty_state(&mut frame, Rect::new(0, 0, 200, 50), "D", "No Data", "Data will appear here");
+    }
+
+    #[test]
+    fn render_empty_state_with_offset_area() {
+        let _guard = ScopedThemeLock::new(ThemeId::Doom);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(100, 40, &mut pool);
+        render_empty_state(&mut frame, Rect::new(10, 5, 60, 20), "I", "No Items", "Create an item to begin");
+    }
+
+    #[test]
+    fn render_empty_state_zero_area() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        render_empty_state(&mut frame, Rect::new(0, 0, 0, 0), "M", "Empty", "hint");
+    }
+
+    #[test]
+    fn panel_block_with_empty_title() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let block = panel_block("");
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(40, 10, &mut pool);
+        block.render(Rect::new(0, 0, 40, 10), &mut frame);
+    }
+
+    #[test]
+    fn panel_block_with_long_title() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let long_title = "A".repeat(200);
+        let block = panel_block(&long_title);
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(40, 10, &mut pool);
+        block.render(Rect::new(0, 0, 40, 10), &mut frame);
+    }
+}

@@ -234,6 +234,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_poll_params_empty_query_string() {
+        let parsed = parse_poll_params(Some(""));
+        assert_eq!(parsed.since, None);
+        assert_eq!(parsed.limit, DEFAULT_EVENT_LIMIT);
+    }
+
+    #[test]
+    fn parse_poll_params_key_without_value() {
+        let parsed = parse_poll_params(Some("since=&limit="));
+        assert_eq!(parsed.since, None);
+        assert_eq!(parsed.limit, DEFAULT_EVENT_LIMIT);
+    }
+
+    #[test]
+    fn parse_poll_params_duplicate_keys_last_wins() {
+        let parsed = parse_poll_params(Some("since=10&since=20&limit=5&limit=50"));
+        assert_eq!(parsed.since, Some(20));
+        assert_eq!(parsed.limit, 50);
+    }
+
+    #[test]
+    fn parse_poll_params_negative_since_rejected() {
+        let parsed = parse_poll_params(Some("since=-1"));
+        assert_eq!(parsed.since, None, "negative since should not parse as u64");
+    }
+
+    #[test]
+    fn parse_poll_params_limit_exact_max() {
+        let parsed = parse_poll_params(Some(&format!("limit={MAX_EVENT_LIMIT}")));
+        assert_eq!(parsed.limit, MAX_EVENT_LIMIT);
+    }
+
+    #[test]
+    fn parse_poll_params_limit_exact_one() {
+        let parsed = parse_poll_params(Some("limit=1"));
+        assert_eq!(parsed.limit, 1);
+    }
+
+    #[test]
     fn poll_payload_delta_respects_limit_and_tracks_latest_seq() {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);

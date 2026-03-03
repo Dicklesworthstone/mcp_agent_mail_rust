@@ -217,4 +217,98 @@ mod tests {
         assert!(parsed.events.is_empty());
         assert_eq!(parsed.ignored, 1);
     }
+
+    #[test]
+    fn parse_rejects_oversized_body() {
+        let body = vec![b' '; 512 * 1024 + 1];
+        let err = parse_remote_terminal_events(&body).expect_err("expected oversized error");
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn parse_accepts_body_at_size_limit() {
+        let prefix = br#"{"type":"Ping"}"#;
+        let mut body = Vec::with_capacity(prefix.len());
+        body.extend_from_slice(prefix);
+        let parsed = parse_remote_terminal_events(&body).expect("should accept at limit");
+        assert_eq!(parsed.ignored, 1);
+    }
+
+    #[test]
+    fn parse_long_key_is_truncated() {
+        let long_key = "x".repeat(5000);
+        let payload = serde_json::to_vec(&json!({
+            "type": "Input",
+            "data": {"kind": "Key", "key": long_key, "modifiers": 0}
+        }))
+        .expect("serialize");
+        let parsed = parse_remote_terminal_events(&payload).expect("parse long key");
+        assert_eq!(parsed.events.len(), 1);
+        if let RemoteTerminalEvent::Key { ref key, .. } = parsed.events[0] {
+            assert!(key.len() <= 4096, "key should be truncated to 4096 bytes");
+        } else {
+            panic!("expected Key event");
+        }
+    }
+
+    #[test]
+    fn parse_long_multibyte_key_truncates_at_char_boundary() {
+        let emoji = "\u{1F600}"; // 4 bytes per char
+        let key = emoji.repeat(1025); // 4100 bytes
+        assert!(key.len() > 4096);
+        let payload = serde_json::to_vec(&json!({
+            "type": "Input",
+            "data": {"kind": "Key", "key": key, "modifiers": 0}
+        }))
+        .expect("serialize");
+        let parsed = parse_remote_terminal_events(&payload).expect("parse multibyte key");
+        assert_eq!(parsed.events.len(), 1);
+        if let RemoteTerminalEvent::Key { ref key, .. } = parsed.events[0] {
+            assert!(key.len() <= 4096);
+            assert!(std::str::from_utf8(key.as_bytes()).is_ok());
+        } else {
+            panic!("expected Key event");
+        }
+    }
+
+    #[test]
+    fn parse_pong_is_ignored() {
+        let payload = br#"{"type":"Pong"}"#;
+        let parsed = parse_remote_terminal_events(payload).expect("parse pong");
+        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.ignored, 1);
+    }
+
+    #[test]
+    fn parse_batch_mixed_pong_and_keys() {
+        let payload = br#"{
+            "events": [
+                {"type":"Pong"},
+                {"type":"Input","data":{"kind":"Key","key":"a","modifiers":0}},
+                {"type":"Pong"},
+                {"type":"Ping"}
+            ]
+        }"#;
+        let parsed = parse_remote_terminal_events(payload).expect("parse mixed");
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.ignored, 3);
+    }
+
+    #[test]
+    fn parse_key_with_zero_modifiers_default() {
+        let payload = br#"{"type":"Input","data":{"kind":"Key","key":"Enter"}}"#;
+        let parsed = parse_remote_terminal_events(payload).expect("parse default modifiers");
+        assert_eq!(parsed.events.len(), 1);
+        if let RemoteTerminalEvent::Key { modifiers, .. } = parsed.events[0] {
+            assert_eq!(modifiers, 0, "default modifiers should be 0");
+        }
+    }
+
+    #[test]
+    fn parse_empty_batch() {
+        let payload = br#"{"events":[]}"#;
+        let parsed = parse_remote_terminal_events(payload).expect("parse empty batch");
+        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.ignored, 0);
+    }
 }

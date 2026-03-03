@@ -946,4 +946,140 @@ mod tests {
             );
         }
     }
+
+    // ── V2 Comprehensive edge cases (br-2bbt.11) ───────────────────
+
+    #[test]
+    fn extreme_change_ratio_1_0() {
+        let frame = FrameState {
+            change_ratio: 1.0,
+            is_resize: false,
+            budget_remaining_ms: 14.0,
+            error_count: 0,
+        };
+        let mut strategy = BayesianDiffStrategy::new();
+        let action = strategy.observe_with_ledger(&frame, None);
+        assert_eq!(action, DiffAction::Full);
+    }
+
+    #[test]
+    fn zero_budget_remaining() {
+        let frame = FrameState {
+            change_ratio: 0.0,
+            is_resize: false,
+            budget_remaining_ms: 0.0,
+            error_count: 0,
+        };
+        let mut strategy = BayesianDiffStrategy::new();
+        let action = strategy.observe_with_ledger(&frame, None);
+        assert_eq!(action, DiffAction::Full);
+    }
+
+    #[test]
+    fn negative_budget_remaining_no_panic() {
+        let frame = FrameState {
+            change_ratio: 0.05,
+            is_resize: false,
+            budget_remaining_ms: -5.0,
+            error_count: 0,
+        };
+        let mut strategy = BayesianDiffStrategy::new();
+        let action = strategy.observe_with_ledger(&frame, None);
+        assert!(matches!(
+            action,
+            DiffAction::Incremental | DiffAction::Full | DiffAction::Deferred
+        ));
+    }
+
+    #[test]
+    fn max_error_count() {
+        let frame = FrameState {
+            change_ratio: 0.05,
+            is_resize: false,
+            budget_remaining_ms: 14.0,
+            error_count: u32::MAX,
+        };
+        let mut strategy = BayesianDiffStrategy::new();
+        let action = strategy.observe_with_ledger(&frame, None);
+        assert_eq!(action, DiffAction::Full);
+    }
+
+    #[test]
+    fn rapid_state_transitions_convergence() {
+        let mut strategy = BayesianDiffStrategy::new();
+        let sequence = [stable_frame(), bursty_frame(), resize_frame(), degraded_frame()];
+        for round in 0..50 {
+            let frame = &sequence[round % 4];
+            strategy.observe_with_ledger(frame, None);
+            let post = strategy.posterior();
+            let sum: f64 = post.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "posterior diverged at round {round}: sum={sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_zeros_frame_no_panic() {
+        let frame = FrameState {
+            change_ratio: 0.0,
+            is_resize: false,
+            budget_remaining_ms: 0.0,
+            error_count: 0,
+        };
+        let lik = compute_likelihood(&frame);
+        let sum: f64 = lik.iter().sum();
+        assert!(sum > 0.0, "likelihood should not be all zeros");
+    }
+
+    #[test]
+    fn resize_with_high_change_ratio_still_uses_full() {
+        let frame = FrameState {
+            change_ratio: 0.9,
+            is_resize: true,
+            budget_remaining_ms: 2.0,
+            error_count: 10,
+        };
+        let mut strategy = BayesianDiffStrategy::new();
+        let action = strategy.observe_with_ledger(&frame, None);
+        assert_eq!(action, DiffAction::Full);
+    }
+
+    #[test]
+    fn posterior_monotonic_convergence_on_stable() {
+        let mut strategy = BayesianDiffStrategy::new();
+        let mut prev_stable_prob = 0.25;
+        for i in 0..20 {
+            strategy.observe_with_ledger(&stable_frame(), None);
+            let post = strategy.posterior();
+            if i >= 2 {
+                assert!(
+                    post[STATE_STABLE] >= prev_stable_prob - 0.01,
+                    "stable prob decreased at frame {i}: {} < {}",
+                    post[STATE_STABLE],
+                    prev_stable_prob
+                );
+            }
+            prev_stable_prob = post[STATE_STABLE];
+        }
+        assert!(
+            prev_stable_prob > 0.7,
+            "stable prob should be > 0.7 after 20 stable frames, got {prev_stable_prob}"
+        );
+    }
+
+    #[test]
+    fn expected_loss_decreases_for_optimal_action_after_training() {
+        let mut strategy = BayesianDiffStrategy::new();
+        let initial_el_inc = strategy.expected_loss(DiffAction::Incremental);
+        for _ in 0..50 {
+            strategy.observe_with_ledger(&stable_frame(), None);
+        }
+        let trained_el_inc = strategy.expected_loss(DiffAction::Incremental);
+        assert!(
+            trained_el_inc < initial_el_inc,
+            "incremental EL should decrease after stable training: {trained_el_inc} >= {initial_el_inc}"
+        );
+    }
 }
