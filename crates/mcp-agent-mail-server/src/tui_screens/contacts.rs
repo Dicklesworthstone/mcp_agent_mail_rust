@@ -209,13 +209,10 @@ impl ContactsScreen {
         // Sort
         rows.sort_by(|a, b| {
             let cmp = match self.sort_col {
-                COL_FROM => a
-                    .from_agent
-                    .to_lowercase()
-                    .cmp(&b.from_agent.to_lowercase()),
-                COL_TO => a.to_agent.to_lowercase().cmp(&b.to_agent.to_lowercase()),
+                COL_FROM => super::cmp_ci(&a.from_agent, &b.from_agent),
+                COL_TO => super::cmp_ci(&a.to_agent, &b.to_agent),
                 COL_STATUS => a.status.cmp(&b.status),
-                COL_REASON => a.reason.to_lowercase().cmp(&b.reason.to_lowercase()),
+                COL_REASON => super::cmp_ci(&a.reason, &b.reason),
                 COL_UPDATED => a.updated_ts.cmp(&b.updated_ts),
                 _ => std::cmp::Ordering::Equal,
             };

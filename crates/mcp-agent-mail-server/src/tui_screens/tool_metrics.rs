@@ -556,7 +556,7 @@ impl ToolMetricsScreen {
         let mut tools: Vec<&ToolStats> = self.tool_map.values().collect();
         tools.sort_by(|a, b| {
             let cmp = match self.sort_col {
-                COL_NAME => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                COL_NAME => super::cmp_ci(&a.name, &b.name),
                 COL_CALLS => a.calls.cmp(&b.calls),
                 COL_ERRORS => a.errors.cmp(&b.errors),
                 COL_ERR_PCT => a

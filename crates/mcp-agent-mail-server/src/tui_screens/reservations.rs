@@ -649,13 +649,13 @@ impl ReservationsScreen {
 
         entries.sort_by(|(ka, a), (kb, b)| {
             let cmp = match self.sort_col {
-                COL_AGENT => a.agent.to_lowercase().cmp(&b.agent.to_lowercase()),
+                COL_AGENT => super::cmp_ci(&a.agent, &b.agent),
                 COL_PATH => a.path_pattern.cmp(&b.path_pattern),
                 COL_EXCLUSIVE => a.exclusive.cmp(&b.exclusive),
                 COL_TTL => a
                     .remaining_secs_at(now_micros)
                     .cmp(&b.remaining_secs_at(now_micros)),
-                COL_PROJECT => a.project.to_lowercase().cmp(&b.project.to_lowercase()),
+                COL_PROJECT => super::cmp_ci(&a.project, &b.project),
                 _ => std::cmp::Ordering::Equal,
             };
             let cmp = cmp.then_with(|| ka.cmp(kb));

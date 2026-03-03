@@ -435,16 +435,10 @@ impl AttachmentExplorerScreen {
             let cmp = match col {
                 COL_MEDIA => ea.media_type.cmp(&eb.media_type),
                 COL_SIZE => ea.bytes.cmp(&eb.bytes),
-                COL_SENDER => ea
-                    .sender_name
-                    .to_lowercase()
-                    .cmp(&eb.sender_name.to_lowercase()),
-                COL_SUBJECT => ea.subject.to_lowercase().cmp(&eb.subject.to_lowercase()),
+                COL_SENDER => super::cmp_ci(&ea.sender_name, &eb.sender_name),
+                COL_SUBJECT => super::cmp_ci(&ea.subject, &eb.subject),
                 COL_DATE => ea.created_ts.cmp(&eb.created_ts),
-                COL_PROJECT => ea
-                    .project_slug
-                    .to_lowercase()
-                    .cmp(&eb.project_slug.to_lowercase()),
+                COL_PROJECT => super::cmp_ci(&ea.project_slug, &eb.project_slug),
                 _ => std::cmp::Ordering::Equal,
             };
             if asc { cmp } else { cmp.reverse() }

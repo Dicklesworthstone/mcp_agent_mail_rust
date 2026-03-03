@@ -4,6 +4,7 @@
 //! Right pane: file content preview with format-aware rendering
 //! (syntax-highlighted JSON, rendered markdown, plain text with line numbers).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
@@ -340,6 +341,7 @@ impl ArchiveBrowserScreen {
             return;
         };
 
+        let filter_lc = filter.to_lowercase();
         let mut items: Vec<(bool, String, PathBuf, u64)> = Vec::new();
         for entry in read_dir.flatten() {
             let path = entry.path();
@@ -358,11 +360,8 @@ impl ArchiveBrowserScreen {
             };
 
             // Apply filter (only to files; always show dirs that might contain matches)
-            if !filter.is_empty() && !is_dir {
-                let f = filter.to_lowercase();
-                if !name.to_lowercase().contains(&f) {
-                    continue;
-                }
+            if !filter_lc.is_empty() && !is_dir && !name.to_lowercase().contains(&filter_lc) {
+                continue;
             }
 
             items.push((is_dir, name, path, size));
@@ -372,7 +371,7 @@ impl ArchiveBrowserScreen {
         items.sort_by(|a, b| match (a.0, b.0) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
+            _ => super::cmp_ci(&a.1, &b.1),
         });
 
         for (is_dir, name, path, size) in items {
@@ -383,11 +382,9 @@ impl ArchiveBrowserScreen {
                 0
             };
 
-            // Find if this dir was previously expanded
-            let expanded = entries
-                .iter()
-                .find(|e| e.rel_path == rel_path)
-                .is_some_and(|e| e.expanded);
+            // Fresh scan — nothing is expanded (state restore uses
+            // scan_directory_with_state instead).
+            let expanded = false;
 
             entries.push(ArchiveEntry {
                 name,
@@ -398,11 +395,6 @@ impl ArchiveBrowserScreen {
                 expanded,
                 child_count,
             });
-
-            // If directory is expanded, recurse
-            if is_dir && expanded {
-                Self::scan_directory(root, &path, depth + 1, filter, entries);
-            }
         }
     }
 
@@ -497,11 +489,11 @@ impl ArchiveBrowserScreen {
                 let root = root.clone();
                 let filter = self.filter.clone();
                 // Preserve expansion states
-                let expanded_paths: Vec<(PathBuf, bool)> = self
+                let expanded_paths: HashSet<PathBuf> = self
                     .entries
                     .iter()
-                    .filter(|e| e.is_dir)
-                    .map(|e| (e.rel_path.clone(), e.expanded))
+                    .filter(|e| e.is_dir && e.expanded)
+                    .map(|e| e.rel_path.clone())
                     .collect();
 
                 // Re-scan with correct expansion
@@ -533,13 +525,14 @@ impl ArchiveBrowserScreen {
         dir: &Path,
         depth: usize,
         filter: &str,
-        expanded_state: &[(PathBuf, bool)],
+        expanded_state: &HashSet<PathBuf>,
         entries: &mut Vec<ArchiveEntry>,
     ) {
         let Ok(read_dir) = std::fs::read_dir(dir) else {
             return;
         };
 
+        let filter_lc = filter.to_lowercase();
         let mut items: Vec<(bool, String, PathBuf, u64)> = Vec::new();
         for entry in read_dir.flatten() {
             let path = entry.path();
@@ -556,9 +549,9 @@ impl ArchiveBrowserScreen {
                 entry.metadata().map_or(0, |metadata| metadata.len())
             };
 
-            if !filter.is_empty()
+            if !filter_lc.is_empty()
                 && !is_dir
-                && !name.to_lowercase().contains(&filter.to_lowercase())
+                && !name.to_lowercase().contains(&filter_lc)
             {
                 continue;
             }
@@ -569,7 +562,7 @@ impl ArchiveBrowserScreen {
         items.sort_by(|a, b| match (a.0, b.0) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
+            _ => super::cmp_ci(&a.1, &b.1),
         });
 
         for (is_dir, name, path, size) in items {
@@ -580,10 +573,7 @@ impl ArchiveBrowserScreen {
                 0
             };
 
-            let expanded = is_dir
-                && expanded_state
-                    .iter()
-                    .any(|(p, expanded)| *p == rel_path && *expanded);
+            let expanded = is_dir && expanded_state.contains(&rel_path);
 
             entries.push(ArchiveEntry {
                 name,
