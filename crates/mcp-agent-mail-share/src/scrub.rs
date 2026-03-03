@@ -42,9 +42,11 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // URL-embedded basic auth credentials
         Regex::new(r"(?i)https?://[^/\s:@]+:[^@\s/]+@").unwrap_or_else(|_| unreachable!()),
         // Environment-variable references likely to contain secrets
-        Regex::new(r"(?i)\$[A-Z_][A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z0-9_]*").unwrap_or_else(|_| unreachable!()),
+        Regex::new(r"(?i)\$[A-Z_][A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z0-9_]*")
+            .unwrap_or_else(|_| unreachable!()),
         // JWTs (three base64url segments)
-        Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+").unwrap_or_else(|_| unreachable!()),
+        Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+")
+            .unwrap_or_else(|_| unreachable!()),
         // AWS access key IDs (always start with AKIA)
         Regex::new(r"AKIA[0-9A-Z]{16}").unwrap_or_else(|_| unreachable!()),
         // PEM private keys (multi-line block)
@@ -184,8 +186,11 @@ pub fn scrub_snapshot(
             0
         };
 
-        // Delete file reservations
+        // Delete file reservations (child table first to satisfy FK constraint)
         let file_reservations_removed = if cfg.clear_file_reservations {
+            if table_exists(&conn, "file_reservation_releases")? {
+                exec_count(&conn, "DELETE FROM file_reservation_releases", &[])?;
+            }
             exec_count(&conn, "DELETE FROM file_reservations", &[])?
         } else {
             0
@@ -329,9 +334,22 @@ pub fn scrub_snapshot(
             }
         }
 
+        // Generate a unique salt for pseudonymization reproducibility.
+        let pseudonym_salt = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .hash(&mut h);
+            std::process::id().hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
         Ok(ScrubSummary {
             preset: preset.as_str().to_string(),
-            pseudonym_salt: preset.as_str().to_string(),
+            pseudonym_salt,
             agents_total,
             agents_pseudonymized: 0,
             ack_flags_cleared,

@@ -3240,14 +3240,9 @@ pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
 /// Ensure a per-project archive directory exists under the archive root.
 pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
     // Reject slugs with path separators or traversal components.
-    if slug.contains('/')
-        || slug.contains('\\')
-        || slug.contains("..")
-        || slug.is_empty()
-    {
+    if slug.contains('/') || slug.contains('\\') || slug.contains("..") || slug.is_empty() {
         return Err(StorageError::InvalidPath(
-            "invalid project slug: must not contain path separators or '..' components"
-                .to_string(),
+            "invalid project slug: must not contain path separators or '..' components".to_string(),
         ));
     }
     let (repo_root, _fresh) = ensure_archive_root(config)?;
@@ -4404,7 +4399,9 @@ pub fn process_attachments(
 /// Regex for matching Markdown image references: `![alt](path)`.
 fn image_pattern_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)").unwrap_or_else(|_| unreachable!()))
+    RE.get_or_init(|| {
+        Regex::new(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)").unwrap_or_else(|_| unreachable!())
+    })
 }
 
 /// Process inline image references in Markdown body.
@@ -4428,9 +4425,21 @@ pub fn process_markdown_images(
     let processable: Vec<(String, String, PathBuf)> = re
         .captures_iter(body_md)
         .filter_map(|cap| {
-            let full = cap.get(0).unwrap_or_else(|| unreachable!()).as_str().to_string();
-            let alt = cap.name("alt").unwrap_or_else(|| unreachable!()).as_str().to_string();
-            let path = cap.name("path").unwrap_or_else(|| unreachable!()).as_str().to_string();
+            let full = cap
+                .get(0)
+                .unwrap_or_else(|| unreachable!())
+                .as_str()
+                .to_string();
+            let alt = cap
+                .name("alt")
+                .unwrap_or_else(|| unreachable!())
+                .as_str()
+                .to_string();
+            let path = cap
+                .name("path")
+                .unwrap_or_else(|| unreachable!())
+                .as_str()
+                .to_string();
 
             // Skip data URIs and URLs
             if path.starts_with("data:")

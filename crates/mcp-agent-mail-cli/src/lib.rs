@@ -3486,11 +3486,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
         DoctorCommand::Reconstruct { dry_run, yes, json } => {
             handle_doctor_reconstruct(dry_run, yes, json)
         }
-        DoctorCommand::Fix {
-            dry_run,
-            yes,
-            json,
-        } => handle_doctor_fix(dry_run, yes, json),
+        DoctorCommand::Fix { dry_run, yes, json } => handle_doctor_fix(dry_run, yes, json),
     }
 }
 
@@ -3747,6 +3743,7 @@ fn is_sqlite_corruption_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("database disk image is malformed")
         || lower.contains("malformed database schema")
+        || lower.contains("database schema is corrupt")
         || lower.contains("file is not a database")
         || lower.contains("no healthy backup was found")
 }
@@ -3797,7 +3794,81 @@ fn sqlite_conn_is_healthy(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     }
 }
 
-fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
+fn sqlite_conn_quick_check_ok_canonical(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+) -> CliResult<bool> {
+    let rows = conn
+        .query_sync("PRAGMA quick_check", &[])
+        .map_err(|e| CliError::Other(format!("PRAGMA quick_check failed: {e}")))?;
+    let mut checks: Vec<String> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(v) = row.get_named::<String>("quick_check") {
+            checks.push(v);
+            continue;
+        }
+        if let Ok(v) = row.get_named::<String>("integrity_check") {
+            checks.push(v);
+        }
+    }
+    if checks.is_empty() {
+        return Ok(false);
+    }
+    Ok(checks.len() == 1 && checks[0] == "ok")
+}
+
+fn sqlite_conn_incremental_check_ok_canonical(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+) -> CliResult<bool> {
+    let rows = conn
+        .query_sync("PRAGMA integrity_check(1)", &[])
+        .map_err(|e| CliError::Other(format!("PRAGMA integrity_check(1) failed: {e}")))?;
+    let mut checks: Vec<String> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(v) = row.get_named::<String>("integrity_check") {
+            checks.push(v);
+            continue;
+        }
+        if let Ok(v) = row.get_named::<String>("quick_check") {
+            checks.push(v);
+        }
+    }
+    if checks.is_empty() {
+        return Ok(false);
+    }
+    Ok(checks.len() == 1 && checks[0] == "ok")
+}
+
+fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_os = path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar = PathBuf::from(sidecar_os);
+        if let Ok(meta) = std::fs::metadata(&sidecar)
+            && meta.len() > 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn sqlite_file_is_healthy_canonical(path: &Path) -> CliResult<bool> {
+    let path_string = path.to_string_lossy().into_owned();
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_string)
+        .map_err(|e| CliError::Other(format!("cannot open sqlite file {}: {e}", path.display())))?;
+    if !sqlite_conn_quick_check_ok_canonical(&conn)? {
+        return Ok(false);
+    }
+    sqlite_conn_incremental_check_ok_canonical(&conn)
+}
+
+fn sqlite_file_is_healthy_with_compat_probe<F>(
+    path: &Path,
+    mut compatibility_probe: F,
+) -> CliResult<bool>
+where
+    F: FnMut(&Path) -> CliResult<bool>,
+{
     if !path.exists() {
         return Ok(true);
     }
@@ -3816,7 +3887,32 @@ fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
         }
     };
 
-    sqlite_conn_is_healthy(&conn)
+    if !sqlite_conn_is_healthy(&conn)? {
+        return Ok(false);
+    }
+
+    if sqlite_file_has_live_sidecars(path) {
+        match compatibility_probe(path) {
+            Ok(ok) => return Ok(ok),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_sqlite_recovery_error_message(&msg) {
+                    return Ok(false);
+                }
+                if mcp_agent_mail_db::is_lock_error(&msg) {
+                    // Preserve primary health verdict on transient lock/busy errors.
+                    return Ok(true);
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
+    sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
 }
 
 fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
@@ -10594,10 +10690,7 @@ fn fix_path_order(home: &Path) -> Result<String, String> {
                 .map_err(|e| format!("cannot append to {}: {e}", rc_path.display()))?;
             std::io::Write::write_all(&mut file, line.as_bytes())
                 .map_err(|e| format!("write failed: {e}"))?;
-            return Ok(format!(
-                "Appended PATH export to {}",
-                rc_path.display()
-            ));
+            return Ok(format!("Appended PATH export to {}", rc_path.display()));
         }
     }
     Err("No shell rc file found to update".to_string())
@@ -10621,7 +10714,9 @@ fn fix_mcp_config_entry(config_path: &Path, rust_binary: &Path) -> Result<String
             continue;
         };
         for ek in &entry_keys {
-            let Some(entry) = container.get_mut(*ek).and_then(serde_json::Value::as_object_mut)
+            let Some(entry) = container
+                .get_mut(*ek)
+                .and_then(serde_json::Value::as_object_mut)
             else {
                 continue;
             };
@@ -10636,10 +10731,7 @@ fn fix_mcp_config_entry(config_path: &Path, rust_binary: &Path) -> Result<String
                         .is_some_and(|s| s.contains("mcp_agent_mail") || s.contains("python"))
                 });
                 if has_python_arg {
-                    entry.insert(
-                        "args".to_string(),
-                        serde_json::Value::Array(Vec::new()),
-                    );
+                    entry.insert("args".to_string(), serde_json::Value::Array(Vec::new()));
                 }
             }
             updated = true;
@@ -10655,8 +10747,7 @@ fn fix_mcp_config_entry(config_path: &Path, rust_binary: &Path) -> Result<String
 
     // Write back with pretty formatting, preserving backup.
     let backup_path = config_path.with_extension("json.bak");
-    std::fs::copy(config_path, &backup_path)
-        .map_err(|e| format!("backup failed: {e}"))?;
+    std::fs::copy(config_path, &backup_path).map_err(|e| format!("backup failed: {e}"))?;
     let formatted =
         serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize failed: {e}"))?;
     std::fs::write(config_path, format!("{formatted}\n"))
@@ -10920,10 +11011,7 @@ fn handle_doctor_fix(dry_run: bool, _yes: bool, json: bool) -> CliResult<()> {
                             fixed_count += 1;
                         }
                         Err(err) => {
-                            let msg = format!(
-                                "Cannot remove {}: {err}",
-                                lock_path.display()
-                            );
+                            let msg = format!("Cannot remove {}: {err}", lock_path.display());
                             ftui_runtime::ftui_eprintln!("[fail] {msg}");
                             results.push(serde_json::json!({
                                 "check": "storage_root_git_index_lock",
@@ -10966,16 +11054,9 @@ fn handle_doctor_fix(dry_run: bool, _yes: bool, json: bool) -> CliResult<()> {
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown");
-                        match mcp_agent_mail_guard::install_guard(
-                            project_slug,
-                            &cwd,
-                            None,
-                            true,
-                        ) {
+                        match mcp_agent_mail_guard::install_guard(project_slug, &cwd, None, true) {
                             Ok(()) => {
-                                ftui_runtime::ftui_eprintln!(
-                                    "[fix] Installed guard hooks"
-                                );
+                                ftui_runtime::ftui_eprintln!("[fix] Installed guard hooks");
                                 results.push(serde_json::json!({
                                     "check": "guard_hooks",
                                     "action": "fixed",
@@ -11037,9 +11118,7 @@ fn handle_doctor_fix(dry_run: bool, _yes: bool, json: bool) -> CliResult<()> {
                     }));
                     skipped_count += 1;
                 } else if dry_run {
-                    ftui_runtime::ftui_eprintln!(
-                        "[dry-run] {mode_label}: enable WAL journal mode"
-                    );
+                    ftui_runtime::ftui_eprintln!("[dry-run] {mode_label}: enable WAL journal mode");
                     results.push(serde_json::json!({
                         "check": "wal_mode",
                         "action": "dry_run",
@@ -17038,7 +17117,10 @@ mod tests {
         let result = fix_path_order(dir.path());
         assert!(result.is_ok(), "{result:?}");
         let content = std::fs::read_to_string(&rc).unwrap();
-        assert!(content.contains(".local/bin"), "should contain path addition");
+        assert!(
+            content.contains(".local/bin"),
+            "should contain path addition"
+        );
         assert!(
             content.contains("export PATH="),
             "should contain export statement"
@@ -17050,7 +17132,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join(".zshrc");
         let local_bin = dir.path().join(".local/bin");
-        std::fs::write(&rc, format!("export PATH=\"{}:$PATH\"\n", local_bin.display())).unwrap();
+        std::fs::write(
+            &rc,
+            format!("export PATH=\"{}:$PATH\"\n", local_bin.display()),
+        )
+        .unwrap();
         let result = fix_path_order(dir.path());
         assert!(result.is_ok());
         assert!(result.unwrap().contains("already contains"));
@@ -22470,6 +22556,73 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_file_has_live_sidecars_detects_non_empty_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sidecar_health.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+        conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+        drop(conn);
+
+        assert!(!sqlite_file_has_live_sidecars(&db_path));
+
+        let mut shm_os = db_path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        std::fs::write(PathBuf::from(shm_os), b"live-sidecar").expect("write sidecar");
+        assert!(sqlite_file_has_live_sidecars(&db_path));
+    }
+
+    #[test]
+    fn sqlite_file_is_healthy_with_sidecar_invokes_compat_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("compat_probe.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+        conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+        drop(conn);
+
+        let mut shm_os = db_path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        std::fs::write(PathBuf::from(shm_os), b"live-sidecar").expect("write sidecar");
+
+        let mut probe_called = false;
+        let healthy = sqlite_file_is_healthy_with_compat_probe(&db_path, |_| {
+            probe_called = true;
+            Ok(true)
+        })
+        .expect("health check");
+        assert!(healthy, "compat probe success should keep healthy verdict");
+        assert!(
+            probe_called,
+            "compatibility probe should run when sidecars exist"
+        );
+    }
+
+    #[test]
+    fn sqlite_file_is_healthy_with_sidecar_accepts_compat_unhealthy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("compat_unhealthy.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+        conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+        drop(conn);
+
+        let mut shm_os = db_path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        std::fs::write(PathBuf::from(shm_os), b"live-sidecar").expect("write sidecar");
+
+        let healthy = sqlite_file_is_healthy_with_compat_probe(&db_path, |_| Ok(false))
+            .expect("health check");
+        assert!(
+            !healthy,
+            "compatibility probe failure should mark DB unhealthy"
+        );
+    }
+
+    #[test]
     fn query_preflight_banner_stats_batched_reads_expected_counts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("preflight_banner.sqlite3");
@@ -22553,6 +22706,9 @@ mod tests {
     fn sqlite_corruption_error_message_detection_includes_no_backup_marker() {
         assert!(is_sqlite_corruption_error_message(
             "database file tmp/storage.sqlite3 is malformed and no healthy backup was found"
+        ));
+        assert!(is_sqlite_corruption_error_message(
+            "database schema is corrupt"
         ));
     }
 

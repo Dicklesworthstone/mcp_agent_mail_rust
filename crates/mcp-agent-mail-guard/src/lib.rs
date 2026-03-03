@@ -922,6 +922,10 @@ fn check_path_conflicts(
             // matching the custom Python glob_to_regex behavior where * -> [^/]* and ** -> .*.
             // Use normalize_path to handle slashes before compiling.
             let pat_str = normalize_path(&res.path_pattern, ignorecase);
+            // Skip patterns that normalize to empty — they would match everything.
+            if pat_str.is_empty() {
+                continue;
+            }
             let glob = globset::GlobBuilder::new(&pat_str)
                 .literal_separator(true)
                 .build();
@@ -941,6 +945,11 @@ fn check_path_conflicts(
 
     for path in paths {
         let normalized = normalize_path(path, ignorecase);
+        // Skip degenerate paths that normalize to empty (e.g. "./", "/", "..")
+        // to avoid false-positive conflicts with every reservation pattern.
+        if normalized.is_empty() {
+            continue;
+        }
 
         // Check if path matches any reservation pattern
         let matches = glob_set.matches(&normalized);

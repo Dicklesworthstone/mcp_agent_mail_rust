@@ -1231,6 +1231,7 @@ pub fn is_corruption_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("database disk image is malformed")
         || lower.contains("malformed database schema")
+        || lower.contains("database schema is corrupt")
         || lower.contains("file is not a database")
         || lower.contains("no healthy backup was found")
 }
@@ -1266,6 +1267,69 @@ fn sqlite_incremental_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
+fn sqlite_pragma_check_is_ok_canonical(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    pragma_sql: &str,
+) -> Result<bool, SqlError> {
+    let rows = conn.query_sync(pragma_sql, &[])?;
+    let mut details: Vec<String> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(v) = row.get_named::<String>("quick_check") {
+            details.push(v);
+        } else if let Ok(v) = row.get_named::<String>("integrity_check") {
+            details.push(v);
+        } else if let Some(Value::Text(v)) = row.values().next() {
+            details.push(v.clone());
+        }
+    }
+    if details.is_empty() {
+        // Some backends may return an empty rowset for success.
+        return Ok(true);
+    }
+    Ok(details.len() == 1 && details[0] == "ok")
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_canonical_quick_check_is_ok(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+) -> Result<bool, SqlError> {
+    sqlite_pragma_check_is_ok_canonical(conn, "PRAGMA quick_check")
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_canonical_incremental_check_is_ok(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+) -> Result<bool, SqlError> {
+    sqlite_pragma_check_is_ok_canonical(conn, "PRAGMA integrity_check(1)")
+}
+
+#[must_use]
+fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_os = path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar_path = PathBuf::from(sidecar_os);
+        if let Ok(meta) = std::fs::metadata(&sidecar_path)
+            && meta.len() > 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_file_is_healthy_canonical(path: &Path) -> Result<bool, SqlError> {
+    let path_str = path.to_string_lossy();
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref())?;
+
+    if !sqlite_canonical_quick_check_is_ok(&conn)? {
+        return Ok(false);
+    }
+    sqlite_canonical_incremental_check_is_ok(&conn)
+}
+
+#[allow(clippy::result_large_err)]
 fn sqlite_table_has_column(conn: &DbConn, table: &str, column: &str) -> Result<bool, SqlError> {
     let rows = conn.query_sync(&format!("PRAGMA table_info({table})"), &[])?;
     Ok(rows
@@ -1298,7 +1362,13 @@ fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+fn sqlite_file_is_healthy_with_compat_probe<F>(
+    path: &Path,
+    mut compatibility_probe: F,
+) -> Result<bool, SqlError>
+where
+    F: FnMut(&Path) -> Result<bool, SqlError>,
+{
     if !path.exists() {
         return Ok(false);
     }
@@ -1336,7 +1406,8 @@ fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     }
 
     match sqlite_ack_pending_probe_is_ok(&conn) {
-        Ok(ok) => Ok(ok),
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
         Err(e) => {
             let msg = e.to_string();
             if is_corruption_error_message(&msg)
@@ -1344,9 +1415,41 @@ fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
             {
                 return Ok(false);
             }
-            Err(e)
+            return Err(e);
         }
     }
+
+    // FrankenConnection can miss schema faults present in active WAL sidecars.
+    // When sidecars exist, run a canonical sqlite probe to avoid false healthy
+    // verdicts (e.g. duplicate-index malformed schema in WAL state).
+    if sqlite_file_has_live_sidecars(path) {
+        match compatibility_probe(path) {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_corruption_error_message(&msg) || is_sqlite_recovery_error_message(&msg) {
+                    return Ok(false);
+                }
+                if is_lock_error(&msg) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "sqlite canonical health probe hit lock/busy error; preserving primary health verdict"
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
 }
 
 #[allow(clippy::result_large_err)]
@@ -2753,6 +2856,7 @@ mod tests {
         assert!(is_corruption_error_message(
             "malformed database schema - something"
         ));
+        assert!(is_corruption_error_message("database schema is corrupt"));
         assert!(is_corruption_error_message("file is not a database"));
         assert!(is_corruption_error_message(
             "database file tmp/storage.sqlite3 is malformed and no healthy backup was found"
@@ -2817,6 +2921,74 @@ mod tests {
         drop(conn);
         let healthy = sqlite_file_is_healthy(&path).expect("should not error");
         assert!(healthy, "valid DB should be healthy");
+    }
+
+    #[test]
+    fn sqlite_file_has_live_sidecars_detects_non_empty_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sidecar.db");
+        let path_str = path.to_string_lossy();
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        assert!(!sqlite_file_has_live_sidecars(&path));
+
+        let mut shm_os = path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        let shm_path = PathBuf::from(shm_os);
+        std::fs::write(&shm_path, b"live-sidecar").expect("write sidecar");
+        assert!(sqlite_file_has_live_sidecars(&path));
+    }
+
+    #[test]
+    fn sqlite_file_is_healthy_with_sidecar_invokes_compat_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("compat_probe.db");
+        let path_str = path.to_string_lossy();
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let mut shm_os = path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        std::fs::write(PathBuf::from(shm_os), b"live-sidecar").expect("write sidecar");
+
+        let mut probe_called = false;
+        let healthy = sqlite_file_is_healthy_with_compat_probe(&path, |_| {
+            probe_called = true;
+            Ok(true)
+        })
+        .expect("health check");
+        assert!(healthy, "compat probe true should preserve healthy verdict");
+        assert!(
+            probe_called,
+            "compatibility probe must run when sidecars exist"
+        );
+    }
+
+    #[test]
+    fn sqlite_file_is_healthy_with_sidecar_accepts_compat_unhealthy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("compat_unhealthy.db");
+        let path_str = path.to_string_lossy();
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let mut shm_os = path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        std::fs::write(PathBuf::from(shm_os), b"live-sidecar").expect("write sidecar");
+
+        let healthy =
+            sqlite_file_is_healthy_with_compat_probe(&path, |_| Ok(false)).expect("health check");
+        assert!(
+            !healthy,
+            "compatibility probe failure should mark file unhealthy"
+        );
     }
 
     #[test]

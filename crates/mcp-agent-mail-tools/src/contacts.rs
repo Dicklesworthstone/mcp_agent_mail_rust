@@ -496,15 +496,23 @@ pub async fn list_contacts(
     b_agent_ids.dedup();
 
     let mut agent_names: HashMap<i64, String> = HashMap::with_capacity(b_agent_ids.len());
-    if !b_agent_ids.is_empty()
-        && let Ok(rows) = db_outcome_to_mcp_result(
+    if !b_agent_ids.is_empty() {
+        match db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::get_agents_by_ids(ctx.cx(), &pool, &b_agent_ids).await,
-        )
-    {
-        for row in rows {
-            // Safe unwrap: row.id is primary key, guaranteed to be Some(id)
-            if let Some(id) = row.id {
-                agent_names.insert(id, row.name);
+        ) {
+            Ok(rows) => {
+                for row in rows {
+                    if let Some(id) = row.id {
+                        agent_names.insert(id, row.name);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent_ids = ?b_agent_ids,
+                    error = %e,
+                    "list_contacts: failed to resolve agent names, using synthetic fallbacks"
+                );
             }
         }
     }

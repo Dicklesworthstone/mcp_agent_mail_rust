@@ -28,7 +28,8 @@ const SLOW_QUERY_LIMIT: usize = 50;
 /// Used only for slow-query logging and the legacy `extract_table()` API.
 static TABLE_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
-        Regex::new(r#"(?i)\binsert\s+(?:or\s+\w+\s+)?into\s+([\w.`"\[\]]+)"#).unwrap_or_else(|_| unreachable!()),
+        Regex::new(r#"(?i)\binsert\s+(?:or\s+\w+\s+)?into\s+([\w.`"\[\]]+)"#)
+            .unwrap_or_else(|_| unreachable!()),
         Regex::new(r#"(?i)\bupdate\s+([\w.`"\[\]]+)"#).unwrap_or_else(|_| unreachable!()),
         Regex::new(r#"(?i)\bfrom\s+([\w.`"\[\]]+)"#).unwrap_or_else(|_| unreachable!()),
     ]

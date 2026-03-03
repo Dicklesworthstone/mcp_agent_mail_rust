@@ -120,6 +120,7 @@ pub fn verify_bundle(
 
     // Check SRI hashes
     let mut sri_checked = false;
+    let mut sri_files_verified: usize = 0;
     if let Some(viewer) = manifest.get("viewer")
         && let Some(sri_map) = viewer.get("sri").and_then(|v| v.as_object())
     {
@@ -143,6 +144,7 @@ pub fn verify_bundle(
                             )),
                         });
                     }
+                    sri_files_verified += 1;
                 } else {
                     return Ok(VerifyResult {
                         bundle: bundle_root.display().to_string(),
@@ -210,7 +212,7 @@ pub fn verify_bundle(
     Ok(VerifyResult {
         bundle: bundle_root.display().to_string(),
         sri_checked,
-        sri_valid: sri_checked,
+        sri_valid: sri_checked && sri_files_verified > 0,
         signature_checked,
         signature_verified,
         key_source,
@@ -330,16 +332,18 @@ pub fn decrypt_with_age(
     if let Some(pass) = passphrase {
         use std::io::Write;
         cmd.stdin(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(pass.as_bytes())?;
             stdin.write_all(b"\n")?;
         }
-        let status = child.wait()?;
-        if !status.success() {
-            return Err(ShareError::Io(std::io::Error::other(
-                "age decryption failed",
-            )));
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "age decryption failed: {stderr}"
+            ))));
         }
     } else {
         let result = cmd.output()?;

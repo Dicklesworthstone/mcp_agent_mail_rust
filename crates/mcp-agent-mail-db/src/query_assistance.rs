@@ -41,8 +41,9 @@ static UNSEARCHABLE: LazyLock<Regex> =
 /// Hyphenated token: ASCII alphanumeric segments joined by hyphens
 /// We use a simpler regex without lookbehind (not supported by `regex` crate)
 /// and handle the "already quoted" case in the replacement function.
-static HYPHENATED_TOKEN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+").unwrap_or_else(|_| unreachable!()));
+static HYPHENATED_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+").unwrap_or_else(|_| unreachable!())
+});
 
 /// Multiple consecutive spaces
 static MULTI_SPACE: LazyLock<Regex> =

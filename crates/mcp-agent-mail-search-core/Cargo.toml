@@ -16,6 +16,7 @@ chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
 regex.workspace = true
+unicode-normalization.workspace = true
 tracing.workspace = true
 
 # Core types (config, models)

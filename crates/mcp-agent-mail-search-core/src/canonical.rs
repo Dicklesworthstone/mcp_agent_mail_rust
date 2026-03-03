@@ -15,6 +15,7 @@
 
 use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::document::DocKind;
 
@@ -52,7 +53,8 @@ static SECRET_PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         // Bearer tokens
         regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{16,}").unwrap_or_else(|_| unreachable!()),
         // JWTs (three base64url segments)
-        regex::Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+").unwrap_or_else(|_| unreachable!()),
+        regex::Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+")
+            .unwrap_or_else(|_| unreachable!()),
         // AWS access key IDs
         regex::Regex::new(r"AKIA[0-9A-Z]{16}").unwrap_or_else(|_| unreachable!()),
         // PEM private keys
@@ -77,34 +79,43 @@ static SECRET_PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
 /// blockquotes, horizontal rules, list markers, and HTML tags.
 #[must_use]
 pub fn strip_markdown(input: &str) -> String {
-    static RE_CODE_FENCE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?ms)^```[^\n]*\n.*?^```").unwrap_or_else(|_| unreachable!()));
+    static RE_CODE_FENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?ms)^```[^\n]*\n.*?^```").unwrap_or_else(|_| unreachable!())
+    });
     static RE_INLINE_CODE: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"`[^`]+`").unwrap_or_else(|_| unreachable!()));
-    static RE_IMAGE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"!\[([^\]]*)\]\([^)]+\)").unwrap_or_else(|_| unreachable!()));
-    static RE_LINK: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\[([^\]]*)\]\([^)]+\)").unwrap_or_else(|_| unreachable!()));
+    static RE_IMAGE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"!\[([^\]]*)\]\([^)]+\)").unwrap_or_else(|_| unreachable!())
+    });
+    static RE_LINK: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\[([^\]]*)\]\([^)]+\)").unwrap_or_else(|_| unreachable!())
+    });
     static RE_HEADER: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"(?m)^#{1,6}\s+").unwrap_or_else(|_| unreachable!()));
-    static RE_BOLD_ITALIC: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\*{1,3}([^*]+)\*{1,3}").unwrap_or_else(|_| unreachable!()));
-    static RE_UNDERSCORE_EMPHASIS: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"_{1,3}([^_]+)_{1,3}").unwrap_or_else(|_| unreachable!()));
+    static RE_BOLD_ITALIC: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\*{1,3}([^*]+)\*{1,3}").unwrap_or_else(|_| unreachable!())
+    });
+    static RE_UNDERSCORE_EMPHASIS: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"_{1,3}([^_]+)_{1,3}").unwrap_or_else(|_| unreachable!())
+    });
     static RE_STRIKETHROUGH: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"~~([^~]+)~~").unwrap_or_else(|_| unreachable!()));
     static RE_BLOCKQUOTE: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"(?m)^>\s*").unwrap_or_else(|_| unreachable!()));
-    static RE_HR: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^[-*_]{3,}\s*$").unwrap_or_else(|_| unreachable!()));
-    static RE_LIST_MARKER: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^(\s*)[-*+]\s+").unwrap_or_else(|_| unreachable!()));
-    static RE_ORDERED_LIST: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^(\s*)\d+\.\s+").unwrap_or_else(|_| unreachable!()));
+    static RE_HR: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^[-*_]{3,}\s*$").unwrap_or_else(|_| unreachable!())
+    });
+    static RE_LIST_MARKER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^(\s*)[-*+]\s+").unwrap_or_else(|_| unreachable!())
+    });
+    static RE_ORDERED_LIST: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^(\s*)\d+\.\s+").unwrap_or_else(|_| unreachable!())
+    });
     static RE_HTML_TAG: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap_or_else(|_| unreachable!()));
-    static RE_TABLE_SEPARATOR: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^\|?[\s-]+\|[\s\-|]+$").unwrap_or_else(|_| unreachable!()));
+    static RE_TABLE_SEPARATOR: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^\|?[\s-]+\|[\s\-|]+$").unwrap_or_else(|_| unreachable!())
+    });
     let mut text = input.to_owned();
 
     // Remove code fences first (before other patterns match inside them)
@@ -173,16 +184,11 @@ pub fn redact_secrets(input: &str) -> String {
 /// - Trims leading and trailing whitespace
 #[must_use]
 pub fn normalize_text(input: &str) -> String {
-    // NFC normalization: we iterate codepoints and apply canonical composition.
-    // For a no-dependency approach, we rely on the fact that most Agent Mail
-    // text is already NFC (ASCII + common Unicode). For full correctness with
-    // exotic decomposed sequences, the `unicode-normalization` crate would be
-    // ideal, but we avoid adding it as a dep. Instead, we focus on whitespace
-    // normalization which is the main concern.
-    let mut result = String::with_capacity(input.len());
+    let nfc: String = input.nfc().collect();
+    let mut result = String::with_capacity(nfc.len());
     let mut prev_ws = false;
 
-    for ch in input.chars() {
+    for ch in nfc.chars() {
         if ch.is_whitespace() {
             if !prev_ws {
                 result.push(' ');
@@ -248,13 +254,7 @@ pub fn canonicalize(doc_kind: DocKind, title: &str, body: &str, policy: CanonPol
     };
 
     let stripped = strip_markdown(&raw);
-
-    let redacted = if matches!(policy, CanonPolicy::TitleOnly) {
-        stripped
-    } else {
-        // Full and RedactSecrets both scrub obvious secrets from canonical text.
-        redact_secrets(&stripped)
-    };
+    let redacted = redact_secrets(&stripped);
 
     let normalized = normalize_text(&redacted);
 
@@ -766,6 +766,15 @@ mod tests {
         assert_eq!(result, "hello world");
     }
 
+    #[test]
+    fn normalize_nfc_equivalence() {
+        let composed = "café";
+        let decomposed = "cafe\u{301}";
+
+        assert_ne!(composed.as_bytes(), decomposed.as_bytes());
+        assert_eq!(normalize_text(composed), normalize_text(decomposed));
+    }
+
     // ── extract_text edge cases ──
 
     #[test]
@@ -790,6 +799,18 @@ mod tests {
             "Config",
             "key: sk-1234567890abcdefghijklmn",
             CanonPolicy::RedactSecrets,
+        );
+        assert!(result.contains("[redacted]"));
+        assert!(!result.contains("sk-"));
+    }
+
+    #[test]
+    fn canonicalize_title_only_still_redacts_secrets() {
+        let result = canonicalize(
+            DocKind::Message,
+            "token sk-1234567890abcdefghijklmn",
+            "body ignored",
+            CanonPolicy::TitleOnly,
         );
         assert!(result.contains("[redacted]"));
         assert!(!result.contains("sk-"));

@@ -141,7 +141,7 @@ fn contact_required_error(
     blocked_sorted.sort();
     blocked_sorted.dedup();
     let recipient_list = blocked_sorted.join(", ");
-    let sample_target = blocked_sorted.first().cloned().unwrap_or_default();
+    let sample_target = blocked_recipients.first().cloned().unwrap_or_default();
 
     let mut err_msg_parts = vec![
         format!("Contact approval required for recipients: {recipient_list}."),
@@ -167,12 +167,12 @@ fn contact_required_error(
         "arguments": {
             "project_key": project_key,
             "requester": sender_name,
-            "target": blocked_recipients.first().cloned().unwrap_or_default(),
+            "target": sample_target,
             "auto_accept": true,
             "ttl_seconds": ttl_seconds,
         }
     })];
-    for nm in blocked_recipients.iter().take(3) {
+    for nm in blocked_sorted.iter().take(3) {
         examples.push(json!({
             "tool": "request_contact",
             "arguments": {
@@ -785,8 +785,8 @@ async fn push_recipient(
     // the entire message transaction.
     if !all_recipients.iter().any(|(id, _)| *id == agent_id) {
         all_recipients.push((agent_id, kind.to_string()));
+        resolved_list.push(agent.name);
     }
-    resolved_list.push(agent.name);
     Ok(())
 }
 

@@ -116,9 +116,8 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
         ));
     }
     // 3. Absolute paths (check original pattern for this one, as normalize_pattern strips leading slash)
-    if (pattern.trim().starts_with('/') && !pattern.trim().starts_with("//"))
-        || std::path::Path::new(pattern.trim()).is_absolute()
-    {
+    let trimmed = pattern.trim();
+    if !trimmed.starts_with("//") && (trimmed.starts_with('/') || std::path::Path::new(trimmed).is_absolute()) {
         return Some(format!(
             "Pattern '{pattern}' looks like an absolute path. \
              Reservations should use project-relative paths like 'src/module.py'."
@@ -713,8 +712,7 @@ pub async fn renew_file_reservations(
         .map(|p| p.iter().map(String::as_str).collect());
 
     let existing_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, true)
-            .await,
+        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, true).await,
     )?;
     let previous_expires_by_id = collect_previous_expiries(
         &existing_rows,
@@ -827,7 +825,6 @@ pub async fn force_release_file_reservation(
     notify_previous: Option<bool>,
 ) -> McpResult<String> {
     let should_notify = notify_previous.unwrap_or(true);
-    let now_iso = chrono::Utc::now().to_rfc3339();
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -843,8 +840,12 @@ pub async fn force_release_file_reservation(
     .await?;
 
     let mut reservations = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::get_reservations_by_ids(ctx.cx(), &pool, &[file_reservation_id])
-            .await,
+        mcp_agent_mail_db::queries::get_reservations_by_ids(
+            ctx.cx(),
+            &pool,
+            &[file_reservation_id],
+        )
+        .await,
     )?;
     let reservation = reservations.pop();
 
@@ -949,8 +950,9 @@ pub async fn force_release_file_reservation(
             .await,
     )?;
 
+    let now_iso = micros_to_iso(mcp_agent_mail_db::now_micros());
+
     if released_count > 0 {
-        let now_iso = micros_to_iso(mcp_agent_mail_db::now_micros());
         let res_json = serde_json::json!({
             "id": reservation.id.unwrap_or(0),
             "agent": &holder_agent.name,

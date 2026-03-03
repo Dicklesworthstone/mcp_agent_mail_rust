@@ -3285,13 +3285,19 @@ fn reservation_compute_pattern_activity(
     }
 
     let git_activity = if matches && want_git {
-        let spec = reservation_git_pathspec(workspace_rel.unwrap_or_else(|| std::path::Path::new("")), &normalized);
+        let spec = reservation_git_pathspec(
+            workspace_rel.unwrap_or_else(|| std::path::Path::new("")),
+            &normalized,
+        );
         let spec = if has_glob {
             format!(":(glob){spec}")
         } else {
             spec
         };
-        reservation_git_latest_activity_micros(repo_root.unwrap_or_else(|| std::path::Path::new("")), &[spec])
+        reservation_git_latest_activity_micros(
+            repo_root.unwrap_or_else(|| std::path::Path::new("")),
+            &[spec],
+        )
     } else {
         None
     };
@@ -4066,6 +4072,7 @@ mod resource_shape_tests {
                         .await
                         .expect("outbox");
                 let outbox_value = parse_json(&outbox_payload);
+                println!("OUTBOX PAYLOAD: {}", outbox_payload);
                 assert_eq!(outbox_value["count"], 1);
                 assert_eq!(
                     outbox_value["messages"][0]["subject"],

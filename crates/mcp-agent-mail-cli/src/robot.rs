@@ -1781,12 +1781,10 @@ fn build_message(
                             .or_else(|| a.get("content_type"))
                             .and_then(|s| s.as_str())
                             .or_else(|| {
-                                a.get("type")
-                                    .and_then(|s| s.as_str())
-                                    .filter(|kind| {
-                                        // Disposition values are not MIME types
-                                        !matches!(*kind, "file" | "inline" | "auto")
-                                    })
+                                a.get("type").and_then(|s| s.as_str()).filter(|kind| {
+                                    // Disposition values are not MIME types
+                                    !matches!(*kind, "file" | "inline" | "auto")
+                                })
                             })
                             .unwrap_or("application/octet-stream")
                             .to_string(),
@@ -5391,7 +5389,8 @@ mod tests {
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
             &empty,
-        ).expect("insert project");
+        )
+        .expect("insert project");
         conn.query_sync(
             "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender'), (2, 1, 'RecipA'), (3, 1, 'RecipB')",
             &empty,
@@ -5410,7 +5409,8 @@ mod tests {
                 (1, 10, 2, 'to', NULL, 999),
                 (2, 10, 3, 'to', NULL, NULL)",
             &empty,
-        ).expect("insert recipients");
+        )
+        .expect("insert recipients");
 
         let (result, _action) =
             build_navigate(&conn, "resource://outbox/Sender", 1, "proj", None).expect("navigate");
@@ -5418,7 +5418,10 @@ mod tests {
         match result {
             NavigateResult::Inbox { entries } => {
                 assert_eq!(entries.len(), 1, "should have one outbox entry");
-                assert_eq!(entries[0].ack_status, "partial (1/2)", "partial ack should show fractional status");
+                assert_eq!(
+                    entries[0].ack_status, "partial (1/2)",
+                    "partial ack should show fractional status"
+                );
             }
             other => panic!("unexpected navigate result: {other:?}"),
         }
@@ -5668,8 +5671,8 @@ mod tests {
         )
         .expect("insert recipients");
 
-        let thread = build_thread(&conn, 1, "ACK-DONE-THREAD", Some(10), None, false)
-            .expect("build thread");
+        let thread =
+            build_thread(&conn, 1, "ACK-DONE-THREAD", Some(10), None, false).expect("build thread");
         assert_eq!(thread.messages[0].ack, "done");
     }
 
@@ -5705,8 +5708,8 @@ mod tests {
         )
         .expect("insert recipients");
 
-        let thread = build_thread(&conn, 1, "ACK-REQ-THREAD", Some(10), None, false)
-            .expect("build thread");
+        let thread =
+            build_thread(&conn, 1, "ACK-REQ-THREAD", Some(10), None, false).expect("build thread");
         assert_eq!(thread.messages[0].ack, "required");
     }
 
@@ -5739,8 +5742,8 @@ mod tests {
         )
         .expect("insert recipient");
 
-        let thread = build_thread(&conn, 1, "NO-ACK-THREAD", Some(10), None, false)
-            .expect("build thread");
+        let thread =
+            build_thread(&conn, 1, "NO-ACK-THREAD", Some(10), None, false).expect("build thread");
         assert_eq!(thread.messages[0].ack, "none");
     }
 

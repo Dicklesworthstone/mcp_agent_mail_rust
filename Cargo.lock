@@ -4738,6 +4738,7 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "tracing",
+ "unicode-normalization",
  "wide",
 ]
 
@@ -4782,6 +4783,7 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "tracing",
+ "unicode-normalization",
  "wide",
 ]
 

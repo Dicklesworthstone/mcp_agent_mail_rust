@@ -1001,7 +1001,7 @@ pub async fn register_agent(
     }
 
     let normalize_sql = format!(
-        "UPDATE agents SET {} WHERE project_id = ? AND name = ?",
+        "UPDATE agents SET {} WHERE project_id = ? AND name = ? COLLATE NOCASE",
         normalize_sets.join(", ")
     );
     let mut normalize_params = normalize_base_params.clone();
@@ -1061,7 +1061,7 @@ pub async fn register_agent(
     let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                      inception_ts, last_active_ts, attachments_policy, contact_policy \
                      FROM agents \
-                     WHERE project_id = ? AND name = ? \
+                     WHERE project_id = ? AND name = ? COLLATE NOCASE \
                      ORDER BY id ASC \
                      LIMIT 1";
     let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -1299,7 +1299,18 @@ pub async fn list_agents(
     // Use raw SQL with explicit column order to avoid ORM decoding issues
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy \
-               FROM agents WHERE project_id = ?";
+               FROM ( \
+                 SELECT id, project_id, name, program, model, task_description, \
+                        inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY name COLLATE NOCASE \
+                            ORDER BY last_active_ts DESC, id DESC \
+                        ) AS rn \
+                 FROM agents \
+                 WHERE project_id = ? \
+               ) dedup \
+               WHERE rn = 1 \
+               ORDER BY last_active_ts DESC, id DESC";
     let params = [Value::BigInt(project_id)];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
@@ -6361,6 +6372,93 @@ mod tests {
             assert_eq!(fetched.program, "codex-cli");
             assert_eq!(fetched.model, "gpt-5");
             assert_eq!(fetched.id, registered.id);
+        });
+    }
+
+    #[test]
+    fn register_agent_case_insensitive_reuses_existing_row() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_agent_case_insensitive_reuse.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        // Simulate environments where NOCASE uniqueness may be missing.
+        init_conn
+            .execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+            .ok();
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-agent-case-reuse-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let initial = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("first"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("initial register");
+
+            let updated = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "bluelake",
+                "codex-cli",
+                "gpt-5.1",
+                Some("second"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("case-insensitive register");
+
+            assert_eq!(
+                updated.id, initial.id,
+                "case-only name differences must reuse the same agent row"
+            );
+            assert_eq!(updated.model, "gpt-5.1");
+
+            let agents = list_agents(&cx, &pool, project_id)
+                .await
+                .into_result()
+                .expect("list agents");
+            assert_eq!(agents.len(), 1);
         });
     }
 

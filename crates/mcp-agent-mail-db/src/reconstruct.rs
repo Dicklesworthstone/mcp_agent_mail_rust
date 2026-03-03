@@ -845,7 +845,8 @@ mod tests {
 
     #[test]
     fn extract_body_after_frontmatter_preserves_code_block() {
-        let content = "---json\n{}\n---\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n";
+        let content =
+            "---json\n{}\n---\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n";
         let body = extract_body_after_frontmatter(content).expect("should extract");
         assert!(body.starts_with("```rust\n"));
         assert!(body.ends_with("```\n"));
