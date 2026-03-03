@@ -79,6 +79,7 @@ const TOAST_ENTRANCE_TICKS: u8 = 3;
 const TOAST_EXIT_TICKS: u8 = 2;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
 const HOUSEKEEPING_EVENTS_PER_TICK: usize = 192;
+const RESERVATION_EXPIRY_SCAN_TICK_DIVISOR: u64 = 10;
 const MAX_DEFERRED_ACTIONS_PER_TICK: usize = 64;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
@@ -3480,6 +3481,7 @@ impl MailAppModel {
         let new_events = self
             .state
             .events_since_limited(self.last_toast_seq, HOUSEKEEPING_EVENTS_PER_TICK);
+        let mut reservation_tracker_changed = false;
         for event in &new_events {
             self.last_toast_seq = event.seq().max(self.last_toast_seq);
 
@@ -3499,6 +3501,7 @@ impl MailAppModel {
                         let label = format!("{agent}:{path}");
                         self.reservation_tracker.insert(key, (label, expiry));
                     }
+                    reservation_tracker_changed = true;
                 }
                 MailEvent::ReservationReleased {
                     agent,
@@ -3511,6 +3514,7 @@ impl MailAppModel {
                         self.reservation_tracker.remove(&key);
                         self.warned_reservations.remove(&key);
                     }
+                    reservation_tracker_changed = true;
                 }
                 _ => {}
             }
@@ -3522,35 +3526,41 @@ impl MailAppModel {
             }
         }
 
-        // Check for reservations expiring soon (within 5 minutes).
-        let now = now_micros();
-        let mut expired_keys = Vec::new();
-        let mut expiry_toasts = Vec::new();
-        for (key, (label, expiry)) in &self.reservation_tracker {
-            if *expiry <= now {
-                expired_keys.push(key.clone());
-                continue;
+        let reservation_expiry_scan_due = reservation_tracker_changed
+            || self
+                .tick_count
+                .is_multiple_of(RESERVATION_EXPIRY_SCAN_TICK_DIVISOR);
+        if reservation_expiry_scan_due {
+            // Check for reservations expiring soon (within 5 minutes).
+            let now = now_micros();
+            let mut expired_keys = Vec::new();
+            let mut expiry_toasts = Vec::new();
+            for (key, (label, expiry)) in &self.reservation_tracker {
+                if *expiry <= now {
+                    expired_keys.push(key.clone());
+                    continue;
+                }
+                if *expiry - now < RESERVATION_EXPIRY_WARN_MICROS
+                    && !self.warned_reservations.contains(key)
+                {
+                    let minutes_left = (*expiry - now) / 60_000_000;
+                    expiry_toasts.push((
+                        key.clone(),
+                        Toast::new(format!("{label} expires in ~{minutes_left}m"))
+                            .icon(ToastIcon::Warning)
+                            .duration(Duration::from_secs(10)),
+                    ));
+                }
             }
-            if *expiry - now < RESERVATION_EXPIRY_WARN_MICROS
-                && !self.warned_reservations.contains(key)
-            {
-                let minutes_left = (*expiry - now) / 60_000_000;
-                expiry_toasts.push((
-                    key.clone(),
-                    Toast::new(format!("{label} expires in ~{minutes_left}m"))
-                        .icon(ToastIcon::Warning)
-                        .duration(Duration::from_secs(10)),
-                ));
+            for key in expired_keys {
+                self.reservation_tracker.remove(&key);
+                self.warned_reservations.remove(&key);
             }
-        }
-        for key in expired_keys {
-            self.reservation_tracker.remove(&key);
-            self.warned_reservations.remove(&key);
-        }
-        for (key, toast) in expiry_toasts {
-            if !self.toast_muted && self.toast_severity.allows(ToastIcon::Warning) {
-                self.warned_reservations.insert(key);
-                self.notifications.notify(self.apply_toast_policy(toast));
+            for (key, toast) in expiry_toasts {
+                if !self.toast_muted && self.toast_severity.allows(ToastIcon::Warning) {
+                    self.warned_reservations.insert(key);
+                    self.notifications.notify(self.apply_toast_policy(toast));
+                }
             }
         }
 
@@ -9708,7 +9718,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("focus target")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_mins(1)),
+                .duration(Duration::from_secs(60)),
         );
         model.notifications.tick(Duration::from_millis(16));
         assert_eq!(model.notifications.visible_count(), 1);
@@ -9781,7 +9791,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_mins(1)),
+                    .duration(Duration::from_secs(60)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -10099,7 +10109,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("test")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_mins(1)),
+                .duration(Duration::from_secs(60)),
         );
         model.notifications.tick(Duration::from_millis(16));
         assert_eq!(model.notifications.visible_count(), 1);
@@ -10135,7 +10145,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_mins(1)),
+                    .duration(Duration::from_secs(60)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -10160,7 +10170,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_mins(1)),
+                    .duration(Duration::from_secs(60)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -10180,7 +10190,7 @@ mod tests {
             model.notifications.notify(
                 Toast::new(format!("toast {i}"))
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_mins(1)),
+                    .duration(Duration::from_secs(60)),
             );
         }
         model.notifications.tick(Duration::from_millis(16));
@@ -10204,7 +10214,7 @@ mod tests {
         model.notifications.notify(
             Toast::new("only one")
                 .icon(ToastIcon::Info)
-                .duration(Duration::from_mins(1)),
+                .duration(Duration::from_secs(60)),
         );
         model.notifications.tick(Duration::from_millis(16));
         model.toast_focus_index = Some(0);
@@ -10359,7 +10369,7 @@ mod tests {
     #[test]
     fn focus_highlight_noop_when_index_out_of_bounds() {
         let mut queue = NotificationQueue::new(QueueConfig::default());
-        queue.notify(Toast::new("test").duration(Duration::from_mins(1)));
+        queue.notify(Toast::new("test").duration(Duration::from_secs(60)));
         queue.tick(Duration::from_millis(16));
         assert_eq!(queue.visible_count(), 1);
 
@@ -10373,7 +10383,7 @@ mod tests {
     #[test]
     fn focus_highlight_renders_hint_text() {
         let mut queue = NotificationQueue::new(QueueConfig::default());
-        queue.notify(Toast::new("test toast").duration(Duration::from_mins(1)));
+        queue.notify(Toast::new("test toast").duration(Duration::from_secs(60)));
         queue.tick(Duration::from_millis(16));
         assert_eq!(queue.visible_count(), 1);
 
@@ -11354,7 +11364,7 @@ mod tests {
         model.notifications.notify(
             ftui_widgets::Toast::new("test")
                 .icon(ftui_widgets::ToastIcon::Info)
-                .duration(Duration::from_mins(1)),
+                .duration(Duration::from_secs(60)),
         );
         model.toast_focus_index = Some(0);
 
@@ -12307,7 +12317,7 @@ mod tests {
         model.notifications.notify(
             ftui_widgets::Toast::new("test")
                 .icon(ftui_widgets::ToastIcon::Info)
-                .duration(Duration::from_mins(1)),
+                .duration(Duration::from_secs(60)),
         );
         model.toast_focus_index = Some(0);
         assert_eq!(model.topmost_overlay(), OverlayLayer::ToastFocus);

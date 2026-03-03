@@ -7,17 +7,42 @@
     },
     {
       "check": "db_file_sanity",
-      "detail": "quick_check OK (176128 bytes)",
+      "detail": "quick_check OK (221184 bytes)",
       "status": "ok"
     },
     {
       "check": "pool_init",
-      "detail": "Pool initialization + migrations OK",
+      "detail": "Database reopen probe OK (doctor check kept non-mutating)",
       "status": "ok"
     },
     {
       "check": "storage_root",
       "detail": "<TMP_ROOT>/storage_root",
+      "status": "warn"
+    },
+    {
+      "check": "storage_root_writable",
+      "detail": "Skipped: storage root missing",
+      "status": "warn"
+    },
+    {
+      "check": "storage_root_disk_space",
+      "detail": "Skipped: storage root missing",
+      "status": "warn"
+    },
+    {
+      "check": "storage_root_git_repo",
+      "detail": "Skipped: storage root missing",
+      "status": "warn"
+    },
+    {
+      "check": "storage_root_git_index_lock",
+      "detail": "Skipped: storage root missing",
+      "status": "warn"
+    },
+    {
+      "check": "guard_hooks",
+      "detail": "Missing hooks (pre-commit=false, pre-push=false) in /data/projects/mcp_agent_mail_rust/.git/hooks",
       "status": "warn"
     },
     {
@@ -31,13 +56,33 @@
       "status": "ok"
     },
     {
+      "check": "legacy_python_alias",
+      "detail": "No legacy Python `alias am=...` entries found in shell rc files",
+      "status": "ok"
+    },
+    {
+      "check": "stale_python_processes",
+      "detail": "Legacy Python processes detected; stop them to avoid conflicts: 3450234 rsync -az --stats --delete -e ssh -i /home/ubuntu/.ssh/contabo_vps_ed25519 -o StrictHostKeyChecking=accept-new -o BatchMode=yes --rsync-path mkdir -p /data/projects/frankenlibc/crates/frankenlibc-harness && rsync --exclude target/ --exclude target_*/ --exclude target-*/ --exclude .cargo-target/ --exclude .cargo-target-rusticmill/ --exclude .cargo-target-*/ --exclude *.rlib --exclude *.rmeta --exclude .git/objects/ --exclude node_modules/ --exclude .bun/ --exclude .npm/ --exclude .pnpm-store/ --exclude dist/ --exclude build/ --exclude .next/ --exclude .nuxt/ --exclude .turbo/ --exclude .parcel-cache/ --exclude .beads/ --exclude coverage/ --exclude .nyc_output/ --exclude perf.data --exclude perf.data.old --exclude perf_hsmm.data --exclude perf_hsmm.data.old --exclude tests/artifacts/ --exclude process_triage/ --exclude sample_sqlite_db_files/ --exclude legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/ --exclude .rch-target/ --exclude .rch-tmp/ --compress-choice=zstd --compress-level=3 /data/projects/frankenlibc/crates/frankenlibc-harness/ ubuntu@38.242.134.66:/data/projects/frankenlibc/crates/frankenlibc-harness",
+      "status": "warn"
+    },
+    {
       "check": "path_order",
       "detail": "/home/ubuntu/.local/bin in PATH at position 5 of 6 (shadowed by /home/ubuntu/.cargo/bin/am at PATH position 1). Fix: move /home/ubuntu/.local/bin earlier in PATH",
       "status": "warn"
     },
     {
+      "check": "binary_version",
+      "detail": "am 0.1.0 (expected v0.2.0)",
+      "status": "warn"
+    },
+    {
       "check": "mcp_config",
-      "detail": "8 config(s) found: 0 Rust, 0 Python, 8 no entry, 0 unreadable",
+      "detail": "11 config(s) found: 3 Rust, 0 Python, 7 no entry, 1 unreadable",
+      "status": "ok"
+    },
+    {
+      "check": "update_available",
+      "detail": "No recent update-check cache. Run `am self-update --check`",
       "status": "warn"
     },
     {
@@ -63,7 +108,7 @@
     {
       "check": "beads_issue_awareness",
       "detail": "<BEADS_ISSUE_AWARENESS_SUMMARY>",
-      "status": "ok"
+      "status": "warn"
     }
   ],
   "healthy": true
