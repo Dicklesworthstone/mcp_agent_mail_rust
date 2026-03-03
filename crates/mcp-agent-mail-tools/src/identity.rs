@@ -635,10 +635,7 @@ Check that all parameters have valid values."
     {
         match result {
             Ok(path) => {
-                tracing::debug!(
-                    "wrote pane identity file: {}",
-                    path.display()
-                );
+                tracing::debug!("wrote pane identity file: {}", path.display());
             }
             Err(e) => {
                 tracing::warn!("failed to write pane identity file: {e}");
@@ -846,10 +843,7 @@ Choose a different name (or omit the name to auto-generate one)."
     {
         match result {
             Ok(path) => {
-                tracing::debug!(
-                    "wrote pane identity file: {}",
-                    path.display()
-                );
+                tracing::debug!("wrote pane identity file: {}", path.display());
             }
             Err(e) => {
                 tracing::warn!("failed to write pane identity file: {e}");

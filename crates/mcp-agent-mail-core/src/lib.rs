@@ -89,16 +89,16 @@ pub use models::{
     detect_agent_name_mistake, generate_agent_name, is_valid_agent_name, looks_like_model_name,
     looks_like_program_name, looks_like_unix_username,
 };
+pub use pane_identity::{
+    canonical_identity_path, cleanup_all_stale_identities, cleanup_stale_identities,
+    list_identities, resolve_identity, resolve_identity_current_pane, write_identity,
+    write_identity_current_pane,
+};
 pub use search_types::{
     DateRange, DocChange, DocId, DocKind, Document, ExplainComposerConfig, ExplainReasonCode,
     ExplainReport, ExplainStage, ExplainVerbosity, HighlightRange, HitExplanation,
     ImportanceFilter, ScoreFactor, SearchFilter, SearchHit, SearchMode, SearchQuery, SearchResults,
     StageExplanation, StageScoreInput, compose_explain_report, compose_hit_explanation,
     factor_sort_cmp, missing_stage, redact_hit_explanation, redact_report_for_docs,
-};
-pub use pane_identity::{
-    canonical_identity_path, cleanup_all_stale_identities, cleanup_stale_identities,
-    list_identities, resolve_identity, resolve_identity_current_pane, write_identity,
-    write_identity_current_pane,
 };
 pub use slo::{OpClass, PoolHealth};

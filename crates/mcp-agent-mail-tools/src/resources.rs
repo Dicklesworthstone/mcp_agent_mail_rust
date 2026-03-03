@@ -4072,7 +4072,7 @@ mod resource_shape_tests {
                         .await
                         .expect("outbox");
                 let outbox_value = parse_json(&outbox_payload);
-                
+
                 assert_eq!(outbox_value["count"], 1);
                 assert_eq!(
                     outbox_value["messages"][0]["subject"],

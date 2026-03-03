@@ -1,6 +1,6 @@
 //! Canonical per-pane agent identity file contract.
 //!
-//! Resolves the diverging conventions described in mcp_agent_mail#111:
+//! Resolves the diverging conventions described in `mcp_agent_mail#111`:
 //!
 //! - Claude Code: `~/.claude/agent-mail/identity.$TMUX_PANE` (persistent, not project-scoped)
 //! - NTM #68: `/tmp/agent-mail-name.<hash>.<pane_id>` (project-scoped, ephemeral)
@@ -42,9 +42,7 @@ pub fn canonical_identity_path(project_key: &str, pane_id: &str) -> PathBuf {
     let base = config_base_dir();
     let hash = project_hash(project_key);
     let sanitized_pane = sanitize_pane_id(pane_id);
-    base.join(IDENTITY_DIR_NAME)
-        .join(hash)
-        .join(sanitized_pane)
+    base.join(IDENTITY_DIR_NAME).join(hash).join(sanitized_pane)
 }
 
 /// Write an agent name to the canonical identity file for a pane.
@@ -122,6 +120,7 @@ pub fn resolve_identity_current_pane(project_key: &str) -> Option<String> {
 ///
 /// Returns `None` if `$TMUX_PANE` is not set, otherwise returns the
 /// write result.
+#[must_use]
 pub fn write_identity_current_pane(
     project_key: &str,
     agent_name: &str,
@@ -137,6 +136,7 @@ pub fn write_identity_current_pane(
 /// whose names do not correspond to a live pane.
 ///
 /// Returns the list of removed file paths.
+#[must_use]
 pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     let base = config_base_dir();
@@ -149,9 +149,8 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
 
     let live_panes = list_live_tmux_panes();
 
-    let entries = match std::fs::read_dir(&project_dir) {
-        Ok(e) => e,
-        Err(_) => return removed,
+    let Ok(entries) = std::fs::read_dir(&project_dir) else {
+        return removed;
     };
 
     for entry in entries.flatten() {
@@ -166,10 +165,8 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
 
         if !live_panes.contains(&name_str.to_string()) {
             let path = entry.path();
-            if path.is_file() {
-                if std::fs::remove_file(&path).is_ok() {
-                    removed.push(path);
-                }
+            if path.is_file() && std::fs::remove_file(&path).is_ok() {
+                removed.push(path);
             }
         }
     }
@@ -181,6 +178,7 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
 ///
 /// Iterates over every `<project_hash>/` directory under the identity root
 /// and prunes files for dead panes. Returns all removed file paths.
+#[must_use]
 pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
     let mut removed = Vec::new();
     let base = config_base_dir();
@@ -196,9 +194,8 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
         return removed;
     }
 
-    let entries = match std::fs::read_dir(&identity_root) {
-        Ok(e) => e,
-        Err(_) => return removed,
+    let Ok(entries) = std::fs::read_dir(&identity_root) else {
+        return removed;
     };
 
     for dir_entry in entries.flatten() {
@@ -206,19 +203,16 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
         if !project_dir.is_dir() {
             continue;
         }
-        let files = match std::fs::read_dir(&project_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(files) = std::fs::read_dir(&project_dir) else {
+            continue;
         };
         for file_entry in files.flatten() {
             let file_name = file_entry.file_name();
             let name_str = file_name.to_string_lossy();
             if !live_panes.contains(&name_str.to_string()) {
                 let path = file_entry.path();
-                if path.is_file() {
-                    if std::fs::remove_file(&path).is_ok() {
-                        removed.push(path);
-                    }
+                if path.is_file() && std::fs::remove_file(&path).is_ok() {
+                    removed.push(path);
                 }
             }
         }
@@ -241,9 +235,8 @@ pub fn list_identities(project_key: &str) -> Vec<(String, String)> {
     }
 
     let mut result = Vec::new();
-    let entries = match std::fs::read_dir(&project_dir) {
-        Ok(e) => e,
-        Err(_) => return result,
+    let Ok(entries) = std::fs::read_dir(&project_dir) else {
+        return result;
     };
 
     for entry in entries.flatten() {
@@ -297,7 +290,11 @@ fn sanitize_pane_id(pane_id: &str) -> String {
 fn read_identity_file(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let trimmed = content.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 #[must_use]
@@ -414,7 +411,10 @@ mod tests {
             path_str.contains("agent-mail/identity/"),
             "missing identity dir: {path_str}"
         );
-        assert!(path_str.ends_with("/3"), "expected pane id suffix: {path_str}");
+        assert!(
+            path_str.ends_with("/3"),
+            "expected pane id suffix: {path_str}"
+        );
     }
 
     #[test]
