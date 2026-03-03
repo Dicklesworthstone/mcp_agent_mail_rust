@@ -3959,6 +3959,41 @@ fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
     sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
 }
 
+fn sqlite_quick_check_via_cli(path: &Path) -> CliResult<Option<bool>> {
+    let output = match std::process::Command::new("sqlite3")
+        .arg(path)
+        .arg("PRAGMA quick_check;")
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(CliError::Other(format!(
+                "failed to run sqlite3 quick_check for {}: {e}",
+                path.display()
+            )));
+        }
+    };
+
+    if !output.status.success() {
+        return Ok(Some(false));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let checks: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if checks.is_empty() {
+        return Ok(Some(false));
+    }
+
+    Ok(Some(
+        checks.len() == 1 && checks[0].eq_ignore_ascii_case("ok"),
+    ))
+}
+
 fn sqlite_doctor_sanity_with_health_probe<F>(
     db_path: &str,
     mut health_probe: F,
@@ -3969,6 +4004,7 @@ where
     let mut selected_path = PathBuf::from(db_path);
     let mut used_absolute_fallback = false;
     let mut fallback_due_to_missing_configured_path = false;
+    let mut sqlite3_probe_failed = false;
 
     if !selected_path.exists() {
         if let Some(absolute_candidate) = sqlite_absolute_candidate_path(db_path) {
@@ -4025,6 +4061,13 @@ where
         }
     }
 
+    if let Some(sqlite3_ok) = sqlite_quick_check_via_cli(selected_path.as_path())? {
+        if !sqlite3_ok {
+            sqlite3_probe_failed = true;
+            healthy = false;
+        }
+    }
+
     let file_size = selected_path.metadata().map(|m| m.len()).map_err(|e| {
         CliError::Other(format!(
             "cannot stat database file {}: {e}",
@@ -4040,19 +4083,27 @@ where
         ));
     }
 
+    let sqlite3_note = if sqlite3_probe_failed {
+        "; sqlite3 quick_check failed".to_string()
+    } else {
+        String::new()
+    };
+
     if healthy {
         if used_absolute_fallback {
             let detail = if fallback_due_to_missing_configured_path {
                 format!(
-                    "quick_check OK via absolute fallback {} (configured path missing; {} bytes)",
+                    "quick_check OK via absolute fallback {} (configured path missing; {} bytes){}",
                     selected_path.display(),
-                    file_size
+                    file_size,
+                    sqlite3_note
                 )
             } else {
                 format!(
-                    "quick_check OK via absolute fallback {} ({} bytes)",
+                    "quick_check OK via absolute fallback {} ({} bytes){}",
                     selected_path.display(),
-                    file_size
+                    file_size,
+                    sqlite3_note
                 )
             };
             return Ok((
@@ -4064,7 +4115,7 @@ where
         }
         return Ok((
             true,
-            format!("quick_check OK ({file_size} bytes)"),
+            format!("quick_check OK ({file_size} bytes){sqlite3_note}"),
             used_absolute_fallback,
             fallback_due_to_missing_configured_path,
         ));
@@ -4073,8 +4124,9 @@ where
     Ok((
         false,
         format!(
-            "Health probes failed for {} (possible corruption)",
-            selected_path.display()
+            "Health probes failed for {} (possible corruption){}",
+            selected_path.display(),
+            sqlite3_note
         ),
         used_absolute_fallback,
         fallback_due_to_missing_configured_path,
@@ -4090,8 +4142,11 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
         return Vec::new();
     };
-    let Some(parent) = path.parent() else {
-        return Vec::new();
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let scan_dir = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
     };
 
     let bak = path.with_file_name(format!("{file_name}.bak"));
@@ -4106,7 +4161,7 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     let backup_prefix = format!("{file_name}.backup-");
     let backup_bak_prefix = format!("{file_name}.bak.");
     let recovery_prefix = format!("{file_name}.recovery");
-    if let Ok(entries) = std::fs::read_dir(parent) {
+    if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
             let candidate = entry.path();
             if !candidate.is_file() {
@@ -7354,6 +7409,11 @@ fn handle_migrate_rollback(
 fn list_db_backups(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Vec<PathBuf>> {
     let backup_parent =
         backup_dir.unwrap_or_else(|| db_path.parent().unwrap_or_else(|| Path::new(".")));
+    let backup_parent = if backup_parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        backup_parent
+    };
     let db_name = db_path
         .file_name()
         .unwrap_or_default()
@@ -7385,21 +7445,44 @@ fn list_db_backups(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Vec<P
     Ok(backups)
 }
 
-fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
-    let rollback_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let rollback_backup = db_path.with_file_name(format!(
-        "{}.pre_rollback.{rollback_ts}",
-        db_path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    std::fs::copy(db_path, &rollback_backup).map_err(|e| {
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar_os = db_path.as_os_str().to_os_string();
+    sidecar_os.push(suffix);
+    PathBuf::from(sidecar_os)
+}
+
+fn sqlite_checkpoint_truncate(db_path: &Path) -> CliResult<()> {
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).map_err(|e| {
         CliError::Other(format!(
-            "failed to create pre-rollback backup {}: {e}",
-            rollback_backup.display()
+            "cannot open {} to create consistent backup: {e}",
+            db_path.display()
         ))
     })?;
+    conn.execute_raw("PRAGMA busy_timeout = 60000;")
+        .map_err(|e| CliError::Other(format!("cannot set busy_timeout before backup: {e}")))?;
+    conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+        .map_err(|e| CliError::Other(format!("WAL checkpoint failed before backup: {e}")))?;
+    Ok(())
+}
 
-    let db_wal = PathBuf::from(format!("{}-wal", db_path.display()));
-    let db_shm = PathBuf::from(format!("{}-shm", db_path.display()));
+fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
+    if db_path.exists() {
+        let rollback_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let rollback_backup = db_path.with_file_name(format!(
+            "{}.pre_rollback.{rollback_ts}",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::copy(db_path, &rollback_backup).map_err(|e| {
+            CliError::Other(format!(
+                "failed to create pre-rollback backup {}: {e}",
+                rollback_backup.display()
+            ))
+        })?;
+    }
+
+    let db_wal = sqlite_sidecar_path(db_path, "-wal");
+    let db_shm = sqlite_sidecar_path(db_path, "-shm");
     if db_wal.exists() {
         let _ = std::fs::remove_file(&db_wal);
     }
@@ -7415,18 +7498,22 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
         ))
     })?;
 
-    let backup_name = backup_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let wal_backup = backup_path.with_file_name(format!("{backup_name}-wal"));
-    if wal_backup.exists() {
-        let _ = std::fs::copy(&wal_backup, &db_wal);
+    // Never restore WAL/SHM sidecars from backup artifacts. Sidecars can be
+    // stale/inconsistent relative to the copied main DB and have repeatedly
+    // caused malformed-image failures. Let SQLite recreate fresh sidecars.
+    if db_wal.exists() {
+        let _ = std::fs::remove_file(&db_wal);
     }
-    let shm_backup = backup_path.with_file_name(format!("{backup_name}-shm"));
-    if shm_backup.exists() {
-        let _ = std::fs::copy(&shm_backup, &db_shm);
+    if db_shm.exists() {
+        let _ = std::fs::remove_file(&db_shm);
+    }
+
+    if !sqlite_file_is_healthy(db_path)? {
+        return Err(CliError::Other(format!(
+            "restored backup {} but quick_check failed for {}",
+            backup_path.display(),
+            db_path.display()
+        )));
     }
 
     Ok(())
@@ -7434,6 +7521,15 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
 
 /// Create a timestamped backup of the database file.
 fn create_db_backup(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<PathBuf> {
+    if !db_path.exists() {
+        return Err(CliError::Other(format!(
+            "database file does not exist: {}",
+            db_path.display()
+        )));
+    }
+
+    sqlite_checkpoint_truncate(db_path)?;
+
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let backup_name = format!(
         "{}.bak.{timestamp}",
@@ -7457,16 +7553,6 @@ fn create_db_backup(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Path
             backup_path.display()
         ))
     })?;
-
-    // Also backup WAL/SHM if present
-    let wal = PathBuf::from(format!("{}-wal", db_path.display()));
-    if wal.exists() {
-        let _ = std::fs::copy(&wal, backup_parent.join(format!("{backup_name}-wal")));
-    }
-    let shm = PathBuf::from(format!("{}-shm", db_path.display()));
-    if shm.exists() {
-        let _ = std::fs::copy(&shm, backup_parent.join(format!("{backup_name}-shm")));
-    }
 
     Ok(backup_path)
 }
@@ -16193,18 +16279,66 @@ mod tests {
         assert_eq!(backups[1], older);
     }
 
+    fn write_marker_db(path: &Path, marker: &str) {
+        let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
+            .expect("open marker db");
+        conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT)")
+            .expect("create marker table");
+        conn.execute_raw("DELETE FROM marker")
+            .expect("clear marker table");
+        conn.execute_sync(
+            "INSERT INTO marker(value) VALUES (?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                marker.to_string(),
+            )],
+        )
+        .expect("insert marker row");
+        let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+
+    fn read_marker_db(path: &Path) -> String {
+        let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
+            .expect("open marker db for read");
+        let rows = conn
+            .query_sync("SELECT value FROM marker LIMIT 1", &[])
+            .expect("query marker");
+        rows.first()
+            .and_then(|row| row.get_named::<String>("value").ok())
+            .expect("marker value")
+    }
+
     #[test]
     fn restore_db_from_backup_replaces_contents() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         let backup_path = dir.path().join("storage.sqlite3.bak.20260102_000000");
+        let backup_source_path = dir.path().join("storage-backup-source.sqlite3");
 
-        std::fs::write(&db_path, b"live-db").expect("write live db");
-        std::fs::write(&backup_path, b"backup-db").expect("write backup db");
+        write_marker_db(&db_path, "live-db");
+        write_marker_db(&backup_source_path, "backup-db");
+        std::fs::copy(&backup_source_path, &backup_path).expect("seed backup db");
+
+        let db_wal = sqlite_sidecar_path(&db_path, "-wal");
+        let db_shm = sqlite_sidecar_path(&db_path, "-shm");
+        let backup_wal = sqlite_sidecar_path(&backup_path, "-wal");
+        let backup_shm = sqlite_sidecar_path(&backup_path, "-shm");
+        std::fs::write(&db_wal, b"live-wal").expect("write live wal");
+        std::fs::write(&db_shm, b"live-shm").expect("write live shm");
+        std::fs::write(&backup_wal, b"backup-wal").expect("write backup wal");
+        std::fs::write(&backup_shm, b"backup-shm").expect("write backup shm");
 
         restore_db_from_backup(&db_path, &backup_path).expect("restore");
-        let restored = std::fs::read(&db_path).expect("read restored db");
-        assert_eq!(restored, b"backup-db");
+        let restored = read_marker_db(&db_path);
+        assert_eq!(restored, "backup-db");
+
+        if db_wal.exists() {
+            let wal_bytes = std::fs::read(&db_wal).expect("read restored wal");
+            assert_ne!(wal_bytes, b"backup-wal");
+        }
+        if db_shm.exists() {
+            let shm_bytes = std::fs::read(&db_shm).expect("read restored shm");
+            assert_ne!(shm_bytes, b"backup-shm");
+        }
 
         let backup_prefix = "storage.sqlite3.pre_rollback.";
         let rollback_artifacts: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
@@ -16221,6 +16355,28 @@ mod tests {
             rollback_artifacts.len(),
             1,
             "expected one pre-rollback backup artifact"
+        );
+    }
+
+    #[test]
+    fn create_db_backup_omits_wal_and_shm_sidecar_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        write_marker_db(&db_path, "snapshot");
+
+        let backup = create_db_backup(&db_path, Some(dir.path())).expect("create backup");
+        assert!(backup.exists());
+        assert_eq!(read_marker_db(&backup), "snapshot");
+
+        let backup_wal = sqlite_sidecar_path(&backup, "-wal");
+        let backup_shm = sqlite_sidecar_path(&backup, "-shm");
+        assert!(
+            !backup_wal.exists(),
+            "backup should not carry WAL sidecar to avoid stale restore artifacts"
+        );
+        assert!(
+            !backup_shm.exists(),
+            "backup should not carry SHM sidecar to avoid stale restore artifacts"
         );
     }
 
@@ -23796,6 +23952,25 @@ mod tests {
         assert!(is_sqlite_recovery_error_message(
             "Query error: cursor must be on a leaf"
         ));
+    }
+
+    #[test]
+    fn sqlite_quick_check_via_cli_handles_missing_binary_and_valid_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sqlite3_probe_ok.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open sqlite db");
+        conn.execute_raw("CREATE TABLE marker(value TEXT)")
+            .expect("create marker table");
+        conn.execute_raw("INSERT INTO marker(value) VALUES('ok')")
+            .expect("insert marker");
+        let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+
+        let probe = sqlite_quick_check_via_cli(&db_path).expect("probe should not error");
+        if let Some(ok) = probe {
+            assert!(ok, "sqlite3 quick_check should report ok for healthy db");
+        }
     }
 
     #[test]

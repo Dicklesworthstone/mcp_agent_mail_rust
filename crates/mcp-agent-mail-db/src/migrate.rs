@@ -704,7 +704,11 @@ fn is_sqlite_file(path: &std::path::Path) -> bool {
     header.starts_with(b"SQLite format 3\0")
 }
 
-/// Copy a Python database to the Rust storage root, preserving WAL/SHM files.
+/// Copy a Python database to the Rust storage root.
+///
+/// Performs `wal_checkpoint(TRUNCATE)` on the source DB first, then copies only
+/// the main database file. WAL/SHM sidecars are intentionally not copied to avoid
+/// transporting stale sidecar state that can trigger malformed-image failures.
 ///
 /// Returns the destination path if successful, or `None` if:
 /// - The destination already exists (won't overwrite)
@@ -732,6 +736,26 @@ pub fn copy_python_database_to_rust(
         ))
     })?;
 
+    // Ensure the source DB is self-contained before copying.
+    let source_path = python_db.to_string_lossy().into_owned();
+    let source_conn = DbConn::open_file(&source_path).map_err(|e| {
+        MigrationError::Aborted(format!(
+            "cannot open source database {} for checkpoint: {e}",
+            python_db.display()
+        ))
+    })?;
+    source_conn
+        .execute_raw("PRAGMA busy_timeout = 60000;")
+        .map_err(|e| MigrationError::Aborted(format!("cannot set source busy_timeout: {e}")))?;
+    source_conn
+        .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+        .map_err(|e| {
+            MigrationError::Aborted(format!(
+                "cannot checkpoint source database {} before copy: {e}",
+                python_db.display()
+            ))
+        })?;
+
     // Copy main DB file
     std::fs::copy(python_db, &dest).map_err(|e| {
         MigrationError::Aborted(format!(
@@ -741,16 +765,14 @@ pub fn copy_python_database_to_rust(
         ))
     })?;
 
-    // Copy WAL and SHM if present
-    let wal = python_db.with_extension("sqlite3-wal");
-    if wal.exists() {
-        let dest_wal = dest.with_extension("sqlite3-wal");
-        let _ = std::fs::copy(&wal, &dest_wal);
-    }
-    let shm = python_db.with_extension("sqlite3-shm");
-    if shm.exists() {
-        let dest_shm = dest.with_extension("sqlite3-shm");
-        let _ = std::fs::copy(&shm, &dest_shm);
+    // Ensure destination starts without stale sidecars.
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_os = dest.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar = std::path::PathBuf::from(sidecar_os);
+        if sidecar.exists() {
+            let _ = std::fs::remove_file(sidecar);
+        }
     }
 
     Ok(Some(dest))
@@ -1271,7 +1293,6 @@ mod tests {
 
     #[test]
     fn copy_database_to_rust_storage() {
-        use std::io::Write;
         let base = std::env::temp_dir().join("migrate_test_copy_db");
         let src_dir = base.join("python");
         let dst_dir = base.join("rust_storage");
@@ -1279,9 +1300,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dst_dir);
 
         let src_db = src_dir.join("storage.sqlite3");
-        let mut f = std::fs::File::create(&src_db).unwrap();
-        f.write_all(b"SQLite format 3\0test data here").unwrap();
-        drop(f);
+        let source_conn = DbConn::open_file(src_db.display().to_string()).expect("open source db");
+        source_conn
+            .execute_raw("CREATE TABLE marker(value TEXT)")
+            .expect("create source marker table");
+        source_conn
+            .execute_raw("INSERT INTO marker(value) VALUES('python-source')")
+            .expect("seed source marker");
+        let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+
+        let source_wal = std::path::PathBuf::from(format!("{}-wal", src_db.display()));
+        let source_shm = std::path::PathBuf::from(format!("{}-shm", src_db.display()));
+        std::fs::write(&source_wal, b"python-sidecar-wal").expect("write source wal");
+        std::fs::write(&source_shm, b"python-sidecar-shm").expect("write source shm");
 
         let result = copy_python_database_to_rust(&src_db, &dst_dir).unwrap();
         assert!(result.is_some());
@@ -1289,8 +1320,26 @@ mod tests {
         assert!(dest.exists());
         assert_eq!(dest, dst_dir.join("storage.sqlite3"));
 
-        let content = std::fs::read(&dest).unwrap();
-        assert!(content.starts_with(b"SQLite format 3\0"));
+        let dest_conn = DbConn::open_file(dest.display().to_string()).expect("open copied db");
+        let rows = dest_conn
+            .query_sync("SELECT value FROM marker LIMIT 1", &[])
+            .expect("query copied marker");
+        let marker: String = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("value").ok())
+            .expect("copied marker value");
+        assert_eq!(marker, "python-source");
+
+        let dest_wal = std::path::PathBuf::from(format!("{}-wal", dest.display()));
+        let dest_shm = std::path::PathBuf::from(format!("{}-shm", dest.display()));
+        assert!(
+            !dest_wal.exists(),
+            "destination should not include copied WAL sidecar"
+        );
+        assert!(
+            !dest_shm.exists(),
+            "destination should not include copied SHM sidecar"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
