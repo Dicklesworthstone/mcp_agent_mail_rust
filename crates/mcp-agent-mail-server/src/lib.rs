@@ -2561,7 +2561,6 @@ impl StartupDashboard {
         const INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
         const INPUT_DRAIN_POLL_TIMEOUT: Duration = Duration::from_millis(6);
         const INPUT_ERROR_BACKOFF: Duration = Duration::from_millis(25);
-        const INPUT_EMPTY_READY_STREAK_LIMIT: usize = 8;
         const INPUT_EMPTY_READY_BACKOFF: Duration = Duration::from_millis(8);
         const INPUT_DRAIN_CAP_STREAK_LIMIT: usize = 1;
         const INPUT_DRAIN_CAP_BACKOFF: Duration = Duration::from_millis(6);
@@ -2595,7 +2594,6 @@ impl StartupDashboard {
 
                 let mut poll_error_reported = false;
                 let mut read_error_reported = false;
-                let mut empty_ready_streak = 0usize;
                 let mut drain_cap_streak = 0usize;
 
                 while !this.stop.load(Ordering::Relaxed) {
@@ -2616,7 +2614,6 @@ impl StartupDashboard {
                         }
                     };
                     if !ready {
-                        empty_ready_streak = 0;
                         continue;
                     }
 
@@ -2672,14 +2669,8 @@ impl StartupDashboard {
                         }
                     }
 
-                    if saw_event {
-                        empty_ready_streak = 0;
-                    } else {
-                        empty_ready_streak = empty_ready_streak.saturating_add(1);
-                        if empty_ready_streak >= INPUT_EMPTY_READY_STREAK_LIMIT {
-                            std::thread::sleep(INPUT_EMPTY_READY_BACKOFF);
-                            empty_ready_streak = 0;
-                        }
+                    if !saw_event {
+                        std::thread::sleep(INPUT_EMPTY_READY_BACKOFF);
                     }
 
                     if hit_drain_cap {

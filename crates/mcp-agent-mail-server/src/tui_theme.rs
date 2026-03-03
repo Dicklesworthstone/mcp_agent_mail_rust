@@ -3761,8 +3761,8 @@ mod tests {
             let mut frame = Frame::new(120, 40, &mut pool);
             model.view(&mut frame);
 
-            assert_eq!(frame.width(), 120, "theme {:?} frame width", theme_id);
-            assert_eq!(frame.height(), 40, "theme {:?} frame height", theme_id);
+            assert_eq!(frame.width(), 120, "theme {theme_id:?} frame width");
+            assert_eq!(frame.height(), 40, "theme {theme_id:?} frame height");
         }
     }
 
@@ -3779,11 +3779,10 @@ mod tests {
         for &theme_id in &themes {
             let _guard = ScopedThemeLock::new(theme_id);
             let md = markdown_theme();
-            assert!(md.h1.fg.is_some(), "theme {:?} h1 missing fg", theme_id);
+            assert!(md.h1.fg.is_some(), "theme {theme_id:?} h1 missing fg");
             assert!(
                 md.code_block.fg.is_some(),
-                "theme {:?} code_block missing fg",
-                theme_id
+                "theme {theme_id:?} code_block missing fg"
             );
             h1_fgs.push(md.h1.fg);
         }
