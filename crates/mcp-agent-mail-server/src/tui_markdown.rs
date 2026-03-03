@@ -5,8 +5,11 @@
 //! styling, otherwise it's displayed as plain text.
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 
+use ftui::PackedRgba;
+use ftui::text::{Line, Span};
 use ammonia::Builder;
 use ftui::text::Text;
 pub use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown};
@@ -153,6 +156,270 @@ fn prepare_body_for_render(body_md: &str) -> String {
     } else {
         body_md.to_string()
     }
+}
+
+/// One visible row in a collapsible JSON tree rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonTreeRow {
+    /// Stable node path (JSON Pointer-like, rooted at `$`).
+    pub path: String,
+    /// Whether the node has children that can be expanded/collapsed.
+    pub expandable: bool,
+    /// Whether the node is currently expanded.
+    pub expanded: bool,
+    /// Human-readable scalar/summary value for this row.
+    pub value_preview: String,
+    /// Pre-styled render line.
+    pub line: Line<'static>,
+}
+
+/// Shared JSON-tree interaction state for detail panes.
+#[derive(Debug, Clone, Default)]
+pub struct JsonTreeViewState {
+    body_hash: Option<u64>,
+    parsed_value: Option<serde_json::Value>,
+    expanded_paths: HashSet<String>,
+    cursor: usize,
+}
+
+impl JsonTreeViewState {
+    /// Synchronize the state against a candidate body payload.
+    ///
+    /// Returns `true` when `body` is valid JSON and tree view is available.
+    pub fn sync_body(&mut self, body: &str) -> bool {
+        let body_hash = stable_hash(body.as_bytes());
+        if self.body_hash == Some(body_hash) {
+            return self.parsed_value.is_some();
+        }
+
+        self.body_hash = Some(body_hash);
+        self.parsed_value = serde_json::from_str::<serde_json::Value>(body.trim()).ok();
+        self.expanded_paths.clear();
+        self.cursor = 0;
+        if self.parsed_value.is_some() {
+            self.expanded_paths.insert("$".to_string());
+        }
+        self.parsed_value.is_some()
+    }
+
+    /// Whether the currently synced payload is valid JSON.
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        self.parsed_value.is_some()
+    }
+
+    /// Build flattened rows for the current JSON tree.
+    #[must_use]
+    pub fn rows(&self) -> Vec<JsonTreeRow> {
+        let Some(value) = self.parsed_value.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        flatten_json_rows(value, None, "$".to_string(), 0, &self.expanded_paths, &mut out);
+        out
+    }
+
+    /// Current selected row index.
+    #[must_use]
+    pub const fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Move selection by `delta` rows.
+    pub fn move_cursor_by(&mut self, delta: isize) {
+        let rows_len = self.rows().len();
+        if rows_len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        if delta.is_negative() {
+            self.cursor = self.cursor.saturating_sub(delta.unsigned_abs());
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            let step = delta as usize;
+            self.cursor = self.cursor.saturating_add(step).min(rows_len.saturating_sub(1));
+        }
+    }
+
+    /// Toggle expand/collapse on the selected row.
+    ///
+    /// Returns `true` when a node expansion state changed.
+    pub fn toggle_selected(&mut self) -> bool {
+        let rows = self.rows();
+        let Some(row) = rows.get(self.cursor) else {
+            self.cursor = 0;
+            return false;
+        };
+        if !row.expandable {
+            return false;
+        }
+        if row.expanded {
+            self.expanded_paths.remove(&row.path);
+        } else {
+            self.expanded_paths.insert(row.path.clone());
+        }
+        true
+    }
+
+    /// Ensure the cursor remains within row bounds.
+    pub fn clamp_cursor(&mut self) {
+        let rows_len = self.rows().len();
+        if rows_len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= rows_len {
+            self.cursor = rows_len - 1;
+        }
+    }
+}
+
+fn stable_hash<T: Hash>(value: T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+const JSON_KEY_FG: PackedRgba = PackedRgba::rgb(17, 168, 205);
+const JSON_STRING_FG: PackedRgba = PackedRgba::rgb(13, 188, 121);
+const JSON_NUMBER_FG: PackedRgba = PackedRgba::rgb(229, 229, 16);
+const JSON_BOOL_FG: PackedRgba = PackedRgba::rgb(188, 63, 188);
+const JSON_NULL_FG: PackedRgba = PackedRgba::rgb(120, 120, 120);
+const JSON_PUNCT_FG: PackedRgba = PackedRgba::rgb(180, 180, 190);
+
+fn flatten_json_rows(
+    value: &serde_json::Value,
+    key_label: Option<String>,
+    path: String,
+    depth: usize,
+    expanded_paths: &HashSet<String>,
+    out: &mut Vec<JsonTreeRow>,
+) {
+    let expandable = match value {
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        _ => false,
+    };
+    let expanded = !expandable || expanded_paths.contains(path.as_str());
+    let value_preview = format_json_value_preview(value);
+    let line = build_json_tree_line(depth, key_label.as_deref(), value, &value_preview, expandable, expanded);
+    out.push(JsonTreeRow {
+        path: path.clone(),
+        expandable,
+        expanded,
+        value_preview,
+        line,
+    });
+
+    if !expandable || !expanded {
+        return;
+    }
+
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = format!("{path}/{}", json_pointer_escape(key));
+                flatten_json_rows(
+                    child,
+                    Some(key.clone()),
+                    child_path,
+                    depth + 1,
+                    expanded_paths,
+                    out,
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let child_path = format!("{path}/{index}");
+                flatten_json_rows(
+                    child,
+                    Some(format!("[{index}]")),
+                    child_path,
+                    depth + 1,
+                    expanded_paths,
+                    out,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_pointer_escape(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
+fn format_json_value_preview(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let count = map.len();
+            let suffix = if count == 1 { "" } else { "s" };
+            format!("{{{count} key{suffix}}}")
+        }
+        serde_json::Value::Array(items) => {
+            let count = items.len();
+            let suffix = if count == 1 { "" } else { "s" };
+            format!("[{count} item{suffix}]")
+        }
+        serde_json::Value::String(s) => format!("\"{}\"", truncate_str(s, 96)),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+    }
+}
+
+fn build_json_tree_line(
+    depth: usize,
+    key_label: Option<&str>,
+    value: &serde_json::Value,
+    value_preview: &str,
+    expandable: bool,
+    expanded: bool,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if depth > 0 {
+        spans.push(Span::raw("  ".repeat(depth)));
+    }
+    let marker = if expandable {
+        if expanded { "▼ " } else { "▶ " }
+    } else {
+        "  "
+    };
+    spans.push(Span::styled(
+        marker.to_string(),
+        ftui::Style::default().fg(JSON_PUNCT_FG),
+    ));
+    if let Some(label) = key_label {
+        let rendered_label = if label.starts_with('[') {
+            label.to_string()
+        } else {
+            format!("\"{label}\"")
+        };
+        spans.push(Span::styled(
+            rendered_label,
+            ftui::Style::default().fg(JSON_KEY_FG),
+        ));
+        spans.push(Span::styled(
+            ": ".to_string(),
+            ftui::Style::default().fg(JSON_PUNCT_FG),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "root: ".to_string(),
+            ftui::Style::default().fg(JSON_PUNCT_FG),
+        ));
+    }
+
+    let value_style = match value {
+        serde_json::Value::String(_) => ftui::Style::default().fg(JSON_STRING_FG),
+        serde_json::Value::Number(_) => ftui::Style::default().fg(JSON_NUMBER_FG),
+        serde_json::Value::Bool(_) => ftui::Style::default().fg(JSON_BOOL_FG),
+        serde_json::Value::Null => ftui::Style::default().fg(JSON_NULL_FG),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            ftui::Style::default().fg(JSON_PUNCT_FG)
+        }
+    };
+    spans.push(Span::styled(value_preview.to_string(), value_style));
+    Line::from_spans(spans)
 }
 
 /// Truncate a string to at most `max_chars` characters, appending "..."

@@ -13,6 +13,7 @@
 #   --dest DIR         Install to DIR (default: ~/.local/bin)
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
+#   --no-easy          Do not auto-update PATH, even for piped installs
 #   --verify           Run self-test after install
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
@@ -21,6 +22,8 @@
 #   --no-verify        Skip checksum + signature verification (for testing only)
 #   --offline          Skip network preflight checks
 #   --force            Force reinstall even if already at version
+#   --migrate          Force Python->Rust migration/displacement when Python install detected
+#   --no-migrate       Skip Python->Rust migration/displacement even when detected
 #   --uninstall        Remove installed binaries/configuration helpers
 #   --yes              Non-interactive mode (skip all confirmations)
 #   --purge            With --uninstall, also delete data directories/database
@@ -34,6 +37,8 @@ shopt -s lastpipe 2>/dev/null || true
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-mcp_agent_mail_rust}"
+ISSUES_URL="${ISSUES_URL:-https://github.com/${OWNER}/${REPO}/issues}"
+INSTALL_SCRIPT_URL="${INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.sh}"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
 EASY=0
@@ -52,6 +57,8 @@ SYSTEM=0
 NO_GUM=0
 NO_CHECKSUM=0
 FORCE_INSTALL=0
+FORCE_MIGRATE=0
+FORCE_NO_MIGRATE=0
 UNINSTALL=0
 ASSUME_YES=0
 PURGE=0
@@ -118,6 +125,15 @@ err() {
   fi
 }
 
+error_usage_hint() {
+  err "Run './install.sh --help' for full option details."
+}
+
+error_support_hint() {
+  err "Try re-running with --verbose for detailed diagnostics."
+  err "If this persists, report at ${ISSUES_URL} and include log: ${LOG_FILE}"
+}
+
 init_verbose_log() {
   [ "$LOG_INITIALIZED" -eq 1 ] && return 0
   local log_dir
@@ -165,6 +181,8 @@ on_error() {
   trap - ERR
   if [ "$exit_code" -ne 0 ]; then
     err "Installer failed (exit ${exit_code}) at line ${line_no}"
+    err "Unexpected installer error."
+    error_support_hint
     dump_verbose_tail
   fi
   exit "$exit_code"
@@ -351,6 +369,7 @@ check_disk_space() {
     avail_kb=$(df -Pk "$path" | awk 'NR==2 {print $4}')
     if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$min_kb" ]; then
       err "Insufficient disk space in $path (need at least 20MB)"
+      err "Free disk space or choose a different install directory with --dest."
       exit 1
     fi
   else
@@ -2236,6 +2255,8 @@ verify_checksum() {
 
   if [ ! -f "$file" ]; then
     err "File not found: $file"
+    err "Re-run the installer to download a fresh artifact."
+    error_support_hint
     return 1
   fi
 
@@ -2254,6 +2275,10 @@ verify_checksum() {
     err "Expected: $expected"
     err "Got:      $actual"
     err "The downloaded file may be corrupted or tampered with."
+    err "Try re-running the installer to fetch a fresh artifact."
+    err "If you passed --checksum manually, verify it matches the release asset."
+    err "Use --no-verify only for local testing with trusted artifacts."
+    error_support_hint
     rm -f "$file"
     return 1
   fi
@@ -2330,7 +2355,7 @@ usage() {
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] \\
                   [--offline] [--no-gum] [--no-verify] [--force] [--from-source] [--verbose] \\
-                  [--uninstall] [--yes] [--purge] [--dry-run]
+                  [--migrate|--no-migrate] [--uninstall] [--yes] [--purge] [--dry-run]
 
 Installs mcp-agent-mail and am (CLI) binaries.
 
@@ -2339,6 +2364,7 @@ Options:
   --dest DIR         Install to DIR (default: ~/.local/bin)
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH in shell rc files
+  --no-easy          Do not auto-update PATH in shell rc files
   --verify           Run self-test after install
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
@@ -2347,6 +2373,8 @@ Options:
   --no-gum           Disable gum formatting even if available
   --no-verify        Skip checksum + signature verification (for testing only)
   --force            Force reinstall even if same version is installed
+  --migrate          Force Python->Rust migration/displacement when Python install is detected
+  --no-migrate       Skip Python->Rust migration/displacement even if Python install is detected
   --uninstall        Remove installed binaries/configuration helpers
   --yes              Non-interactive mode (skip all confirmations)
   --purge            With --uninstall, also delete storage/database data
@@ -2365,6 +2393,7 @@ while [ $# -gt 0 ]; do
     --version)
       if [ $# -lt 2 ]; then
         err "Option --version requires a value"
+        error_usage_hint
         dump_verbose_tail
         exit 2
       fi
@@ -2372,16 +2401,19 @@ while [ $# -gt 0 ]; do
     --dest)
       if [ $# -lt 2 ]; then
         err "Option --dest requires a value"
+        error_usage_hint
         dump_verbose_tail
         exit 2
       fi
       DEST="$2"; shift 2;;
     --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
     --easy-mode) EASY=1; shift;;
+    --no-easy) EASY=0; shift;;
     --verify) VERIFY=1; shift;;
     --artifact-url)
       if [ $# -lt 2 ]; then
         err "Option --artifact-url requires a value"
+        error_usage_hint
         dump_verbose_tail
         exit 2
       fi
@@ -2389,6 +2421,7 @@ while [ $# -gt 0 ]; do
     --checksum)
       if [ $# -lt 2 ]; then
         err "Option --checksum requires a value"
+        error_usage_hint
         dump_verbose_tail
         exit 2
       fi
@@ -2396,6 +2429,7 @@ while [ $# -gt 0 ]; do
     --checksum-url)
       if [ $# -lt 2 ]; then
         err "Option --checksum-url requires a value"
+        error_usage_hint
         dump_verbose_tail
         exit 2
       fi
@@ -2407,16 +2441,28 @@ while [ $# -gt 0 ]; do
     --no-gum) NO_GUM=1; shift;;
     --no-verify) NO_CHECKSUM=1; shift;;
     --force) FORCE_INSTALL=1; shift;;
+    --migrate) FORCE_MIGRATE=1; shift;;
+    --no-migrate) FORCE_NO_MIGRATE=1; shift;;
     --uninstall) UNINSTALL=1; shift;;
     --yes|-y) ASSUME_YES=1; shift;;
     --purge) PURGE=1; shift;;
     --dry-run|--preview) DRY_RUN=1; shift;;
     -h|--help) usage; exit 0;;
-    *) shift;;
+    *)
+      err "Unknown option: $1"
+      error_usage_hint
+      exit 2
+      ;;
   esac
 done
 
-verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
+if [ "$FORCE_MIGRATE" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
+  err "Cannot combine --migrate and --no-migrate"
+  error_usage_hint
+  exit 2
+fi
+
+verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} FORCE_MIGRATE=${FORCE_MIGRATE} FORCE_NO_MIGRATE=${FORCE_NO_MIGRATE} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
 
 if [ "$UNINSTALL" -eq 1 ]; then
   uninstall
@@ -2590,6 +2636,8 @@ else
   fi
   if [ "$LOCKED" -eq 0 ]; then
     err "Another installer is running (lock $LOCK_DIR)"
+    err "Wait for the other install to finish, or remove a stale lock after confirming no installer is active."
+    err "Stale-lock cleanup: rmdir \"$LOCK_DIR\""
     exit 1
   fi
 fi
@@ -2631,7 +2679,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     err "only available on the project build server."
     err ""
     err "For end-user installation, use pre-built release binaries:"
-    err "  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh | bash"
+    err "  curl -fsSL ${INSTALL_SCRIPT_URL} | bash"
     err ""
     err "If no release exists yet, check https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases"
     exit 1
@@ -2639,12 +2687,23 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
 
   if ! (cd "$TMP/src" && cargo build --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
     err "Build failed. Check compiler output above for details."
+    error_support_hint
     exit 1
   fi
   local_server="$TMP/src/target/release/$BIN_SERVER"
   local_cli="$TMP/src/target/release/$BIN_CLI"
-  [ -x "$local_server" ] || { err "Build failed: $BIN_SERVER not found"; exit 1; }
-  [ -x "$local_cli" ] || { err "Build failed: $BIN_CLI not found"; exit 1; }
+  [ -x "$local_server" ] || {
+    err "Build failed: $BIN_SERVER not found"
+    err "Retry with --verbose and ensure cargo build completed successfully."
+    error_support_hint
+    exit 1
+  }
+  [ -x "$local_cli" ] || {
+    err "Build failed: $BIN_CLI not found"
+    err "Retry with --verbose and ensure cargo build completed successfully."
+    error_support_hint
+    exit 1
+  }
   atomic_install "$local_server" "$DEST/$BIN_SERVER"
   atomic_install "$local_cli" "$DEST/$BIN_CLI"
   ok "Installed to $DEST (source build)"
@@ -2681,6 +2740,7 @@ else
   if [ -n "$CHECKSUM" ]; then
     if ! verify_checksum "$TMP/$TAR" "$CHECKSUM"; then
       err "Installation aborted due to checksum failure"
+      err "Re-run the installer to fetch a fresh artifact and checksum."
       exit 1
     fi
   fi
@@ -2688,6 +2748,8 @@ else
   if ! verify_sigstore_bundle "$TMP/$TAR" "$URL"; then
     err "Signature verification failed"
     err "The downloaded file may be corrupted or tampered with."
+    err "Retry with a fresh download, or use --no-verify only for trusted local testing."
+    error_support_hint
     exit 1
   fi
 fi
@@ -2707,8 +2769,20 @@ find_bin() {
   return 1
 }
 
-SERVER_BIN=$(find_bin "$BIN_SERVER") || { err "Binary $BIN_SERVER not found in archive"; exit 1; }
-CLI_BIN=$(find_bin "$BIN_CLI") || { err "Binary $BIN_CLI not found in archive"; exit 1; }
+SERVER_BIN=$(find_bin "$BIN_SERVER") || {
+  err "Binary $BIN_SERVER not found in archive"
+  err "The release artifact may be malformed or incomplete."
+  err "Re-run installer with a cache buster or pin a different --version."
+  error_support_hint
+  exit 1
+}
+CLI_BIN=$(find_bin "$BIN_CLI") || {
+  err "Binary $BIN_CLI not found in archive"
+  err "The release artifact may be malformed or incomplete."
+  err "Re-run installer with a cache buster or pin a different --version."
+  error_support_hint
+  exit 1
+}
 
 atomic_install "$SERVER_BIN" "$DEST/$BIN_SERVER"
 atomic_install "$CLI_BIN" "$DEST/$BIN_CLI"
@@ -2720,7 +2794,13 @@ maybe_add_path
 # Displace Python installation if detected (T2.2)
 if [ "$PYTHON_DETECTED" -eq 1 ]; then
   MIGRATE_PYTHON=1
-  if [ "$EASY" -eq 0 ] && [ -t 0 ]; then
+  if [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
+    MIGRATE_PYTHON=0
+    warn "Skipping Python displacement due to --no-migrate."
+  elif [ "$FORCE_MIGRATE" -eq 1 ]; then
+    MIGRATE_PYTHON=1
+    info "Forcing Python displacement due to --migrate."
+  elif [ "$EASY" -eq 0 ] && [ -t 0 ]; then
     # Interactive mode: ask the user
     echo ""
     info "An existing Python mcp-agent-mail installation was detected."
@@ -2748,11 +2828,15 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
     if ! displace_python_alias; then
       err "Failed to fully displace legacy 'am' alias/function definitions."
       err "Please remove remaining alias/function manually, then rerun installer."
+      err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+      error_support_hint
       exit 1
     fi
     if ! displace_python_binary; then
       err "Failed to displace legacy 'am' launcher in PATH."
       err "Please remove or rename the legacy launcher manually, then rerun installer."
+      err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+      error_support_hint
       exit 1
     fi
     resolve_database_path

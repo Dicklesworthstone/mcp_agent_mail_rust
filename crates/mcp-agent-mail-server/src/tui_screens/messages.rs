@@ -547,6 +547,12 @@ enum Focus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailViewMode {
+    Markdown,
+    JsonTree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DockDragState {
     Idle,
     Dragging,
@@ -996,7 +1002,8 @@ pub struct MessageBrowserScreen {
     search_input: TextInput,
     results: Vec<MessageEntry>,
     cursor: usize,
-    detail_scroll: usize,
+    detail_scroll: Cell<usize>,
+    detail_view_mode: Cell<DetailViewMode>,
     focus: Focus,
     /// `VirtualizedList` state for efficient rendering.
     list_state: RefCell<VirtualizedListState>,
@@ -1053,6 +1060,8 @@ pub struct MessageBrowserScreen {
     compose_form: Option<ComposeFormState>,
     /// Cache for rendered message body with inline images:
     detail_cache: RefCell<Option<MessageDetailRenderCache>>,
+    /// Per-selection collapsible JSON tree interaction state.
+    json_tree_state: RefCell<crate::tui_markdown::JsonTreeViewState>,
     /// On-disk path for persisted screen filter presets.
     filter_presets_path: PathBuf,
     /// Preset store loaded from `filter_presets_path`.
@@ -1082,7 +1091,8 @@ impl MessageBrowserScreen {
                 .with_focused(false),
             results: Vec::new(),
             cursor: 0,
-            detail_scroll: 0,
+            detail_scroll: Cell::new(0),
+            detail_view_mode: Cell::new(DetailViewMode::Markdown),
             focus: Focus::ResultList,
             list_state: RefCell::new(VirtualizedListState::default()),
             selected_message_ids: SelectionState::new(),
@@ -1111,6 +1121,7 @@ impl MessageBrowserScreen {
             quick_reply_form: None,
             compose_form: None,
             detail_cache: RefCell::new(None),
+            json_tree_state: RefCell::new(crate::tui_markdown::JsonTreeViewState::default()),
             filter_presets_path,
             filter_presets,
             preset_dialog_mode: PresetDialogMode::None,
@@ -1948,7 +1959,7 @@ impl MessageBrowserScreen {
         let idx = start.saturating_add(row);
         if idx < end {
             self.cursor = idx;
-            self.detail_scroll = 0;
+            self.detail_scroll.set(0);
         }
     }
 
@@ -2202,15 +2213,125 @@ impl MessageBrowserScreen {
     fn scroll_detail_by(&mut self, delta: isize) {
         let max = self.detail_max_scroll();
         if delta.is_negative() {
-            self.detail_scroll = self
-                .detail_scroll
+            self.detail_scroll.set(self
+                .detail_scroll.get()
                 .saturating_sub(delta.unsigned_abs())
-                .min(max);
+                .min(max));
         } else {
             #[allow(clippy::cast_sign_loss)]
             let add = delta as usize;
-            self.detail_scroll = self.detail_scroll.saturating_add(add).min(max);
+            self.detail_scroll.set(self.detail_scroll.get().saturating_add(add).min(max));
         }
+    }
+
+    fn toggle_detail_view_mode(&mut self) {
+        match self.detail_view_mode.get() {
+            DetailViewMode::Markdown => {
+                let Some(entry) = self.results.get(self.cursor) else {
+                    return;
+                };
+                if self.json_tree_state.borrow_mut().sync_body(&entry.body_md) {
+                    self.detail_view_mode.set(DetailViewMode::JsonTree);
+                    self.detail_scroll.set(0);
+                }
+            }
+            DetailViewMode::JsonTree => {
+                self.detail_view_mode.set(DetailViewMode::Markdown);
+                self.detail_scroll.set(0);
+            }
+        }
+    }
+
+    fn sync_json_tree_scroll(&self, row_count: usize) {
+        let area = self.last_detail_area.get();
+        let visible_rows = usize::from(area.height.saturating_sub(4)).max(1);
+        if row_count <= visible_rows {
+            self.detail_scroll.set(0);
+            return;
+        }
+        let cursor = self.json_tree_state.borrow().cursor();
+        if cursor < self.detail_scroll.get() {
+            self.detail_scroll.set(cursor);
+        } else if cursor >= self.detail_scroll.get().saturating_add(visible_rows) {
+            self.detail_scroll.set(cursor
+                .saturating_add(1)
+                .saturating_sub(visible_rows)
+                .min(row_count.saturating_sub(visible_rows)));
+        } else {
+            self.detail_scroll.set(self
+                .detail_scroll.get()
+                .min(row_count.saturating_sub(visible_rows)));
+        }
+    }
+
+    fn handle_json_tree_navigation(&mut self, key: &ftui::KeyEvent) -> bool {
+        if self.detail_view_mode.get() != DetailViewMode::JsonTree {
+            return false;
+        }
+
+        let Some(entry) = self.results.get(self.cursor) else {
+            self.detail_view_mode.set(DetailViewMode::Markdown);
+            self.detail_scroll.set(0);
+            return false;
+        };
+        if !self.json_tree_state.borrow_mut().sync_body(&entry.body_md) {
+            self.detail_view_mode.set(DetailViewMode::Markdown);
+            self.detail_scroll.set(0);
+            return false;
+        }
+
+        let mut handled = true;
+        match key.code {
+            KeyCode::Char('J') => {
+                self.toggle_detail_view_mode();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.json_tree_state.borrow_mut().move_cursor_by(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.json_tree_state.borrow_mut().move_cursor_by(-1);
+            }
+            KeyCode::Char('d') | KeyCode::PageDown => {
+                self.json_tree_state.borrow_mut().move_cursor_by(8);
+            }
+            KeyCode::Char('u') | KeyCode::PageUp => {
+                self.json_tree_state.borrow_mut().move_cursor_by(-8);
+            }
+            KeyCode::Home => {
+                self.json_tree_state.borrow_mut().move_cursor_by(isize::MIN);
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.json_tree_state.borrow_mut().move_cursor_by(isize::MAX);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let _ = self.json_tree_state.borrow_mut().toggle_selected();
+            }
+            KeyCode::Left => {
+                let rows = self.json_tree_state.borrow().rows();
+                if let Some(row) = rows.get(self.json_tree_state.borrow().cursor())
+                    && row.expandable
+                    && row.expanded
+                {
+                    let _ = self.json_tree_state.borrow_mut().toggle_selected();
+                }
+            }
+            KeyCode::Right => {
+                let rows = self.json_tree_state.borrow().rows();
+                if let Some(row) = rows.get(self.json_tree_state.borrow().cursor())
+                    && row.expandable
+                    && !row.expanded
+                {
+                    let _ = self.json_tree_state.borrow_mut().toggle_selected();
+                }
+            }
+            _ => handled = false,
+        }
+
+        if handled && self.detail_view_mode.get() == DetailViewMode::JsonTree {
+            self.json_tree_state.borrow_mut().clamp_cursor();
+            self.sync_json_tree_scroll(self.json_tree_state.borrow().rows().len());
+        }
+        handled
     }
 
     /// Return the current active preset, if any.
@@ -2303,7 +2424,7 @@ impl MessageBrowserScreen {
         } else {
             self.cursor = self.cursor.min(self.results.len() - 1);
         }
-        self.detail_scroll = 0;
+        self.detail_scroll.set(0);
         self.search_dirty = false;
 
         // Emit truthfulness diagnostic (br-2k3qx.2.2 / A2)
@@ -2523,7 +2644,7 @@ impl MailScreen for MessageBrowserScreen {
                             && !self.results.is_empty()
                         {
                             self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                             return Cmd::None;
                         }
@@ -2544,7 +2665,7 @@ impl MailScreen for MessageBrowserScreen {
                         }
                         if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y) {
                             self.cursor = self.cursor.saturating_sub(1);
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                             return Cmd::None;
                         }
@@ -2577,7 +2698,11 @@ impl MailScreen for MessageBrowserScreen {
                         return Cmd::None;
                     }
                 },
-                Focus::ResultList => match key.code {
+                Focus::ResultList => {
+                    if self.handle_json_tree_navigation(key) {
+                        return Cmd::None;
+                    }
+                    match key.code {
                     KeyCode::Escape if state.keyboard_move_snapshot().is_some() => {
                         state.clear_keyboard_move_snapshot();
                         return Cmd::None;
@@ -2592,25 +2717,25 @@ impl MailScreen for MessageBrowserScreen {
                     KeyCode::Char('j') | KeyCode::Down => {
                         if !self.results.is_empty() {
                             self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.cursor = self.cursor.saturating_sub(1);
-                        self.detail_scroll = 0;
+                        self.detail_scroll.set(0);
                         self.extend_visual_selection_to_cursor();
                     }
                     KeyCode::Char('G') | KeyCode::End => {
                         if !self.results.is_empty() {
                             self.cursor = self.results.len() - 1;
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                         }
                     }
                     KeyCode::Home => {
                         self.cursor = 0;
-                        self.detail_scroll = 0;
+                        self.detail_scroll.set(0);
                         self.extend_visual_selection_to_cursor();
                     }
                     // Toggle inbox mode (Local/Global)
@@ -2622,13 +2747,13 @@ impl MailScreen for MessageBrowserScreen {
                     KeyCode::Char('d') | KeyCode::PageDown => {
                         if !self.results.is_empty() {
                             self.cursor = (self.cursor + 20).min(self.results.len() - 1);
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                         }
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
                         self.cursor = self.cursor.saturating_sub(20);
-                        self.detail_scroll = 0;
+                        self.detail_scroll.set(0);
                         self.extend_visual_selection_to_cursor();
                     }
                     // Multi-select controls
@@ -2652,7 +2777,15 @@ impl MailScreen for MessageBrowserScreen {
                         return Cmd::None;
                     }
                     // Detail scroll
-                    KeyCode::Char('J') => self.scroll_detail_by(1),
+                    KeyCode::Char('J') => {
+                        let previous_mode = self.detail_view_mode.get();
+                        self.toggle_detail_view_mode();
+                        if previous_mode == DetailViewMode::Markdown
+                            && self.detail_view_mode.get() == DetailViewMode::Markdown
+                        {
+                            self.scroll_detail_by(1);
+                        }
+                    }
                     KeyCode::Char('K') => self.scroll_detail_by(-1),
                     // Split layout controls
                     KeyCode::Char('i') => self.dock.toggle_visible(),
@@ -2714,7 +2847,8 @@ impl MailScreen for MessageBrowserScreen {
                         self.preset_index = 0;
                     }
                     _ => {}
-                },
+                }
+                }
             },
             _ => {}
         }
@@ -2803,7 +2937,7 @@ impl MailScreen for MessageBrowserScreen {
                 // Find message by ID and move cursor to it
                 if let Some(pos) = self.results.iter().position(|m| m.id == *id) {
                     self.cursor = pos;
-                    self.detail_scroll = 0;
+                    self.detail_scroll.set(0);
                     self.focus = Focus::ResultList;
                     self.search_input.set_focused(false);
                 }
@@ -3018,13 +3152,33 @@ impl MailScreen for MessageBrowserScreen {
         drop(list_state);
 
         if let Some(detail_area) = detail_area {
+            let mut json_rows: Option<Vec<crate::tui_markdown::JsonTreeRow>> = None;
+            if self.detail_view_mode.get() == DetailViewMode::JsonTree {
+                if let Some(entry) = self.results.get(self.cursor) {
+                    if self.json_tree_state.borrow_mut().sync_body(&entry.body_md) {
+                        self.json_tree_state.borrow_mut().clamp_cursor();
+                        let rows = self.json_tree_state.borrow().rows();
+                        self.sync_json_tree_scroll(rows.len());
+                        json_rows = Some(rows);
+                    } else {
+                        self.detail_view_mode.set(DetailViewMode::Markdown);
+                        self.detail_scroll.set(0);
+                    }
+                } else {
+                    self.detail_view_mode.set(DetailViewMode::Markdown);
+                    self.detail_scroll.set(0);
+                }
+            }
             render_detail_panel(
                 frame,
                 detail_area,
                 self.results.get(self.cursor),
-                self.detail_scroll,
+                self.detail_scroll.get(),
                 !matches!(self.focus, Focus::SearchBar),
                 &self.detail_cache,
+                self.detail_view_mode.get(),
+                json_rows.as_deref(),
+                self.json_tree_state.borrow().cursor(),
             );
         }
 
@@ -3085,8 +3239,16 @@ impl MailScreen for MessageBrowserScreen {
                 action: "Jump to timeline",
             },
             HelpEntry {
-                key: "J/K",
-                action: "Scroll detail",
+                key: "J",
+                action: "Toggle Markdown/JSON tree detail",
+            },
+            HelpEntry {
+                key: "j/k + Enter (JSON)",
+                action: "Move tree cursor / expand-collapse node",
+            },
+            HelpEntry {
+                key: "K",
+                action: "Scroll detail up (markdown)",
             },
             HelpEntry {
                 key: "i [ ] { }",
@@ -3559,7 +3721,7 @@ fn render_search_bar(
             let pulse = if pulse_on { "\u{25cf}" } else { "\u{25cb}" };
             let meter = pulse_meter(ui_phase, 10);
             let hint = format!(
-                "{pulse} {meter}  Mouse: click/select, wheel preset/scroll, drag split border   Ops: / j k J K"
+                "{pulse} {meter}  Mouse: click/select, wheel preset/scroll, drag split border   Ops: / j k J(toggle tree) K"
             );
             let hint_area = Rect::new(content_inner.x, content_inner.y + 1, content_inner.width, 1);
             Paragraph::new(truncate_str(&hint, content_inner.width as usize))
@@ -3955,6 +4117,9 @@ fn render_detail_panel(
     scroll: usize,
     focused: bool,
     cache: &RefCell<Option<MessageDetailRenderCache>>,
+    detail_view_mode: DetailViewMode,
+    json_rows: Option<&[crate::tui_markdown::JsonTreeRow]>,
+    json_cursor: usize,
 ) {
     let detail_title = entry.map_or_else(
         || "Detail".to_string(),
@@ -3969,7 +4134,12 @@ fn render_detail_panel(
                 "high" => "!",
                 _ => "\u{00b7}",
             };
-            format!("Detail {importance} [{clamped}/{max_scroll}]")
+            let view_suffix = if detail_view_mode == DetailViewMode::JsonTree {
+                " | JSON Tree"
+            } else {
+                ""
+            };
+            format!("Detail {importance} [{clamped}/{max_scroll}]{view_suffix}")
         },
     );
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -4058,7 +4228,12 @@ fn render_detail_panel(
         lines.push(format!("ID:      #{}", msg.id));
     }
     lines.push(String::new()); // Blank separator
-    lines.push("--- Body ---".to_string());
+    let show_json_tree = detail_view_mode == DetailViewMode::JsonTree && json_rows.is_some();
+    lines.push(if show_json_tree {
+        "--- JSON Tree ---".to_string()
+    } else {
+        "--- Body ---".to_string()
+    });
 
     // Combine header and body into one Text for unified scrolling
     let mut combined_lines: Vec<Line<'static>> = Vec::new();
@@ -4066,58 +4241,78 @@ fn render_detail_panel(
         combined_lines.push(Line::raw(line));
     }
 
-    let body_text = {
-        let width = content_inner.width;
-        let body_hash = stable_hash(msg.body_md.as_bytes());
-        let theme_key = crate::tui_theme::current_theme_env_value();
-        let mut cached = cache.borrow_mut();
+    let total_estimated = if show_json_tree {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        if let Some(rows) = json_rows {
+            let selected_style = Style::default().fg(tp.selection_indicator).bold();
+            let marker_style = Style::default().fg(tp.text_disabled);
+            for (idx, row) in rows.iter().enumerate() {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let selected = idx == json_cursor;
+                spans.push(Span::styled(
+                    if selected { "▸ ".to_string() } else { "  ".to_string() },
+                    if selected { selected_style } else { marker_style },
+                ));
+                spans.extend(row.line.spans().iter().cloned());
+                combined_lines.push(Line::from_spans(spans));
+            }
+        }
+        combined_lines.len().max(1)
+    } else {
+        let body_text = {
+            let width = content_inner.width;
+            let body_hash = stable_hash(msg.body_md.as_bytes());
+            let theme_key = crate::tui_theme::current_theme_env_value();
+            let mut cached = cache.borrow_mut();
 
-        cached
-            .as_ref()
-            .and_then(|cached| {
-                if cached.message_id == msg.id
-                    && cached.width == width
-                    && cached.body_hash == body_hash
-                    && cached.theme_key == theme_key
-                {
-                    Some(cached.rendered.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                let mut body_md = msg.body_md.clone();
-                let image_block = build_inline_image_block(&msg.body_md, width);
-                if !image_block.is_empty() {
-                    body_md.push_str("\n\n");
-                    body_md.push_str(&image_block);
-                }
-                let markdown_body = if looks_like_json(&body_md) {
-                    format!("```json\n{}\n```", body_md.trim_end())
-                } else {
-                    body_md
-                };
-                let md_theme = crate::tui_theme::markdown_theme();
-                let rendered = crate::tui_markdown::render_body(&markdown_body, &md_theme);
-                *cached = Some(MessageDetailRenderCache {
-                    message_id: msg.id,
-                    width,
-                    body_hash,
-                    theme_key,
-                    rendered: rendered.clone(),
-                });
-                rendered
-            })
+            cached
+                .as_ref()
+                .and_then(|cached| {
+                    if cached.message_id == msg.id
+                        && cached.width == width
+                        && cached.body_hash == body_hash
+                        && cached.theme_key == theme_key
+                    {
+                        Some(cached.rendered.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    let mut body_md = msg.body_md.clone();
+                    let image_block = build_inline_image_block(&msg.body_md, width);
+                    if !image_block.is_empty() {
+                        body_md.push_str("\n\n");
+                        body_md.push_str(&image_block);
+                    }
+                    let markdown_body = if looks_like_json(&body_md) {
+                        format!("```json\n{}\n```", body_md.trim_end())
+                    } else {
+                        body_md
+                    };
+                    let md_theme = crate::tui_theme::markdown_theme();
+                    let rendered = crate::tui_markdown::render_body(&markdown_body, &md_theme);
+                    *cached = Some(MessageDetailRenderCache {
+                        message_id: msg.id,
+                        width,
+                        body_hash,
+                        theme_key,
+                        rendered: rendered.clone(),
+                    });
+                    rendered
+                })
+        };
+
+        for line in body_text.lines() {
+            combined_lines.push(line.clone());
+        }
+
+        estimate_message_detail_lines(msg, content_inner.width)
     };
-
-    for line in body_text.lines() {
-        combined_lines.push(line.clone());
-    }
 
     let combined_text = Text::from_lines(combined_lines);
 
     // Apply scroll using Paragraph's internal wrapping support
-    let total_estimated = estimate_message_detail_lines(msg, content_inner.width);
     let visible_height = usize::from(content_inner.height);
     let max_scroll = total_estimated.saturating_sub(visible_height);
     let clamped_scroll = scroll.min(max_scroll);
@@ -5319,6 +5514,47 @@ mod tests {
         assert_eq!(screen.detail_scroll, 0);
     }
 
+    #[test]
+    fn detail_json_tree_toggle_and_expand_collapse() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.last_detail_area.set(Rect::new(0, 0, 80, 12));
+        screen.results.push(MessageEntry {
+            id: 7,
+            subject: "JSON".to_string(),
+            from_agent: "BlueLake".to_string(),
+            to_agents: "GreenCastle".to_string(),
+            project_slug: "proj".to_string(),
+            thread_id: "br-2bbt".to_string(),
+            timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
+            timestamp_micros: 0,
+            body_md: r#"{"a":{"b":1},"list":[1,2]}"#.to_string(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        });
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
+        assert_eq!(screen.detail_view_mode, DetailViewMode::JsonTree);
+        assert!(screen.json_tree_state.is_available());
+
+        let expanded_rows = screen.json_tree_state.rows().len();
+        assert!(expanded_rows > 1, "root should be expanded initially");
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        let collapsed_rows = screen.json_tree_state.rows().len();
+        assert_eq!(collapsed_rows, 1, "enter collapses selected root node");
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert!(
+            screen.json_tree_state.rows().len() > 1,
+            "enter toggles root back to expanded"
+        );
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
+        assert_eq!(screen.detail_view_mode, DetailViewMode::Markdown);
+    }
+
     // ── consumes_text_input ─────────────────────────────────────────
 
     #[test]
@@ -6061,7 +6297,17 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         let cache = RefCell::new(None);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), None, 0, true, &cache);
+        render_detail_panel(
+            &mut frame,
+            Rect::new(40, 0, 40, 20),
+            None,
+            0,
+            true,
+            &cache,
+            DetailViewMode::Markdown,
+            None,
+            0,
+        );
     }
 
     #[test]
@@ -6091,6 +6337,9 @@ mod tests {
             0,
             true,
             &cache,
+            DetailViewMode::Markdown,
+            None,
+            0,
         );
     }
 
@@ -6123,6 +6372,9 @@ mod tests {
             10,
             true,
             &cache,
+            DetailViewMode::Markdown,
+            None,
+            0,
         );
     }
 
@@ -6152,6 +6404,9 @@ mod tests {
             0,
             true,
             &cache,
+            DetailViewMode::Markdown,
+            None,
+            0,
         );
     }
 

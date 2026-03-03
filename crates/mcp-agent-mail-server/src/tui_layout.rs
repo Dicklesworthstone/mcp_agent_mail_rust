@@ -804,8 +804,7 @@ impl LayoutComposition {
     /// Get the primary panel rect (always present).
     #[must_use]
     pub fn primary(&self) -> Rect {
-        self.rect(PanelSlot::Primary)
-            .unwrap_or_default()
+        self.rect(PanelSlot::Primary).unwrap_or_default()
     }
 }
 

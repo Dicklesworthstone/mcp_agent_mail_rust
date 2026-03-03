@@ -6383,8 +6383,7 @@ mod tests {
         };
         let theme = crate::tui_theme::markdown_theme();
         assert!(
-            crate::tui_markdown::render_message_body_blockquote(&preview.body_md, &theme)
-                .is_none(),
+            crate::tui_markdown::render_message_body_blockquote(&preview.body_md, &theme).is_none(),
             "empty body should not produce blockquote via canonical renderer"
         );
     }

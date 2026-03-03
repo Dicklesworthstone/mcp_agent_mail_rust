@@ -551,7 +551,14 @@ fn git_head_oid_for_workspace(workspace: &Path) -> Option<String> {
         return None;
     }
     let output = std::process::Command::new("timeout")
-        .args(["5s", "git", "-C", &workspace.to_string_lossy(), "rev-parse", "HEAD"])
+        .args([
+            "5s",
+            "git",
+            "-C",
+            &workspace.to_string_lossy(),
+            "rev-parse",
+            "HEAD",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

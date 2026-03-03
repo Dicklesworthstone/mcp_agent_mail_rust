@@ -1368,7 +1368,7 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
     let env_cfg = Config::from_env();
 
     let remote_url = tailscale_ip.map(|ip| {
-        crate::build_remote_url(ip, env_cfg.http_port, env_cfg.http_bearer_token.as_deref())
+        crate::build_web_ui_url(ip, env_cfg.http_port, env_cfg.http_bearer_token.as_deref())
     });
 
     let mut out = DiagnosticsSnapshot {

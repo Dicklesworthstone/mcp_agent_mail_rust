@@ -134,7 +134,11 @@ impl ConfigSnapshot {
             "http://{}:{}{}",
             config.http_host, config.http_port, config.http_path
         );
-        let web_ui_url = format!("http://{}:{}/mail", config.http_host, config.http_port);
+        let web_ui_url = crate::build_web_ui_url(
+            &config.http_host,
+            config.http_port,
+            config.http_bearer_token.as_deref(),
+        );
         let database_url = console::sanitize_known_value("database_url", &config.database_url)
             .unwrap_or_else(|| config.database_url.clone());
 

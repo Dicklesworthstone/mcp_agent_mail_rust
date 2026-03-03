@@ -88,6 +88,9 @@ const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
 /// animation updates at ~5 fps. The diff engine's dirty-span tracking
 /// ensures unchanged cells produce no terminal writes.
 const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 2;
+/// Safety-net cadence for full-frame contrast scans when no explicit repaint
+/// trigger (theme/resize/screen change) requests one.
+const CONTRAST_GUARD_SAFETY_SCAN_TICK_DIVISOR: u64 = 20;
 
 /// Nearby (adjacent) inactive screens tick every Nth frame.
 const NEARBY_SCREEN_TICK_DIVISOR: u64 = 3;
@@ -1307,6 +1310,10 @@ pub struct MailAppModel {
     /// calculations are amortised rather than recomputed from scratch on every
     /// render.  Cleared when the theme changes (see `apply_theme` / `cycle_theme`).
     contrast_guard_cache: RefCell<ContrastGuardCache>,
+    /// One-shot request for a full-frame contrast normalization pass.
+    contrast_guard_pending: Cell<bool>,
+    /// Tick index of the most recent full-frame contrast normalization pass.
+    contrast_guard_last_tick: Cell<u64>,
     /// Sender for deferred actions from modal callbacks.
     action_tx: std::sync::mpsc::Sender<(String, String)>,
     /// Receiver for deferred actions from modal callbacks.
@@ -1400,6 +1407,8 @@ impl MailAppModel {
             quit_confirm_source: None,
             compose_state: None,
             contrast_guard_cache: RefCell::new(ContrastGuardCache::default()),
+            contrast_guard_pending: Cell::new(true),
+            contrast_guard_last_tick: Cell::new(u64::MAX),
             inspector: InspectorState::new(),
             inspector_last_tree_len: Cell::new(0),
             inspector_selected_index: 0,
@@ -1600,6 +1609,7 @@ impl MailAppModel {
         // Force-tick the newly active screen so it shows fresh data
         // immediately (inactive screens tick at a reduced rate).
         if from != to {
+            self.request_contrast_guard_pass();
             let tick_count = self.tick_count;
             let tick_state = &self.state;
             if let Some(screen) = self.screen_manager.get_mut(to) {
@@ -1634,6 +1644,9 @@ impl MailAppModel {
         self.remember_focus_for_screen(from);
         self.screen_manager.apply_deep_link(target);
         let to = self.screen_manager.active_screen();
+        if from != to {
+            self.request_contrast_guard_pass();
+        }
         self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
     }
@@ -2416,6 +2429,7 @@ impl MailAppModel {
             self.last_non_hc_theme = theme_id;
         }
         *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
+        self.request_contrast_guard_pass();
         self.sync_theme_snapshot();
         self.persist_appearance_settings();
         name
@@ -2431,9 +2445,32 @@ impl MailAppModel {
             self.last_non_hc_theme = theme_id;
         }
         *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
+        self.request_contrast_guard_pass();
         self.sync_theme_snapshot();
         self.persist_appearance_settings();
         display
+    }
+
+    fn request_contrast_guard_pass(&self) {
+        self.contrast_guard_pending.set(true);
+    }
+
+    fn should_run_contrast_guard_pass(&self) -> bool {
+        if self.contrast_guard_pending.get() {
+            return true;
+        }
+        if !self
+            .tick_count
+            .is_multiple_of(CONTRAST_GUARD_SAFETY_SCAN_TICK_DIVISOR)
+        {
+            return false;
+        }
+        self.contrast_guard_last_tick.get() != self.tick_count
+    }
+
+    fn mark_contrast_guard_pass_complete(&self) {
+        self.contrast_guard_pending.set(false);
+        self.contrast_guard_last_tick.set(self.tick_count);
     }
 
     fn toggle_high_contrast_theme(&mut self) -> &'static str {
@@ -3124,6 +3161,7 @@ impl MailAppModel {
                     self.last_non_hc_theme = theme_id;
                 }
                 *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
+                self.request_contrast_guard_pass();
                 self.sync_theme_snapshot();
                 self.persist_appearance_settings();
                 self.notifications.notify(
@@ -3657,6 +3695,9 @@ impl Model for MailAppModel {
                 {
                     return Cmd::none();
                 }
+                if matches!(*event, Event::Resize { .. }) {
+                    self.request_contrast_guard_pass();
+                }
 
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
@@ -3817,6 +3858,8 @@ impl Model for MailAppModel {
                             if let Some(ref mut idx) = self.toast_focus_index {
                                 let count = self.notifications.visible_count();
                                 if count > 0 {
+                                    // Clamp first in case toasts expired since last nav
+                                    *idx = (*idx).min(count - 1);
                                     *idx = if *idx == 0 { count - 1 } else { *idx - 1 };
                                 }
                             }
@@ -3826,6 +3869,8 @@ impl Model for MailAppModel {
                             if let Some(ref mut idx) = self.toast_focus_index {
                                 let count = self.notifications.visible_count();
                                 if count > 0 {
+                                    // Clamp first in case toasts expired since last nav
+                                    *idx = (*idx).min(count - 1);
                                     *idx = (*idx + 1) % count;
                                 }
                             }
@@ -4524,7 +4569,10 @@ impl Model for MailAppModel {
 
         // Final readability guard: normalize low-contrast cells so every
         // visible glyph remains legible across all themes (especially light).
-        apply_frame_contrast_guard(frame, &tp, &mut self.contrast_guard_cache.borrow_mut());
+        if self.should_run_contrast_guard_pass() {
+            apply_frame_contrast_guard(frame, &tp, &mut self.contrast_guard_cache.borrow_mut());
+            self.mark_contrast_guard_pass_complete();
+        }
 
         // Keep an exportable snapshot of the last fully rendered frame.
         //
@@ -11094,6 +11142,48 @@ mod tests {
         assert_eq!(
             updates.borrow().as_slice(),
             &[(120, 40), (121, 40), (121, 41)]
+        );
+    }
+
+    #[test]
+    fn contrast_guard_schedule_runs_on_explicit_requests() {
+        let model = test_model();
+        assert!(
+            model.should_run_contrast_guard_pass(),
+            "initial frame should run contrast guard"
+        );
+        model.mark_contrast_guard_pass_complete();
+        assert!(
+            !model.should_run_contrast_guard_pass(),
+            "explicit pass completion should clear pending flag"
+        );
+
+        model.request_contrast_guard_pass();
+        assert!(
+            model.should_run_contrast_guard_pass(),
+            "explicit request should force a pass"
+        );
+    }
+
+    #[test]
+    fn contrast_guard_schedule_uses_periodic_safety_scan_once_per_tick() {
+        let mut model = test_model();
+        model.mark_contrast_guard_pass_complete();
+        model.tick_count = CONTRAST_GUARD_SAFETY_SCAN_TICK_DIVISOR;
+        assert!(
+            model.should_run_contrast_guard_pass(),
+            "safety scan should run at configured divisor boundary"
+        );
+        model.mark_contrast_guard_pass_complete();
+        assert!(
+            !model.should_run_contrast_guard_pass(),
+            "safety scan should not rerun within the same tick"
+        );
+
+        model.tick_count = model.tick_count.saturating_add(1);
+        assert!(
+            !model.should_run_contrast_guard_pass(),
+            "non-divisor ticks should skip periodic safety scan"
         );
     }
 

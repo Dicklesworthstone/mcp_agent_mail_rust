@@ -524,7 +524,9 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     // Skip integrity probe for fresh installs to avoid noisy recovery warnings.
     if let Some(path) = sqlite_file_path_from_database_url(&config.database_url)
         && !path.exists()
-        && !std::path::Path::new(&config.storage_root).join("projects").is_dir()
+        && !std::path::Path::new(&config.storage_root)
+            .join("projects")
+            .is_dir()
     {
         return ProbeResult::Ok { name: "integrity" };
     }

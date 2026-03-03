@@ -518,7 +518,7 @@ fn maybe_attempt_sqlite_recovery(sqlite_path: &str, reason: &str) {
     let sqlite_path_buf = Path::new(sqlite_path).to_path_buf();
     let config = mcp_agent_mail_core::Config::from_env();
     let root_path = config.storage_root.as_path();
-    
+
     let recovery_result = if root_path.is_dir() {
         ensure_sqlite_file_healthy_with_archive(&sqlite_path_buf, root_path)
     } else {

@@ -25,7 +25,7 @@ use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
 use mcp_agent_mail_server::tui_events::{
-    AgentSummary, ContactSummary, DbStatSnapshot, ProjectSummary,
+    AgentSummary, ContactSummary, DbStatSnapshot, MailEvent, ProjectSummary, ReservationSnapshot,
 };
 use mcp_agent_mail_server::tui_screens::MailScreen;
 
@@ -756,6 +756,408 @@ fn e1_attachments_connects_to_seeded_db() {
         !att_unavailable,
         "{}",
         mismatch_msg("attachments", "db_unavailable_diagnostic", "none", "found")
+    );
+}
+
+/// Dashboard screen emits non-empty truth diagnostics when seeded events are present.
+#[test]
+fn e1_dashboard_truthful_when_seeded() {
+    use mcp_agent_mail_server::tui_screens::dashboard::DashboardScreen;
+
+    let env = SeededEnv::new();
+    env.validate_seed();
+
+    let state = env.state();
+    state.update_db_stats(env.db_stat_snapshot());
+
+    for i in 1..=6_i64 {
+        let pushed = state.push_event(MailEvent::message_received(
+            i,
+            "RedFox",
+            vec!["BlueBear".to_string()],
+            format!("Dashboard seeded message {i}"),
+            "thread-alpha",
+            "alpha-proj",
+            format!("seeded dashboard body {i}"),
+        ));
+        assert!(pushed, "dashboard fixture event should be accepted");
+    }
+
+    let mut screen = DashboardScreen::new();
+    screen.tick(0, &state);
+
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(120, 40, &mut pool);
+    screen.view(&mut frame, ftui::layout::Rect::new(0, 0, 120, 40), &state);
+
+    let diag = find_diagnostic(&state, "dashboard");
+    assert!(
+        diag.is_some(),
+        "{}",
+        mismatch_msg("dashboard", "diagnostic_emitted", "true", "false")
+    );
+    let diag = diag.unwrap();
+    assert!(
+        diag.raw_count > 0,
+        "{}",
+        mismatch_msg("dashboard", "raw_count", ">0", &diag.raw_count.to_string())
+    );
+    assert!(
+        diag.rendered_count > 0,
+        "{}",
+        mismatch_msg(
+            "dashboard",
+            "rendered_count",
+            ">0",
+            &diag.rendered_count.to_string()
+        )
+    );
+}
+
+/// Timeline screen emits non-empty truth diagnostics when seeded events are present.
+#[test]
+fn e1_timeline_truthful_when_seeded() {
+    use mcp_agent_mail_server::tui_screens::timeline::TimelineScreen;
+
+    let env = SeededEnv::new();
+    env.validate_seed();
+
+    let state = env.state();
+    state.update_db_stats(env.db_stat_snapshot());
+
+    let pushed_msg = state.push_event(MailEvent::message_received(
+        101,
+        "GreenOwl",
+        vec!["GoldEagle".to_string()],
+        "Timeline seeded message",
+        "thread-beta",
+        "beta-proj",
+        "seeded timeline message body",
+    ));
+    assert!(
+        pushed_msg,
+        "timeline fixture message event should be accepted"
+    );
+    let pushed_res = state.push_event(MailEvent::reservation_granted(
+        "GreenOwl",
+        vec!["src/**".to_string()],
+        true,
+        3600,
+        "beta-proj",
+    ));
+    assert!(
+        pushed_res,
+        "timeline fixture reservation event should be accepted"
+    );
+
+    let mut screen = TimelineScreen::new();
+    screen.tick(0, &state);
+
+    let diag = find_diagnostic(&state, "timeline");
+    assert!(
+        diag.is_some(),
+        "{}",
+        mismatch_msg("timeline", "diagnostic_emitted", "true", "false")
+    );
+    let diag = diag.unwrap();
+    assert!(
+        diag.raw_count > 0,
+        "{}",
+        mismatch_msg("timeline", "raw_count", ">0", &diag.raw_count.to_string())
+    );
+    assert!(
+        diag.rendered_count > 0,
+        "{}",
+        mismatch_msg(
+            "timeline",
+            "rendered_count",
+            ">0",
+            &diag.rendered_count.to_string()
+        )
+    );
+}
+
+/// Reservations screen emits non-empty truth diagnostics when reservation snapshots exist.
+#[test]
+fn e1_reservations_truthful_when_seeded() {
+    use mcp_agent_mail_server::tui_screens::reservations::ReservationsScreen;
+
+    let env = SeededEnv::new();
+    env.validate_seed();
+
+    let state = env.state();
+    let mut snap = env.db_stat_snapshot();
+    let base_ts: i64 = 1_704_067_200_000_000;
+    snap.file_reservations = 2;
+    snap.reservation_snapshots = vec![
+        ReservationSnapshot {
+            id: 1001,
+            project_slug: "alpha-proj".to_string(),
+            agent_name: "RedFox".to_string(),
+            path_pattern: "crates/mcp-agent-mail-core/src/**".to_string(),
+            exclusive: true,
+            granted_ts: base_ts,
+            expires_ts: base_ts + 3_600_000_000,
+            released_ts: None,
+        },
+        ReservationSnapshot {
+            id: 1002,
+            project_slug: "beta-proj".to_string(),
+            agent_name: "GreenOwl".to_string(),
+            path_pattern: "crates/mcp-agent-mail-tools/src/**".to_string(),
+            exclusive: false,
+            granted_ts: base_ts + 60_000_000,
+            expires_ts: base_ts + 7_200_000_000,
+            released_ts: None,
+        },
+    ];
+    state.update_db_stats(snap);
+
+    let mut screen = ReservationsScreen::new();
+    screen.tick(0, &state);
+
+    let diag = find_diagnostic(&state, "reservations");
+    assert!(
+        diag.is_some(),
+        "{}",
+        mismatch_msg("reservations", "diagnostic_emitted", "true", "false")
+    );
+    let diag = diag.unwrap();
+    assert!(
+        diag.raw_count > 0,
+        "{}",
+        mismatch_msg(
+            "reservations",
+            "raw_count",
+            ">0",
+            &diag.raw_count.to_string()
+        )
+    );
+    assert!(
+        diag.rendered_count > 0,
+        "{}",
+        mismatch_msg(
+            "reservations",
+            "rendered_count",
+            ">0",
+            &diag.rendered_count.to_string()
+        )
+    );
+}
+
+/// Tool Metrics screen emits non-empty truth diagnostics when tool-call events exist.
+#[test]
+fn e1_tool_metrics_truthful_when_seeded() {
+    use mcp_agent_mail_server::tui_screens::tool_metrics::ToolMetricsScreen;
+
+    let env = SeededEnv::new();
+    env.validate_seed();
+
+    let state = env.state();
+    state.update_db_stats(env.db_stat_snapshot());
+
+    let pushed_send = state.push_event(MailEvent::tool_call_end(
+        "send_message",
+        42,
+        Some("ok".to_string()),
+        1,
+        2.1,
+        vec![("messages".to_string(), 1)],
+        Some("alpha-proj".to_string()),
+        Some("RedFox".to_string()),
+    ));
+    assert!(pushed_send, "tool-metrics fixture event send_message");
+
+    let pushed_fetch = state.push_event(MailEvent::tool_call_end(
+        "fetch_inbox",
+        15,
+        Some("ok".to_string()),
+        1,
+        1.3,
+        vec![("message_recipients".to_string(), 1)],
+        Some("beta-proj".to_string()),
+        Some("GreenOwl".to_string()),
+    ));
+    assert!(pushed_fetch, "tool-metrics fixture event fetch_inbox");
+
+    let mut screen = ToolMetricsScreen::new();
+    screen.tick(0, &state);
+
+    let diag = find_diagnostic(&state, "tool_metrics");
+    assert!(
+        diag.is_some(),
+        "{}",
+        mismatch_msg("tool_metrics", "diagnostic_emitted", "true", "false")
+    );
+    let diag = diag.unwrap();
+    assert!(
+        diag.raw_count > 0,
+        "{}",
+        mismatch_msg(
+            "tool_metrics",
+            "raw_count",
+            ">0",
+            &diag.raw_count.to_string()
+        )
+    );
+    assert!(
+        diag.rendered_count > 0,
+        "{}",
+        mismatch_msg(
+            "tool_metrics",
+            "rendered_count",
+            ">0",
+            &diag.rendered_count.to_string()
+        )
+    );
+}
+
+/// System Health screen emits non-empty truth diagnostics after worker refresh.
+#[test]
+fn e1_system_health_truthful_when_seeded() {
+    use mcp_agent_mail_server::tui_screens::system_health::SystemHealthScreen;
+
+    let env = SeededEnv::new();
+    env.validate_seed();
+
+    let state = env.state();
+    state.update_db_stats(env.db_stat_snapshot());
+    let _screen = SystemHealthScreen::new(Arc::clone(&state));
+
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(3);
+    let diag = loop {
+        if let Some(diag) = find_diagnostic(&state, "system_health") {
+            break Some(diag);
+        }
+        if started.elapsed() > timeout {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+
+    assert!(
+        diag.is_some(),
+        "{}",
+        mismatch_msg("system_health", "diagnostic_emitted", "true", "false")
+    );
+    let diag = diag.unwrap();
+    assert!(
+        diag.raw_count > 0,
+        "{}",
+        mismatch_msg(
+            "system_health",
+            "raw_count",
+            ">0",
+            &diag.raw_count.to_string()
+        )
+    );
+    assert!(
+        diag.rendered_count > 0,
+        "{}",
+        mismatch_msg(
+            "system_health",
+            "rendered_count",
+            ">0",
+            &diag.rendered_count.to_string()
+        )
+    );
+}
+
+/// Archive Browser screen emits non-empty truth diagnostics when archive files exist.
+#[test]
+fn e1_archive_browser_truthful_when_seeded() {
+    use mcp_agent_mail_server::tui_screens::archive_browser::ArchiveBrowserScreen;
+
+    let env = SeededEnv::new();
+    env.validate_seed();
+
+    let storage_root = env.tmp_dir.path().join("storage");
+    let archive_dir = storage_root
+        .join("alpha-proj")
+        .join(".archive")
+        .join("messages")
+        .join("2026")
+        .join("03");
+    std::fs::create_dir_all(&archive_dir).expect("create archive fixture dir");
+    std::fs::write(
+        archive_dir.join("msg-001.md"),
+        "# Archive fixture\n\nSeeded entry for truth test.\n",
+    )
+    .expect("write archive fixture");
+
+    let mut cfg = env.config();
+    cfg.storage_root = storage_root;
+    let state = TuiSharedState::new(&cfg);
+    state.update_db_stats(env.db_stat_snapshot());
+
+    let mut screen = ArchiveBrowserScreen::new();
+    screen.tick(0, &state);
+
+    let diag = find_diagnostic(&state, "archive_browser");
+    assert!(
+        diag.is_some(),
+        "{}",
+        mismatch_msg("archive_browser", "diagnostic_emitted", "true", "false")
+    );
+    let diag = diag.unwrap();
+    assert!(
+        diag.raw_count > 0,
+        "{}",
+        mismatch_msg(
+            "archive_browser",
+            "raw_count",
+            ">0",
+            &diag.raw_count.to_string()
+        )
+    );
+    assert!(
+        diag.rendered_count > 0,
+        "{}",
+        mismatch_msg(
+            "archive_browser",
+            "rendered_count",
+            ">0",
+            &diag.rendered_count.to_string()
+        )
+    );
+}
+
+/// Analytics screen emits non-empty truth diagnostics with seeded runtime context.
+#[test]
+fn e1_analytics_truthful_when_seeded() {
+    use mcp_agent_mail_server::tui_screens::analytics::AnalyticsScreen;
+
+    let env = SeededEnv::new();
+    env.validate_seed();
+
+    let state = env.state();
+    state.update_db_stats(env.db_stat_snapshot());
+
+    let mut screen = AnalyticsScreen::new();
+    screen.tick(0, &state);
+
+    let diag = find_diagnostic(&state, "analytics");
+    assert!(
+        diag.is_some(),
+        "{}",
+        mismatch_msg("analytics", "diagnostic_emitted", "true", "false")
+    );
+    let diag = diag.unwrap();
+    assert!(
+        diag.raw_count > 0,
+        "{}",
+        mismatch_msg("analytics", "raw_count", ">0", &diag.raw_count.to_string())
+    );
+    assert!(
+        diag.rendered_count > 0,
+        "{}",
+        mismatch_msg(
+            "analytics",
+            "rendered_count",
+            ">0",
+            &diag.rendered_count.to_string()
+        )
     );
 }
 

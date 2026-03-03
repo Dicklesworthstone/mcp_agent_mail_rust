@@ -5037,9 +5037,7 @@ pub fn generate_thread_flow_mermaid(thread_messages: &[MermaidThreadMessage]) ->
 
     let mut out = String::from("sequenceDiagram\n");
     for participant in &participants {
-        let id = participant_ids
-            .get(participant)
-            .map_or("", String::as_str);
+        let id = participant_ids.get(participant).map_or("", String::as_str);
         let _ = writeln!(
             out,
             "    participant {id} as {}",
@@ -5107,9 +5105,7 @@ pub fn generate_system_overview_mermaid(
 
     let mut out = String::from("graph LR\n");
     for project in &ordered_projects {
-        let id = project_ids
-            .get(&project.slug)
-            .map_or("", String::as_str);
+        let id = project_ids.get(&project.slug).map_or("", String::as_str);
         let _ = writeln!(
             out,
             "    {id}[\"Project: {}\"]",

@@ -2438,9 +2438,13 @@ impl StartupDashboard {
             "http://{}:{}{}",
             config.http_host, config.http_port, config.http_path
         );
-        let web_ui = format!("http://{}:{}/mail", config.http_host, config.http_port);
+        let web_ui = build_web_ui_url(
+            &config.http_host,
+            config.http_port,
+            config.http_bearer_token.as_deref(),
+        );
         let remote_url = detect_tailscale_ip()
-            .map(|ip| build_remote_url(&ip, config.http_port, config.http_bearer_token.as_deref()));
+            .map(|ip| build_web_ui_url(&ip, config.http_port, config.http_bearer_token.as_deref()));
         let transport_mode = detect_transport_mode(&config.http_path).to_string();
 
         let dashboard = Arc::new(Self {
@@ -4538,7 +4542,7 @@ impl HttpState {
 
         // D3: Accept bearer token from `?token=` query parameter only on /mail routes.
         // Browser-opened URLs (e.g. health link) cannot set Authorization headers,
-        // so build_remote_url() embeds the token as a query param instead.
+        // so build_web_ui_url() embeds the token as a query param instead.
         if is_mail_route && self.has_expected_query_token(req) {
             return None;
         }
@@ -5620,15 +5624,8 @@ fn message_sent_event_from_payload(
         .and_then(serde_json::Value::as_str)
         .map(truncate_body_md)
         .unwrap_or_default();
-    let event = tui_events::MailEvent::message_sent(
-        id,
-        from,
-        to,
-        subject,
-        thread_id,
-        &project,
-        body_md,
-    );
+    let event =
+        tui_events::MailEvent::message_sent(id, from, to, subject, thread_id, &project, body_md);
     Some((id, project, event))
 }
 
@@ -6374,8 +6371,8 @@ fn readiness_check_with_integrity(
 
     // Pre-flight check: Auto-recover missing SQLite files before acquiring pool connections
     // that would otherwise create a fresh empty DB (bypassing archive reconstruction).
-    if run_integrity_check 
-        && config.integrity_check_on_startup 
+    if run_integrity_check
+        && config.integrity_check_on_startup
         && !is_memory
         && let Some(sqlite_path) =
             mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
@@ -6413,7 +6410,7 @@ fn readiness_check_with_integrity(
         run_migrations: true,
         warmup_connections: 0,
     };
-    
+
     let cx = Cx::for_testing();
     let mut pool = create_pool(&db_config).map_err(|e| e.to_string())?;
     let mut conn;
@@ -6448,13 +6445,15 @@ fn readiness_check_with_integrity(
             }
             asupersync::Outcome::Cancelled(_) => return Err("readiness cancelled".to_string()),
             asupersync::Outcome::Panicked(p) => {
-                return Err(format!("readiness panic: {}", p.message()))
+                return Err(format!("readiness panic: {}", p.message()));
             }
         }
 
         // We only reach here if we hit a corruption error and haven't retried yet.
         retry_after_recovery = true;
-        tracing::warn!("SQLite corruption detected during readiness check; attempting automatic recovery");
+        tracing::warn!(
+            "SQLite corruption detected during readiness check; attempting automatic recovery"
+        );
         if let Some(sqlite_path) =
             mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
         {
@@ -6475,7 +6474,9 @@ fn readiness_check_with_integrity(
             // Recreate pool because old connections might be broken/stale
             pool = create_pool(&db_config).map_err(|e| e.to_string())?;
         } else {
-            return Err("SQLite corruption detected but unable to resolve database path".to_string());
+            return Err(
+                "SQLite corruption detected but unable to resolve database path".to_string(),
+            );
         }
     }
 
@@ -6488,10 +6489,7 @@ fn readiness_check_with_integrity(
             .is_some_and(|(sqlite_path, fingerprint)| {
                 startup_integrity_cache_is_fresh(config, sqlite_path, *fingerprint)
             });
-    if run_integrity_check
-        && config.integrity_check_on_startup
-        && !is_memory
-    {
+    if run_integrity_check && config.integrity_check_on_startup && !is_memory {
         if skip_startup_integrity {
             tracing::debug!(
                 "startup integrity quick-check skipped (schema fingerprint unchanged and cache is fresh)"
@@ -6744,9 +6742,12 @@ pub(crate) fn detect_tailscale_ip() -> Option<String> {
     Some(ip)
 }
 
-/// Build a remote-access URL with the Tailscale IP and optional auth token.
-pub(crate) fn build_remote_url(tailscale_ip: &str, port: u16, token: Option<&str>) -> String {
-    let base = format!("http://{tailscale_ip}:{port}/mail");
+/// Build a web UI URL with the given host, port, and optional auth token.
+///
+/// When `token` is `Some`, the token is percent-encoded and appended as
+/// `?token=…` so the URL works in a browser without extra auth headers.
+pub(crate) fn build_web_ui_url(host: &str, port: u16, token: Option<&str>) -> String {
+    let base = format!("http://{host}:{port}/mail");
     match token {
         Some(t) => format!("{base}?token={}", percent_encode_query_component(t)),
         None => base,
@@ -16145,8 +16146,8 @@ mod tests {
     }
 
     #[test]
-    fn build_remote_url_percent_encodes_token() {
-        let url = build_remote_url("100.64.0.1", 8765, Some("a+b/c?d=e&f"));
+    fn build_web_ui_url_percent_encodes_token() {
+        let url = build_web_ui_url("100.64.0.1", 8765, Some("a+b/c?d=e&f"));
         assert_eq!(
             url,
             "http://100.64.0.1:8765/mail?token=a%2Bb%2Fc%3Fd%3De%26f"

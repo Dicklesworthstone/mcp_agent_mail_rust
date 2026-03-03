@@ -2705,7 +2705,7 @@ fn build_filter_tag(
 // ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-    mod tests {
+mod tests {
     use super::*;
     use crate::tui_layout::DockPosition;
     use ftui_harness::buffer_to_text;
