@@ -242,6 +242,8 @@ pub struct SystemHealthScreen {
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
     detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
     /// Selected anomaly/finding index for detail panel focus.
     anomaly_cursor: usize,
     /// Generation snapshot from last tick (for dirty-state gating).
@@ -286,6 +288,7 @@ impl SystemHealthScreen {
             view_mode: ViewMode::Text,
             detail_visible: true,
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             anomaly_cursor: 0,
             last_data_gen: super::DataGeneration::stale(),
         }
@@ -968,7 +971,7 @@ impl SystemHealthScreen {
             ));
         }
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
     }
 
     /// Render the findings summary panel (Text mode).
@@ -1015,7 +1018,7 @@ impl SystemHealthScreen {
             }
         }
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
     }
 }
 
@@ -1026,12 +1029,15 @@ fn render_kv_lines(
     area: Rect,
     lines: &[(String, String, Option<PackedRgba>)],
     scroll: usize,
+    max_scroll_cell: &std::cell::Cell<usize>,
     tp: &crate::tui_theme::TuiThemePalette,
 ) {
     let label_w: u16 = 14;
     let visible = usize::from(area.height);
     let total = lines.len();
-    let offset = scroll.min(total.saturating_sub(visible));
+    let max_scroll = total.saturating_sub(visible);
+    max_scroll_cell.set(max_scroll);
+    let offset = scroll.min(max_scroll);
 
     for (i, (label, value, color)) in lines.iter().skip(offset).enumerate() {
         let row_y = area.y + i as u16;
@@ -1110,7 +1116,8 @@ impl MailScreen for SystemHealthScreen {
                     self.detail_scroll = 0;
                 }
                 KeyCode::Char('J') => {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    let max = self.last_detail_max_scroll.get();
+                    self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
                 }
                 KeyCode::Char('K') => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
@@ -1794,6 +1801,7 @@ mod tests {
             view_mode: ViewMode::Dashboard,
             detail_visible: true,
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             anomaly_cursor: 0,
             last_data_gen: crate::tui_screens::DataGeneration::default(),
         }

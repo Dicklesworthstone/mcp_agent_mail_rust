@@ -1029,12 +1029,19 @@ impl<'a> TwoTierSearchIter<'a> {
         // Docs without quality use fast score only.
         let _blend_span = tracing::debug_span!("two_tier.blend", refinement_limit).entered();
         let blend_start = Instant::now();
+        
+        // Extract raw scores for normalization
+        let raw_fast_scores: Vec<f32> = fast_results.iter().take(refinement_limit).map(|r| r.score).collect();
+        let fast_norm = normalize_scores(&raw_fast_scores);
+        let quality_norm = normalize_scores(&quality_scores);
+        
         let weight = self.searcher.config.quality_weight;
         let mut blended: Vec<ScoredResult> = fast_results
             .iter()
             .take(refinement_limit)
-            .zip(quality_scores.iter())
-            .map(|(fast, &quality)| {
+            .zip(fast_norm.iter())
+            .zip(quality_norm.iter())
+            .map(|((fast, &f_norm), &q_norm)| {
                 // Check if this doc has a real quality embedding
                 let effective_weight = if self.searcher.index.has_quality(fast.idx) {
                     weight
@@ -1047,7 +1054,7 @@ impl<'a> TwoTierSearchIter<'a> {
                     doc_id: fast.doc_id,
                     doc_kind: fast.doc_kind,
                     project_id: fast.project_id,
-                    score: (1.0 - effective_weight).mul_add(fast.score, effective_weight * quality),
+                    score: (1.0 - effective_weight).mul_add(f_norm, effective_weight * q_norm),
                 }
             })
             .collect();
