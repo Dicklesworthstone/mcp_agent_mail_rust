@@ -36,7 +36,7 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
-use crate::tui_action_menu::{ActionEntry, messages_actions, messages_batch_actions};
+use crate::tui_action_menu::{ActionEntry, ActionKind, messages_actions, messages_batch_actions};
 use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_layout::{DockLayout, DockPosition};
@@ -3412,7 +3412,7 @@ impl MailScreen for MessageBrowserScreen {
         let message = self.results.get(self.cursor)?;
         let selected_ids = self.selected_message_ids_sorted();
 
-        let actions = if selected_ids.len() > 1 {
+        let mut actions = if selected_ids.len() > 1 {
             messages_batch_actions(selected_ids.len())
         } else {
             let thread_id = if message.thread_id.is_empty() {
@@ -3423,6 +3423,27 @@ impl MailScreen for MessageBrowserScreen {
 
             messages_actions(message.id, thread_id, &message.from_agent)
         };
+
+        if selected_ids.len() == 1 && self.detail_view_mode.get() == DetailViewMode::JsonTree {
+            let mut tree = self.json_tree_state.borrow_mut();
+            if tree.sync_body(&message.body_md) {
+                tree.clamp_cursor();
+                if let Some(path) = tree.selected_path() {
+                    actions.push(
+                        ActionEntry::new("Copy JSON path", ActionKind::CopyToClipboard(path))
+                            .with_description("Copy selected JSON node path")
+                            .with_keybinding("Y"),
+                    );
+                }
+                if let Some(value) = tree.selected_value_text() {
+                    actions.push(
+                        ActionEntry::new("Copy JSON value", ActionKind::CopyToClipboard(value))
+                            .with_description("Copy selected JSON node value")
+                            .with_keybinding("y"),
+                    );
+                }
+            }
+        }
 
         // Anchor row is cursor position + header offset
         #[allow(clippy::cast_possible_truncation)]
@@ -3445,6 +3466,15 @@ impl MailScreen for MessageBrowserScreen {
 
     fn copyable_content(&self) -> Option<String> {
         let msg = self.results.get(self.cursor)?;
+        if self.detail_view_mode.get() == DetailViewMode::JsonTree {
+            let mut tree = self.json_tree_state.borrow_mut();
+            if tree.sync_body(&msg.body_md) {
+                tree.clamp_cursor();
+                if let Some(payload) = tree.selected_copy_payload() {
+                    return Some(payload);
+                }
+            }
+        }
         if msg.body_md.is_empty() {
             Some(msg.subject.clone())
         } else {
@@ -5706,6 +5736,68 @@ mod tests {
             screen.detail_max_scroll() > 0,
             "json tree mode should account for expanded row count in max-scroll calculation"
         );
+    }
+
+    #[test]
+    fn copyable_content_returns_json_node_payload_in_tree_mode() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.last_detail_area.set(Rect::new(0, 0, 80, 12));
+        screen.results.push(MessageEntry {
+            id: 11,
+            subject: "Copy JSON".to_string(),
+            from_agent: "BlueLake".to_string(),
+            to_agents: "GreenCastle".to_string(),
+            project_slug: "proj".to_string(),
+            thread_id: "br-2bbt.7".to_string(),
+            timestamp_iso: "2026-03-04T00:00:00Z".to_string(),
+            timestamp_micros: 0,
+            body_md: r#"{"outer":{"inner":42}}"#.to_string(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        });
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
+        let payload = screen.copyable_content().expect("copy payload");
+        assert!(payload.contains("path: $"), "payload should include JSON path");
+        assert!(payload.contains("value:"), "payload should include value");
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('j'))), &state);
+        let child_payload = screen.copyable_content().expect("child payload");
+        assert!(
+            child_payload.contains("path: $/outer"),
+            "child payload should include selected node path"
+        );
+    }
+
+    #[test]
+    fn contextual_actions_include_json_copy_entries_in_tree_mode() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.last_detail_area.set(Rect::new(0, 0, 80, 12));
+        screen.results.push(MessageEntry {
+            id: 12,
+            subject: "JSON actions".to_string(),
+            from_agent: "BlueLake".to_string(),
+            to_agents: "GreenCastle".to_string(),
+            project_slug: "proj".to_string(),
+            thread_id: String::new(),
+            timestamp_iso: "2026-03-04T00:00:00Z".to_string(),
+            timestamp_micros: 0,
+            body_md: r#"{"k":"v"}"#.to_string(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        });
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
+
+        let (actions, _, _) = screen
+            .contextual_actions()
+            .expect("contextual actions should exist");
+        let labels: Vec<&str> = actions.iter().map(|entry| entry.label.as_str()).collect();
+        assert!(labels.contains(&"Copy JSON path"));
+        assert!(labels.contains(&"Copy JSON value"));
     }
 
     // ── consumes_text_input ─────────────────────────────────────────

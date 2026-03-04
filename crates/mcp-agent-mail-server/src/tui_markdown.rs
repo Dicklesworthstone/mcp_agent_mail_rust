@@ -226,6 +226,30 @@ impl JsonTreeViewState {
         out
     }
 
+    /// Selected row path (`$`-rooted JSON pointer-like path), if available.
+    #[must_use]
+    pub fn selected_path(&self) -> Option<String> {
+        self.rows().get(self.cursor).map(|row| row.path.clone())
+    }
+
+    /// Selected row value serialized for clipboard copy.
+    ///
+    /// Objects/arrays are pretty-printed JSON; scalars are serialized to JSON.
+    #[must_use]
+    pub fn selected_value_text(&self) -> Option<String> {
+        let path = self.selected_path()?;
+        let value = self.value_at_path(path.as_str())?;
+        serde_json::to_string_pretty(value).ok()
+    }
+
+    /// Clipboard payload for the selected node (path + value).
+    #[must_use]
+    pub fn selected_copy_payload(&self) -> Option<String> {
+        let path = self.selected_path()?;
+        let value = self.selected_value_text()?;
+        Some(format!("path: {path}\nvalue: {value}"))
+    }
+
     /// Current selected row index.
     #[must_use]
     pub const fn cursor(&self) -> usize {
@@ -278,6 +302,16 @@ impl JsonTreeViewState {
             self.cursor = 0;
         } else if self.cursor >= rows_len {
             self.cursor = rows_len - 1;
+        }
+    }
+
+    fn value_at_path(&self, path: &str) -> Option<&serde_json::Value> {
+        let root = self.parsed_value.as_ref()?;
+        let pointer = path.strip_prefix('$').unwrap_or(path);
+        if pointer.is_empty() {
+            Some(root)
+        } else {
+            root.pointer(pointer)
         }
     }
 }
@@ -1300,6 +1334,31 @@ Thanks!";
     #[test]
     fn looks_like_json_rejects_already_fenced() {
         assert!(!looks_like_json("```json\n{}\n```"));
+    }
+
+    #[test]
+    fn json_tree_selected_copy_payload_includes_path_and_value() {
+        let mut state = JsonTreeViewState::default();
+        assert!(state.sync_body(r#"{"a":{"b":1},"list":[1,2]}"#));
+
+        // Root payload.
+        let root_payload = state.selected_copy_payload().expect("root payload");
+        assert!(root_payload.contains("path: $"));
+        assert!(root_payload.contains("\"a\""));
+        assert!(root_payload.contains("\"list\""));
+
+        // First child row should be `a`.
+        state.move_cursor_by(1);
+        let child_payload = state.selected_copy_payload().expect("child payload");
+        assert!(child_payload.contains("path: $/a"));
+        assert!(child_payload.contains("\"b\""));
+    }
+
+    #[test]
+    fn json_tree_selected_copy_payload_none_without_json() {
+        let mut state = JsonTreeViewState::default();
+        assert!(!state.sync_body("not-json"));
+        assert!(state.selected_copy_payload().is_none());
     }
 
     #[test]

@@ -3446,6 +3446,17 @@ impl MailScreen for SearchCockpitScreen {
 
     fn copyable_content(&self) -> Option<String> {
         let entry = self.results.get(self.cursor)?;
+        if self.detail_view_mode.get() == DetailViewMode::JsonTree
+            && let Some(body) = entry.full_body.as_ref()
+        {
+            let mut tree = self.json_tree_state.borrow_mut();
+            if tree.sync_body(body) {
+                tree.clamp_cursor();
+                if let Some(payload) = tree.selected_copy_payload() {
+                    return Some(payload);
+                }
+            }
+        }
         Some(entry.full_body.as_ref().map_or_else(
             || {
                 if entry.body_preview.is_empty() {
@@ -6722,6 +6733,30 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
         assert_eq!(screen.detail_view_mode.get(), DetailViewMode::Markdown);
+    }
+
+    #[test]
+    fn copyable_content_returns_json_node_payload_in_tree_mode() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.last_detail_area.set(Rect::new(0, 0, 80, 12));
+        let mut entry = make_msg_entry();
+        entry.full_body = Some(r#"{"outer":{"inner":42}}"#.to_string());
+        entry.rendered_body = None;
+        screen.results = vec![entry];
+        screen.focus = Focus::ResultList;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
+        let payload = screen.copyable_content().expect("copy payload");
+        assert!(payload.contains("path: $"), "payload should include JSON path");
+        assert!(payload.contains("value:"), "payload should include value");
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('j'))), &state);
+        let child_payload = screen.copyable_content().expect("child payload");
+        assert!(
+            child_payload.contains("path: $/outer"),
+            "child payload should include selected node path"
+        );
     }
 
     #[test]
