@@ -658,7 +658,8 @@ impl MailScreen for AgentsScreen {
                     self.detail_visible = !self.detail_visible;
                 }
                 KeyCode::Char('J') => {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    let max = self.last_detail_max_scroll.get();
+                    self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
                 }
                 KeyCode::Char('K') => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
@@ -942,7 +943,7 @@ impl AgentsScreen {
         };
 
         let lines = self.build_detail_lines(agent, &tp);
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
     }
 
     /// Build key-value lines for agent detail.
@@ -1212,11 +1213,13 @@ fn render_kv_lines(
     inner: Rect,
     lines: &[(String, String, Option<PackedRgba>)],
     scroll: usize,
+    max_scroll_cell: &std::cell::Cell<usize>,
     tp: &crate::tui_theme::TuiThemePalette,
 ) {
     let visible_height = usize::from(inner.height);
     let total_lines = lines.len();
     let max_scroll = total_lines.saturating_sub(visible_height);
+    max_scroll_cell.set(max_scroll);
     let scroll = scroll.min(max_scroll);
     let label_w = 12u16;
 

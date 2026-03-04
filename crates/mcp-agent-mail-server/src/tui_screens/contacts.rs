@@ -169,6 +169,8 @@ pub struct ContactsScreen {
     prev_contact_counts: (u64, u64, u64, u64),
     detail_visible: bool,
     detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
     /// Last observed data generation for dirty-state tracking.
     last_data_gen: super::DataGeneration,
     /// True when the DB poller has not yet delivered any data.
@@ -202,6 +204,7 @@ impl ContactsScreen {
             prev_contact_counts: (0, 0, 0, 0),
             detail_visible: true,
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             last_data_gen: super::DataGeneration::stale(),
             db_context_unavailable: false,
         }
@@ -1134,7 +1137,7 @@ impl ContactsScreen {
         );
         lines.push(("Expires".into(), expires_str, None));
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
     }
 
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1563,12 +1566,15 @@ fn render_kv_lines(
     area: Rect,
     lines: &[(String, String, Option<PackedRgba>)],
     scroll: usize,
+    max_scroll_cell: &std::cell::Cell<usize>,
     tp: &crate::tui_theme::TuiThemePalette,
 ) {
     let label_w: u16 = 14;
     let visible = area.height as usize;
     let total = lines.len();
-    let offset = scroll.min(total.saturating_sub(visible));
+    let max_scroll = total.saturating_sub(visible);
+    max_scroll_cell.set(max_scroll);
+    let offset = scroll.min(max_scroll);
 
     for (i, (label, value, color)) in lines.iter().skip(offset).enumerate() {
         let row_y = area.y + i as u16;
