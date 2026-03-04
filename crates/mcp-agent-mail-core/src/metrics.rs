@@ -418,6 +418,7 @@ pub struct DbMetrics {
     pub pool_pending_requests: GaugeU64,
     pub pool_peak_active_connections: GaugeU64,
     pub pool_over_80_since_us: GaugeU64,
+    pub integrity_failures_total: Counter,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -432,6 +433,7 @@ pub struct DbMetricsSnapshot {
     pub pool_peak_active_connections: u64,
     pub pool_utilization_pct: u64,
     pub pool_over_80_since_us: u64,
+    pub integrity_failures_total: u64,
 }
 
 impl Default for DbMetrics {
@@ -446,6 +448,7 @@ impl Default for DbMetrics {
             pool_pending_requests: GaugeU64::new(),
             pool_peak_active_connections: GaugeU64::new(),
             pool_over_80_since_us: GaugeU64::new(),
+            integrity_failures_total: Counter::new(),
         }
     }
 }
@@ -474,6 +477,7 @@ impl DbMetrics {
             pool_peak_active_connections: self.pool_peak_active_connections.load(),
             pool_utilization_pct,
             pool_over_80_since_us: self.pool_over_80_since_us.load(),
+            integrity_failures_total: self.integrity_failures_total.load(),
         }
     }
 }

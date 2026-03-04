@@ -130,8 +130,9 @@ const RING_FILL_WARN: u8 = 80;
 const TOOL_LATENCY_WARN_MS: u64 = 500;
 const TOOL_LATENCY_HIGH_MS: u64 = 2_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DashboardQuickFilter {
+    #[default]
     All,
     Messages,
     Tools,
@@ -223,30 +224,8 @@ struct VisibleCacheKey {
 /// Cached heatmap grid computation.
 #[derive(Debug, Clone)]
 struct HeatmapCache {
-    ts_min: i64,
-    ts_max: i64,
     grid: Vec<Vec<u32>>,
     max_count: u32,
-}
-
-/// Cached formatted summary tile strings and trends.
-#[derive(Debug, Clone)]
-struct SummaryTileCache {
-    messages: String,
-    agents: String,
-    projects: String,
-    reservations: String,
-    threads: String,
-    ack_pending: String,
-    contacts: String,
-    avg_latency: String,
-    total_requests: String,
-    msg_trend: MetricTrend,
-    agent_trend: MetricTrend,
-    project_trend: MetricTrend,
-    reservation_trend: MetricTrend,
-    thread_trend: MetricTrend,
-    ack_trend: MetricTrend,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -329,18 +308,18 @@ pub struct DashboardScreen {
     /// Cached visible entries (indices into `event_log`). Invalidated when events,
     /// filters, query, or verbosity change.
     cached_visible_indices: RefCell<Vec<usize>>,
-    /// Generation counter for `cached_visible_indices`; bumped on any filter or data change.
-    visible_cache_gen: u64,
     /// Snapshot of filter state at the time of the last cache fill.
     visible_cache_filter_sig: RefCell<VisibleCacheKey>,
-    /// Cached heatmap grid (ts_min, ts_max, grid, max_count). Invalidated on `dirty.events`.
+    /// Cached heatmap grid. Invalidated on `dirty.events`.
     cached_heatmap: RefCell<Option<HeatmapCache>>,
     /// Event count at last heatmap computation.
     heatmap_event_gen: usize,
-    /// Cached summary tile formatted strings. Refreshed only on stat tick.
-    cached_summary_tiles: RefCell<Option<SummaryTileCache>>,
-    /// Stat tick count at last summary tile cache fill.
-    summary_cache_stat_tick: u64,
+    /// Cached parsed query terms (query string → lowercased terms). Avoids 15+
+    /// redundant `parse_query_terms()` calls per frame across render functions.
+    cached_query_terms: RefCell<(String, Vec<String>)>,
+    /// Cached tool latency aggregation. Keyed by event count so it only recomputes
+    /// when the event log changes (not every frame).
+    cached_tool_latency: RefCell<(usize, Vec<ToolLatencyRow>)>,
 }
 
 /// A pre-formatted event log entry.
@@ -506,12 +485,11 @@ impl DashboardScreen {
             last_diagnostic_signature: RefCell::new(None),
             last_data_gen: super::DataGeneration::stale(),
             cached_visible_indices: RefCell::new(Vec::new()),
-            visible_cache_gen: 0,
             visible_cache_filter_sig: RefCell::new(VisibleCacheKey::default()),
             cached_heatmap: RefCell::new(None),
             heatmap_event_gen: 0,
-            cached_summary_tiles: RefCell::new(None),
-            summary_cache_stat_tick: 0,
+            cached_query_terms: RefCell::new((String::new(), Vec::new())),
+            cached_tool_latency: RefCell::new((0, Vec::new())),
         }
     }
 
@@ -676,6 +654,8 @@ impl DashboardScreen {
         };
         self.heatmap_event_gen = self.heatmap_event_gen.wrapping_add(1);
         *self.cached_heatmap.borrow_mut() = None;
+        // Invalidate tool latency cache so it recomputes on next frame.
+        self.cached_tool_latency.borrow_mut().0 = usize::MAX;
     }
 
     /// Build the current filter key for cache invalidation.
@@ -719,8 +699,7 @@ impl DashboardScreen {
                 .enumerate()
                 .filter(|(_, (entry, searchable_key))| {
                     self.verbosity.includes(entry.severity)
-                        && (self.type_filter.is_empty()
-                            || self.type_filter.contains(&entry.kind))
+                        && (self.type_filter.is_empty() || self.type_filter.contains(&entry.kind))
                         && text_matches_query_terms(searchable_key, &query_terms)
                 })
                 .map(|(i, _)| i)
@@ -738,6 +717,36 @@ impl DashboardScreen {
             .iter()
             .filter_map(|&i| self.event_log.get(i))
             .collect()
+    }
+
+    /// Return parsed query terms, using cache to avoid 15+ re-parses per frame.
+    fn cached_parsed_query_terms(&self) -> Vec<String> {
+        let query = self.quick_query().to_string();
+        let cache = self.cached_query_terms.borrow();
+        if cache.0 == query {
+            return cache.1.clone();
+        }
+        drop(cache);
+        let terms = parse_query_terms(&query);
+        *self.cached_query_terms.borrow_mut() = (query, terms.clone());
+        terms
+    }
+
+    /// Return cached tool latency aggregation. Only recomputes when visible
+    /// entries change (event count) or query terms change. Avoids 10+
+    /// redundant O(N log N) aggregation+sort passes per frame.
+    fn cached_tool_latency_rows(&self, entries: &[&EventEntry]) -> Vec<ToolLatencyRow> {
+        let query_terms = self.cached_parsed_query_terms();
+        let entry_count = entries.len();
+        {
+            let cache = self.cached_tool_latency.borrow();
+            if cache.0 == entry_count && !cache.1.is_empty() {
+                return cache.1.clone();
+            }
+        }
+        let rows = compute_tool_latency_rows(entries, &query_terms);
+        *self.cached_tool_latency.borrow_mut() = (entry_count, rows.clone());
+        rows
     }
 
     fn quick_query(&self) -> &str {
@@ -1485,6 +1494,10 @@ impl MailScreen for DashboardScreen {
             inline_anomaly_count,
             effects_enabled && !self.reduced_motion,
         );
+        // Compute tool latency rows once for the whole frame. This avoids 10+
+        // redundant O(N log N) aggregation passes across render_insight_rail,
+        // render_bottom_rail, and render_insight_panel_slot.
+        let latency_rows = self.cached_tool_latency_rows(&visible_entries);
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
             render_insight_rail(
                 frame,
@@ -1497,6 +1510,7 @@ impl MailScreen for DashboardScreen {
                 &self.animated_throughput_history,
                 &self.event_log,
                 &self.cached_heatmap,
+                &latency_rows,
             );
         }
         if let Some(preview_rect) = comp.rect(PanelSlot::Footer) {
@@ -1507,6 +1521,7 @@ impl MailScreen for DashboardScreen {
                 &db_snapshot,
                 &visible_entries,
                 preview,
+                &latency_rows,
             );
         }
         if let Some(log_rect) = comp.rect(PanelSlot::Sidebar) {
@@ -1634,12 +1649,29 @@ fn summarize_recipients(recipients: &[String]) -> String {
     }
 }
 
+/// Parse space-separated query terms. Uses a thread-local cache so that the 15+
+/// render functions that call this per frame only allocate once (same query string
+/// within a single frame render cycle).
 fn parse_query_terms(raw: &str) -> Vec<String> {
-    raw.split_whitespace()
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
+    thread_local! {
+        static CACHE: RefCell<(String, Vec<String>)> = RefCell::new((String::new(), Vec::new()));
+    }
+    CACHE.with(|cell| {
+        let cache = cell.borrow();
+        if cache.0 == raw {
+            return cache.1.clone();
+        }
+        drop(cache);
+        let terms: Vec<String> = raw
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let result = terms.clone();
+        *cell.borrow_mut() = (raw.to_string(), terms);
+        result
+    })
 }
 
 fn sanitize_diagnostic_value(value: &str) -> String {
@@ -1658,13 +1690,35 @@ fn sanitize_diagnostic_value(value: &str) -> String {
         .join(" ")
 }
 
+/// Compute a deterministic signature for the type filter set.
+/// Uses a thread-local cache since this is called multiple times per frame
+/// (from `current_visible_cache_key()` and `emit_screen_diagnostic()`).
 fn type_filter_signature(type_filter: &HashSet<MailEventKind>) -> String {
     if type_filter.is_empty() {
         return "none".to_string();
     }
-    let mut names: Vec<String> = type_filter.iter().map(|kind| format!("{kind:?}")).collect();
-    names.sort_unstable();
-    names.join("|")
+    thread_local! {
+        static CACHE: RefCell<(u64, String)> = RefCell::new((0, String::new()));
+    }
+    // Use a cheap hash of the set to detect changes (avoids sorting every call).
+    let hash: u64 = type_filter
+        .iter()
+        .map(|k| *k as u64)
+        .fold(type_filter.len() as u64, |acc, v| {
+            acc.wrapping_mul(31).wrapping_add(v)
+        });
+    CACHE.with(|cell| {
+        let cache = cell.borrow();
+        if cache.0 == hash && !cache.1.is_empty() {
+            return cache.1.clone();
+        }
+        drop(cache);
+        let mut names: Vec<String> = type_filter.iter().map(|kind| format!("{kind:?}")).collect();
+        names.sort_unstable();
+        let sig = names.join("|");
+        *cell.borrow_mut() = (hash, sig.clone());
+        sig
+    })
 }
 
 fn text_matches_query_terms(haystack: &str, query_terms: &[String]) -> bool {
@@ -1918,6 +1972,7 @@ fn render_insight_panel_slot(
     query_text: &str,
     anomalies: &[DetectedAnomaly],
     entries: &[&EventEntry],
+    latency_rows: &[ToolLatencyRow],
 ) {
     match slot {
         InsightPanelSlot::Agents => {
@@ -1959,7 +2014,7 @@ fn render_insight_panel_slot(
             );
         }
         InsightPanelSlot::ToolLatency => {
-            render_tool_latency_panel(frame, area, entries, query_text);
+            render_tool_latency_panel_cached(frame, area, latency_rows);
         }
         InsightPanelSlot::EventMix => {
             render_event_mix_panel(frame, area, entries, query_text);
@@ -2661,6 +2716,7 @@ fn render_insight_rail(
     throughput_history: &[f64],
     event_log: &VecDeque<EventEntry>,
     heatmap_cache: &RefCell<Option<HeatmapCache>>,
+    latency_rows: &[ToolLatencyRow],
 ) {
     if area.width < 24 || area.height < 8 {
         return;
@@ -2728,6 +2784,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
                 render_insight_panel_slot(
                     frame,
@@ -2737,6 +2794,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
                 render_insight_panel_slot(
                     frame,
@@ -2746,6 +2804,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
                 render_insight_panel_slot(
                     frame,
@@ -2755,6 +2814,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
             } else if three_rows {
                 let (top, rest_rows) = split_height_ratio_with_gap(*col, 0.34, 1);
@@ -2767,6 +2827,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
                 render_insight_panel_slot(
                     frame,
@@ -2776,6 +2837,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
                 render_insight_panel_slot(
                     frame,
@@ -2785,6 +2847,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
             } else {
                 let (top, bottom) = split_height_ratio_with_gap(*col, 0.5, 1);
@@ -2796,6 +2859,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
                 render_insight_panel_slot(
                     frame,
@@ -2805,6 +2869,7 @@ fn render_insight_rail(
                     query_text,
                     anomalies,
                     entries,
+                    latency_rows,
                 );
             }
         }
@@ -2844,7 +2909,7 @@ fn render_insight_rail(
             &db_snapshot.contacts_list,
             query_text,
         );
-        render_tool_latency_panel(frame, d_bottom, entries, query_text);
+        render_tool_latency_panel_cached(frame, d_bottom, latency_rows);
         return;
     }
 
@@ -2920,6 +2985,7 @@ fn render_bottom_rail(
     db_snapshot: &DbStatSnapshot,
     entries: &[&EventEntry],
     preview: Option<&RecentMessagePreview>,
+    latency_rows: &[ToolLatencyRow],
 ) {
     if area.width < 24 || area.height < 4 {
         return;
@@ -2938,7 +3004,7 @@ fn render_bottom_rail(
                 render_message_flow_panel(frame, flow_col, entries, query_text);
                 if ops_col.height >= 10 {
                     let (ops_top, ops_bottom) = split_height_ratio_with_gap(ops_col, 0.5, 1);
-                    render_tool_latency_panel(frame, ops_top, entries, query_text);
+                    render_tool_latency_panel_cached(frame, ops_top, latency_rows);
                     render_project_load_panel(
                         frame,
                         ops_bottom,
@@ -2946,7 +3012,7 @@ fn render_bottom_rail(
                         query_text,
                     );
                 } else {
-                    render_tool_latency_panel(frame, ops_col, entries, query_text);
+                    render_tool_latency_panel_cached(frame, ops_col, latency_rows);
                 }
                 if reservations_col.height >= 10 {
                     let (res_top, res_bottom) =
@@ -2986,7 +3052,7 @@ fn render_bottom_rail(
                 render_message_flow_panel(frame, analytics_bottom, entries, query_text);
 
                 let (ops_top, ops_bottom) = split_height_ratio_with_gap(ops_col, 0.5, 1);
-                render_tool_latency_panel(frame, ops_top, entries, query_text);
+                render_tool_latency_panel_cached(frame, ops_top, latency_rows);
                 render_reservation_ttl_buckets_panel(
                     frame,
                     ops_bottom,
@@ -3007,7 +3073,7 @@ fn render_bottom_rail(
                     render_recent_activity_panel(frame, activity_col, entries, query_text);
                     render_event_mix_panel(frame, top_left, entries, query_text);
                     render_message_flow_panel(frame, top_right, entries, query_text);
-                    render_tool_latency_panel(frame, bottom_left, entries, query_text);
+                    render_tool_latency_panel_cached(frame, bottom_left, latency_rows);
                     render_reservation_ttl_buckets_panel(
                         frame,
                         bottom_right,
@@ -3034,7 +3100,7 @@ fn render_bottom_rail(
                     render_recent_activity_panel(frame, activity_col, entries, query_text);
                     render_event_mix_panel(frame, mix_col, entries, query_text);
                     render_message_flow_panel(frame, right_top, entries, query_text);
-                    render_tool_latency_panel(frame, right_bottom, entries, query_text);
+                    render_tool_latency_panel_cached(frame, right_bottom, latency_rows);
                 } else {
                     let (left, right) = split_width_ratio_with_gap(area, 0.64, 1);
                     let (right_top, right_bottom) = split_height_ratio_with_gap(right, 0.5, 1);
@@ -3071,7 +3137,7 @@ fn render_bottom_rail(
         if metrics_col.height >= 10 {
             let (metrics_top, metrics_bottom) = split_height_ratio_with_gap(metrics_col, 0.5, 1);
             render_event_mix_panel(frame, metrics_top, entries, query_text);
-            render_tool_latency_panel(frame, metrics_bottom, entries, query_text);
+            render_tool_latency_panel_cached(frame, metrics_bottom, latency_rows);
         } else {
             render_event_mix_panel(frame, metrics_col, entries, query_text);
         }
@@ -3105,7 +3171,7 @@ fn render_bottom_rail(
             let (bottom_left, bottom_right) = split_width_ratio_with_gap(metrics_bottom, 0.5, 1);
             render_event_mix_panel(frame, top_left, entries, query_text);
             render_message_flow_panel(frame, top_right, entries, query_text);
-            render_tool_latency_panel(frame, bottom_left, entries, query_text);
+            render_tool_latency_panel_cached(frame, bottom_left, latency_rows);
             render_reservation_ttl_buckets_panel(
                 frame,
                 bottom_right,
@@ -3134,7 +3200,7 @@ fn render_bottom_rail(
             let (bottom_left, bottom_right) = split_width_ratio_with_gap(aux_bottom, 0.5, 1);
             render_event_mix_panel(frame, top_left, entries, query_text);
             render_message_flow_panel(frame, top_right, entries, query_text);
-            render_tool_latency_panel(frame, bottom_left, entries, query_text);
+            render_tool_latency_panel_cached(frame, bottom_left, latency_rows);
             render_reservation_ttl_buckets_panel(
                 frame,
                 bottom_right,
@@ -4089,6 +4155,7 @@ struct ToolAgg {
     samples: Vec<u64>,
 }
 
+#[derive(Clone)]
 struct ToolLatencyRow {
     tool_name: String,
     calls: usize,
@@ -4098,22 +4165,14 @@ struct ToolLatencyRow {
     max_ms: u64,
 }
 
-#[allow(clippy::too_many_lines)]
-fn render_tool_latency_panel(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    entries: &[&EventEntry],
-    query_text: &str,
-) {
-    if area.width < 20 || area.height < 3 {
-        return;
-    }
-
-    let query_terms = parse_query_terms(query_text);
+/// Aggregate tool latency data from visible entries. Extracted from
+/// `render_tool_latency_panel` so the result can be cached across the 10+
+/// render calls per frame that display the same aggregation.
+fn compute_tool_latency_rows(entries: &[&EventEntry], query_terms: &[String]) -> Vec<ToolLatencyRow> {
     let mut by_tool: HashMap<String, ToolAgg> = HashMap::new();
     for entry in entries.iter().filter(|entry| {
         entry.kind == MailEventKind::ToolCallEnd
-            && text_matches_query_terms(&entry.summary, &query_terms)
+            && text_matches_query_terms(&entry.summary, query_terms)
     }) {
         if let Some((tool_name, duration_ms)) = parse_tool_end_duration(&entry.summary) {
             let slot = by_tool.entry(tool_name).or_default();
@@ -4123,24 +4182,7 @@ fn render_tool_latency_panel(
             slot.samples.push(duration_ms);
         }
     }
-
-    let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Tool Latency · {}", by_tool.len());
-    let block = accent_panel_block(&title, tp.metric_latency);
-    let inner = block.inner(area);
-    block.render(area, frame);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    if by_tool.is_empty() {
-        Paragraph::new("No matching tool completions")
-            .style(crate::tui_theme::text_meta(&tp))
-            .render(inner, frame);
-        return;
-    }
-
-    let mut rows = by_tool
+    let mut rows: Vec<ToolLatencyRow> = by_tool
         .into_iter()
         .map(|(tool_name, mut stats)| {
             stats.samples.sort_unstable();
@@ -4158,13 +4200,41 @@ fn render_tool_latency_panel(
                 max_ms: stats.max_ms,
             }
         })
-        .collect::<Vec<_>>();
+        .collect();
     rows.sort_by(|a, b| {
         b.p95_ms
             .cmp(&a.p95_ms)
             .then_with(|| b.calls.cmp(&a.calls))
             .then_with(|| b.max_ms.cmp(&a.max_ms))
     });
+    rows
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_tool_latency_panel_cached(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    rows: &[ToolLatencyRow],
+) {
+    if area.width < 20 || area.height < 3 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = format!("Tool Latency · {}", rows.len());
+    let block = accent_panel_block(&title, tp.metric_latency);
+    let inner = block.inner(area);
+    block.render(area, frame);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if rows.is_empty() {
+        Paragraph::new("No matching tool completions")
+            .style(crate::tui_theme::text_meta(&tp))
+            .render(inner, frame);
+        return;
+    }
 
     let total_calls = rows.iter().map(|stats| stats.calls).sum::<usize>();
     let total_latency_ms = rows.iter().map(|stats| stats.total_ms).sum::<u64>();
@@ -5225,10 +5295,22 @@ fn heatmap_intensity_color(intensity: f64, tp: &crate::tui_theme::TuiThemePalett
 }
 
 /// Compute heatmap grid from event log for a given number of pixel columns.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn compute_heatmap_grid(event_log: &VecDeque<EventEntry>, num_cols: usize) -> HeatmapCache {
-    let ts_min = event_log.iter().map(|e| e.timestamp_micros).min().unwrap_or(0);
-    let ts_max = event_log.iter().map(|e| e.timestamp_micros).max().unwrap_or(0);
+    let ts_min = event_log
+        .iter()
+        .map(|e| e.timestamp_micros)
+        .min()
+        .unwrap_or(0);
+    let ts_max = event_log
+        .iter()
+        .map(|e| e.timestamp_micros)
+        .max()
+        .unwrap_or(0);
     let ts_span = (ts_max - ts_min).max(1);
     let mut grid = vec![vec![0u32; num_cols]; HEATMAP_EVENT_KINDS];
     for entry in event_log {
@@ -5238,8 +5320,14 @@ fn compute_heatmap_grid(event_log: &VecDeque<EventEntry>, num_cols: usize) -> He
         let row = heatmap_kind_index(entry.kind);
         grid[row][col] += 1;
     }
-    let max_count = grid.iter().flat_map(|row| row.iter()).copied().max().unwrap_or(1).max(1);
-    HeatmapCache { ts_min, ts_max, grid, max_count }
+    let max_count = grid
+        .iter()
+        .flat_map(|row| row.iter())
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    HeatmapCache { grid, max_count }
 }
 
 /// Render a Braille-mode Canvas heatmap of event activity density.
@@ -5603,6 +5691,11 @@ fn render_event_log(
     pane.render(viewer_area, frame);
 }
 
+/// Pre-computed total char width of quick-filter control labels (avoids 4× format!
+/// allocations per frame). Labels: " [1:All] ", " [2:Msg] ", " [3:Tools] ", " [4:Resv] ".
+const QUICK_FILTER_CONTROLS_TOTAL_CHARS: usize =
+    " [1:All] ".len() + " [2:Msg] ".len() + " [3:Tools] ".len() + " [4:Resv] ".len();
+
 fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
     if width == 0 || available_height == 0 {
         return 0;
@@ -5611,16 +5704,7 @@ fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
         // Preserve one line for the event viewer on cramped layouts.
         return 0;
     }
-    let total_chars = [
-        DashboardQuickFilter::All,
-        DashboardQuickFilter::Messages,
-        DashboardQuickFilter::Tools,
-        DashboardQuickFilter::Reservations,
-    ]
-    .iter()
-    .fold(0usize, |acc, filter| {
-        acc.saturating_add(format!(" [{}:{}] ", filter.key(), filter.control_label()).len())
-    });
+    let total_chars = QUICK_FILTER_CONTROLS_TOTAL_CHARS;
     let width_usize = usize::from(width.max(1));
     let estimated_lines = total_chars.saturating_add(width_usize.saturating_sub(1)) / width_usize;
     let estimated_lines = estimated_lines.max(1);
@@ -8233,5 +8317,85 @@ mod tests {
             preview.body_md,
             "This is the actual message body with real content"
         );
+    }
+
+    // ── E1: Cache correctness tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_query_terms_lowercases_and_splits() {
+        let terms = parse_query_terms("  Hello WORLD  rust  ");
+        assert_eq!(terms, vec!["hello", "world", "rust"]);
+    }
+
+    #[test]
+    fn parse_query_terms_empty_input() {
+        let terms = parse_query_terms("");
+        assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn parse_query_terms_cache_returns_same_result() {
+        let t1 = parse_query_terms("alpha beta");
+        let t2 = parse_query_terms("alpha beta");
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn parse_query_terms_cache_invalidates_on_change() {
+        let t1 = parse_query_terms("first query");
+        let t2 = parse_query_terms("second query");
+        assert_eq!(t1, vec!["first", "query"]);
+        assert_eq!(t2, vec!["second", "query"]);
+    }
+
+    #[test]
+    fn type_filter_signature_cache_returns_consistent_result() {
+        let mut filters = HashSet::new();
+        filters.insert(MailEventKind::MessageSent);
+        filters.insert(MailEventKind::ReservationReleased);
+        let s1 = type_filter_signature(&filters);
+        let s2 = type_filter_signature(&filters);
+        assert_eq!(s1, s2);
+        assert!(s1.contains("MessageSent"));
+        assert!(s1.contains("ReservationReleased"));
+    }
+
+    #[test]
+    fn type_filter_signature_cache_invalidates_on_different_set() {
+        let mut f1 = HashSet::new();
+        f1.insert(MailEventKind::MessageSent);
+        let sig1 = type_filter_signature(&f1);
+
+        let mut f2 = HashSet::new();
+        f2.insert(MailEventKind::ReservationReleased);
+        let sig2 = type_filter_signature(&f2);
+
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn quick_filter_controls_total_chars_matches_label_sum() {
+        let expected = " [1:All] ".len()
+            + " [2:Msg] ".len()
+            + " [3:Tools] ".len()
+            + " [4:Resv] ".len();
+        assert_eq!(QUICK_FILTER_CONTROLS_TOTAL_CHARS, expected);
+    }
+
+    #[test]
+    fn quick_filter_controls_height_zero_width() {
+        assert_eq!(quick_filter_controls_height(0, 10), 0);
+    }
+
+    #[test]
+    fn quick_filter_controls_height_single_line_available() {
+        assert_eq!(quick_filter_controls_height(80, 1), 0);
+    }
+
+    #[test]
+    fn quick_filter_controls_height_wide_terminal_single_row() {
+        // 80 cols should fit all labels in 1 row
+        let h = quick_filter_controls_height(80, 5);
+        assert_eq!(h, 1);
     }
 }

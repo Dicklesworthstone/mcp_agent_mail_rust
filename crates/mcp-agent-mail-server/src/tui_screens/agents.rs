@@ -218,6 +218,21 @@ pub struct AgentsScreen {
     last_data_gen: super::DataGeneration,
     /// True when the DB poller has not yet delivered any data.
     db_context_unavailable: bool,
+    // ── Cached derived data (computed once per rebuild, reused in render) ──
+    /// Cached (active, idle, inactive) agent counts.
+    cached_status_counts: (u64, u64, u64),
+    /// Cached total message count across all agents.
+    cached_total_msgs: u64,
+    /// Cached timestamp (microseconds) snapshotted once per tick.
+    cached_now_ts: i64,
+    /// Cached sparkline data as Vec (avoids VecDeque→Vec copy every render).
+    cached_sparkline_vec: Vec<f64>,
+    /// Whether the sparkline cache needs refresh.
+    sparkline_dirty: bool,
+    /// Last selection index, used to gate `sync_focused_event`.
+    last_selection: Option<usize>,
+    /// Generation counter for agent list changes (gates focused-event sync).
+    agents_list_gen: u64,
 }
 
 impl AgentsScreen {
@@ -247,6 +262,13 @@ impl AgentsScreen {
             detail_scroll: 0,
             last_data_gen: super::DataGeneration::stale(),
             db_context_unavailable: false,
+            cached_status_counts: (0, 0, 0),
+            cached_total_msgs: 0,
+            cached_now_ts: 0,
+            cached_sparkline_vec: Vec::new(),
+            sparkline_dirty: true,
+            last_selection: None,
+            agents_list_gen: 0,
         }
     }
 
@@ -346,7 +368,7 @@ impl AgentsScreen {
             raw_count: raw_from_db,
             rendered_count,
             dropped_count,
-            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            timestamp_micros: self.cached_now_ts,
             db_url: cfg.database_url,
             storage_root: cfg.storage_root,
             transport_mode,
@@ -356,6 +378,12 @@ impl AgentsScreen {
         self.track_stagger_reveals(&rows);
         self.rebuild_status_transitions(&rows);
         self.agents = rows;
+        self.agents_list_gen = self.agents_list_gen.wrapping_add(1);
+
+        // Cache derived data used by multiple render methods.
+        self.cached_status_counts = self.compute_status_counts();
+        self.cached_total_msgs = self.msg_counts.values().sum();
+        self.sparkline_dirty = true;
 
         // Clamp selection
         if let Some(sel) = self.table_state.selected
@@ -418,7 +446,7 @@ impl AgentsScreen {
     }
 
     fn rebuild_status_transitions(&mut self, rows: &[AgentRow]) {
-        let now_ts = chrono::Utc::now().timestamp_micros();
+        let now_ts = self.cached_now_ts;
         let mut next_statuses = HashMap::with_capacity(rows.len());
         for row in rows {
             let next = AgentStatus::from_last_active(row.last_active_ts, now_ts);
@@ -496,6 +524,15 @@ impl AgentsScreen {
         let sparkline_sample = u32::try_from(self.total_msgs_this_tick).unwrap_or(u32::MAX);
         self.msg_rate_history.push_back(f64::from(sparkline_sample));
         self.total_msgs_this_tick = 0;
+        self.sparkline_dirty = true;
+    }
+
+    /// Refresh the cached sparkline Vec if dirty.
+    fn refresh_sparkline_cache(&mut self) {
+        if self.sparkline_dirty {
+            self.cached_sparkline_vec = self.msg_rate_history.iter().copied().collect();
+            self.sparkline_dirty = false;
+        }
     }
 
     fn status_color(&self, agent: &AgentRow, now_ts: i64) -> PackedRgba {
@@ -541,9 +578,9 @@ impl AgentsScreen {
         style
     }
 
-    /// Count agents by status category.
-    fn status_counts(&self) -> (u64, u64, u64) {
-        let now_ts = chrono::Utc::now().timestamp_micros();
+    /// Count agents by status category using the cached timestamp.
+    fn compute_status_counts(&self) -> (u64, u64, u64) {
+        let now_ts = self.cached_now_ts;
         let mut active = 0u64;
         let mut idle = 0u64;
         let mut inactive = 0u64;
@@ -635,6 +672,9 @@ impl MailScreen for AgentsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        // Snapshot timestamp once per tick for all downstream use.
+        self.cached_now_ts = chrono::Utc::now().timestamp_micros();
+
         // ── Dirty-state gated data ingestion ────────────────────────
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
@@ -659,7 +699,18 @@ impl MailScreen for AgentsScreen {
             self.record_sparkline_sample();
             self.rebuild_from_state(state);
         }
-        self.sync_focused_event();
+
+        // Only recompute focused_synthetic when selection or agent list changed.
+        let current_sel = self.table_state.selected;
+        if current_sel != self.last_selection
+            || (dirty.db_stats && self.last_selection.is_some())
+        {
+            self.sync_focused_event();
+            self.last_selection = current_sel;
+        }
+
+        // Lazily refresh sparkline cache before next render.
+        self.refresh_sparkline_cache();
 
         self.last_data_gen = current_gen;
     }
@@ -896,7 +947,7 @@ impl AgentsScreen {
         agent: &AgentRow,
         tp: &crate::tui_theme::TuiThemePalette,
     ) -> Vec<(String, String, Option<PackedRgba>)> {
-        let now_ts = chrono::Utc::now().timestamp_micros();
+        let now_ts = self.cached_now_ts;
         let status = AgentStatus::from_last_active(agent.last_active_ts, now_ts);
         let status_color = self.status_color(agent, now_ts);
 
@@ -925,7 +976,7 @@ impl AgentsScreen {
             if agent.last_active_ts == 0 {
                 "never".into()
             } else {
-                let relative = format_relative_time(agent.last_active_ts);
+                let relative = format_relative_time_with(agent.last_active_ts, now_ts);
                 let iso = mcp_agent_mail_db::timestamps::micros_to_iso(agent.last_active_ts);
                 format!("{relative}  ({iso})")
             },
@@ -949,15 +1000,15 @@ impl AgentsScreen {
     fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let total_agents = self.agents.len() as u64;
-        let (active, idle, _inactive) = self.status_counts();
-        let total_msgs: u64 = self.msg_counts.values().sum();
+        let (active, idle, _inactive) = self.cached_status_counts;
+        let total_msgs = self.cached_total_msgs;
 
         let agents_str = total_agents.to_string();
         let active_str = active.to_string();
         let idle_str = idle.to_string();
         let msgs_str = total_msgs.to_string();
 
-        let sparkline_data: Vec<f64> = self.msg_rate_history.iter().copied().collect();
+        let sparkline_data = &self.cached_sparkline_vec;
 
         let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = vec![
             ("Agents", &agents_str, MetricTrend::Flat, tp.metric_agents),
@@ -990,7 +1041,7 @@ impl AgentsScreen {
                 .sparkline_color(*color);
             // Add sparkline to Messages tile
             if *label == "Messages" && !sparkline_data.is_empty() {
-                tile = tile.sparkline(&sparkline_data);
+                tile = tile.sparkline(sparkline_data);
             }
             tile.render(tile_area, frame);
         }
@@ -999,7 +1050,7 @@ impl AgentsScreen {
     #[allow(clippy::cast_possible_truncation)]
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect, wide: bool, narrow: bool) {
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let now_ts = chrono::Utc::now().timestamp_micros();
+        let now_ts = self.cached_now_ts;
 
         // Responsive columns
         let (header_cells, widths): (Vec<&str>, Vec<Constraint>) = if narrow {
@@ -1044,7 +1095,7 @@ impl AgentsScreen {
             .iter()
             .enumerate()
             .map(|(i, agent)| {
-                let active_str = format_relative_time(agent.last_active_ts);
+                let active_str = format_relative_time_with(agent.last_active_ts, now_ts);
                 let msg_str = agent.message_count.to_string();
                 let style = self.row_style(i, agent, now_ts);
 
@@ -1086,8 +1137,8 @@ impl AgentsScreen {
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let total = self.agents.len() as u64;
-        let (active, idle, inactive) = self.status_counts();
-        let total_msgs: u64 = self.msg_counts.values().sum();
+        let (active, idle, inactive) = self.cached_status_counts;
+        let total_msgs = self.cached_total_msgs;
 
         let total_str = total.to_string();
         let active_str = active.to_string();
@@ -1107,13 +1158,12 @@ impl AgentsScreen {
     }
 }
 
-/// Format a timestamp as relative time from now.
-fn format_relative_time(ts_micros: i64) -> String {
+/// Format a timestamp as relative time from `now_micros`.
+fn format_relative_time_with(ts_micros: i64, now_micros: i64) -> String {
     if ts_micros == 0 {
         return "never".to_string();
     }
-    let now = chrono::Utc::now().timestamp_micros();
-    let delta_secs = (now - ts_micros) / 1_000_000;
+    let delta_secs = (now_micros - ts_micros) / 1_000_000;
     if delta_secs < 0 {
         return "future".to_string();
     }
@@ -1365,11 +1415,11 @@ mod tests {
 
     #[test]
     fn format_relative_time_values() {
-        assert_eq!(format_relative_time(0), "never");
         let now = chrono::Utc::now().timestamp_micros();
-        let result = format_relative_time(now - 30_000_000); // 30s ago
+        assert_eq!(format_relative_time_with(0, now), "never");
+        let result = format_relative_time_with(now - 30_000_000, now); // 30s ago
         assert!(result.contains("s ago"));
-        let result = format_relative_time(now - 300_000_000); // 5m ago
+        let result = format_relative_time_with(now - 300_000_000, now); // 5m ago
         assert!(result.contains("m ago"));
     }
 
@@ -1504,6 +1554,7 @@ mod tests {
         let mut screen = AgentsScreen::new();
         screen.reduced_motion = false;
         let now = chrono::Utc::now().timestamp_micros();
+        screen.cached_now_ts = now;
         let mut rows = vec![AgentRow {
             name: "RedFox".to_string(),
             program: "claude-code".to_string(),
@@ -1662,7 +1713,7 @@ mod tests {
     #[test]
     fn status_counts_empty() {
         let screen = AgentsScreen::new();
-        assert_eq!(screen.status_counts(), (0, 0, 0));
+        assert_eq!(screen.compute_status_counts(), (0, 0, 0));
     }
 
     // ── B4: Cardinality truth assertions ────────────────────────────
@@ -1948,5 +1999,127 @@ mod tests {
             text.contains("Database context unavailable"),
             "should render degraded banner: {text}"
         );
+    }
+
+    // ── E4: Hotspot remediation cache tests ─────────────────────────
+
+    #[test]
+    fn cached_now_ts_set_on_tick() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+        assert_eq!(screen.cached_now_ts, 0);
+        screen.tick(0, &state);
+        assert!(screen.cached_now_ts > 0, "tick must snapshot now_ts");
+    }
+
+    #[test]
+    fn cached_status_counts_updated_on_rebuild() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 2,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: chrono::Utc::now().timestamp_micros(), // active
+                },
+                crate::tui_events::AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 100, // inactive (ancient ts)
+                },
+            ],
+            ..Default::default()
+        });
+        let mut screen = AgentsScreen::new();
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+        screen.rebuild_from_state(&state);
+        let (active, _idle, inactive) = screen.cached_status_counts;
+        assert_eq!(active, 1);
+        assert_eq!(inactive, 1);
+    }
+
+    #[test]
+    fn cached_total_msgs_updated_on_rebuild() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 1,
+            agents_list: vec![crate::tui_events::AgentSummary {
+                name: "RedFox".to_string(),
+                program: "claude-code".to_string(),
+                last_active_ts: 100,
+            }],
+            ..Default::default()
+        });
+        let mut screen = AgentsScreen::new();
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+        screen.msg_counts.insert("RedFox".to_string(), 42);
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.cached_total_msgs, 42);
+    }
+
+    #[test]
+    fn sparkline_cache_refreshed_after_sample() {
+        let mut screen = AgentsScreen::new();
+        assert!(screen.cached_sparkline_vec.is_empty());
+        screen.total_msgs_this_tick = 7;
+        screen.record_sparkline_sample();
+        assert!(screen.sparkline_dirty);
+        screen.refresh_sparkline_cache();
+        assert!(!screen.sparkline_dirty);
+        assert_eq!(screen.cached_sparkline_vec.len(), 1);
+        assert!((screen.cached_sparkline_vec[0] - 7.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sync_focused_event_gated_by_selection_change() {
+        let mut screen = AgentsScreen::new();
+        screen.agents.push(AgentRow {
+            name: "RedFox".to_string(),
+            program: "claude-code".to_string(),
+            model: "opus-4.6".to_string(),
+            last_active_ts: 100,
+            message_count: 0,
+        });
+        // No selection → sync_focused_event produces None
+        screen.sync_focused_event();
+        assert!(screen.focused_synthetic.is_none());
+        // Set selection → sync produces Some
+        screen.table_state.selected = Some(0);
+        screen.sync_focused_event();
+        assert!(screen.focused_synthetic.is_some());
+        // Gate: last_selection tracks changes
+        screen.last_selection = Some(0);
+        let current_sel = screen.table_state.selected;
+        assert_eq!(current_sel, screen.last_selection, "no change = gate closed");
+    }
+
+    #[test]
+    fn format_relative_time_with_uses_provided_now() {
+        let now = 1_000_000_000_000i64; // 1e12 micros
+        let ts = now - 120_000_000; // 120s ago
+        let result = format_relative_time_with(ts, now);
+        assert_eq!(result, "2m ago");
+    }
+
+    #[test]
+    fn agents_list_gen_increments_on_rebuild() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 1,
+            agents_list: vec![crate::tui_events::AgentSummary {
+                name: "RedFox".to_string(),
+                program: "claude-code".to_string(),
+                last_active_ts: 100,
+            }],
+            ..Default::default()
+        });
+        let mut screen = AgentsScreen::new();
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+        let gen_before = screen.agents_list_gen;
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.agents_list_gen, gen_before + 1);
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.agents_list_gen, gen_before + 2);
     }
 }
