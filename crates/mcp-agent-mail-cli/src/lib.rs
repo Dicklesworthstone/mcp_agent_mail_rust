@@ -24189,11 +24189,8 @@ mod tests {
         std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
         let conn = open_db_sync_with_database_url(&db_url).expect("open after quarantine");
         let rows = conn
-            .query_sync(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='projects'",
-                &[],
-            )
-            .expect("query sqlite_master");
+            .query_sync("SELECT COUNT(*) AS c FROM projects", &[])
+            .expect("query projects count");
         assert!(
             !rows.is_empty(),
             "schema init should recreate core tables after quarantine"

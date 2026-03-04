@@ -3287,6 +3287,20 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     fi
   fi
 
+  # Final post-migration invariants: even after fallback, the database must
+  # be healthy and core legacy row counts must be preserved.
+  if [ "$migration_succeeded" -eq 1 ]; then
+    migration_integrity=$(sqlite3 "$PYTHON_DB_MIGRATED_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
+    if [ "$migration_integrity" != "ok" ]; then
+      migration_succeeded=0
+      warn "Final migration integrity_check failed: '${migration_integrity:-<empty>}'"
+    fi
+    if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
+      migration_succeeded=0
+      warn "Final migration verification detected reduced core legacy row counts."
+    fi
+  fi
+
   if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
     if [ "$migration_succeeded" -eq 1 ]; then
       rm -f "$migration_pristine_backup" "${migration_pristine_backup}-wal" "${migration_pristine_backup}-shm" 2>/dev/null || true
