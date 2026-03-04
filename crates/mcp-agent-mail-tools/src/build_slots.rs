@@ -172,8 +172,8 @@ pub async fn acquire_build_slot(
 
     let now = chrono::Utc::now();
     let ttl = match ttl_seconds {
-        Some(t) if t > 0 => t.clamp(60, 31_536_000),
-        _ => 3600, // 1 hour default
+        Some(t) => t.clamp(60, 31_536_000),
+        None => 3600, // 1 hour default
     };
     let expires_ts = (now + chrono::Duration::seconds(ttl)).to_rfc3339();
     let branch = compute_branch(&project.human_key);
@@ -230,8 +230,8 @@ pub async fn renew_build_slot(
 
     let now = chrono::Utc::now();
     let extend = match extend_seconds {
-        Some(t) if t > 0 => t.clamp(60, 31_536_000),
-        _ => 1800, // 30 minutes default
+        Some(t) => t.clamp(60, 31_536_000),
+        None => 1800, // 30 minutes default
     };
     let new_exp = (now + chrono::Duration::seconds(extend)).to_rfc3339();
 

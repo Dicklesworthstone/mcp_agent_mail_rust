@@ -157,6 +157,7 @@ pub struct AnalyticsScreen {
     selected: usize,
     table_state: TableState,
     detail_scroll: u16,
+    last_detail_max_scroll: Cell<u16>,
     last_refresh_tick: Option<u64>,
     severity_filter: AnalyticsSeverityFilter,
     sort_mode: AnalyticsSortMode,
@@ -190,6 +191,7 @@ impl AnalyticsScreen {
             selected: 0,
             table_state: TableState::default(),
             detail_scroll: 0,
+            last_detail_max_scroll: Cell::new(0),
             last_refresh_tick: None,
             severity_filter: AnalyticsSeverityFilter::All,
             sort_mode: AnalyticsSortMode::Priority,
@@ -370,6 +372,11 @@ impl AnalyticsScreen {
     #[allow(clippy::missing_const_for_fn)] // stateful runtime helper
     fn scroll_detail_down(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_add(1);
+        self.clamp_detail_scroll();
+    }
+
+    fn clamp_detail_scroll(&mut self) {
+        self.detail_scroll = self.detail_scroll.min(self.last_detail_max_scroll.get());
     }
 
     /// Parse deep-link anchors like `"screen:tool_metrics"` into navigation targets.
@@ -1167,6 +1174,7 @@ fn render_card_detail(
     card: &InsightCard,
     scroll: u16,
     focus: AnalyticsFocus,
+    max_scroll_cell: &Cell<u16>,
 ) {
     use ftui::text::{Line, Span, Text};
 
@@ -1337,10 +1345,17 @@ fn render_card_detail(
     if content.is_empty() {
         return;
     }
+    let visible_height = content.height;
+    let max_scroll = lines.len().saturating_sub(usize::from(visible_height));
+    let max_scroll_u16 = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+    max_scroll_cell.set(max_scroll_u16);
+
+    let clamped_scroll = scroll.min(max_scroll_u16);
+
     fill_rect(frame, content, tp.panel_bg);
     Paragraph::new(Text::from_lines(lines))
         .style(crate::tui_theme::text_primary(&tp).bg(tp.panel_bg))
-        .scroll((scroll, 0))
+        .scroll((clamped_scroll, 0))
         .render(content, frame);
 }
 
@@ -2044,6 +2059,7 @@ impl MailScreen for AnalyticsScreen {
                     }
                 } else {
                     self.detail_scroll = self.detail_scroll.saturating_add(5);
+                    self.clamp_detail_scroll();
                 }
                 Cmd::None
             }
@@ -2354,6 +2370,7 @@ impl MailScreen for AnalyticsScreen {
                     selected_card,
                     self.detail_scroll,
                     self.focus,
+                    &self.last_detail_max_scroll,
                 );
                 render_runtime_viz_fallback(
                     frame,
@@ -2419,6 +2436,7 @@ impl MailScreen for AnalyticsScreen {
                     selected_card,
                     self.detail_scroll,
                     self.focus,
+                    &self.last_detail_max_scroll,
                 );
                 render_context_lens(frame, lens_area, selected_card, runtime_snapshot);
             } else {
@@ -2561,6 +2579,7 @@ impl MailScreen for AnalyticsScreen {
                     selected_card,
                     self.detail_scroll,
                     self.focus,
+                    &self.last_detail_max_scroll,
                 );
                 render_context_lens(frame, lens_area, selected_card, runtime_snapshot);
             } else {

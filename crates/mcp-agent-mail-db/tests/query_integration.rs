@@ -86,14 +86,17 @@ fn insert_tantivy_message_doc(
 
 fn block_on<F, Fut, T>(f: F) -> T
 where
-    F: FnOnce(Cx) -> Fut,
-    Fut: std::future::Future<Output = T>,
+    F: FnOnce(Cx) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
+    let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime");
-    rt.block_on(f(cx))
+    runtime.block_on(runtime.handle().spawn(async move {
+        let cx = Cx::current().expect("runtime should provide task context");
+        f(cx).await
+    }))
 }
 
 fn make_pool() -> (DbPool, tempfile::TempDir) {

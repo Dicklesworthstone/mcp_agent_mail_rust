@@ -1345,7 +1345,7 @@ fn scaled_level(value: u32, max_value: u32, min: i32, max: i32) -> i32 {
         return min;
     }
     let clamped = value.min(max_value);
-    let range = i64::from(max - min);
+    let range = i64::from(max) - i64::from(min);
     let scaled = i64::from(min)
         + ((i64::from(clamped) * range) + i64::from(max_value / 2)) / i64::from(max_value);
     i32::try_from(scaled.clamp(i64::from(min), i64::from(max))).unwrap_or(max)

@@ -5460,10 +5460,10 @@ fn truncate_str(s: &str, max_width: usize) -> String {
     }
     let mw_u16 = u16::try_from(max_width).unwrap_or(u16::MAX);
     if max_width <= 3 {
-        return crate::tui_widgets::truncate_width(s, mw_u16);
+        return crate::tui_widgets::truncate_width(s, mw_u16).into_owned();
     }
     let target = mw_u16.saturating_sub(3);
-    let mut result = crate::tui_widgets::truncate_width(s, target);
+    let mut result = crate::tui_widgets::truncate_width(s, target).into_owned();
     result.push_str("...");
     result
 }

@@ -1635,7 +1635,7 @@ fn format_ctx(project: Option<&str>, agent: Option<&str>) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+fn truncate(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
     let max_u16 = u16::try_from(max).unwrap_or(u16::MAX);
     crate::tui_widgets::truncate_width(s, max_u16)
 }

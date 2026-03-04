@@ -318,19 +318,19 @@ impl<'a> HeatmapGrid<'a> {
     }
 }
 
-pub(crate) fn truncate_width(s: &str, max_width: u16) -> String {
+pub(crate) fn truncate_width(s: &str, max_width: u16) -> std::borrow::Cow<'_, str> {
     let mut w = 0;
-    let mut out = String::new();
-    for ch in s.chars() {
+    let mut end_idx = 0;
+    for (idx, ch) in s.char_indices() {
         let mut b = [0; 4];
         let cw = u16::try_from(display_width(ch.encode_utf8(&mut b))).unwrap_or(u16::MAX);
         if w + cw > max_width {
-            break;
+            return std::borrow::Cow::Owned(s[..idx].to_string());
         }
         w += cw;
-        out.push(ch);
+        end_idx = idx + ch.len_utf8();
     }
-    out
+    std::borrow::Cow::Borrowed(&s[..end_idx])
 }
 
 impl Widget for HeatmapGrid<'_> {

@@ -357,6 +357,7 @@ pub struct MailExplorerScreen {
     entries: Vec<DisplayEntry>,
     cursor: usize,
     detail_scroll: usize,
+    last_detail_max_scroll: std::cell::Cell<usize>,
 
     // Stats
     stats: ExplorerStats,
@@ -411,6 +412,7 @@ impl MailExplorerScreen {
             entries: Vec::new(),
             cursor: 0,
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             stats: ExplorerStats::default(),
             focus: Focus::ResultList,
             active_filter: FilterSlot::Direction,
@@ -1101,7 +1103,8 @@ impl MailScreen for MailExplorerScreen {
                         self.detail_scroll = 0;
                     }
                     KeyCode::Char('J') => {
-                        self.detail_scroll += 1;
+                        let max = self.last_detail_max_scroll.get();
+                        self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
                     }
                     KeyCode::Char('K') => {
                         self.detail_scroll = self.detail_scroll.saturating_sub(1);
@@ -1270,6 +1273,7 @@ impl MailScreen for MailExplorerScreen {
                     self.entries.get(self.cursor),
                     self.detail_scroll,
                     results_focused,
+                    &self.last_detail_max_scroll,
                 );
             }
         }
@@ -1744,6 +1748,7 @@ fn render_detail(
     entry: Option<&DisplayEntry>,
     scroll: usize,
     focused: bool,
+    max_scroll_cell: &std::cell::Cell<usize>,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
@@ -1754,6 +1759,7 @@ fn render_detail(
     block.render(area, frame);
 
     if inner.height == 0 || inner.width == 0 {
+        max_scroll_cell.set(0);
         return;
     }
     let content_inner = if inner.width > 2 {
@@ -1768,6 +1774,7 @@ fn render_detail(
     };
 
     let Some(entry) = entry else {
+        max_scroll_cell.set(0);
         Paragraph::new("Select a message to view details.").render(content_inner, frame);
         return;
     };
@@ -1830,6 +1837,7 @@ fn render_detail(
 
     let visible_height = usize::from(content_inner.height).max(1);
     let max_scroll = lines.len().saturating_sub(visible_height);
+    max_scroll_cell.set(max_scroll);
     let clamped_scroll = scroll.min(max_scroll);
     Paragraph::new(Text::from_lines(lines))
         .wrap(ftui::text::WrapMode::Word)

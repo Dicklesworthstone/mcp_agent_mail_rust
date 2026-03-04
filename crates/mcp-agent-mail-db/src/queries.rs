@@ -5736,55 +5736,55 @@ pub async fn fetch_unacked_for_agent(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let id: i64 = match row.get_named("id") {
+                let id: i64 = match row.get_as(0) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let proj_id: i64 = match row.get_named("project_id") {
+                let proj_id: i64 = match row.get_as(1) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_id: i64 = match row.get_named("sender_id") {
+                let sender_id: i64 = match row.get_as(2) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let thread_id: Option<String> = match row.get_named("thread_id") {
+                let thread_id: Option<String> = match row.get_as(3) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_named("subject") {
+                let subject: String = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_named("body_md") {
+                let body_md: String = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_named("importance") {
+                let importance: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_named("ack_required") {
+                let ack_required: i64 = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_named("created_ts") {
+                let created_ts: i64 = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_named("attachments") {
+                let attachments: String = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_named("kind") {
+                let kind: String = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_name: String = match row.get_named("sender_name") {
+                let sender_name: String = match row.get_as(11) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let read_ts: Option<i64> = match row.get_named("read_ts") {
+                let read_ts: Option<i64> = match row.get_as(12) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
