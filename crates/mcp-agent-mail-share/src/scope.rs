@@ -143,6 +143,17 @@ pub fn apply_project_scope(
         }
     }
 
+    // If all provided identifiers were empty/whitespace, treat as no-op scope.
+    if matched_ids.is_empty() {
+        let remaining = count_remaining(&conn)?;
+        return Ok(ProjectScopeResult {
+            identifiers: identifiers.to_vec(),
+            projects: all_projects,
+            removed_count: 0,
+            remaining,
+        });
+    }
+
     // Compute disallowed IDs
     let all_ids: Vec<i64> = all_projects.iter().map(|p| p.id).collect();
     let disallowed: Vec<i64> = all_ids
@@ -559,6 +570,17 @@ mod tests {
         assert_eq!(result.removed_count, 1);
         assert_eq!(result.projects.len(), 1);
         assert_eq!(result.projects[0].slug, "proj-alpha");
+    }
+
+    #[test]
+    fn scope_only_empty_identifiers_keeps_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let result = apply_project_scope(&db, &["".to_string(), "   ".to_string()]).unwrap();
+        assert_eq!(result.removed_count, 0);
+        assert_eq!(result.projects.len(), 2);
+        assert_eq!(result.remaining.projects, 2);
+        assert_eq!(result.remaining.messages, 3);
     }
 
     #[test]
