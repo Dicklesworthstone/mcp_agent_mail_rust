@@ -35,6 +35,11 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"(?i)github_pat_[A-Za-z0-9_]{20,}").unwrap_or_else(|_| unreachable!()),
         // Slack tokens
         Regex::new(r"(?i)xox[baprs]-[A-Za-z0-9\-]{10,}").unwrap_or_else(|_| unreachable!()),
+        // Anthropic API keys (must precede generic sk- pattern)
+        Regex::new(r"(?i)sk-ant-[A-Za-z0-9\-]{20,}").unwrap_or_else(|_| unreachable!()),
+        // Stripe API keys
+        Regex::new(r"(?i)(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,}")
+            .unwrap_or_else(|_| unreachable!()),
         // OpenAI / generic sk- keys
         Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap_or_else(|_| unreachable!()),
         // Bearer tokens
@@ -49,11 +54,19 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
             .unwrap_or_else(|_| unreachable!()),
         // AWS access key IDs (always start with AKIA)
         Regex::new(r"AKIA[0-9A-Z]{16}").unwrap_or_else(|_| unreachable!()),
+        // Azure connection strings
+        Regex::new(r"(?i)(?:AccountKey|SharedAccessKey)=[A-Za-z0-9+/=]{20,}")
+            .unwrap_or_else(|_| unreachable!()),
+        // GCP service-account private key IDs
+        Regex::new(r#""private_key_id"\s*:\s*"[a-f0-9]{40}""#)
+            .unwrap_or_else(|_| unreachable!()),
+        // Google API keys
+        Regex::new(r"AIza[0-9A-Za-z\-_]{35}").unwrap_or_else(|_| unreachable!()),
+        // npm tokens
+        Regex::new(r"(?i)npm_[A-Za-z0-9]{36,}").unwrap_or_else(|_| unreachable!()),
         // PEM private keys (multi-line block)
         Regex::new(r"(?s)-----BEGIN[A-Z ]* PRIVATE KEY-----.*?-----END[A-Z ]* PRIVATE KEY-----")
             .unwrap_or_else(|_| unreachable!()),
-        // Anthropic API keys
-        Regex::new(r"(?i)sk-ant-[A-Za-z0-9\-]{20,}").unwrap_or_else(|_| unreachable!()),
         // GitLab tokens
         Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap_or_else(|_| unreachable!()),
     ]
@@ -908,5 +921,50 @@ mod tests {
         conn.execute_raw("INSERT INTO message_recipients VALUES (1, 1, 'to', NULL, NULL)")
             .unwrap();
         db_path
+    }
+
+    #[test]
+    fn scrub_text_finds_stripe_keys() {
+        let (result, count) = scrub_text("Use sk_live_abc123def456ghi7 for prod");
+        assert_eq!(result, "Use [REDACTED] for prod");
+        assert_eq!(count, 1);
+
+        let (result2, count2) = scrub_text("Test pk_test_0123456789abcdef");
+        assert_eq!(result2, "Test [REDACTED]");
+        assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn scrub_text_finds_azure_keys() {
+        let (result, count) =
+            scrub_text("AccountKey=abc123def456ghi789jkl012mno345pqr678stu901vwx234y+z=");
+        assert_eq!(result, "[REDACTED]");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn scrub_text_finds_google_api_keys() {
+        let (result, count) = scrub_text("key=AIzaSyA1234567890abcdefghijklmnopqrstuv");
+        assert_eq!(result, "key=[REDACTED]");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn scrub_text_finds_npm_tokens() {
+        let (result, count) =
+            scrub_text("//registry.npmjs.org/:_authToken=npm_abcdefghijklmnopqrstuvwxyz0123456789");
+        assert_eq!(
+            result,
+            "//registry.npmjs.org/:_authToken=[REDACTED]"
+        );
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn scrub_text_anthropic_before_generic_sk() {
+        // sk-ant- should be caught by the Anthropic-specific pattern
+        let input = "sk-ant-api03-ABCdefGHIjklMNOpqrSTUvwxyz0123456789";
+        let (result, _count) = scrub_text(input);
+        assert_eq!(result, "[REDACTED]");
     }
 }

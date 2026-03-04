@@ -4443,7 +4443,17 @@ pub async fn list_unreleased_file_reservations(
     let tracked = tracked(&*conn);
 
     let sql = format!(
-        "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id"
+        "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, \
+         CASE \
+             WHEN released_ts IS NULL THEN NULL \
+             WHEN typeof(released_ts) = 'text' THEN CAST(strftime('%s', released_ts) AS INTEGER) * 1000000 + \
+                 CASE WHEN instr(released_ts, '.') > 0 \
+                      THEN CAST(substr(released_ts || '000000', instr(released_ts, '.') + 1, 6) AS INTEGER) \
+                      ELSE 0 \
+                 END \
+             ELSE released_ts \
+         END AS released_ts \
+         FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id"
     );
     let params = vec![Value::BigInt(project_id)];
 
@@ -4705,13 +4715,20 @@ pub async fn respond_contact(
     row.updated_ts = now;
     row.expires_ts = expires;
 
+    let Some(link_id) = row.id else {
+        rollback_tx(cx, &tracked).await;
+        return Outcome::Err(DbError::invalid(
+            "AgentLink.id",
+            "existing agent_link row has NULL id",
+        ));
+    };
     let update_sql =
         "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? WHERE id = ?";
     let update_params = [
         Value::Text(row.status.clone()),
         Value::BigInt(row.updated_ts),
         row.expires_ts.map_or(Value::Null, Value::BigInt),
-        Value::BigInt(row.id.unwrap_or(0)),
+        Value::BigInt(link_id),
     ];
     let updated = try_in_tx!(
         cx,
@@ -5547,6 +5564,53 @@ pub struct UnackedMessageRow {
     pub agent_id: i64,
 }
 
+/// Decode raw SQL rows into [`UnackedMessageRow`]s, logging a warning for any
+/// row with an unexpected column type rather than silently skipping it.
+fn decode_unacked_rows(rows: &[sqlmodel_core::Row], caller: &str) -> Vec<UnackedMessageRow> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (row_idx, r) in rows.iter().enumerate() {
+        let mid = match r.get_by_name("id") {
+            Some(Value::BigInt(n)) => *n,
+            Some(Value::Int(n)) => i64::from(*n),
+            _ => {
+                tracing::warn!("{caller}: skipping row {row_idx}: unexpected type for m.id");
+                continue;
+            }
+        };
+        let pid = match r.get_by_name("project_id") {
+            Some(Value::BigInt(n)) => *n,
+            Some(Value::Int(n)) => i64::from(*n),
+            _ => {
+                tracing::warn!("{caller}: skipping row {row_idx}: unexpected type for m.project_id");
+                continue;
+            }
+        };
+        let cts = match r.get_by_name("created_ts") {
+            Some(Value::BigInt(n)) => *n,
+            Some(Value::Int(n)) => i64::from(*n),
+            _ => {
+                tracing::warn!("{caller}: skipping row {row_idx}: unexpected type for m.created_ts");
+                continue;
+            }
+        };
+        let aid = match r.get_by_name("agent_id") {
+            Some(Value::BigInt(n)) => *n,
+            Some(Value::Int(n)) => i64::from(*n),
+            _ => {
+                tracing::warn!("{caller}: skipping row {row_idx}: unexpected type for mr.agent_id");
+                continue;
+            }
+        };
+        out.push(UnackedMessageRow {
+            message_id: mid,
+            project_id: pid,
+            created_ts: cts,
+            agent_id: aid,
+        });
+    }
+    out
+}
+
 /// List all messages with `ack_required = 1` that have at least one recipient
 /// who has not acknowledged (`ack_ts IS NULL`).
 ///
@@ -5570,38 +5634,7 @@ pub async fn list_unacknowledged_messages(
                WHERE m.ack_required = 1 AND mr.ack_ts IS NULL";
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for r in &rows {
-                let mid = match r.get(0) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    _ => continue,
-                };
-                let pid = match r.get(1) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    _ => continue,
-                };
-                let cts = match r.get(2) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    _ => continue,
-                };
-                let aid = match r.get(3) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    _ => continue,
-                };
-                out.push(UnackedMessageRow {
-                    message_id: mid,
-                    project_id: pid,
-                    created_ts: cts,
-                    agent_id: aid,
-                });
-            }
-            Outcome::Ok(out)
-        }
+        Outcome::Ok(rows) => Outcome::Ok(decode_unacked_rows(&rows, "list_unacknowledged_messages")),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -5638,38 +5671,7 @@ pub async fn list_overdue_unacknowledged_messages(
     let params = [Value::BigInt(overdue_before_ts)];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for r in &rows {
-                let mid = match r.get(0) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    _ => continue,
-                };
-                let pid = match r.get(1) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    _ => continue,
-                };
-                let cts = match r.get(2) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    _ => continue,
-                };
-                let aid = match r.get(3) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    _ => continue,
-                };
-                out.push(UnackedMessageRow {
-                    message_id: mid,
-                    project_id: pid,
-                    created_ts: cts,
-                    agent_id: aid,
-                });
-            }
-            Outcome::Ok(out)
-        }
+        Outcome::Ok(rows) => Outcome::Ok(decode_unacked_rows(&rows, "list_overdue_unacknowledged_messages")),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),

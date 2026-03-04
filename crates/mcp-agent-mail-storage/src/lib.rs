@@ -5951,10 +5951,14 @@ fn walk_md_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             walk_md_files(&path, files)?;
-        } else if path.extension().is_some_and(|e| e == "md") {
+        } else if file_type.is_file() && path.extension().is_some_and(|e| e == "md") {
             files.push(path);
         }
     }
