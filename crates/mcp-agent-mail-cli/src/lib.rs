@@ -4359,6 +4359,24 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
     }
 }
 
+fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(path)
+        .map_err(|e| CliError::Other(format!("cannot open DB at {path} for schema init: {e}")))?;
+    conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)
+        .map_err(|e| {
+            CliError::Other(format!(
+                "failed to apply base init PRAGMAs for {path} via canonical sqlite: {e}"
+            ))
+        })?;
+    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
+    conn.execute_raw(&init_sql).map_err(|e| {
+        CliError::Other(format!(
+            "schema init failed for {path} via canonical sqlite: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
 /// Open a synchronous SQLite connection for CLI commands.
 pub(crate) fn open_db_sync_with_database_url(
     database_url: &str,
@@ -4393,26 +4411,29 @@ pub(crate) fn open_db_sync_with_database_url(
                 .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
         }
     }
-    // Run schema init so tables exist even if first use
-    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
-    if let Err(init_error) = conn.execute_raw(&init_sql) {
-        let init_error_text = init_error.to_string();
-        if opened_path != ":memory:" && is_sqlite_recovery_error_message(&init_error_text) {
-            drop(conn);
-            recover_sqlite_file(Path::new(&opened_path))?;
-            let recovered_conn = mcp_agent_mail_db::DbConn::open_file(&opened_path)
-                .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
-            recovered_conn.execute_raw(&init_sql).map_err(|e| {
-                CliError::Other(format!(
-                    "schema init failed for {opened_path} after auto-recovery: {e}"
-                ))
-            })?;
-            return Ok(recovered_conn);
+
+    // For file-backed DBs, run base schema init via canonical sqlite first.
+    // This avoids known malformed-index issues observed on legacy fixtures when
+    // applying broad schema DDL through the Franken connection path.
+    if opened_path != ":memory:" {
+        drop(conn);
+        if let Err(init_error) = init_schema_sqlite_canonical(&opened_path) {
+            let init_error_text = init_error.to_string();
+            if is_sqlite_recovery_error_message(&init_error_text) {
+                recover_sqlite_file(Path::new(&opened_path))?;
+                init_schema_sqlite_canonical(&opened_path)?;
+            } else {
+                return Err(init_error);
+            }
         }
-        return Err(CliError::Other(format!(
-            "schema init failed for {opened_path}: {init_error}"
-        )));
+        let (reopened, _resolved_path) = open_sqlite_with_fallback(&opened_path)?;
+        return Ok(reopened);
     }
+
+    // In-memory DBs keep the original Franken init path.
+    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
+    conn.execute_raw(&init_sql)
+        .map_err(|e| CliError::Other(format!("schema init failed for {opened_path}: {e}")))?;
     Ok(conn)
 }
 
@@ -24052,6 +24073,7 @@ mod tests {
             .expect("create marker table");
         conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
             .expect("seed marker");
+        let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(conn);
 
         let bak_path = PathBuf::from(format!("{}.bak", db_path.display()));
@@ -24064,6 +24086,63 @@ mod tests {
             .expect("query marker");
         let marker: String = rows.first().unwrap().get_named("value").unwrap();
         assert_eq!(marker, "from-backup", "should restore from .bak backup");
+    }
+
+    #[test]
+    fn open_db_sync_with_database_url_preserves_legacy_fixture_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("legacy_fixture.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let seed_conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open seed db");
+        let seed_sql = [
+            "PRAGMA foreign_keys = OFF",
+            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto')",
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            "CREATE TABLE IF NOT EXISTS message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT, created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'legacy-project', '/tmp/legacy-project', '2026-02-24 15:30:00.123456')",
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (1, 1, 'LegacySender', 'python', 'legacy', 'sender', '2026-02-24 15:30:01', '2026-02-24 15:30:02', 'auto', 'auto')",
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (2, 1, 'LegacyReceiver', 'python', 'legacy', 'receiver', '2026-02-24 15:31:01', '2026-02-24 15:31:02', 'auto', 'auto')",
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) VALUES (1, 1, 1, 'br-28mgh.8.2', 'Legacy migration message', 'from python db', 'high', 1, '2026-02-24 15:32:00.654321', '[]')",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', NULL, NULL)",
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00', '2026-12-24 15:33:00', NULL)",
+        ];
+        for stmt in seed_sql {
+            seed_conn.execute_raw(stmt).expect("seed statement");
+        }
+        drop(seed_conn);
+
+        let opened = open_db_sync_with_database_url(&db_url).expect("open with init");
+        let _ = opened
+            .query_sync("SELECT COUNT(*) AS c FROM agents", &[])
+            .expect("agents count query");
+        drop(opened);
+
+        let verify_conn =
+            mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open verify db");
+        assert!(
+            sqlite_conn_is_healthy(&verify_conn).expect("health probe"),
+            "legacy fixture should remain healthy after CLI schema init"
+        );
+        for (table, expected) in [
+            ("projects", 1_i64),
+            ("agents", 2_i64),
+            ("messages", 1_i64),
+            ("message_recipients", 1_i64),
+            ("file_reservations", 1_i64),
+        ] {
+            let rows = verify_conn
+                .query_sync(&format!("SELECT COUNT(*) AS c FROM {table}"), &[])
+                .expect("count query");
+            let actual = rows
+                .first()
+                .and_then(|r| r.get_named::<i64>("c").ok())
+                .unwrap_or(-1);
+            assert_eq!(actual, expected, "{table} row count should be preserved");
+        }
     }
 
     #[test]

@@ -945,22 +945,25 @@ async fn run_sqlite_init_once(
     sqlite_path: &str,
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
-    let mig_conn = match open_sqlite_file_with_lock_retry(sqlite_path) {
-        Ok(conn) => conn,
-        Err(err) => {
+    // Run schema migrations through canonical SQLite to avoid known
+    // malformed-index behavior seen in Franken migration paths on legacy
+    // fixtures. Runtime traffic still uses Franken pooled connections.
+    if run_migrations {
+        let mig_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=open_file_canonical failed: {err}"
+                )));
+            }
+        };
+
+        if let Err(err) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
             return Outcome::Err(SqlError::Custom(format!(
-                "sqlite init stage=open_file failed: {err}"
+                "sqlite init stage=base_pragmas_canonical failed: {err}"
             )));
         }
-    };
 
-    if let Err(err) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
-        return Outcome::Err(SqlError::Custom(format!(
-            "sqlite init stage=base_pragmas failed: {err}"
-        )));
-    }
-
-    if run_migrations {
         match schema::migrate_to_latest_base(cx, &mig_conn).await {
             Outcome::Ok(_) => {}
             Outcome::Err(err) => {
@@ -971,12 +974,31 @@ async fn run_sqlite_init_once(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
+
+        drop(mig_conn);
+    }
+
+    let runtime_conn = match open_sqlite_file_with_lock_retry(sqlite_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=open_file_runtime failed: {err}"
+            )));
+        }
+    };
+
+    if !run_migrations
+        && let Err(err) = runtime_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
+    {
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite init stage=base_pragmas_runtime failed: {err}"
+        )));
     }
 
     // Always enforce startup cleanup for legacy identity FTS artifacts.
     // These can be reintroduced by historical/full migration paths and have
     // caused post-crash rowid/index mismatch failures.
-    if let Err(err) = schema::enforce_runtime_fts_cleanup(&mig_conn) {
+    if let Err(err) = schema::enforce_runtime_fts_cleanup(&runtime_conn) {
         return Outcome::Err(SqlError::Custom(format!(
             "sqlite init stage=enforce_runtime_fts_cleanup failed: {err}"
         )));
@@ -989,7 +1011,7 @@ async fn run_sqlite_init_once(
     // If we leave the DB in DELETE mode, concurrent pool connections applying
     // WAL-specific PRAGMAs can corrupt a freshly created database.
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/13
-    if let Err(err) = mig_conn.execute_raw("PRAGMA journal_mode = WAL;") {
+    if let Err(err) = runtime_conn.execute_raw("PRAGMA journal_mode = WAL;") {
         tracing::warn!(
             path = %sqlite_path,
             error = %err,
@@ -998,7 +1020,7 @@ async fn run_sqlite_init_once(
         // Non-fatal: pool connections will attempt WAL mode themselves.
     }
 
-    drop(mig_conn);
+    drop(runtime_conn);
     Outcome::Ok(())
 }
 
@@ -1070,13 +1092,24 @@ fn open_sqlite_file_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlErro
 }
 
 #[allow(clippy::result_large_err)]
-fn open_sqlite_file_with_lock_retry_impl<F, S>(
+fn open_sqlite_file_with_lock_retry_canonical(
+    sqlite_path: &str,
+) -> Result<sqlmodel_sqlite::SqliteConnection, SqlError> {
+    open_sqlite_file_with_lock_retry_impl(
+        sqlite_path,
+        |path| sqlmodel_sqlite::SqliteConnection::open_file(path),
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_with_lock_retry_impl<C, F, S>(
     sqlite_path: &str,
     mut open_file: F,
     mut sleep_fn: S,
-) -> Result<DbConn, SqlError>
+) -> Result<C, SqlError>
 where
-    F: FnMut(&str) -> Result<DbConn, SqlError>,
+    F: FnMut(&str) -> Result<C, SqlError>,
     S: FnMut(Duration),
 {
     let mut retries = 0usize;
@@ -1484,6 +1517,7 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     }
 
     let backup_prefix = format!("{file_name}.backup-");
+    let backup_bak_prefix = format!("{file_name}.bak.");
     let recovery_prefix = format!("{file_name}.recovery");
     if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
@@ -1494,10 +1528,12 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let priority = if name.starts_with(&backup_prefix) {
+            let priority = if name.starts_with(&backup_bak_prefix) {
                 1
-            } else if name.starts_with(&recovery_prefix) {
+            } else if name.starts_with(&backup_prefix) {
                 2
+            } else if name.starts_with(&recovery_prefix) {
+                3
             } else {
                 continue;
             };
@@ -1696,7 +1732,7 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
 /// Runs layered health probes (`quick_check`, `integrity_check(1)`, and
 /// a schema-aware query smoke test) on the file. If corruption is detected:
 ///
-/// 1. Search for a healthy `.bak` / `.backup-*` / `.recovery*` sibling.
+/// 1. Search for a healthy `.bak` / `.bak.*` / `.backup-*` / `.recovery*` sibling.
 /// 2. Quarantine the corrupt file (rename to `*.corrupt-{timestamp}`).
 /// 3. Restore from the first healthy backup found.
 /// 4. If no healthy backup exists, reinitialize an empty database file.
@@ -1742,7 +1778,7 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
 /// database from the Git archive before falling back to a blank reinitialize.
 ///
 /// Recovery priority:
-/// 1. `.bak` / `.backup-*` / `.recovery*` backup files
+/// 1. `.bak` / `.bak.*` / `.backup-*` / `.recovery*` backup files
 /// 2. Git archive reconstruction (recovers messages + agents)
 /// 3. Blank reinitialization (empty database)
 #[allow(clippy::result_large_err)]
@@ -2305,6 +2341,24 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_backup_candidates_include_timestamped_bak_series() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let backup_bak_series = dir.path().join("storage.sqlite3.bak.20260212_000000");
+        let backup_series = dir.path().join("storage.sqlite3.backup-20260212_010000");
+        std::fs::write(&primary, b"primary").expect("write primary");
+        std::fs::write(&backup_bak_series, b"bak series").expect("write .bak timestamp series");
+        std::fs::write(&backup_series, b"backup series").expect("write .backup- series");
+
+        let candidates = sqlite_backup_candidates(&primary);
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(backup_bak_series.as_path()),
+            "timestamped .bak.* backups should be discovered and prioritized over .backup-*"
+        );
+    }
+
+    #[test]
     fn ensure_sqlite_file_healthy_restores_from_bak() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("storage.sqlite3");
@@ -2336,6 +2390,29 @@ mod tests {
         assert!(
             corrupt_artifacts >= 1,
             "expected quarantined corrupt artifact(s) after recovery"
+        );
+    }
+
+    #[test]
+    fn ensure_sqlite_file_healthy_restores_from_timestamped_bak() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak.20260212_000000");
+        let primary_str = primary.to_string_lossy();
+        let conn = DbConn::open_file(primary_str.as_ref()).expect("open db");
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
+            .expect("create marker table");
+        conn.execute_raw("INSERT INTO marker(value) VALUES('from-timestamped-backup')")
+            .expect("seed marker");
+        drop(conn);
+        std::fs::copy(&primary, &backup).expect("copy timestamped backup");
+        std::fs::write(&primary, b"not-a-sqlite-file").expect("corrupt primary");
+
+        ensure_sqlite_file_healthy(&primary).expect("auto-recovery should succeed");
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("from-timestamped-backup"),
+            "restored DB should preserve timestamped backup data"
         );
     }
 
@@ -2382,6 +2459,89 @@ mod tests {
         assert!(
             sqlite_file_is_healthy(&primary).expect("post-startup health check"),
             "sqlite file should be healthy after startup recovery"
+        );
+    }
+
+    #[test]
+    fn pool_init_preserves_legacy_fixture_rows() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("legacy_fixture.db");
+        let db_path_str = db_path.to_string_lossy();
+
+        let seed_conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path_str.as_ref())
+            .expect("open seed sqlite db");
+        let seed_sql = [
+            "PRAGMA foreign_keys = OFF",
+            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto')",
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            "CREATE TABLE IF NOT EXISTS message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT, created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'legacy-project', '/tmp/legacy-project', '2026-02-24 15:30:00.123456')",
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (1, 1, 'LegacySender', 'python', 'legacy', 'sender', '2026-02-24 15:30:01', '2026-02-24 15:30:02', 'auto', 'auto')",
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (2, 1, 'LegacyReceiver', 'python', 'legacy', 'receiver', '2026-02-24 15:31:01', '2026-02-24 15:31:02', 'auto', 'auto')",
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) VALUES (1, 1, 1, 'br-28mgh.8.2', 'Legacy migration message', 'from python db', 'high', 1, '2026-02-24 15:32:00.654321', '[]')",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', NULL, NULL)",
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00', '2026-12-24 15:33:00', NULL)",
+        ];
+        for stmt in seed_sql {
+            seed_conn.execute_raw(stmt).expect("seed fixture statement");
+        }
+        drop(seed_conn);
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _ = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire pool connection");
+        });
+
+        assert!(
+            sqlite_file_is_healthy_canonical(&db_path).expect("post-init health probe"),
+            "legacy fixture should remain healthy after pool init"
+        );
+
+        let verify_conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path_str.as_ref())
+            .expect("open verify sqlite db");
+        for (table, expected) in [
+            ("projects", 1_i64),
+            ("agents", 2_i64),
+            ("messages", 1_i64),
+            ("message_recipients", 1_i64),
+            ("file_reservations", 1_i64),
+        ] {
+            let rows = verify_conn
+                .query_sync(&format!("SELECT COUNT(*) AS c FROM {table}"), &[])
+                .expect("count query");
+            let actual = rows
+                .first()
+                .and_then(|r| r.get_named::<i64>("c").ok())
+                .unwrap_or(-1);
+            assert_eq!(actual, expected, "{table} row count should be preserved");
+        }
+
+        let type_rows = verify_conn
+            .query_sync("SELECT typeof(created_at) AS t FROM projects WHERE id = 1", &[])
+            .expect("projects type query");
+        assert_eq!(
+            type_rows[0]
+                .get_named::<String>("t")
+                .expect("projects.created_at typeof"),
+            "integer",
+            "timestamp migration should convert TEXT project timestamp to INTEGER"
         );
     }
 
@@ -3463,7 +3623,7 @@ mod tests {
     fn open_sqlite_file_with_lock_retry_does_not_retry_non_lock_errors() {
         let open_calls = std::cell::Cell::new(0usize);
         let sleep_calls = std::cell::RefCell::new(Vec::new());
-        let result = open_sqlite_file_with_lock_retry_impl(
+        let result: Result<DbConn, SqlError> = open_sqlite_file_with_lock_retry_impl(
             "ignored",
             |_| {
                 open_calls.set(open_calls.get() + 1);
