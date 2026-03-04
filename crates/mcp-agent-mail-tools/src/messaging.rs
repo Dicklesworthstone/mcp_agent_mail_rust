@@ -1046,7 +1046,6 @@ effective_free_bytes={free}"
     .await?;
     let sender_id = sender.id.unwrap_or(0);
 
-    let to = to;
     let broadcast = broadcast.unwrap_or(false);
     if broadcast {
         return Err(legacy_tool_error(

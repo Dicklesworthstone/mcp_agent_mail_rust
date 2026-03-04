@@ -1193,8 +1193,10 @@ pub fn install_precommit_guard(
         database_url: config.database_url.clone(),
         ..Default::default()
     };
-    
-    let sqlite_path = db_cfg.sqlite_path().unwrap_or_else(|_| ":memory:".to_string());
+
+    let sqlite_path = db_cfg
+        .sqlite_path()
+        .unwrap_or_else(|_| ":memory:".to_string());
     if sqlite_path == ":memory:" {
         return Err(McpError::new(
             McpErrorCode::InvalidParams,

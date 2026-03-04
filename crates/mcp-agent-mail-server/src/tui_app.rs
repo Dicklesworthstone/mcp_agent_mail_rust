@@ -1242,6 +1242,10 @@ pub struct MailAppModel {
     /// Last terminal dimensions dispatched to screens. Duplicate resize events
     /// are suppressed to avoid redundant invalidation/repaint churn.
     last_dispatched_resize: Option<(u16, u16)>,
+    /// Most recent resize dimensions waiting to be dispatched on the next
+    /// tick boundary. This coalesces bursty SIGWINCH streams to a single
+    /// latest-size update.
+    pending_resize: Option<(u16, u16)>,
     accessibility: crate::tui_persist::AccessibilitySettings,
     macro_engine: MacroEngine,
     /// Tracks active reservations for expiry warnings.
@@ -1380,6 +1384,7 @@ impl MailAppModel {
             tick_count: 0,
             tick_event_batch_last_seq: 0,
             last_dispatched_resize: None,
+            pending_resize: None,
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
             macro_engine: MacroEngine::new(),
             reservation_tracker: HashMap::new(),
@@ -1557,12 +1562,54 @@ impl MailAppModel {
         )
     }
 
-    fn should_forward_resize(&mut self, width: u16, height: u16) -> bool {
+    fn queue_resize_event(&mut self, width: u16, height: u16) {
+        let dims = (width, height);
+        if self.last_dispatched_resize == Some(dims) || self.pending_resize == Some(dims) {
+            return;
+        }
+        self.pending_resize = Some(dims);
+    }
+
+    fn flush_pending_resize_event(&mut self) -> Cmd<MailMsg> {
+        let Some((width, height)) = self.pending_resize.take() else {
+            return Cmd::none();
+        };
         if self.last_dispatched_resize == Some((width, height)) {
-            return false;
+            return Cmd::none();
         }
         self.last_dispatched_resize = Some((width, height));
-        true
+        self.request_contrast_guard_pass();
+        self.forward_event_to_active_screen(&Event::Resize { width, height })
+    }
+
+    fn forward_event_to_active_screen(&mut self, event: &Event) -> Cmd<MailMsg> {
+        let current = self.screen_manager.active_screen();
+        if self.screen_panics.borrow().contains_key(&current) {
+            // Screen is in error state — 'r' resets it
+            if matches!(
+                event,
+                Event::Key(k) if k.kind == KeyEventKind::Press
+                    && k.code == KeyCode::Char('r')
+            ) {
+                self.screen_panics.borrow_mut().remove(&current);
+                let fresh = ScreenManager::create_screen(current, &self.screen_manager.state);
+                self.screen_manager.set_screen(current, fresh);
+            }
+            Cmd::none()
+        } else if let Some(screen) = self.screen_manager.active_screen_mut() {
+            let state_ref = &self.state;
+            let result = catch_unwind(AssertUnwindSafe(|| screen.update(event, state_ref)));
+            match result {
+                Ok(cmd) => map_screen_cmd(cmd),
+                Err(payload) => {
+                    let msg = panic_payload_to_string(&payload);
+                    self.screen_panics.borrow_mut().insert(current, msg);
+                    Cmd::none()
+                }
+            }
+        } else {
+            Cmd::none()
+        }
     }
 
     fn publish_shared_tick_event_batch(&mut self) {
@@ -3681,6 +3728,7 @@ impl Model for MailAppModel {
         match msg {
             // ── Tick ────────────────────────────────────────────────
             MailMsg::Terminal(Event::Tick) => {
+                let pre_tick_resize_cmd = self.flush_pending_resize_event();
                 self.tick_count = self.tick_count.wrapping_add(1);
                 let tick_count = self.tick_count;
                 self.publish_shared_tick_event_batch();
@@ -3699,19 +3747,21 @@ impl Model for MailAppModel {
                         self.tick_screen_with_panic_guard(id, tick_count);
                     }
                 }
-                self.run_housekeeping_tick(TICK_INTERVAL)
+                let housekeeping_cmd = self.run_housekeeping_tick(TICK_INTERVAL);
+                let post_tick_resize_cmd = self.flush_pending_resize_event();
+                Cmd::batch(vec![
+                    pre_tick_resize_cmd,
+                    housekeeping_cmd,
+                    post_tick_resize_cmd,
+                ])
             }
             MailMsg::HousekeepingTick => self.run_housekeeping_tick(TICK_INTERVAL),
 
             // ── Terminal events (key, mouse, resize, etc.) ─────────
             MailMsg::Terminal(ref event) => {
-                if let Event::Resize { width, height } = *event
-                    && !self.should_forward_resize(width, height)
-                {
+                if let Event::Resize { width, height } = *event {
+                    self.queue_resize_event(width, height);
                     return Cmd::none();
-                }
-                if matches!(*event, Event::Resize { .. }) {
-                    self.request_contrast_guard_pass();
                 }
 
                 if let Event::Key(key) = event
@@ -4184,35 +4234,8 @@ impl Model for MailAppModel {
                     }
                 }
 
-                // Forward unhandled events to the active screen
-                let current = self.screen_manager.active_screen();
-                if self.screen_panics.borrow().contains_key(&current) {
-                    // Screen is in error state — 'r' resets it
-                    if matches!(
-                        event,
-                        Event::Key(k) if k.kind == KeyEventKind::Press
-                            && k.code == KeyCode::Char('r')
-                    ) {
-                        self.screen_panics.borrow_mut().remove(&current);
-                        let fresh =
-                            ScreenManager::create_screen(current, &self.screen_manager.state);
-                        self.screen_manager.set_screen(current, fresh);
-                    }
-                    Cmd::none()
-                } else if let Some(screen) = self.screen_manager.active_screen_mut() {
-                    let state_ref = &self.state;
-                    let result = catch_unwind(AssertUnwindSafe(|| screen.update(event, state_ref)));
-                    match result {
-                        Ok(cmd) => map_screen_cmd(cmd),
-                        Err(payload) => {
-                            let msg = panic_payload_to_string(&payload);
-                            self.screen_panics.borrow_mut().insert(current, msg);
-                            Cmd::none()
-                        }
-                    }
-                } else {
-                    Cmd::none()
-                }
+                // Forward unhandled events to the active screen.
+                self.forward_event_to_active_screen(event)
             }
 
             // ── Screen messages / direct navigation ─────────────────
@@ -11148,11 +11171,17 @@ mod tests {
             height: 40,
         }));
 
+        assert!(
+            updates.borrow().is_empty(),
+            "coalesced resize should flush on tick boundary"
+        );
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
         assert_eq!(updates.borrow().as_slice(), &[(120, 40)]);
     }
 
     #[test]
-    fn changed_resize_dimensions_are_forwarded() {
+    fn resize_burst_coalesces_to_latest_dimensions_on_tick() {
         let mut model = test_model();
         let updates = Rc::new(RefCell::new(Vec::new()));
         model.set_screen(
@@ -11178,10 +11207,37 @@ mod tests {
             height: 41,
         }));
 
-        assert_eq!(
-            updates.borrow().as_slice(),
-            &[(120, 40), (121, 40), (121, 41)]
+        assert!(
+            updates.borrow().is_empty(),
+            "burst updates should be coalesced until tick"
         );
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert_eq!(updates.borrow().as_slice(), &[(121, 41)]);
+    }
+
+    #[test]
+    fn changed_resize_dimensions_flush_in_order_across_ticks() {
+        let mut model = test_model();
+        let updates = Rc::new(RefCell::new(Vec::new()));
+        model.set_screen(
+            MailScreenId::Messages,
+            Box::new(ResizeCountingScreen::new(Rc::clone(&updates))),
+        );
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        let _ = model.update(MailMsg::Terminal(Event::Resize {
+            width: 120,
+            height: 40,
+        }));
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+        let _ = model.update(MailMsg::Terminal(Event::Resize {
+            width: 121,
+            height: 41,
+        }));
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+        assert_eq!(updates.borrow().as_slice(), &[(120, 40), (121, 41)]);
     }
 
     #[test]

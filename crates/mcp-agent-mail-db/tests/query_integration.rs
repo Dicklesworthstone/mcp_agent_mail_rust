@@ -1406,6 +1406,56 @@ fn request_contact_and_respond_accept() {
 }
 
 #[test]
+fn respond_contact_updates_status_and_expires() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let fox_id = setup_agent(&pool, pid, "GoldFox");
+    let wolf_id = setup_agent(&pool, pid, "SilverWolf");
+
+    // Request contact
+    let pool2 = pool.clone();
+    block_on(|cx| async move {
+        match queries::request_contact(
+            &cx, &pool2, pid, fox_id, pid, wolf_id, "hello", 86400,
+        )
+        .await
+        {
+            Outcome::Ok(_) => {}
+            other => panic!("request_contact failed: {other:?}"),
+        }
+    });
+
+    // Respond: accept with 30-day TTL
+    let pool3 = pool.clone();
+    let (updated_count, link) = block_on(|cx| async move {
+        match queries::respond_contact(&cx, &pool3, pid, fox_id, pid, wolf_id, true, 2_592_000)
+            .await
+        {
+            Outcome::Ok(v) => v,
+            other => panic!("respond_contact failed: {other:?}"),
+        }
+    });
+    assert_eq!(updated_count, 1, "should update exactly one row");
+    assert_eq!(link.status, "approved");
+    assert!(link.expires_ts.is_some(), "accepted contact should have expiry");
+    assert!(link.updated_ts > 0, "updated_ts should be set");
+
+    // Respond: block (no TTL)
+    let pool4 = pool.clone();
+    let (updated_count2, link2) = block_on(|cx| async move {
+        match queries::respond_contact(&cx, &pool4, pid, fox_id, pid, wolf_id, false, 0)
+            .await
+        {
+            Outcome::Ok(v) => v,
+            other => panic!("respond_contact (block) failed: {other:?}"),
+        }
+    });
+    assert_eq!(updated_count2, 1);
+    assert_eq!(link2.status, "blocked");
+    assert!(link2.expires_ts.is_none(), "blocked contact should have no expiry");
+}
+
+#[test]
 fn set_contact_policy_contacts_only() {
     let (pool, _dir) = make_pool();
     let pid = setup_project(&pool);

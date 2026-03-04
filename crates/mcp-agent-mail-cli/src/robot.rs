@@ -5475,8 +5475,6 @@ mod tests {
         )
         .expect("insert messages");
 
-        
-
         let rows = build_agents(&conn, 1, false, None).expect("build agents");
 
         assert_eq!(rows.len(), 2, "duplicate logical agent should be collapsed");

@@ -209,6 +209,46 @@ pub(crate) struct DetectedAnomaly {
     pub(crate) rationale: String,
 }
 
+// ── Memoization cache types (br-legjy.5.1) ─────────────────────────
+
+/// Key for invalidating the visible-entries cache.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VisibleCacheKey {
+    query: String,
+    quick_filter: DashboardQuickFilter,
+    verbosity: VerbosityTier,
+    type_filter_sig: String,
+}
+
+/// Cached heatmap grid computation.
+#[derive(Debug, Clone)]
+struct HeatmapCache {
+    ts_min: i64,
+    ts_max: i64,
+    grid: Vec<Vec<u32>>,
+    max_count: u32,
+}
+
+/// Cached formatted summary tile strings and trends.
+#[derive(Debug, Clone)]
+struct SummaryTileCache {
+    messages: String,
+    agents: String,
+    projects: String,
+    reservations: String,
+    threads: String,
+    ack_pending: String,
+    contacts: String,
+    avg_latency: String,
+    total_requests: String,
+    msg_trend: MetricTrend,
+    agent_trend: MetricTrend,
+    project_trend: MetricTrend,
+    reservation_trend: MetricTrend,
+    thread_trend: MetricTrend,
+    ack_trend: MetricTrend,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // DashboardScreen
 // ──────────────────────────────────────────────────────────────────────
@@ -285,6 +325,22 @@ pub struct DashboardScreen {
     last_diagnostic_signature: RefCell<Option<String>>,
     /// Last observed data generation for dirty-state tracking.
     last_data_gen: super::DataGeneration,
+    // ── Memoization caches (br-legjy.5.1) ────────────────────────
+    /// Cached visible entries (indices into `event_log`). Invalidated when events,
+    /// filters, query, or verbosity change.
+    cached_visible_indices: RefCell<Vec<usize>>,
+    /// Generation counter for `cached_visible_indices`; bumped on any filter or data change.
+    visible_cache_gen: u64,
+    /// Snapshot of filter state at the time of the last cache fill.
+    visible_cache_filter_sig: RefCell<VisibleCacheKey>,
+    /// Cached heatmap grid (ts_min, ts_max, grid, max_count). Invalidated on `dirty.events`.
+    cached_heatmap: RefCell<Option<HeatmapCache>>,
+    /// Event count at last heatmap computation.
+    heatmap_event_gen: usize,
+    /// Cached summary tile formatted strings. Refreshed only on stat tick.
+    cached_summary_tiles: RefCell<Option<SummaryTileCache>>,
+    /// Stat tick count at last summary tile cache fill.
+    summary_cache_stat_tick: u64,
 }
 
 /// A pre-formatted event log entry.
@@ -449,6 +505,13 @@ impl DashboardScreen {
             db_delta_baseline_ready: false,
             last_diagnostic_signature: RefCell::new(None),
             last_data_gen: super::DataGeneration::stale(),
+            cached_visible_indices: RefCell::new(Vec::new()),
+            visible_cache_gen: 0,
+            visible_cache_filter_sig: RefCell::new(VisibleCacheKey::default()),
+            cached_heatmap: RefCell::new(None),
+            heatmap_event_gen: 0,
+            cached_summary_tiles: RefCell::new(None),
+            summary_cache_stat_tick: 0,
         }
     }
 
@@ -604,31 +667,65 @@ impl DashboardScreen {
         self.event_log.push_back(entry);
     }
 
-    /// Visible entries after applying verbosity tier and type filter.
-    fn visible_entries(&self) -> Vec<&EventEntry> {
+    /// Build the current filter key for cache invalidation.
+    fn current_visible_cache_key(&self) -> VisibleCacheKey {
+        VisibleCacheKey {
+            query: self.quick_query().to_string(),
+            quick_filter: self.quick_filter,
+            verbosity: self.verbosity,
+            type_filter_sig: type_filter_signature(&self.type_filter),
+        }
+    }
+
+    /// Ensure the visible-indices cache is fresh, rebuilding if invalidated.
+    fn refresh_visible_cache(&self) {
+        let current_key = self.current_visible_cache_key();
+        {
+            let prev_key = self.visible_cache_filter_sig.borrow();
+            if *prev_key == current_key {
+                // Cache is still valid — filter state unchanged and event data
+                // wasn't modified (bump happens in tick on dirty.events).
+                return;
+            }
+        }
+        // Rebuild cache.
         let query_terms = parse_query_terms(self.quick_query());
-        if self.event_log_search_keys.len() != self.event_log.len() {
-            // Safety fallback for tests or unexpected manual state edits.
-            return self
-                .event_log
+        let indices: Vec<usize> = if self.event_log_search_keys.len() != self.event_log.len() {
+            self.event_log
                 .iter()
-                .filter(|e| {
+                .enumerate()
+                .filter(|(_, e)| {
                     self.verbosity.includes(e.severity)
                         && (self.type_filter.is_empty() || self.type_filter.contains(&e.kind))
                         && event_entry_matches_query(e, &query_terms)
                 })
-                .collect();
-        }
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            self.event_log
+                .iter()
+                .zip(self.event_log_search_keys.iter())
+                .enumerate()
+                .filter(|(_, (entry, searchable_key))| {
+                    self.verbosity.includes(entry.severity)
+                        && (self.type_filter.is_empty()
+                            || self.type_filter.contains(&entry.kind))
+                        && text_matches_query_terms(searchable_key, &query_terms)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        *self.cached_visible_indices.borrow_mut() = indices;
+        *self.visible_cache_filter_sig.borrow_mut() = current_key;
+    }
 
-        self.event_log
+    /// Visible entries after applying verbosity tier and type filter (cached).
+    fn visible_entries(&self) -> Vec<&EventEntry> {
+        self.refresh_visible_cache();
+        let indices = self.cached_visible_indices.borrow();
+        indices
             .iter()
-            .zip(self.event_log_search_keys.iter())
-            .filter(|(entry, searchable_key)| {
-                self.verbosity.includes(entry.severity)
-                    && (self.type_filter.is_empty() || self.type_filter.contains(&entry.kind))
-                    && text_matches_query_terms(searchable_key, &query_terms)
-            })
-            .map(|(entry, _)| entry)
+            .filter_map(|&i| self.event_log.get(i))
             .collect()
     }
 
@@ -1072,6 +1169,7 @@ impl MailScreen for DashboardScreen {
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.scroll_offset += 1;
                         self.auto_follow = false;
+                        self.clamp_scroll_offset();
                     }
                     KeyCode::Char('G') | KeyCode::End => {
                         self.scroll_offset = 0;

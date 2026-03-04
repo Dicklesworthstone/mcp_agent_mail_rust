@@ -127,10 +127,12 @@ err() {
 
 error_usage_hint() {
   err "Run './install.sh --help' for full option details."
+  err "Example: ./install.sh --version vX.Y.Z --dest \"\$HOME/.local/bin\""
 }
 
 error_support_hint() {
   err "Try re-running with --verbose for detailed diagnostics."
+  err "Inspect the log with: tail -n ${VERBOSE_DUMP_LINES} \"${LOG_FILE}\""
   err "If this persists, report at ${ISSUES_URL} and include log: ${LOG_FILE}"
 }
 
@@ -2186,6 +2188,7 @@ uninstall() {
   if [ "$ASSUME_YES" -eq 0 ] && [ ! -t 0 ]; then
     err "--uninstall without --yes requires an interactive terminal"
     err "Re-run with --yes for non-interactive uninstall"
+    err "Example: ./install.sh --uninstall --yes [--purge]"
     exit 2
   fi
 
@@ -2480,6 +2483,7 @@ done
 
 if [ "$FORCE_MIGRATE" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
   err "Cannot combine --migrate and --no-migrate"
+  err "Choose one behavior: --migrate (force migration) OR --no-migrate (skip migration)."
   error_usage_hint
   exit 2
 fi
@@ -2659,6 +2663,7 @@ else
   if [ "$LOCKED" -eq 0 ]; then
     err "Another installer is running (lock $LOCK_DIR)"
     err "Wait for the other install to finish, or remove a stale lock after confirming no installer is active."
+    err "Check lock owner with: cat \"$LOCK_DIR/pid\" && ps -p \"\$(cat \"$LOCK_DIR/pid\" 2>/dev/null)\""
     err "Stale-lock cleanup: rmdir \"$LOCK_DIR\""
     exit 1
   fi
@@ -3319,6 +3324,11 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     err "Database migration could not be completed safely."
     err "Aborting install to avoid running with a potentially inconsistent migrated database."
     err "Retry with --verbose after reviewing migration diagnostics above."
+    if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
+      err "Pristine backup preserved at: $migration_pristine_backup"
+      err "Manual restore command: cp \"$migration_pristine_backup\" \"$PYTHON_DB_MIGRATED_PATH\""
+    fi
+    error_support_hint
     exit 1
   fi
 fi

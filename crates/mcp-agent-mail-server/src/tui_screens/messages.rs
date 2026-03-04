@@ -5760,7 +5760,10 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
         let payload = screen.copyable_content().expect("copy payload");
-        assert!(payload.contains("path: $"), "payload should include JSON path");
+        assert!(
+            payload.contains("path: $"),
+            "payload should include JSON path"
+        );
         assert!(payload.contains("value:"), "payload should include value");
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('j'))), &state);

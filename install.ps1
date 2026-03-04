@@ -29,6 +29,8 @@ $Repo = "mcp_agent_mail_rust"
 $Target = "x86_64-pc-windows-msvc"
 $AssetName = "mcp-agent-mail-$Target.zip"
 $DefaultDest = Join-Path $env:LOCALAPPDATA "Programs\mcp-agent-mail"
+$IssuesUrl = "https://github.com/$Owner/$Repo/issues"
+$ReleasesUrl = "https://github.com/$Owner/$Repo/releases"
 
 if ([string]::IsNullOrWhiteSpace($Dest)) {
     $Dest = $DefaultDest
@@ -36,11 +38,11 @@ if ([string]::IsNullOrWhiteSpace($Dest)) {
 $Dest = [System.IO.Path]::GetFullPath($Dest)
 
 if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
-    throw "install.ps1 is only supported on Windows."
+    throw "install.ps1 is only supported on Windows. On Linux/macOS use install.sh: curl -fsSL https://raw.githubusercontent.com/$Owner/$Repo/main/install.sh | bash"
 }
 
 if ($Verify -and $NoVerify) {
-    throw "Cannot combine -Verify and -NoVerify."
+    throw "Cannot combine -Verify and -NoVerify. Choose one, or omit both to use default verification behavior."
 }
 
 $ShouldVerifyChecksum = if ($NoVerify) { $false } else { $true }
@@ -97,7 +99,7 @@ function Resolve-Version {
     $response = Invoke-RestMethod -Method Get -Uri $latestUrl -Headers $headers
 
     if ($null -eq $response -or [string]::IsNullOrWhiteSpace($response.tag_name)) {
-        throw "Unable to resolve latest release tag from $latestUrl"
+        throw "Unable to resolve latest release tag from $latestUrl. Check network/GitHub API access, or pass -Version vX.Y.Z explicitly."
     }
 
     return [string]$response.tag_name
@@ -178,7 +180,7 @@ function Download-File {
 function Get-Sha256Hex {
     param([string]$FilePath)
     if (-not (Test-Path -LiteralPath $FilePath)) {
-        throw "SHA256 source file not found: $FilePath"
+        throw "SHA256 source file not found: $FilePath. Re-run installer to re-download artifacts, or verify the custom path exists."
     }
     return (Get-FileHash -LiteralPath $FilePath -Algorithm SHA256).Hash.ToLowerInvariant()
 }
@@ -186,11 +188,11 @@ function Get-Sha256Hex {
 function Parse-ChecksumHex {
     param([string]$ChecksumText)
     if ([string]::IsNullOrWhiteSpace($ChecksumText)) {
-        throw "Checksum text is empty."
+        throw "Checksum text is empty. Re-download the checksum file; use -NoVerify only for trusted local artifacts."
     }
     $match = [regex]::Match($ChecksumText, "(?i)\b([a-f0-9]{64})\b")
     if (-not $match.Success) {
-        throw "Could not parse SHA256 checksum from text."
+        throw "Could not parse SHA256 checksum from text. Ensure the checksum file contains a 64-character SHA256 hex digest."
     }
     return $match.Groups[1].Value.ToLowerInvariant()
 }
@@ -203,7 +205,7 @@ function Verify-ChecksumFile {
     $expected = Parse-ChecksumHex -ChecksumText $ExpectedChecksum
     $actual = Get-Sha256Hex -FilePath $FilePath
     if ($actual -ne $expected) {
-        throw "Checksum verification failed. Expected $expected but got $actual."
+        throw "Checksum verification failed. Expected $expected but got $actual. Re-run installer to fetch fresh artifacts; if using a manual checksum, verify it matches the release asset."
     }
     Write-Ok "Checksum verified ($($actual.Substring(0, 16))...)"
 }
@@ -216,10 +218,10 @@ function Install-BinariesAtomically {
     )
 
     if (-not (Test-Path -LiteralPath $AmSource)) {
-        throw "Atomic install source missing: $AmSource"
+        throw "Atomic install source missing: $AmSource. Release archive may be incomplete; retry download or pin a known-good -Version."
     }
     if (-not (Test-Path -LiteralPath $ServerSource)) {
-        throw "Atomic install source missing: $ServerSource"
+        throw "Atomic install source missing: $ServerSource. Release archive may be incomplete; retry download or pin a known-good -Version."
     }
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -270,7 +272,7 @@ function Install-BinariesAtomically {
         if ($null -ne $serverBackup -and (Test-Path -LiteralPath $serverBackup)) {
             Move-Item -LiteralPath $serverBackup -Destination $serverDest -Force -ErrorAction SilentlyContinue
         }
-        throw "Atomic binary replacement failed. Rollback attempted. Root error: $installError"
+        throw "Atomic binary replacement failed. Rollback attempted. Close any running am/mcp-agent-mail processes and re-run with -Force. Root error: $installError"
     } finally {
         if (Test-Path -LiteralPath $amTemp) {
             Remove-Item -LiteralPath $amTemp -Force -ErrorAction SilentlyContinue
@@ -489,20 +491,20 @@ function Verify-Install {
     $serverExe = Join-Path $InstallDir "mcp-agent-mail.exe"
 
     if (-not (Test-Path -LiteralPath $amExe)) {
-        throw "Install verification failed: $amExe is missing."
+        throw "Install verification failed: $amExe is missing. Re-run with -Force and verify antivirus did not quarantine files under $InstallDir."
     }
     if (-not (Test-Path -LiteralPath $serverExe)) {
-        throw "Install verification failed: $serverExe is missing."
+        throw "Install verification failed: $serverExe is missing. Re-run with -Force and verify antivirus did not quarantine files under $InstallDir."
     }
 
     $amVersion = (& $amExe --version 2>$null | Select-Object -First 1)
     $serverVersion = (& $serverExe --version 2>$null | Select-Object -First 1)
 
     if ([string]::IsNullOrWhiteSpace($amVersion)) {
-        throw "Install verification failed: am.exe --version returned no output."
+        throw "Install verification failed: am.exe --version returned no output. Re-run with -Force and run '$amExe --version' manually for diagnostics."
     }
     if ([string]::IsNullOrWhiteSpace($serverVersion)) {
-        throw "Install verification failed: mcp-agent-mail.exe --version returned no output."
+        throw "Install verification failed: mcp-agent-mail.exe --version returned no output. Re-run with -Force and run '$serverExe --version' manually for diagnostics."
     }
 
     Write-Ok "VERIFY am.exe -> $amVersion"
@@ -551,7 +553,7 @@ try {
     $amSource = Get-ChildItem -LiteralPath $extractDir -Filter "am.exe" -Recurse | Select-Object -First 1
     $serverSource = Get-ChildItem -LiteralPath $extractDir -Filter "mcp-agent-mail.exe" -Recurse | Select-Object -First 1
     if ($null -eq $amSource -or $null -eq $serverSource) {
-        throw "Release archive did not contain am.exe and mcp-agent-mail.exe."
+        throw "Release archive did not contain am.exe and mcp-agent-mail.exe. Retry download, pin a known-good -Version, or report at $IssuesUrl. Release list: $ReleasesUrl"
     }
 
     Install-BinariesAtomically -AmSource $amSource.FullName -ServerSource $serverSource.FullName -InstallDir $Dest

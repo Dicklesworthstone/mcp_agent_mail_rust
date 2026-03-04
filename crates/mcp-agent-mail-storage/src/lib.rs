@@ -6515,10 +6515,7 @@ pub fn check_archive_consistency(
             &iso_filename
         };
 
-        let messages_dir = project_dir
-            .join("messages")
-            .join(&year)
-            .join(&month);
+        let messages_dir = project_dir.join("messages").join(&year).join(&month);
 
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
         // We check both the computed path and do a directory scan fallback

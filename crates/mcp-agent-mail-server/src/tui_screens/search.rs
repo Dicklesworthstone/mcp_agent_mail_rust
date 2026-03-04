@@ -576,7 +576,7 @@ struct SearchDegradedDiagnostics {
     remediation_hint: Option<String>,
 }
 
-type DetailCacheKey = (i64, &'static str, &'static str);
+type DetailCacheKey = (i64, &'static str, &'static str, u64);
 
 fn explain_facet_value<'a>(
     explain: &'a mcp_agent_mail_db::search_planner::QueryExplain,
@@ -1216,6 +1216,18 @@ pub struct SearchCockpitScreen {
     last_diagnostics: Option<SearchDegradedDiagnostics>,
     /// Most recent search execution time in milliseconds.
     last_search_ms: Option<u32>,
+    /// Number of search executions for the current screen instance.
+    search_exec_count: u64,
+    /// Number of times the facet signature changed between executions.
+    facet_rebuild_count: u64,
+    /// Last facet signature observed at execution time.
+    last_facet_signature: String,
+    /// Detail-cache generation; increments only when detail context changes.
+    detail_cache_generation: u64,
+    /// Last signature used to derive `detail_cache_generation`.
+    last_detail_cache_signature: String,
+    /// Counter of markdown renders performed on cache misses.
+    preview_markdown_render_count: Cell<u64>,
     debounce_remaining: u8,
     search_dirty: bool,
 
@@ -1313,6 +1325,12 @@ impl SearchCockpitScreen {
             guidance: None,
             last_diagnostics: None,
             last_search_ms: None,
+            search_exec_count: 0,
+            facet_rebuild_count: 0,
+            last_facet_signature: String::new(),
+            detail_cache_generation: 0,
+            last_detail_cache_signature: String::new(),
+            preview_markdown_render_count: Cell::new(0),
             debounce_remaining: 0,
             search_dirty: true,
             saved_recipes: Vec::new(),
@@ -1736,6 +1754,7 @@ impl SearchCockpitScreen {
         }
         let theme = crate::tui_theme::markdown_theme();
         let rendered = Arc::new(tui_markdown::render_body(body, &theme));
+        self.bump_preview_markdown_render_count();
         let mut cache = self.rendered_markdown_cache.borrow_mut();
         if cache.len() > 512 {
             cache.clear();
@@ -1747,12 +1766,20 @@ impl SearchCockpitScreen {
     /// Return cached detail text for an entry, generating lazily.
     fn cached_rendered_detail(&self, entry: &ResultEntry) -> Arc<Text<'static>> {
         let theme_key = crate::tui_theme::current_theme_env_value();
-        let cache_key = (entry.id, entry.doc_kind.as_str(), theme_key);
+        let cache_key = (
+            entry.id,
+            entry.doc_kind.as_str(),
+            theme_key,
+            self.detail_cache_generation,
+        );
         if let Some(existing) = self.rendered_detail_cache.borrow().get(&cache_key) {
             return Arc::clone(existing);
         }
 
         let rendered_body = self.cached_rendered_markdown(entry);
+        if rendered_body.is_none() && entry.rendered_body.is_none() {
+            self.bump_preview_markdown_render_count();
+        }
         let tp = crate::tui_theme::TuiThemePalette::current();
         let rendered = Arc::new(compose_detail_text(
             entry,
@@ -2484,6 +2511,94 @@ impl SearchCockpitScreen {
         if let (Some(conn), Some(id)) = (&self.db_conn, recipe.id) {
             let _ = touch_recipe(conn, id);
         }
+    }
+
+    fn facet_signature(&self) -> String {
+        let importance = self
+            .importance_filter
+            .filter_string()
+            .unwrap_or_else(|| "any".to_string());
+        let ack = match self.ack_filter {
+            AckFilter::Any => "any",
+            AckFilter::Required => "required",
+            AckFilter::NotRequired => "not_required",
+        };
+        let field_scope = match self.field_scope {
+            FieldScope::SubjectAndBody => "subject_and_body",
+            FieldScope::SubjectOnly => "subject_only",
+            FieldScope::BodyOnly => "body_only",
+        };
+        let search_mode = match self.search_mode {
+            SearchModeFilter::Auto => "auto",
+            SearchModeFilter::Lexical => "lexical",
+            SearchModeFilter::Semantic => "semantic",
+            SearchModeFilter::Hybrid => "hybrid",
+        };
+        let thread = self
+            .thread_filter
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-");
+        let explain = if self.explain_toggle.is_on() {
+            "on"
+        } else {
+            "off"
+        };
+        format!(
+            "scope={};type={};imp={};ack={};sort={};field={};mode={};explain={};thread={thread}",
+            self.scope_mode.as_str(),
+            self.doc_kind_filter.route_value(),
+            importance,
+            ack,
+            self.sort_direction.route_value(),
+            field_scope,
+            search_mode,
+            explain,
+        )
+    }
+
+    fn detail_cache_signature(&self) -> String {
+        let mut terms: Vec<String> = self
+            .highlight_terms
+            .iter()
+            .filter(|term| !term.negated && !term.text.is_empty())
+            .map(|term| format!("{:?}:{}", term.kind, term.text.to_ascii_lowercase()))
+            .collect();
+        terms.sort_unstable();
+        let term_sig = terms.join("|");
+        let diag_sig = self.last_diagnostics.as_ref().map_or_else(
+            || "none".to_string(),
+            |diag| {
+                format!(
+                    "degraded={};fallback={};timeout={};budget={};budget_exhausted={};hint={}",
+                    diag.degraded,
+                    diag.fallback_mode.as_deref().unwrap_or("-"),
+                    diag.timeout_stage.as_deref().unwrap_or("-"),
+                    diag.budget_tier.as_deref().unwrap_or("-"),
+                    diag.budget_exhausted
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    diag.remediation_hint.as_deref().unwrap_or("-"),
+                )
+            },
+        );
+        format!("terms={term_sig};diag={diag_sig}")
+    }
+
+    fn refresh_detail_cache_generation(&mut self) {
+        let signature = self.detail_cache_signature();
+        if signature != self.last_detail_cache_signature {
+            self.detail_cache_generation = self.detail_cache_generation.saturating_add(1);
+            self.last_detail_cache_signature = signature;
+        }
+    }
+
+    fn bump_preview_markdown_render_count(&self) {
+        self.preview_markdown_render_count.set(
+            self.preview_markdown_render_count
+                .get()
+                .saturating_add(1),
+        );
     }
 
     fn route_string(&self) -> String {
@@ -6748,7 +6863,10 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
         let payload = screen.copyable_content().expect("copy payload");
-        assert!(payload.contains("path: $"), "payload should include JSON path");
+        assert!(
+            payload.contains("path: $"),
+            "payload should include JSON path"
+        );
         assert!(payload.contains("value:"), "payload should include value");
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('j'))), &state);

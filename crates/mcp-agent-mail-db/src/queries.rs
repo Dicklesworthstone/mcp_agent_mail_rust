@@ -4704,10 +4704,19 @@ pub async fn respond_contact(
     row.status = status.to_string();
     row.updated_ts = now;
     row.expires_ts = expires;
+
+    let update_sql =
+        "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? WHERE id = ?";
+    let update_params = [
+        Value::Text(row.status.clone()),
+        Value::BigInt(row.updated_ts),
+        row.expires_ts.map_or(Value::Null, Value::BigInt),
+        Value::BigInt(row.id.unwrap_or(0)),
+    ];
     let updated = try_in_tx!(
         cx,
         &tracked,
-        map_sql_outcome(update!(&row).execute(cx, &tracked).await)
+        map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
     );
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     usize::try_from(updated).map_or_else(

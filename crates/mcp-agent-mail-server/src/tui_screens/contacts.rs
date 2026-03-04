@@ -147,6 +147,8 @@ pub struct ContactsScreen {
     view_mode: ViewMode,
     /// (Agent Name, x, y) normalized 0.0-1.0
     graph_nodes: Vec<(String, f64, f64)>,
+    /// Cached flow metrics for graph rendering.
+    graph_metrics: GraphFlowMetrics,
     graph_selected_idx: usize,
     show_mermaid_panel: bool,
     mermaid_cache: RefCell<Option<MermaidPanelCache>>,
@@ -174,6 +176,7 @@ impl ContactsScreen {
             status_filter: StatusFilter::All,
             view_mode: ViewMode::Table,
             graph_nodes: Vec::new(),
+            graph_metrics: GraphFlowMetrics::default(),
             graph_selected_idx: 0,
             show_mermaid_panel: false,
             mermaid_cache: RefCell::new(None),
@@ -252,6 +255,7 @@ impl ContactsScreen {
         self.contacts = rows;
         let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
         self.layout_graph(&recent_events);
+        self.graph_metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
 
         // Clamp selection
         if let Some(sel) = self.table_state.selected
@@ -487,10 +491,11 @@ impl MailScreen for ContactsScreen {
         // startup grace period before showing the degraded banner.
         self.db_context_unavailable = current_gen.db_stats_gen == 0 && tick_count >= 30;
 
-        // Rebuild every 5 seconds, but only when DB stats actually changed.
-        if tick_count.is_multiple_of(50) {
+        // Rebuild every second with dirty gating. This keeps graph/event-driven
+        // state fresh without doing heavy recomputation every render frame.
+        if tick_count.is_multiple_of(10) {
             let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
-            if dirty.db_stats {
+            if dirty.db_stats || dirty.events {
                 self.prev_contact_counts = self.contact_counts();
                 self.rebuild_from_state(state);
             }
@@ -606,21 +611,12 @@ impl MailScreen for ContactsScreen {
             && split.breakpoint >= Breakpoint::Xl
             && split.rects[1].width >= GRAPH_MIN_WIDTH
             && split.rects[1].height >= GRAPH_MIN_HEIGHT;
-        let needs_recent_events =
-            self.show_mermaid_panel || main_graph_visible || side_graph_visible;
-        let recent_events = needs_recent_events.then(|| state.recent_events(GRAPH_EVENTS_WINDOW));
-        let graph_metrics = (main_graph_visible || side_graph_visible).then(|| {
-            build_graph_flow_metrics(&self.contacts, recent_events.as_deref().unwrap_or(&[]))
-        });
 
         if self.show_mermaid_panel {
-            if let Some(recent_events) = recent_events.as_deref() {
-                self.render_mermaid_panel(frame, content_area, recent_events);
-            }
+            let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
+            self.render_mermaid_panel(frame, content_area, &recent_events);
         } else if main_graph_visible {
-            if let Some(metrics) = graph_metrics.as_ref() {
-                self.render_graph(frame, content_area, metrics);
-            }
+            self.render_graph(frame, content_area, &self.graph_metrics);
         } else {
             self.render_table(frame, content_area);
         }
@@ -637,11 +633,7 @@ impl MailScreen for ContactsScreen {
             if split.breakpoint >= Breakpoint::Xl {
                 // On Xl: show graph visualization in the side panel
                 if side_graph_visible {
-                    if let Some(graph_metrics) = graph_metrics.as_ref() {
-                        self.render_graph(frame, detail_area, graph_metrics);
-                    } else {
-                        self.render_contact_detail_panel(frame, detail_area);
-                    }
+                    self.render_graph(frame, detail_area, &self.graph_metrics);
                 } else {
                     self.render_contact_detail_panel(frame, detail_area);
                 }
@@ -1903,6 +1895,49 @@ mod tests {
                 .iter()
                 .any(|(name, _, _)| name == "OnlyInEvents")
         );
+    }
+
+    #[test]
+    fn rebuild_populates_cached_graph_metrics_from_recent_events() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "Alpha",
+            vec!["Beta".to_string()],
+            "subject",
+            "thread",
+            "project",
+            "",
+        ));
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.graph_metrics.edge_weight("Alpha", "Beta"), 1);
+    }
+
+    #[test]
+    fn tick_refreshes_graph_metrics_at_refresh_boundary_when_events_change() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+        screen.last_data_gen = state.data_generation();
+
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "TickAgent",
+            vec!["Peer".to_string()],
+            "subject",
+            "thread",
+            "project",
+            "",
+        ));
+
+        // Non-refresh tick should defer expensive rebuild work.
+        screen.tick(9, &state);
+        assert_eq!(screen.graph_metrics.edge_weight("TickAgent", "Peer"), 0);
+
+        // Refresh boundary applies pending dirty-state updates.
+        screen.tick(10, &state);
+        assert_eq!(screen.graph_metrics.edge_weight("TickAgent", "Peer"), 1);
     }
 
     #[test]
