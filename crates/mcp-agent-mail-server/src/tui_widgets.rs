@@ -320,17 +320,15 @@ impl<'a> HeatmapGrid<'a> {
 
 pub(crate) fn truncate_width(s: &str, max_width: u16) -> std::borrow::Cow<'_, str> {
     let mut w = 0;
-    let mut end_idx = 0;
     for (idx, ch) in s.char_indices() {
         let mut b = [0; 4];
         let cw = u16::try_from(display_width(ch.encode_utf8(&mut b))).unwrap_or(u16::MAX);
         if w + cw > max_width {
-            return std::borrow::Cow::Owned(s[..idx].to_string());
+            return std::borrow::Cow::Borrowed(&s[..idx]);
         }
         w += cw;
-        end_idx = idx + ch.len_utf8();
     }
-    std::borrow::Cow::Borrowed(&s[..end_idx])
+    std::borrow::Cow::Borrowed(s)
 }
 
 impl Widget for HeatmapGrid<'_> {
