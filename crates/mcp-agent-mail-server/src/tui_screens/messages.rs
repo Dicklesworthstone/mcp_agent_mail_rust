@@ -979,6 +979,7 @@ struct MessageDetailRenderCache {
     body_hash: u64,
     theme_key: &'static str,
     rendered: Text<'static>,
+    estimated_lines: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1066,6 +1067,13 @@ pub struct MessageBrowserScreen {
     filter_presets_path: PathBuf,
     /// Preset store loaded from `filter_presets_path`.
     filter_presets: ScreenFilterPresetStore,
+    /// Cursor position when `focused_synthetic` was last built.
+    /// Avoids rebuilding the synthetic event every tick when cursor hasn't moved.
+    focused_sync_cursor: usize,
+    /// Results generation counter incremented whenever `results` changes.
+    results_generation: usize,
+    /// Results generation when `focused_synthetic` was last built.
+    focused_sync_results_gen: usize,
     /// Active preset dialog mode (save/load/none).
     preset_dialog_mode: PresetDialogMode,
     /// Save dialog field focus.
@@ -1122,6 +1130,9 @@ impl MessageBrowserScreen {
             compose_form: None,
             detail_cache: RefCell::new(None),
             json_tree_state: RefCell::new(crate::tui_markdown::JsonTreeViewState::default()),
+            focused_sync_cursor: usize::MAX,
+            results_generation: 0,
+            focused_sync_results_gen: usize::MAX,
             filter_presets_path,
             filter_presets,
             preset_dialog_mode: PresetDialogMode::None,
@@ -1697,6 +1708,13 @@ impl MessageBrowserScreen {
 
     /// Rebuild the synthetic `MailEvent` for the currently selected message.
     fn sync_focused_event(&mut self) {
+        if self.focused_sync_cursor == self.cursor
+            && self.focused_sync_results_gen == self.results_generation
+        {
+            return;
+        }
+        self.focused_sync_cursor = self.cursor;
+        self.focused_sync_results_gen = self.results_generation;
         self.focused_synthetic = self.results.get(self.cursor).map(|entry| {
             crate::tui_events::MailEvent::message_sent(
                 entry.id,
@@ -2510,6 +2528,7 @@ impl MessageBrowserScreen {
         }
 
         self.results = results;
+        self.results_generation = self.results_generation.wrapping_add(1);
         self.prune_selection_to_visible();
         self.total_results = total.saturating_add(live_added);
 
@@ -3424,7 +3443,7 @@ impl MailScreen for MessageBrowserScreen {
             messages_actions(message.id, thread_id, &message.from_agent)
         };
 
-        if selected_ids.len() == 1 && self.detail_view_mode.get() == DetailViewMode::JsonTree {
+        if selected_ids.len() <= 1 && self.detail_view_mode.get() == DetailViewMode::JsonTree {
             let mut tree = self.json_tree_state.borrow_mut();
             if tree.sync_body(&message.body_md) {
                 tree.clamp_cursor();
@@ -4276,7 +4295,11 @@ fn render_detail_panel(
             } else {
                 let viewport = usize::from(area.height.saturating_sub(2)).max(1);
                 let width = if area.width == 0 { 80 } else { area.width };
-                let total = estimate_message_detail_lines(msg, width);
+                let total = cache
+                    .borrow()
+                    .as_ref()
+                    .filter(|c| c.message_id == msg.id && c.width == width)
+                    .map_or_else(|| estimate_message_detail_lines(msg, width), |c| c.estimated_lines);
                 let max_scroll = total.saturating_sub(viewport);
                 let clamped = scroll.min(max_scroll);
                 format!("Detail {importance} [{clamped}/{max_scroll}]")
@@ -4408,55 +4431,52 @@ fn render_detail_panel(
         }
         estimate_wrapped_line_count(&combined_lines, usize::from(content_inner.width))
     } else {
-        let body_text = {
+        let (body_text, est_lines) = {
             let width = content_inner.width;
             let body_hash = stable_hash(msg.body_md.as_bytes());
             let theme_key = crate::tui_theme::current_theme_env_value();
             let mut cached = cache.borrow_mut();
 
-            cached
-                .as_ref()
-                .and_then(|cached| {
-                    if cached.message_id == msg.id
-                        && cached.width == width
-                        && cached.body_hash == body_hash
-                        && cached.theme_key == theme_key
-                    {
-                        Some(cached.rendered.clone())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| {
-                    let mut body_md = msg.body_md.clone();
-                    let image_block = build_inline_image_block(&msg.body_md, width);
-                    if !image_block.is_empty() {
-                        body_md.push_str("\n\n");
-                        body_md.push_str(&image_block);
-                    }
-                    let markdown_body = if looks_like_json(&body_md) {
-                        format!("```json\n{}\n```", body_md.trim_end())
-                    } else {
-                        body_md
-                    };
-                    let md_theme = crate::tui_theme::markdown_theme();
-                    let rendered = crate::tui_markdown::render_body(&markdown_body, &md_theme);
-                    *cached = Some(MessageDetailRenderCache {
-                        message_id: msg.id,
-                        width,
-                        body_hash,
-                        theme_key,
-                        rendered: rendered.clone(),
-                    });
-                    rendered
-                })
+            #[allow(clippy::option_if_let_else)]
+            if let Some(hit) = cached.as_ref().filter(|c| {
+                c.message_id == msg.id
+                    && c.width == width
+                    && c.body_hash == body_hash
+                    && c.theme_key == theme_key
+            }) {
+                (hit.rendered.clone(), hit.estimated_lines)
+            } else {
+                let mut body_md = msg.body_md.clone();
+                let image_block = build_inline_image_block(&msg.body_md, width);
+                if !image_block.is_empty() {
+                    body_md.push_str("\n\n");
+                    body_md.push_str(&image_block);
+                }
+                let markdown_body = if looks_like_json(&body_md) {
+                    format!("```json\n{}\n```", body_md.trim_end())
+                } else {
+                    body_md
+                };
+                let md_theme = crate::tui_theme::markdown_theme();
+                let rendered = crate::tui_markdown::render_body(&markdown_body, &md_theme);
+                let estimated_lines = estimate_message_detail_lines(msg, width);
+                *cached = Some(MessageDetailRenderCache {
+                    message_id: msg.id,
+                    width,
+                    body_hash,
+                    theme_key,
+                    rendered: rendered.clone(),
+                    estimated_lines,
+                });
+                (rendered, estimated_lines)
+            }
         };
 
         for line in body_text.lines() {
             combined_lines.push(line.clone());
         }
 
-        estimate_message_detail_lines(msg, content_inner.width)
+        est_lines
     };
 
     let combined_text = Text::from_lines(combined_lines);

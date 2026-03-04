@@ -681,18 +681,7 @@ impl DashboardScreen {
         }
         // Rebuild cache.
         let query_terms = parse_query_terms(self.quick_query());
-        let indices: Vec<usize> = if self.event_log_search_keys.len() != self.event_log.len() {
-            self.event_log
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| {
-                    self.verbosity.includes(e.severity)
-                        && (self.type_filter.is_empty() || self.type_filter.contains(&e.kind))
-                        && event_entry_matches_query(e, &query_terms)
-                })
-                .map(|(i, _)| i)
-                .collect()
-        } else {
+        let indices: Vec<usize> = if self.event_log_search_keys.len() == self.event_log.len() {
             self.event_log
                 .iter()
                 .zip(self.event_log_search_keys.iter())
@@ -704,9 +693,22 @@ impl DashboardScreen {
                 })
                 .map(|(i, _)| i)
                 .collect()
+        } else {
+            self.event_log
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    self.verbosity.includes(e.severity)
+                        && (self.type_filter.is_empty() || self.type_filter.contains(&e.kind))
+                        && event_entry_matches_query(e, &query_terms)
+                })
+                .map(|(i, _)| i)
+                .collect()
         };
         *self.cached_visible_indices.borrow_mut() = indices;
         *self.visible_cache_filter_sig.borrow_mut() = current_key;
+        // Invalidate tool latency cache because the visible entries changed.
+        self.cached_tool_latency.borrow_mut().0 = usize::MAX;
     }
 
     /// Visible entries after applying verbosity tier and type filter (cached).
@@ -1654,7 +1656,7 @@ fn summarize_recipients(recipients: &[String]) -> String {
 /// within a single frame render cycle).
 fn parse_query_terms(raw: &str) -> Vec<String> {
     thread_local! {
-        static CACHE: RefCell<(String, Vec<String>)> = RefCell::new((String::new(), Vec::new()));
+        static CACHE: RefCell<(String, Vec<String>)> = const { RefCell::new((String::new(), Vec::new())) };
     }
     CACHE.with(|cell| {
         let cache = cell.borrow();
@@ -1698,7 +1700,7 @@ fn type_filter_signature(type_filter: &HashSet<MailEventKind>) -> String {
         return "none".to_string();
     }
     thread_local! {
-        static CACHE: RefCell<(u64, String)> = RefCell::new((0, String::new()));
+        static CACHE: RefCell<(u64, String)> = const { RefCell::new((0, String::new())) };
     }
     // Use a cheap hash of the set to detect changes (avoids sorting every call).
     let hash: u64 = type_filter
@@ -5374,8 +5376,8 @@ fn render_activity_heatmap(
     // Use cached grid if available and column count matches; otherwise recompute.
     let need_recompute = {
         let cached = heatmap_cache.borrow();
-        cached.as_ref().map_or(true, |c| {
-            c.grid.first().map_or(true, |row| row.len() != px_w)
+        cached.as_ref().is_none_or(|c| {
+            c.grid.first().is_none_or(|row| row.len() != px_w)
         })
     };
     if need_recompute {
@@ -7555,6 +7557,19 @@ mod tests {
         let state = TuiSharedState::new(&config);
         let mut screen = DashboardScreen::new();
         assert!(screen.auto_follow);
+
+        // Add events so scroll has room to move
+        for i in 0..5 {
+            screen.push_event_entry(format_event(&MailEvent::message_received(
+                i + 1,
+                "alice",
+                vec!["bob".to_string()],
+                "subj",
+                "thread-1",
+                "proj",
+                "",
+            )));
+        }
 
         let up = Event::Key(ftui::KeyEvent::new(KeyCode::Char('k')));
         screen.update(&up, &state);
