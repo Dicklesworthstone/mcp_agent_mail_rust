@@ -14176,6 +14176,36 @@ mod tests {
     }
 
     #[test]
+    fn resolve_agent_id_for_inbox_check_is_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("check-inbox-direct.db");
+        let url = format!("sqlite:///{}", db_path.display());
+        let conn = open_db_sync_with_database_url(&url).unwrap();
+
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
+        )
+        .unwrap();
+        let project_rows = conn
+            .query_sync("SELECT id FROM projects WHERE slug = 'p' LIMIT 1", &[])
+            .unwrap();
+        let project_id: i64 = project_rows
+            .first()
+            .and_then(|row| row.get_named("id").ok())
+            .unwrap();
+
+        conn.execute_raw(&format!(
+            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+             VALUES ({project_id}, 'BlueLake', 'test', 'test-model', '', 1000000, 1000000, 'auto')"
+        ))
+        .unwrap();
+
+        let agent_id =
+            resolve_agent_id_for_inbox_check(&conn, project_id, "bluelake", "/tmp/p").unwrap();
+        assert!(agent_id > 0);
+    }
+
+    #[test]
     fn format_micros_as_iso_produces_valid_timestamp() {
         // 2026-01-01 00:00:00 UTC in microseconds
         let micros = 1_767_225_600_000_000_i64;
@@ -27707,6 +27737,36 @@ pub struct CheckInboxDirectConfig {
     pub limit: i64,
 }
 
+fn resolve_agent_id_for_inbox_check(
+    conn: &mcp_agent_mail_db::DbConn,
+    project_id: i64,
+    agent_name: &str,
+    project_key: &str,
+) -> CliResult<i64> {
+    use sqlmodel_core::Value;
+
+    let agent_rows = conn
+        .query_sync(
+            "SELECT id FROM agents \
+             WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(agent_name.to_string()),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("agent lookup failed: {e}")))?;
+
+    agent_rows
+        .first()
+        .and_then(|row| row.get_named("id").ok())
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "agent '{}' not found in project '{}'",
+                agent_name, project_key
+            ))
+        })
+}
+
 /// Check inbox via direct SQLite query (for co-located setups).
 ///
 /// This bypasses the HTTP/MCP server and queries the database directly,
@@ -27732,26 +27792,12 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
         .and_then(|row| row.get_named("id").ok())
         .ok_or_else(|| CliError::Other(format!("project not found: {}", config.project_key)))?;
 
-    // Resolve agent ID from agent_name
-    let agent_rows = conn
-        .query_sync(
-            "SELECT id FROM agents WHERE project_id = ? AND name = ? LIMIT 1",
-            &[
-                Value::BigInt(project_id),
-                Value::Text(config.agent_name.clone()),
-            ],
-        )
-        .map_err(|e| CliError::Other(format!("agent lookup failed: {e}")))?;
-
-    let agent_id: i64 = agent_rows
-        .first()
-        .and_then(|row| row.get_named("id").ok())
-        .ok_or_else(|| {
-            CliError::Other(format!(
-                "agent '{}' not found in project '{}'",
-                config.agent_name, config.project_key
-            ))
-        })?;
+    let agent_id = resolve_agent_id_for_inbox_check(
+        &conn,
+        project_id,
+        &config.agent_name,
+        &config.project_key,
+    )?;
 
     // Query unread messages (where read_ts IS NULL)
     let sql = "

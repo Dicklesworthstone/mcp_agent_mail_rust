@@ -949,7 +949,14 @@ impl AgentsScreen {
         };
 
         let lines = self.build_detail_lines(agent, &tp);
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
     }
 
     /// Build key-value lines for agent detail.
@@ -2126,7 +2133,10 @@ mod tests {
         // Gate: last_selection tracks changes
         screen.last_selection = Some(0);
         let current_sel = screen.table_state.selected;
-        assert_eq!(current_sel, screen.last_selection, "no change = gate closed");
+        assert_eq!(
+            current_sel, screen.last_selection,
+            "no change = gate closed"
+        );
     }
 
     #[test]

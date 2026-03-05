@@ -4175,7 +4175,10 @@ struct ToolLatencyRow {
 /// Aggregate tool latency data from visible entries. Extracted from
 /// `render_tool_latency_panel` so the result can be cached across the 10+
 /// render calls per frame that display the same aggregation.
-fn compute_tool_latency_rows(entries: &[&EventEntry], query_terms: &[String]) -> Vec<ToolLatencyRow> {
+fn compute_tool_latency_rows(
+    entries: &[&EventEntry],
+    query_terms: &[String],
+) -> Vec<ToolLatencyRow> {
     let mut by_tool: HashMap<String, ToolAgg> = HashMap::new();
     for entry in entries.iter().filter(|entry| {
         entry.kind == MailEventKind::ToolCallEnd
@@ -4218,11 +4221,7 @@ fn compute_tool_latency_rows(entries: &[&EventEntry], query_terms: &[String]) ->
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_tool_latency_panel_cached(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    rows: &[ToolLatencyRow],
-) {
+fn render_tool_latency_panel_cached(frame: &mut Frame<'_>, area: Rect, rows: &[ToolLatencyRow]) {
     if area.width < 20 || area.height < 3 {
         return;
     }
@@ -5381,9 +5380,9 @@ fn render_activity_heatmap(
     // Use cached grid if available and column count matches; otherwise recompute.
     let need_recompute = {
         let cached = heatmap_cache.borrow();
-        cached.as_ref().is_none_or(|c| {
-            c.grid.first().is_none_or(|row| row.len() != px_w)
-        })
+        cached
+            .as_ref()
+            .is_none_or(|c| c.grid.first().is_none_or(|row| row.len() != px_w))
     };
     if need_recompute {
         *heatmap_cache.borrow_mut() = Some(compute_heatmap_grid(event_log, px_w));
@@ -8427,10 +8426,8 @@ mod tests {
 
     #[test]
     fn quick_filter_controls_total_chars_matches_label_sum() {
-        let expected = " [1:All] ".len()
-            + " [2:Msg] ".len()
-            + " [3:Tools] ".len()
-            + " [4:Resv] ".len();
+        let expected =
+            " [1:All] ".len() + " [2:Msg] ".len() + " [3:Tools] ".len() + " [4:Resv] ".len();
         assert_eq!(QUICK_FILTER_CONTROLS_TOTAL_CHARS, expected);
     }
 

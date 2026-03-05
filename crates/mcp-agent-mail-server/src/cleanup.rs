@@ -245,10 +245,26 @@ fn run_cleanup_cycle_with_cache(
 
         // Write archive artifacts for released reservations.
         if !expired_ids.is_empty() {
-            let _ = write_cleanup_artifacts(config, pool, &cx, *pid, &expired_ids);
+            if let Err(err) = write_cleanup_artifacts(config, pool, &cx, *pid, &expired_ids) {
+                warn!(
+                    project_id = *pid,
+                    phase = "expired",
+                    released_count = expired_ids.len(),
+                    error = %err,
+                    "cleanup: failed to enqueue archive updates for released reservations"
+                );
+            }
         }
         if !stale_ids.is_empty() {
-            let _ = write_cleanup_artifacts(config, pool, &cx, *pid, &stale_ids);
+            if let Err(err) = write_cleanup_artifacts(config, pool, &cx, *pid, &stale_ids) {
+                warn!(
+                    project_id = *pid,
+                    phase = "stale",
+                    released_count = stale_ids.len(),
+                    error = %err,
+                    "cleanup: failed to enqueue archive updates for released reservations"
+                );
+            }
         }
     }
 
@@ -454,7 +470,10 @@ fn check_filesystem_activity(
         return false;
     }
 
-    let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[') || pattern.contains('{');
+    let has_glob = pattern.contains('*')
+        || pattern.contains('?')
+        || pattern.contains('[')
+        || pattern.contains('{');
 
     if has_glob {
         // Fast path: use `git ls-files -c -o --exclude-standard -- pattern` to get matching files.
@@ -549,12 +568,7 @@ fn git_head_oid_for_workspace(workspace: &Path) -> Option<String> {
         return None;
     }
     let output = std::process::Command::new("git")
-        .args([
-            "-C",
-            &workspace.to_string_lossy(),
-            "rev-parse",
-            "HEAD",
-        ])
+        .args(["-C", &workspace.to_string_lossy(), "rev-parse", "HEAD"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -608,7 +622,10 @@ fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf>
         return Vec::new();
     }
 
-    let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[') || pattern.contains('{');
+    let has_glob = pattern.contains('*')
+        || pattern.contains('?')
+        || pattern.contains('[')
+        || pattern.contains('{');
 
     if has_glob {
         let base_str = base.to_string_lossy();
@@ -682,14 +699,28 @@ fn write_cleanup_artifacts(
             config: config.clone(),
             reservations: res_jsons,
         };
-        // Best effort
-        let _ = mcp_agent_mail_storage::wbq_enqueue(op);
+        match mcp_agent_mail_storage::wbq_enqueue(op) {
+            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued => {
+                info!(
+                    project = %project.slug,
+                    released_count = released_ids.len(),
+                    "cleanup: released expired/stale reservations and enqueued archive updates"
+                );
+                return Ok(());
+            }
+            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                return Err("cleanup archive enqueue failed: queue unavailable".into());
+            }
+            mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
+                return Err("cleanup archive enqueue skipped due to critical disk pressure".into());
+            }
+        }
     }
 
     info!(
         project = %project.slug,
         released_count = released_ids.len(),
-        "cleanup: released expired/stale reservations and enqueued archive updates"
+        "cleanup: released reservations but found no archive rows to update"
     );
 
     Ok(())
@@ -1170,6 +1201,35 @@ mod tests {
         assert!(
             row.released_ts.is_some(),
             "inactive agent reservation should be released"
+        );
+    }
+
+    #[test]
+    fn write_cleanup_artifacts_errors_when_archive_enqueue_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
+            seed_active_reservation(&tmp);
+
+        match fastmcp_core::block_on(async {
+            queries::release_reservations_by_ids(&cx, &pool, &[reservation_id]).await
+        }) {
+            Outcome::Ok(1) => {}
+            other => panic!("release_reservations_by_ids failed: {other:?}"),
+        }
+
+        let config = Config::from_env();
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let previous_pressure = metrics.system.disk_pressure_level.load();
+        metrics
+            .system
+            .disk_pressure_level
+            .set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+        let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
+        metrics.system.disk_pressure_level.set(previous_pressure);
+
+        assert_eq!(
+            result,
+            Err("cleanup archive enqueue skipped due to critical disk pressure".into())
         );
     }
 }

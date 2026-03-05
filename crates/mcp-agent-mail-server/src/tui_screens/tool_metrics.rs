@@ -1168,7 +1168,14 @@ impl ToolMetricsScreen {
         };
 
         let lines = Self::build_tool_detail_lines(stats, &tp);
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
     }
 
     fn build_tool_detail_lines(

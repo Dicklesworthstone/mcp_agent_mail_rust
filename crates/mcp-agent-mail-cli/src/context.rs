@@ -154,6 +154,9 @@ pub struct ResolvedAgent {
 }
 
 /// Look up an agent by name within a project.
+///
+/// Agent names are resolved case-insensitively to match the MCP tool/database
+/// surface.
 pub fn resolve_agent(
     conn: &mcp_agent_mail_db::DbConn,
     project_id: i64,
@@ -161,7 +164,8 @@ pub fn resolve_agent(
 ) -> CliResult<ResolvedAgent> {
     let rows = conn
         .query_sync(
-            "SELECT id, name FROM agents WHERE project_id = ? AND name = ? LIMIT 1",
+            "SELECT id, name FROM agents \
+             WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1",
             &[
                 sqlmodel_core::Value::BigInt(project_id),
                 sqlmodel_core::Value::Text(agent_name.to_string()),
@@ -510,6 +514,34 @@ mod tests {
             .unwrap();
 
         let agent = ctx.resolve_agent(proj.id, "RedFox").unwrap();
+        assert_eq!(agent.name, "RedFox");
+        assert_eq!(agent.project_id, proj.id);
+        assert!(agent.id > 0);
+    }
+
+    #[test]
+    fn resolve_agent_found_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let url = format!("sqlite:///{}", db_path.display());
+        let ctx = CliContext::open_with_url(&url).unwrap();
+
+        ctx.conn
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
+            )
+            .unwrap();
+        let proj = ctx.resolve_project("p").unwrap();
+
+        ctx.conn
+            .execute_raw(&format!(
+                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                 VALUES ({}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+                proj.id
+            ))
+            .unwrap();
+
+        let agent = ctx.resolve_agent(proj.id, "redfox").unwrap();
         assert_eq!(agent.name, "RedFox");
         assert_eq!(agent.project_id, proj.id);
         assert!(agent.id > 0);

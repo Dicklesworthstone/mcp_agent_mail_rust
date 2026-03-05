@@ -978,7 +978,8 @@ impl ThreadExplorerScreen {
         {
             let cache = self.tree_rows_cache.borrow();
             if let Some(ref c) = *cache
-                && c.key_hash == key {
+                && c.key_hash == key
+            {
                 return c.rows.clone();
             }
         }
@@ -4586,7 +4587,8 @@ mod tests {
 
         // Once interval elapses, the latched signal should trigger refresh even
         // if this tick has no fresh dirty edge.
-        screen.last_refresh = Instant::now().checked_sub(Duration::from_secs(REFRESH_INTERVAL_SECS + 1));
+        screen.last_refresh =
+            Instant::now().checked_sub(Duration::from_secs(REFRESH_INTERVAL_SECS + 1));
         screen.tick(2, &state);
         assert!(screen.list_dirty);
     }

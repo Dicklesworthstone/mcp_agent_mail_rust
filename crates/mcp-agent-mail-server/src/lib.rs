@@ -944,6 +944,41 @@ fn start_advisory_consistency_probe(config: &mcp_agent_mail_core::Config) {
         });
 }
 
+fn tui_readiness_warmup_failure_message(error: &str) -> String {
+    format!("TUI startup: background DB readiness warmup failed ({error})")
+}
+
+fn handle_tui_readiness_warmup_result(
+    tui_state: Option<&Arc<tui_bridge::TuiSharedState>>,
+    result: Result<(), String>,
+) {
+    if let Err(error) = result {
+        tracing::warn!(
+            error = %error,
+            "tui readiness warmup failed; continuing with degraded DB-unavailable startup"
+        );
+        if let Some(state) = tui_state {
+            state.push_console_log(tui_readiness_warmup_failure_message(&error));
+        }
+    }
+}
+
+fn spawn_tui_readiness_warmup(
+    config: &mcp_agent_mail_core::Config,
+    tui_state: &Arc<tui_bridge::TuiSharedState>,
+) {
+    let config = config.clone();
+    let tui_state = Arc::clone(tui_state);
+    if let Err(error) = std::thread::Builder::new()
+        .name("tui-readiness-warmup".into())
+        .spawn(move || {
+            handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check_quick(&config));
+        })
+    {
+        handle_tui_readiness_warmup_result(None, Err(format!("spawn failed: {error}")));
+    }
+}
+
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -1479,11 +1514,6 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
-    // Run a fast readiness init pass before any TUI screen opens raw sync DB
-    // handles; this guarantees schema migrations have been applied first
-    // without blocking first render on integrity verification.
-    readiness_check_quick(config).map_err(std::io::Error::other)?;
-
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
@@ -1505,6 +1535,10 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
     let tui_state = tui_bridge::TuiSharedState::new(config);
     set_tui_state_handle(Some(Arc::clone(&tui_state)));
+    // Keep first paint fast: screens and the DB poller already degrade
+    // gracefully while SQLite is still warming up, so do not block the
+    // interactive handoff on migrations/readiness work here.
+    spawn_tui_readiness_warmup(config, &tui_state);
 
     // ── 4. DB poller on dedicated thread ────────────────────────────
     let mut db_poller =
@@ -7487,6 +7521,37 @@ mod tests {
             &config,
             "database disk image is malformed"
         ));
+    }
+
+    #[test]
+    fn tui_readiness_warmup_failure_records_console_log() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+
+        handle_tui_readiness_warmup_result(Some(&state), Err("boom".to_string()));
+
+        let logs = state.console_log_since(0);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].1,
+            "TUI startup: background DB readiness warmup failed (boom)"
+        );
+    }
+
+    #[test]
+    fn tui_readiness_warmup_success_is_silent() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+
+        handle_tui_readiness_warmup_result(Some(&state), Ok(()));
+
+        assert!(state.console_log_since(0).is_empty());
     }
 
     #[cfg(target_os = "linux")]

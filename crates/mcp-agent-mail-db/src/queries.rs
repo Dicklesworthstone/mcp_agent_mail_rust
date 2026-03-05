@@ -2233,8 +2233,10 @@ pub async fn create_message_with_recipients(
             "message commit succeeded but returned row has no id".to_string(),
         ));
     };
-    match verify_message_recipients_visible_after_commit(cx, pool, project_id, message_id, recipients)
-        .await
+    match verify_message_recipients_visible_after_commit(
+        cx, pool, project_id, message_id, recipients,
+    )
+    .await
     {
         Outcome::Ok(()) => {}
         Outcome::Err(e) => return Outcome::Err(e),
@@ -7056,7 +7058,11 @@ mod tests {
         });
     }
 
+    /// Requires trigger-body execution. Under `FrankenSQLite`, `CREATE TRIGGER`
+    /// can succeed while the trigger body is never run, so this harness cannot
+    /// reliably suppress committed recipient rows.
     #[test]
+    #[ignore = "FrankenSQLite does not reliably execute trigger bodies for this harness"]
     fn create_message_with_recipients_rejects_missing_recipient_rows_after_commit() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -7142,6 +7148,86 @@ mod tests {
             .await
             .into_result()
             .expect_err("missing recipient rows must not return success");
+
+            match err {
+                asupersync::OutcomeError::Err(DbError::Internal(msg)) => {
+                    assert!(
+                        msg.contains("message recipient rows not visible after commit"),
+                        "unexpected error message: {msg}"
+                    );
+                }
+                other => panic!("expected internal durability error, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn verify_message_recipients_visible_after_commit_rejects_committed_message_without_recipients()
+    {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("message_recipient_probe_missing_rows.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'durability-project', '/tmp/am-recipient-probe-missing', 0)",
+            )
+            .expect("seed project");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed sender");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (2, 1, 'GreenStone', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed recipient");
+        init_conn
+            .execute_raw(
+                "INSERT INTO messages \
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                 VALUES (1, 1, 1, 'THREAD-DURABILITY', 'durability-test', 'body', 'normal', 0, 0, '[]')",
+            )
+            .expect("seed committed message without recipient rows");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let err =
+                verify_message_recipients_visible_after_commit(&cx, &pool, 1, 1, &[(2, "to")])
+                    .await
+                    .into_result()
+                    .expect_err("missing committed recipient rows must fail durability probe");
 
             match err {
                 asupersync::OutcomeError::Err(DbError::Internal(msg)) => {

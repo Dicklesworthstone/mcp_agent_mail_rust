@@ -6366,11 +6366,7 @@ mod tests {
             Line::raw("regular prose line that should wrap"),
         ]);
         let wrapped = wrap_markdown_for_message_panel(&rendered, 12);
-        let plain: Vec<String> = wrapped
-            .lines()
-            .iter()
-            .map(Line::to_plain_text)
-            .collect();
+        let plain: Vec<String> = wrapped.lines().iter().map(Line::to_plain_text).collect();
 
         assert!(
             plain

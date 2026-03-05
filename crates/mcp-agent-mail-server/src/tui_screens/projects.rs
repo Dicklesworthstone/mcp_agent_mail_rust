@@ -661,7 +661,14 @@ impl ProjectsScreen {
             lines.push(("Last Activity".into(), relative, None));
         }
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
     }
 
     #[allow(clippy::cast_possible_truncation)]

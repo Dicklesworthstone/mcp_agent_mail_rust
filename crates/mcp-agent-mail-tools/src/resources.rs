@@ -64,6 +64,10 @@ fn parse_resource_limit(query: &HashMap<String, String>) -> usize {
         })
 }
 
+fn parse_attachment_metadata(input: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str(input).unwrap_or_default()
+}
+
 fn parse_query(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&') {
@@ -131,6 +135,27 @@ fn workspace_root_from(start: &Path) -> Option<PathBuf> {
 
 fn tool_filter_allows(config: &Config, tool_name: &str) -> bool {
     tool_cluster(tool_name).is_none_or(|cluster| config.should_expose_tool(tool_name, cluster))
+}
+
+async fn resolve_resource_agent(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    agent_name: &str,
+) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await {
+        Outcome::Ok(agent) => Ok(agent),
+        Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Agent not found",
+        )),
+        Outcome::Err(err) => Err(McpError::internal_error(err.to_string())),
+        Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+        Outcome::Panicked(p) => Err(McpError::internal_error(format!(
+            "Internal panic: {}",
+            p.message()
+        ))),
+    }
 }
 
 // Float -> int casts saturate, but we treat out-of-range values as invalid timestamps.
@@ -1826,7 +1851,7 @@ pub struct MessageDetails {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     pub from: String,
 }
 
@@ -1879,7 +1904,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         importance: msg.importance,
         ack_required: msg.ack_required != 0,
         created_ts: Some(micros_to_iso(msg.created_ts)),
-        attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+        attachments: parse_attachment_metadata(&msg.attachments),
         from: sender.name,
     };
 
@@ -1900,7 +1925,7 @@ pub struct ThreadMessageEntry {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     pub from: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
@@ -1959,18 +1984,9 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
         .await,
     )?;
 
-    // Build messages list - need to get sender names
+    // Sender names are already materialized by `list_thread_messages`.
     let mut messages: Vec<ThreadMessageEntry> = Vec::with_capacity(rows.len());
     for row in rows {
-        // Get sender name
-        let sender = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, row.sender_id).await,
-        );
-        let from = match sender {
-            Ok(s) => s.name,
-            Err(_) => String::new(),
-        };
-
         messages.push(ThreadMessageEntry {
             id: row.id,
             project_id: row.project_id,
@@ -1980,8 +1996,8 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
             importance: row.importance,
             ack_required: row.ack_required != 0,
             created_ts: Some(micros_to_iso(row.created_ts)),
-            attachments: serde_json::from_str(&row.attachments).unwrap_or_default(),
-            from,
+            attachments: parse_attachment_metadata(&row.attachments),
+            from: row.from,
             body_md: if include_bodies {
                 Some(row.body_md)
             } else {
@@ -2033,7 +2049,7 @@ pub struct InboxResourceMessage {
     pub from: String,
     pub created_ts: Option<String>,
     pub kind: String,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
     pub commit: CommitMetadata,
@@ -2087,17 +2103,10 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 
     let project_id = project.id.unwrap_or(0);
 
-    // Find agent by name in project
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-
-    let agent_row = agents
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
-
-    let agent_id = agent_row.id.unwrap_or(0);
+    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
+        .await?
+        .id
+        .unwrap_or(0);
 
     // Fetch inbox messages
     let inbox_rows = db_outcome_to_mcp_result(
@@ -2149,7 +2158,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 from: row.sender_name.clone(),
                 created_ts: Some(micros_to_iso(msg.created_ts)),
                 kind: row.kind.clone(),
-                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                attachments: parse_attachment_metadata(&msg.attachments),
                 body_md: if include_bodies {
                     Some(msg.body_md.clone())
                 } else {
@@ -2222,7 +2231,7 @@ pub struct MailboxMessageEntrySimple {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     pub from: String,
     pub kind: String,
     pub commit: MailboxCommitMetaSimple,
@@ -2239,7 +2248,7 @@ pub struct MailboxMessageEntryFull {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     pub from: String,
     pub kind: String,
     pub commit: MailboxCommitMetaFull,
@@ -2292,15 +2301,10 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 
     let project_id = project.id.unwrap_or(0);
 
-    // Find agent
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_row = agents
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
-    let agent_id = agent_row.id.unwrap_or(0);
+    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
+        .await?
+        .id
+        .unwrap_or(0);
 
     // Fetch inbox messages
     let inbox_rows = db_outcome_to_mcp_result(
@@ -2330,7 +2334,7 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
                 created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                attachments: parse_attachment_metadata(&msg.attachments),
                 from: row.sender_name.clone(),
                 kind: row.kind.clone(),
                 commit: MailboxCommitMetaSimple {
@@ -2382,15 +2386,10 @@ pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<
 
     let project_id = project.id.unwrap_or(0);
 
-    // Find agent
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_row = agents
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
-    let agent_id = agent_row.id.unwrap_or(0);
+    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
+        .await?
+        .id
+        .unwrap_or(0);
 
     // Fetch inbox messages
     let inbox_rows = db_outcome_to_mcp_result(
@@ -2424,7 +2423,7 @@ pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
                 created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                attachments: parse_attachment_metadata(&msg.attachments),
                 from: row.sender_name.clone(),
                 kind: row.kind.clone(),
                 commit: MailboxCommitMetaFull {
@@ -2465,7 +2464,7 @@ pub struct OutboxMessageEntry {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     pub from: String,
     pub body_md: String,
     pub to: Vec<String>,
@@ -2519,16 +2518,10 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 
     let project_id = project.id.unwrap_or(0);
 
-    // Find agent
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_row = agents
-        .iter()
-        .find(|a| a.name == agent_name)
-        .cloned()
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
-    let agent_id = agent_row.id.unwrap_or(0);
+    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
+        .await?
+        .id
+        .unwrap_or(0);
 
     // Query sent messages (where sender_id = agent_id)
     let conn = match pool.acquire(ctx.cx()).await {
@@ -2636,7 +2629,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
             importance,
             ack_required: ack_required != 0,
             created_ts: Some(micros_to_iso(created_ts)),
-            attachments: serde_json::from_str(&attachments_json).unwrap_or_default(),
+            attachments: parse_attachment_metadata(&attachments_json),
             from: agent_name.clone(),
             body_md,
             to: to_list,
@@ -2683,7 +2676,7 @@ pub struct ViewMessageEntry {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     pub kind: String,
@@ -2729,15 +2722,10 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
 
     let project_id = project.id.unwrap_or(0);
 
-    // Find agent by name
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_row = agents
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
-    let agent_id = agent_row.id.unwrap_or(0);
+    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
+        .await?
+        .id
+        .unwrap_or(0);
 
     // Fetch inbox and filter for urgent unread
     let inbox_rows = db_outcome_to_mcp_result(
@@ -2766,7 +2754,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
                 importance: msg.importance.clone(),
                 ack_required: msg.ack_required != 0,
                 created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                attachments: parse_attachment_metadata(&msg.attachments),
                 from: Some(row.sender_name.clone()),
                 kind: row.kind.clone(),
             }
@@ -2815,15 +2803,10 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
 
     let project_id = project.id.unwrap_or(0);
 
-    // Find agent
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_row = agents
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
-    let agent_id = agent_row.id.unwrap_or(0);
+    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
+        .await?
+        .id
+        .unwrap_or(0);
 
     // Fetch full inbox (no pre-limit) so post-filter for ack_required gets enough rows
     let inbox_rows = db_outcome_to_mcp_result(
@@ -2855,7 +2838,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
                 importance: msg.importance.clone(),
                 ack_required: true,
                 created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                attachments: parse_attachment_metadata(&msg.attachments),
                 from: None, // ack-required view doesn't include from
                 kind: row.kind.clone(),
             }
@@ -2886,7 +2869,7 @@ pub struct StaleAckMessageEntry {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<serde_json::Value>,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<String>,
@@ -2939,15 +2922,10 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
 
     let project_id = project.id.unwrap_or(0);
 
-    // Find agent
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_row = agents
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
-    let agent_id = agent_row.id.unwrap_or(0);
+    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
+        .await?
+        .id
+        .unwrap_or(0);
 
     // Fetch unacked ack-required messages (over-fetch, then filter by age)
     let unacked_rows = db_outcome_to_mcp_result(
@@ -2981,7 +2959,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
                 importance: msg.importance.clone(),
                 ack_required: true,
                 created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                attachments: parse_attachment_metadata(&msg.attachments),
                 kind: row.kind.clone(),
                 read_at: row.read_ts.map(mcp_agent_mail_db::micros_to_iso),
                 age_seconds,
@@ -3041,15 +3019,10 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
 
     let project_id = project.id.unwrap_or(0);
 
-    // Find agent
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_row = agents
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
-    let agent_id = agent_row.id.unwrap_or(0);
+    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
+        .await?
+        .id
+        .unwrap_or(0);
 
     // Compute cutoff: messages older than ttl_minutes are overdue
     let cutoff_minutes = ttl_minutes.max(1);
@@ -3086,7 +3059,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
                 importance: msg.importance.clone(),
                 ack_required: true,
                 created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                attachments: parse_attachment_metadata(&msg.attachments),
                 from: None,
                 kind: row.kind.clone(),
             });
@@ -3824,6 +3797,39 @@ mod resource_shape_tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn create_message_with_attachments(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        sender_id: i64,
+        recipient_id: i64,
+        subject: &str,
+        body_md: &str,
+        thread_id: &str,
+        ack_required: bool,
+        attachments_json: &str,
+    ) -> MessageRow {
+        match queries::create_message_with_recipients(
+            cx,
+            pool,
+            project_id,
+            sender_id,
+            subject,
+            body_md,
+            Some(thread_id),
+            "high",
+            ack_required,
+            attachments_json,
+            &[(recipient_id, "to")],
+        )
+        .await
+        {
+            Outcome::Ok(message) => message,
+            other => panic!("create_message_with_recipients failed: {other:?}"),
+        }
+    }
+
     fn parse_json(payload: &str) -> Value {
         serde_json::from_str(payload).expect("valid JSON")
     }
@@ -4107,6 +4113,514 @@ mod resource_shape_tests {
                     thread_value["messages"][0]["body_md"],
                     "Hello from integration test."
                 );
+            });
+        });
+    }
+
+    #[test]
+    fn tool_identity_success_is_immediately_visible_via_agents_resource() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!("/tmp/resources-tool-identity-{}", unique_suffix());
+
+                crate::ensure_project(&ctx, project_key.clone(), None)
+                    .await
+                    .expect("ensure_project");
+
+                let registered = parse_json(
+                    &crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("BlueLake".to_string()),
+                        Some("resource visibility regression".to_string()),
+                        None,
+                    )
+                    .await
+                    .expect("register_agent"),
+                );
+                let registered_id = registered["id"].as_i64().expect("registered id");
+
+                let created = parse_json(
+                    &crate::create_agent_identity(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("GreenCastle".to_string()),
+                        Some("resource visibility regression".to_string()),
+                        None,
+                    )
+                    .await
+                    .expect("create_agent_identity"),
+                );
+                let created_id = created["id"].as_i64().expect("created id");
+
+                let agents = parse_json(
+                    &agents_list(&ctx, project_key.clone())
+                        .await
+                        .expect("agents list"),
+                );
+                let agent_rows = agents["agents"].as_array().expect("agents array");
+
+                let registered_row = agent_rows
+                    .iter()
+                    .find(|row| row["name"] == "BlueLake")
+                    .expect("registered agent should be visible");
+                assert_eq!(registered_row["id"], registered_id);
+
+                let created_row = agent_rows
+                    .iter()
+                    .find(|row| row["name"] == "GreenCastle")
+                    .expect("created identity should be visible");
+                assert_eq!(created_row["id"], created_id);
+
+                let whois_created = parse_json(
+                    &crate::whois(
+                        &ctx,
+                        project_key,
+                        "GreenCastle".to_string(),
+                        Some(false),
+                        Some(0),
+                    )
+                    .await
+                    .expect("whois"),
+                );
+                assert_eq!(whois_created["id"], created_id);
+                assert_eq!(whois_created["name"], "GreenCastle");
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn tool_send_and_reply_success_are_immediately_visible_via_inbox_reads() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!("/tmp/resources-tool-messaging-{}", unique_suffix());
+
+                crate::ensure_project(&ctx, project_key.clone(), None)
+                    .await
+                    .expect("ensure_project");
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("BlueLake".to_string()),
+                    Some("resource visibility regression".to_string()),
+                    None,
+                )
+                .await
+                .expect("register sender");
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("RedPeak".to_string()),
+                    Some("resource visibility regression".to_string()),
+                    None,
+                )
+                .await
+                .expect("register recipient");
+
+                let thread_id = format!("br-{}", unique_suffix());
+                let sent = parse_json(
+                    &crate::send_message(
+                        &ctx,
+                        project_key.clone(),
+                        "BlueLake".to_string(),
+                        vec!["RedPeak".to_string()],
+                        "Durability Subject".to_string(),
+                        "Durability body".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("high".to_string()),
+                        Some(true),
+                        Some(thread_id),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("send_message"),
+                );
+                let sent_id = sent["deliveries"][0]["payload"]["id"]
+                    .as_i64()
+                    .expect("sent message id");
+
+                let recipient_inbox_tool = parse_json(
+                    &crate::fetch_inbox(
+                        &ctx,
+                        project_key.clone(),
+                        "RedPeak".to_string(),
+                        None,
+                        None,
+                        Some(10),
+                        Some(true),
+                        None,
+                    )
+                    .await
+                    .expect("fetch recipient inbox"),
+                );
+                let recipient_messages = recipient_inbox_tool
+                    .as_array()
+                    .expect("recipient inbox should be an array");
+                let sent_message = recipient_messages
+                    .iter()
+                    .find(|msg| msg["id"] == sent_id)
+                    .expect("sent message should be visible in recipient inbox");
+                assert_eq!(sent_message["subject"], "Durability Subject");
+                assert_eq!(sent_message["body_md"], "Durability body");
+
+                let recipient_inbox_resource = parse_json(
+                    &inbox(
+                        &ctx,
+                        format!("RedPeak?project={project_key}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("recipient inbox resource"),
+                );
+                let recipient_resource_messages = recipient_inbox_resource["messages"]
+                    .as_array()
+                    .expect("recipient resource messages");
+                let recipient_resource_message = recipient_resource_messages
+                    .iter()
+                    .find(|msg| msg["id"] == sent_id)
+                    .expect("sent message should be visible via inbox resource");
+                assert_eq!(recipient_resource_message["subject"], "Durability Subject");
+                assert_eq!(recipient_resource_message["body_md"], "Durability body");
+
+                let reply = parse_json(
+                    &crate::reply_message(
+                        &ctx,
+                        project_key.clone(),
+                        sent_id,
+                        "RedPeak".to_string(),
+                        "Reply body".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("reply_message"),
+                );
+                let reply_id = reply["deliveries"][0]["payload"]["id"]
+                    .as_i64()
+                    .expect("reply message id");
+
+                let sender_inbox_tool = parse_json(
+                    &crate::fetch_inbox(
+                        &ctx,
+                        project_key.clone(),
+                        "BlueLake".to_string(),
+                        None,
+                        None,
+                        Some(10),
+                        Some(true),
+                        None,
+                    )
+                    .await
+                    .expect("fetch sender inbox"),
+                );
+                let sender_messages = sender_inbox_tool
+                    .as_array()
+                    .expect("sender inbox should be an array");
+                let reply_message = sender_messages
+                    .iter()
+                    .find(|msg| msg["id"] == reply_id)
+                    .expect("reply should be visible in sender inbox");
+                assert_eq!(reply_message["subject"], "Re: Durability Subject");
+                assert_eq!(reply_message["body_md"], "Reply body");
+
+                let sender_inbox_resource = parse_json(
+                    &inbox(
+                        &ctx,
+                        format!("BlueLake?project={project_key}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("sender inbox resource"),
+                );
+                let sender_resource_messages = sender_inbox_resource["messages"]
+                    .as_array()
+                    .expect("sender resource messages");
+                let sender_resource_message = sender_resource_messages
+                    .iter()
+                    .find(|msg| msg["id"] == reply_id)
+                    .expect("reply should be visible via inbox resource");
+                assert_eq!(sender_resource_message["subject"], "Re: Durability Subject");
+                assert_eq!(sender_resource_message["body_md"], "Reply body");
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn resources_preserve_attachment_metadata_objects() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-attachments-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                let thread_id = format!("thread-attachments-{}", unique_suffix());
+                let attachments_json = r#"[{"name":"artifact.txt","path":"attachments/artifact.txt","content_type":"text/plain","size":12}]"#;
+                let message = create_message_with_attachments(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    "Attachment Subject",
+                    "Attachment body",
+                    &thread_id,
+                    true,
+                    attachments_json,
+                )
+                .await;
+                let message_id = message.id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = created_ts - ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(120_000_000),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
+                    ],
+                )
+                .expect("age message for overdue/stale views");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.human_key.clone();
+
+                let assert_attachment = |value: &Value| {
+                    assert_eq!(value["attachments"][0]["name"], "artifact.txt");
+                    assert_eq!(value["attachments"][0]["path"], "attachments/artifact.txt");
+                    assert_eq!(value["attachments"][0]["content_type"], "text/plain");
+                    assert_eq!(value["attachments"][0]["size"], 12);
+                };
+
+                let message_details_value = parse_json(
+                    &message_details(&ctx, format!("{message_id}?project={project_ref}"))
+                        .await
+                        .expect("message details"),
+                );
+                assert_attachment(&message_details_value);
+
+                let thread_value = parse_json(
+                    &thread_details(
+                        &ctx,
+                        format!("{thread_id}?project={project_ref}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("thread details"),
+                );
+                assert_eq!(thread_value["messages"][0]["from"], "BlueLake");
+                assert_attachment(&thread_value["messages"][0]);
+
+                let inbox_value = parse_json(
+                    &inbox(
+                        &ctx,
+                        format!("RedPeak?project={project_ref}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("inbox"),
+                );
+                assert_attachment(&inbox_value["messages"][0]);
+
+                let mailbox_value = parse_json(
+                    &mailbox(&ctx, format!("RedPeak?project={project_ref}"))
+                        .await
+                        .expect("mailbox"),
+                );
+                assert_attachment(&mailbox_value["messages"][0]);
+
+                let mailbox_commits_value = parse_json(
+                    &mailbox_with_commits(&ctx, format!("RedPeak?project={project_ref}"))
+                        .await
+                        .expect("mailbox-with-commits"),
+                );
+                assert_attachment(&mailbox_commits_value["messages"][0]);
+
+                let outbox_value = parse_json(
+                    &outbox(
+                        &ctx,
+                        format!("BlueLake?project={project_ref}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("outbox"),
+                );
+                assert_attachment(&outbox_value["messages"][0]);
+
+                let urgent_value = parse_json(
+                    &views_urgent_unread(&ctx, format!("RedPeak?project={project_ref}"))
+                        .await
+                        .expect("urgent-unread"),
+                );
+                assert_attachment(&urgent_value["messages"][0]);
+
+                let ack_required_value = parse_json(
+                    &views_ack_required(&ctx, format!("RedPeak?project={project_ref}"))
+                        .await
+                        .expect("ack-required"),
+                );
+                assert_attachment(&ack_required_value["messages"][0]);
+
+                let stale_value = parse_json(
+                    &views_acks_stale(&ctx, format!("RedPeak?project={project_ref}&ttl_seconds=0"))
+                        .await
+                        .expect("acks-stale"),
+                );
+                assert_attachment(&stale_value["messages"][0]);
+
+                let overdue_value = parse_json(
+                    &views_ack_overdue(
+                        &ctx,
+                        format!("RedPeak?project={project_ref}&ttl_minutes=1"),
+                    )
+                    .await
+                    .expect("ack-overdue"),
+                );
+                assert_attachment(&overdue_value["messages"][0]);
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn agent_named_resources_use_case_insensitive_lookup() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-case-insensitive-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                let message = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    "Case Subject",
+                    "Case body",
+                    &format!("thread-case-{}", unique_suffix()),
+                    true,
+                )
+                .await;
+                let message_id = message.id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = created_ts - ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(120_000_000),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
+                    ],
+                )
+                .expect("age message for overdue/stale views");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.human_key.clone();
+                let sender_lookup = sender.name.to_ascii_lowercase();
+                let recipient_lookup = recipient.name.to_ascii_lowercase();
+
+                let inbox_value = parse_json(
+                    &inbox(
+                        &ctx,
+                        format!("{recipient_lookup}?project={project_ref}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("case-insensitive inbox"),
+                );
+                assert_eq!(inbox_value["count"], 1);
+                assert_eq!(inbox_value["messages"][0]["subject"], "Case Subject");
+                assert_eq!(inbox_value["messages"][0]["body_md"], "Case body");
+
+                let mailbox_value = parse_json(
+                    &mailbox(&ctx, format!("{recipient_lookup}?project={project_ref}"))
+                        .await
+                        .expect("case-insensitive mailbox"),
+                );
+                assert_eq!(mailbox_value["count"], 1);
+
+                let mailbox_commits_value = parse_json(
+                    &mailbox_with_commits(
+                        &ctx,
+                        format!("{recipient_lookup}?project={project_ref}"),
+                    )
+                    .await
+                    .expect("case-insensitive mailbox-with-commits"),
+                );
+                assert_eq!(mailbox_commits_value["count"], 1);
+
+                let outbox_value = parse_json(
+                    &outbox(&ctx, format!("{sender_lookup}?project={project_ref}"))
+                        .await
+                        .expect("case-insensitive outbox"),
+                );
+                assert_eq!(outbox_value["count"], 1);
+                assert_eq!(outbox_value["messages"][0]["subject"], "Case Subject");
+
+                let urgent_value = parse_json(
+                    &views_urgent_unread(&ctx, format!("{recipient_lookup}?project={project_ref}"))
+                        .await
+                        .expect("case-insensitive urgent-unread"),
+                );
+                assert_eq!(urgent_value["count"], 1);
+
+                let ack_required_value = parse_json(
+                    &views_ack_required(&ctx, format!("{recipient_lookup}?project={project_ref}"))
+                        .await
+                        .expect("case-insensitive ack-required"),
+                );
+                assert_eq!(ack_required_value["count"], 1);
+
+                let stale_value = parse_json(
+                    &views_acks_stale(
+                        &ctx,
+                        format!("{recipient_lookup}?project={project_ref}&ttl_seconds=0"),
+                    )
+                    .await
+                    .expect("case-insensitive acks-stale"),
+                );
+                assert_eq!(stale_value["count"], 1);
+
+                let overdue_value = parse_json(
+                    &views_ack_overdue(
+                        &ctx,
+                        format!("{recipient_lookup}?project={project_ref}&ttl_minutes=1"),
+                    )
+                    .await
+                    .expect("case-insensitive ack-overdue"),
+                );
+                assert_eq!(overdue_value["count"], 1);
             });
         });
     }
