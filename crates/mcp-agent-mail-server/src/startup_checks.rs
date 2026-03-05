@@ -290,10 +290,10 @@ fn pid_is_agent_mail(pid: u32) -> bool {
         {
             return true;
         }
-        if let Some(basename) = exe.file_name() {
-            if basename == "am" {
-                return true;
-            }
+        if let Some(basename) = exe.file_name()
+            && basename == "am"
+        {
+            return true;
         }
     }
 

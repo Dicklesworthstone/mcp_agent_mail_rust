@@ -361,7 +361,7 @@ pub async fn file_reservation_paths(
     )?;
 
     let mut paths_to_grant: SmallVec<[&str; 8]> = SmallVec::new();
-    let mut granted_patterns: HashSet<String> = HashSet::new();
+    let mut seen_paths: HashSet<String> = HashSet::new();
 
     let mut pending_conflicts: Vec<PendingReservationConflict> = Vec::new();
 
@@ -404,16 +404,16 @@ pub async fn file_reservation_paths(
         .collect();
 
     for (path, path_pat) in normalized_paths.iter().zip(requested_compiled.iter()) {
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+
         // Check conflicts with existing reservations
         let conflict_refs = index.find_conflicts(path_pat);
 
-        // Deduplicate exact same patterns in the request
-        let exact_duplicate = granted_patterns.contains(path);
-
-        if conflict_refs.is_empty() && !exact_duplicate {
+        if conflict_refs.is_empty() {
             paths_to_grant.push(path);
-            granted_patterns.insert(path.clone());
-        } else if !conflict_refs.is_empty() {
+        } else {
             // Deterministic ordering keeps API output stable across runs
             // even when the index scans hash buckets in different orders.
             let mut holders: Vec<PendingConflictHolder> = conflict_refs
@@ -437,7 +437,6 @@ pub async fn file_reservation_paths(
                 holders,
             });
         }
-        // If self_conflict is true but conflict_refs is empty, we silently skip (deduplication behavior)
     }
 
     // Only resolve agent names if there were actual conflicts.
