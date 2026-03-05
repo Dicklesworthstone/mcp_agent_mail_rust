@@ -145,14 +145,14 @@ impl CliTable {
             .enumerate()
             .map(|(i, h)| {
                 let min = self.min_widths.get(i).copied().unwrap_or(0);
-                h.len().max(min)
+                h.chars().count().max(min)
             })
             .collect();
 
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < ncols {
-                    widths[i] = widths[i].max(cell.len());
+                    widths[i] = widths[i].max(cell.chars().count());
                 }
             }
         }

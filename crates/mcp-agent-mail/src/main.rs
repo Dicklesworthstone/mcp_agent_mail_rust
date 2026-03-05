@@ -10,11 +10,11 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use mcp_agent_mail_core::config::{env_value, ConfigSource, InterfaceMode};
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, env_value};
 use mcp_agent_mail_server::startup_checks::{self, PortStatus};
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Directive;
+use tracing_subscriber::EnvFilter;
 
 /// Runtime interface mode selector for the `mcp-agent-mail` binary.
 ///
@@ -57,10 +57,8 @@ fn invocation_is_am(arg0: Option<&str>) -> bool {
     })
 }
 
-fn interface_mode_env_is_explicit() -> bool {
-    env::var("AM_INTERFACE_MODE")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
+fn should_dispatch_to_cli_surface(invoked_as_am: bool, mode: InterfaceMode) -> bool {
+    invoked_as_am || mode.is_cli()
 }
 
 const fn default_mcp_log_filter() -> &'static str {
@@ -423,19 +421,16 @@ fn main() {
     };
 
     let invoked_as_am = invocation_is_am(env::args().next().as_deref());
-    let explicit_mode_override = interface_mode_env_is_explicit();
+    if should_dispatch_to_cli_surface(invoked_as_am, mode) {
+        // If this process is invoked as `am`, always route to the CLI surface.
+        //
+        // This protects users from environment misconfiguration (for example,
+        // `AM_INTERFACE_MODE=mcp` exported in their shell), and from packaging/path
+        // regressions where `am` points at the `mcp-agent-mail` binary.
+        if invoked_as_am {
+            std::process::exit(mcp_agent_mail_cli::run_with_invocation_name("am"));
+        }
 
-    // If this process is invoked as `am`, prefer the CLI surface by default.
-    //
-    // This guards against packaging/path regressions where `am` points at the
-    // `mcp-agent-mail` binary instead of the dedicated CLI binary.
-    //
-    // Explicit `AM_INTERFACE_MODE=mcp` still wins for advanced users.
-    if invoked_as_am && (!explicit_mode_override || mode.is_cli()) {
-        std::process::exit(mcp_agent_mail_cli::run_with_invocation_name("am"));
-    }
-
-    if mode.is_cli() {
         let Some(cmd) = env::args().nth(1) else {
             render_cli_mode_missing_command();
             std::process::exit(2);
@@ -657,26 +652,11 @@ mod tests {
     }
 
     #[test]
-    fn interface_mode_env_explicit_detection() {
-        // SAFETY: tests in this module are not marked parallel and restore env state.
-        let old = env::var("AM_INTERFACE_MODE").ok();
-
-        env::remove_var("AM_INTERFACE_MODE");
-        assert!(!interface_mode_env_is_explicit());
-
-        env::set_var("AM_INTERFACE_MODE", "");
-        assert!(!interface_mode_env_is_explicit());
-
-        env::set_var("AM_INTERFACE_MODE", "   ");
-        assert!(!interface_mode_env_is_explicit());
-
-        env::set_var("AM_INTERFACE_MODE", "cli");
-        assert!(interface_mode_env_is_explicit());
-
-        match old {
-            Some(value) => env::set_var("AM_INTERFACE_MODE", value),
-            None => env::remove_var("AM_INTERFACE_MODE"),
-        }
+    fn dispatch_to_cli_surface_behavior() {
+        assert!(should_dispatch_to_cli_surface(true, InterfaceMode::Mcp));
+        assert!(should_dispatch_to_cli_surface(true, InterfaceMode::Cli));
+        assert!(should_dispatch_to_cli_surface(false, InterfaceMode::Cli));
+        assert!(!should_dispatch_to_cli_surface(false, InterfaceMode::Mcp));
     }
 
     #[test]

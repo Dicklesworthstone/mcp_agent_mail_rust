@@ -171,10 +171,7 @@ pub async fn acquire_build_slot(
     let project = resolve_project(ctx, &pool, &project_key).await?;
 
     let now = chrono::Utc::now();
-    let ttl = match ttl_seconds {
-        Some(t) => t.clamp(60, 31_536_000),
-        None => 3600, // 1 hour default
-    };
+    let ttl = ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000)); // 1 hour default
     let expires_ts = (now + chrono::Duration::seconds(ttl)).to_rfc3339();
     let branch = compute_branch(&project.human_key);
     let is_exclusive = exclusive.unwrap_or(true);
@@ -229,10 +226,7 @@ pub async fn renew_build_slot(
     let project = resolve_project(ctx, &pool, &project_key).await?;
 
     let now = chrono::Utc::now();
-    let extend = match extend_seconds {
-        Some(t) => t.clamp(60, 31_536_000),
-        None => 1800, // 30 minutes default
-    };
+    let extend = extend_seconds.map_or(1800, |t| t.clamp(60, 31_536_000)); // 30 minutes default
     let new_exp = (now + chrono::Duration::seconds(extend)).to_rfc3339();
 
     let project_root = project_archive_root(config, &project.slug);

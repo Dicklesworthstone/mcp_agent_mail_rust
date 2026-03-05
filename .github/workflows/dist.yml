@@ -83,6 +83,21 @@ jobs:
               *) echo "ERROR: $f has unexpected type '$mime' — refusing to package" >&2; exit 1 ;;
             esac
           done
+          # Surface verification: fail fast if binaries are swapped/mispackaged.
+          staging/am --help > staging/am.help.txt
+          staging/mcp-agent-mail --help > staging/mcp-agent-mail.help.txt
+          grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' staging/am.help.txt || {
+            echo "ERROR: staging/am missing expected CLI command surface" >&2
+            exit 1
+          }
+          grep -qE '^Usage: mcp-agent-mail ' staging/mcp-agent-mail.help.txt || {
+            echo "ERROR: staging/mcp-agent-mail has unexpected usage header" >&2
+            exit 1
+          }
+          grep -qE '(^|[[:space:]])serve([[:space:]]|$)' staging/mcp-agent-mail.help.txt || {
+            echo "ERROR: staging/mcp-agent-mail missing expected server command surface" >&2
+            exit 1
+          }
           tar -cJf "dist/$TARBALL" -C staging mcp-agent-mail am
           cd dist
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
@@ -93,6 +108,17 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $zipName = "mcp-agent-mail-${{ matrix.target }}.zip"
+          $cliHelp = & "target/${{ matrix.target }}/release/am.exe" --help | Out-String
+          if ($cliHelp -notmatch '(^|\s)serve-http(\s|$)') {
+            throw "target/${{ matrix.target }}/release/am.exe missing expected CLI command surface"
+          }
+          $serverHelp = & "target/${{ matrix.target }}/release/mcp-agent-mail.exe" --help | Out-String
+          if ($serverHelp -notmatch 'Usage:\s+mcp-agent-mail') {
+            throw "target/${{ matrix.target }}/release/mcp-agent-mail.exe has unexpected usage header"
+          }
+          if ($serverHelp -notmatch '(^|\s)serve(\s|$)') {
+            throw "target/${{ matrix.target }}/release/mcp-agent-mail.exe missing expected server command surface"
+          }
           Compress-Archive -Path "target/${{ matrix.target }}/release/mcp-agent-mail.exe","target/${{ matrix.target }}/release/am.exe" -DestinationPath "dist/$zipName"
           cd dist
           $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()

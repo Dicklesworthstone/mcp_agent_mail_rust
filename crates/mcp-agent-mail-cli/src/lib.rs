@@ -2138,17 +2138,42 @@ fn handle_default_launch() -> CliResult<()> {
     let is_interactive = crate::output::is_tty() && crate::output::is_stdin_tty();
 
     if !is_interactive {
-        // Non-interactive: emit robot status as JSON so coding agents get useful output
-        return robot::handle_robot(robot::RobotArgs {
-            format: Some(robot::OutputFormat::Json),
-            project: None,
-            agent: None,
-            command: robot::RobotSubcommand::Status,
-        });
+        return run_noninteractive_default_with(robot::handle_robot);
     }
 
     // Interactive: full server launch experience (setup self-heal + port check + serve)
     handle_serve_http(None, None, None, false, false)
+}
+
+fn noninteractive_robot_args(command: robot::RobotSubcommand) -> robot::RobotArgs {
+    robot::RobotArgs {
+        format: Some(robot::OutputFormat::Json),
+        project: None,
+        agent: None,
+        command,
+    }
+}
+
+fn is_project_not_found_error(err: &CliError) -> bool {
+    matches!(
+        err,
+        CliError::InvalidArgument(message) if message.starts_with("project not found:")
+    )
+}
+
+fn run_noninteractive_default_with<F>(mut run_robot: F) -> CliResult<()>
+where
+    F: FnMut(robot::RobotArgs) -> CliResult<()>,
+{
+    // Non-interactive: emit robot status as JSON so coding agents get useful output.
+    // If no project is registered yet for CWD, fall back to cross-project overview.
+    match run_robot(noninteractive_robot_args(robot::RobotSubcommand::Status)) {
+        Ok(()) => Ok(()),
+        Err(err) if is_project_not_found_error(&err) => {
+            run_robot(noninteractive_robot_args(robot::RobotSubcommand::Overview))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
@@ -13770,6 +13795,50 @@ mod tests {
         let directives = noisy_dependency_log_clamp_directives();
         assert!(directives.contains(&"jit_compile=error"));
         assert!(directives.contains(&"execute_statement_dispatch=error"));
+    }
+
+    #[test]
+    fn noninteractive_default_falls_back_to_overview_when_project_missing() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let result = run_noninteractive_default_with(|args| {
+            let command_name = args.command.name().to_string();
+            calls
+                .lock()
+                .expect("calls mutex poisoned")
+                .push(command_name);
+
+            match args.command {
+                robot::RobotSubcommand::Status => Err(CliError::InvalidArgument(
+                    "project not found: /tmp/proj".to_string(),
+                )),
+                robot::RobotSubcommand::Overview => Ok(()),
+                other => panic!("unexpected command in fallback test: {other:?}"),
+            }
+        });
+
+        assert!(result.is_ok(), "fallback should recover missing project");
+        assert_eq!(
+            calls.into_inner().expect("calls mutex poisoned"),
+            vec!["robot status".to_string(), "robot overview".to_string()]
+        );
+    }
+
+    #[test]
+    fn noninteractive_default_returns_non_project_errors_without_fallback() {
+        let calls = std::sync::Mutex::new(0usize);
+        let result = run_noninteractive_default_with(|args| {
+            *calls.lock().expect("calls mutex poisoned") += 1;
+            match args.command {
+                robot::RobotSubcommand::Status => Err(CliError::Other("status failed".to_string())),
+                other => panic!("unexpected command without fallback: {other:?}"),
+            }
+        });
+
+        assert_eq!(*calls.lock().expect("calls mutex poisoned"), 1);
+        match result {
+            Err(CliError::Other(message)) => assert_eq!(message, "status failed"),
+            other => panic!("expected passthrough error, got: {other:?}"),
+        }
     }
 
     #[test]

@@ -3338,6 +3338,12 @@ verify_installation() {
   local issues=0
   verbose "verify_installation:start dest=${DEST} shell=${SHELL:-unknown}"
 
+  # Surface guard helpers: ensure CLI/server binaries were not swapped.
+  local cli_help=""
+  local server_help=""
+  local cli_surface_ok=0
+  local server_surface_ok=0
+
   # 1. Check binaries exist and are executable
   if [ ! -x "$DEST/$BIN_SERVER" ]; then
     warn "VERIFY: $DEST/$BIN_SERVER is missing or not executable"
@@ -3358,7 +3364,28 @@ verify_installation() {
     ok "VERIFY: $version_out"
   fi
 
-  # 3. Check that 'am' resolves to the Rust binary in a login shell
+  # 3. Check binary command surfaces (prevents swapped/mispackaged installs)
+  cli_help=$("$DEST/$BIN_CLI" --help 2>&1 || true)
+  if printf "%s\n" "$cli_help" | grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)'; then
+    cli_surface_ok=1
+    ok "VERIFY: '$BIN_CLI' exposes CLI command surface"
+  else
+    warn "VERIFY: '$BIN_CLI --help' missing expected CLI command 'serve-http'"
+    issues=$((issues + 1))
+  fi
+
+  server_help=$("$DEST/$BIN_SERVER" --help 2>&1 || true)
+  if printf "%s\n" "$server_help" | grep -qE '^Usage: mcp-agent-mail ' && \
+     printf "%s\n" "$server_help" | grep -qE '(^|[[:space:]])serve([[:space:]]|$)'; then
+    server_surface_ok=1
+    ok "VERIFY: '$BIN_SERVER' exposes server command surface"
+  else
+    warn "VERIFY: '$BIN_SERVER --help' missing expected server command surface"
+    issues=$((issues + 1))
+  fi
+  verbose "verify_installation:surface_guard cli_ok=${cli_surface_ok} server_ok=${server_surface_ok}"
+
+  # 4. Check that 'am' resolves to the Rust binary in a login shell
   local shell_name
   shell_name=$(basename "${SHELL:-/bin/sh}")
   local resolved_path
@@ -3412,7 +3439,7 @@ verify_installation() {
     ok "VERIFY: 'am' resolves to $DEST/$BIN_CLI"
   fi
 
-  # 4. If Python was displaced, verify the alias is gone
+  # 5. If Python was displaced, verify the alias is gone
   if [ "$PYTHON_DETECTED" -eq 1 ] && [ "${MIGRATE_PYTHON:-0}" -eq 1 ]; then
     if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && [ -n "$PYTHON_ALIAS_FILE" ]; then
       if grep -qE "^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\\(\\))" "$PYTHON_ALIAS_FILE" 2>/dev/null; then
@@ -3424,7 +3451,7 @@ verify_installation() {
     fi
   fi
 
-  # 5. Summary
+  # 6. Summary
   if [ "$issues" -gt 0 ]; then
     warn "Verification found $issues issue(s). See warnings above."
   else

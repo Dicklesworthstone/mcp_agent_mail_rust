@@ -697,7 +697,12 @@ fn normalize_send_message_cc_bcc_argument(
 /// - enforces broadcast+explicit-to mutual exclusivity message parity
 pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> {
     let Some(args) = arguments.as_object_mut() else {
-        return Ok(());
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Tool arguments must be a JSON object".to_string(),
+            true,
+            json!({}),
+        ));
     };
 
     if args
@@ -1392,6 +1397,14 @@ effective_free_bytes={free}"
             let mut total_size = subject.len().saturating_add(final_body.len());
             for meta in &all_attachment_meta {
                 let att_type = meta.get("type").and_then(serde_json::Value::as_str);
+                
+                // If this is an inline image originating from markdown, we stripped its `data_base64` 
+                // in `process_markdown_images` because it's already embedded in `final_body`.
+                // Don't double-count its size here!
+                if att_type == Some("inline") && meta.get("data_base64").is_none() {
+                    continue;
+                }
+
                 if (att_type == Some("file") || att_type == Some("inline"))
                     && let Some(bytes) = meta.get("bytes").and_then(serde_json::Value::as_u64)
                 {

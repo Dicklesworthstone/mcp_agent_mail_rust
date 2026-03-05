@@ -185,6 +185,20 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
             complexity: "medium",
         },
     ),
+    (
+        "resolve_pane_identity",
+        ToolMeta {
+            capabilities: &["identity"],
+            complexity: "low",
+        },
+    ),
+    (
+        "cleanup_pane_identities",
+        ToolMeta {
+            capabilities: &["identity"],
+            complexity: "low",
+        },
+    ),
     // Messaging
     (
         "send_message",
