@@ -3884,45 +3884,67 @@ const fn digit_count(mut n: u64) -> usize {
 /// Colorize a single JSON line: keys in `key_color`, numbers in `num_color`.
 #[allow(dead_code)]
 fn colorize_json_line(line: &str, key_color: &str, num_color: &str, ansi_off: &str) -> String {
-    let trimmed = line.trim_start();
-    let indent = &line[..line.len() - trimmed.len()];
-    let mut out = String::from(indent);
-
-    let mut tail = trimmed;
-    // Try to match "key": value pattern
-    if let Some(colon_pos) = tail.find(':') {
-        let before_colon = &tail[..colon_pos];
-        if before_colon.contains('"') {
-            // It's a key
-            out.push_str(key_color);
-            out.push_str(before_colon);
-            out.push_str(ansi_off);
-            out.push(':');
-            tail = &tail[colon_pos + 1..];
-
-            // Check if value is numeric
-            let val = tail.trim().trim_end_matches(',');
-            if val.parse::<u64>().is_ok() || val.parse::<i64>().is_ok() {
-                let before_val = &tail[..tail.len() - tail.trim_start().len()];
-                let trimmed_tail = tail.trim_start();
-                out.push_str(before_val);
-                let has_comma = trimmed_tail.ends_with(',');
-                let num_part = trimmed_tail.trim_end_matches(',');
-                out.push_str(num_color);
-                out.push_str(num_part);
-                out.push_str(ansi_off);
-                if has_comma {
-                    out.push(',');
+    let mut out = String::with_capacity(line.len() + 40);
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut s = String::with_capacity(32);
+            let mut escaped = false;
+            for inner in chars.by_ref() {
+                if escaped {
+                    s.push(inner);
+                    escaped = false;
+                } else if inner == '\\' {
+                    s.push(inner);
+                    escaped = true;
+                } else if inner == '"' {
+                    break;
+                } else {
+                    s.push(inner);
                 }
-            } else {
-                out.push_str(tail);
             }
-            return out;
+            // If the next char after skipping spaces is a colon, it's a key
+            let mut is_key = false;
+            let mut peek_chars = chars.clone();
+            while let Some(&next_c) = peek_chars.peek() {
+                if next_c == ':' {
+                    is_key = true;
+                    break;
+                } else if next_c.is_whitespace() {
+                    peek_chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            if is_key {
+                out.push_str(key_color);
+            }
+            out.push('"');
+            out.push_str(&s);
+            out.push('"');
+            if is_key {
+                out.push_str(ansi_off);
+            }
+        } else if c.is_ascii_digit() || c == '-' {
+            let mut num = String::with_capacity(16);
+            num.push(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_digit() || next == '.' {
+                    if let Some(ch) = chars.next() {
+                        num.push(ch);
+                    }
+                } else {
+                    break;
+                }
+            }
+            out.push_str(num_color);
+            out.push_str(&num);
+            out.push_str(ansi_off);
+        } else {
+            out.push(c);
         }
     }
-
-    // Not a key-value line — just return as-is (braces, etc.)
-    out.push_str(tail);
     out
 }
 

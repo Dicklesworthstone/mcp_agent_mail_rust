@@ -17233,7 +17233,7 @@ mod tests {
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
             &[
                 Value::BigInt(1),
-                Value::Text("proj-alpha".to_string()),
+                Value::Text(mcp_agent_mail_core::compute_project_slug(&proj_alpha_key)),
                 Value::Text(proj_alpha_key.clone()),
                 Value::BigInt(created_at_us),
             ],
@@ -17243,7 +17243,7 @@ mod tests {
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
             &[
                 Value::BigInt(2),
-                Value::Text("proj-beta".to_string()),
+                Value::Text(mcp_agent_mail_core::compute_project_slug(&proj_beta_key)),
                 Value::Text(proj_beta_key.clone()),
                 Value::BigInt(created_at_us),
             ],
@@ -17481,6 +17481,8 @@ mod tests {
 
         // Normalize created_at for stable snapshots.
         // Drop pool before opening a standalone connection on the same file.
+        // Ensure background writes finish before dropping the pool
+        pool.wal_checkpoint().unwrap();
         drop(pool);
         {
             let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();

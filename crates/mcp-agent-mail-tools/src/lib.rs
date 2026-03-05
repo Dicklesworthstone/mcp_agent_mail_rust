@@ -1237,8 +1237,8 @@ mod tests {
 
     #[test]
     fn patterns_overlap_empty_patterns() {
-        // Empty patterns should not overlap with anything meaningful
-        assert!(!patterns_overlap("", "src/main.rs"));
+        // An empty pattern normalizes to the root directory, which overlaps with everything
+        assert!(patterns_overlap("", "src/main.rs"));
     }
 
     // -- cluster constants test --

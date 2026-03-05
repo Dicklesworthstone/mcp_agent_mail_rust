@@ -1967,7 +1967,10 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
     }
     
     // Write atomically to prevent partial writes/corruption
-    let tmp_path = path.with_extension("tmp");
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let pid = std::process::id();
+    let tmp_path = parent.join(format!(".{file_name}.{pid}.tmp"));
     fs::write(&tmp_path, out)?;
     fs::rename(&tmp_path, path)
 }

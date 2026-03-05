@@ -921,8 +921,15 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
         std::fs::copy(&action.file_path, &backup)?;
     }
 
-    // Atomic write: write to temp, then rename
-    let temp = action.file_path.with_extension("tmp");
+    // Atomic write: write to unique temp file in same directory, then rename
+    let ts = chrono::Utc::now().timestamp_micros();
+    let pid = std::process::id();
+    let file_name = action
+        .file_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let temp = parent.join(format!(".{file_name}.{pid}.{ts}.tmp"));
     std::fs::write(&temp, &new_content)?;
 
     #[cfg(unix)]

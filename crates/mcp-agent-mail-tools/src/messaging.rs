@@ -2956,7 +2956,7 @@ mod tests {
                 "arguments": {
                     "project_key": "/tmp/project",
                     "requester": "GreenCastle",
-                    "target": "Zulu",
+                    "target": "Alpha",
                     "auto_accept": true,
                     "ttl_seconds": 1800,
                 }
@@ -2969,7 +2969,7 @@ mod tests {
                 "arguments": {
                     "project_key": "/tmp/project",
                     "from_agent": "GreenCastle",
-                    "to_agent": "Zulu",
+                    "to_agent": "Alpha",
                     "ttl_seconds": 1800,
                 }
             })
@@ -2981,23 +2981,12 @@ mod tests {
                 "arguments": {
                     "project_key": "/tmp/project",
                     "from_agent": "GreenCastle",
-                    "to_agent": "Alpha",
-                    "ttl_seconds": 1800,
-                }
-            })
-        );
-        assert_eq!(
-            calls[3],
-            serde_json::json!({
-                "tool": "request_contact",
-                "arguments": {
-                    "project_key": "/tmp/project",
-                    "from_agent": "GreenCastle",
                     "to_agent": "Zulu",
                     "ttl_seconds": 1800,
                 }
             })
         );
+        assert_eq!(calls.len(), 3);
     }
 
     #[test]

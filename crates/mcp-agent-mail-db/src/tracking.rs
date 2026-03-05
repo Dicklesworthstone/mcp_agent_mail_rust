@@ -431,7 +431,9 @@ impl QueryTracker {
             let name = extract_table(sql);
             let mut aux = self.aux.lock();
             if let Some(ref table_str) = name {
-                *aux.unknown_tables.entry(table_str.clone()).or_insert(0) += 1;
+                if aux.unknown_tables.len() < 100 || aux.unknown_tables.contains_key(table_str) {
+                    *aux.unknown_tables.entry(table_str.clone()).or_insert(0) += 1;
+                }
             }
             if is_slow {
                 if aux.slow_queries.len() >= SLOW_QUERY_LIMIT {

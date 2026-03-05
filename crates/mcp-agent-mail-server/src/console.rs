@@ -1274,11 +1274,19 @@ fn colorize_json_line(line: &str) -> String {
         if c == '"' {
             // Read until closing quote
             let mut s = String::with_capacity(32);
+            let mut escaped = false;
             for inner in chars.by_ref() {
-                if inner == '"' {
+                if escaped {
+                    s.push(inner);
+                    escaped = false;
+                } else if inner == '\\' {
+                    s.push(inner);
+                    escaped = true;
+                } else if inner == '"' {
                     break;
+                } else {
+                    s.push(inner);
                 }
-                s.push(inner);
             }
             // Check if followed by ':'  -> key, else -> string value
             let is_key = chars.peek() == Some(&':');
