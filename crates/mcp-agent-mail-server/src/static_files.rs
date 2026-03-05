@@ -51,14 +51,14 @@ impl WebRoot {
     }
 
     fn read_file(path: &Path) -> Option<(&'static str, Vec<u8>)> {
+        use std::io::Read;
         let content_type = mime_type_for_path(path);
         
-        let max_bytes = 100 * 1024 * 1024; // 100 MB limit
+        let max_bytes: u64 = 100 * 1024 * 1024; // 100 MB limit
         let mut file = std::fs::File::open(path).ok()?;
         let mut body = Vec::new();
-        use std::io::Read;
         file.by_ref().take(max_bytes + 1).read_to_end(&mut body).ok()?;
-        if body.len() > max_bytes as usize {
+        if body.len() > usize::try_from(max_bytes).unwrap_or(usize::MAX) {
             return None;
         }
         

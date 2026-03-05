@@ -29,6 +29,11 @@ impl PatternCache {
 
     fn get_or_insert(&mut self, raw: &str) -> Arc<CompiledPattern> {
         if let Some(compiled) = self.entries.get(raw) {
+            if let Some(pos) = self.order.iter().position(|x| x == raw)
+                && let Some(key) = self.order.remove(pos)
+            {
+                self.order.push_back(key);
+            }
             return Arc::clone(compiled);
         }
 
@@ -129,6 +134,15 @@ impl CompiledPattern {
     #[must_use]
     pub const fn is_glob(&self) -> bool {
         self.is_glob
+    }
+
+    /// Returns `true` when this pattern can participate in literal/glob matching.
+    ///
+    /// Exact paths are always matchable. Glob patterns are only matchable when
+    /// the glob compiled successfully.
+    #[must_use]
+    pub const fn is_matchable(&self) -> bool {
+        !self.is_glob || self.matcher.is_some()
     }
 
     /// Returns the first literal segment if it doesn't contain glob chars.

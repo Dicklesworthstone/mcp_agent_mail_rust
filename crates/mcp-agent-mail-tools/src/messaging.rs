@@ -335,6 +335,30 @@ fn contact_policy_decision(
     ContactPolicyDecision::RequireApproval
 }
 
+fn reservations_prove_shared_scope_for_contact(
+    sender_patterns: &[CompiledPattern],
+    recipient_patterns: &[CompiledPattern],
+) -> bool {
+    sender_patterns.iter().any(|sender_pattern| {
+        recipient_patterns.iter().any(|recipient_pattern| {
+            if sender_pattern.normalized() == recipient_pattern.normalized() {
+                return sender_pattern.is_matchable() && recipient_pattern.is_matchable();
+            }
+
+            // `CompiledPattern::overlaps` is intentionally conservative for
+            // reservation conflict detection; two unrelated globs can return
+            // true when the matcher cannot prove disjointness. Contact
+            // enforcement must fail closed, so only exact/glob or exact/exact
+            // overlaps are trusted here.
+            if sender_pattern.is_glob() && recipient_pattern.is_glob() {
+                return false;
+            }
+
+            sender_pattern.overlaps(recipient_pattern)
+        })
+    })
+}
+
 async fn resolve_or_register_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -564,6 +588,25 @@ fn validate_reply_body_limit(config: &Config, body_md: &str) -> McpResult<()> {
         ));
     }
     Ok(())
+}
+
+fn normalized_topic_argument(topic: Option<&str>) -> Option<&str> {
+    topic.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn reject_unsupported_topic_argument(topic: Option<&str>, tool_name: &str) -> McpResult<()> {
+    let Some(topic_value) = normalized_topic_argument(topic) else {
+        return Ok(());
+    };
+    Err(legacy_tool_error(
+        "INVALID_ARGUMENT",
+        format!("{tool_name} does not support the 'topic' argument yet. Omit 'topic' and retry."),
+        true,
+        json!({
+            "argument": "topic",
+            "value": topic_value,
+        }),
+    ))
 }
 
 const fn has_any_recipients(to: &[String], cc: &[String], bcc: &[String]) -> bool {
@@ -904,6 +947,7 @@ pub struct ReplyMessageResponse {
 /// - `importance`: Message importance: low, normal, high, urgent (default: normal)
 /// - `ack_required`: Request acknowledgement (default: false)
 /// - `thread_id`: Associate with existing thread (optional)
+/// - `topic`: Reserved for future topic tags; non-blank values are currently rejected
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
 #[allow(
     clippy::too_many_arguments,
@@ -911,7 +955,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    If true and `to` is empty, expand recipients to all registered agents in the\n    project (excluding the sender). Mutually exclusive with explicit `to` recipients.\n    Respects contact_policy settings \u{2014} agents with block_all are skipped.\ntopic : Optional[str]\n    Optional topic tag (alphanumeric + hyphens, max 64 chars). Stored on the message\n    for topic-based filtering via fetch_inbox(topic=...) or fetch_topic().\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```"
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    If true and `to` is empty, expand recipients to all registered agents in the\n    project (excluding the sender). Mutually exclusive with explicit `to` recipients.\n    Respects contact_policy settings \u{2014} agents with block_all are skipped.\ntopic : Optional[str]\n    Reserved for future topic tags. Non-blank values are currently rejected until\n    topic persistence and filtering are implemented.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```"
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -965,11 +1009,7 @@ pub async fn send_message(
     let thread_id = thread_id
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    if let Some(topic_value) = topic.as_deref() {
-        tracing::warn!(
-            "send_message received topic='{topic_value}', but topic persistence/filtering is not implemented yet; argument is ignored"
-        );
-    }
+    reject_unsupported_topic_argument(topic.as_deref(), "send_message")?;
 
     // Validate thread_id format if provided
     if let Some(ref tid) = thread_id
@@ -1397,8 +1437,8 @@ effective_free_bytes={free}"
             let mut total_size = subject.len().saturating_add(final_body.len());
             for meta in &all_attachment_meta {
                 let att_type = meta.get("type").and_then(serde_json::Value::as_str);
-                
-                // If this is an inline image originating from markdown, we stripped its `data_base64` 
+
+                // If this is an inline image originating from markdown, we stripped its `data_base64`
                 // in `process_markdown_images` because it's already embedded in `final_body`.
                 // Don't double-count its size here!
                 if att_type == Some("inline") && meta.get("data_base64").is_none() {
@@ -1528,13 +1568,9 @@ effective_free_bytes={free}"
             for agent in recipient_map.values() {
                 if let Some(rec_id) = agent.id
                     && let Some(rec_patterns) = patterns_by_agent.get(&rec_id)
+                    && reservations_prove_shared_scope_for_contact(sender_patterns, rec_patterns)
                 {
-                    let overlaps = sender_patterns
-                        .iter()
-                        .any(|a| rec_patterns.iter().any(|b| a.overlaps(b)));
-                    if overlaps {
-                        auto_ok_names.insert(agent.name.clone());
-                    }
+                    auto_ok_names.insert(agent.name.clone());
                 }
             }
         }
@@ -2286,13 +2322,9 @@ effective_free_bytes={free}"
             for agent in recipient_map.values() {
                 if let Some(rec_id) = agent.id
                     && let Some(rec_patterns) = patterns_by_agent.get(&rec_id)
+                    && reservations_prove_shared_scope_for_contact(sender_patterns, rec_patterns)
                 {
-                    let overlaps = sender_patterns
-                        .iter()
-                        .any(|a| rec_patterns.iter().any(|b| a.overlaps(b)));
-                    if overlaps {
-                        auto_ok_names.insert(agent.name.clone());
-                    }
+                    auto_ok_names.insert(agent.name.clone());
                 }
             }
         }
@@ -2594,9 +2626,10 @@ effective_free_bytes={free}"
 /// - `since_ts`: Only messages after this timestamp
 /// - `limit`: Max messages to return (default: 20)
 /// - `include_bodies`: Include full message bodies (default: false)
+/// - `topic`: Reserved for future topic filtering; non-blank values are currently rejected
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
-    description = "Retrieve recent messages for an agent without mutating read/ack state.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: filter to messages with this topic tag\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```"
+    description = "Retrieve recent messages for an agent without mutating read/ack state.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```"
 )]
 pub async fn fetch_inbox(
     ctx: &McpContext,
@@ -2634,11 +2667,7 @@ pub async fn fetch_inbox(
     })?;
     let include_body = include_bodies.unwrap_or(false);
     let urgent = urgent_only.unwrap_or(false);
-    if let Some(topic_value) = topic.as_deref() {
-        tracing::warn!(
-            "fetch_inbox received topic='{topic_value}', but topic persistence/filtering is not implemented yet; argument is ignored"
-        );
-    }
+    reject_unsupported_topic_argument(topic.as_deref(), "fetch_inbox")?;
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -3134,6 +3163,46 @@ mod tests {
     }
 
     #[test]
+    fn reservations_prove_shared_scope_for_contact_rejects_ambiguous_glob_pairs() {
+        let sender_patterns = [CompiledPattern::new("src/*.rs")];
+        let recipient_patterns = [CompiledPattern::new("src/*.txt")];
+        assert!(!reservations_prove_shared_scope_for_contact(
+            &sender_patterns,
+            &recipient_patterns
+        ));
+    }
+
+    #[test]
+    fn reservations_prove_shared_scope_for_contact_allows_equal_globs() {
+        let sender_patterns = [CompiledPattern::new("src/**")];
+        let recipient_patterns = [CompiledPattern::new("src/**")];
+        assert!(reservations_prove_shared_scope_for_contact(
+            &sender_patterns,
+            &recipient_patterns
+        ));
+    }
+
+    #[test]
+    fn reservations_prove_shared_scope_for_contact_rejects_equal_invalid_globs() {
+        let sender_patterns = [CompiledPattern::new("[abc")];
+        let recipient_patterns = [CompiledPattern::new(" [abc ")];
+        assert!(!reservations_prove_shared_scope_for_contact(
+            &sender_patterns,
+            &recipient_patterns
+        ));
+    }
+
+    #[test]
+    fn reservations_prove_shared_scope_for_contact_allows_exact_directory_and_glob() {
+        let sender_patterns = [CompiledPattern::new("src")];
+        let recipient_patterns = [CompiledPattern::new("src/**/*.rs")];
+        assert!(reservations_prove_shared_scope_for_contact(
+            &sender_patterns,
+            &recipient_patterns
+        ));
+    }
+
+    #[test]
     fn normalize_send_message_arguments_converts_single_string_recipient_forms() {
         let mut args = json!({
             "to": "BlueLake",
@@ -3265,6 +3334,41 @@ mod tests {
         let data = err.data.expect("error payload");
         assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
         assert_eq!(data["error"]["data"]["argument"], "bcc");
+    }
+
+    #[test]
+    fn normalized_topic_argument_treats_blank_as_absent() {
+        assert_eq!(normalized_topic_argument(Some("   ")), None);
+        assert_eq!(normalized_topic_argument(None), None);
+    }
+
+    #[test]
+    fn normalized_topic_argument_trims_non_blank_topic() {
+        assert_eq!(
+            normalized_topic_argument(Some("  build-updates  ")),
+            Some("build-updates")
+        );
+    }
+
+    #[test]
+    fn reject_unsupported_topic_argument_allows_blank_topic() {
+        reject_unsupported_topic_argument(Some("   "), "send_message")
+            .expect("blank topic should behave like an omitted topic");
+    }
+
+    #[test]
+    fn reject_unsupported_topic_argument_rejects_non_blank_topic() {
+        let err = reject_unsupported_topic_argument(Some("build-updates"), "fetch_inbox")
+            .expect_err("non-blank topic should be rejected until implemented");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "fetch_inbox does not support the 'topic' argument yet. Omit 'topic' and retry."
+        );
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["argument"], "topic");
+        assert_eq!(data["error"]["data"]["value"], "build-updates");
     }
 
     // -----------------------------------------------------------------------

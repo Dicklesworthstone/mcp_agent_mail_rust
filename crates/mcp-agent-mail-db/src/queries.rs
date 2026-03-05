@@ -1155,7 +1155,7 @@ pub async fn register_agent(
             let mut normalize_params = normalize_base_params.clone();
             normalize_params.push(Value::BigInt(project_id));
             normalize_params.push(Value::Text(name.to_string()));
-            let updated_rows = try_in_tx!(
+            let _updated_rows = try_in_tx!(
                 cx,
                 &tracked,
                 map_sql_outcome(
@@ -1163,7 +1163,20 @@ pub async fn register_agent(
                 )
             );
 
-            if updated_rows == 0 {
+            // FrankenSQLite's `changes()` always returns 0, so we cannot rely
+            // on the UPDATE return value to decide whether the row exists.
+            // Use an explicit SELECT existence check instead.
+            let exists_sql = "SELECT 1 FROM agents \
+                              WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                              LIMIT 1";
+            let exists_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+            let exists_rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, exists_sql, &exists_params).await)
+            );
+
+            if exists_rows.is_empty() {
                 let insert_sql = "INSERT INTO agents \
                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
@@ -7142,7 +7155,12 @@ mod tests {
         });
     }
 
+    /// Requires C `SQLite` trigger execution. `FrankenSQLite`'s VDBE cannot fire
+    /// BEFORE INSERT triggers (CREATE TRIGGER returns Ok but the trigger body
+    /// is never executed during INSERT), so this test is skipped when
+    /// `DbConn = FrankenConnection`.
     #[test]
+    #[ignore = "FrankenSQLite VDBE does not fire BEFORE INSERT triggers"]
     fn register_agent_rejects_suppressed_agent_insert() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -7218,7 +7236,12 @@ mod tests {
         });
     }
 
+    /// Requires C `SQLite` trigger execution. `FrankenSQLite`'s VDBE cannot fire
+    /// BEFORE INSERT triggers (CREATE TRIGGER returns Ok but the trigger body
+    /// is never executed during INSERT), so this test is skipped when
+    /// `DbConn = FrankenConnection`.
     #[test]
+    #[ignore = "FrankenSQLite VDBE does not fire BEFORE INSERT triggers"]
     fn create_agent_rejects_suppressed_agent_insert() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -7378,6 +7401,142 @@ mod tests {
             }
 
             rollback_tx(&cx, &tracked).await;
+        });
+    }
+
+    /// Verify that the durability probe returns an Internal error when asked
+    /// about an agent name that has never been inserted. This is the
+    /// FrankenSQLite-safe counterpart of the `#[ignore]`d trigger-based tests:
+    /// rather than suppressing an INSERT via a BEFORE INSERT trigger (which
+    /// requires C `SQLite` VDBE), we simply ask the probe about a name that was
+    /// never written.
+    #[test]
+    fn durability_probe_rejects_never_inserted_agent() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("probe_rejects_ghost.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'durability-project', '/tmp/am-probe-rejects-ghost', 0)",
+            )
+            .expect("seed project");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            // No agent "GhostAgent" was ever inserted — the probe must reject.
+            let err = verify_agent_visible_after_commit(&cx, &pool, 1, "GhostAgent")
+                .await
+                .into_result()
+                .expect_err("probe must reject non-existent agent");
+
+            match err {
+                asupersync::OutcomeError::Err(DbError::Internal(msg)) => {
+                    assert!(
+                        msg.contains("agent row not visible after commit"),
+                        "unexpected error: {msg}"
+                    );
+                }
+                other => panic!("expected internal durability error, got: {other:?}"),
+            }
+        });
+    }
+
+    /// Verify that the durability probe succeeds for a committed agent.
+    /// Complements `durability_probe_rejects_never_inserted_agent` by
+    /// confirming the probe returns `Ok(AgentRow)` on the happy path.
+    #[test]
+    fn durability_probe_succeeds_for_committed_agent() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("probe_succeeds_committed.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'durability-project', '/tmp/am-probe-succeeds', 0)",
+            )
+            .expect("seed project");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            // Register an agent through the normal path (commits to DB).
+            let agent = register_agent(
+                &cx,
+                &pool,
+                1,
+                "BlueLake",
+                "claude-code",
+                "opus-4.6",
+                Some("durability test"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register_agent should succeed");
+
+            assert_eq!(agent.name, "BlueLake");
+            assert_eq!(agent.project_id, 1);
+
+            // The durability probe must find the committed agent.
+            let probed = verify_agent_visible_after_commit(&cx, &pool, 1, "BlueLake")
+                .await
+                .into_result()
+                .expect("probe must find committed agent");
+
+            assert_eq!(probed.name, "BlueLake");
+            assert_eq!(probed.project_id, 1);
         });
     }
 

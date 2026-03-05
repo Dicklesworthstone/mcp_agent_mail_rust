@@ -520,6 +520,8 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
                 let r = if disk_pressure
                     >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64()
                 {
+                    tracing::warn!("[wbq-drain] disk pressure critical, skipping write-behind op (shutdown drain)");
+                    metrics.storage.wbq_errors_total.inc();
                     Ok(())
                 } else {
                     wbq_execute_op(&envelope.op)

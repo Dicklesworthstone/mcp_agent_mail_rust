@@ -2183,6 +2183,7 @@ dependencies = [
  "fsqlite-vdbe",
  "fsqlite-vfs",
  "fsqlite-wal",
+ "hashbrown 0.14.5",
  "serde",
  "serde_json",
  "tracing",
@@ -2304,6 +2305,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-types",
  "fsqlite-vfs",
+ "hashbrown 0.14.5",
  "parking_lot",
  "xxhash-rust",
 ]
@@ -2359,6 +2361,7 @@ dependencies = [
  "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-wal",
+ "hashbrown 0.14.5",
  "smallvec",
  "tempfile",
  "tracing",
@@ -2482,6 +2485,7 @@ dependencies = [
  "ftui-core",
  "rustc-hash",
  "serde",
+ "smallvec",
 ]
 
 [[package]]
@@ -2503,6 +2507,7 @@ dependencies = [
 name = "ftui-runtime"
 version = "0.2.1"
 dependencies = [
+ "arc-swap",
  "ftui-backend",
  "ftui-core",
  "ftui-i18n",
@@ -2565,6 +2570,7 @@ dependencies = [
  "ftui-core",
  "ftui-layout",
  "ftui-render",
+ "ftui-runtime",
  "ftui-style",
  "ftui-text",
  "regex",

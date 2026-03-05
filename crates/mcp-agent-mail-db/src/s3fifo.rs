@@ -23,7 +23,7 @@ use std::hash::Hash;
 enum Node<V> {
     Small { value: V, freq: u8 },
     Main { value: V, freq: u8 },
-    Ghost,
+    Ghost { ghost_gen: u64 },
 }
 
 /// S3-FIFO cache with O(1) amortized insert, get, and eviction.
@@ -45,11 +45,12 @@ enum Node<V> {
 pub struct S3FifoCache<K, V> {
     small: VecDeque<K>,
     main: VecDeque<K>,
-    ghost: VecDeque<K>,
+    ghost: VecDeque<(K, u64)>,
     index: HashMap<K, Node<V>>,
     small_capacity: usize,
     main_capacity: usize,
     ghost_capacity: usize,
+    ghost_gen: u64,
 }
 
 impl<K, V> S3FifoCache<K, V>
@@ -78,6 +79,7 @@ where
             small_capacity: small_cap,
             main_capacity: main_cap,
             ghost_capacity: capacity,
+            ghost_gen: 0,
         }
     }
 
@@ -143,7 +145,7 @@ where
                     *freq = (*freq + 1).min(3);
                     return;
                 }
-                Node::Ghost => true,
+                Node::Ghost { .. } => true,
             }
         } else {
             false
@@ -206,8 +208,8 @@ where
                 }
                 Some(value)
             }
-            Some(Node::Ghost) => {
-                if let Some(pos) = self.ghost.iter().position(|k| k.borrow() == key) {
+            Some(Node::Ghost { .. }) => {
+                if let Some(pos) = self.ghost.iter().position(|(k, _)| k.borrow() == key) {
                     self.ghost.remove(pos);
                 }
                 None
@@ -232,8 +234,9 @@ where
             if freq >= 1 {
                 if self.main_capacity == 0 {
                     self.evict_ghost_if_full();
-                    self.ghost.push_back(key.clone());
-                    self.index.insert(key, Node::Ghost);
+                    self.ghost_gen += 1;
+                    self.ghost.push_back((key.clone(), self.ghost_gen));
+                    self.index.insert(key, Node::Ghost { ghost_gen: self.ghost_gen });
                 } else {
                     self.evict_main_if_full();
                     self.main.push_back(key.clone());
@@ -241,8 +244,9 @@ where
                 }
             } else {
                 self.evict_ghost_if_full();
-                self.ghost.push_back(key.clone());
-                self.index.insert(key, Node::Ghost);
+                self.ghost_gen += 1;
+                self.ghost.push_back((key.clone(), self.ghost_gen));
+                self.index.insert(key, Node::Ghost { ghost_gen: self.ghost_gen });
             }
         }
     }
@@ -289,8 +293,9 @@ where
     /// Evict from Ghost until it is below capacity.
     fn evict_ghost_if_full(&mut self) {
         while self.ghost.len() >= self.ghost_capacity {
-            if let Some(key) = self.ghost.pop_front()
-                && matches!(self.index.get(&key), Some(Node::Ghost))
+            if let Some((key, expected_gen)) = self.ghost.pop_front()
+                && let Some(Node::Ghost { ghost_gen: current_gen }) = self.index.get(&key)
+                && *current_gen == expected_gen
             {
                 self.index.remove(&key);
             }

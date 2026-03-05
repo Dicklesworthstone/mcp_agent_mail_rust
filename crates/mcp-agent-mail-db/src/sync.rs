@@ -67,6 +67,36 @@ fn rollback_sync_write_tx(conn: &DbConn) {
     let _ = conn.execute_sync("ROLLBACK", &[]);
 }
 
+fn is_agent_name_unique_violation(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("unique constraint failed")
+        && normalized.contains("agents.project_id")
+        && normalized.contains("agents.name")
+}
+
+fn lookup_agent_id_by_name(
+    conn: &DbConn,
+    project_id: i64,
+    agent_name: &str,
+) -> Result<Option<i64>, DbError> {
+    let rows = conn
+        .query_sync(
+            "SELECT id FROM agents \
+             WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE \
+             ORDER BY id ASC LIMIT 1",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(agent_name.trim().to_string()),
+            ],
+        )
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.get_named::<i64>("id").ok()))
+}
+
 fn resolve_root_project_id(conn: &DbConn) -> Result<i64, DbError> {
     let project_row = conn
         .query_sync("SELECT id FROM projects ORDER BY id LIMIT 1", &[])
@@ -88,47 +118,33 @@ fn resolve_or_create_sender_id(
     sender_name: &str,
     now: i64,
 ) -> Result<i64, DbError> {
-    let sender_rows = conn
-        .query_sync(
-            "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
-            &[
-                Value::BigInt(project_id),
-                Value::Text(sender_name.to_string()),
-            ],
-        )
-        .map_err(|e| DbError::Sqlite(e.to_string()))?;
-
-    if let Some(row) = sender_rows.into_iter().next() {
-        return row
-            .get_named::<i64>("id")
-            .map_err(|_| DbError::Internal("Failed to decode sender ID".into()));
+    if let Some(sender_id) = lookup_agent_id_by_name(conn, project_id, sender_name)? {
+        return Ok(sender_id);
     }
 
-    conn.execute_sync(
+    match conn.execute_sync(
         "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
          VALUES (?1, ?2, 'tui-overseer', 'human', 'Human operator via TUI', ?3, ?4)",
         &[
             Value::BigInt(project_id),
-            Value::Text(sender_name.to_string()),
+            Value::Text(sender_name.trim().to_string()),
             Value::BigInt(now),
             Value::BigInt(now),
         ],
-    )
-    .map_err(|e| DbError::Sqlite(e.to_string()))?;
+    ) {
+        Ok(_) => {}
+        Err(err) => {
+            let message = err.to_string();
+            if is_agent_name_unique_violation(&message)
+                && let Some(sender_id) = lookup_agent_id_by_name(conn, project_id, sender_name)?
+            {
+                return Ok(sender_id);
+            }
+            return Err(DbError::Sqlite(message));
+        }
+    }
 
-    let rows = conn
-        .query_sync(
-            "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
-            &[
-                Value::BigInt(project_id),
-                Value::Text(sender_name.to_string()),
-            ],
-        )
-        .map_err(|e| DbError::Sqlite(e.to_string()))?;
-
-    rows.into_iter()
-        .next()
-        .and_then(|r| r.get_named::<i64>("id").ok())
+    lookup_agent_id_by_name(conn, project_id, sender_name)?
         .ok_or_else(|| DbError::Internal("Failed to resolve sender ID after insert".into()))
 }
 
@@ -186,19 +202,19 @@ fn insert_message_recipients(
     use std::collections::HashSet;
 
     let mut inserted_recipient_ids: HashSet<i64> = HashSet::new();
+    let mut missing_names: Vec<String> = Vec::new();
+    let mut missing_seen: HashSet<String> = HashSet::new();
 
     for (name, kind) in recipients {
-        let rec_rows = conn
-            .query_sync(
-                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
-                &[Value::BigInt(project_id), Value::Text(name.clone())],
-            )
-            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let Some(aid) = lookup_agent_id_by_name(conn, project_id, name)? else {
+            let normalized = name.trim().to_ascii_lowercase();
+            if missing_seen.insert(normalized) {
+                missing_names.push(name.trim().to_string());
+            }
+            continue;
+        };
 
-        if let Some(row) = rec_rows.into_iter().next()
-            && let Ok(aid) = row.get_named::<i64>("id")
-            && inserted_recipient_ids.insert(aid)
-        {
+        if inserted_recipient_ids.insert(aid) {
             conn.execute_sync(
                 "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, ?3)",
                 &[
@@ -209,6 +225,16 @@ fn insert_message_recipients(
             )
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
         }
+    }
+
+    if !missing_names.is_empty() {
+        return Err(DbError::not_found(
+            "Agent",
+            format!(
+                "unknown recipients in project {project_id}: {}",
+                missing_names.join(", ")
+            ),
+        ));
     }
 
     Ok(())
@@ -652,11 +678,85 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_root_message_unknown_recipient_skipped() {
+    fn dispatch_root_message_reuses_sender_case_insensitively() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let sender_id = insert_agent(&conn, pid, "BlueLake");
+
+        let msg_id = dispatch_root_message(
+            &conn,
+            "bluelake",
+            "Sender case fold",
+            "Body",
+            "normal",
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let sender_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents \
+                 WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE",
+                &[Value::BigInt(pid), Value::Text("BlueLake".to_string())],
+            )
+            .unwrap();
+        let sender_count = sender_rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.get_named::<i64>("cnt").ok())
+            .unwrap();
+        assert_eq!(sender_count, 1, "sender lookup should be case-insensitive");
+
+        let msg_rows = conn
+            .query_sync(
+                "SELECT sender_id FROM messages WHERE id = ?1",
+                &[Value::BigInt(msg_id)],
+            )
+            .unwrap();
+        let actual_sender_id = msg_rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.get_named::<i64>("sender_id").ok())
+            .unwrap();
+        assert_eq!(actual_sender_id, sender_id);
+    }
+
+    #[test]
+    fn dispatch_root_message_resolves_recipients_case_insensitively() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let _sender = insert_agent(&conn, pid, "Sender");
+        let recipient_id = insert_agent(&conn, pid, "BlueLake");
+
+        let msg_id = dispatch_root_message(
+            &conn,
+            "Sender",
+            "Recipient case fold",
+            "Body",
+            "normal",
+            None,
+            &[("bluelake".to_string(), "to".to_string())],
+        )
+        .unwrap();
+
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id, kind FROM message_recipients WHERE message_id = ?1",
+                &[Value::BigInt(msg_id)],
+            )
+            .unwrap();
+        let row = rows.into_iter().next().expect("recipient row should exist");
+        assert_eq!(row.get_named::<i64>("agent_id").unwrap(), recipient_id);
+        assert_eq!(row.get_named::<String>("kind").unwrap(), "to");
+    }
+
+    #[test]
+    fn dispatch_root_message_unknown_recipient_returns_not_found_and_rolls_back() {
         let conn = test_conn();
         let _pid = insert_project(&conn);
 
-        let msg_id = dispatch_root_message(
+        let err = dispatch_root_message(
             &conn,
             "Sender",
             "Unknown recipient",
@@ -665,13 +765,23 @@ mod tests {
             None,
             &[("NonexistentAgent".to_string(), "to".to_string())],
         )
-        .unwrap();
+        .expect_err("unknown recipient should fail");
 
-        // Message should exist but have no recipients
+        assert!(
+            matches!(
+                err,
+                DbError::NotFound {
+                    entity: "Agent",
+                    ..
+                }
+            ),
+            "expected agent not found, got {err:?}"
+        );
+
         let rows = conn
             .query_sync(
-                "SELECT COUNT(*) AS cnt FROM message_recipients WHERE message_id = ?",
-                &[Value::BigInt(msg_id)],
+                "SELECT COUNT(*) AS cnt FROM messages WHERE subject = 'Unknown recipient'",
+                &[],
             )
             .unwrap();
         let cnt = rows
@@ -679,7 +789,10 @@ mod tests {
             .next()
             .and_then(|r| r.get_named::<i64>("cnt").ok())
             .unwrap();
-        assert_eq!(cnt, 0, "unknown recipient should be silently skipped");
+        assert_eq!(
+            cnt, 0,
+            "message insert should roll back on unknown recipient"
+        );
     }
 
     #[test]

@@ -1203,7 +1203,7 @@ pub fn render_inspector_overlay(
             .constraints([Constraint::Percentage(62.0), Constraint::Percentage(38.0)])
             .split(inner)
     } else {
-        vec![inner]
+        std::iter::once(inner).collect()
     };
 
     let tree_area = panes[0];

@@ -1031,11 +1031,7 @@ impl<'a> TwoTierSearchIter<'a> {
         let blend_start = Instant::now();
 
         // Extract raw scores for normalization
-        let raw_fast_scores: Vec<f32> = fast_results
-            .iter()
-            .take(refinement_limit)
-            .map(|r| r.score)
-            .collect();
+        let raw_fast_scores: Vec<f32> = fast_results.iter().map(|r| r.score).collect();
         let fast_norm = normalize_scores(&raw_fast_scores);
         let quality_norm = normalize_scores(&quality_scores);
 
@@ -1043,7 +1039,7 @@ impl<'a> TwoTierSearchIter<'a> {
         let mut blended: Vec<ScoredResult> = fast_results
             .iter()
             .take(refinement_limit)
-            .zip(fast_norm.iter())
+            .zip(fast_norm.iter().take(refinement_limit))
             .zip(quality_norm.iter())
             .map(|((fast, &f_norm), &q_norm)| {
                 // Check if this doc has a real quality embedding
@@ -1065,8 +1061,22 @@ impl<'a> TwoTierSearchIter<'a> {
         self.search_metrics.blend_us =
             u64::try_from(blend_start.elapsed().as_micros()).unwrap_or(u64::MAX);
 
-        // Leave documents outside the refinement budget untouched.
-        blended.extend(fast_results.iter().skip(refinement_limit).cloned());
+        // Leave documents outside the refinement budget untouched, but
+        // convert them to the normalized score domain so they don't outrank
+        // refined documents due to raw score magnitude.
+        blended.extend(
+            fast_results
+                .iter()
+                .zip(fast_norm.iter())
+                .skip(refinement_limit)
+                .map(|(fast, &f_norm)| ScoredResult {
+                    idx: fast.idx,
+                    doc_id: fast.doc_id,
+                    doc_kind: fast.doc_kind,
+                    project_id: fast.project_id,
+                    score: f_norm,
+                }),
+        );
 
         // Re-sort by blended score.
         let _rerank_span =

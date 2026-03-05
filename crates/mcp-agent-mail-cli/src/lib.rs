@@ -3637,7 +3637,9 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             let input = {
                 use std::io::Read;
                 let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf).map_err(|e| CliError::Other(format!("Failed to read stdin: {e}")))?;
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .map_err(|e| CliError::Other(format!("Failed to read stdin: {e}")))?;
                 String::from_utf8_lossy(&buf).into_owned()
             };
             let paths: Vec<String> = if stdin_nul {
@@ -5307,7 +5309,11 @@ fn handle_golden_verify(
     });
     output::emit_output(&payload, fmt, || {
         output::section("Golden output verification");
-        let width = rows.iter().map(|row| row.filename.chars().count()).max().unwrap_or(0);
+        let width = rows
+            .iter()
+            .map(|row| row.filename.chars().count())
+            .max()
+            .unwrap_or(0);
         for row in &rows {
             let status = match row.status.as_str() {
                 "ok" => "OK",
@@ -5419,7 +5425,11 @@ fn handle_golden_list(
     });
     output::emit_output(&payload, fmt, || {
         output::section("Golden files");
-        let width = rows.iter().map(|row| row.filename.chars().count()).max().unwrap_or(0);
+        let width = rows
+            .iter()
+            .map(|row| row.filename.chars().count())
+            .max()
+            .unwrap_or(0);
         for row in &rows {
             ftui_runtime::ftui_println!(
                 "  {:<width$}  {}",
@@ -12250,7 +12260,9 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             // Resolve or generate agent name
-            let agent_name = name.unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
+            let agent_name = name
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
 
             let row = match mcp_agent_mail_db::queries::register_agent(
                 &cx,
@@ -12265,6 +12277,12 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             .await
             {
                 asupersync::Outcome::Ok(r) => r,
+                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
+                    message,
+                    ..
+                }) => {
+                    return Err(CliError::InvalidArgument(message));
+                }
                 asupersync::Outcome::Err(e) => {
                     return Err(CliError::Other(format!("register_agent failed: {e}")));
                 }
@@ -12302,33 +12320,11 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
-            let agent_name =
-                name_hint.unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
+            let agent_name = name_hint
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
 
-            // Enforce uniqueness: check if agent already exists
-            let existing = match mcp_agent_mail_db::queries::get_agent(
-                &cx,
-                &ctx.pool,
-                proj.id.unwrap_or(0),
-                &agent_name,
-            )
-            .await
-            {
-                asupersync::Outcome::Ok(row) => Some(row),
-                asupersync::Outcome::Err(_) => None,
-                asupersync::Outcome::Cancelled(_) => None,
-                asupersync::Outcome::Panicked(p) => {
-                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                }
-            };
-
-            if existing.is_some() {
-                return Err(CliError::InvalidArgument(format!(
-                    "agent name already exists in this project: {agent_name}"
-                )));
-            }
-
-            let row = match mcp_agent_mail_db::queries::register_agent(
+            let row = match mcp_agent_mail_db::queries::create_agent(
                 &cx,
                 &ctx.pool,
                 proj.id.unwrap_or(0),
@@ -12341,6 +12337,17 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             .await
             {
                 asupersync::Outcome::Ok(r) => r,
+                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
+                    return Err(CliError::InvalidArgument(format!(
+                        "agent name already exists in this project: {agent_name}"
+                    )));
+                }
+                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
+                    message,
+                    ..
+                }) => {
+                    return Err(CliError::InvalidArgument(message));
+                }
                 asupersync::Outcome::Err(e) => {
                     return Err(CliError::Other(format!("create_agent failed: {e}")));
                 }
