@@ -4321,44 +4321,47 @@ impl Model for MailAppModel {
         frame.cursor_visible = false;
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
-        // Paint the theme background.  The buffer is already cleared by ftui's
-        // `reset_for_frame()`, so we only need to set the bg color on cells
-        // that widgets won't paint over.  A lightweight Paragraph achieves
-        // this without resetting every cell attribute (which would inflate the
-        // per-frame diff and cause visible flashing at high tick rates).
-        let tp = crate::tui_theme::TuiThemePalette::current();
-        Paragraph::new("")
-            .style(Style::default().bg(tp.bg_deep))
-            .render(area, frame);
+        self.state.mark_first_paint();
+        let chrome = tui_chrome::chrome_layout(area);
+        let ambient_area = chrome.content;
         let effects_enabled = self.state.tui_effects_enabled();
+        let ambient_mode = self.ambient_mode_for_frame(effects_enabled);
+        let tp = crate::tui_theme::TuiThemePalette::current();
         // Throttle ambient effects to every Nth frame.  At 10fps with N=2
-        // the animation updates at ~5 fps.  On intervening frames,
-        // render_cached replays the previous buffer so the diff engine only
-        // sees cell changes from widget updates, not ambient animation.
+        // the animation updates at ~5 fps. On intervening frames, replay the
+        // cached cell background instead of rerunning the ambient simulation.
         let should_render_ambient = self
             .tick_count
             .is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES)
             && self.ambient_last_render_tick.get() != Some(self.tick_count);
-        if should_render_ambient {
+        let can_replay_cached = !should_render_ambient
+            && self
+                .ambient_renderer
+                .borrow()
+                .can_replay_cached(ambient_area, ambient_mode);
+        if !can_replay_cached {
+            Paragraph::new("")
+                .style(Style::default().bg(tp.bg_deep))
+                .render(ambient_area, frame);
+        }
+        if should_render_ambient || (ambient_mode.is_enabled() && !can_replay_cached) {
             let ambient_telemetry = self.ambient_renderer.borrow_mut().render(
-                area,
+                ambient_area,
                 frame,
-                self.ambient_mode_for_frame(effects_enabled),
+                ambient_mode,
                 self.ambient_health_input(now_micros()),
                 self.state.uptime().as_secs_f64(),
+                tp.bg_deep,
             );
             self.ambient_last_telemetry.set(ambient_telemetry);
             self.ambient_last_render_tick.set(Some(self.tick_count));
             self.ambient_render_invocations
                 .set(self.ambient_render_invocations.get().saturating_add(1));
-        } else {
-            self.ambient_renderer.borrow().render_cached(
-                area,
-                frame,
-                self.ambient_mode_for_frame(effects_enabled),
-            );
+        } else if can_replay_cached {
+            self.ambient_renderer
+                .borrow()
+                .render_cached(ambient_area, frame, ambient_mode, tp.bg_deep);
         }
-        let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();
         *self.last_content_area.borrow_mut() = chrome.content;
 
@@ -6915,6 +6918,31 @@ mod tests {
             model.ambient_render_invocations.get(),
             first_count + 1,
             "next bucket tick should render ambient exactly once"
+        );
+    }
+
+    #[test]
+    fn ambient_cache_miss_on_resize_forces_rerender_between_buckets() {
+        let mut model = test_model();
+        let mut pool = ftui::GraphemePool::new();
+        let mut initial_frame = Frame::new(80, 24, &mut pool);
+
+        for _ in 0..AMBIENT_RENDER_EVERY_N_FRAMES {
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+        }
+        model.view(&mut initial_frame);
+        let first_count = model.ambient_render_invocations.get();
+        assert!(first_count >= 1, "expected an initial ambient render");
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        let mut resized_pool = ftui::GraphemePool::new();
+        let mut resized_frame = Frame::new(120, 36, &mut resized_pool);
+        model.view(&mut resized_frame);
+
+        assert_eq!(
+            model.ambient_render_invocations.get(),
+            first_count + 1,
+            "cache miss from a larger frame should force an immediate ambient rerender"
         );
     }
 

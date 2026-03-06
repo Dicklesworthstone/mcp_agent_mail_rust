@@ -2311,7 +2311,7 @@ pub async fn create_message(
 /// On MVCC write conflicts (`BEGIN CONCURRENT` page collision), the entire
 /// transaction is retried up to `FSQLITE_CONCURRENT_RETRIES` times (default 5)
 /// with exponential backoff (10–200 ms).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn create_message_with_recipients(
     cx: &Cx,
     pool: &DbPool,
@@ -3009,6 +3009,7 @@ pub async fn fetch_inbox_unread(
     .await
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn fetch_inbox_impl(
     cx: &Cx,
     pool: &DbPool,
@@ -7515,6 +7516,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn cleanup_committed_message_after_consistency_failure_removes_orphaned_message_state() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;

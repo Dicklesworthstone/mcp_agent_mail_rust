@@ -4070,7 +4070,7 @@ mod tests {
             Outcome::Err(err) => panic!("sqlite init should repair legacy index: {err}"),
             Outcome::Cancelled(reason) => panic!("sqlite init cancelled unexpectedly: {reason:?}"),
             Outcome::Panicked(payload) => {
-                std::panic::resume_unwind(payload);
+                std::panic::panic_any(payload);
             }
         }
 

@@ -305,10 +305,7 @@ fn port_holder_pids_via_lsof(port: u16) -> Vec<u32> {
 fn parse_ss_port_holder_pids(output: &str) -> Vec<u32> {
     let mut pids = BTreeSet::new();
     for segment in output.split("pid=").skip(1) {
-        let digits: String = segment
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect();
+        let digits: String = segment.chars().take_while(char::is_ascii_digit).collect();
         if let Ok(pid) = digits.parse::<u32>() {
             pids.insert(pid);
         }

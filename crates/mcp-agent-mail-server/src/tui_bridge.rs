@@ -8,7 +8,7 @@ use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const REQUEST_SPARKLINE_CAPACITY: usize = 60;
@@ -310,6 +310,12 @@ struct TickEventBatch {
     events: Arc<Vec<MailEvent>>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StartupSignalState {
+    first_paint: bool,
+    db_ready: bool,
+}
+
 #[derive(Debug)]
 pub struct TuiSharedState {
     events: EventRingBuffer,
@@ -343,6 +349,9 @@ pub struct TuiSharedState {
     db_stats_gen: AtomicU64,
     /// Generation counter bumped on each `record_request` call.
     request_gen: AtomicU64,
+    /// Startup latches used to stage heavyweight background work behind first
+    /// paint and behind the initial DB readiness result.
+    startup_signals: (Mutex<StartupSignalState>, Condvar),
 }
 
 impl TuiSharedState {
@@ -381,6 +390,7 @@ impl TuiSharedState {
             screen_diagnostic_seq: AtomicU64::new(0),
             db_stats_gen: AtomicU64::new(0),
             request_gen: AtomicU64::new(0),
+            startup_signals: (Mutex::new(StartupSignalState::default()), Condvar::new()),
         })
     }
 
@@ -524,11 +534,62 @@ impl TuiSharedState {
 
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.startup_signals.1.notify_all();
     }
 
     #[must_use]
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_first_paint(&self) {
+        let (signals_lock, signals_cv) = &self.startup_signals;
+        let mut signals = signals_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !signals.first_paint {
+            signals.first_paint = true;
+            signals_cv.notify_all();
+        }
+    }
+
+    #[must_use]
+    pub fn first_paint_seen(&self) -> bool {
+        self.startup_signals
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_paint
+    }
+
+    #[must_use]
+    pub fn wait_for_first_paint(&self, timeout: Duration) -> bool {
+        self.wait_for_startup_signal(timeout, |signals| signals.first_paint)
+    }
+
+    pub fn mark_db_ready(&self) {
+        let (signals_lock, signals_cv) = &self.startup_signals;
+        let mut signals = signals_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !signals.db_ready {
+            signals.db_ready = true;
+            signals_cv.notify_all();
+        }
+    }
+
+    #[must_use]
+    pub fn db_ready(&self) -> bool {
+        self.startup_signals
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .db_ready
+    }
+
+    #[must_use]
+    pub fn wait_for_db_ready(&self, timeout: Duration) -> bool {
+        self.wait_for_startup_signal(timeout, |signals| signals.db_ready)
     }
 
     pub fn request_headless_detach(&self) {
@@ -573,6 +634,42 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.transport_mode()
+    }
+
+    #[must_use]
+    fn wait_for_startup_signal(
+        &self,
+        timeout: Duration,
+        predicate: impl Fn(StartupSignalState) -> bool,
+    ) -> bool {
+        if self.is_shutdown_requested() {
+            return false;
+        }
+        let (signals_lock, signals_cv) = &self.startup_signals;
+        let mut signals = signals_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if predicate(*signals) {
+            return true;
+        }
+        if timeout.is_zero() {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline || self.is_shutdown_requested() {
+                return predicate(*signals);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_signals, _) = signals_cv
+                .wait_timeout(signals, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            signals = next_signals;
+            if predicate(*signals) {
+                return true;
+            }
+        }
     }
 
     pub fn update_config_snapshot(&self, snapshot: ConfigSnapshot) {
@@ -1040,6 +1137,33 @@ mod tests {
         assert!(state.is_headless_detach_requested());
         assert!(state.take_headless_detach_requested());
         assert!(!state.is_headless_detach_requested());
+    }
+
+    #[test]
+    fn startup_latches_mark_and_wait() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(!state.first_paint_seen());
+        assert!(!state.db_ready());
+        assert!(!state.wait_for_first_paint(Duration::ZERO));
+        assert!(!state.wait_for_db_ready(Duration::ZERO));
+
+        let state_clone = Arc::clone(&state);
+        let waiter = thread::spawn(move || {
+            let first_paint = state_clone.wait_for_first_paint(Duration::from_millis(250));
+            let db_ready = state_clone.wait_for_db_ready(Duration::from_millis(250));
+            (first_paint, db_ready)
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        state.mark_first_paint();
+        state.mark_db_ready();
+
+        let (first_paint, db_ready) = waiter.join().expect("join startup waiter");
+        assert!(first_paint);
+        assert!(db_ready);
+        assert!(state.first_paint_seen());
+        assert!(state.db_ready());
     }
 
     #[test]

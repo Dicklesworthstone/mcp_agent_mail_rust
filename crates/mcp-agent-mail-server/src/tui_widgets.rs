@@ -2024,6 +2024,9 @@ pub struct AmbientEffectRenderer {
     doom_fire_fx: DoomFireFx,
     metaballs_fx: MetaballsFx,
     effect_buffer: Vec<PackedRgba>,
+    cached_bg_buffer: Vec<PackedRgba>,
+    cached_draw_width: u16,
+    cached_draw_height: u16,
     frame_counter: u64,
     resolution_mode: Mode,
     last_telemetry: AmbientRenderTelemetry,
@@ -2037,6 +2040,9 @@ impl AmbientEffectRenderer {
             doom_fire_fx: DoomFireFx::new(),
             metaballs_fx: MetaballsFx::default_theme(),
             effect_buffer: Vec::new(),
+            cached_bg_buffer: Vec::new(),
+            cached_draw_width: 0,
+            cached_draw_height: 0,
             frame_counter: 0,
             resolution_mode: Mode::HalfBlock,
             last_telemetry: AmbientRenderTelemetry::default(),
@@ -2053,6 +2059,17 @@ impl AmbientEffectRenderer {
         self.last_telemetry
     }
 
+    #[must_use]
+    pub fn can_replay_cached(&self, area: Rect, mode: AmbientMode) -> bool {
+        mode.is_enabled()
+            && self.last_telemetry.mode == mode
+            && self.last_telemetry.effect_opacity == mode.effect_opacity()
+            && self.last_telemetry.quality.is_enabled()
+            && self.cached_draw_width >= area.width
+            && self.cached_draw_height >= area.height
+            && !self.cached_bg_buffer.is_empty()
+    }
+
     /// Render ambient background effect into z-layer 0 (background colors only).
     ///
     /// `animation_seconds` should be a monotonic animation clock from the caller.
@@ -2064,11 +2081,13 @@ impl AmbientEffectRenderer {
         mode: AmbientMode,
         health: AmbientHealthInput,
         animation_seconds: f64,
+        base_bg: PackedRgba,
     ) -> AmbientRenderTelemetry {
         let render_start = std::time::Instant::now();
         let state = determine_ambient_health_state(health);
 
         if area.is_empty() || !mode.is_enabled() {
+            self.clear_cached_composite();
             return self.finish_telemetry(
                 state,
                 AmbientEffectKind::None,
@@ -2089,6 +2108,7 @@ impl AmbientEffectRenderer {
             .saturating_mul(self.resolution_mode.rows_per_cell());
         let len = usize::from(subpixel_width) * usize::from(subpixel_height);
         if len == 0 {
+            self.clear_cached_composite();
             return self.finish_telemetry(
                 state,
                 AmbientEffectKind::None,
@@ -2108,6 +2128,7 @@ impl AmbientEffectRenderer {
 
         let quality = FxQuality::from_degradation_with_area(frame.buffer.degradation, len);
         if !quality.is_enabled() {
+            self.clear_cached_composite();
             return self.finish_telemetry(
                 state,
                 AmbientEffectKind::None,
@@ -2177,7 +2198,14 @@ impl AmbientEffectRenderer {
         };
 
         let opacity = mode.effect_opacity();
-        self.composite_halfblock(area, frame, opacity, subpixel_width, subpixel_height);
+        self.composite_halfblock(
+            area,
+            frame,
+            opacity,
+            subpixel_width,
+            subpixel_height,
+            base_bg,
+        );
 
         self.finish_telemetry(
             state,
@@ -2193,18 +2221,38 @@ impl AmbientEffectRenderer {
 
     /// Composite the already-rendered background effect onto the frame
     /// without re-running the expensive simulation.
-    pub fn render_cached(&self, area: Rect, frame: &mut Frame, mode: AmbientMode) {
-        if area.is_empty() || !mode.is_enabled() {
+    pub fn render_cached(
+        &self,
+        area: Rect,
+        frame: &mut Frame,
+        mode: AmbientMode,
+        _base_bg: PackedRgba,
+    ) {
+        if area.is_empty() || !self.can_replay_cached(area, mode) {
             return;
         }
-        let opacity = mode.effect_opacity();
-        self.composite_halfblock(
-            area,
-            frame,
-            opacity,
-            self.last_telemetry.subpixel_width,
-            self.last_telemetry.subpixel_height,
-        );
+
+        let draw_width = area.width.min(self.cached_draw_width);
+        let draw_height = area.height.min(self.cached_draw_height);
+        if draw_width == 0 || draw_height == 0 {
+            return;
+        }
+
+        let frame_width = usize::from(frame.width());
+        let area_x = usize::from(area.x);
+        let area_y = usize::from(area.y);
+        let cached_stride = usize::from(self.cached_draw_width);
+        let draw_width = usize::from(draw_width);
+        let draw_height = usize::from(draw_height);
+        let cells = frame.buffer.cells_mut();
+
+        for dy in 0..draw_height {
+            let frame_row = (area_y + dy) * frame_width + area_x;
+            let cached_row = dy * cached_stride;
+            for dx in 0..draw_width {
+                cells[frame_row + dx].bg = self.cached_bg_buffer[cached_row + dx];
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2302,12 +2350,13 @@ impl AmbientEffectRenderer {
     }
 
     fn composite_halfblock(
-        &self,
+        &mut self,
         area: Rect,
         frame: &mut Frame,
         opacity: f32,
         subpixel_width: u16,
         subpixel_height: u16,
+        base_bg: PackedRgba,
     ) {
         if opacity <= 0.0 || area.is_empty() || subpixel_width == 0 || subpixel_height == 0 {
             return;
@@ -2324,20 +2373,38 @@ impl AmbientEffectRenderer {
             .height
             .min(u16::try_from(max_cells_h).unwrap_or(u16::MAX));
         if draw_width == 0 || draw_height == 0 {
+            self.clear_cached_composite();
             return;
         }
 
+        let draw_len = usize::from(draw_width) * usize::from(draw_height);
+        if self.cached_bg_buffer.len() < draw_len {
+            self.cached_bg_buffer
+                .resize(draw_len, PackedRgba::TRANSPARENT);
+        }
+        self.cached_bg_buffer[..draw_len].fill(base_bg);
+        self.cached_draw_width = draw_width;
+        self.cached_draw_height = draw_height;
+
         let stride = usize::from(subpixel_width);
         let max_sub_y = usize::from(subpixel_height.saturating_sub(1));
+        let frame_width = usize::from(frame.width());
+        let area_x = usize::from(area.x);
+        let area_y = usize::from(area.y);
+        let draw_width = usize::from(draw_width);
+        let draw_height = usize::from(draw_height);
+        let cells = frame.buffer.cells_mut();
 
         for dy in 0..draw_height {
-            let top_sub_y = usize::from(dy) * rows_per_cell;
+            let top_sub_y = dy * rows_per_cell;
             let bottom_sub_y = (top_sub_y + rows_per_cell.saturating_sub(1)).min(max_sub_y);
             let top_row = top_sub_y * stride;
             let bottom_row = bottom_sub_y * stride;
+            let frame_row = (area_y + dy) * frame_width + area_x;
+            let cache_row = dy * draw_width;
 
             for dx in 0..draw_width {
-                let sub_x = usize::from(dx) * cols_per_cell;
+                let sub_x = dx * cols_per_cell;
                 let Some(top) = self.effect_buffer.get(top_row + sub_x).copied() else {
                     continue;
                 };
@@ -2349,14 +2416,18 @@ impl AmbientEffectRenderer {
                 if overlay.a() == 0 {
                     continue;
                 }
-                if let Some(cell) = frame
-                    .buffer
-                    .get_mut(area.x.saturating_add(dx), area.y.saturating_add(dy))
-                {
-                    cell.bg = overlay.over(cell.bg);
-                }
+                let cell = &mut cells[frame_row + dx];
+                let final_bg = overlay.over(base_bg);
+                cell.bg = final_bg;
+                self.cached_bg_buffer[cache_row + dx] = final_bg;
             }
         }
+    }
+
+    fn clear_cached_composite(&mut self) {
+        self.cached_bg_buffer.clear();
+        self.cached_draw_width = 0;
+        self.cached_draw_height = 0;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8754,6 +8825,7 @@ mod tests {
             AmbientMode::Off,
             AmbientHealthInput::default(),
             10.0,
+            base,
         );
 
         let after = extract_buffer_snapshot(&frame, width, height);
@@ -8779,6 +8851,7 @@ mod tests {
             AmbientMode::Subtle,
             AmbientHealthInput::default(),
             1.0,
+            base,
         );
         assert_eq!(healthy.state, AmbientHealthState::Healthy);
         assert_eq!(healthy.effect, AmbientEffectKind::Plasma);
@@ -8794,6 +8867,7 @@ mod tests {
                 ..AmbientHealthInput::default()
             },
             2.0,
+            base,
         );
         assert_eq!(warning.state, AmbientHealthState::Warning);
         assert_eq!(warning.effect, AmbientEffectKind::Plasma);
@@ -8810,6 +8884,7 @@ mod tests {
                 ..AmbientHealthInput::default()
             },
             3.0,
+            base,
         );
         assert_eq!(critical.state, AmbientHealthState::Critical);
         assert_eq!(critical.effect, AmbientEffectKind::DoomFire);
@@ -8825,6 +8900,7 @@ mod tests {
                 ..AmbientHealthInput::default()
             },
             4.0,
+            base,
         );
         assert_eq!(idle.state, AmbientHealthState::Idle);
         assert_eq!(idle.effect, AmbientEffectKind::Metaballs);
@@ -8845,19 +8921,151 @@ mod tests {
         let mut subtle_pool = GraphemePool::new();
         let mut subtle_frame = Frame::new(width, height, &mut subtle_pool);
         fill_bg(&mut subtle_frame, width, height, base);
-        subtle_renderer.render(area, &mut subtle_frame, AmbientMode::Subtle, health, 12.0);
+        subtle_renderer.render(
+            area,
+            &mut subtle_frame,
+            AmbientMode::Subtle,
+            health,
+            12.0,
+            base,
+        );
         let subtle_delta = total_bg_delta(&subtle_frame, width, height, base);
 
         let mut full_renderer = AmbientEffectRenderer::new();
         let mut full_pool = GraphemePool::new();
         let mut full_frame = Frame::new(width, height, &mut full_pool);
         fill_bg(&mut full_frame, width, height, base);
-        full_renderer.render(area, &mut full_frame, AmbientMode::Full, health, 12.0);
+        full_renderer.render(area, &mut full_frame, AmbientMode::Full, health, 12.0, base);
         let full_delta = total_bg_delta(&full_frame, width, height, base);
 
         assert!(
             full_delta > subtle_delta,
             "full mode should have stronger visual impact (full={full_delta}, subtle={subtle_delta})"
+        );
+    }
+
+    #[test]
+    fn ambient_renderer_cached_replay_matches_last_composite() {
+        let mut renderer = AmbientEffectRenderer::new();
+        let width = 40;
+        let height = 12;
+        let area = Rect::new(0, 0, width, height);
+        let base = PackedRgba::rgb(12, 18, 24);
+        let health = AmbientHealthInput {
+            event_buffer_utilization: 0.82,
+            ..AmbientHealthInput::default()
+        };
+
+        let mut pool = GraphemePool::new();
+        let mut rendered_frame = Frame::new(width, height, &mut pool);
+        fill_bg(&mut rendered_frame, width, height, base);
+        renderer.render(
+            area,
+            &mut rendered_frame,
+            AmbientMode::Subtle,
+            health,
+            10.0,
+            base,
+        );
+        let rendered_snapshot = extract_buffer_snapshot(&rendered_frame, width, height);
+
+        let mut cached_pool = GraphemePool::new();
+        let mut cached_frame = Frame::new(width, height, &mut cached_pool);
+        fill_bg(&mut cached_frame, width, height, base);
+        renderer.render_cached(area, &mut cached_frame, AmbientMode::Subtle, base);
+        let cached_snapshot = extract_buffer_snapshot(&cached_frame, width, height);
+
+        assert_eq!(
+            rendered_snapshot, cached_snapshot,
+            "cached ambient replay must match the previous composited frame"
+        );
+    }
+
+    #[test]
+    fn ambient_renderer_cached_replay_overwrites_current_frame_background() {
+        let mut renderer = AmbientEffectRenderer::new();
+        let width = 40;
+        let height = 12;
+        let area = Rect::new(0, 0, width, height);
+        let original_base = PackedRgba::rgb(12, 18, 24);
+        let replay_base = PackedRgba::rgb(220, 40, 40);
+        let health = AmbientHealthInput {
+            event_buffer_utilization: 0.82,
+            ..AmbientHealthInput::default()
+        };
+
+        let mut rendered_pool = GraphemePool::new();
+        let mut rendered_frame = Frame::new(width, height, &mut rendered_pool);
+        fill_bg(&mut rendered_frame, width, height, original_base);
+        renderer.render(
+            area,
+            &mut rendered_frame,
+            AmbientMode::Subtle,
+            health,
+            10.0,
+            original_base,
+        );
+        let rendered_snapshot = extract_buffer_snapshot(&rendered_frame, width, height);
+
+        let mut replay_pool = GraphemePool::new();
+        let mut replay_frame = Frame::new(width, height, &mut replay_pool);
+        fill_bg(&mut replay_frame, width, height, replay_base);
+        renderer.render_cached(area, &mut replay_frame, AmbientMode::Subtle, replay_base);
+        let replay_snapshot = extract_buffer_snapshot(&replay_frame, width, height);
+
+        assert_eq!(
+            rendered_snapshot, replay_snapshot,
+            "cached ambient replay must not depend on the frame's current background"
+        );
+    }
+
+    #[test]
+    fn ambient_renderer_cached_replay_skips_when_last_render_disabled_effects() {
+        let mut renderer = AmbientEffectRenderer::new();
+        let width = 40;
+        let height = 12;
+        let area = Rect::new(0, 0, width, height);
+        let base = PackedRgba::rgb(12, 18, 24);
+        let health = AmbientHealthInput {
+            event_buffer_utilization: 0.82,
+            ..AmbientHealthInput::default()
+        };
+
+        let mut first_pool = GraphemePool::new();
+        let mut first_frame = Frame::new(width, height, &mut first_pool);
+        fill_bg(&mut first_frame, width, height, base);
+        renderer.render(
+            area,
+            &mut first_frame,
+            AmbientMode::Subtle,
+            health,
+            10.0,
+            base,
+        );
+
+        let mut degraded_pool = GraphemePool::new();
+        let mut degraded_frame = Frame::new(width, height, &mut degraded_pool);
+        degraded_frame.buffer.degradation = ftui_render::budget::DegradationLevel::EssentialOnly;
+        fill_bg(&mut degraded_frame, width, height, base);
+        renderer.render(
+            area,
+            &mut degraded_frame,
+            AmbientMode::Subtle,
+            health,
+            11.0,
+            base,
+        );
+
+        let mut cached_pool = GraphemePool::new();
+        let mut cached_frame = Frame::new(width, height, &mut cached_pool);
+        fill_bg(&mut cached_frame, width, height, base);
+        let base_snapshot = extract_buffer_snapshot(&cached_frame, width, height);
+        renderer.render_cached(area, &mut cached_frame, AmbientMode::Subtle, base);
+        let cached_snapshot = extract_buffer_snapshot(&cached_frame, width, height);
+
+        assert_eq!(
+            base_snapshot, cached_snapshot,
+            "cached ambient replay must not reuse stale pixels after a no-effect render"
         );
     }
 
@@ -8879,8 +9087,14 @@ mod tests {
             let mut pool = GraphemePool::new();
             let mut frame = Frame::new(width, height, &mut pool);
             fill_bg(&mut frame, width, height, base);
-            let telemetry =
-                renderer.render(area, &mut frame, AmbientMode::Subtle, health, f64::from(i));
+            let telemetry = renderer.render(
+                area,
+                &mut frame,
+                AmbientMode::Subtle,
+                health,
+                f64::from(i),
+                base,
+            );
             total_us += telemetry.render_duration.as_micros();
         }
 

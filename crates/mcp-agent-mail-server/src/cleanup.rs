@@ -244,27 +244,27 @@ fn run_cleanup_cycle_with_cache(
         total_released += stale_ids.len();
 
         // Write archive artifacts for released reservations.
-        if !expired_ids.is_empty() {
-            if let Err(err) = write_cleanup_artifacts(config, pool, &cx, *pid, &expired_ids) {
-                warn!(
-                    project_id = *pid,
-                    phase = "expired",
-                    released_count = expired_ids.len(),
-                    error = %err,
-                    "cleanup: failed to enqueue archive updates for released reservations"
-                );
-            }
+        if !expired_ids.is_empty()
+            && let Err(err) = write_cleanup_artifacts(config, pool, &cx, *pid, &expired_ids)
+        {
+            warn!(
+                project_id = *pid,
+                phase = "expired",
+                released_count = expired_ids.len(),
+                error = %err,
+                "cleanup: failed to enqueue archive updates for released reservations"
+            );
         }
-        if !stale_ids.is_empty() {
-            if let Err(err) = write_cleanup_artifacts(config, pool, &cx, *pid, &stale_ids) {
-                warn!(
-                    project_id = *pid,
-                    phase = "stale",
-                    released_count = stale_ids.len(),
-                    error = %err,
-                    "cleanup: failed to enqueue archive updates for released reservations"
-                );
-            }
+        if !stale_ids.is_empty()
+            && let Err(err) = write_cleanup_artifacts(config, pool, &cx, *pid, &stale_ids)
+        {
+            warn!(
+                project_id = *pid,
+                phase = "stale",
+                released_count = stale_ids.len(),
+                error = %err,
+                "cleanup: failed to enqueue archive updates for released reservations"
+            );
         }
     }
 

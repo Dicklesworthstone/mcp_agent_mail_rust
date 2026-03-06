@@ -829,6 +829,7 @@ impl DashboardScreen {
     }
 
     /// Detect anomalies from current state.
+    #[allow(clippy::cast_precision_loss, clippy::unused_self)]
     fn detect_anomalies_from_samples(
         &self,
         counters: crate::tui_bridge::RequestCounters,
@@ -904,6 +905,7 @@ impl DashboardScreen {
         out
     }
 
+    #[cfg(test)]
     #[allow(clippy::cast_precision_loss, clippy::unused_self)]
     fn detect_anomalies(&self, state: &TuiSharedState) -> Vec<DetectedAnomaly> {
         let counters = state.request_counters();
@@ -1395,7 +1397,6 @@ impl MailScreen for DashboardScreen {
 
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
-        let tp = crate::tui_theme::TuiThemePalette::current();
         let tc = TerminalClass::from_rect(area);
         let density = DensityHint::from_terminal_class(tc);
         let effects_enabled = state.tui_effects_enabled();

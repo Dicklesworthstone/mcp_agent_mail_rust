@@ -2471,6 +2471,7 @@ impl MessageBrowserScreen {
     }
 
     /// Execute a search query against the database, merging live event results.
+    #[allow(clippy::too_many_lines)]
     fn execute_search(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let query = self.search_input.value().trim().to_string();

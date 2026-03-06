@@ -1424,13 +1424,68 @@ fn handle_tui_readiness_warmup_result(
     tui_state: Option<&Arc<tui_bridge::TuiSharedState>>,
     result: Result<(), String>,
 ) {
-    if let Err(error) = result {
-        tracing::warn!(
-            error = %error,
-            "tui readiness warmup failed; continuing with degraded DB-unavailable startup"
-        );
-        if let Some(state) = tui_state {
-            state.push_console_log(tui_readiness_warmup_failure_message(&error));
+    match result {
+        Ok(()) => {
+            if let Some(state) = tui_state {
+                state.mark_db_ready();
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "tui readiness warmup failed; continuing with degraded DB-unavailable startup"
+            );
+            if let Some(state) = tui_state {
+                state.push_console_log(tui_readiness_warmup_failure_message(&error));
+            }
+        }
+    }
+}
+
+const TUI_DEFERRED_WORKER_FIRST_PAINT_WAIT: Duration = Duration::from_millis(500);
+const TUI_DEFERRED_WORKER_DB_GRACE: Duration = Duration::from_secs(2);
+
+fn start_tui_deferred_background_workers(config: &mcp_agent_mail_core::Config) {
+    init_search_bridge(config);
+    cleanup::start(config);
+    ack_ttl::start(config);
+    tool_metrics::start(config);
+    retention::start(config);
+    if config.integrity_check_on_startup {
+        integrity_guard::defer_next_proactive_backup();
+    }
+    integrity_guard::start(config);
+    disk_monitor::start(config);
+    start_advisory_consistency_probe(config);
+}
+
+fn spawn_tui_deferred_background_workers(
+    config: &mcp_agent_mail_core::Config,
+    tui_state: &Arc<tui_bridge::TuiSharedState>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let config = config.clone();
+    let tui_state = Arc::clone(tui_state);
+    match std::thread::Builder::new()
+        .name("tui-deferred-workers".into())
+        .spawn(move || {
+            let _ = tui_state.wait_for_first_paint(TUI_DEFERRED_WORKER_FIRST_PAINT_WAIT);
+            if tui_state.is_shutdown_requested() {
+                return;
+            }
+            let _ = tui_state.wait_for_db_ready(TUI_DEFERRED_WORKER_DB_GRACE);
+            if tui_state.is_shutdown_requested() {
+                return;
+            }
+            start_tui_deferred_background_workers(&config);
+        }) {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to spawn deferred TUI worker starter; starting background workers inline"
+            );
+            start_tui_deferred_background_workers(&config);
+            None
         }
     }
 }
@@ -1527,19 +1582,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
-    // ── 2. Background workers (same as run_http) ────────────────────
+    // ── 2. Pre-paint essentials only ────────────────────────────────
     heal_storage_lock_artifacts(config);
-    init_search_bridge(config);
     mcp_agent_mail_storage::wbq_start();
-    cleanup::start(config);
-    ack_ttl::start(config);
-    tool_metrics::start(config);
-    retention::start(config);
-    // TUI startup uses quick readiness (migrations + connectivity only). Let
-    // the background integrity guard run its immediate quick cycle.
-    integrity_guard::start(config);
-    disk_monitor::start(config);
-    start_advisory_consistency_probe(config);
 
     // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
     let tui_state = tui_bridge::TuiSharedState::new(config);
@@ -1548,6 +1593,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // gracefully while SQLite is still warming up, so do not block the
     // interactive handoff on migrations/readiness work here.
     spawn_tui_readiness_warmup(config, &tui_state);
+    let mut deferred_workers = spawn_tui_deferred_background_workers(config, &tui_state);
 
     // ── 4. DB poller on dedicated thread ────────────────────────────
     let mut db_poller =
@@ -1583,6 +1629,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         // TUI detached intentionally: keep HTTP server running headless.
         set_tui_state_handle(None);
         db_poller.stop();
+        if let Some(handle) = deferred_workers.take() {
+            let _ = handle.join();
+        }
 
         let supervisor_result = supervisor_thread
             .join()
@@ -1604,6 +1653,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     tui_state.request_shutdown();
     let _ = server_ctl_tx.send(tui_bridge::ServerControlMsg::Shutdown);
     db_poller.stop();
+    if let Some(handle) = deferred_workers.take() {
+        let _ = handle.join();
+    }
 
     let supervisor_result = supervisor_thread
         .join()

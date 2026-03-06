@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static SKIP_NEXT_QUICK_CYCLE: AtomicBool = AtomicBool::new(false);
+static SKIP_NEXT_PROACTIVE_BACKUP: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
@@ -56,6 +57,16 @@ fn full_check_interval(config: &Config) -> Option<Duration> {
 /// in the background worker before the first interval elapses.
 pub fn note_startup_integrity_probe_completed() {
     SKIP_NEXT_QUICK_CYCLE.store(true, Ordering::Release);
+}
+
+/// Skip only the next proactive backup refresh while still performing the
+/// integrity guard's quick health check.
+pub fn defer_next_proactive_backup() {
+    SKIP_NEXT_PROACTIVE_BACKUP.store(true, Ordering::Release);
+}
+
+fn take_deferred_proactive_backup() -> bool {
+    SKIP_NEXT_PROACTIVE_BACKUP.swap(false, Ordering::AcqRel)
 }
 
 pub fn start(config: &Config) {
@@ -204,6 +215,12 @@ fn run_quick_cycle(
 ) {
     match pool.run_startup_integrity_check() {
         Ok(_) => {
+            if take_deferred_proactive_backup() {
+                tracing::debug!(
+                    "integrity guard: deferred proactive backup during startup quick cycle"
+                );
+                return;
+            }
             if let Err(err) = pool.create_proactive_backup(Duration::from_secs(BACKUP_MAX_AGE_SECS))
             {
                 tracing::warn!(error = %err, "integrity guard: proactive backup refresh failed");
@@ -353,6 +370,18 @@ mod tests {
     #[test]
     fn quick_check_interval_is_5_minutes() {
         assert_eq!(quick_check_interval().as_secs(), 300);
+    }
+
+    #[test]
+    fn defer_next_proactive_backup_is_one_shot() {
+        SKIP_NEXT_PROACTIVE_BACKUP.store(false, Ordering::Release);
+        assert!(!take_deferred_proactive_backup());
+        defer_next_proactive_backup();
+        assert!(take_deferred_proactive_backup());
+        assert!(
+            !take_deferred_proactive_backup(),
+            "startup backup deferral should apply only once"
+        );
     }
 
     #[test]

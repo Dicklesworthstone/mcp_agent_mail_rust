@@ -35,6 +35,8 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Manual/test overrides are allowed to go below `MIN_POLL_INTERVAL`, but never to zero.
 const MIN_OVERRIDE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Retry snapshot-gap recovery occasionally, not every poll cycle forever.
+const RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Maximum agents to fetch per poll cycle.  Raised from 50 to 500 to avoid
 /// silently truncating the agent list in large deployments (B4 truthfulness).
@@ -329,6 +331,7 @@ struct PollerConnectionState {
     conn: DbConn,
     sqlite_path: String,
     last_data_version: Option<i64>,
+    last_reservation_snapshot_gap_refresh_micros: i64,
 }
 
 /// Handle returned by [`DbPoller::start`].
@@ -386,8 +389,16 @@ impl DbPoller {
             .unwrap_or(now);
         let mut panic_recovery_active = false;
         let mut connection_state: Option<PollerConnectionState> = None;
+        let mut startup_wait_applied = false;
 
         while !self.stop.load(Ordering::Relaxed) {
+            if !startup_wait_applied && connection_state.is_none() && prev.timestamp_micros == 0 {
+                startup_wait_applied = true;
+                let _ = self.state.wait_for_db_ready(self.interval);
+                if self.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             // Fetch fresh snapshot
             let snapshot = if let Ok(snapshot) =
                 catch_optional_panic(std::panic::AssertUnwindSafe(|| {
@@ -557,6 +568,7 @@ fn open_poller_connection_state(database_url: &str) -> Option<PollerConnectionSt
         conn,
         sqlite_path,
         last_data_version: None,
+        last_reservation_snapshot_gap_refresh_micros: 0,
     })
 }
 
@@ -566,12 +578,18 @@ fn fetch_db_stats_with_connection(
 ) -> DbStatSnapshot {
     let now = now_micros();
     let data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
-    let must_refresh_for_expiry = reservation_state_requires_time_refresh(previous, now);
+    let must_refresh_for_expiry = reservation_expiry_requires_time_refresh(previous, now);
+    let must_refresh_for_snapshot_gap = reservation_snapshot_gap_requires_refresh(
+        previous,
+        now,
+        state.last_reservation_snapshot_gap_refresh_micros,
+    );
     if let Some(version) = data_version
         && state
             .last_data_version
             .is_some_and(|previous_version| previous_version == version)
         && !must_refresh_for_expiry
+        && !must_refresh_for_snapshot_gap
         && previous.timestamp_micros > 0
     {
         let mut snapshot = previous.clone();
@@ -581,24 +599,38 @@ fn fetch_db_stats_with_connection(
     let snapshot =
         DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot();
     state.last_data_version = data_version;
+    if must_refresh_for_snapshot_gap {
+        state.last_reservation_snapshot_gap_refresh_micros = now;
+    } else if snapshot.file_reservations == 0 || !snapshot.reservation_snapshots.is_empty() {
+        state.last_reservation_snapshot_gap_refresh_micros = 0;
+    }
     snapshot
 }
 
-fn reservation_state_requires_time_refresh(previous: &DbStatSnapshot, now_micros: i64) -> bool {
+fn reservation_expiry_requires_time_refresh(previous: &DbStatSnapshot, now_micros: i64) -> bool {
     if previous.file_reservations == 0 {
         return false;
-    }
-    // If we know active reservations exist but have no snapshot rows (e.g. prior
-    // fallback/truncation), force a fresh query so expiry-driven counts stay
-    // correct even when PRAGMA data_version is unchanged.
-    if previous.reservation_snapshots.is_empty() {
-        return true;
     }
     previous
         .reservation_snapshots
         .iter()
         .filter(|snapshot| !snapshot.is_released())
         .any(|snapshot| snapshot.expires_ts > 0 && snapshot.expires_ts <= now_micros)
+}
+
+fn reservation_snapshot_gap_requires_refresh(
+    previous: &DbStatSnapshot,
+    now_micros: i64,
+    last_refresh_micros: i64,
+) -> bool {
+    if previous.file_reservations == 0 || !previous.reservation_snapshots.is_empty() {
+        return false;
+    }
+    if last_refresh_micros <= 0 {
+        return true;
+    }
+    now_micros.saturating_sub(last_refresh_micros)
+        >= i64::try_from(RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL.as_micros()).unwrap_or(i64::MAX)
 }
 
 /// Open a sync `SQLite` connection from a database URL (public for compose dispatch).
@@ -1798,6 +1830,85 @@ mod tests {
     }
 
     #[test]
+    fn poller_cold_start_wakes_early_when_db_ready_is_marked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_poller_ready.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            &[],
+        )
+        .expect("create file_reservations");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agent_links (id INTEGER PRIMARY KEY)",
+            &[],
+        )
+        .expect("create agent_links");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
+            &[],
+        )
+        .expect("create message_recipients");
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj1', 'hk1', 100)",
+            &[],
+        )
+        .expect("insert project");
+        drop(conn);
+
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let poller =
+            DbPoller::new(Arc::clone(&state), db_url).with_interval(Duration::from_secs(5));
+        let mut handle = poller.start();
+
+        thread::sleep(Duration::from_millis(75));
+        let before = state.db_stats_snapshot().unwrap_or_default();
+        assert_eq!(
+            before.timestamp_micros, 0,
+            "cold-start poller should not query SQLite before readiness is signaled"
+        );
+
+        state.mark_db_ready();
+
+        let deadline = Instant::now() + Duration::from_millis(750);
+        let mut woke = false;
+        while Instant::now() < deadline {
+            if state
+                .db_stats_snapshot()
+                .is_some_and(|snapshot| snapshot.timestamp_micros > 0 && snapshot.projects == 1)
+            {
+                woke = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        handle.stop();
+        assert!(
+            woke,
+            "db-ready signal should wake the poller before the full interval elapses"
+        );
+    }
+
+    #[test]
     fn poller_skips_update_when_no_change() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_no_change.db");
@@ -1910,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn reservation_state_requires_time_refresh_when_expiry_due() {
+    fn reservation_expiry_requires_time_refresh_when_expiry_due() {
         let mut snapshot = DbStatSnapshot {
             file_reservations: 1,
             reservation_snapshots: vec![ReservationSnapshot {
@@ -1927,31 +2038,45 @@ mod tests {
         };
 
         assert!(
-            !reservation_state_requires_time_refresh(&snapshot, 99),
+            !reservation_expiry_requires_time_refresh(&snapshot, 99),
             "should not force refresh before expiry"
         );
         assert!(
-            reservation_state_requires_time_refresh(&snapshot, 100),
+            reservation_expiry_requires_time_refresh(&snapshot, 100),
             "should force refresh once reservation reaches expiry"
         );
 
         snapshot.reservation_snapshots[0].released_ts = Some(90);
         assert!(
-            !reservation_state_requires_time_refresh(&snapshot, 100),
+            !reservation_expiry_requires_time_refresh(&snapshot, 100),
             "released reservations should not force refresh"
         );
     }
 
     #[test]
-    fn reservation_state_requires_time_refresh_when_snapshot_missing() {
+    fn reservation_snapshot_gap_requires_refresh_uses_retry_cooldown() {
         let snapshot = DbStatSnapshot {
             file_reservations: 2,
             reservation_snapshots: Vec::new(),
             ..DbStatSnapshot::default()
         };
         assert!(
-            reservation_state_requires_time_refresh(&snapshot, now_micros()),
-            "active reservation count without rows must force refresh"
+            reservation_snapshot_gap_requires_refresh(&snapshot, 1_000_000, 0),
+            "first missing-row retry should refresh immediately"
+        );
+        assert!(
+            !reservation_snapshot_gap_requires_refresh(&snapshot, 1_500_000, 1_000_000),
+            "missing-row retry should not fire every poll cycle"
+        );
+        assert!(
+            reservation_snapshot_gap_requires_refresh(
+                &snapshot,
+                1_000_000
+                    + i64::try_from(RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL.as_micros())
+                        .unwrap_or(i64::MAX),
+                1_000_000,
+            ),
+            "missing-row retry should resume after the cooldown"
         );
     }
 
