@@ -5784,19 +5784,7 @@ fn handle_file_reservations_with_conn(
                     CliError::InvalidArgument(format!("project not found: {project}"))
                 })?;
 
-            let agent_rows = conn
-                .query_sync(
-                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::Text(agent.clone()),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let agent_id: i64 = agent_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {agent}")))?;
+            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             // Check conflicts: find active exclusive reservations that overlap.
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
@@ -5915,19 +5903,7 @@ fn handle_file_reservations_with_conn(
                     CliError::InvalidArgument(format!("project not found: {project}"))
                 })?;
 
-            let agent_rows = conn
-                .query_sync(
-                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::Text(agent.clone()),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let agent_id: i64 = agent_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {agent}")))?;
+            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             // Build WHERE clause for renewal.
             let base_where =
@@ -6025,19 +6001,7 @@ fn handle_file_reservations_with_conn(
                     CliError::InvalidArgument(format!("project not found: {project}"))
                 })?;
 
-            let agent_rows = conn
-                .query_sync(
-                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::Text(agent.clone()),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let agent_id: i64 = agent_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {agent}")))?;
+            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             let base_where = "project_id = ? AND agent_id = ? AND released_ts IS NULL";
             let (sql, params) = if !ids.is_empty() {
@@ -6187,6 +6151,8 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
             agent,
             limit,
         } => {
+            let project_id = crate::context::resolve_project(conn, &project)?.id;
+            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
             // Messages sent TO this agent with ack_required=1 that haven't been acked
             let rows = conn
                 .query_sync(
@@ -6196,14 +6162,13 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
                      JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
                      JOIN agents sender_a ON sender_a.id = m.sender_id \
-                     JOIN projects p ON p.id = m.project_id \
-                     WHERE p.slug = ? AND recv_a.name = ? \
+                     WHERE m.project_id = ? AND recv_a.id = ? \
                        AND m.ack_required = 1 AND i.ack_ts IS NULL \
                      ORDER BY m.created_ts DESC \
                      LIMIT ?",
                     &[
-                        sqlmodel_core::Value::Text(project),
-                        sqlmodel_core::Value::Text(agent),
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(agent_id),
                         sqlmodel_core::Value::BigInt(limit),
                     ],
                 )
@@ -6231,6 +6196,8 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
             min_age_minutes,
             limit,
         } => {
+            let project_id = crate::context::resolve_project(conn, &project)?.id;
+            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
             // Stale acks: ack_required but not acked, older than min_age_minutes
             let cutoff = now_us - min_age_minutes * 60 * 1_000_000;
             let rows = conn
@@ -6240,15 +6207,14 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
                      JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
                      JOIN agents sender_a ON sender_a.id = m.sender_id \
-                     JOIN projects p ON p.id = m.project_id \
-                     WHERE p.slug = ? AND recv_a.name = ? \
+                     WHERE m.project_id = ? AND recv_a.id = ? \
                        AND m.ack_required = 1 AND i.ack_ts IS NULL \
                        AND m.created_ts < ? \
                      ORDER BY m.created_ts ASC \
                      LIMIT ?",
                     &[
-                        sqlmodel_core::Value::Text(project),
-                        sqlmodel_core::Value::Text(agent),
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(agent_id),
                         sqlmodel_core::Value::BigInt(cutoff),
                         sqlmodel_core::Value::BigInt(limit),
                     ],
@@ -6283,6 +6249,8 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
             ttl_minutes,
             limit,
         } => {
+            let project_id = crate::context::resolve_project(conn, &project)?.id;
+            let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
             // Overdue acks: ack_required, not acked, older than ttl_minutes
             let cutoff = now_us - ttl_minutes * 60 * 1_000_000;
             let rows = conn
@@ -6292,15 +6260,14 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
                      JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
                      JOIN agents sender_a ON sender_a.id = m.sender_id \
-                     JOIN projects p ON p.id = m.project_id \
-                     WHERE p.slug = ? AND recv_a.name = ? \
+                     WHERE m.project_id = ? AND recv_a.id = ? \
                        AND m.ack_required = 1 AND i.ack_ts IS NULL \
                        AND m.created_ts < ? \
                      ORDER BY m.created_ts ASC \
                      LIMIT ?",
                     &[
-                        sqlmodel_core::Value::Text(project),
-                        sqlmodel_core::Value::Text(agent),
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(agent_id),
                         sqlmodel_core::Value::BigInt(cutoff),
                         sqlmodel_core::Value::BigInt(limit),
                     ],
@@ -6371,35 +6338,8 @@ fn handle_contacts_with_conn(
                     CliError::InvalidArgument(format!("project not found: {project_key}"))
                 })?;
 
-            let from_rows = conn
-                .query_sync(
-                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::Text(from_agent.clone()),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let from_id: i64 = from_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("agent not found: {from_agent}"))
-                })?;
-
-            let to_rows = conn
-                .query_sync(
-                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::Text(to_agent.clone()),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let to_id: i64 = to_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {to_agent}")))?;
+            let from_id = crate::context::resolve_agent(conn, project_id, &from_agent)?.id;
+            let to_id = crate::context::resolve_agent(conn, project_id, &to_agent)?.id;
 
             // Upsert agent_links: set status to 'pending'.
             // FrankenConnection does not support ON CONFLICT ... DO UPDATE;
@@ -6481,37 +6421,8 @@ fn handle_contacts_with_conn(
                     CliError::InvalidArgument(format!("project not found: {project_key}"))
                 })?;
 
-            let from_rows = conn
-                .query_sync(
-                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::Text(from_agent.clone()),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let from_id: i64 = from_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("agent not found: {from_agent}"))
-                })?;
-
-            let to_rows = conn
-                .query_sync(
-                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::Text(agent_name.clone()),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let to_id: i64 = to_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("agent not found: {agent_name}"))
-                })?;
+            let from_id = crate::context::resolve_agent(conn, project_id, &from_agent)?.id;
+            let to_id = crate::context::resolve_agent(conn, project_id, &agent_name)?.id;
 
             let _updated = conn
                 .query_sync(
@@ -6566,21 +6477,7 @@ fn handle_contacts_with_conn(
                     CliError::InvalidArgument(format!("project not found: {project_key}"))
                 })?;
 
-            let agent_rows = conn
-                .query_sync(
-                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
-                    &[
-                        sqlmodel_core::Value::BigInt(project_id),
-                        sqlmodel_core::Value::Text(agent_name.clone()),
-                    ],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let agent_id: i64 = agent_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("agent not found: {agent_name}"))
-                })?;
+            let agent_id = crate::context::resolve_agent(conn, project_id, &agent_name)?.id;
 
             // Outgoing links.
             let outgoing = conn
@@ -6707,22 +6604,23 @@ fn handle_contacts_with_conn(
                     CliError::InvalidArgument(format!("project not found: {project_key}"))
                 })?;
 
+            let agent = crate::context::resolve_agent(conn, project_id, &agent_name)?;
+
             conn.query_sync(
-                "UPDATE agents SET contact_policy = ? WHERE project_id = ? AND name = ?",
+                "UPDATE agents SET contact_policy = ? WHERE id = ?",
                 &[
                     sqlmodel_core::Value::Text(policy.clone()),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::Text(agent_name.clone()),
+                    sqlmodel_core::Value::BigInt(agent.id),
                 ],
             )
             .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
 
             let result = serde_json::json!({
-                "agent": agent_name.clone(),
+                "agent": agent.name.clone(),
                 "policy": policy.clone(),
             });
             output::emit_output(&result, fmt, || {
-                output::success(&format!("Contact policy set: {agent_name} → {policy}"));
+                output::success(&format!("Contact policy set: {} → {policy}", agent.name));
             });
             Ok(())
         }
@@ -7021,6 +6919,8 @@ fn handle_list_acks_with_conn(
     agent_name: &str,
     limit: i64,
 ) -> CliResult<()> {
+    let project_id = crate::context::resolve_project(conn, project_key)?.id;
+    let agent_id = crate::context::resolve_agent(conn, project_id, agent_name)?.id;
     let rows = conn
         .query_sync(
             "SELECT m.id, m.subject, m.importance, m.created_ts, \
@@ -7029,13 +6929,12 @@ fn handle_list_acks_with_conn(
              JOIN message_recipients i ON i.message_id = m.id \
              JOIN agents recv_a ON recv_a.id = i.agent_id \
              JOIN agents sender_a ON sender_a.id = m.sender_id \
-             JOIN projects p ON p.id = m.project_id \
-             WHERE p.slug = ? AND recv_a.name = ? AND m.ack_required = 1 \
+             WHERE m.project_id = ? AND recv_a.id = ? AND m.ack_required = 1 \
              ORDER BY m.created_ts DESC \
              LIMIT ?",
             &[
-                sqlmodel_core::Value::Text(project_key.to_string()),
-                sqlmodel_core::Value::Text(agent_name.to_string()),
+                sqlmodel_core::Value::BigInt(project_id),
+                sqlmodel_core::Value::BigInt(agent_id),
                 sqlmodel_core::Value::BigInt(limit),
             ],
         )
@@ -14200,9 +14099,51 @@ mod tests {
         ))
         .unwrap();
 
-        let agent_id =
-            resolve_agent_id_for_inbox_check(&conn, project_id, "bluelake", "/tmp/p").unwrap();
+        let agent_id = resolve_agent_id_for_inbox_check(&conn, project_id, "bluelake").unwrap();
         assert!(agent_id > 0);
+    }
+
+    #[test]
+    fn resolve_agent_id_for_inbox_check_rejects_ambiguous_case_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("check-inbox-direct.db");
+        let url = format!("sqlite:///{}", db_path.display());
+        let conn = open_db_sync_with_database_url(&url).unwrap();
+
+        // Simulate a legacy pre-migration duplicate state on top of the
+        // current schema so the direct inbox helper can prove it refuses to
+        // guess between case-duplicate agent rows.
+        conn.execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+            .unwrap();
+
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
+        )
+        .unwrap();
+        let project_rows = conn
+            .query_sync("SELECT id FROM projects WHERE slug = 'p' LIMIT 1", &[])
+            .unwrap();
+        let project_id: i64 = project_rows
+            .first()
+            .and_then(|row| row.get_named("id").ok())
+            .unwrap();
+
+        conn.execute_raw(&format!(
+            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+             VALUES ({project_id}, 'BlueLake', 'test', 'test-model', '', 1000000, 1000000, 'auto')"
+        ))
+        .unwrap();
+        conn.execute_raw(&format!(
+            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+             VALUES ({project_id}, 'bluelake', 'test', 'test-model', '', 1000000, 1000000, 'auto')"
+        ))
+        .unwrap();
+
+        let err = resolve_agent_id_for_inbox_check(&conn, project_id, "BlUeLaKe").unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous agent name"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -27741,30 +27682,8 @@ fn resolve_agent_id_for_inbox_check(
     conn: &mcp_agent_mail_db::DbConn,
     project_id: i64,
     agent_name: &str,
-    project_key: &str,
 ) -> CliResult<i64> {
-    use sqlmodel_core::Value;
-
-    let agent_rows = conn
-        .query_sync(
-            "SELECT id FROM agents \
-             WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1",
-            &[
-                Value::BigInt(project_id),
-                Value::Text(agent_name.to_string()),
-            ],
-        )
-        .map_err(|e| CliError::Other(format!("agent lookup failed: {e}")))?;
-
-    agent_rows
-        .first()
-        .and_then(|row| row.get_named("id").ok())
-        .ok_or_else(|| {
-            CliError::Other(format!(
-                "agent '{}' not found in project '{}'",
-                agent_name, project_key
-            ))
-        })
+    crate::context::resolve_agent(conn, project_id, agent_name).map(|agent| agent.id)
 }
 
 /// Check inbox via direct SQLite query (for co-located setups).
@@ -27792,12 +27711,7 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
         .and_then(|row| row.get_named("id").ok())
         .ok_or_else(|| CliError::Other(format!("project not found: {}", config.project_key)))?;
 
-    let agent_id = resolve_agent_id_for_inbox_check(
-        &conn,
-        project_id,
-        &config.agent_name,
-        &config.project_key,
-    )?;
+    let agent_id = resolve_agent_id_for_inbox_check(&conn, project_id, &config.agent_name)?;
 
     // Query unread messages (where read_ts IS NULL)
     let sql = "

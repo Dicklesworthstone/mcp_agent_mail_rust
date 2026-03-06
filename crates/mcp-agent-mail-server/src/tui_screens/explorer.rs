@@ -829,7 +829,7 @@ impl MailExplorerScreen {
 
         // Agent filter (filter by recipient name)
         if !self.agent_filter.is_empty() {
-            conditions.push("a_recip.name = ?".to_string());
+            conditions.push("a_recip.name = ? COLLATE NOCASE".to_string());
             params.push(Value::Text(self.agent_filter.clone()));
         }
 
@@ -895,7 +895,7 @@ impl MailExplorerScreen {
 
         // Agent filter (filter by sender name)
         if !self.agent_filter.is_empty() {
-            conditions.push("s.name = ?".to_string());
+            conditions.push("s.name = ? COLLATE NOCASE".to_string());
             params.push(Value::Text(self.agent_filter.clone()));
         }
 

@@ -411,7 +411,7 @@ fn facet_agent_name_without_direction_matches_both() {
     let plan = plan_search(&q);
     assert!(plan.facets_applied.contains(&"agent_name".to_string()));
     // Should have OR for sender and recipient
-    assert!(plan.sql.contains("a.name = ?"));
+    assert!(plan.sql.contains("a.name = ? COLLATE NOCASE"));
     assert!(plan.sql.contains("message_recipients"));
 }
 
@@ -421,7 +421,7 @@ fn facet_outbox_direction() {
     q.direction = Some(Direction::Outbox);
     q.agent_name = Some("Agent".to_string());
     let plan = plan_search(&q);
-    assert!(plan.sql.contains("a.name = ?"));
+    assert!(plan.sql.contains("a.name = ? COLLATE NOCASE"));
     assert!(!plan.sql.contains("message_recipients mr\n"));
 }
 
@@ -1644,7 +1644,8 @@ fn direction_agent_exhaustive_matrix() {
                     "agent without direction should still be a facet"
                 );
                 assert!(
-                    plan.sql.contains("a.name = ?") && plan.sql.contains("message_recipients"),
+                    plan.sql.contains("a.name = ? COLLATE NOCASE")
+                        && plan.sql.contains("message_recipients"),
                     "agent without direction should match both: {}",
                     plan.sql
                 );

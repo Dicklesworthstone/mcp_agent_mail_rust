@@ -2729,7 +2729,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
 
     // Fetch inbox and filter for urgent unread
     let inbox_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_inbox(
+        mcp_agent_mail_db::queries::fetch_inbox_unread(
             ctx.cx(),
             &pool,
             project_id,
@@ -4113,6 +4113,71 @@ mod resource_shape_tests {
                     thread_value["messages"][0]["body_md"],
                     "Hello from integration test."
                 );
+            });
+        });
+    }
+
+    #[test]
+    fn urgent_unread_view_excludes_read_messages() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-urgent-read-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "SilverFox").await;
+                let recipient = register_agent(&cx, &pool, project_id, "GoldenLynx").await;
+                let thread_id = format!("thread-read-{}", unique_suffix());
+                let message = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    "Urgent Read Subject",
+                    "Hello from integration test.",
+                    &thread_id,
+                    true,
+                )
+                .await;
+                let message_id = message.id.unwrap_or(0);
+                let recipient_id = recipient.id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(_) => panic!("acquire panicked"),
+                };
+                conn.execute_sync(
+                    "UPDATE message_recipients SET read_ts = ? WHERE message_id = ? AND agent_id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros(),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(recipient_id),
+                    ],
+                )
+                .expect("mark message read");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.human_key.clone();
+
+                let inbox_value = parse_json(
+                    &inbox(&ctx, format!("{}?project={project_ref}", recipient.name))
+                        .await
+                        .expect("inbox"),
+                );
+                assert_eq!(inbox_value["count"], 1);
+
+                let urgent_value = parse_json(
+                    &views_urgent_unread(&ctx, format!("{}?project={project_ref}", recipient.name))
+                        .await
+                        .expect("urgent view"),
+                );
+                assert_eq!(urgent_value["count"], 0);
+                assert_eq!(urgent_value["messages"].as_array().map_or(0, Vec::len), 0);
             });
         });
     }

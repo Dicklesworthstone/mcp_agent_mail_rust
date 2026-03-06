@@ -294,13 +294,15 @@ async fn resolve_agent_ids(
     let (sql, params) = project_id.map_or_else(
         || {
             (
-                "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1".to_string(),
+                "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1 COLLATE NOCASE"
+                    .to_string(),
                 vec![Value::Text(agent_name.to_string())],
             )
         },
         |pid| {
             (
-                "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1 AND a.project_id = ?2"
+                "SELECT a.project_id, a.id FROM agents a \
+                 WHERE a.name = ?1 COLLATE NOCASE AND a.project_id = ?2"
                     .to_string(),
                 vec![Value::Text(agent_name.to_string()), Value::BigInt(pid)],
             )

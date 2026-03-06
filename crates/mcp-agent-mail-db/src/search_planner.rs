@@ -834,13 +834,13 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     if let (Some(dir), Some(agent)) = (query.direction, &query.agent_name) {
         match dir {
             Direction::Outbox => {
-                where_clauses.push("a.name = ?".to_string());
+                where_clauses.push("a.name = ? COLLATE NOCASE".to_string());
                 params.push(PlanParam::Text(agent.clone()));
             }
             Direction::Inbox => {
                 where_clauses.push(
                     "m.id IN (SELECT mr.message_id FROM message_recipients mr \
-                     JOIN agents ra ON ra.id = mr.agent_id WHERE ra.name = ?)"
+                     JOIN agents ra ON ra.id = mr.agent_id WHERE ra.name = ? COLLATE NOCASE)"
                         .to_string(),
                 );
                 params.push(PlanParam::Text(agent.clone()));
@@ -850,8 +850,8 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     } else if let Some(ref agent) = query.agent_name {
         // Agent filter without direction: match sender OR recipient
         where_clauses.push(
-            "(a.name = ? OR m.id IN (SELECT mr.message_id FROM message_recipients mr \
-             JOIN agents ra ON ra.id = mr.agent_id WHERE ra.name = ?))"
+            "(a.name = ? COLLATE NOCASE OR m.id IN (SELECT mr.message_id FROM message_recipients mr \
+             JOIN agents ra ON ra.id = mr.agent_id WHERE ra.name = ? COLLATE NOCASE))"
                 .to_string(),
         );
         params.push(PlanParam::Text(agent.clone()));
@@ -1435,7 +1435,7 @@ mod tests {
         q.direction = Some(Direction::Outbox);
         q.agent_name = Some("BlueLake".to_string());
         let plan = plan_search(&q);
-        assert!(plan.sql.contains("a.name = ?"));
+        assert!(plan.sql.contains("a.name = ? COLLATE NOCASE"));
         assert!(plan.facets_applied.contains(&"direction".to_string()));
     }
 
@@ -1455,7 +1455,7 @@ mod tests {
         q.agent_name = Some("BlueLake".to_string());
         let plan = plan_search(&q);
         // Should match sender OR recipient
-        assert!(plan.sql.contains("a.name = ?"));
+        assert!(plan.sql.contains("a.name = ? COLLATE NOCASE"));
         assert!(plan.sql.contains("message_recipients"));
         assert!(plan.facets_applied.contains(&"agent_name".to_string()));
     }

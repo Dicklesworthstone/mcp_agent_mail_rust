@@ -665,10 +665,15 @@ async fn durability_probe_query(
         return map_sql_outcome(traw_query(cx, &tracked, sql, params).await);
     }
 
-    let probe_conn = match crate::DbConn::open_file(pool.sqlite_path()) {
+    let probe_conn = match crate::pool::open_sqlite_file_with_recovery(pool.sqlite_path()) {
         Ok(conn) => conn,
         Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
     };
+    if let Err(e) = probe_conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL) {
+        return Outcome::Err(DbError::Sqlite(format!(
+            "durability probe connection init failed: {e}"
+        )));
+    }
     let probe_tracked = tracked(&probe_conn);
     let out = map_sql_outcome(traw_query(cx, &probe_tracked, sql, params).await);
     drop(probe_conn);
@@ -784,6 +789,128 @@ async fn verify_message_recipients_visible_after_commit(
         )));
     }
 
+    Outcome::Ok(())
+}
+
+fn is_hard_post_commit_probe_error(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Internal(_) | DbError::IntegrityCorruption { .. } | DbError::Schema(_)
+    )
+}
+
+fn log_advisory_post_commit_probe_error(operation: &'static str, detail: &str, error: &str) {
+    tracing::warn!(
+        operation,
+        detail,
+        error,
+        "post-commit durability probe failed after commit; returning committed result"
+    );
+}
+
+async fn cleanup_committed_message_after_consistency_failure(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    message_id: i64,
+) -> Outcome<(), DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+    let recipient_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT DISTINCT agent_id FROM message_recipients WHERE message_id = ?",
+                &[Value::BigInt(message_id)],
+            )
+            .await,
+        )
+    );
+
+    let mut affected_agent_ids = Vec::with_capacity(recipient_rows.len());
+    for row in &recipient_rows {
+        let agent_id: i64 = match row.get_as(0) {
+            Ok(value) => value,
+            Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(map_sql_error(&e));
+            }
+        };
+        affected_agent_ids.push(agent_id);
+    }
+
+    let delete_recipients_sql = "DELETE FROM message_recipients WHERE message_id = ?";
+    let delete_recipients_params = [Value::BigInt(message_id)];
+    try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                delete_recipients_sql,
+                &delete_recipients_params
+            )
+            .await
+        )
+    );
+
+    let delete_message_sql = "DELETE FROM messages WHERE id = ? AND project_id = ?";
+    let delete_message_params = [Value::BigInt(message_id), Value::BigInt(project_id)];
+    try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_execute(cx, &tracked, delete_message_sql, &delete_message_params).await
+        )
+    );
+
+    let reset_stats_sql = "DELETE FROM inbox_stats WHERE agent_id = ?";
+    let rebuild_stats_sql = "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         SELECT \
+             r.agent_id, \
+             COUNT(*) AS total_count, \
+             SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+             SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+             MAX(m.created_ts) AS last_message_ts \
+         FROM message_recipients r \
+         JOIN messages m ON m.id = r.message_id \
+         WHERE r.agent_id = ? \
+         GROUP BY r.agent_id";
+    for agent_id in &affected_agent_ids {
+        let stats_params = [Value::BigInt(*agent_id)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, reset_stats_sql, &stats_params).await)
+        );
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, rebuild_stats_sql, &stats_params).await)
+        );
+    }
+
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    drop(conn);
+
+    let cache = crate::cache::read_cache();
+    let cache_scope = pool.sqlite_path();
+    for agent_id in affected_agent_ids {
+        cache.invalidate_inbox_stats_scoped(cache_scope, agent_id);
+    }
     Outcome::Ok(())
 }
 
@@ -1246,26 +1373,50 @@ pub async fn register_agent(
         };
         drop(conn);
         let durable = match verify_agent_visible_after_commit(cx, pool, project_id, name).await {
-            Outcome::Ok(agent) => agent,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
+            Outcome::Ok(agent) => Some(agent),
+            Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => return Outcome::Err(e),
+            Outcome::Err(e) => {
+                log_advisory_post_commit_probe_error(
+                    "register_agent",
+                    &format!("{project_id}:{name}"),
+                    &e.to_string(),
+                );
+                None
+            }
+            Outcome::Cancelled(_) => {
+                tracing::warn!(
+                    project_id,
+                    agent = %name,
+                    "register_agent durability probe cancelled after commit; returning committed result"
+                );
+                None
+            }
+            Outcome::Panicked(p) => {
+                tracing::error!(
+                    project_id,
+                    agent = %name,
+                    panic = %p.message(),
+                    "register_agent durability probe panicked after commit; returning committed result"
+                );
+                None
+            }
         };
         (provisional, durable)
     };
 
-    if durable.id != provisional.id {
+    let final_agent = durable.unwrap_or_else(|| provisional.clone());
+    if final_agent.id != provisional.id {
         tracing::warn!(
             project_id,
             agent = %name,
             provisional_id = ?provisional.id,
-            durable_id = ?durable.id,
+            durable_id = ?final_agent.id,
             "agent id changed between commit and durability check"
         );
     }
 
-    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &durable);
-    Outcome::Ok(durable)
+    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &final_agent);
+    Outcome::Ok(final_agent)
 }
 
 /// Create a new agent identity, failing if the name is already taken.
@@ -1388,26 +1539,50 @@ pub async fn create_agent(
         };
         drop(conn);
         let durable = match verify_agent_visible_after_commit(cx, pool, project_id, name).await {
-            Outcome::Ok(agent) => agent,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
+            Outcome::Ok(agent) => Some(agent),
+            Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => return Outcome::Err(e),
+            Outcome::Err(e) => {
+                log_advisory_post_commit_probe_error(
+                    "create_agent",
+                    &format!("{project_id}:{name}"),
+                    &e.to_string(),
+                );
+                None
+            }
+            Outcome::Cancelled(_) => {
+                tracing::warn!(
+                    project_id,
+                    agent = %name,
+                    "create_agent durability probe cancelled after commit; returning committed result"
+                );
+                None
+            }
+            Outcome::Panicked(p) => {
+                tracing::error!(
+                    project_id,
+                    agent = %name,
+                    panic = %p.message(),
+                    "create_agent durability probe panicked after commit; returning committed result"
+                );
+                None
+            }
         };
         (provisional, durable)
     };
 
-    if durable.id != provisional.id {
+    let final_agent = durable.unwrap_or_else(|| provisional.clone());
+    if final_agent.id != provisional.id {
         tracing::warn!(
             project_id,
             agent = %name,
             provisional_id = ?provisional.id,
-            durable_id = ?durable.id,
+            durable_id = ?final_agent.id,
             "agent id changed between commit and durability check"
         );
     }
 
-    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &durable);
-    Outcome::Ok(durable)
+    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &final_agent);
+    Outcome::Ok(final_agent)
 }
 
 /// Get agent by project and name (cache-first)
@@ -1812,7 +1987,7 @@ pub async fn set_agent_contact_policy_by_name(
     // Resolve row first so we can preserve attachments_policy explicitly.
     let current_sql = "SELECT id, project_id, name, program, model, task_description, \
                        inception_ts, last_active_ts, attachments_policy, contact_policy \
-                       FROM agents WHERE project_id = ? AND name = ? \
+                       FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                        ORDER BY last_active_ts DESC, id DESC LIMIT 1";
     let current_params = [
         Value::BigInt(project_id),
@@ -2239,9 +2414,54 @@ pub async fn create_message_with_recipients(
     .await
     {
         Outcome::Ok(()) => {}
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+        Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => {
+            let error_text = e.to_string();
+            match cleanup_committed_message_after_consistency_failure(
+                cx, pool, project_id, message_id,
+            )
+            .await
+            {
+                Outcome::Ok(()) => return Outcome::Err(e),
+                Outcome::Err(cleanup_err) => {
+                    return Outcome::Err(DbError::Internal(format!(
+                        "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup failed: {cleanup_err}"
+                    )));
+                }
+                Outcome::Cancelled(_) => {
+                    return Outcome::Err(DbError::Internal(format!(
+                        "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup was cancelled"
+                    )));
+                }
+                Outcome::Panicked(p) => {
+                    return Outcome::Err(DbError::Internal(format!(
+                        "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup panicked: {}",
+                        p.message()
+                    )));
+                }
+            }
+        }
+        Outcome::Err(e) => {
+            log_advisory_post_commit_probe_error(
+                "create_message_with_recipients",
+                &format!("{project_id}:{message_id}"),
+                &e.to_string(),
+            );
+        }
+        Outcome::Cancelled(_) => {
+            tracing::warn!(
+                project_id,
+                message_id,
+                "message recipient durability probe cancelled after commit; returning committed result"
+            );
+        }
+        Outcome::Panicked(p) => {
+            tracing::error!(
+                project_id,
+                message_id,
+                panic = %p.message(),
+                "message recipient durability probe panicked after commit; returning committed result"
+            );
+        }
     }
 
     // Invalidate cached inbox stats for all recipients.
@@ -2740,6 +2960,7 @@ pub struct InboxRow {
     pub message: MessageRow,
     pub kind: String,
     pub sender_name: String,
+    pub read_ts: Option<i64>,
     pub ack_ts: Option<i64>,
 }
 
@@ -2750,6 +2971,51 @@ pub async fn fetch_inbox(
     project_id: i64,
     agent_id: i64,
     urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        urgent_only,
+        false,
+        since_ts,
+        limit,
+    )
+    .await
+}
+
+pub async fn fetch_inbox_unread(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        urgent_only,
+        true,
+        since_ts,
+        limit,
+    )
+    .await
+}
+
+async fn fetch_inbox_impl(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    unread_only: bool,
     since_ts: Option<i64>,
     limit: usize,
 ) -> Outcome<Vec<InboxRow>, DbError> {
@@ -2764,7 +3030,7 @@ pub async fn fetch_inbox(
 
     let mut sql = String::from(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                m.importance, m.ack_required, m.created_ts, m.attachments, r.kind, s.name as sender_name, r.ack_ts \
+                m.importance, m.ack_required, m.created_ts, m.attachments, r.kind, s.name as sender_name, r.read_ts, r.ack_ts \
          FROM message_recipients r \
          JOIN messages m ON m.id = r.message_id \
          JOIN agents s ON s.id = m.sender_id \
@@ -2775,6 +3041,9 @@ pub async fn fetch_inbox(
 
     if urgent_only {
         sql.push_str(" AND m.importance IN ('high', 'urgent')");
+    }
+    if unread_only {
+        sql.push_str(" AND r.read_ts IS NULL");
     }
     if let Some(ts) = since_ts {
         sql.push_str(" AND m.created_ts > ?");
@@ -2840,7 +3109,11 @@ pub async fn fetch_inbox(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_ts: Option<i64> = match row.get_as(12) {
+                let read_ts: Option<i64> = match row.get_as(12) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let ack_ts: Option<i64> = match row.get_as(13) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -2860,6 +3133,7 @@ pub async fn fetch_inbox(
                     },
                     kind,
                     sender_name,
+                    read_ts,
                     ack_ts,
                 });
             }
@@ -3479,7 +3753,7 @@ pub async fn fetch_inbox_global(
          JOIN messages m ON m.id = r.message_id \
          JOIN agents s ON s.id = m.sender_id \
          JOIN projects p ON p.id = m.project_id \
-         WHERE a.name = ?",
+         WHERE a.name = ? COLLATE NOCASE",
     );
 
     let mut params: Vec<Value> = vec![Value::Text(agent_name.to_string())];
@@ -3577,7 +3851,7 @@ pub async fn count_unread_global(
                JOIN agents a ON a.id = r.agent_id \
                JOIN messages m ON m.id = r.message_id \
                JOIN projects p ON p.id = m.project_id \
-               WHERE a.name = ? AND r.read_ts IS NULL \
+               WHERE a.name = ? COLLATE NOCASE AND r.read_ts IS NULL \
                GROUP BY p.id, p.slug \
                ORDER BY unread_count DESC";
 
@@ -6119,7 +6393,7 @@ pub async fn insert_system_agent(
 
     let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                       inception_ts, last_active_ts, attachments_policy, contact_policy \
-                      FROM agents WHERE project_id = ? AND name = ? LIMIT 1";
+                      FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1";
     let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
     let rows = try_in_tx!(
         cx,
@@ -7241,6 +7515,130 @@ mod tests {
         });
     }
 
+    #[test]
+    fn cleanup_committed_message_after_consistency_failure_removes_orphaned_message_state() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("cleanup_committed_message_after_probe_failure.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "CREATE TABLE IF NOT EXISTS inbox_stats (
+                    agent_id INTEGER PRIMARY KEY,
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    ack_pending_count INTEGER NOT NULL DEFAULT 0,
+                    last_message_ts INTEGER
+                )",
+            )
+            .expect("ensure inbox_stats");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'cleanup-project', '/tmp/am-cleanup-message', 0)",
+            )
+            .expect("seed project");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                 VALUES
+                    (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'),
+                    (2, 1, 'GreenStone', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed agents");
+        init_conn
+            .execute_raw(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+                 VALUES (1, 1, 1, 'THREAD-CLEANUP', 'cleanup', 'body', 'normal', 1, 100, '[]')",
+            )
+            .expect("seed message");
+        init_conn
+            .execute_raw(
+                "INSERT INTO message_recipients
+                 (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (1, 2, 'to', NULL, NULL)",
+            )
+            .expect("seed recipient");
+        init_conn
+            .execute_raw(
+                "INSERT OR REPLACE INTO inbox_stats
+                 (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
+                 VALUES (2, 1, 1, 1, 100)",
+            )
+            .expect("seed inbox stats");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            cleanup_committed_message_after_consistency_failure(&cx, &pool, 1, 1)
+                .await
+                .into_result()
+                .expect("cleanup should succeed");
+        });
+
+        let verify_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open verify connection");
+        let message_rows = verify_conn
+            .query_sync("SELECT COUNT(*) AS count FROM messages WHERE id = 1", &[])
+            .expect("query messages after cleanup");
+        let recipient_rows = verify_conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM message_recipients WHERE message_id = 1",
+                &[],
+            )
+            .expect("query recipients after cleanup");
+        let stats_rows = verify_conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM inbox_stats WHERE agent_id = 2",
+                &[],
+            )
+            .expect("query inbox_stats after cleanup");
+
+        assert_eq!(
+            message_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            0,
+            "cleanup must delete the orphaned message row"
+        );
+        assert_eq!(
+            recipient_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            0,
+            "cleanup must delete recipient rows for the failed message"
+        );
+        assert_eq!(
+            stats_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            0,
+            "cleanup must rebuild inbox_stats so stale recipient counts are removed"
+        );
+    }
+
     /// Requires C `SQLite` trigger execution. `FrankenSQLite`'s VDBE cannot fire
     /// BEFORE INSERT triggers (CREATE TRIGGER returns Ok but the trigger body
     /// is never executed during INSERT), so this test is skipped when
@@ -7836,18 +8234,74 @@ mod tests {
             assert_eq!(updated2.contact_policy, "contacts_only");
             assert_eq!(updated2.attachments_policy, "inline");
 
+            let updated3 =
+                set_agent_contact_policy_by_name(&cx, &pool, project_id, "bluelake", "closed")
+                    .await
+                    .into_result()
+                    .expect("set policy by lowercase name");
+            assert_eq!(updated3.name, "BlueLake");
+            assert_eq!(updated3.contact_policy, "closed");
+            assert_eq!(updated3.attachments_policy, "inline");
+
             let fetched = get_agent(&cx, &pool, project_id, "BlueLake")
                 .await
                 .into_result()
                 .expect("get_agent should work after policy updates");
-            assert_eq!(fetched.contact_policy, "contacts_only");
+            assert_eq!(fetched.contact_policy, "closed");
             assert_eq!(fetched.attachments_policy, "inline");
 
             let cached = crate::read_cache()
                 .get_agent_scoped(pool.sqlite_path(), project_id, "BlueLake")
                 .expect("cache entry should be refreshed");
-            assert_eq!(cached.contact_policy, "contacts_only");
+            assert_eq!(cached.contact_policy, "closed");
             assert_eq!(cached.attachments_policy, "inline");
+        });
+    }
+
+    #[test]
+    fn insert_system_agent_reselects_existing_name_case_insensitively() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("insert_system_agent_case_insensitive.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-system-agent-case-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let first = insert_system_agent(
+                &cx,
+                &pool,
+                project_id,
+                "AckEscalator",
+                "worker",
+                "gpt-5",
+                "first insert",
+            )
+            .await
+            .into_result()
+            .expect("insert first system agent");
+            let second = insert_system_agent(
+                &cx,
+                &pool,
+                project_id,
+                "ackescalator",
+                "worker",
+                "gpt-5",
+                "second insert should reuse existing row",
+            )
+            .await
+            .into_result()
+            .expect("reselect existing system agent after case-insensitive conflict");
+
+            assert_eq!(second.id, first.id);
+            assert_eq!(second.name, "AckEscalator");
         });
     }
 
@@ -9149,6 +9603,101 @@ mod tests {
     }
 
     #[test]
+    fn fetch_inbox_global_matches_agent_name_case_insensitively() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("global_inbox_case_insensitive.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-global-case-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "Case-insensitive global inbox",
+                "Body",
+                Some("global-case-thread"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let rows = fetch_inbox_global(&cx, &pool, "bluelake", false, None, 25)
+                .await
+                .into_result()
+                .expect("fetch inbox global");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].sender_name, "GreenStone");
+            assert_eq!(rows[0].project_slug, project.slug);
+        });
+    }
+
+    #[test]
     fn count_unread_global_empty_returns_empty() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -9193,6 +9742,101 @@ mod tests {
                 .expect("count unread global on empty");
 
             assert!(counts.is_empty());
+        });
+    }
+
+    #[test]
+    fn count_unread_global_matches_agent_name_case_insensitively() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("global_unread_case_insensitive.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-unread-case-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "Case-insensitive unread count",
+                "Body",
+                Some("global-unread-thread"),
+                "high",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let counts = count_unread_global(&cx, &pool, "bluelake")
+                .await
+                .into_result()
+                .expect("count unread global");
+
+            assert_eq!(counts.len(), 1);
+            assert_eq!(counts[0].project_slug, project.slug);
+            assert_eq!(counts[0].unread_count, 1);
         });
     }
 

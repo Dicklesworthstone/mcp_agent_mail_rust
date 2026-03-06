@@ -944,41 +944,6 @@ fn start_advisory_consistency_probe(config: &mcp_agent_mail_core::Config) {
         });
 }
 
-fn tui_readiness_warmup_failure_message(error: &str) -> String {
-    format!("TUI startup: background DB readiness warmup failed ({error})")
-}
-
-fn handle_tui_readiness_warmup_result(
-    tui_state: Option<&Arc<tui_bridge::TuiSharedState>>,
-    result: Result<(), String>,
-) {
-    if let Err(error) = result {
-        tracing::warn!(
-            error = %error,
-            "tui readiness warmup failed; continuing with degraded DB-unavailable startup"
-        );
-        if let Some(state) = tui_state {
-            state.push_console_log(tui_readiness_warmup_failure_message(&error));
-        }
-    }
-}
-
-fn spawn_tui_readiness_warmup(
-    config: &mcp_agent_mail_core::Config,
-    tui_state: &Arc<tui_bridge::TuiSharedState>,
-) {
-    let config = config.clone();
-    let tui_state = Arc::clone(tui_state);
-    if let Err(error) = std::thread::Builder::new()
-        .name("tui-readiness-warmup".into())
-        .spawn(move || {
-            handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check_quick(&config));
-        })
-    {
-        handle_tui_readiness_warmup_result(None, Err(format!("spawn failed: {error}")));
-    }
-}
-
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -1427,26 +1392,72 @@ fn run_http_headless_supervisor(mut config: mcp_agent_mail_core::Config) -> std:
     }
 }
 
+fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    let probe_report = startup_checks::run_startup_probes(config);
+    if !probe_report.is_ok() {
+        return Err(std::io::Error::other(probe_report.format_errors()));
+    }
+
+    // Force DB initialization (including migrations + integrity recovery) during
+    // startup so HTTP/TUI surfaces that open direct sync connections never
+    // observe an uninitialized or recoverable-but-not-yet-recovered SQLite file.
+    readiness_check(config).map_err(std::io::Error::other)?;
+
+    if config.instrumentation_enabled {
+        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
+    }
+
+    Ok(())
+}
+
+fn note_startup_integrity_probe_if_enabled(config: &mcp_agent_mail_core::Config) {
+    if config.integrity_check_on_startup {
+        integrity_guard::note_startup_integrity_probe_completed();
+    }
+}
+
+fn tui_readiness_warmup_failure_message(error: &str) -> String {
+    format!("TUI startup: background DB readiness warmup failed ({error})")
+}
+
+fn handle_tui_readiness_warmup_result(
+    tui_state: Option<&Arc<tui_bridge::TuiSharedState>>,
+    result: Result<(), String>,
+) {
+    if let Err(error) = result {
+        tracing::warn!(
+            error = %error,
+            "tui readiness warmup failed; continuing with degraded DB-unavailable startup"
+        );
+        if let Some(state) = tui_state {
+            state.push_console_log(tui_readiness_warmup_failure_message(&error));
+        }
+    }
+}
+
+fn spawn_tui_readiness_warmup(
+    config: &mcp_agent_mail_core::Config,
+    tui_state: &Arc<tui_bridge::TuiSharedState>,
+) {
+    let config = config.clone();
+    let tui_state = Arc::clone(tui_state);
+    if let Err(error) = std::thread::Builder::new()
+        .name("tui-readiness-warmup".into())
+        .spawn(move || {
+            handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check_quick(&config));
+        })
+    {
+        handle_tui_readiness_warmup_result(None, Err(format!("spawn failed: {error}")));
+    }
+}
+
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
 
-    // Run startup verification probes before committing to background workers.
-    let probe_report = startup_checks::run_startup_probes(config);
-    if !probe_report.is_ok() {
-        return Err(std::io::Error::other(probe_report.format_errors()));
-    }
-    // Force DB initialization (including migrations) during startup so HTTP/TUI
-    // surfaces that open direct sync connections never observe an uninitialized
-    // SQLite file and emit "no such table" query errors.
-    readiness_check(config).map_err(std::io::Error::other)?;
-
-    // Enable global query tracker if instrumentation is on.
-    if config.instrumentation_enabled {
-        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
-    }
+    prepare_http_runtime_startup(config)?;
     heal_storage_lock_artifacts(config);
     init_search_bridge(config);
     mcp_agent_mail_storage::wbq_start();
@@ -1456,9 +1467,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     retention::start(config);
     // readiness_check() already performed the first integrity verification.
     // Avoid immediately repeating the same expensive check in the guard loop.
-    if config.integrity_check_on_startup {
-        integrity_guard::note_startup_integrity_probe_completed();
-    }
+    note_startup_integrity_probe_if_enabled(config);
     integrity_guard::start(config);
     disk_monitor::start(config);
     start_advisory_consistency_probe(config);
@@ -7503,27 +7512,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_search_recovery_skips_nonrecoverable_errors() {
-        let config = mcp_agent_mail_core::Config::default();
-        assert!(!recover_startup_search_backfill_db(
-            &config,
-            "permission denied"
-        ));
-    }
-
-    #[test]
-    fn startup_search_recovery_skips_memory_database() {
-        let config = mcp_agent_mail_core::Config {
-            database_url: "sqlite:///:memory:".to_string(),
-            ..Default::default()
-        };
-        assert!(!recover_startup_search_backfill_db(
-            &config,
-            "database disk image is malformed"
-        ));
-    }
-
-    #[test]
     fn tui_readiness_warmup_failure_records_console_log() {
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
@@ -7552,6 +7540,27 @@ mod tests {
         handle_tui_readiness_warmup_result(Some(&state), Ok(()));
 
         assert!(state.console_log_since(0).is_empty());
+    }
+
+    #[test]
+    fn startup_search_recovery_skips_nonrecoverable_errors() {
+        let config = mcp_agent_mail_core::Config::default();
+        assert!(!recover_startup_search_backfill_db(
+            &config,
+            "permission denied"
+        ));
+    }
+
+    #[test]
+    fn startup_search_recovery_skips_memory_database() {
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        assert!(!recover_startup_search_backfill_db(
+            &config,
+            "database disk image is malformed"
+        ));
     }
 
     #[cfg(target_os = "linux")]

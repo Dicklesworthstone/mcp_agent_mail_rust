@@ -791,8 +791,12 @@ fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), C
 }
 
 /// Resolve agent ID from --agent flag or AGENT_MAIL_AGENT/AGENT_NAME env vars.
-fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Option<(i64, String)> {
-    let name = flag
+fn resolve_agent_id(
+    conn: &DbConn,
+    project_id: i64,
+    flag: Option<&str>,
+) -> Result<Option<(i64, String)>, CliError> {
+    let Some(name) = flag
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(std::borrow::ToOwned::to_owned)
@@ -807,20 +811,37 @@ fn resolve_agent_id(conn: &DbConn, project_id: i64, flag: Option<&str>) -> Optio
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-        })?;
-    let rows = conn
-        .query_sync(
-            "SELECT id, name
-             FROM agents
-             WHERE project_id = ? AND lower(name) = lower(?)
-             LIMIT 1",
-            &[Value::BigInt(project_id), Value::Text(name)],
-        )
-        .ok()?;
-    let row = rows.first()?;
-    let id: i64 = row.get_named("id").ok().or_else(|| row.get_as(0).ok())?;
-    let agent_name: String = row.get_named("name").ok().or_else(|| row.get_as(1).ok())?;
-    if id > 0 { Some((id, agent_name)) } else { None }
+        })
+    else {
+        return Ok(None);
+    };
+    let resolved = crate::context::resolve_agent(conn, project_id, &name)?;
+    Ok(Some((resolved.id, resolved.name)))
+}
+
+fn soften_implicit_missing_agent_error(
+    explicit_flag: Option<&str>,
+    result: Result<Option<(i64, String)>, CliError>,
+) -> Result<Option<(i64, String)>, CliError> {
+    match result {
+        Err(CliError::InvalidArgument(message))
+            if explicit_flag.is_none() && message.starts_with("agent not found: ") =>
+        {
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
+fn resolve_optional_agent_id(
+    conn: &DbConn,
+    project_id: i64,
+    explicit_flag: Option<&str>,
+) -> Result<Option<(i64, String)>, CliError> {
+    soften_implicit_missing_agent_error(
+        explicit_flag,
+        resolve_agent_id(conn, project_id, explicit_flag),
+    )
 }
 
 /// Format seconds into human-readable relative time.
@@ -2872,7 +2893,7 @@ fn build_navigate(
         }
         ["inbox", agent_name] => {
             // Resolve agent and get inbox using simplified direct query
-            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
+            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name))?;
             if let Some((agent_id, name)) = agent_opt {
                 let result = build_inbox(
                     conn,
@@ -2953,7 +2974,7 @@ fn build_navigate(
             ))
         }
         ["mailbox", agent_name] => {
-            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
+            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name))?;
             if let Some((agent_id, name)) = agent_opt {
                 let result = build_inbox(
                     conn,
@@ -2979,7 +3000,7 @@ fn build_navigate(
             }
         }
         ["outbox", agent_name] => {
-            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
+            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name))?;
             if let Some((agent_id, _name)) = agent_opt {
                 let entries = build_outbox_entries(conn, project_id, agent_id, 50, false)?;
                 Ok((NavigateResult::Inbox { entries }, None))
@@ -3014,7 +3035,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         RobotSubcommand::Status => {
             let conn = crate::open_db_sync()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let agent = resolve_agent_id(&conn, project_id, args.agent.as_deref());
+            let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
 
             let agent_name = agent.as_ref().map(|(_, n)| n.clone());
             let (data, actions) = build_status(&conn, project_id, &project_slug, agent)?;
@@ -3070,7 +3091,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let conn = crate::open_db_sync()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let (agent_id, agent_name_str) =
-                resolve_agent_id(&conn, project_id, args.agent.as_deref()).ok_or_else(|| {
+                resolve_agent_id(&conn, project_id, args.agent.as_deref())?.ok_or_else(|| {
                     CliError::InvalidArgument(
                         "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME"
                             .to_string(),
@@ -3172,7 +3193,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let conn = crate::open_db_sync()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
-            let agent = resolve_agent_id(&conn, project_id, agent_flag);
+            let agent = resolve_optional_agent_id(&conn, project_id, agent_flag)?;
             let (data, actions) = build_reservations(
                 &conn,
                 project_id,
@@ -3534,7 +3555,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         RobotSubcommand::Analytics => {
             let conn = crate::open_db_sync()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let agent = resolve_agent_id(&conn, project_id, args.agent.as_deref());
+            let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
             let anomalies = build_analytics(&conn, project_id, agent)?;
 
             #[derive(Serialize)]
@@ -3663,7 +3684,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         RobotSubcommand::Navigate { uri } => {
             let conn = crate::open_db_sync()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let agent = resolve_agent_id(&conn, project_id, args.agent.as_deref());
+            let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
 
             let (result, _action) = build_navigate(&conn, &uri, project_id, &project_slug, agent)?;
 
@@ -5481,6 +5502,107 @@ mod tests {
         assert_eq!(rows[0].name, "rubyprairie");
         assert_eq!(rows[0].program, "codex-cli");
         assert_eq!(rows[0].msg_count, 2);
+    }
+
+    #[test]
+    fn resolve_agent_id_finds_case_insensitive_agent() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_agent_resolve_case.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents table");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'BlueLake')",
+            &empty,
+        )
+        .expect("insert agent");
+
+        let resolved =
+            resolve_agent_id(&conn, 1, Some("bluelake")).expect("case-insensitive resolve");
+        assert_eq!(resolved, Some((1, "BlueLake".to_string())));
+    }
+
+    #[test]
+    fn resolve_agent_id_preserves_ambiguous_agent_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir
+            .path()
+            .join("robot_agent_resolve_ambiguous.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents table");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name)
+             VALUES (1, 1, 'BlueLake'), (2, 1, 'bluelake')",
+            &empty,
+        )
+        .expect("insert duplicate logical agents");
+
+        let err = resolve_agent_id(&conn, 1, Some("BlUeLaKe"))
+            .expect_err("ambiguous legacy case-duplicate rows must error");
+        assert!(
+            err.to_string().contains("ambiguous agent name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn soften_implicit_missing_agent_error_drops_missing_env_agent() {
+        let result = soften_implicit_missing_agent_error(
+            None,
+            Err(CliError::InvalidArgument(
+                "agent not found: GhostAgent".to_string(),
+            )),
+        )
+        .expect("missing implicit agent should be ignored");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn soften_implicit_missing_agent_error_preserves_explicit_missing_agent() {
+        let err = soften_implicit_missing_agent_error(
+            Some("GhostAgent"),
+            Err(CliError::InvalidArgument(
+                "agent not found: GhostAgent".to_string(),
+            )),
+        )
+        .expect_err("explicit missing agent should stay an error");
+        assert!(
+            err.to_string().contains("agent not found: GhostAgent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn soften_implicit_missing_agent_error_preserves_ambiguous_agent_error() {
+        let err = soften_implicit_missing_agent_error(
+            None,
+            Err(CliError::InvalidArgument(
+                "ambiguous agent name 'BlueLake' in project 1".to_string(),
+            )),
+        )
+        .expect_err("ambiguous env agent should stay an error");
+        assert!(err.to_string().contains("ambiguous agent name"));
     }
 
     fn setup_robot_thread_message_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {

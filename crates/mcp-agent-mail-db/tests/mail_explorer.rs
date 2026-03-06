@@ -425,6 +425,64 @@ fn explorer_all_directions() {
 }
 
 #[test]
+fn explorer_agent_name_lookup_is_case_insensitive() {
+    let TestCorpus { pool: p, _dir, .. } = seed_corpus("agent_name_case");
+
+    let canonical = block_on({
+        let p = p.clone();
+        move |cx| async move {
+            match fetch_explorer_page(
+                &cx,
+                &p,
+                &ExplorerQuery {
+                    agent_name: "RedFox".into(),
+                    direction: Direction::All,
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Outcome::Ok(v) => v,
+                other => panic!("canonical explorer lookup failed: {other:?}"),
+            }
+        }
+    });
+
+    let lowercase = block_on(move |cx| async move {
+        match fetch_explorer_page(
+            &cx,
+            &p,
+            &ExplorerQuery {
+                agent_name: "redfox".into(),
+                direction: Direction::All,
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Outcome::Ok(v) => v,
+            other => panic!("lowercase explorer lookup failed: {other:?}"),
+        }
+    });
+
+    let canonical_ids: Vec<i64> = canonical
+        .entries
+        .iter()
+        .map(|entry| entry.message_id)
+        .collect();
+    let lowercase_ids: Vec<i64> = lowercase
+        .entries
+        .iter()
+        .map(|entry| entry.message_id)
+        .collect();
+
+    assert_eq!(lowercase.total_count, canonical.total_count);
+    assert_eq!(lowercase_ids, canonical_ids);
+}
+
+#[test]
 fn explorer_cross_project() {
     let TestCorpus { pool: p, _dir, .. } = seed_corpus("cross_project");
 

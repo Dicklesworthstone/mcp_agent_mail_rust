@@ -155,8 +155,9 @@ pub struct ResolvedAgent {
 
 /// Look up an agent by name within a project.
 ///
-/// Agent names are resolved case-insensitively to match the MCP tool/database
-/// surface.
+/// Agent names are resolved case-insensitively when the project has a single
+/// matching row. Legacy databases may still contain case-duplicate rows before
+/// `am migrate`; in that case, fail instead of guessing which agent was meant.
 pub fn resolve_agent(
     conn: &mcp_agent_mail_db::DbConn,
     project_id: i64,
@@ -165,13 +166,20 @@ pub fn resolve_agent(
     let rows = conn
         .query_sync(
             "SELECT id, name FROM agents \
-             WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1",
+             WHERE project_id = ? AND name = ? COLLATE NOCASE \
+             ORDER BY id ASC LIMIT 2",
             &[
                 sqlmodel_core::Value::BigInt(project_id),
                 sqlmodel_core::Value::Text(agent_name.to_string()),
             ],
         )
         .map_err(|e| CliError::Other(format!("agent query failed: {e}")))?;
+
+    if rows.len() > 1 {
+        return Err(CliError::InvalidArgument(format!(
+            "ambiguous agent name '{agent_name}' in project {project_id}; run `am migrate` to deduplicate legacy case-duplicate rows"
+        )));
+    }
 
     if let Some(row) = rows.first() {
         return Ok(ResolvedAgent {
@@ -545,5 +553,48 @@ mod tests {
         assert_eq!(agent.name, "RedFox");
         assert_eq!(agent.project_id, proj.id);
         assert!(agent.id > 0);
+    }
+
+    #[test]
+    fn resolve_agent_rejects_ambiguous_case_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let url = format!("sqlite:///{}", db_path.display());
+        let ctx = CliContext::open_with_url(&url).unwrap();
+
+        // Recreate a legacy pre-migration duplicate state so the resolver's
+        // ambiguity handling can be exercised on a migrated test database.
+        ctx.conn
+            .execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+            .unwrap();
+
+        ctx.conn
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
+            )
+            .unwrap();
+        let proj = ctx.resolve_project("p").unwrap();
+
+        ctx.conn
+            .execute_raw(&format!(
+                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                 VALUES ({}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+                proj.id
+            ))
+            .unwrap();
+        ctx.conn
+            .execute_raw(&format!(
+                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                 VALUES ({}, 'redfox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+                proj.id
+            ))
+            .unwrap();
+
+        let err = ctx.resolve_agent(proj.id, "ReDFoX").unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous agent name"),
+            "unexpected: {err}"
+        );
+        assert!(err.to_string().contains("am migrate"), "unexpected: {err}");
     }
 }

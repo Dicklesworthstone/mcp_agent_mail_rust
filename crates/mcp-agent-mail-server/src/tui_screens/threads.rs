@@ -634,6 +634,22 @@ impl ThreadExplorerScreen {
         });
     }
 
+    fn clear_detail_state(&mut self, state: Option<&TuiSharedState>) {
+        self.detail_messages.clear();
+        self.loaded_thread_id.clear();
+        self.detail_scroll = 0;
+        self.total_thread_messages = 0;
+        self.loaded_message_count = 0;
+        self.detail_cursor = 0;
+        self.expanded_message_ids.clear();
+        self.collapsed_tree_ids.clear();
+        self.detail_tree_focus = true;
+        self.load_older_selected = false;
+        if let Some(state) = state {
+            self.emit_thread_detail_diagnostic(state, "", 0, 0, 0);
+        }
+    }
+
     /// Re-sort the thread list according to the active sort mode.
     fn apply_sort(&mut self) {
         match self.sort_mode {
@@ -682,9 +698,12 @@ impl ThreadExplorerScreen {
     /// Fetch thread list from DB.
     fn refresh_thread_list(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
+        let selected_thread_id = self.threads.get(self.cursor).map(|t| t.thread_id.clone());
         let Some(conn) = &self.db_conn else {
             self.threads.clear();
             self.cursor = 0;
+            self.clear_detail_state(Some(state));
+            self.sync_focused_event();
             self.list_dirty = false;
             self.last_refresh = Some(Instant::now());
             self.db_conn_attempted = false;
@@ -712,12 +731,20 @@ impl ThreadExplorerScreen {
         self.last_refresh = Some(Instant::now());
         self.list_dirty = false;
 
-        // Clamp cursor
+        // Preserve selection by thread id so resorting does not silently jump to
+        // a different thread when activity changes reorder the list.
         if self.threads.is_empty() {
             self.cursor = 0;
+        } else if let Some(selected_thread_id) = selected_thread_id.as_deref() {
+            self.cursor = self
+                .threads
+                .iter()
+                .position(|thread| thread.thread_id == selected_thread_id)
+                .unwrap_or_else(|| self.cursor.min(self.threads.len() - 1));
         } else {
             self.cursor = self.cursor.min(self.threads.len() - 1);
         }
+        self.sync_focused_event();
 
         // Truth assertion: if DB has threads but rendered list is empty without
         // a filter, something is wrong with the aggregation pipeline.
@@ -759,55 +786,97 @@ impl ThreadExplorerScreen {
 
     /// Refresh the detail panel if the selected thread changed.
     fn refresh_detail_if_needed(&mut self, state: Option<&TuiSharedState>) {
-        let current_thread_id = self
-            .threads
-            .get(self.cursor)
-            .map_or("", |t| t.thread_id.as_str());
+        let selected_thread = self.threads.get(self.cursor);
+        let current_thread_id = selected_thread.map_or("", |t| t.thread_id.as_str());
+        let selected_message_count = selected_thread.map_or(0, |t| t.message_count);
+        let selected_last_timestamp = selected_thread.map_or(0, |t| t.last_timestamp_micros);
+        let loaded_last_timestamp = self
+            .detail_messages
+            .last()
+            .map_or(0, |m| m.timestamp_micros);
+        let preserving_same_thread =
+            current_thread_id == self.loaded_thread_id && !self.loaded_thread_id.is_empty();
 
-        if current_thread_id == self.loaded_thread_id && !self.loaded_thread_id.is_empty() {
+        if preserving_same_thread
+            && self.total_thread_messages == selected_message_count
+            && loaded_last_timestamp == selected_last_timestamp
+        {
             return;
         }
 
         if current_thread_id.is_empty() {
-            self.detail_messages.clear();
-            self.loaded_thread_id.clear();
-            self.detail_scroll = 0;
-            self.total_thread_messages = 0;
-            self.loaded_message_count = 0;
-            self.detail_cursor = 0;
-            self.expanded_message_ids.clear();
-            self.collapsed_tree_ids.clear();
-            self.detail_tree_focus = true;
-            self.load_older_selected = false;
-            if let Some(state) = state {
-                self.emit_thread_detail_diagnostic(state, "", 0, 0, 0);
-            }
+            self.clear_detail_state(state);
+            self.sync_focused_event();
             return;
         }
 
         let Some(conn) = &self.db_conn else {
+            self.clear_detail_state(state);
+            self.sync_focused_event();
             return;
         };
 
-        // Get total message count for pagination
-        self.total_thread_messages = fetch_thread_message_count(conn, current_thread_id);
+        let previous_total_thread_messages = self.total_thread_messages;
+        let previous_loaded_message_count = self.loaded_message_count;
+        let previous_selected_message_id =
+            preserving_same_thread.then(|| self.selected_tree_row().map(|row| row.message_id));
+        let previous_detail_cursor = self.detail_cursor;
+        let previous_detail_scroll = self.detail_scroll;
+        let previous_expanded_message_ids = self.expanded_message_ids.clone();
+        let previous_collapsed_tree_ids = self.collapsed_tree_ids.clone();
+        let previous_detail_tree_focus = self.detail_tree_focus;
+        let previous_load_older_selected = self.load_older_selected;
 
-        // Load the most recent page_size messages
+        self.total_thread_messages = fetch_thread_message_count(conn, current_thread_id);
+        let additional_messages = self
+            .total_thread_messages
+            .saturating_sub(previous_total_thread_messages);
+        let reload_limit = if preserving_same_thread {
+            previous_loaded_message_count
+                .saturating_add(additional_messages)
+                .max(self.page_size)
+        } else {
+            self.page_size
+        };
+
+        // Keep the currently loaded window stable when the selected thread
+        // receives new messages, instead of snapping back to page zero and
+        // discarding older-page context the operator already loaded.
         let (messages, offset) =
-            fetch_thread_messages_paginated(conn, current_thread_id, self.page_size, 0);
+            fetch_thread_messages_paginated(conn, current_thread_id, reload_limit, 0);
         self.detail_messages = messages;
         self.loaded_message_count = self.detail_messages.len();
         let current_thread_id = current_thread_id.to_string();
         self.loaded_thread_id.clone_from(&current_thread_id);
-        self.detail_cursor = self.detail_messages.len().saturating_sub(1);
-        self.detail_scroll = self.detail_cursor.saturating_sub(3);
-        self.expanded_message_ids.clear();
-        self.collapsed_tree_ids.clear();
-        self.detail_tree_focus = true;
-        if let Some(last) = self.detail_messages.last() {
-            self.expanded_message_ids.insert(last.id);
+        if preserving_same_thread {
+            self.expanded_message_ids = previous_expanded_message_ids;
+            self.collapsed_tree_ids = previous_collapsed_tree_ids;
+            self.detail_tree_focus = previous_detail_tree_focus;
+            self.load_older_selected = previous_load_older_selected;
+
+            let tree_rows = self.detail_tree_rows();
+            if let Some(selected_message_id) = previous_selected_message_id.flatten() {
+                self.detail_cursor = tree_rows
+                    .iter()
+                    .position(|row| row.message_id == selected_message_id)
+                    .unwrap_or_else(|| {
+                        previous_detail_cursor.min(tree_rows.len().saturating_sub(1))
+                    });
+            } else {
+                self.detail_cursor = previous_detail_cursor.min(tree_rows.len().saturating_sub(1));
+            }
+            self.detail_scroll = previous_detail_scroll.min(tree_rows.len().saturating_sub(1));
+        } else {
+            self.detail_cursor = self.detail_messages.len().saturating_sub(1);
+            self.detail_scroll = self.detail_cursor.saturating_sub(3);
+            self.expanded_message_ids.clear();
+            self.collapsed_tree_ids.clear();
+            self.detail_tree_focus = true;
+            if let Some(last) = self.detail_messages.last() {
+                self.expanded_message_ids.insert(last.id);
+            }
+            self.load_older_selected = false;
         }
-        self.load_older_selected = false;
         // If there are older messages to load, note the offset
         let _ = offset; // offset is 0 for initial load
         if let Some(state) = state {
@@ -3914,6 +3983,80 @@ mod tests {
         );
         assert_eq!(diag.raw_count, 0);
         assert_eq!(diag.rendered_count, 0);
+    }
+
+    #[test]
+    fn refresh_thread_list_without_db_clears_focused_event() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("th-1", 3, 2));
+        screen.sync_focused_event();
+        assert!(screen.focused_event().is_some());
+
+        screen.db_conn_attempted = true;
+        screen.refresh_thread_list(&state);
+
+        assert!(screen.threads.is_empty());
+        assert!(screen.focused_event().is_none());
+    }
+
+    #[test]
+    fn refresh_detail_if_needed_preserves_same_thread_context_on_new_message() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = ThreadExplorerScreen::new();
+        screen.page_size = 10;
+        screen.db_conn = Some(make_thread_messages_db("thread-live", 25));
+
+        let mut thread = make_thread("thread-live", 25, 2);
+        thread.last_timestamp_micros = 1_700_000_025_000_000;
+        thread.last_timestamp_iso = "2026-02-06T12:00:25Z".to_string();
+        screen.threads.push(thread);
+
+        screen.refresh_detail_if_needed(Some(&state));
+        assert_eq!(screen.loaded_message_count, 10);
+
+        screen.load_older_messages(&state);
+        assert_eq!(screen.loaded_message_count, 25);
+
+        screen.detail_cursor = 7;
+        screen.detail_scroll = 4;
+        screen.expanded_message_ids.insert(8);
+        screen.collapsed_tree_ids.insert(9);
+        screen.detail_tree_focus = false;
+        assert_eq!(
+            screen.selected_tree_row().map(|row| row.message_id),
+            Some(8)
+        );
+
+        let conn = screen.db_conn.as_ref().expect("thread db connection");
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, subject, body_md, importance, created_ts, sender_id, thread_id) \
+             VALUES (26, 'Subject 26', 'Body 26', 'normal', 1700000026000000, 1, 'thread-live')",
+        )
+        .expect("insert newest message");
+        conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id) VALUES (26, 2)")
+            .expect("insert newest recipient");
+
+        let thread = screen.threads.first_mut().expect("thread summary");
+        thread.message_count = 26;
+        thread.last_timestamp_micros = 1_700_000_026_000_000;
+        thread.last_timestamp_iso = "2026-02-06T12:00:26Z".to_string();
+
+        screen.refresh_detail_if_needed(Some(&state));
+
+        assert_eq!(screen.total_thread_messages, 26);
+        assert_eq!(screen.loaded_message_count, 26);
+        assert_eq!(screen.detail_messages.first().map(|m| m.id), Some(1));
+        assert_eq!(screen.detail_messages.last().map(|m| m.id), Some(26));
+        assert_eq!(
+            screen.selected_tree_row().map(|row| row.message_id),
+            Some(8)
+        );
+        assert_eq!(screen.detail_scroll, 4);
+        assert!(screen.expanded_message_ids.contains(&8));
+        assert!(screen.collapsed_tree_ids.contains(&9));
+        assert!(!screen.detail_tree_focus);
     }
 
     #[test]

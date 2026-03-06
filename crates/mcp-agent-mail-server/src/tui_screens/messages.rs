@@ -200,6 +200,8 @@ const QUERY_PRESETS: &[QueryPreset] = &[
 enum SearchMethod {
     /// No search executed yet.
     None,
+    /// Showing live event-ring results while the DB is unavailable.
+    Live,
     /// Showing recent messages (empty query).
     Recent,
     /// Unified search service (lexical/semantic/hybrid routing).
@@ -2471,13 +2473,6 @@ impl MessageBrowserScreen {
     /// Execute a search query against the database, merging live event results.
     fn execute_search(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
-        let Some(conn) = &self.db_conn else {
-            // Avoid hot-looping failed open attempts on every tick.
-            self.search_dirty = false;
-            self.db_conn_attempted = false;
-            return;
-        };
-
         let query = self.search_input.value().trim().to_string();
         self.last_refresh = Some(Instant::now());
 
@@ -2488,6 +2483,37 @@ impl MessageBrowserScreen {
         let project_filter = match &self.inbox_mode {
             InboxMode::Local(slug) => Some(slug.as_str()),
             InboxMode::Global => None,
+        };
+
+        let Some(conn) = &self.db_conn else {
+            let mut results = Self::search_live_events(state, &query, show_project);
+            if let Some(slug) = project_filter {
+                results.retain(|entry| entry.project_slug == slug);
+            }
+            results.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_micros));
+
+            if query.is_empty() {
+                self.last_search.clear();
+            } else {
+                self.last_search.clone_from(&query);
+            }
+            self.search_method = SearchMethod::Live;
+
+            self.results = results;
+            self.results_generation = self.results_generation.wrapping_add(1);
+            self.prune_selection_to_visible();
+            self.total_results = self.results.len();
+
+            if self.results.is_empty() {
+                self.cursor = 0;
+            } else {
+                self.cursor = self.cursor.min(self.results.len() - 1);
+            }
+            self.detail_scroll.set(0);
+            self.search_dirty = false;
+            // Avoid hot-looping failed open attempts on every tick.
+            self.db_conn_attempted = false;
+            return;
         };
 
         let (mut results, total, method) = if query.is_empty() {
@@ -2620,7 +2646,8 @@ impl MessageBrowserScreen {
 
                 // If there's a query, filter by it
                 if !query_lower.is_empty() {
-                    let haystack = format!("{from} {subject} {}", to.join(" ")).to_lowercase();
+                    let haystack =
+                        format!("{from} {subject} {} {body_md}", to.join(" ")).to_lowercase();
                     if !haystack.contains(&query_lower) {
                         return None;
                     }
@@ -3111,6 +3138,7 @@ impl MailScreen for MessageBrowserScreen {
         // Render search bar with explainability and mode indicator
         let method_label = match self.search_method {
             SearchMethod::None => "",
+            SearchMethod::Live => "live-events",
             SearchMethod::Recent => "recent",
             SearchMethod::Unified => "search-v3",
         };
@@ -7264,8 +7292,39 @@ mod tests {
     fn search_method_variants_exist() {
         // Ensure all variants compile
         let _ = SearchMethod::None;
+        let _ = SearchMethod::Live;
         let _ = SearchMethod::Recent;
         let _ = SearchMethod::Unified;
+    }
+
+    #[test]
+    fn execute_search_without_db_uses_live_method_and_results() {
+        use crate::tui_events::{EventSource, MailEvent};
+
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::with_event_capacity(&config, 8);
+        let _ = state.push_event(MailEvent::MessageSent {
+            seq: 0,
+            timestamp_micros: 1_700_000_000_000_000,
+            source: EventSource::Mail,
+            redacted: false,
+            id: 42,
+            from: "GoldHawk".to_string(),
+            to: vec!["SilverFox".to_string()],
+            subject: "hello world".to_string(),
+            thread_id: "t-1".to_string(),
+            project: "myproj".to_string(),
+            body_md: "Test body content".to_string(),
+        });
+
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn_attempted = true;
+
+        screen.execute_search(&state);
+
+        assert_eq!(screen.search_method, SearchMethod::Live);
+        assert_eq!(screen.results.len(), 1);
+        assert_eq!(screen.results[0].id, 42);
     }
 
     #[test]
@@ -7689,6 +7748,11 @@ mod tests {
         // "goldhawk" appears in both events (sender of #42, recipient of #43)
         let by_agent = MessageBrowserScreen::search_live_events(&state, "goldhawk", false);
         assert_eq!(by_agent.len(), 2);
+
+        // Body text stays searchable in degraded live-event mode.
+        let by_body = MessageBrowserScreen::search_live_events(&state, "reply body", false);
+        assert_eq!(by_body.len(), 1);
+        assert_eq!(by_body[0].id, 43);
 
         // Non-matching query returns empty
         let empty = MessageBrowserScreen::search_live_events(&state, "nonexistent", false);
