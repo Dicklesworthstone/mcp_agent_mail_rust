@@ -987,7 +987,7 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
     let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_agent(&conn, 101, 1, "GreenCastle", "test", "test");
-    insert_agent(&conn, 202, 2, "GreenCastle", "test", "test");
+    insert_agent(&conn, 202, 2, "greencastle", "test", "test");
 
     let source_archive_file = env
         .storage_root
