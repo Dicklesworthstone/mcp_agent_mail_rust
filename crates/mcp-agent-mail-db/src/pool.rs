@@ -4036,6 +4036,67 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    #[test]
+    fn sqlite_init_drops_legacy_agents_lower_name_index_before_runtime_open() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("legacy_agents_lower_name.sqlite3");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        let canonical = open_sqlite_file_with_lock_retry_canonical(db_path_str)
+            .expect("open canonical sqlite file");
+        canonical
+            .execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
+            .expect("apply canonical pragmas");
+        canonical
+            .execute_raw(&schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        canonical
+            .execute_raw(
+                "CREATE UNIQUE INDEX uq_agents_name_ci \
+                 ON agents(lower(name)) WHERE is_active = 1",
+            )
+            .expect("create legacy lower(name) partial index");
+        drop(canonical);
+
+        match rt.block_on(run_sqlite_init_once(&cx, db_path_str, true)) {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => panic!("sqlite init should repair legacy index: {err}"),
+            Outcome::Cancelled(reason) => panic!("sqlite init cancelled unexpectedly: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                std::panic::resume_unwind(payload);
+            }
+        }
+
+        let verify = open_sqlite_file_with_lock_retry_canonical(db_path_str)
+            .expect("reopen canonical sqlite file");
+        let legacy_rows = verify
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'uq_agents_name_ci'",
+                &[],
+            )
+            .expect("query sqlite_master");
+        assert!(
+            legacy_rows.is_empty(),
+            "canonical init should drop legacy lower(name) partial index"
+        );
+        drop(verify);
+
+        let runtime = open_sqlite_file_with_lock_retry(db_path_str)
+            .expect("runtime sqlite should open after legacy index cleanup");
+        let rows = runtime
+            .query_sync("SELECT 1 AS val", &[])
+            .expect("runtime query");
+        assert_eq!(rows.len(), 1);
+    }
+
     // ── DbPoolConfig::from_env ──────────────────────────────────────────
 
     #[test]

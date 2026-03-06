@@ -797,15 +797,9 @@ fn split_resource_path_and_query(
         CliError::InvalidArgument(format!("invalid URI scheme: {uri} (expected resource://)"))
     })?;
     if let Some((base, query)) = path.split_once('?') {
-        Ok((
-            percent_decode_resource_component(base),
-            parse_resource_query(query),
-        ))
+        Ok((base.to_string(), parse_resource_query(query)))
     } else {
-        Ok((
-            percent_decode_resource_component(path),
-            std::collections::HashMap::new(),
-        ))
+        Ok((path.to_string(), std::collections::HashMap::new()))
     }
 }
 
@@ -852,6 +846,26 @@ fn percent_decode_resource_component(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_resource_bool(value: Option<&String>) -> bool {
+    value.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "t" | "yes" | "y" | "on"
+        )
+    })
+}
+
+const RESOURCE_URI_LIMIT_MAX: usize = 10_000;
+
+fn parse_resource_limit(value: Option<&String>, default_limit: usize) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|limit| *limit > 0)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .map(|limit| limit.min(RESOURCE_URI_LIMIT_MAX))
+        .unwrap_or(default_limit)
 }
 
 /// Resolve agent ID from --agent flag or AGENT_MAIL_AGENT/AGENT_NAME env vars.
@@ -2912,24 +2926,29 @@ fn build_navigate(
             |project| resolve_project_sync(conn, project),
         )?;
 
-    let parts: Vec<&str> = path.split('/').collect();
+    let parts: Vec<String> = path
+        .split('/')
+        .map(percent_decode_resource_component)
+        .collect();
+    let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
 
-    match parts.as_slice() {
+    match parts_ref.as_slice() {
         ["projects"] => {
             let projects = build_projects(conn)?;
             Ok((NavigateResult::Projects { projects }, None))
         }
-        ["project", slug] => {
-            // Find project by slug and return its details
+        ["project", project_key] => {
+            let (resolved_project_id, resolved_project_slug) =
+                resolve_project_sync(conn, project_key)?;
             let row = conn
                 .query_sync(
-                    "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ?",
-                    &[Value::Text(slug.to_string())],
+                    "SELECT id, slug, human_key, created_at FROM projects WHERE id = ?",
+                    &[Value::BigInt(resolved_project_id)],
                 )
                 .map_err(|e| CliError::Other(format!("project query: {e}")))?
                 .into_iter()
                 .next()
-                .ok_or_else(|| CliError::Other(format!("project not found: {slug}")))?;
+                .ok_or_else(|| CliError::Other(format!("project not found: {project_key}")))?;
 
             let data = serde_json::json!({
                 "id": row.get_named::<i64>("id").unwrap_or(0),
@@ -2942,49 +2961,49 @@ fn build_navigate(
                     resource_type: "project".to_string(),
                     data,
                 },
-                None,
+                Some(resolved_project_slug),
             ))
         }
-        ["agents", slug] => {
-            // Get project_id for slug
-            let pid = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[Value::Text(slug.to_string())],
-                )
-                .map_err(|e| CliError::Other(format!("project lookup: {e}")))?
-                .first()
-                .and_then(|r| r.get_named::<i64>("id").ok())
-                .ok_or_else(|| CliError::Other(format!("project not found: {slug}")))?;
-
-            let agents = build_agents(conn, pid, false, None)?;
-            Ok((NavigateResult::Agents { agents }, None))
+        ["agents", project_key] => {
+            let (resolved_project_id, resolved_project_slug) =
+                resolve_project_sync(conn, project_key)?;
+            let agents = build_agents(conn, resolved_project_id, false, None)?;
+            Ok((
+                NavigateResult::Agents { agents },
+                Some(resolved_project_slug),
+            ))
         }
         ["inbox", agent_name] => {
             // Resolve agent and get inbox using simplified direct query
             let agent_opt = resolve_agent_id(conn, effective_project_id, Some(agent_name))?;
             if let Some((agent_id, name)) = agent_opt {
+                let limit = parse_resource_limit(query.get("limit"), 50);
+                let include_bodies = parse_resource_bool(query.get("include_bodies"));
+                let urgent_only = parse_resource_bool(query.get("urgent_only"));
                 let result = build_inbox(
                     conn,
                     effective_project_id,
                     &effective_project_slug,
                     agent_id,
                     &name,
-                    false,
+                    urgent_only,
                     false,
                     true,
                     false,
-                    50,
-                    false,
+                    limit,
+                    include_bodies,
                 )?;
                 Ok((
                     NavigateResult::Inbox {
                         entries: result.entries,
                     },
-                    None,
+                    Some(effective_project_slug.clone()),
                 ))
             } else {
-                Ok((NavigateResult::Inbox { entries: vec![] }, None))
+                Ok((
+                    NavigateResult::Inbox { entries: vec![] },
+                    Some(effective_project_slug.clone()),
+                ))
             }
         }
         ["message", id_str] => {
@@ -2992,30 +3011,34 @@ fn build_navigate(
                 .parse()
                 .map_err(|_| CliError::InvalidArgument(format!("invalid message id: {id_str}")))?;
             let message = build_message(conn, effective_project_id, msg_id)?;
-            Ok((NavigateResult::Message { message }, None))
+            Ok((
+                NavigateResult::Message { message },
+                Some(effective_project_slug.clone()),
+            ))
         }
         ["thread", thread_id] => {
+            let limit = parse_resource_limit(query.get("limit"), 100);
+            let include_bodies = parse_resource_bool(query.get("include_bodies"));
+            let since = query
+                .get("since_ts")
+                .or_else(|| query.get("since"))
+                .map(String::as_str);
             let thread = build_thread(
                 conn,
                 effective_project_id,
                 thread_id,
-                Some(100),
-                None,
-                false,
+                Some(limit),
+                since,
+                include_bodies,
             )?;
-            Ok((NavigateResult::Thread { thread }, None))
+            Ok((
+                NavigateResult::Thread { thread },
+                Some(effective_project_slug.clone()),
+            ))
         }
-        ["file_reservations", slug] => {
-            // Get project_id for slug and return generic data
-            let pid = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[Value::Text(slug.to_string())],
-                )
-                .map_err(|e| CliError::Other(format!("project lookup: {e}")))?
-                .first()
-                .and_then(|r| r.get_named::<i64>("id").ok())
-                .ok_or_else(|| CliError::Other(format!("project not found: {slug}")))?;
+        ["file_reservations", project_key] => {
+            let (resolved_project_id, resolved_project_slug) =
+                resolve_project_sync(conn, project_key)?;
 
             let rows = conn
                 .query_sync(
@@ -3024,7 +3047,7 @@ fn build_navigate(
                      JOIN agents a ON a.id = fr.agent_id
                      WHERE fr.project_id = ?
                      ORDER BY fr.created_ts DESC LIMIT 50",
-                    &[Value::BigInt(pid)],
+                    &[Value::BigInt(resolved_project_id)],
                 )
                 .unwrap_or_default();
 
@@ -3046,12 +3069,14 @@ fn build_navigate(
                     resource_type: "file_reservations".to_string(),
                     data: serde_json::json!({ "reservations": reservations }),
                 },
-                None,
+                Some(resolved_project_slug),
             ))
         }
         ["mailbox", agent_name] => {
             let agent_opt = resolve_agent_id(conn, effective_project_id, Some(agent_name))?;
             if let Some((agent_id, name)) = agent_opt {
+                let limit = parse_resource_limit(query.get("limit"), 50);
+                let include_bodies = parse_resource_bool(query.get("include_bodies"));
                 let result = build_inbox(
                     conn,
                     effective_project_id,
@@ -3062,27 +3087,43 @@ fn build_navigate(
                     false,
                     false,
                     true,
-                    50,
-                    false,
+                    limit,
+                    include_bodies,
                 )?;
                 Ok((
                     NavigateResult::Inbox {
                         entries: result.entries,
                     },
-                    None,
+                    Some(effective_project_slug.clone()),
                 ))
             } else {
-                Ok((NavigateResult::Inbox { entries: vec![] }, None))
+                Ok((
+                    NavigateResult::Inbox { entries: vec![] },
+                    Some(effective_project_slug.clone()),
+                ))
             }
         }
         ["outbox", agent_name] => {
             let agent_opt = resolve_agent_id(conn, effective_project_id, Some(agent_name))?;
             if let Some((agent_id, _name)) = agent_opt {
-                let entries =
-                    build_outbox_entries(conn, effective_project_id, agent_id, 50, false)?;
-                Ok((NavigateResult::Inbox { entries }, None))
+                let limit = parse_resource_limit(query.get("limit"), 50);
+                let include_bodies = parse_resource_bool(query.get("include_bodies"));
+                let entries = build_outbox_entries(
+                    conn,
+                    effective_project_id,
+                    agent_id,
+                    limit,
+                    include_bodies,
+                )?;
+                Ok((
+                    NavigateResult::Inbox { entries },
+                    Some(effective_project_slug.clone()),
+                ))
             } else {
-                Ok((NavigateResult::Inbox { entries: vec![] }, None))
+                Ok((
+                    NavigateResult::Inbox { entries: vec![] },
+                    Some(effective_project_slug.clone()),
+                ))
             }
         }
         _ => Err(CliError::InvalidArgument(format!(
@@ -3763,7 +3804,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
 
-            let (result, _action) = build_navigate(&conn, &uri, project_id, &project_slug, agent)?;
+            let (result, resolved_project) =
+                build_navigate(&conn, &uri, project_id, &project_slug, agent)?;
 
             #[derive(Serialize)]
             struct NavigateData {
@@ -3780,7 +3822,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     result,
                 },
             );
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(resolved_project.unwrap_or(project_slug));
             format_output(&env, format)?
         }
     };
@@ -5625,6 +5667,163 @@ mod tests {
             }
             other => panic!("unexpected navigate result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_build_navigate_supports_project_keys_in_path_segments() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_navigate_project_key.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                task_description TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                contact_policy TEXT,
+                attachments_policy TEXT,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                sender_id INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                \"exclusive\" INTEGER NOT NULL,
+                reason TEXT,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create file reservations");
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'proj', '/tmp/proj', 1000)",
+            &empty,
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (
+                id, project_id, name, program, model, task_description,
+                created_at, updated_at, contact_policy, attachments_policy, last_active_ts
+             ) VALUES (
+                1, 1, 'Sender', 'codex-cli', 'gpt-5', 'task',
+                1000, 1000, 'auto', 'inline', 1000
+             )",
+            &empty,
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO file_reservations (
+                id, project_id, agent_id, path_pattern, \"exclusive\",
+                reason, created_ts, expires_ts, released_ts
+             ) VALUES (
+                1, 1, 1, 'src/**', 1, 'test', 1000, 2000, NULL
+             )",
+            &empty,
+        )
+        .expect("insert reservation");
+
+        let encoded_project_key = "%2Ftmp%2Fproj";
+
+        let (project_result, project_scope) = build_navigate(
+            &conn,
+            &format!("resource://project/{encoded_project_key}"),
+            1,
+            "proj",
+            None,
+        )
+        .expect("navigate project by human key");
+        match project_result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "project");
+                assert_eq!(data["slug"], "proj");
+                assert_eq!(data["path"], "/tmp/proj");
+            }
+            other => panic!("unexpected project result: {other:?}"),
+        }
+        assert_eq!(project_scope.as_deref(), Some("proj"));
+
+        let (agents_result, agents_scope) = build_navigate(
+            &conn,
+            &format!("resource://agents/{encoded_project_key}"),
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate agents by human key");
+        match agents_result {
+            NavigateResult::Agents { agents } => {
+                assert_eq!(agents.len(), 1);
+                assert_eq!(agents[0].name, "Sender");
+            }
+            other => panic!("unexpected agents result: {other:?}"),
+        }
+        assert_eq!(agents_scope.as_deref(), Some("proj"));
+
+        let (reservations_result, reservations_scope) = build_navigate(
+            &conn,
+            &format!("resource://file_reservations/{encoded_project_key}"),
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate reservations by human key");
+        match reservations_result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "file_reservations");
+                assert_eq!(data["reservations"].as_array().map(Vec::len), Some(1));
+            }
+            other => panic!("unexpected reservations result: {other:?}"),
+        }
+        assert_eq!(reservations_scope.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn parse_resource_limit_caps_large_values() {
+        let value = "50000".to_string();
+        assert_eq!(
+            parse_resource_limit(Some(&value), 50),
+            RESOURCE_URI_LIMIT_MAX
+        );
     }
 
     #[test]

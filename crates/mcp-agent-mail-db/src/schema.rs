@@ -951,6 +951,18 @@ pub fn schema_migrations() -> Vec<Migration> {
     // Enforce case-insensitive uniqueness for agent names per project.
     // This prevents "BlueLake" and "bluelake" from coexisting.
     //
+    // Legacy Rust builds created a global partial/expression index
+    // `uq_agents_name_ci` on `lower(name) WHERE is_active = 1`. Canonical
+    // SQLite can open that schema, but the runtime FrankenConnection parser
+    // cannot reconstruct it, which breaks fresh startup on existing
+    // `storage.sqlite3` files. Drop it before runtime open.
+    migrations.push(Migration::new(
+        "v10_drop_legacy_agents_lower_name_index".to_string(),
+        "drop legacy agents lower(name) partial index incompatible with runtime sqlite".to_string(),
+        "DROP INDEX IF EXISTS uq_agents_name_ci".to_string(),
+        String::new(),
+    ));
+
     // v10a: Deduplicate any pre-existing case-duplicate agents before
     // creating the UNIQUE index. For each (project_id, LOWER(name)) group
     // with >1 row, keep the one with the lowest id (oldest) and DELETE the rest.

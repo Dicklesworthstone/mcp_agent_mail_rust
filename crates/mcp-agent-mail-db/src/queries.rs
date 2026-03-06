@@ -3749,11 +3749,10 @@ pub async fn fetch_inbox_global(
                 m.importance, m.ack_required, m.created_ts, m.attachments, \
                 r.kind, s.name as sender_name, r.ack_ts, p.slug as project_slug \
          FROM message_recipients r \
-         JOIN agents a ON a.id = r.agent_id \
          JOIN messages m ON m.id = r.message_id \
          JOIN agents s ON s.id = m.sender_id \
          JOIN projects p ON p.id = m.project_id \
-         WHERE a.name = ? COLLATE NOCASE",
+         WHERE r.agent_id IN (SELECT id FROM agents WHERE name = ? COLLATE NOCASE)",
     );
 
     let mut params: Vec<Value> = vec![Value::Text(agent_name.to_string())];
@@ -3848,10 +3847,10 @@ pub async fn count_unread_global(
 
     let sql = "SELECT p.id as project_id, p.slug as project_slug, COUNT(*) as unread_count \
                FROM message_recipients r \
-               JOIN agents a ON a.id = r.agent_id \
                JOIN messages m ON m.id = r.message_id \
                JOIN projects p ON p.id = m.project_id \
-               WHERE a.name = ? COLLATE NOCASE AND r.read_ts IS NULL \
+               WHERE r.agent_id IN (SELECT id FROM agents WHERE name = ? COLLATE NOCASE) \
+               AND r.read_ts IS NULL \
                GROUP BY p.id, p.slug \
                ORDER BY unread_count DESC";
 

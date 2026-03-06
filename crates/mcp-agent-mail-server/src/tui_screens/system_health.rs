@@ -1379,7 +1379,9 @@ fn emit_screen_diagnostic(state: &TuiSharedState, snap: &DiagnosticsSnapshot) {
     let cfg = state.config_snapshot();
     let transport_mode = cfg.transport_mode().to_string();
     let raw_count = u64::try_from(snap.path_probes.len()).unwrap_or(u64::MAX);
-    let rendered_count = u64::try_from(snap.lines.len()).unwrap_or(u64::MAX);
+    // This diagnostic scope tracks HTTP path probes, which are rendered even
+    // when no remediation/finding lines are emitted.
+    let rendered_count = u64::try_from(snap.path_probes.len()).unwrap_or(u64::MAX);
     let dropped_count = raw_count.saturating_sub(rendered_count);
     let failing_paths = snap
         .path_probes
@@ -1943,8 +1945,8 @@ mod tests {
             .expect("system health diagnostic should be recorded");
         assert_eq!(diag.screen, "system_health");
         assert_eq!(diag.raw_count, 2);
-        assert_eq!(diag.rendered_count, 1);
-        assert_eq!(diag.dropped_count, 1);
+        assert_eq!(diag.rendered_count, 2);
+        assert_eq!(diag.dropped_count, 0);
         assert!(diag.query_params.contains("configured_path=/mcp/"));
         assert!(diag.query_params.contains("failing_paths=1"));
     }
