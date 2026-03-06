@@ -10,11 +10,11 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use mcp_agent_mail_core::config::{env_value, ConfigSource, InterfaceMode};
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, env_value};
 use mcp_agent_mail_server::startup_checks::{self, PortStatus};
-use tracing_subscriber::filter::Directive;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Directive;
 
 /// Runtime interface mode selector for the `mcp-agent-mail` binary.
 ///

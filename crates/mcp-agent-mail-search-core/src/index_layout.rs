@@ -221,7 +221,9 @@ impl IndexLayout {
 
         // Create a temporary symlink and atomically rename it
         let file_name = link_path.file_name().unwrap_or_default().to_string_lossy();
-        let parent = link_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parent = link_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
         let pid = std::process::id();
         let tmp_link = parent.join(format!(".{file_name}.{pid}.tmp"));
         // Remove stale tmp link if it exists

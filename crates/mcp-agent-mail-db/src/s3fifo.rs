@@ -236,7 +236,12 @@ where
                     self.evict_ghost_if_full();
                     self.ghost_gen += 1;
                     self.ghost.push_back((key.clone(), self.ghost_gen));
-                    self.index.insert(key, Node::Ghost { ghost_gen: self.ghost_gen });
+                    self.index.insert(
+                        key,
+                        Node::Ghost {
+                            ghost_gen: self.ghost_gen,
+                        },
+                    );
                 } else {
                     self.evict_main_if_full();
                     self.main.push_back(key.clone());
@@ -246,7 +251,12 @@ where
                 self.evict_ghost_if_full();
                 self.ghost_gen += 1;
                 self.ghost.push_back((key.clone(), self.ghost_gen));
-                self.index.insert(key, Node::Ghost { ghost_gen: self.ghost_gen });
+                self.index.insert(
+                    key,
+                    Node::Ghost {
+                        ghost_gen: self.ghost_gen,
+                    },
+                );
             }
         }
     }
@@ -294,7 +304,9 @@ where
     fn evict_ghost_if_full(&mut self) {
         while self.ghost.len() >= self.ghost_capacity {
             if let Some((key, expected_gen)) = self.ghost.pop_front()
-                && let Some(Node::Ghost { ghost_gen: current_gen }) = self.index.get(&key)
+                && let Some(Node::Ghost {
+                    ghost_gen: current_gen,
+                }) = self.index.get(&key)
                 && *current_gen == expected_gen
             {
                 self.index.remove(&key);

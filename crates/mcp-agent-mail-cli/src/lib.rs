@@ -2299,79 +2299,36 @@ fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
     }
 }
 
-/// Kill whatever process is holding `port` using `fuser` (Linux) or `lsof` (macOS).
+/// Kill Agent Mail processes holding `port` using bounded listener PID lookup.
 /// Attempts graceful termination (SIGTERM) before forceful kill (SIGKILL).
 fn kill_port_holder(host: &str, port: u16) -> CliResult<()> {
-    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+    use mcp_agent_mail_server::startup_checks::{
+        PortStatus, agent_mail_port_holder_pids, check_port_status,
+    };
 
     let mut has_kill_tool = false;
-
-    // Try fuser first (Linux, fastest)
-    // First, try SIGTERM
-    let term_result = std::process::Command::new("fuser")
-        .args(["-k", "-TERM", &format!("{port}/tcp")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    if let Ok(s) = term_result {
+    let pids = agent_mail_port_holder_pids(port);
+    if !pids.is_empty() {
         has_kill_tool = true;
-        // fuser returns 0 if it successfully identified processes
-        if s.success() {
-            // Give the OS a moment to release the port
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-
-            // Check if still held
-            let check_result = std::process::Command::new("fuser")
-                .args([&format!("{port}/tcp")])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-
-            // If check fails (exit code 1), it means no processes found -> success
-            if check_result.is_ok_and(|s| !s.success()) {
-                return Ok(());
-            }
-
-            // Still held: FORCE KILL
-            let _ = std::process::Command::new("fuser")
-                .args(["-k", "-KILL", &format!("{port}/tcp")])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-    }
-
-    // Fallback: lsof + kill (macOS / if fuser not available)
-    let lsof_output = std::process::Command::new("lsof")
-        .args(["-ti", &format!("tcp:{port}")])
-        .output();
-
-    if let Ok(out) = lsof_output {
-        has_kill_tool = true;
-        let pids_str = String::from_utf8_lossy(&out.stdout);
-        let pids: Vec<String> = pids_str.split_whitespace().map(|s| s.to_string()).collect();
-
-        if pids.is_empty() {
-            return Ok(());
-        }
-
-        // Try SIGTERM (15)
         for pid in &pids {
             let _ = std::process::Command::new("kill")
-                .args(["-15", pid])
+                .args(["-15", &pid.to_string()])
                 .status();
         }
         std::thread::sleep(std::time::Duration::from_millis(1000));
+        if matches!(check_port_status(host, port), PortStatus::Free) {
+            return Ok(());
+        }
 
-        // Force kill (9) any survivors
-        for pid in &pids {
+        let remaining_pids = agent_mail_port_holder_pids(port);
+        for pid in &remaining_pids {
             let _ = std::process::Command::new("kill")
-                .args(["-9", pid])
+                .args(["-9", &pid.to_string()])
                 .status();
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        if !remaining_pids.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
     }
 
     match check_port_status(host, port) {
@@ -2380,7 +2337,7 @@ fn kill_port_holder(host: &str, port: u16) -> CliResult<()> {
             let tool_hint = if has_kill_tool {
                 ""
             } else {
-                " (no available kill tool: fuser/lsof)"
+                " (no listener PID lookup available)"
             };
             Err(CliError::Other(format!(
                 "Failed to stop existing Agent Mail server on {host}:{port}{tool_hint}"

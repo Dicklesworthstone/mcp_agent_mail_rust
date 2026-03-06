@@ -9,6 +9,7 @@ use mcp_agent_mail_core::{
     disk::{is_sqlite_memory_database_url, sqlite_file_path_from_database_url},
 };
 use mcp_agent_mail_db::DbPoolConfig;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -58,6 +59,7 @@ impl PortStatus {
 /// Keep this short to avoid multi-second startup stalls when probing a port
 /// occupied by an unrelated process that accepts TCP but does not speak HTTP.
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
+const MAX_HEALTH_BODY_BYTES: usize = 4096;
 
 /// Check the status of a port: free, occupied by Agent Mail, or occupied by another process.
 ///
@@ -104,7 +106,7 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
     }
 
     // Step 3: Health check failed (timeout, server busy, etc.) — fall back to
-    // process-level identification via fuser + /proc/{pid}/cmdline.
+    // process-level identification via listener PID lookup + /proc/{pid}/cmdline.
     if is_agent_mail_by_pid(port) {
         return PortStatus::AgentMailServer;
     }
@@ -198,13 +200,17 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
         }
     }
 
-    // Read body (limited to first 4KB for safety)
+    // Read body with a bounded length. Prefer `Content-Length` so we do not
+    // wait for EOF on keep-alive responses.
     let mut body_bytes = Vec::new();
-    // Use take(4096) to prevent OOM/hangs, and read_to_end to ensure we get
-    // the full response body (until EOF or limit) even if fragmented.
-    // The request sent "Connection: close", so the server should close the socket.
-    if reader.take(4096).read_to_end(&mut body_bytes).is_ok() {
-        // Continue
+    if let Some(content_length) = parse_content_length(&headers) {
+        let limit = content_length.min(MAX_HEALTH_BODY_BYTES) as u64;
+        let _ = reader.take(limit).read_to_end(&mut body_bytes);
+    } else {
+        let mut buf = [0_u8; MAX_HEALTH_BODY_BYTES];
+        if let Ok(bytes_read) = reader.read(&mut buf) {
+            body_bytes.extend_from_slice(&buf[..bytes_read]);
+        }
     }
     let body = String::from_utf8_lossy(&body_bytes).to_string();
 
@@ -225,36 +231,99 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
         || combined.contains("\"ok\": true")
 }
 
+fn parse_content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// Fallback: identify the process holding `port` by PID.
 ///
-/// Uses `fuser {port}/tcp` to find the PID, then reads `/proc/{pid}/cmdline`
-/// (Linux) or `/proc/{pid}/exe` to check if it's an Agent Mail binary.
-/// This catches cases where the HTTP health check times out or the server
-/// is temporarily unresponsive but IS an `am` process.
+/// Uses bounded listener PID discovery (`ss` on Linux, `lsof` elsewhere), then
+/// reads `/proc/{pid}/cmdline` or `/proc/{pid}/exe` to check if it's an Agent
+/// Mail binary. This catches cases where the HTTP health check times out or the
+/// server is temporarily unresponsive but IS an `am` process.
 fn is_agent_mail_by_pid(port: u16) -> bool {
-    // Try fuser to get the PID(s) holding the port
-    let output = match std::process::Command::new("fuser")
-        .arg(format!("{port}/tcp"))
+    !agent_mail_port_holder_pids(port).is_empty()
+}
+
+/// Return Agent Mail PIDs currently listening on `port`.
+#[must_use]
+pub fn agent_mail_port_holder_pids(port: u16) -> Vec<u32> {
+    port_holder_pids(port)
+        .into_iter()
+        .filter(|pid| pid_is_agent_mail(*pid))
+        .collect()
+}
+
+fn port_holder_pids(port: u16) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let pids = port_holder_pids_via_ss(port);
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+
+    port_holder_pids_via_lsof(port)
+}
+
+#[cfg(target_os = "linux")]
+fn port_holder_pids_via_ss(port: u16) -> Vec<u32> {
+    let output = match std::process::Command::new("ss")
+        .args(["-H", "-ltnp", &format!("sport = :{port}")])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
     {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // fuser outputs PIDs separated by whitespace (sometimes with leading spaces)
-    for token in stdout.split_whitespace() {
-        let pid: u32 = match token.trim().parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if pid_is_agent_mail(pid) {
-            return true;
+    parse_ss_port_holder_pids(String::from_utf8_lossy(&output.stdout).as_ref())
+}
+
+fn port_holder_pids_via_lsof(port: u16) -> Vec<u32> {
+    let output = match std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() || !output.stdout.is_empty() => output,
+        _ => return Vec::new(),
+    };
+
+    parse_lsof_port_holder_pids(String::from_utf8_lossy(&output.stdout).as_ref())
+}
+
+fn parse_ss_port_holder_pids(output: &str) -> Vec<u32> {
+    let mut pids = BTreeSet::new();
+    for segment in output.split("pid=").skip(1) {
+        let digits: String = segment
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        if let Ok(pid) = digits.parse::<u32>() {
+            pids.insert(pid);
         }
     }
-    false
+    pids.into_iter().collect()
+}
+
+fn parse_lsof_port_holder_pids(output: &str) -> Vec<u32> {
+    let mut pids = BTreeSet::new();
+    for token in output.split_whitespace() {
+        if let Ok(pid) = token.trim().parse::<u32>() {
+            pids.insert(pid);
+        }
+    }
+    pids.into_iter().collect()
 }
 
 /// Check if a PID belongs to an Agent Mail process by inspecting its
@@ -1261,6 +1330,24 @@ mod tests {
         );
 
         server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn parse_content_length_ignores_case_and_whitespace() {
+        let headers = "Content-Type: application/json\r\ncontent-length: 18\r\n";
+        assert_eq!(parse_content_length(headers), Some(18));
+    }
+
+    #[test]
+    fn parse_ss_port_holder_pids_extracts_unique_pids() {
+        let output = r#"LISTEN 0 4096 127.0.0.1:8765 0.0.0.0:* users:(("am",pid=1234,fd=7),("helper",pid=5678,fd=8),("am",pid=1234,fd=9))"#;
+        assert_eq!(parse_ss_port_holder_pids(output), vec![1234, 5678]);
+    }
+
+    #[test]
+    fn parse_lsof_port_holder_pids_extracts_unique_pids() {
+        let output = "1234\n5678\n1234\n";
+        assert_eq!(parse_lsof_port_holder_pids(output), vec![1234, 5678]);
     }
 
     #[test]

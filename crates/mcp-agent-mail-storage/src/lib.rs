@@ -520,7 +520,9 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
                 let r = if disk_pressure
                     >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64()
                 {
-                    tracing::warn!("[wbq-drain] disk pressure critical, skipping write-behind op (shutdown drain)");
+                    tracing::warn!(
+                        "[wbq-drain] disk pressure critical, skipping write-behind op (shutdown drain)"
+                    );
                     metrics.storage.wbq_errors_total.inc();
                     Ok(())
                 } else {
@@ -4506,7 +4508,7 @@ pub fn process_markdown_images(
         };
         result = result.replace(&full_match, &replacement);
         all_rel_paths.extend(stored.rel_paths);
-        
+
         // Strip data_base64 to avoid duplicating the payload in the attachments JSON array,
         // since the base64 string is already fully embedded in the markdown body above.
         let mut meta = stored.meta;

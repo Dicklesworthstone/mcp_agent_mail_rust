@@ -109,7 +109,7 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
     }
     let text =
         serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
-    
+
     // Write atomically to prevent race conditions during read_active_leases
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));

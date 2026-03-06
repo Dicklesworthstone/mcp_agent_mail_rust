@@ -1965,7 +1965,7 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
     {
         fs::create_dir_all(parent)?;
     }
-    
+
     // Write atomically to prevent partial writes/corruption
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
