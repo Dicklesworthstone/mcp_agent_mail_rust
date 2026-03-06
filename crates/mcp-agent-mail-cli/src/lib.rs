@@ -799,7 +799,7 @@ pub struct DeployValidateArgs {
 
 #[derive(Args, Debug)]
 pub struct DeployToolingArgs {
-    /// Path to the bundle directory where config files will be written.
+    /// Path to the bundle directory; repo-root CI/tooling files are written in the current directory.
     pub bundle: PathBuf,
 }
 
@@ -2746,7 +2746,9 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
         }
         DeployCommand::Tooling(args) => {
             ensure_dir(&args.bundle)?;
-            let written = share::deploy::write_deploy_tooling(&args.bundle)?;
+            let repo_root = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("current_dir failed: {e}")))?;
+            let written = share::deploy::write_deploy_tooling(&repo_root, &args.bundle)?;
             ftui_runtime::ftui_println!("Wrote {} deployment files:", written.len());
             for file in &written {
                 ftui_runtime::ftui_println!("  {file}");

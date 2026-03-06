@@ -292,6 +292,13 @@ fn convert_results(results: &SearchResults, doc_kind: DocKind) -> Vec<PlannerRes
 
 static BRIDGE: OnceLock<Option<Arc<TantivyBridge>>> = OnceLock::new();
 
+fn same_index_dir(lhs: &Path, rhs: &Path) -> bool {
+    match (lhs.canonicalize(), rhs.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => lhs == rhs,
+    }
+}
+
 /// Initialize the global Tantivy bridge.
 ///
 /// Should be called once at startup when `SearchEngine::Tantivy` or `Shadow`
@@ -302,6 +309,19 @@ pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
 
     record_warmup_start(WarmResource::LexicalIndex);
     let warmup_timer = std::time::Instant::now();
+    if let Some(existing) = get_bridge() {
+        if same_index_dir(existing.index_dir(), index_dir) {
+            record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
+            return Ok(());
+        }
+        let error = format!(
+            "search bridge already initialized for {}; refusing to reinitialize for {}",
+            existing.index_dir().display(),
+            index_dir.display()
+        );
+        record_warmup_failure(WarmResource::LexicalIndex, &error);
+        return Err(error);
+    }
     let bridge = match TantivyBridge::open(index_dir) {
         Ok(b) => b,
         Err(e) => {
@@ -1539,6 +1559,22 @@ mod tests {
         assert_eq!(bridge.index_dir(), nested.as_path());
     }
 
+    #[test]
+    fn init_bridge_rejects_different_index_dir_after_first_init() {
+        let temp_a = tempfile::tempdir().expect("tempdir a");
+        let temp_b = tempfile::tempdir().expect("tempdir b");
+
+        init_bridge(temp_a.path()).expect("init first bridge");
+        init_bridge(temp_a.path()).expect("reinit same path");
+        let err = init_bridge(temp_b.path()).expect_err("reject different bridge path");
+
+        assert!(err.contains("already initialized"));
+        assert_eq!(
+            get_bridge().expect("bridge should stay initialized").index_dir(),
+            temp_a.path()
+        );
+    }
+
     // -- Search with multiple hits -----------------------------------------
 
     #[test]
@@ -1578,11 +1614,8 @@ mod tests {
     fn index_message_without_bridge_returns_false() {
         // When the global bridge is not initialized, index_message should
         // gracefully return Ok(false) rather than error.
-        // NOTE: This test relies on the global BRIDGE not being set in this
-        // test binary. Since OnceLock is process-global, this test must run
-        // before any test that calls init_bridge in the same process.
-        // In practice, the bridge is only set by init_bridge() and our tests
-        // use TantivyBridge::in_memory() which doesn't set the global.
+        // If another test already initialized the process-global bridge,
+        // index_message may legitimately return Ok(true) instead.
         let msg = make_indexable(1, "Test", "Body");
         let result = index_message(&msg);
         // Either Ok(false) (bridge not set) or Ok(true) (bridge set by another test).

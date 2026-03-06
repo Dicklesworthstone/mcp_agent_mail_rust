@@ -1002,11 +1002,12 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
 
 /// Generate a GitHub Actions workflow for deploying to GitHub Pages.
 #[must_use]
-pub fn generate_gh_pages_workflow() -> String {
-    r###"# Deploy MCP Agent Mail static export to GitHub Pages
+pub fn generate_gh_pages_workflow(bundle_dir: &str) -> String {
+    format!(
+        r###"# Deploy MCP Agent Mail static export to GitHub Pages
 #
 # Usage:
-#   1. Place your bundle output in the `docs/` directory (or configure path below)
+#   1. Place your bundle output in the `{bundle_dir}` directory (or configure path below)
 #   2. Enable GitHub Pages in repo Settings > Pages > Source: "GitHub Actions"
 #   3. Push to main branch to trigger deployment
 #
@@ -1018,7 +1019,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'docs/**'
+      - '{bundle_dir}/**'
   workflow_dispatch:
 
 permissions:
@@ -1038,7 +1039,7 @@ jobs:
 
       - name: Validate bundle
         run: |
-          BUNDLE_DIR="docs"
+          BUNDLE_DIR="{bundle_dir}"
           echo "=== Pre-flight checks ==="
           test -f "$BUNDLE_DIR/manifest.json" || { echo "FAIL: manifest.json missing"; exit 1; }
           test -f "$BUNDLE_DIR/index.html" || { echo "FAIL: index.html missing"; exit 1; }
@@ -1066,7 +1067,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs
+          path: {bundle_dir}
 
       - name: Deploy to GitHub Pages
         id: deployment
@@ -1081,13 +1082,14 @@ jobs:
           echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Triggered by**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
 "###
-    .to_string()
+    )
 }
 
 /// Generate a GitHub Actions workflow for deploying to Cloudflare Pages.
 #[must_use]
-pub fn generate_cf_pages_workflow() -> String {
-    r###"# Deploy MCP Agent Mail static export to Cloudflare Pages
+pub fn generate_cf_pages_workflow(bundle_dir: &str) -> String {
+    format!(
+        r###"# Deploy MCP Agent Mail static export to Cloudflare Pages
 #
 # Usage:
 #   1. Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets in repo settings
@@ -1102,7 +1104,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'docs/**'
+      - '{bundle_dir}/**'
   workflow_dispatch:
 
 concurrency:
@@ -1117,7 +1119,7 @@ jobs:
 
       - name: Validate bundle
         run: |
-          BUNDLE_DIR="docs"
+          BUNDLE_DIR="{bundle_dir}"
           echo "=== Pre-flight checks ==="
           test -f "$BUNDLE_DIR/manifest.json" || { echo "FAIL: manifest.json missing"; exit 1; }
           test -f "$BUNDLE_DIR/index.html" || { echo "FAIL: index.html missing"; exit 1; }
@@ -1143,7 +1145,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy docs/ --project-name=agent-mail
+          command: pages deploy {bundle_dir} --project-name=agent-mail
 
       - name: Generate deployment report
         if: always()
@@ -1153,13 +1155,14 @@ jobs:
           echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Triggered by**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
 "###
-    .to_string()
+    )
 }
 
 /// Generate a Cloudflare Pages deployment configuration.
 #[must_use]
-pub fn generate_cf_pages_config() -> String {
-    r#"# Cloudflare Pages Configuration
+pub fn generate_cf_pages_config(bundle_dir: &str) -> String {
+    format!(
+        r#"# Cloudflare Pages Configuration
 #
 # This file is a template for wrangler.toml when deploying
 # MCP Agent Mail static exports to Cloudflare Pages.
@@ -1167,34 +1170,35 @@ pub fn generate_cf_pages_config() -> String {
 # Usage:
 #   1. Install wrangler: npm install -g wrangler
 #   2. Login: wrangler login
-#   3. Deploy: wrangler pages deploy docs/ --project-name=agent-mail
+#   3. Deploy: wrangler pages deploy {bundle_dir} --project-name=agent-mail
 
 name = "agent-mail-export"
 compatibility_date = "2024-01-01"
 
 [site]
-bucket = "./docs"
+bucket = "./{bundle_dir}"
 
 # Cloudflare Pages automatically picks up _headers file
 # for custom response headers (COOP/COEP configured there).
 "#
-    .to_string()
+    )
 }
 
 /// Generate a Netlify deployment configuration.
 #[must_use]
-pub fn generate_netlify_config() -> String {
-    r#"# Netlify Configuration
+pub fn generate_netlify_config(bundle_dir: &str) -> String {
+    format!(
+        r#"# Netlify Configuration
 #
 # Place this file at the repo root when deploying to Netlify.
 #
 # Usage:
 #   1. Connect your repo to Netlify
-#   2. Set publish directory to "docs"
+#   2. Set publish directory to "{bundle_dir}"
 #   3. No build command needed (static files only)
 
 [build]
-  publish = "docs"
+  publish = "{bundle_dir}"
 
 # Netlify automatically picks up _headers file
 # for custom response headers (COOP/COEP configured there).
@@ -1212,7 +1216,7 @@ pub fn generate_netlify_config() -> String {
     Content-Type = "application/octet-stream"
     Cross-Origin-Resource-Policy = "same-origin"
 "#
-    .to_string()
+    )
 }
 
 /// Generate a deployment validation script (shell).
@@ -1369,6 +1373,7 @@ fn build_platform_info(
     hosting_hints: &[crate::hosting::HostingHint],
 ) -> Vec<PlatformInfo> {
     let mut platforms = Vec::new();
+    let bundle_arg = display_bundle_path(bundle_dir);
 
     let detected_ids: Vec<&str> = hosting_hints.iter().map(|h| h.id.as_str()).collect();
 
@@ -1377,7 +1382,7 @@ fn build_platform_info(
         name: "GitHub Pages".to_string(),
         detected: detected_ids.contains(&"github_pages"),
         config_present: bundle_dir.join(".nojekyll").is_file(),
-        deploy_command: Some("gh-pages -d docs/".to_string()),
+        deploy_command: Some(format!("gh-pages -d {bundle_arg}")),
     });
 
     platforms.push(PlatformInfo {
@@ -1385,7 +1390,9 @@ fn build_platform_info(
         name: "Cloudflare Pages".to_string(),
         detected: detected_ids.contains(&"cloudflare_pages"),
         config_present: bundle_dir.join("_headers").is_file(),
-        deploy_command: Some("wrangler pages deploy docs/ --project-name=agent-mail".to_string()),
+        deploy_command: Some(format!(
+            "wrangler pages deploy {bundle_arg} --project-name=agent-mail"
+        )),
     });
 
     platforms.push(PlatformInfo {
@@ -1393,7 +1400,7 @@ fn build_platform_info(
         name: "Netlify".to_string(),
         detected: detected_ids.contains(&"netlify"),
         config_present: bundle_dir.join("_headers").is_file(),
-        deploy_command: Some("netlify deploy --prod --dir=docs/".to_string()),
+        deploy_command: Some(format!("netlify deploy --prod --dir={bundle_arg}")),
     });
 
     platforms.push(PlatformInfo {
@@ -1401,7 +1408,7 @@ fn build_platform_info(
         name: "Amazon S3".to_string(),
         detected: detected_ids.contains(&"s3"),
         config_present: false,
-        deploy_command: Some("aws s3 sync docs/ s3://your-bucket/ --delete".to_string()),
+        deploy_command: Some(format!("aws s3 sync {bundle_arg} s3://your-bucket/ --delete")),
     });
 
     platforms
@@ -1594,6 +1601,7 @@ fn build_rollback_guidance(
     bundle_dir: &Path,
     integrity: &BTreeMap<String, String>,
 ) -> RollbackGuidance {
+    let bundle_arg = display_bundle_path(bundle_dir);
     // Compute current content hash from integrity checksums.
     let current_hash = if integrity.is_empty() {
         None
@@ -1614,8 +1622,10 @@ fn build_rollback_guidance(
     let steps = vec![
         RollbackStep {
             platform: "github_pages".to_string(),
-            instruction: "Revert the docs/ directory to the previous commit and push".to_string(),
-            command: Some("git revert HEAD -- docs/ && git push".to_string()),
+            instruction: format!(
+                "Revert the {bundle_arg} directory to the previous commit and push"
+            ),
+            command: Some(format!("git revert HEAD -- {bundle_arg} && git push")),
         },
         RollbackStep {
             platform: "cloudflare_pages".to_string(),
@@ -1625,7 +1635,9 @@ fn build_rollback_guidance(
         RollbackStep {
             platform: "netlify".to_string(),
             instruction: "Use the Netlify dashboard to restore a previous deploy, or re-deploy from a previous commit".to_string(),
-            command: Some("netlify deploy --prod --dir=docs/ # from previous commit checkout".to_string()),
+            command: Some(format!(
+                "netlify deploy --prod --dir={bundle_arg} # from previous commit checkout"
+            )),
         },
         RollbackStep {
             platform: "s3".to_string(),
@@ -1644,6 +1656,37 @@ fn build_rollback_guidance(
 // ── Deploy history ─────────────────────────────────────────────────────
 
 const DEPLOY_HISTORY_FILE: &str = ".deploy_history.json";
+
+fn display_bundle_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn bundle_path_relative_to_repo(repo_root: &Path, bundle_dir: &Path) -> ShareResult<String> {
+    let repo_root = repo_root.canonicalize().map_err(|e| ShareError::Validation {
+        message: format!("failed to resolve repo root {}: {e}", repo_root.display()),
+    })?;
+    let bundle_dir = bundle_dir.canonicalize().map_err(|e| ShareError::Validation {
+        message: format!(
+            "failed to resolve bundle directory {}: {e}",
+            bundle_dir.display()
+        ),
+    })?;
+    let relative = bundle_dir
+        .strip_prefix(&repo_root)
+        .map_err(|_| ShareError::Validation {
+            message: format!(
+                "bundle directory {} must be inside repo root {} to generate CI tooling",
+                bundle_dir.display(),
+                repo_root.display()
+            ),
+        })?;
+    let relative = display_bundle_path(relative);
+    Ok(if relative.is_empty() {
+        ".".to_string()
+    } else {
+        relative
+    })
+}
 
 /// Load deployment history from the bundle directory.
 pub fn load_deploy_history(bundle_dir: &Path) -> ShareResult<DeployHistory> {
@@ -1710,13 +1753,13 @@ pub fn build_verify_plan(deployed_url: &str) -> VerifyResult {
     checks.push(DeployCheck {
         name: "coop_header".to_string(),
         passed: false,
-        message: format!("GET {url}/viewer/ should include Cross-Origin-Opener-Policy header"),
+        message: format!("GET {url}/ should include Cross-Origin-Opener-Policy header"),
         severity: CheckSeverity::Warning,
     });
     checks.push(DeployCheck {
         name: "coep_header".to_string(),
         passed: false,
-        message: format!("GET {url}/viewer/ should include Cross-Origin-Embedder-Policy header"),
+        message: format!("GET {url}/ should include Cross-Origin-Embedder-Policy header"),
         severity: CheckSeverity::Warning,
     });
 
@@ -1747,41 +1790,42 @@ pub fn build_verify_plan(deployed_url: &str) -> VerifyResult {
 /// - `netlify.toml.template` (Netlify config)
 /// - `scripts/validate_deploy.sh` (compatibility wrapper to native `am` validation commands)
 /// - `deploy_report.json` (pre-flight validation report)
-pub fn write_deploy_tooling(bundle_dir: &Path) -> ShareResult<Vec<String>> {
+pub fn write_deploy_tooling(repo_root: &Path, bundle_dir: &Path) -> ShareResult<Vec<String>> {
     let mut written = Vec::new();
+    let bundle_rel = bundle_path_relative_to_repo(repo_root, bundle_dir)?;
 
     // GitHub Actions workflow (GH Pages)
-    let workflow_dir = bundle_dir.join(".github").join("workflows");
+    let workflow_dir = repo_root.join(".github").join("workflows");
     std::fs::create_dir_all(&workflow_dir)?;
     std::fs::write(
         workflow_dir.join("deploy-pages.yml"),
-        generate_gh_pages_workflow(),
+        generate_gh_pages_workflow(&bundle_rel),
     )?;
     written.push(".github/workflows/deploy-pages.yml".to_string());
 
     // GitHub Actions workflow (Cloudflare Pages)
     std::fs::write(
         workflow_dir.join("deploy-cf-pages.yml"),
-        generate_cf_pages_workflow(),
+        generate_cf_pages_workflow(&bundle_rel),
     )?;
     written.push(".github/workflows/deploy-cf-pages.yml".to_string());
 
     // Cloudflare Pages template
     std::fs::write(
-        bundle_dir.join("wrangler.toml.template"),
-        generate_cf_pages_config(),
+        repo_root.join("wrangler.toml.template"),
+        generate_cf_pages_config(&bundle_rel),
     )?;
     written.push("wrangler.toml.template".to_string());
 
     // Netlify template
     std::fs::write(
-        bundle_dir.join("netlify.toml.template"),
-        generate_netlify_config(),
+        repo_root.join("netlify.toml.template"),
+        generate_netlify_config(&bundle_rel),
     )?;
     written.push("netlify.toml.template".to_string());
 
     // Validation script
-    let scripts_dir = bundle_dir.join("scripts");
+    let scripts_dir = repo_root.join("scripts");
     std::fs::create_dir_all(&scripts_dir)?;
     let script_path = scripts_dir.join("validate_deploy.sh");
     std::fs::write(&script_path, generate_validation_script())?;
@@ -1797,7 +1841,7 @@ pub fn write_deploy_tooling(bundle_dir: &Path) -> ShareResult<Vec<String>> {
     let report = validate_bundle(bundle_dir)?;
     let report_json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
     std::fs::write(bundle_dir.join("deploy_report.json"), &report_json)?;
-    written.push("deploy_report.json".to_string());
+    written.push(format!("{bundle_rel}/deploy_report.json"));
 
     Ok(written)
 }
@@ -2031,24 +2075,28 @@ mod tests {
 
     #[test]
     fn gh_pages_workflow_is_valid_yaml() {
-        let workflow = generate_gh_pages_workflow();
+        let workflow = generate_gh_pages_workflow("bundle");
         assert!(workflow.contains("Deploy to GitHub Pages"));
         assert!(workflow.contains("actions/deploy-pages@v4"));
         assert!(workflow.contains("permissions:"));
+        assert!(workflow.contains("bundle/**"));
+        assert!(workflow.contains("BUNDLE_DIR=\"bundle\""));
     }
 
     #[test]
     fn cf_pages_config_valid() {
-        let config = generate_cf_pages_config();
+        let config = generate_cf_pages_config("bundle");
         assert!(config.contains("wrangler"));
         assert!(config.contains("compatibility_date"));
+        assert!(config.contains("bucket = \"./bundle\""));
     }
 
     #[test]
     fn netlify_config_valid() {
-        let config = generate_netlify_config();
+        let config = generate_netlify_config("bundle");
         assert!(config.contains("[build]"));
         assert!(config.contains("publish"));
+        assert!(config.contains("publish = \"bundle\""));
     }
 
     #[test]
@@ -2068,24 +2116,24 @@ mod tests {
         let bundle = dir.path().join("bundle");
         create_minimal_bundle(&bundle);
 
-        let written = write_deploy_tooling(&bundle).unwrap();
+        let written = write_deploy_tooling(dir.path(), &bundle).unwrap();
         assert!(written.contains(&".github/workflows/deploy-pages.yml".to_string()));
         assert!(written.contains(&".github/workflows/deploy-cf-pages.yml".to_string()));
         assert!(written.contains(&"wrangler.toml.template".to_string()));
         assert!(written.contains(&"netlify.toml.template".to_string()));
         assert!(written.contains(&"scripts/validate_deploy.sh".to_string()));
-        assert!(written.contains(&"deploy_report.json".to_string()));
+        assert!(written.contains(&"bundle/deploy_report.json".to_string()));
 
         // Verify files exist
-        assert!(bundle.join(".github/workflows/deploy-pages.yml").is_file());
+        assert!(dir.path().join(".github/workflows/deploy-pages.yml").is_file());
         assert!(
-            bundle
+            dir.path()
                 .join(".github/workflows/deploy-cf-pages.yml")
                 .is_file()
         );
-        assert!(bundle.join("wrangler.toml.template").is_file());
-        assert!(bundle.join("netlify.toml.template").is_file());
-        assert!(bundle.join("scripts/validate_deploy.sh").is_file());
+        assert!(dir.path().join("wrangler.toml.template").is_file());
+        assert!(dir.path().join("netlify.toml.template").is_file());
+        assert!(dir.path().join("scripts/validate_deploy.sh").is_file());
         assert!(bundle.join("deploy_report.json").is_file());
 
         // Verify deploy report is valid JSON with new fields
@@ -2164,10 +2212,11 @@ mod tests {
 
     #[test]
     fn cf_pages_workflow_is_valid_yaml() {
-        let workflow = generate_cf_pages_workflow();
+        let workflow = generate_cf_pages_workflow("bundle");
         assert!(workflow.contains("Deploy to Cloudflare Pages"));
         assert!(workflow.contains("cloudflare/wrangler-action@v3"));
         assert!(workflow.contains("CLOUDFLARE_API_TOKEN"));
+        assert!(workflow.contains("pages deploy bundle --project-name=agent-mail"));
     }
 
     // ── Security expectations ────────────────────────────────────────
@@ -2312,10 +2361,10 @@ mod tests {
         let bundle = dir.path().join("bundle");
         create_minimal_bundle(&bundle);
 
-        let written = write_deploy_tooling(&bundle).unwrap();
+        let written = write_deploy_tooling(dir.path(), &bundle).unwrap();
         assert!(written.contains(&".github/workflows/deploy-cf-pages.yml".to_string()));
         assert!(
-            bundle
+            dir.path()
                 .join(".github/workflows/deploy-cf-pages.yml")
                 .is_file()
         );
