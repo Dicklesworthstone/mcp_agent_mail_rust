@@ -1343,6 +1343,7 @@ pub fn get_commit_queue() -> &'static OrderedMutex<Option<CommitQueue>> {
 /// Fields for a single commit request within the coalescer pipeline.
 ///
 /// Note: `repo_root` is NOT stored here — it's the key in the per-repo queue map.
+#[derive(Clone)]
 struct CoalescerCommitFields {
     enqueued_at: Instant,
     git_author_name: String,
@@ -1372,6 +1373,18 @@ struct CoalescerSpilledWork {
     git_author_email: String,
     message_first_lines: Vec<String>,
     message_total: u64,
+}
+
+struct CoalescerCommitOutcome {
+    committed_requests: u64,
+    committed_commits: u64,
+    failed_requests: Vec<CoalescerCommitFields>,
+}
+
+struct CoalescerSpillOutcome {
+    committed_requests: u64,
+    committed_commits: u64,
+    failed_work: Option<CoalescerSpilledWork>,
 }
 
 /// Per-repo queue with dedicated spill, processing lock, and metrics.
@@ -1930,66 +1943,99 @@ fn coalescer_pool_worker(
         // Phase 4: Commit
         if !batch.is_empty() {
             for chunk in batch.chunks(COALESCER_MAX_BATCH_SIZE) {
-                coalescer_commit_batch(&repo_root, chunk, &stats, &batch_sizes);
+                let outcome = coalescer_commit_batch(&repo_root, chunk, &stats, &batch_sizes);
+                let failed_requests = outcome.failed_requests;
 
                 let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
                 let metrics = mcp_agent_mail_core::global_metrics();
-                metrics.storage.commit_drained_total.add(chunk_len);
-                rq.metrics
-                    .drained_total
-                    .fetch_add(chunk_len, Ordering::Relaxed);
-                rq.metrics.commits_total.fetch_add(1, Ordering::Relaxed);
-
-                for req in chunk {
-                    let latency_us = u64::try_from(
-                        req.enqueued_at
-                            .elapsed()
-                            .as_micros()
-                            .min(u128::from(u64::MAX)),
-                    )
-                    .unwrap_or(u64::MAX);
-                    metrics.storage.commit_queue_latency_us.record(latency_us);
+                if outcome.committed_requests > 0 {
+                    metrics
+                        .storage
+                        .commit_drained_total
+                        .add(outcome.committed_requests);
                     rq.metrics
-                        .commit_latency_us_sum
-                        .fetch_add(latency_us, Ordering::Relaxed);
+                        .drained_total
+                        .fetch_add(outcome.committed_requests, Ordering::Relaxed);
+                }
+                if outcome.committed_commits > 0 {
                     rq.metrics
-                        .commit_latency_us_count
-                        .fetch_add(1, Ordering::Relaxed);
+                        .commits_total
+                        .fetch_add(outcome.committed_commits, Ordering::Relaxed);
+                }
+                if !failed_requests.is_empty() {
+                    rq.metrics.errors_total.fetch_add(
+                        u64::try_from(failed_requests.len()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
                 }
 
-                coalescer_update_pending(&pending_requests, chunk_len);
+                if outcome.committed_requests == chunk_len {
+                    for req in chunk {
+                        let latency_us = u64::try_from(
+                            req.enqueued_at
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX)),
+                        )
+                        .unwrap_or(u64::MAX);
+                        metrics.storage.commit_queue_latency_us.record(latency_us);
+                        rq.metrics
+                            .commit_latency_us_sum
+                            .fetch_add(latency_us, Ordering::Relaxed);
+                        rq.metrics
+                            .commit_latency_us_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                if outcome.committed_requests > 0 {
+                    coalescer_update_pending(&pending_requests, outcome.committed_requests);
+                }
+                if !failed_requests.is_empty() {
+                    coalescer_requeue_requests(&rq, failed_requests);
+                }
             }
         }
 
         if let Some(work) = &spilled_work {
-            coalescer_commit_spilled_work(work, &stats, &batch_sizes);
+            let outcome = coalescer_commit_spilled_work(work, &stats, &batch_sizes);
+            if let Some(failed_work) = outcome.failed_work {
+                rq.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                coalescer_restore_spilled_work(&rq, failed_work);
+            }
 
             let metrics = mcp_agent_mail_core::global_metrics();
-            metrics
-                .storage
-                .commit_drained_total
-                .add(work.pending_requests);
-            rq.metrics
-                .drained_total
-                .fetch_add(work.pending_requests, Ordering::Relaxed);
-            rq.metrics.commits_total.fetch_add(1, Ordering::Relaxed);
+            if outcome.committed_requests > 0 {
+                metrics
+                    .storage
+                    .commit_drained_total
+                    .add(outcome.committed_requests);
+                rq.metrics
+                    .drained_total
+                    .fetch_add(outcome.committed_requests, Ordering::Relaxed);
 
-            let latency_us = u64::try_from(
-                work.earliest_enqueued_at
-                    .elapsed()
-                    .as_micros()
-                    .min(u128::from(u64::MAX)),
-            )
-            .unwrap_or(u64::MAX);
-            metrics.storage.commit_queue_latency_us.record(latency_us);
-            rq.metrics
-                .commit_latency_us_sum
-                .fetch_add(latency_us, Ordering::Relaxed);
-            rq.metrics
-                .commit_latency_us_count
-                .fetch_add(1, Ordering::Relaxed);
+                let latency_us = u64::try_from(
+                    work.earliest_enqueued_at
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)),
+                )
+                .unwrap_or(u64::MAX);
+                metrics.storage.commit_queue_latency_us.record(latency_us);
+                rq.metrics
+                    .commit_latency_us_sum
+                    .fetch_add(latency_us, Ordering::Relaxed);
+                rq.metrics
+                    .commit_latency_us_count
+                    .fetch_add(1, Ordering::Relaxed);
 
-            coalescer_update_pending(&pending_requests, work.pending_requests);
+                coalescer_update_pending(&pending_requests, outcome.committed_requests);
+            }
+            if outcome.committed_commits > 0 {
+                rq.metrics
+                    .commits_total
+                    .fetch_add(outcome.committed_commits, Ordering::Relaxed);
+            }
         }
 
         // Release processing lock (via guard drop) + update last_serviced timestamp
@@ -2061,6 +2107,68 @@ fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<Coales
     })
 }
 
+fn coalescer_requeue_requests(rq: &RepoQueue, failed_requests: Vec<CoalescerCommitFields>) {
+    if failed_requests.is_empty() {
+        return;
+    }
+    let requeued = u64::try_from(failed_requests.len()).unwrap_or(u64::MAX);
+    let mut queue = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+    for request in failed_requests.into_iter().rev() {
+        queue.push_front(request);
+    }
+    rq.depth.fetch_add(requeued, Ordering::Relaxed);
+}
+
+fn coalescer_restore_spilled_work(rq: &RepoQueue, work: CoalescerSpilledWork) {
+    if work.pending_requests == 0 {
+        return;
+    }
+
+    let mut spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = spill.inner.get_or_insert_with(|| CoalescerSpillRepo {
+        pending_requests: 0,
+        earliest_enqueued_at: work.earliest_enqueued_at,
+        dirty_all: false,
+        paths: BTreeSet::new(),
+        git_author_name: work.git_author_name.clone(),
+        git_author_email: work.git_author_email.clone(),
+        message_first_lines: VecDeque::new(),
+        message_total: 0,
+    });
+
+    repo.pending_requests = repo.pending_requests.saturating_add(work.pending_requests);
+    repo.message_total = repo.message_total.saturating_add(work.message_total);
+    if work.earliest_enqueued_at < repo.earliest_enqueued_at {
+        repo.earliest_enqueued_at = work.earliest_enqueued_at;
+    }
+
+    repo.git_author_name = work.git_author_name;
+    repo.git_author_email = work.git_author_email;
+
+    for line in work.message_first_lines {
+        if repo.message_first_lines.len() >= COALESCER_SPILL_MESSAGE_CAP {
+            break;
+        }
+        repo.message_first_lines.push_back(line);
+    }
+
+    if repo.dirty_all || work.dirty_all {
+        repo.dirty_all = true;
+        repo.paths.clear();
+    } else {
+        for path in work.paths {
+            repo.paths.insert(path);
+            if repo.paths.len() > COALESCER_SPILL_PATH_CAP {
+                repo.dirty_all = true;
+                repo.paths.clear();
+                break;
+            }
+        }
+    }
+
+    rq.depth.fetch_add(work.pending_requests, Ordering::Relaxed);
+}
+
 /// Recompute and store the true per-repo queue depth.
 fn coalescer_reconcile_repo_depth(rq: &RepoQueue) -> u64 {
     let queue_depth = {
@@ -2080,9 +2188,13 @@ fn coalescer_commit_spilled_work(
     work: &CoalescerSpilledWork,
     stats: &Arc<Mutex<CommitQueueStats>>,
     batch_sizes: &Arc<Mutex<VecDeque<usize>>>,
-) {
+) -> CoalescerSpillOutcome {
     if work.pending_requests == 0 {
-        return;
+        return CoalescerSpillOutcome {
+            committed_requests: 0,
+            committed_commits: 0,
+            failed_work: None,
+        };
     }
 
     let config = Config {
@@ -2109,30 +2221,34 @@ fn coalescer_commit_spilled_work(
 
     let commit_result = if work.dirty_all {
         coalescer_commit_all_with_retry(&work.repo_root, &config, &msg)
-            .map(|()| work.pending_requests)
+            .map(|()| (work.pending_requests, 1))
     } else if work.paths.is_empty() {
-        Ok(work.pending_requests)
+        Ok((work.pending_requests, 0))
     } else {
         coalescer_commit_with_retry(&work.repo_root, &config, &msg, &work.paths)
-            .map(|()| work.pending_requests)
+            .map(|()| (work.pending_requests, 1))
     };
 
     // Update stats
     match commit_result {
-        Ok(batch_u64) => {
+        Ok((batch_u64, commit_count)) => {
             let batch_size = usize::try_from(batch_u64).unwrap_or(usize::MAX);
             let mut s = stats
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.commits += 1;
+            if commit_count > 0 {
+                s.commits += usize::try_from(commit_count).unwrap_or(usize::MAX);
+            }
             s.batched += batch_size;
 
             let mut sizes = batch_sizes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            sizes.push_back(batch_size);
-            if sizes.len() > 100 {
-                sizes.pop_front();
+            if commit_count > 0 {
+                sizes.push_back(batch_size);
+                if sizes.len() > 100 {
+                    sizes.pop_front();
+                }
             }
             let avg = if sizes.is_empty() {
                 0.0
@@ -2140,6 +2256,11 @@ fn coalescer_commit_spilled_work(
                 sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
             };
             s.avg_batch_size = (avg * 100.0).round() / 100.0;
+            CoalescerSpillOutcome {
+                committed_requests: batch_u64,
+                committed_commits: commit_count,
+                failed_work: None,
+            }
         }
         Err(e) => {
             tracing::warn!("[commit-coalescer] spill commit error: {e}");
@@ -2151,6 +2272,21 @@ fn coalescer_commit_spilled_work(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.errors += 1;
+            CoalescerSpillOutcome {
+                committed_requests: 0,
+                committed_commits: 0,
+                failed_work: Some(CoalescerSpilledWork {
+                    repo_root: work.repo_root.clone(),
+                    pending_requests: work.pending_requests,
+                    earliest_enqueued_at: work.earliest_enqueued_at,
+                    dirty_all: work.dirty_all,
+                    paths: work.paths.clone(),
+                    git_author_name: work.git_author_name.clone(),
+                    git_author_email: work.git_author_email.clone(),
+                    message_first_lines: work.message_first_lines.clone(),
+                    message_total: work.message_total,
+                }),
+            }
         }
     }
 }
@@ -2164,9 +2300,13 @@ fn coalescer_commit_batch(
     requests: &[CoalescerCommitFields],
     stats: &Arc<Mutex<CommitQueueStats>>,
     batch_sizes: &Arc<Mutex<VecDeque<usize>>>,
-) {
+) -> CoalescerCommitOutcome {
     if requests.is_empty() {
-        return;
+        return CoalescerCommitOutcome {
+            committed_requests: 0,
+            committed_commits: 0,
+            failed_requests: Vec::new(),
+        };
     }
 
     // Use the first request's author info
@@ -2232,7 +2372,7 @@ fn coalescer_commit_batch(
     } else {
         // Path conflicts — commit sequentially
         let mut total = 0;
-        let mut last_err = None;
+        let mut failed_requests = Vec::new();
         for req in requests {
             let r_config = Config {
                 git_author_name: req.git_author_name.clone(),
@@ -2241,17 +2381,56 @@ fn coalescer_commit_batch(
             };
             match coalescer_commit_with_retry(repo_root, &r_config, &req.message, &req.rel_paths) {
                 Ok(()) => total += 1,
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    tracing::warn!(
+                        "[commit-coalescer] sequential request commit failed: paths={} err={e}",
+                        req.rel_paths.len()
+                    );
+                    failed_requests.push(req.clone());
+                }
             }
         }
-        if let Some(e) = last_err {
+        if failed_requests.is_empty() {
+            Ok((total, total))
+        } else {
+            let committed = requests.len().saturating_sub(failed_requests.len());
             tracing::warn!(
-                "[commit-coalescer] partial failure in sequential batch: committed={total} total={} err={e}",
+                "[commit-coalescer] partial failure in sequential batch: committed={committed} failed={} total={}",
+                failed_requests.len(),
                 requests.len()
             );
-            Err(e)
-        } else {
-            Ok((total, total))
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .commit_errors_total
+                .add(u64::try_from(failed_requests.len()).unwrap_or(u64::MAX));
+            let mut s = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.commits += total;
+            s.batched += total;
+            s.errors += failed_requests.len();
+
+            let mut sizes = batch_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for _ in 0..total {
+                sizes.push_back(1);
+            }
+            while sizes.len() > 100 {
+                sizes.pop_front();
+            }
+            let avg = if sizes.is_empty() {
+                0.0
+            } else {
+                sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
+            };
+            s.avg_batch_size = (avg * 100.0).round() / 100.0;
+
+            return CoalescerCommitOutcome {
+                committed_requests: u64::try_from(total).unwrap_or(u64::MAX),
+                committed_commits: u64::try_from(total).unwrap_or(u64::MAX),
+                failed_requests,
+            };
         }
     };
 
@@ -2279,6 +2458,11 @@ fn coalescer_commit_batch(
                 sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
             };
             s.avg_batch_size = (avg * 100.0).round() / 100.0;
+            CoalescerCommitOutcome {
+                committed_requests: u64::try_from(batched_items).unwrap_or(u64::MAX),
+                committed_commits: u64::try_from(num_commits).unwrap_or(u64::MAX),
+                failed_requests: Vec::new(),
+            }
         }
         Err(e) => {
             tracing::warn!("[commit-coalescer] batch commit error: {e}");
@@ -2290,6 +2474,11 @@ fn coalescer_commit_batch(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.errors += 1;
+            CoalescerCommitOutcome {
+                committed_requests: 0,
+                committed_commits: 0,
+                failed_requests: requests.to_vec(),
+            }
         }
     }
 }
@@ -3736,6 +3925,7 @@ pub fn write_message_bundle(
     // Parse timestamp
     let created = parse_message_timestamp(message);
     let timestamp_str = created.to_rfc3339();
+    let visible_recipients = message_visible_recipients(message);
 
     let paths = message_paths(
         archive,
@@ -3754,7 +3944,7 @@ pub fn write_message_bundle(
 
     // Build frontmatter content
     let frontmatter = serde_json::to_string_pretty(message)?;
-    let content = format!("---json\n{frontmatter}\n---\n\n{}\n", body_md.trim());
+    let content = format!("---json\n{frontmatter}\n---\n\n{body_md}");
 
     // Create directories and write files
     let mut rel_paths = Vec::new();
@@ -3788,7 +3978,7 @@ pub fn write_message_bundle(
                 archive,
                 thread_id,
                 sender,
-                recipients,
+                &visible_recipients,
                 message
                     .get("subject")
                     .and_then(serde_json::Value::as_str)
@@ -3824,9 +4014,14 @@ pub fn write_message_bundle(
             })
             .unwrap_or_default();
 
+        let visible_recipient_label = if visible_recipients.is_empty() {
+            "(hidden recipients)".to_string()
+        } else {
+            visible_recipients.join(", ")
+        };
         let subject = format!(
             "mail: {sender} -> {} | {}",
-            recipients.join(", "),
+            visible_recipient_label,
             message
                 .get("subject")
                 .and_then(serde_json::Value::as_str)
@@ -3852,6 +4047,27 @@ pub fn write_message_bundle(
     enqueue_async_commit(&archive.repo_root, config, &commit_message, &rel_paths);
 
     Ok(())
+}
+
+fn message_visible_recipients(message: &serde_json::Value) -> Vec<String> {
+    let mut visible = Vec::new();
+    let mut seen = HashSet::new();
+
+    for field in ["to", "cc"] {
+        let Some(items) = message.get(field).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(name) = item.as_str().map(str::trim).filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            if seen.insert(name.to_ascii_lowercase()) {
+                visible.push(name.to_string());
+            }
+        }
+    }
+
+    visible
 }
 
 /// Parse a message timestamp from the JSON value.
@@ -3907,7 +4123,11 @@ fn update_thread_digest(
 
     let safe_thread_id = sanitize_thread_id(thread_id);
     let digest_path = digest_dir.join(format!("{safe_thread_id}.md"));
-    let recipients_str = recipients.join(", ");
+    let recipients_str = if recipients.is_empty() {
+        "(hidden recipients)".to_string()
+    } else {
+        recipients.join(", ")
+    };
 
     let header = format!("## {timestamp} \u{2014} {sender} \u{2192} {recipients_str}\n\n");
     let link_line = format!("[View canonical]({canonical_rel})\n\n");
@@ -4730,6 +4950,10 @@ pub fn clear_notification_signal(config: &Config, project_slug: &str, agent_name
     {
         return false;
     }
+
+    signal_debounce()
+        .lock()
+        .remove(&(project_slug.to_string(), agent_name.to_string()));
 
     let signal_path = config
         .notifications_signals_dir
@@ -5922,7 +6146,11 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
         && let Some(end_idx) = rest.find("\n---\n")
     {
         let json_str = &rest[..end_idx];
-        let body = rest[end_idx + 5..].trim().to_string();
+        let body = rest[end_idx + 5..]
+            .strip_prefix("\r\n")
+            .or_else(|| rest[end_idx + 5..].strip_prefix('\n'))
+            .unwrap_or(&rest[end_idx + 5..])
+            .to_string();
         let frontmatter = serde_json::from_str(json_str)?;
         return Ok((frontmatter, body));
     }
@@ -7085,6 +7313,99 @@ mod tests {
     }
 
     #[test]
+    fn test_write_message_bundle_keeps_bcc_inbox_private_from_thread_digest() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 2,
+            "subject": "Private Message",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-BCC",
+            "project": "proj",
+            "to": ["VisibleAgent"],
+            "cc": [],
+            "bcc": [],
+        });
+
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "Hello world!",
+            "SenderAgent",
+            &["VisibleAgent".to_string(), "HiddenAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let hidden_inbox_dir = archive.root.join("agents/HiddenAgent/inbox/2026/01");
+        assert!(
+            hidden_inbox_dir.exists(),
+            "bcc recipient should still get inbox copy"
+        );
+
+        let digest = archive.root.join("messages/threads/tkt-bcc.md");
+        let digest_body = fs::read_to_string(&digest).unwrap();
+        assert!(
+            digest_body.contains("VisibleAgent"),
+            "visible recipients should still appear in thread digest"
+        );
+        assert!(
+            !digest_body.contains("HiddenAgent"),
+            "bcc recipients must not leak into thread digest"
+        );
+    }
+
+    #[test]
+    fn test_write_message_bundle_preserves_body_whitespace_exactly() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 1,
+            "subject": "Whitespace Fidelity",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-WS",
+            "project": "proj",
+        });
+        let body = "  leading space\nline 2\n\ntrailing space  ";
+
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            body,
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let msg_dir = archive.root.join("messages/2026/01");
+        let canonical_path = fs::read_dir(&msg_dir)
+            .unwrap()
+            .find_map(|entry| entry.ok().map(|entry| entry.path()))
+            .expect("canonical message path");
+
+        let expected_content = format!(
+            "---json\n{}\n---\n\n{}",
+            serde_json::to_string_pretty(&message).unwrap(),
+            body
+        );
+        let raw = fs::read_to_string(&canonical_path).unwrap();
+        assert_eq!(raw, expected_content);
+
+        let (frontmatter, parsed_body) = read_message_file(&canonical_path).unwrap();
+        assert_eq!(frontmatter["subject"], "Whitespace Fidelity");
+        assert_eq!(parsed_body, body);
+    }
+
+    #[test]
     fn thread_digest_truncation_is_utf8_safe() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -7303,6 +7624,22 @@ mod tests {
 
         let signals2 = list_pending_signals(&config, Some("proj"));
         assert!(signals2.is_empty());
+    }
+
+    #[test]
+    fn test_clear_notification_signal_resets_debounce_state() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 60_000;
+
+        assert!(emit_notification_signal(&config, "proj", "Agent", None));
+        assert!(clear_notification_signal(&config, "proj", "Agent"));
+        assert!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            "clearing should allow the next real notification immediately"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8379,7 +8716,33 @@ mod tests {
         let (frontmatter, body) = read_message_file(&msg_path).unwrap();
         assert_eq!(frontmatter["id"], 1);
         assert_eq!(frontmatter["subject"], "Hello");
-        assert_eq!(body, "This is the body.");
+        assert_eq!(body, "This is the body.\n");
+    }
+
+    #[test]
+    fn test_read_message_file_preserves_body_whitespace() {
+        let tmp = TempDir::new().unwrap();
+
+        let msg_path = tmp.path().join("whitespace_msg.md");
+        let content = "---json\n{\"id\": 2}\n---\n\n  leading\nbody line\n\ntrailing  ";
+        fs::write(&msg_path, content).unwrap();
+
+        let (frontmatter, body) = read_message_file(&msg_path).unwrap();
+        assert_eq!(frontmatter["id"], 2);
+        assert_eq!(body, "  leading\nbody line\n\ntrailing  ");
+    }
+
+    #[test]
+    fn test_read_message_file_preserves_leading_blank_lines_in_body() {
+        let tmp = TempDir::new().unwrap();
+
+        let msg_path = tmp.path().join("leading_blank_lines.md");
+        let content = "---json\n{\"id\": 3}\n---\n\n\n\nbody after blanks";
+        fs::write(&msg_path, content).unwrap();
+
+        let (frontmatter, body) = read_message_file(&msg_path).unwrap();
+        assert_eq!(frontmatter["id"], 3);
+        assert_eq!(body, "\n\nbody after blanks");
     }
 
     #[test]
@@ -9724,6 +10087,67 @@ mod tests {
                 enqueued_delta as f64 / commits_delta as f64,
             );
         }
+    }
+
+    #[test]
+    fn coalescer_commit_batch_returns_failed_requests_on_commit_error() {
+        let tmp = TempDir::new().unwrap();
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(CommitQueueStats::default()));
+        let batch_sizes =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let request = CoalescerCommitFields {
+            enqueued_at: std::time::Instant::now(),
+            git_author_name: "Test".to_string(),
+            git_author_email: "test@example.com".to_string(),
+            message: "broken commit".to_string(),
+            rel_paths: vec!["missing.txt".to_string()],
+        };
+
+        let outcome = coalescer_commit_batch(
+            tmp.path(),
+            std::slice::from_ref(&request),
+            &stats,
+            &batch_sizes,
+        );
+
+        assert_eq!(outcome.committed_requests, 0);
+        assert_eq!(outcome.committed_commits, 0);
+        assert_eq!(outcome.failed_requests.len(), 1);
+        assert_eq!(outcome.failed_requests[0].message, request.message);
+        assert_eq!(stats.lock().unwrap_or_else(|e| e.into_inner()).errors, 1);
+    }
+
+    #[test]
+    fn coalescer_restore_spilled_work_restores_depth_and_paths() {
+        let rq = RepoQueue {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            spill: std::sync::Mutex::new(CoalescerSpillState::default()),
+            depth: AtomicU64::new(0),
+            processing: AtomicBool::new(false),
+            last_serviced_us: AtomicU64::new(0),
+            metrics: RepoCommitMetrics::default(),
+        };
+        let work = CoalescerSpilledWork {
+            repo_root: std::path::PathBuf::from("/tmp/fake-repo"),
+            pending_requests: 2,
+            earliest_enqueued_at: std::time::Instant::now(),
+            dirty_all: false,
+            paths: vec!["a.txt".to_string(), "b.txt".to_string()],
+            git_author_name: "Spill".to_string(),
+            git_author_email: "spill@example.com".to_string(),
+            message_first_lines: vec!["first".to_string()],
+            message_total: 2,
+        };
+
+        coalescer_restore_spilled_work(&rq, work);
+
+        assert_eq!(rq.depth.load(Ordering::Relaxed), 2);
+        let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        let restored = spill.inner.as_ref().expect("spill should be restored");
+        assert_eq!(restored.pending_requests, 2);
+        assert!(restored.paths.contains("a.txt"));
+        assert!(restored.paths.contains("b.txt"));
+        assert_eq!(restored.message_total, 2);
     }
 
     #[test]
