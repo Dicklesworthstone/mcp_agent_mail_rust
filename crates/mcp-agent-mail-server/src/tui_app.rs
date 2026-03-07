@@ -34,7 +34,7 @@ use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
 use ftui_runtime::subscription::Subscription;
-use ftui_runtime::tick_strategy::{ScreenTickDispatch, TickDecision, TickStrategy};
+use ftui_runtime::tick_strategy::ScreenTickDispatch;
 use mcp_agent_mail_db::DbPoolConfig;
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
@@ -244,88 +244,6 @@ fn screen_tick_divisor(screen: MailScreenId, active: MailScreenId, urgent_bypass
         divisor = divisor.min(URGENT_BYPASS_SCREEN_TICK_DIVISOR);
     }
     divisor.max(1)
-}
-
-#[derive(Debug)]
-struct TieredCadenceTickStrategy {
-    state: Arc<TuiSharedState>,
-    last_urgent_probe_tick: u64,
-    cached_urgent: bool,
-}
-
-impl TieredCadenceTickStrategy {
-    const fn new(state: Arc<TuiSharedState>) -> Self {
-        Self {
-            state,
-            last_urgent_probe_tick: u64::MAX,
-            cached_urgent: false,
-        }
-    }
-
-    fn urgent_for_tick(&mut self, tick_count: u64) -> bool {
-        if self.last_urgent_probe_tick != tick_count {
-            self.cached_urgent = urgent_poller_bypass_active(&self.state);
-            self.last_urgent_probe_tick = tick_count;
-        }
-        self.cached_urgent
-    }
-}
-
-impl TickStrategy for TieredCadenceTickStrategy {
-    fn should_tick(
-        &mut self,
-        screen_id: &str,
-        tick_count: u64,
-        active_screen: &str,
-    ) -> TickDecision {
-        let Some(screen) = screen_id_from_tick_key(screen_id) else {
-            return TickDecision::Skip;
-        };
-        let Some(active) = screen_id_from_tick_key(active_screen) else {
-            return if tick_count.is_multiple_of(INACTIVE_SCREEN_TICK_DIVISOR) {
-                TickDecision::Tick
-            } else {
-                TickDecision::Skip
-            };
-        };
-        let urgent_bypass = self.urgent_for_tick(tick_count);
-        let divisor = screen_tick_divisor(screen, active, urgent_bypass);
-        if tick_count.is_multiple_of(divisor) {
-            TickDecision::Tick
-        } else {
-            TickDecision::Skip
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        "TieredCadence"
-    }
-
-    fn debug_stats(&self) -> Vec<(String, String)> {
-        vec![
-            ("strategy".into(), "TieredCadence".into()),
-            (
-                "nearby_divisor".into(),
-                NEARBY_SCREEN_TICK_DIVISOR.to_string(),
-            ),
-            (
-                "inactive_divisor".into(),
-                INACTIVE_SCREEN_TICK_DIVISOR.to_string(),
-            ),
-            (
-                "background_divisor".into(),
-                BACKGROUND_SCREEN_TICK_DIVISOR.to_string(),
-            ),
-            (
-                "urgent_bypass_divisor".into(),
-                URGENT_BYPASS_SCREEN_TICK_DIVISOR.to_string(),
-            ),
-            (
-                "urgent_bypass_active".into(),
-                self.cached_urgent.to_string(),
-            ),
-        ]
-    }
 }
 
 fn command_palette_theme_style() -> PaletteStyle {
@@ -3730,11 +3648,7 @@ impl Model for MailAppModel {
     type Message = MailMsg;
 
     fn init(&mut self) -> Cmd<Self::Message> {
-        Cmd::batch(vec![
-            Cmd::set_tick_strategy(TieredCadenceTickStrategy::new(Arc::clone(&self.state))),
-            Cmd::tick(TICK_INTERVAL),
-            Cmd::set_mouse_capture(true),
-        ])
+        Cmd::batch(vec![Cmd::tick(TICK_INTERVAL), Cmd::set_mouse_capture(true)])
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4675,7 +4589,12 @@ impl Model for MailAppModel {
     }
 
     fn as_screen_tick_dispatch(&mut self) -> Option<&mut dyn ScreenTickDispatch> {
-        Some(self)
+        // The app's `update(Event::Tick)` path performs more than per-screen
+        // ticks: it publishes the shared event batch, drains remote terminal
+        // input, advances toast/expiry housekeeping, and observes detach /
+        // shutdown requests. Exposing `ScreenTickDispatch` here would make the
+        // live runtime bypass that maintenance path entirely.
+        None
     }
 }
 
@@ -7345,11 +7264,26 @@ mod tests {
     }
 
     #[test]
-    fn init_returns_batch_with_tick_and_mouse() {
+    fn init_returns_batch_with_tick_and_mouse_only() {
         let mut model = test_model();
         let cmd = model.init();
-        // init() now returns Batch([Tick, SetMouseCapture(true)])
-        assert!(matches!(cmd, Cmd::Batch(_)));
+        match cmd {
+            Cmd::Batch(cmds) => {
+                assert_eq!(cmds.len(), 2, "init should emit tick + mouse capture");
+                assert!(matches!(cmds[0], Cmd::Tick(_)));
+                assert!(matches!(cmds[1], Cmd::SetMouseCapture(true)));
+            }
+            other => panic!("expected init batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_screen_tick_dispatch_is_disabled_for_live_ticks() {
+        let mut model = test_model();
+        assert!(
+            Model::as_screen_tick_dispatch(&mut model).is_none(),
+            "live runtime must use update(Event::Tick) so housekeeping and shared batches run"
+        );
     }
 
     #[test]

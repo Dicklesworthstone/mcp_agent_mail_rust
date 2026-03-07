@@ -1501,6 +1501,58 @@ const TUI_DEFERRED_WORKER_DB_GRACE: Duration = Duration::from_secs(2);
 const TUI_DEFERRED_WORKER_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUI_ADVISORY_CONSISTENCY_IDLE_GRACE: Duration = Duration::from_secs(15);
 
+#[derive(Debug, Default)]
+struct TuiDeferredWorkerProgress {
+    non_db_started: AtomicBool,
+    db_started: AtomicBool,
+    advisory_started: AtomicBool,
+}
+
+impl TuiDeferredWorkerProgress {
+    fn claim_non_db_start(&self) -> bool {
+        !self.non_db_started.swap(true, Ordering::AcqRel)
+    }
+
+    fn claim_db_start(&self) -> bool {
+        !self.db_started.swap(true, Ordering::AcqRel)
+    }
+
+    fn claim_advisory_start(&self) -> bool {
+        !self.advisory_started.swap(true, Ordering::AcqRel)
+    }
+
+    fn start_non_db_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+        if self.claim_non_db_start() {
+            start_tui_non_db_background_workers(config);
+        }
+    }
+
+    fn start_db_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+        if self.claim_db_start() {
+            start_tui_db_background_workers(config);
+        }
+    }
+
+    fn start_advisory_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+        if self.claim_advisory_start() {
+            start_advisory_consistency_probe(config);
+        }
+    }
+}
+
+struct TuiDeferredWorkerHandle {
+    join: Option<std::thread::JoinHandle<()>>,
+    progress: Arc<TuiDeferredWorkerProgress>,
+}
+
+impl TuiDeferredWorkerHandle {
+    fn join(&mut self) {
+        if let Some(handle) = self.join.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn start_tui_non_db_background_workers(config: &mcp_agent_mail_core::Config) {
     disk_monitor::start(config);
 }
@@ -1581,43 +1633,51 @@ fn sleep_with_tui_shutdown(
 fn spawn_tui_deferred_background_workers(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
-) -> Option<std::thread::JoinHandle<()>> {
+) -> TuiDeferredWorkerHandle {
     let inline_config = config.clone();
     let inline_tui_state = Arc::clone(tui_state);
     let worker_config = inline_config.clone();
     let worker_tui_state = Arc::clone(&inline_tui_state);
+    let progress = Arc::new(TuiDeferredWorkerProgress::default());
+    let worker_progress = Arc::clone(&progress);
     match std::thread::Builder::new()
         .name("tui-deferred-workers".into())
         .spawn(move || {
             if !wait_for_tui_first_paint(&worker_tui_state) {
                 return;
             }
-            start_tui_non_db_background_workers(&worker_config);
+            worker_progress.start_non_db_if_needed(&worker_config);
             if !wait_for_tui_db_readiness(&worker_tui_state) {
                 return;
             }
-            start_tui_db_background_workers(&worker_config);
+            worker_progress.start_db_if_needed(&worker_config);
             if sleep_with_tui_shutdown(&worker_tui_state, TUI_ADVISORY_CONSISTENCY_IDLE_GRACE) {
                 return;
             }
-            start_advisory_consistency_probe(&worker_config);
+            worker_progress.start_advisory_if_needed(&worker_config);
         }) {
-        Ok(handle) => Some(handle),
+        Ok(handle) => TuiDeferredWorkerHandle {
+            join: Some(handle),
+            progress,
+        },
         Err(error) => {
             tracing::warn!(
                 error = %error,
                 "failed to spawn deferred TUI worker starter; starting deferred workers inline"
             );
-            start_tui_non_db_background_workers(&inline_config);
+            progress.start_non_db_if_needed(&inline_config);
             if !inline_tui_state.db_ready() {
                 tracing::warn!(
                     db_warmup = ?inline_tui_state.db_warmup_state(),
                     "deferred TUI worker thread unavailable; starting DB workers without startup gating"
                 );
             }
-            start_tui_db_background_workers(&inline_config);
-            start_advisory_consistency_probe(&inline_config);
-            None
+            progress.start_db_if_needed(&inline_config);
+            progress.start_advisory_if_needed(&inline_config);
+            TuiDeferredWorkerHandle {
+                join: None,
+                progress,
+            }
         }
     }
 }
@@ -1763,7 +1823,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     if let Some(watchdog) = startup_watchdog {
         watchdog.shutdown();
     }
-    let detach_headless = tui_result.is_ok() && tui_state.take_headless_detach_requested();
+    let detach_headless = tui_result.is_ok() && tui_state.is_headless_detach_requested();
 
     if detach_headless {
         // TUI detached intentionally: keep HTTP server running headless.
@@ -1771,12 +1831,11 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         // Any startup-gated worker thread must stop waiting on TUI-only latches
         // before we join it; otherwise a detach that happens before DB-ready can
         // leave the thread parked forever while the poller is being stopped.
-        if let Some(handle) = deferred_workers.take() {
-            let _ = handle.join();
-        }
-        start_tui_non_db_background_workers(config);
-        start_tui_db_background_workers(config);
-        start_advisory_consistency_probe(config);
+        deferred_workers.join();
+        deferred_workers.progress.start_non_db_if_needed(config);
+        deferred_workers.progress.start_db_if_needed(config);
+        deferred_workers.progress.start_advisory_if_needed(config);
+        let _ = tui_state.take_headless_detach_requested();
         set_tui_state_handle(None);
         db_poller.stop();
 
@@ -1800,9 +1859,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     tui_state.request_shutdown();
     let _ = server_ctl_tx.send(tui_bridge::ServerControlMsg::Shutdown);
     db_poller.stop();
-    if let Some(handle) = deferred_workers.take() {
-        let _ = handle.join();
-    }
+    deferred_workers.join();
 
     let supervisor_result = supervisor_thread
         .join()
@@ -2205,9 +2262,6 @@ fn run_tui_main_thread(
 
     let model = tui_app::MailAppModel::with_config(Arc::clone(tui_state), config);
 
-    // Bootstrap with ActiveOnly; MailAppModel::init installs the project-level
-    // tiered cadence strategy immediately via `Cmd::set_tick_strategy`.
-    let screen_tick_strategy = ftui_runtime::tick_strategy::TickStrategyKind::ActiveOnly;
     // Explicit resize coalescer wiring keeps bursty terminal resize streams
     // (mux panes, split toggles, drag-resize) from forcing repeated redraws.
     let resize_coalescer = ftui_runtime::resize_coalescer::CoalescerConfig {
@@ -2220,7 +2274,6 @@ fn run_tui_main_thread(
     };
     let tui_config = ftui_runtime::program::ProgramConfig::fullscreen()
         .with_mouse()
-        .with_tick_strategy(screen_tick_strategy)
         .with_diff_config(stable_tui_diff_config())
         .with_budget(ftui_render::budget::FrameBudgetConfig {
             total: Duration::from_millis(100), // Match TICK_INTERVAL
@@ -7807,6 +7860,40 @@ mod tests {
 
         assert!(!first_paint_waiter.join().expect("join first-paint waiter"));
         assert!(!db_ready_waiter.join().expect("join db-ready waiter"));
+    }
+
+    #[test]
+    fn headless_detach_branch_check_does_not_consume_stop_latch() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+
+        state.request_headless_detach();
+
+        let detach_headless = state.is_headless_detach_requested();
+        assert!(detach_headless);
+        assert!(
+            state.is_headless_detach_requested(),
+            "detach branch must leave the stop latch visible until waiters are joined"
+        );
+        assert!(state.take_headless_detach_requested());
+        assert!(!state.is_headless_detach_requested());
+    }
+
+    #[test]
+    fn deferred_worker_progress_claims_each_stage_once() {
+        let progress = TuiDeferredWorkerProgress::default();
+
+        assert!(progress.claim_non_db_start());
+        assert!(!progress.claim_non_db_start());
+
+        assert!(progress.claim_db_start());
+        assert!(!progress.claim_db_start());
+
+        assert!(progress.claim_advisory_start());
+        assert!(!progress.claim_advisory_start());
     }
 
     #[test]
