@@ -2277,9 +2277,7 @@ fn env_var_is_truthy(name: &str) -> bool {
 ///
 /// Refuses to terminate non-Agent-Mail processes.
 fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
-    use mcp_agent_mail_server::startup_checks::{
-        PortStatus, agent_mail_port_holder_pids_with_hint, check_port_status,
-    };
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
     use std::net::TcpListener;
 
     match TcpListener::bind(format!("{host}:{port}")) {
@@ -2289,14 +2287,6 @@ fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
             return Ok(());
         }
         Err(_) => {}
-    }
-
-    let hinted_pids = agent_mail_port_holder_pids_with_hint(host, port);
-    if !hinted_pids.is_empty() {
-        eprintln!(
-            "[info] Existing Agent Mail server on {host}:{port} — stopping it to start fresh"
-        );
-        return kill_port_holder_with_pids(host, port, hinted_pids);
     }
 
     let status = check_port_status(host, port);
@@ -2423,7 +2413,7 @@ fn kill_port_holder_with_pids(host: &str, port: u16, pids: Vec<u32>) -> CliResul
 
     match check_port_status(host, port) {
         PortStatus::Free => Ok(()),
-        PortStatus::AgentMailServer | PortStatus::OtherProcess { .. } => {
+        PortStatus::AgentMailServer => {
             let tool_hint = if has_kill_tool {
                 ""
             } else {
@@ -2433,6 +2423,9 @@ fn kill_port_holder_with_pids(host: &str, port: u16, pids: Vec<u32>) -> CliResul
                 "Failed to stop existing Agent Mail server on {host}:{port}{tool_hint}"
             )))
         }
+        PortStatus::OtherProcess { description } => Err(CliError::Other(format!(
+            "Stopped existing Agent Mail server on {host}:{port}, but another process still holds the port ({description}). Stop it manually or choose a different port."
+        ))),
         PortStatus::Error { message, .. } => Err(CliError::Other(format!(
             "Stopped existing Agent Mail server on {host}:{port}, but could not verify port state: {message}"
         ))),
@@ -2746,8 +2739,7 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
         }
         DeployCommand::Tooling(args) => {
             ensure_dir(&args.bundle)?;
-            let repo_root = std::env::current_dir()
-                .map_err(|e| CliError::Other(format!("current_dir failed: {e}")))?;
+            let repo_root = resolve_deploy_tooling_repo_root(&args.bundle)?;
             let written = share::deploy::write_deploy_tooling(&repo_root, &args.bundle)?;
             ftui_runtime::ftui_println!("Wrote {} deployment files:", written.len());
             for file in &written {
@@ -9156,6 +9148,37 @@ fn git_output_text(cwd: &Path, args: &[&str]) -> Option<String> {
 
 fn git_repo_root(path: &Path) -> Option<PathBuf> {
     git_output_text(path, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+}
+
+fn marker_discovered_repo_root(path: &Path) -> Option<PathBuf> {
+    let resolved = path.canonicalize().ok()?;
+    for candidate in resolved.ancestors() {
+        if candidate.join("Cargo.toml").exists()
+            || candidate.join("pyproject.toml").exists()
+            || candidate.join(".git").exists()
+        {
+            return Some(candidate.to_path_buf());
+        }
+    }
+    None
+}
+
+fn resolve_deploy_tooling_repo_root(bundle_dir: &Path) -> CliResult<PathBuf> {
+    if let Some(root) =
+        git_repo_root(bundle_dir).or_else(|| marker_discovered_repo_root(bundle_dir))
+    {
+        return Ok(root);
+    }
+
+    let cwd =
+        std::env::current_dir().map_err(|e| CliError::Other(format!("current_dir failed: {e}")))?;
+    if let Some(root) = git_repo_root(&cwd).or_else(|| marker_discovered_repo_root(&cwd)) {
+        return Ok(root);
+    }
+
+    cwd.canonicalize()
+        .or(Ok(cwd))
+        .map_err(|e: std::io::Error| CliError::Other(format!("current_dir failed: {e}")))
 }
 
 fn git_common_dir(path: &Path) -> Option<PathBuf> {
@@ -18441,6 +18464,33 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_sqlite_state_roundtrips_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("storage.sqlite3");
+        let quarantine = tmp.path().join("storage.sqlite3.corrupt");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+
+        std::fs::write(&db_path, b"main").unwrap();
+        std::fs::write(&wal_path, b"wal").unwrap();
+        std::fs::write(&shm_path, b"shm").unwrap();
+
+        let state = quarantine_sqlite_state(&db_path, &quarantine).unwrap();
+        assert!(!db_path.exists());
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
+        assert!(quarantine.exists());
+        assert!(quarantine_sidecar_path(&quarantine, "-wal").exists());
+        assert!(quarantine_sidecar_path(&quarantine, "-shm").exists());
+
+        restore_quarantined_sqlite_state(&state);
+        assert!(db_path.exists());
+        assert!(wal_path.exists());
+        assert!(shm_path.exists());
+        assert!(!quarantine.exists());
+    }
+
+    #[test]
     fn doctor_backups_lists_sqlite3_files_only() {
         let tmp = tempfile::tempdir().unwrap();
         let backup_dir = tmp.path().join("backups");
@@ -26980,6 +27030,58 @@ fn handle_doctor_reconstruct(dry_run: bool, _yes: bool, json: bool) -> CliResult
     handle_doctor_reconstruct_with(None, None, dry_run, json)
 }
 
+#[derive(Debug)]
+struct QuarantinedSqliteState {
+    original_db: PathBuf,
+    quarantined_db: PathBuf,
+    sidecars: Vec<(PathBuf, PathBuf)>,
+}
+
+fn quarantine_sidecar_path(quarantine_db: &Path, suffix: &str) -> PathBuf {
+    let mut aux_os = quarantine_db.as_os_str().to_os_string();
+    aux_os.push(suffix);
+    PathBuf::from(aux_os)
+}
+
+fn quarantine_sqlite_state(
+    db_path: &Path,
+    quarantine_db: &Path,
+) -> CliResult<QuarantinedSqliteState> {
+    std::fs::rename(db_path, quarantine_db)?;
+
+    let mut sidecars = Vec::new();
+    for suffix in ["-wal", "-shm"] {
+        let original = sqlite_sidecar_path(db_path, suffix);
+        if !original.exists() {
+            continue;
+        }
+        let quarantined = quarantine_sidecar_path(quarantine_db, suffix);
+        if let Err(err) = std::fs::rename(&original, &quarantined) {
+            for (restore_original, restore_quarantined) in sidecars.iter().rev() {
+                let _ = std::fs::rename(restore_quarantined, restore_original);
+            }
+            let _ = std::fs::rename(quarantine_db, db_path);
+            return Err(err.into());
+        }
+        sidecars.push((original, quarantined));
+    }
+
+    Ok(QuarantinedSqliteState {
+        original_db: db_path.to_path_buf(),
+        quarantined_db: quarantine_db.to_path_buf(),
+        sidecars,
+    })
+}
+
+fn restore_quarantined_sqlite_state(state: &QuarantinedSqliteState) {
+    let _ = std::fs::remove_file(&state.original_db);
+    let _ = std::fs::rename(&state.quarantined_db, &state.original_db);
+    for (original, quarantined) in &state.sidecars {
+        let _ = std::fs::remove_file(original);
+        let _ = std::fs::rename(quarantined, original);
+    }
+}
+
 fn handle_doctor_reconstruct_with(
     db_path_override: Option<&Path>,
     storage_root_override: Option<&Path>,
@@ -27057,7 +27159,7 @@ fn handle_doctor_reconstruct_with(
     }
 
     // Rename the existing DB out of the way (if it exists), preserving a unique quarantine path.
-    let mut quarantined_original: Option<(PathBuf, PathBuf)> = None;
+    let mut quarantined_original: Option<QuarantinedSqliteState> = None;
     if db_path.exists() {
         let base_name = db_path
             .file_name()
@@ -27072,18 +27174,7 @@ fn handle_doctor_reconstruct_with(
             suffix = suffix.saturating_add(1);
         }
         ftui_runtime::ftui_println!("Moving corrupt database to {}", quarantine.display());
-        std::fs::rename(&db_path, &quarantine)?;
-        quarantined_original = Some((db_path.clone(), quarantine));
-        // Also remove WAL/SHM sidecars if present.
-        // SQLite names these by appending -wal/-shm to the full filename.
-        for suffix in &["-wal", "-shm"] {
-            let mut aux_os = db_path.as_os_str().to_os_string();
-            aux_os.push(suffix);
-            let aux = PathBuf::from(aux_os);
-            if aux.exists() {
-                let _ = std::fs::remove_file(&aux);
-            }
-        }
+        quarantined_original = Some(quarantine_sqlite_state(&db_path, &quarantine)?);
     }
 
     ftui_runtime::ftui_println!(
@@ -27094,9 +27185,8 @@ fn handle_doctor_reconstruct_with(
     let stats = match mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root) {
         Ok(stats) => stats,
         Err(e) => {
-            if let Some((original, quarantine)) = quarantined_original.as_ref() {
-                let _ = std::fs::remove_file(original);
-                let _ = std::fs::rename(quarantine, original);
+            if let Some(state) = quarantined_original.as_ref() {
+                restore_quarantined_sqlite_state(state);
             }
             return Err(CliError::Other(format!("reconstruction failed: {e}")));
         }
@@ -30398,6 +30488,20 @@ fn atomic_replace_binary_roundtrip() {
     assert!(!backup.exists(), "backup should be cleaned up");
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn resolve_deploy_tooling_repo_root_uses_bundle_ancestors_instead_of_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    let nested = repo_root.join("crates/mcp-agent-mail-cli");
+    let bundle = repo_root.join("dist/bundle");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(repo_root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+
+    let resolved = resolve_deploy_tooling_repo_root(&bundle).unwrap();
+    assert_eq!(resolved, repo_root);
 }
 
 #[test]

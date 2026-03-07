@@ -1817,11 +1817,74 @@ pub fn detect_source(key: &str) -> ConfigSource {
 
 static DOTENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
 static USER_ENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
+static PROCESS_ENV_OVERRIDES: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
     static TEST_ENV_OVERRIDES: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+}
+
+fn process_env_overrides() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    PROCESS_ENV_OVERRIDES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn process_env_override_value(key: &str) -> Option<String> {
+    let guard = process_env_overrides()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.get(key).cloned()
+}
+
+#[doc(hidden)]
+pub fn with_process_env_overrides_for_test<R>(
+    overrides: &[(&str, &str)],
+    f: impl FnOnce() -> R,
+) -> R {
+    struct OverrideGuard {
+        previous: Vec<(String, Option<String>)>,
+    }
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            {
+                let mut guard = process_env_overrides()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (key, previous) in self.previous.drain(..) {
+                    match previous {
+                        Some(value) => {
+                            guard.insert(key, value);
+                        }
+                        None => {
+                            guard.remove(&key);
+                        }
+                    }
+                }
+            }
+            global_config_cache_reset();
+        }
+    }
+
+    let previous = {
+        let mut guard = process_env_overrides()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = overrides
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), guard.get(*key).cloned()))
+            .collect::<Vec<_>>();
+        for (key, value) in overrides {
+            guard.insert((*key).to_string(), (*value).to_string());
+        }
+        previous
+    };
+
+    global_config_cache_reset();
+    let restore = OverrideGuard { previous };
+    let result = f();
+    drop(restore);
+    result
 }
 
 #[cfg(test)]
@@ -1876,6 +1939,9 @@ pub fn env_value(key: &str) -> Option<String> {
     if let Some(v) = test_env_override_value(key) {
         return Some(v);
     }
+    if let Some(v) = process_env_override_value(key) {
+        return Some(v);
+    }
     env::var(key).ok().or_else(|| dotenv_value(key))
 }
 
@@ -1884,6 +1950,9 @@ pub fn env_value(key: &str) -> Option<String> {
 fn real_env_value(key: &str) -> Option<String> {
     #[cfg(test)]
     if let Some(v) = test_env_override_value(key) {
+        return Some(v);
+    }
+    if let Some(v) = process_env_override_value(key) {
         return Some(v);
     }
     env::var(key).ok()

@@ -811,20 +811,28 @@ fn parse_resource_query(query: &str) -> std::collections::HashMap<String, String
         }
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         params.insert(
-            percent_decode_resource_component(key),
-            percent_decode_resource_component(value),
+            percent_decode_resource_query_component(key),
+            percent_decode_resource_query_component(value),
         );
     }
     params
 }
 
-fn percent_decode_resource_component(input: &str) -> String {
+fn percent_decode_resource_path_component(input: &str) -> String {
+    percent_decode_resource_component(input, false)
+}
+
+fn percent_decode_resource_query_component(input: &str) -> String {
+    percent_decode_resource_component(input, true)
+}
+
+fn percent_decode_resource_component(input: &str, plus_as_space: bool) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -1545,14 +1553,9 @@ fn build_thread(
 ) -> Result<ThreadData, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
 
-    let mut conditions = vec![
-        "m.thread_id = ?".to_string(),
-        "m.project_id = ?".to_string(),
-    ];
-    let mut params: Vec<Value> = vec![
-        Value::Text(thread_id.to_string()),
-        Value::BigInt(project_id),
-    ];
+    let mut conditions = vec!["m.project_id = ?".to_string()];
+    let mut params: Vec<Value> = vec![Value::BigInt(project_id)];
+    append_thread_membership_condition("m", thread_id, &mut conditions, &mut params);
 
     if let Some(since_str) = since {
         let since_us = parse_since_micros(since_str)?;
@@ -1560,23 +1563,35 @@ fn build_thread(
         params.push(Value::BigInt(since_us));
     }
 
-    let limit_val = limit.unwrap_or(200);
-    params.push(Value::BigInt(limit_val.try_into().unwrap_or(i64::MAX)));
-
     let where_clause = conditions.join(" AND ");
+    let reverse_to_chronological = if let Some(limit_val) = limit {
+        params.push(Value::BigInt(limit_val.try_into().unwrap_or(i64::MAX)));
+        true
+    } else {
+        params.push(Value::BigInt(200));
+        false
+    };
+    let order_clause = if reverse_to_chronological {
+        "ORDER BY m.created_ts DESC, m.id DESC"
+    } else {
+        "ORDER BY m.created_ts ASC, m.id ASC"
+    };
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
                 m.sender_id, a_sender.name AS sender_name
          FROM messages m
          JOIN agents a_sender ON a_sender.id = m.sender_id
          WHERE {where_clause}
-         ORDER BY m.created_ts ASC
+         {order_clause}
          LIMIT ?"
     );
 
-    let rows = conn
+    let mut rows = conn
         .query_sync(&sql, &params)
         .map_err(|e| CliError::Other(format!("thread query failed: {e}")))?;
+    if reverse_to_chronological {
+        rows.reverse();
+    }
 
     let mut messages = Vec::new();
     let mut participants = Vec::new();
@@ -1680,6 +1695,43 @@ fn build_thread(
 
 // ── Message command implementation ──────────────────────────────────────────
 
+fn append_thread_membership_condition(
+    alias: &str,
+    thread_ref: &str,
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Value>,
+) {
+    if let Ok(root_id) = thread_ref.parse::<i64>() {
+        conditions.push(format!("({alias}.id = ? OR {alias}.thread_id = ?)"));
+        params.push(Value::BigInt(root_id));
+    } else {
+        conditions.push(format!("{alias}.thread_id = ?"));
+    }
+    params.push(Value::Text(thread_ref.to_string()));
+}
+
+fn thread_scope_params(alias: &str, project_id: i64, thread_ref: &str) -> (String, Vec<Value>) {
+    let mut conditions = vec![format!("{alias}.project_id = ?")];
+    let mut params = vec![Value::BigInt(project_id)];
+    append_thread_membership_condition(alias, thread_ref, &mut conditions, &mut params);
+    (conditions.join(" AND "), params)
+}
+
+fn canonical_thread_ref(message_id: i64, thread_id: &str) -> String {
+    if thread_id.is_empty() {
+        message_id.to_string()
+    } else {
+        thread_id.to_string()
+    }
+}
+
+fn format_adjacent_thread_row(row: &sqlmodel_core::Row) -> String {
+    let id: i64 = row.get_named("id").unwrap_or(0);
+    let sender: String = row.get_named("sender").unwrap_or_default();
+    let subject: String = row.get_named("subject").unwrap_or_default();
+    format!("#{id} {sender}: {}", truncate_str(&subject, 60))
+}
+
 /// Truncate a string to `max_len` chars, appending "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
@@ -1724,6 +1776,7 @@ fn build_message(
     let sender_name: String = row.get_named("sender_name").unwrap_or_default();
     let program: String = row.get_named("program").unwrap_or_default();
     let model: String = row.get_named("model").unwrap_or_default();
+    let thread_ref = canonical_thread_ref(message_id, &thread_id);
 
     // Recipients
     let recipient_rows = conn
@@ -1772,82 +1825,35 @@ fn build_message(
     };
 
     // Thread context
-    let (position, total_in_thread) = if !thread_id.is_empty() {
-        let total: i64 = conn
+    let (position, total_in_thread, previous, next) = if !thread_ref.is_empty() {
+        let (thread_where, thread_params) = thread_scope_params("m", project_id, &thread_ref);
+        let thread_rows = conn
             .query_sync(
-                "SELECT COUNT(*) AS cnt FROM messages WHERE thread_id = ? AND project_id = ?",
-                &[Value::Text(thread_id.clone()), Value::BigInt(project_id)],
+                &format!(
+                    "SELECT m.id, m.subject, m.created_ts, a.name AS sender
+                     FROM messages m
+                     JOIN agents a ON a.id = m.sender_id
+                     WHERE {thread_where}
+                     ORDER BY m.created_ts ASC, m.id ASC"
+                ),
+                &thread_params,
             )
-            .ok()
-            .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
-            .unwrap_or(1);
-        let pos: i64 = conn
-            .query_sync(
-                "SELECT COUNT(*) AS cnt FROM messages
-                 WHERE thread_id = ? AND project_id = ? AND created_ts <= ?",
-                &[
-                    Value::Text(thread_id.clone()),
-                    Value::BigInt(project_id),
-                    Value::BigInt(created_ts),
-                ],
-            )
-            .ok()
-            .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
-            .unwrap_or(1);
-        (pos as usize, total as usize)
+            .map_err(|e| CliError::Other(format!("thread context query failed: {e}")))?;
+        let total = thread_rows.len().max(1);
+        let current_index = thread_rows
+            .iter()
+            .position(|thread_row| thread_row.get_named::<i64>("id").ok() == Some(message_id));
+        let position = current_index.map_or(1, |idx| idx + 1);
+        let previous = current_index
+            .and_then(|idx| idx.checked_sub(1))
+            .and_then(|idx| thread_rows.get(idx))
+            .map(format_adjacent_thread_row);
+        let next = current_index
+            .and_then(|idx| thread_rows.get(idx + 1))
+            .map(format_adjacent_thread_row);
+        (position, total, previous, next)
     } else {
-        (1, 1)
-    };
-
-    // Adjacent messages
-    let previous = if !thread_id.is_empty() {
-        conn.query_sync(
-            "SELECT m.id, a.name AS sender, m.subject FROM messages m
-             JOIN agents a ON a.id = m.sender_id
-             WHERE m.thread_id = ? AND m.project_id = ? AND m.created_ts < ?
-             ORDER BY m.created_ts DESC LIMIT 1",
-            &[
-                Value::Text(thread_id.clone()),
-                Value::BigInt(project_id),
-                Value::BigInt(created_ts),
-            ],
-        )
-        .ok()
-        .and_then(|r| {
-            r.first().map(|row| {
-                let pid: i64 = row.get_named("id").unwrap_or(0);
-                let pname: String = row.get_named("sender").unwrap_or_default();
-                let psubj: String = row.get_named("subject").unwrap_or_default();
-                format!("#{pid} {pname}: {}", truncate_str(&psubj, 60))
-            })
-        })
-    } else {
-        None
-    };
-
-    let next = if !thread_id.is_empty() {
-        conn.query_sync(
-            "SELECT m.id, a.name AS sender, m.subject FROM messages m
-             JOIN agents a ON a.id = m.sender_id
-             WHERE m.thread_id = ? AND m.project_id = ? AND m.created_ts > ?
-             ORDER BY m.created_ts ASC LIMIT 1",
-            &[
-                Value::Text(thread_id.clone()),
-                Value::BigInt(project_id),
-                Value::BigInt(created_ts),
-            ],
-        )
-        .ok()
-        .and_then(|r| {
-            r.first().map(|row| {
-                let nid: i64 = row.get_named("id").unwrap_or(0);
-                let nname: String = row.get_named("sender").unwrap_or_default();
-                let nsubj: String = row.get_named("subject").unwrap_or_default();
-                format!("#{nid} {nname}: {}", truncate_str(&nsubj, 60))
-            })
-        })
-    } else {
-        None
+        (1, 1, None, None)
     };
 
     // Parse attachments JSON
@@ -1909,7 +1915,7 @@ fn build_message(
         to,
         subject,
         body,
-        thread: thread_id,
+        thread: thread_ref,
         position,
         total_in_thread,
         importance,
@@ -1969,7 +1975,6 @@ fn build_search(
     let now_us = mcp_agent_mail_db::now_micros();
     let mut search_query =
         mcp_agent_mail_db::search_planner::SearchQuery::messages(raw_query.to_string(), project_id);
-    search_query.limit = Some(limit);
 
     if let Some(imp) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
         let parsed = mcp_agent_mail_db::search_planner::Importance::parse(imp);
@@ -1994,16 +1999,8 @@ fn build_search(
         };
     }
 
-    let response = run_robot_search_query(&search_query)?;
     let recipient_kind = kind_filter.map(str::trim).filter(|s| !s.is_empty());
-    let kind_id_filter = match recipient_kind {
-        Some(kind) => Some(search_message_ids_by_recipient_kind(
-            conn,
-            kind,
-            &response.results,
-        )?),
-        None => None,
-    };
+    let search_rows = collect_search_rows(conn, &search_query, recipient_kind, limit)?;
 
     // Build results and facets
     let mut results = Vec::new();
@@ -2014,13 +2011,7 @@ fn build_search(
     let mut importance_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
-    for row in response.results {
-        if let Some(filter_ids) = &kind_id_filter
-            && !filter_ids.contains(&row.id)
-        {
-            continue;
-        }
-
+    for row in search_rows {
         let subject = row.title;
         let thread_id = row.thread_id.unwrap_or_default();
         let importance = row.importance.unwrap_or_else(|| "normal".to_string());
@@ -2086,19 +2077,101 @@ fn build_search(
     })
 }
 
-fn run_robot_search_query(
+fn collect_search_rows(
+    conn: &DbConn,
     query: &mcp_agent_mail_db::search_planner::SearchQuery,
-) -> Result<mcp_agent_mail_db::search_planner::SearchResponse, CliError> {
+    recipient_kind: Option<&str>,
+    limit: usize,
+) -> Result<Vec<mcp_agent_mail_db::search_planner::SearchResult>, CliError> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let pool = mcp_agent_mail_db::create_pool(&cfg)
         .map_err(|e| CliError::Other(format!("failed to initialize DB pool for search: {e}")))?;
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build async runtime for search: {e}")))?;
+
+    let requested_limit = limit.clamp(1, 1000);
+    let mut paged_query = query.clone();
+    paged_query.limit = Some(search_page_limit(requested_limit, recipient_kind));
+
+    collect_search_rows_with_runner(
+        conn,
+        paged_query,
+        recipient_kind,
+        requested_limit,
+        |query| execute_robot_search_query(&runtime, &pool, query),
+    )
+}
+
+fn collect_search_rows_with_runner<F>(
+    conn: &DbConn,
+    mut paged_query: mcp_agent_mail_db::search_planner::SearchQuery,
+    recipient_kind: Option<&str>,
+    requested_limit: usize,
+    mut run_query: F,
+) -> Result<Vec<mcp_agent_mail_db::search_planner::SearchResult>, CliError>
+where
+    F: FnMut(
+        &mcp_agent_mail_db::search_planner::SearchQuery,
+    ) -> Result<mcp_agent_mail_db::search_planner::SearchResponse, CliError>,
+{
+    let mut out = Vec::with_capacity(requested_limit);
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_cursors = std::collections::HashSet::new();
+
+    loop {
+        let response = run_query(&paged_query)?;
+        let kind_id_filter = match recipient_kind {
+            Some(kind) => Some(search_message_ids_by_recipient_kind(
+                conn,
+                kind,
+                &response.results,
+            )?),
+            None => None,
+        };
+
+        for row in response.results {
+            if let Some(filter_ids) = &kind_id_filter
+                && !filter_ids.contains(&row.id)
+            {
+                continue;
+            }
+            if !seen_ids.insert(row.id) {
+                continue;
+            }
+            out.push(row);
+            if out.len() >= requested_limit {
+                return Ok(out);
+            }
+        }
+
+        let Some(next_cursor) = response.next_cursor else {
+            return Ok(out);
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Ok(out);
+        }
+        paged_query.cursor = Some(next_cursor);
+    }
+}
+
+fn search_page_limit(limit: usize, recipient_kind: Option<&str>) -> usize {
+    if recipient_kind.is_some() {
+        limit.saturating_mul(4).clamp(limit, 1000)
+    } else {
+        limit
+    }
+}
+
+fn execute_robot_search_query(
+    runtime: &asupersync::runtime::Runtime,
+    pool: &mcp_agent_mail_db::DbPool,
+    query: &mcp_agent_mail_db::search_planner::SearchQuery,
+) -> Result<mcp_agent_mail_db::search_planner::SearchResponse, CliError> {
     let cx = asupersync::Cx::for_request();
 
     match runtime.block_on(async {
-        mcp_agent_mail_db::search_service::execute_search_simple(&cx, &pool, query).await
+        mcp_agent_mail_db::search_service::execute_search_simple(&cx, pool, query).await
     }) {
         Outcome::Ok(resp) => Ok(resp),
         Outcome::Err(e) => Err(CliError::Other(format!("search query failed: {e}"))),
@@ -2141,6 +2214,47 @@ fn search_message_ids_by_recipient_kind(
         }
     }
     Ok(out)
+}
+
+fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (HealthProbe, bool) {
+    let has_checks = metrics.checks_total > 0;
+    let last_check_failed = has_checks && metrics.last_ok_ts < metrics.last_check_ts;
+    let runtime_failures_without_checks = !has_checks && metrics.failures_total > 0;
+    let detail = if !has_checks && metrics.failures_total == 0 {
+        "No checks run yet".to_string()
+    } else if runtime_failures_without_checks {
+        format!(
+            "No integrity checks run yet; {} runtime corruption failures recorded",
+            metrics.failures_total
+        )
+    } else if last_check_failed {
+        format!(
+            "last check failed; {} cumulative failures across {} checks",
+            metrics.failures_total, metrics.checks_total
+        )
+    } else if metrics.failures_total == 0 {
+        format!("{} checks, all passed", metrics.checks_total)
+    } else {
+        format!(
+            "last check passed; {} historical failures across {} checks",
+            metrics.failures_total, metrics.checks_total
+        )
+    };
+
+    (
+        HealthProbe {
+            name: "integrity".into(),
+            status: if last_check_failed || runtime_failures_without_checks {
+                "warn"
+            } else {
+                "ok"
+            }
+            .into(),
+            latency_ms: 0.0,
+            detail,
+        },
+        !(last_check_failed || runtime_failures_without_checks),
+    )
 }
 
 // ── Reservations command implementation ─────────────────────────────────────
@@ -2480,6 +2594,12 @@ fn build_timeline(
 // ── Overview command implementation ─────────────────────────────────────────
 
 fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
+    fn decode_count(row: &sqlmodel_core::Row, label: &str) -> Result<i64, CliError> {
+        row.get_by_name("cnt")
+            .and_then(sqlmodel_core::Value::as_i64)
+            .ok_or_else(|| CliError::Other(format!("{label} query returned a non-integer count")))
+    }
+
     let now_us = mcp_agent_mail_db::now_micros();
 
     let rows = conn
@@ -2488,20 +2608,26 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
 
     let mut projects = Vec::new();
     for row in &rows {
-        let pid: i64 = row.get_named("id").unwrap_or(0);
-        let slug: String = row.get_named("slug").unwrap_or_default();
+        let pid = row
+            .get_by_name("id")
+            .and_then(sqlmodel_core::Value::as_i64)
+            .ok_or_else(|| CliError::Other("overview project row missing integer id".into()))?;
+        let slug = row
+            .get_named::<String>("slug")
+            .map_err(|e| CliError::Other(format!("overview project slug decode failed: {e}")))?;
 
         // Count unread messages across all agents in project
         let unread: i64 = conn
             .query_sync(
                 "SELECT COUNT(*) AS cnt FROM message_recipients mr
                  JOIN messages m ON m.id = mr.message_id
-                 WHERE m.project_id = ? AND mr.read_ts IS NULL",
+                WHERE m.project_id = ? AND mr.read_ts IS NULL",
                 &[Value::BigInt(pid)],
             )
-            .unwrap_or_default()
+            .map_err(|e| CliError::Other(format!("overview unread query failed: {e}")))?
             .first()
-            .and_then(|r| r.get_named("cnt").ok())
+            .map(|row| decode_count(row, "overview unread"))
+            .transpose()?
             .unwrap_or(0);
 
         // Count urgent/high unread messages
@@ -2513,9 +2639,10 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
                  AND mr.read_ts IS NULL",
                 &[Value::BigInt(pid)],
             )
-            .unwrap_or_default()
+            .map_err(|e| CliError::Other(format!("overview urgent query failed: {e}")))?
             .first()
-            .and_then(|r| r.get_named("cnt").ok())
+            .map(|row| decode_count(row, "overview urgent"))
+            .transpose()?
             .unwrap_or(0);
 
         // Count actionable ack-overdue items using the same 30m threshold as status/inbox.
@@ -2530,9 +2657,10 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
                     Value::BigInt(now_us - ACK_OVERDUE_THRESHOLD_US),
                 ],
             )
-            .unwrap_or_default()
+            .map_err(|e| CliError::Other(format!("overview ack-overdue query failed: {e}")))?
             .first()
-            .and_then(|r| r.get_named("cnt").ok())
+            .map(|row| decode_count(row, "overview ack-overdue"))
+            .transpose()?
             .unwrap_or(0);
 
         // Count active reservations
@@ -2542,9 +2670,10 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
                  WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ?",
                 &[Value::BigInt(pid), Value::BigInt(now_us)],
             )
-            .unwrap_or_default()
+            .map_err(|e| CliError::Other(format!("overview reservations query failed: {e}")))?
             .first()
-            .and_then(|r| r.get_named("cnt").ok())
+            .map(|row| decode_count(row, "overview reservations"))
+            .transpose()?
             .unwrap_or(0);
 
         projects.push(OverviewProject {
@@ -2934,7 +3063,7 @@ fn build_navigate(
 
     let parts: Vec<String> = path
         .split('/')
-        .map(percent_decode_resource_component)
+        .map(percent_decode_resource_path_component)
         .collect();
     let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
 
@@ -3514,23 +3643,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             // 4. Integrity metrics
             let integrity = mcp_agent_mail_db::integrity_metrics();
-            let integrity_ok = integrity.failures_total == 0;
-            let integrity_detail = if integrity.checks_total == 0 {
-                "No checks run yet".to_string()
-            } else if integrity_ok {
-                format!("{} checks, all passed", integrity.checks_total)
-            } else {
-                format!(
-                    "{} failures out of {} checks",
-                    integrity.failures_total, integrity.checks_total
-                )
-            };
-            probes.push(HealthProbe {
-                name: "integrity".into(),
-                status: if integrity_ok { "ok" } else { "warn" }.into(),
-                latency_ms: 0.0,
-                detail: integrity_detail,
-            });
+            let (integrity_probe, integrity_ok) = summarize_integrity_probe(&integrity);
+            probes.push(integrity_probe);
 
             // 5. Disk space probe
             let config = mcp_agent_mail_core::Config::from_env();
@@ -3550,7 +3664,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // Overall health
             let overall = if !db_ok {
                 "unhealthy"
-            } else if !circuits_ok || disk.pressure != mcp_agent_mail_core::disk::DiskPressure::Ok {
+            } else if !integrity_ok
+                || !circuits_ok
+                || disk.pressure != mcp_agent_mail_core::disk::DiskPressure::Ok
+            {
                 "degraded"
             } else {
                 "healthy"
@@ -3594,7 +3711,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 env = env.with_alert(
                     "warn",
                     format!(
-                        "{} integrity check failures detected",
+                        "Latest integrity check failed ({} cumulative failures recorded)",
                         integrity.failures_total
                     ),
                     None,
@@ -3623,8 +3740,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             if !db_ok {
                 env = env.with_action("Check DATABASE_URL env var and SQLite file accessibility");
             }
-            if mcp_agent_mail_db::is_full_check_due(24) {
-                env = env.with_action("Run full integrity check (last check >24h ago)");
+            if config.integrity_check_interval_hours > 0
+                && mcp_agent_mail_db::is_full_check_due(config.integrity_check_interval_hours)
+            {
+                env = env.with_action(format!(
+                    "Run full integrity check (last full check >{}h ago)",
+                    config.integrity_check_interval_hours
+                ));
             }
 
             format_output(&env, format)?
@@ -4422,6 +4544,158 @@ mod tests {
     }
 
     #[test]
+    fn collect_search_rows_with_runner_pages_until_kind_matches_fill_limit() {
+        use mcp_agent_mail_db::search_planner::{
+            DocKind, SearchQuery, SearchResponse, SearchResult as PlannerSearchResult,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_search_kind_paging.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind) VALUES
+                (1, 10, 1, 'cc'),
+                (2, 20, 1, 'to'),
+                (3, 30, 1, 'to')",
+            &empty,
+        )
+        .expect("insert recipients");
+
+        let mut query = SearchQuery::messages("needle", 1);
+        query.limit = Some(search_page_limit(2, Some("to")));
+
+        let mut call_count = 0usize;
+        let rows = collect_search_rows_with_runner(&conn, query, Some("to"), 2, |query| {
+            call_count += 1;
+            match query.cursor.as_deref() {
+                None => Ok(SearchResponse {
+                    results: vec![
+                        PlannerSearchResult {
+                            doc_kind: DocKind::Message,
+                            id: 10,
+                            project_id: Some(1),
+                            title: "first".into(),
+                            body: "body".into(),
+                            score: Some(0.9),
+                            importance: Some("normal".into()),
+                            ack_required: Some(false),
+                            created_ts: Some(100),
+                            thread_id: Some("th-1".into()),
+                            from_agent: Some("Alpha".into()),
+                            reason_codes: vec![],
+                            score_factors: vec![],
+                            redacted: false,
+                            redaction_reason: None,
+                        },
+                        PlannerSearchResult {
+                            doc_kind: DocKind::Message,
+                            id: 20,
+                            project_id: Some(1),
+                            title: "second".into(),
+                            body: "body".into(),
+                            score: Some(0.8),
+                            importance: Some("normal".into()),
+                            ack_required: Some(false),
+                            created_ts: Some(200),
+                            thread_id: Some("th-2".into()),
+                            from_agent: Some("Beta".into()),
+                            reason_codes: vec![],
+                            score_factors: vec![],
+                            redacted: false,
+                            redaction_reason: None,
+                        },
+                    ],
+                    next_cursor: Some("cursor-2".into()),
+                    explain: None,
+                    assistance: None,
+                    guidance: None,
+                    audit: vec![],
+                }),
+                Some("cursor-2") => Ok(SearchResponse {
+                    results: vec![PlannerSearchResult {
+                        doc_kind: DocKind::Message,
+                        id: 30,
+                        project_id: Some(1),
+                        title: "third".into(),
+                        body: "body".into(),
+                        score: Some(0.7),
+                        importance: Some("normal".into()),
+                        ack_required: Some(false),
+                        created_ts: Some(300),
+                        thread_id: Some("th-3".into()),
+                        from_agent: Some("Gamma".into()),
+                        reason_codes: vec![],
+                        score_factors: vec![],
+                        redacted: false,
+                        redaction_reason: None,
+                    }],
+                    next_cursor: None,
+                    explain: None,
+                    assistance: None,
+                    guidance: None,
+                    audit: vec![],
+                }),
+                other => panic!("unexpected cursor: {other:?}"),
+            }
+        })
+        .expect("collect kind-filtered rows");
+
+        assert_eq!(
+            call_count, 2,
+            "should page until matching rows fill the limit"
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+    }
+
+    #[test]
+    fn summarize_integrity_probe_uses_latest_check_not_cumulative_failures() {
+        let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
+            last_ok_ts: 1_000,
+            last_check_ts: 2_000,
+            checks_total: 5,
+            failures_total: 2,
+        });
+        assert!(!ok);
+        assert_eq!(probe.status, "warn");
+        assert!(probe.detail.contains("last check failed"));
+
+        let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
+            last_ok_ts: 2_000,
+            last_check_ts: 2_000,
+            checks_total: 5,
+            failures_total: 2,
+        });
+        assert!(ok);
+        assert_eq!(probe.status, "ok");
+        assert!(probe.detail.contains("historical failures"));
+
+        let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
+            last_ok_ts: 0,
+            last_check_ts: 0,
+            checks_total: 0,
+            failures_total: 1,
+        });
+        assert!(!ok);
+        assert_eq!(probe.status, "warn");
+        assert!(probe.detail.contains("runtime corruption failures"));
+    }
+
+    #[test]
     fn test_reservations_data_with_conflicts() {
         let data = ReservationsData {
             my_reservations: vec![ReservationEntry {
@@ -5148,104 +5422,6 @@ mod tests {
         assert!(v["projects"].as_array().unwrap().is_empty());
     }
 
-    fn setup_robot_overview_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let db_path = temp_dir.path().join("robot_overview_test.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
-        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
-
-        conn.query_sync(
-            "CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create projects");
-        conn.query_sync(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                importance TEXT NOT NULL,
-                ack_required INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create messages");
-        conn.query_sync(
-            "CREATE TABLE message_recipients (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL,
-                read_ts INTEGER,
-                ack_ts INTEGER
-            )",
-            &empty,
-        )
-        .expect("create recipients");
-        conn.query_sync(
-            "CREATE TABLE file_reservations (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL,
-                released_ts INTEGER,
-                expires_ts INTEGER NOT NULL
-            )",
-            &empty,
-        )
-        .expect("create reservations");
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
-            &empty,
-        )
-        .expect("insert project");
-
-        (temp_dir, conn)
-    }
-
-    #[test]
-    fn test_build_overview_counts_only_actionable_ack_overdue_messages() {
-        let (_temp_dir, conn) = setup_robot_overview_test_db();
-        let now_us = mcp_agent_mail_db::now_micros();
-        let old_message_ts = now_us - ACK_OVERDUE_THRESHOLD_US - 1;
-        let recent_message_ts = now_us - ACK_OVERDUE_THRESHOLD_US + 60 * 1_000_000;
-        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
-
-        conn.query_sync(
-            "INSERT INTO messages (id, project_id, importance, ack_required, created_ts)
-             VALUES
-                (10, 1, 'normal', 1, ?),
-                (20, 1, 'normal', 1, ?),
-                (30, 1, 'normal', 1, ?)",
-            &[
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(old_message_ts),
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(recent_message_ts),
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(old_message_ts),
-            ],
-        )
-        .expect("insert messages");
-        conn.query_sync(
-            "INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts)
-             VALUES
-                (1, 10, 1, NULL, NULL),
-                (2, 20, 1, NULL, NULL),
-                (3, 30, 1, NULL, 12345)",
-            &empty,
-        )
-        .expect("insert recipients");
-
-        let projects = build_overview(&conn).expect("build overview");
-
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].slug, "proj");
-        assert_eq!(
-            projects[0].ack_overdue, 1,
-            "only unacked messages older than the overdue threshold should count"
-        );
-    }
-
     // ── Track 3: Context & Discovery Unit Tests ──────────────────────────────
 
     #[test]
@@ -5922,6 +6098,55 @@ mod tests {
     }
 
     #[test]
+    fn test_build_navigate_preserves_literal_plus_in_path_segments() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_navigate_project_plus.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'proj-plus', '/tmp/proj+plus', 1000)",
+            &empty,
+        )
+        .expect("insert project");
+
+        let (result, project_scope) = build_navigate(
+            &conn,
+            "resource://project/%2Ftmp%2Fproj+plus",
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate project by plus-containing human key");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "project");
+                assert_eq!(data["slug"], "proj-plus");
+                assert_eq!(data["path"], "/tmp/proj+plus");
+            }
+            other => panic!("unexpected project result: {other:?}"),
+        }
+        assert_eq!(project_scope.as_deref(), Some("proj-plus"));
+    }
+
+    #[test]
     fn parse_resource_limit_caps_large_values() {
         let value = "50000".to_string();
         assert_eq!(
@@ -6401,6 +6626,131 @@ mod tests {
         let thread =
             build_thread(&conn, 1, "NO-ACK-THREAD", Some(10), None, false).expect("build thread");
         assert_eq!(thread.messages[0].ack, "none");
+    }
+
+    #[test]
+    fn test_build_thread_numeric_seed_includes_root_and_latest_window() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        for (id, subject, thread_id, created_ts) in [
+            (
+                200,
+                "Root",
+                mcp_agent_mail_db::sqlmodel_core::Value::Null,
+                10_i64,
+            ),
+            (
+                201,
+                "Reply one",
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("200".to_string()),
+                20_i64,
+            ),
+            (
+                202,
+                "Reply two",
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("200".to_string()),
+                30_i64,
+            ),
+        ] {
+            conn.query_sync(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(subject.to_string()),
+                    thread_id,
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(format!("{subject} body")),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+                ],
+            )
+            .expect("insert message");
+            conn.query_sync(
+                "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (?, ?, ?, 'to', NULL, NULL)",
+                &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                ],
+            )
+            .expect("insert recipient");
+        }
+
+        let full = build_thread(&conn, 1, "200", Some(10), None, false).expect("build thread");
+        assert_eq!(full.message_count, 3);
+        assert_eq!(full.messages[0].subject, "Root");
+        assert_eq!(full.messages[2].subject, "Reply two");
+
+        let latest_two =
+            build_thread(&conn, 1, "200", Some(2), None, false).expect("build limited thread");
+        assert_eq!(latest_two.message_count, 2);
+        assert_eq!(latest_two.messages[0].subject, "Reply one");
+        assert_eq!(latest_two.messages[1].subject, "Reply two");
+    }
+
+    #[test]
+    fn test_build_message_uses_seeded_thread_context_for_root_and_reply() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        for (id, sender_id, subject, thread_id, created_ts) in [
+            (
+                300,
+                1,
+                "Root",
+                mcp_agent_mail_db::sqlmodel_core::Value::Null,
+                100_i64,
+            ),
+            (
+                301,
+                2,
+                "Reply",
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("300".to_string()),
+                200_i64,
+            ),
+        ] {
+            conn.query_sync(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(sender_id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(subject.to_string()),
+                    thread_id,
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(format!("{subject} body")),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+                ],
+            )
+            .expect("insert message");
+        }
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (300, 300, 2, 'to', NULL, NULL),
+                (301, 301, 1, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let root = build_message(&conn, 1, 300).expect("build root message");
+        assert_eq!(root.thread, "300");
+        assert_eq!(root.position, 1);
+        assert_eq!(root.total_in_thread, 2);
+        assert_eq!(root.next.as_deref(), Some("#301 Bob: Reply"));
+
+        let reply = build_message(&conn, 1, 301).expect("build reply message");
+        assert_eq!(reply.thread, "300");
+        assert_eq!(reply.position, 2);
+        assert_eq!(reply.total_in_thread, 2);
+        assert_eq!(reply.previous.as_deref(), Some("#300 Alice: Root"));
     }
 
     // ── is_prose_command ────────────────────────────────────────────────
