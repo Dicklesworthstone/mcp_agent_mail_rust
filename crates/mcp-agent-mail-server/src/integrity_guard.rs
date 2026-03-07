@@ -195,15 +195,15 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             );
         }
 
-        if full_check_due(config, full_every, last_full_attempt)
-            && run_full_cycle(
+        if full_check_due(config, full_every, last_full_attempt) {
+            let attempted_at = Instant::now();
+            let _ = run_full_cycle(
                 &pool,
                 sqlite_path,
                 &storage_root,
                 &mut last_recovery_attempt,
-            )
-        {
-            last_full_attempt = Some(Instant::now());
+            );
+            last_full_attempt = Some(attempted_at);
         }
 
         // Sleep in short increments so shutdown reacts quickly.
@@ -395,6 +395,26 @@ mod tests {
         config.integrity_check_interval_hours = 1;
         let interval = full_check_interval(&config);
         assert!(!full_check_due(&config, interval, Some(Instant::now())));
+    }
+
+    #[test]
+    fn full_check_due_uses_last_attempt_not_last_success() {
+        let mut config = Config::from_env();
+        config.integrity_check_interval_hours = 1;
+        let interval = full_check_interval(&config);
+        let stale_success = Instant::now()
+            .checked_sub(Duration::from_secs(MIN_FULL_CHECK_INTERVAL_SECS + 1))
+            .expect("stale success timestamp");
+        assert!(
+            full_check_due(&config, interval, Some(stale_success)),
+            "an old successful full check should make another attempt due"
+        );
+
+        let attempted_at = Instant::now();
+        assert!(
+            !full_check_due(&config, interval, Some(attempted_at)),
+            "a recent failed attempt should still throttle the next full check"
+        );
     }
 
     #[test]
