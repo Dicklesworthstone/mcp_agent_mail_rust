@@ -117,9 +117,7 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
     }
     // 3. Absolute paths (check original pattern for this one, as normalize_pattern strips leading slash)
     let trimmed = pattern.trim();
-    if !trimmed.starts_with("//")
-        && (trimmed.starts_with('/') || std::path::Path::new(trimmed).is_absolute())
-    {
+    if !trimmed.starts_with("//") && path_looks_absolute(trimmed) {
         return Some(format!(
             "Pattern '{pattern}' looks like an absolute path. \
              Reservations should use project-relative paths like 'src/module.py'."
@@ -127,6 +125,18 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
     }
 
     None
+}
+
+fn path_looks_absolute(input: &str) -> bool {
+    if std::path::Path::new(input).is_absolute() {
+        return true;
+    }
+
+    let bytes = input.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
 }
 
 fn relativize_path(project_root: &str, path: &str) -> Option<String> {
@@ -145,7 +155,7 @@ fn relativize_path(project_root: &str, path: &str) -> Option<String> {
     }
 
     let normalized_slash = path.replace('\\', "/");
-    let path_is_absolute = std::path::Path::new(&normalized_slash).is_absolute();
+    let path_is_absolute = path_looks_absolute(&normalized_slash);
 
     let path_parts = normalize_parts(&normalized_slash)?;
     if path_is_absolute {
@@ -210,6 +220,12 @@ fn expand_tilde(input: &str) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     PathBuf::from(input)
+}
+
+fn released_ts_json_value(released_ts: Option<i64>) -> serde_json::Value {
+    released_ts.map_or(serde_json::Value::Null, |ts| {
+        serde_json::Value::String(micros_to_iso(ts))
+    })
 }
 
 fn normalize_repo_path(input: &str) -> PathBuf {
@@ -621,7 +637,7 @@ pub async fn release_file_reservations(
                     "reason": &r.reason,
                     "created_ts": micros_to_iso(r.created_ts),
                     "expires_ts": micros_to_iso(r.expires_ts),
-                    "released_ts": micros_to_iso(r.released_ts.unwrap_or(0)),
+                    "released_ts": released_ts_json_value(r.released_ts),
                 })
             })
             .collect();
@@ -1399,6 +1415,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn released_ts_json_value_none_is_null() {
+        assert!(released_ts_json_value(None).is_null());
+    }
+
+    #[test]
+    fn released_ts_json_value_some_is_iso_string() {
+        let value = released_ts_json_value(Some(1_738_801_200_000_000));
+        assert_eq!(
+            value,
+            serde_json::Value::String("2025-02-06T00:20:00.000000Z".to_string())
+        );
+    }
+
     fn reservation_row(
         id: i64,
         agent_id: i64,
@@ -1653,6 +1683,21 @@ mod tests {
     }
 
     #[test]
+    fn normalize_filter_paths_rejects_windows_absolute_outside_root() {
+        let root = "/project";
+        let err = normalize_filter_paths(root, Some(vec!["C:\\other\\main.rs".to_string()]));
+        let rendered = err.expect_err("expected invalid path").to_string();
+        assert!(
+            rendered.contains("outside the project root"),
+            "expected outside-root error, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains(root),
+            "error details must not leak absolute project root"
+        );
+    }
+
+    #[test]
     fn normalize_filter_paths_rejects_project_root_target() {
         let root = "/project";
         let err = normalize_filter_paths(root, Some(vec![".".to_string()]));
@@ -1805,6 +1850,13 @@ mod tests {
     #[test]
     fn absolute_path_detected() {
         let warning = detect_suspicious_file_reservation("/full/path/src/module.py");
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("absolute path"));
+    }
+
+    #[test]
+    fn windows_absolute_path_detected() {
+        let warning = detect_suspicious_file_reservation("C:\\full\\path\\src\\module.py");
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("absolute path"));
     }

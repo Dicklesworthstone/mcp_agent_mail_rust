@@ -219,6 +219,53 @@ fn test_invalid_thread_id_message() {
     });
 }
 
+#[test]
+fn test_numeric_thread_id_reserved_message() {
+    run_serial_async(|cx| async move {
+        let project_key = format!("/tmp/inv_tid_numeric-{}", unique_suffix());
+
+        let ctx = McpContext::new(cx.clone(), 1);
+        setup_project_and_agent(&ctx, &project_key, "BlueLake").await;
+
+        let err = send_message(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            vec!["BlueLake".to_string()],
+            "Test".to_string(),
+            "Test body".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("123".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("numeric thread_id should fail");
+
+        let payload = error_object(&err);
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("INVALID_THREAD_ID"),
+            "error type mismatch"
+        );
+
+        let msg = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("message field");
+        assert!(
+            msg.contains("Bare numeric IDs are reserved for reply-seeded threads."),
+            "message should explain numeric reservation: {msg}"
+        );
+    });
+}
+
 // -----------------------------------------------------------------------
 // T8.2: EMPTY_PROGRAM
 // -----------------------------------------------------------------------

@@ -432,6 +432,14 @@ fn is_valid_thread_id(tid: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
+/// Validate an explicit `thread_id` passed to `send_message`.
+///
+/// Bare numeric ids are reserved for reply-seeded threads when `reply_message`
+/// falls back to the original message id.
+fn is_valid_explicit_thread_id(tid: &str) -> bool {
+    is_valid_thread_id(tid) && !tid.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Defense-in-depth sanitization for `thread_id` values derived from DB rows.
 /// Strips invalid characters, truncates to 128 chars, and ensures the result
 /// starts with an alphanumeric character. Returns the sanitized value, or
@@ -838,6 +846,209 @@ async fn push_recipient(
     Ok(())
 }
 
+#[allow(dead_code, clippy::too_many_arguments, clippy::too_many_lines)]
+fn process_message_attachments(
+    config: &Config,
+    project_slug: &str,
+    project_human_key: &str,
+    base_dir: &Path,
+    subject: &str,
+    body_md: &str,
+    attachment_paths: Option<&[String]>,
+    do_convert: bool,
+    embed_policy: mcp_agent_mail_storage::EmbedPolicy,
+) -> McpResult<(String, Vec<serde_json::Value>, Vec<String>)> {
+    let attachment_count = attachment_paths.map_or(0, <[String]>::len);
+    let mut final_body = body_md.to_string();
+    let mut all_attachment_meta: Vec<serde_json::Value> = Vec::with_capacity(attachment_count + 4);
+    let mut all_attachment_rel_paths: Vec<String> = Vec::with_capacity(attachment_count + 4);
+
+    if do_convert {
+        match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
+            Ok(archive) => {
+                if let Ok((updated_body, md_meta, rel_paths)) =
+                    mcp_agent_mail_storage::process_markdown_images(
+                        &archive,
+                        config,
+                        base_dir,
+                        body_md,
+                        embed_policy,
+                    )
+                {
+                    final_body = updated_body;
+                    all_attachment_rel_paths.extend(rel_paths);
+                    for meta in &md_meta {
+                        if let Ok(value) = serde_json::to_value(meta) {
+                            all_attachment_meta.push(value);
+                        }
+                    }
+                }
+
+                if let Some(paths) = attachment_paths
+                    && !paths.is_empty()
+                {
+                    let (att_meta, rel_paths) = mcp_agent_mail_storage::process_attachments(
+                        &archive,
+                        config,
+                        base_dir,
+                        paths,
+                        embed_policy,
+                    )
+                    .map_err(|e| {
+                        legacy_tool_error(
+                            "INVALID_ARGUMENT",
+                            format!("Invalid attachment_paths: {e}"),
+                            true,
+                            json!({
+                                "field": "attachment_paths",
+                                "provided": paths,
+                            }),
+                        )
+                    })?;
+                    all_attachment_rel_paths.extend(rel_paths);
+                    for meta in &att_meta {
+                        if let Ok(value) = serde_json::to_value(meta) {
+                            all_attachment_meta.push(value);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if attachment_paths.is_some_and(|paths| !paths.is_empty()) {
+                    return Err(legacy_tool_error(
+                        "ARCHIVE_ERROR",
+                        format!(
+                            "Failed to initialize git archive for project '{project_slug}'. This prevents storing attachments: {e}"
+                        ),
+                        true,
+                        json!({
+                            "project_slug": project_slug,
+                            "project_root": project_human_key,
+                        }),
+                    ));
+                }
+            }
+        }
+    } else if let Some(paths) = attachment_paths {
+        match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
+            Ok(archive) => {
+                for path in paths {
+                    let resolved = mcp_agent_mail_storage::resolve_attachment_source_path(
+                        base_dir, config, path,
+                    )
+                    .map_err(|e| {
+                        legacy_tool_error(
+                            "INVALID_ARGUMENT",
+                            format!("Invalid attachment path: {e}"),
+                            true,
+                            json!({
+                                "field": "attachment_paths",
+                                "provided": path,
+                            }),
+                        )
+                    })?;
+
+                    let stored = mcp_agent_mail_storage::store_raw_attachment(&archive, &resolved)
+                        .map_err(|e| {
+                            legacy_tool_error(
+                                "ARCHIVE_ERROR",
+                                format!("Failed to store raw attachment: {e}"),
+                                true,
+                                json!({
+                                    "path": path,
+                                }),
+                            )
+                        })?;
+
+                    all_attachment_rel_paths.extend(stored.rel_paths);
+                    if let Ok(value) = serde_json::to_value(&stored.meta) {
+                        all_attachment_meta.push(value);
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(legacy_tool_error(
+                    "ARCHIVE_ERROR",
+                    format!(
+                        "Failed to initialize git archive for project '{project_slug}'. This prevents storing attachments: {e}"
+                    ),
+                    true,
+                    json!({
+                        "project_slug": project_slug,
+                        "project_root": project_human_key,
+                    }),
+                ));
+            }
+        }
+    }
+
+    if do_convert {
+        if config.max_message_body_bytes > 0 && final_body.len() > config.max_message_body_bytes {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "Message body exceeds size limit after inlining images: {} bytes > {} byte limit. \
+                     Use 'file' attachments policy or reduce image sizes.",
+                    final_body.len(),
+                    config.max_message_body_bytes,
+                ),
+                true,
+                json!({
+                    "field": "body_md",
+                    "size_bytes": final_body.len(),
+                    "limit_bytes": config.max_message_body_bytes,
+                }),
+            ));
+        }
+
+        if config.max_total_message_bytes > 0 {
+            let mut total_size = subject.len().saturating_add(final_body.len());
+            for meta in &all_attachment_meta {
+                let att_type = meta.get("type").and_then(serde_json::Value::as_str);
+
+                if att_type == Some("inline") && meta.get("data_base64").is_none() {
+                    continue;
+                }
+
+                if (att_type == Some("file") || att_type == Some("inline"))
+                    && let Some(bytes) = meta.get("bytes").and_then(serde_json::Value::as_u64)
+                {
+                    if let Ok(bytes_usize) = usize::try_from(bytes) {
+                        let effective_bytes = if att_type == Some("inline") {
+                            bytes_usize.saturating_mul(4).saturating_div(3)
+                        } else {
+                            bytes_usize
+                        };
+                        total_size = total_size.saturating_add(effective_bytes);
+                    } else {
+                        total_size = usize::MAX;
+                        break;
+                    }
+                }
+            }
+
+            if total_size > config.max_total_message_bytes {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Total message size exceeds limit after processing: {} bytes > {} byte limit. \
+                         Reduce body or attachment sizes.",
+                        total_size, config.max_total_message_bytes,
+                    ),
+                    true,
+                    json!({
+                        "field": "total",
+                        "size_bytes": total_size,
+                        "limit_bytes": config.max_total_message_bytes,
+                    }),
+                ));
+            }
+        }
+    }
+
+    Ok((final_body, all_attachment_meta, all_attachment_rel_paths))
+}
+
 /// Message delivery result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryResult {
@@ -946,7 +1157,7 @@ pub struct ReplyMessageResponse {
 /// - `convert_images`: Override image conversion (optional)
 /// - `importance`: Message importance: low, normal, high, urgent (default: normal)
 /// - `ack_required`: Request acknowledgement (default: false)
-/// - `thread_id`: Associate with existing thread (optional)
+/// - `thread_id`: Associate with existing thread (optional; bare numerics are reserved)
 /// - `topic`: Reserved for future topic tags; non-blank values are currently rejected
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
 #[allow(
@@ -1013,13 +1224,14 @@ pub async fn send_message(
 
     // Validate thread_id format if provided
     if let Some(ref tid) = thread_id
-        && !is_valid_thread_id(tid)
+        && !is_valid_explicit_thread_id(tid)
     {
         return Err(legacy_tool_error(
             "INVALID_THREAD_ID",
             format!(
                 "Invalid thread_id: '{tid}'. Thread IDs must start with an alphanumeric character and \
                      contain only letters, numbers, '.', '_', or '-' (max 128). \
+                     Bare numeric IDs are reserved for reply-seeded threads. \
                      Examples: 'TKT-123', 'bd-42', 'feature-xyz'."
             ),
             true,
@@ -1268,7 +1480,6 @@ effective_free_bytes={free}"
         ));
     }
 
-    // Determine attachment processing settings
     let embed_policy =
         mcp_agent_mail_storage::EmbedPolicy::from_str_policy(&sender.attachments_policy);
     let sender_forces_convert = matches!(
@@ -1280,208 +1491,6 @@ effective_free_bytes={free}"
     } else {
         convert_images.unwrap_or(config.convert_images)
     };
-
-    // Process attachments and markdown images
-    let mut final_body = body_md.clone();
-    let attachment_count = attachment_paths.as_ref().map_or(0, Vec::len);
-    let mut all_attachment_meta: Vec<serde_json::Value> = Vec::with_capacity(attachment_count + 4);
-    let mut all_attachment_rel_paths: Vec<String> = Vec::with_capacity(attachment_count + 4);
-    if do_convert {
-        let slug = &project.slug;
-        match mcp_agent_mail_storage::ensure_archive(config, slug) {
-            Ok(archive) => {
-                // Process inline markdown images
-                if let Ok((updated_body, md_meta, rel_paths)) =
-                    mcp_agent_mail_storage::process_markdown_images(
-                        &archive,
-                        config,
-                        base_dir,
-                        &body_md,
-                        embed_policy,
-                    )
-                {
-                    final_body = updated_body;
-                    all_attachment_rel_paths.extend(rel_paths);
-                    for m in &md_meta {
-                        if let Ok(v) = serde_json::to_value(m) {
-                            all_attachment_meta.push(v);
-                        }
-                    }
-                }
-
-                // Process explicit attachment_paths
-                if let Some(ref paths) = attachment_paths
-                    && !paths.is_empty()
-                {
-                    let (att_meta, rel_paths) = mcp_agent_mail_storage::process_attachments(
-                        &archive,
-                        config,
-                        base_dir,
-                        paths,
-                        embed_policy,
-                    )
-                    .map_err(|e| {
-                        legacy_tool_error(
-                            "INVALID_ARGUMENT",
-                            format!("Invalid attachment_paths: {e}"),
-                            true,
-                            json!({
-                                "field": "attachment_paths",
-                                "provided": paths,
-                            }),
-                        )
-                    })?;
-                    all_attachment_rel_paths.extend(rel_paths);
-                    for m in &att_meta {
-                        if let Ok(v) = serde_json::to_value(m) {
-                            all_attachment_meta.push(v);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                if attachment_paths.as_ref().is_some_and(|p| !p.is_empty()) {
-                    // If explicit attachments were provided, fail loudly rather than silently dropping them.
-                    return Err(legacy_tool_error(
-                        "ARCHIVE_ERROR",
-                        format!(
-                            "Failed to initialize git archive for project '{slug}'. This prevents storing attachments: {e}"
-                        ),
-                        true,
-                        json!({
-                            "project_slug": slug,
-                            "project_root": project.human_key,
-                        }),
-                    ));
-                }
-            }
-        }
-    } else if let Some(ref paths) = attachment_paths {
-        // No conversion: store raw files in archive
-        let slug = &project.slug;
-        match mcp_agent_mail_storage::ensure_archive(config, slug) {
-            Ok(archive) => {
-                for p in paths {
-                    // Resolve source path first
-                    let resolved =
-                        mcp_agent_mail_storage::resolve_attachment_source_path(base_dir, config, p)
-                            .map_err(|e| {
-                                legacy_tool_error(
-                                    "INVALID_ARGUMENT",
-                                    format!("Invalid attachment path: {e}"),
-                                    true,
-                                    json!({
-                                        "field": "attachment_paths",
-                                        "provided": p,
-                                    }),
-                                )
-                            })?;
-
-                    // Store raw file in archive
-                    let stored = mcp_agent_mail_storage::store_raw_attachment(&archive, &resolved)
-                        .map_err(|e| {
-                            legacy_tool_error(
-                                "ARCHIVE_ERROR",
-                                format!("Failed to store raw attachment: {e}"),
-                                true,
-                                json!({
-                                    "path": p,
-                                }),
-                            )
-                        })?;
-
-                    all_attachment_rel_paths.extend(stored.rel_paths);
-                    if let Ok(v) = serde_json::to_value(&stored.meta) {
-                        all_attachment_meta.push(v);
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(legacy_tool_error(
-                    "ARCHIVE_ERROR",
-                    format!(
-                        "Failed to initialize git archive for project '{slug}'. This prevents storing attachments: {e}"
-                    ),
-                    true,
-                    json!({
-                        "project_slug": slug,
-                        "project_root": project.human_key,
-                    }),
-                ));
-            }
-        }
-    }
-
-    // Re-validate size limits on the final (potentially inlined) body.
-    // If inline images were processed, final_body may be significantly larger than body_md.
-    if do_convert {
-        if config.max_message_body_bytes > 0 && final_body.len() > config.max_message_body_bytes {
-            return Err(legacy_tool_error(
-                "INVALID_ARGUMENT",
-                format!(
-                    "Message body exceeds size limit after inlining images: {} bytes > {} byte limit. \
-                     Use 'file' attachments policy or reduce image sizes.",
-                    final_body.len(),
-                    config.max_message_body_bytes,
-                ),
-                true,
-                json!({
-                    "field": "body_md",
-                    "size_bytes": final_body.len(),
-                    "limit_bytes": config.max_message_body_bytes,
-                }),
-            ));
-        }
-
-        if config.max_total_message_bytes > 0 {
-            let mut total_size = subject.len().saturating_add(final_body.len());
-            for meta in &all_attachment_meta {
-                let att_type = meta.get("type").and_then(serde_json::Value::as_str);
-
-                // If this is an inline image originating from markdown, we stripped its `data_base64`
-                // in `process_markdown_images` because it's already embedded in `final_body`.
-                // Don't double-count its size here!
-                if att_type == Some("inline") && meta.get("data_base64").is_none() {
-                    continue;
-                }
-
-                if (att_type == Some("file") || att_type == Some("inline"))
-                    && let Some(bytes) = meta.get("bytes").and_then(serde_json::Value::as_u64)
-                {
-                    if let Ok(bytes_usize) = usize::try_from(bytes) {
-                        let effective_bytes = if att_type == Some("inline") {
-                            // Base64 encoding adds ~33% overhead
-                            bytes_usize.saturating_mul(4).saturating_div(3)
-                        } else {
-                            bytes_usize
-                        };
-                        total_size = total_size.saturating_add(effective_bytes);
-                    } else {
-                        // On 32-bit platforms, treat oversized metadata as exceeding limits.
-                        total_size = usize::MAX;
-                        break;
-                    }
-                }
-            }
-
-            if total_size > config.max_total_message_bytes {
-                return Err(legacy_tool_error(
-                    "INVALID_ARGUMENT",
-                    format!(
-                        "Total message size exceeds limit after processing: {} bytes > {} byte limit. \
-                         Reduce body or attachment sizes.",
-                        total_size, config.max_total_message_bytes,
-                    ),
-                    true,
-                    json!({
-                        "field": "total",
-                        "size_bytes": total_size,
-                        "limit_bytes": config.max_total_message_bytes,
-                    }),
-                ));
-            }
-        }
-    }
 
     if let Some(auto_contact) = auto_contact_if_blocked {
         tracing::debug!("Auto contact if blocked: {}", auto_contact);
@@ -1757,6 +1766,18 @@ effective_free_bytes={free}"
         }
     }
 
+    let (final_body, all_attachment_meta, all_attachment_rel_paths) = process_message_attachments(
+        config,
+        &project.slug,
+        &project.human_key,
+        base_dir,
+        &subject,
+        &body_md,
+        attachment_paths.as_deref(),
+        do_convert,
+        embed_policy,
+    )?;
+
     // Serialize processed attachment metadata as JSON array
     let attachments_json =
         serde_json::to_string(&all_attachment_meta).unwrap_or_else(|_| "[]".to_string());
@@ -1789,7 +1810,7 @@ effective_free_bytes={free}"
         id: message_id,
         project_id,
         project_slug: project.slug.clone(),
-        sender_name: sender_name.clone(),
+        sender_name: sender.name.clone(),
         subject: message.subject.clone(),
         body_md: message.body_md.clone(),
         thread_id: thread_id.clone(),
@@ -1804,7 +1825,7 @@ effective_free_bytes={free}"
     // Python implementation + fixture tests).
     let notification_meta = mcp_agent_mail_storage::NotificationMessage {
         id: Some(message_id),
-        from: Some(sender_name.clone()),
+        from: Some(sender.name.clone()),
         subject: Some(message.subject.clone()),
         importance: Some(message.importance.clone()),
     };
@@ -1833,7 +1854,7 @@ effective_free_bytes={free}"
 
         let msg_json = serde_json::json!({
             "id": message_id,
-            "from": &sender_name,
+            "from": &sender.name,
             "to": &resolved_to,
             "cc": &resolved_cc_recipients,
             "bcc": serde_json::Value::Array(vec![]),
@@ -1851,7 +1872,7 @@ effective_free_bytes={free}"
             &project.slug,
             &msg_json,
             &message.body_md,
-            &sender_name,
+            &sender.name,
             &all_recipient_names,
             &all_attachment_rel_paths,
         );
@@ -1874,7 +1895,7 @@ effective_free_bytes={free}"
         ack_required: message.ack_required != 0,
         created_ts: Some(micros_to_iso(message.created_ts)),
         attachments: all_attachment_meta,
-        from: sender_name.clone(),
+        from: sender.name.clone(),
         to: resolved_to.into_vec(),
         cc: resolved_cc_recipients.into_vec(),
         bcc: resolved_bcc_recipients.into_vec(),
@@ -2499,7 +2520,7 @@ effective_free_bytes={free}"
         id: reply_id,
         project_id,
         project_slug: project.slug.clone(),
-        sender_name: sender_name.clone(),
+        sender_name: sender.name.clone(),
         subject: reply.subject.clone(),
         body_md: reply.body_md.clone(),
         thread_id: Some(thread_id.clone()),
@@ -2511,7 +2532,7 @@ effective_free_bytes={free}"
     // Mirrors the send_message notification logic for parity with Python.
     let notification_meta = mcp_agent_mail_storage::NotificationMessage {
         id: Some(reply_id),
-        from: Some(sender_name.clone()),
+        from: Some(sender.name.clone()),
         subject: Some(reply.subject.clone()),
         importance: Some(reply.importance.clone()),
     };
@@ -2540,7 +2561,7 @@ effective_free_bytes={free}"
 
         let msg_json = serde_json::json!({
             "id": reply_id,
-            "from": &sender_name,
+            "from": &sender.name,
             "to": &resolved_to,
             "cc": &resolved_cc_recipients,
             "bcc": serde_json::Value::Array(vec![]),
@@ -2559,7 +2580,7 @@ effective_free_bytes={free}"
             &project.slug,
             &msg_json,
             &reply.body_md,
-            &sender_name,
+            &sender.name,
             &all_recipient_names,
             &[],
         );
@@ -2576,7 +2597,7 @@ effective_free_bytes={free}"
         ack_required: reply.ack_required != 0,
         created_ts: Some(micros_to_iso(reply.created_ts)),
         attachments: vec![],
-        from: sender_name.clone(),
+        from: sender.name.clone(),
         to: resolved_to.to_vec(),
         cc: resolved_cc_recipients.to_vec(),
         bcc: resolved_bcc_recipients.to_vec(),
@@ -2593,7 +2614,7 @@ effective_free_bytes={free}"
         created_ts: Some(micros_to_iso(reply.created_ts)),
         attachments: vec![],
         body_md: reply.body_md,
-        from: sender_name.clone(),
+        from: sender.name.clone(),
         to: resolved_to.into_vec(),
         cc: resolved_cc_recipients.into_vec(),
         bcc: resolved_bcc_recipients.into_vec(),
@@ -3458,6 +3479,16 @@ mod tests {
     fn thread_id_numeric_start() {
         assert!(is_valid_thread_id("42"));
         assert!(is_valid_thread_id("123-abc"));
+    }
+
+    #[test]
+    fn explicit_thread_id_all_digits_rejected() {
+        assert!(!is_valid_explicit_thread_id("42"));
+    }
+
+    #[test]
+    fn explicit_thread_id_numeric_prefix_with_suffix_allowed() {
+        assert!(is_valid_explicit_thread_id("123-abc"));
     }
 
     // -----------------------------------------------------------------------

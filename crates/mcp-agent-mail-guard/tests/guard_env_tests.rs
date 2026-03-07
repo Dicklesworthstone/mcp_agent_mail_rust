@@ -272,6 +272,28 @@ fn guard_check_full_no_conflict_for_own_reservations() {
 }
 
 #[test]
+fn guard_check_full_no_conflict_for_own_reservations_case_insensitively() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvGuard::save(&["WORKTREES_ENABLED", "AGENT_NAME", "AGENT_MAIL_BYPASS"]);
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = make_archive_with_reservations(td.path());
+
+    unsafe {
+        std::env::set_var("WORKTREES_ENABLED", "1");
+        std::env::set_var("AGENT_NAME", "myagent");
+        std::env::remove_var("AGENT_MAIL_BYPASS");
+    }
+
+    let result = guard_check_full(&archive, &archive, &["my/stuff/file.txt".to_string()])
+        .expect("guard_check_full");
+    assert!(
+        result.conflicts.is_empty(),
+        "own reservations should not conflict regardless of AGENT_NAME casing"
+    );
+}
+
+#[test]
 fn guard_check_full_empty_archive_no_conflicts() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _guard = EnvGuard::save(&["WORKTREES_ENABLED", "AGENT_NAME", "AGENT_MAIL_BYPASS"]);

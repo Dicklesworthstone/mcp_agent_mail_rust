@@ -1,11 +1,12 @@
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
     ensure_project, fetch_inbox, register_agent, send_message, set_contact_policy,
 };
 use serde_json::Value;
+use std::fs;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,11 +31,24 @@ where
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    let env_suffix = unique_suffix();
+    let db_path = format!("/tmp/contact-policy-parity-{env_suffix}.sqlite3");
+    let database_url = format!("sqlite://{db_path}");
+    let storage_root = format!("/tmp/contact-policy-storage-{env_suffix}");
+    with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root.as_str()),
+        ],
+        || {
+            Config::reset_cached();
+            let cx = Cx::for_testing();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(f(cx))
+        },
+    )
 }
 
 fn error_object(err: &fastmcp::McpError) -> serde_json::Map<String, Value> {
@@ -45,6 +59,10 @@ fn error_object(err: &fastmcp::McpError) -> serde_json::Map<String, Value> {
         .and_then(Value::as_object)
         .cloned()
         .expect("error payload should contain root.error object")
+}
+
+fn create_test_ppm(path: &std::path::Path) {
+    fs::write(path, b"P6\n1 1\n255\n\xff\x00\x00").expect("write test image");
 }
 
 fn assert_message_eq(expected: &str, actual: &str, scenario: &str) {
@@ -65,10 +83,19 @@ fn assert_message_eq(expected: &str, actual: &str, scenario: &str) {
     );
 }
 
-async fn setup_project_and_agents(ctx: &McpContext, project_key: &str, agents: &[&str]) {
-    ensure_project(ctx, project_key.to_string(), None)
+async fn setup_project_and_agents(ctx: &McpContext, project_key: &str, agents: &[&str]) -> String {
+    let ensured = ensure_project(ctx, project_key.to_string(), None)
         .await
         .expect("ensure_project");
+    let project_slug = serde_json::from_str::<Value>(&ensured)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| mcp_agent_mail_core::slugify(project_key));
     for name in agents {
         register_agent(
             ctx,
@@ -82,6 +109,7 @@ async fn setup_project_and_agents(ctx: &McpContext, project_key: &str, agents: &
         .await
         .expect("register_agent");
     }
+    project_slug
 }
 
 async fn send_basic_message(
@@ -119,7 +147,8 @@ fn test_contact_blocked_message() {
         eprintln!("Testing contact violation: scenario={scenario}...");
 
         let ctx = McpContext::new(cx.clone(), 1);
-        setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "RedStone"]).await;
+        let _project_slug =
+            setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "RedStone"]).await;
 
         set_contact_policy(
             &ctx,
@@ -187,7 +216,8 @@ fn test_contact_required_message() {
         eprintln!("Testing contact violation: scenario={scenario}...");
 
         let ctx = McpContext::new(cx.clone(), 1);
-        setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "BlueLake"]).await;
+        let _project_slug =
+            setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "BlueLake"]).await;
 
         set_contact_policy(
             &ctx,
@@ -283,8 +313,9 @@ fn test_mixed_recipients_partial_block() {
         eprintln!("Testing contact violation: scenario={scenario}...");
 
         let ctx = McpContext::new(cx.clone(), 1);
-        setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "BlueLake", "RedStone"])
-            .await;
+        let _project_slug =
+            setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "BlueLake", "RedStone"])
+                .await;
 
         set_contact_policy(
             &ctx,
@@ -343,6 +374,68 @@ fn test_mixed_recipients_partial_block() {
         assert!(
             blue_inbox.is_empty(),
             "blocking checks must happen before any recipient delivery"
+        );
+    });
+}
+
+#[test]
+fn test_contact_block_prevents_attachment_archive_artifacts() {
+    run_serial_async(|cx| async move {
+        let scenario = "contact_block_prevents_attachment_archive_artifacts";
+        let project_key = format!("/tmp/{scenario}-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_slug =
+            setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "BlueLake"]).await;
+
+        set_contact_policy(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            "contacts_only".to_string(),
+        )
+        .await
+        .expect("set contacts_only policy");
+
+        let attachment_path = std::path::Path::new(&project_key).join("pixel.ppm");
+        fs::create_dir_all(&project_key).expect("create project dir");
+        create_test_ppm(&attachment_path);
+
+        let err = send_message(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            vec!["BlueLake".to_string()],
+            "Attachment parity test".to_string(),
+            "![pixel](pixel.ppm)".to_string(),
+            None,
+            None,
+            Some(vec!["pixel.ppm".to_string()]),
+            Some(true),
+            Some("normal".to_string()),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+        )
+        .await
+        .expect_err("contacts_only recipient should block send before attachment writes");
+
+        let payload = error_object(&err);
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("CONTACT_REQUIRED")
+        );
+
+        let attachments_dir = Config::get()
+            .storage_root
+            .join("projects")
+            .join(project_slug)
+            .join("attachments");
+        assert!(
+            !attachments_dir.exists(),
+            "blocked send must not materialize archive attachments at {}",
+            attachments_dir.display()
         );
     });
 }

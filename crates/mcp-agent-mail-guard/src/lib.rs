@@ -437,25 +437,36 @@ def get_active_reservations():
             if storage_root:
                 db_path = os.path.join(storage_root, "..", "storage.sqlite3")
     if not db_path or not os.path.exists(db_path):
-        return []
+        print("mcp-agent-mail: guard requires a readable AGENT_MAIL_DB path", file=sys.stderr)
+        sys.exit(2)
     try:
         import sqlite3
         conn = sqlite3.connect(db_path, timeout=5)
         conn.row_factory = sqlite3.Row
         now_micros = int(__import__("time").time() * 1_000_000)
-        rows = conn.execute(
+        has_release_ledger = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_reservation_releases' LIMIT 1"
+        ).fetchone() is not None
+        sql = (
             "SELECT fr.path_pattern, fr.agent_id, fr.expires_ts, a.name as agent_name "
             "FROM file_reservations fr "
             "JOIN agents a ON a.id = fr.agent_id "
             "JOIN projects p ON p.id = fr.project_id "
             "WHERE fr.exclusive = 1 AND (fr.released_ts IS NULL OR fr.released_ts = 0) "
-            "AND fr.expires_ts > ? AND (p.human_key = ? OR p.slug = ?)",
-            (now_micros, PROJECT, PROJECT),
-        ).fetchall()
+            "AND fr.expires_ts > ? AND (p.human_key = ? OR p.slug = ?)"
+        )
+        if has_release_ledger:
+            sql += (
+                " AND NOT EXISTS ("
+                "SELECT 1 FROM file_reservation_releases rr "
+                "WHERE rr.reservation_id = fr.id)"
+            )
+        rows = conn.execute(sql, (now_micros, PROJECT, PROJECT)).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except Exception:
-        return []
+    except Exception as exc:
+        print(f"mcp-agent-mail: guard failed to read reservations: {{exc}}", file=sys.stderr)
+        sys.exit(2)
 
 def core_ignorecase_enabled():
     """Detect git core.ignorecase for path comparison parity with Rust guard."""
@@ -510,12 +521,13 @@ def glob_match(path, pattern):
 
 def check_conflicts(paths, reservations):
     """Check if any paths conflict with active reservations."""
+    self_agent = AGENT_NAME.lower()
     conflicts = []
     for f in paths:
         for res in reservations:
             pattern = res["path_pattern"]
             holder = res.get("agent_name", "unknown")
-            if holder == AGENT_NAME:
+            if holder.lower() == self_agent:
                 continue  # Skip our own reservations
 
             normalized_f = normalize_match_input(f)
@@ -924,7 +936,7 @@ fn check_path_conflicts(
     let mut active_indices: Vec<&FileReservationRecord> = Vec::with_capacity(reservations.len());
 
     for res in reservations {
-        if res.exclusive && res.agent_name != self_agent {
+        if res.exclusive && !res.agent_name.eq_ignore_ascii_case(self_agent) {
             // Configure glob to match gitignore semantics (literal_separator(true) means * does not cross /)
             // matching the custom Python glob_to_regex behavior where * -> [^/]* and ** -> .*.
             // Use normalize_path to handle slashes before compiling.
@@ -1833,6 +1845,18 @@ mod tests {
         // "MyAgent" should not conflict with its own reservation
         let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
         assert!(conflicts.is_empty(), "own reservations should be skipped");
+    }
+
+    #[test]
+    fn check_path_conflicts_skips_own_reservations_case_insensitively() {
+        let paths = vec!["src/main.rs".to_string()];
+        let reservations = vec![reservation("src/main.rs", "BlueLake", true)];
+
+        let conflicts = check_path_conflicts(&paths, &reservations, "bluelake", false);
+        assert!(
+            conflicts.is_empty(),
+            "own reservations should be skipped regardless of agent-name casing"
+        );
     }
 
     #[test]
@@ -2847,5 +2871,9 @@ mod tests {
         assert!(script.contains("check_conflicts"));
         assert!(script.contains("def glob_to_regex"));
         assert!(script.contains("core.ignorecase"));
+        assert!(script.contains("self_agent = AGENT_NAME.lower()"));
+        assert!(script.contains("if holder.lower() == self_agent:"));
+        assert!(script.contains("file_reservation_releases"));
+        assert!(script.contains("sys.exit(2)"));
     }
 }
