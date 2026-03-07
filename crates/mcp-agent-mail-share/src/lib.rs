@@ -261,6 +261,8 @@ pub enum ShareError {
     ScopeNoProjects,
     #[error("project identifier not found: {identifier}")]
     ScopeIdentifierNotFound { identifier: String },
+    #[error("validation error: {message}")]
+    Validation { message: String },
     #[error("sqlite error: {message}")]
     Sqlite { message: String },
     #[error("io error: {0}")]

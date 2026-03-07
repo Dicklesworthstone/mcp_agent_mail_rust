@@ -11,6 +11,7 @@ use std::path::Path;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlmodel_sqlite::SqliteConnection;
 
 use crate::{ShareError, ShareResult};
 
@@ -496,6 +497,38 @@ fn check_header_value(
     }
 }
 
+fn is_root_derived_remote_check(check: &crate::probe::ProbeCheck) -> bool {
+    matches!(
+        check.id.as_str(),
+        "remote.root" | "remote.coop" | "remote.coep"
+    )
+}
+
+fn build_probe_check_result(
+    check: &crate::probe::ProbeCheck,
+    response: &Result<crate::probe::ProbeResponse, crate::probe::ProbeError>,
+    elapsed: std::time::Duration,
+) -> crate::probe::ProbeCheckResult {
+    match response {
+        Ok(resp) => crate::probe::evaluate_probe_check(check, resp, elapsed),
+        Err(err) => crate::probe::probe_error_result(check, err, elapsed),
+    }
+}
+
+fn run_single_probe_check(
+    base_url: &str,
+    check: &crate::probe::ProbeCheck,
+    config: &crate::probe::ProbeConfig,
+) -> crate::probe::ProbeCheckResult {
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}{}", check.path);
+    let start = std::time::Instant::now();
+    match crate::probe::probe_get_headers_only(&url, config) {
+        Ok(resp) => crate::probe::evaluate_probe_check(check, &resp, start.elapsed()),
+        Err(err) => crate::probe::probe_error_result(check, &err, start.elapsed()),
+    }
+}
+
 /// Run the full verify-live pipeline (Stage 1 + Stage 2 + optional Stage 3).
 ///
 /// Returns a complete `VerifyLiveReport` conforming to the JSON schema
@@ -580,10 +613,64 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
         }
     };
 
+    if opts.fail_fast
+        && local_stage
+            .checks
+            .iter()
+            .any(|check| !check.passed && check.severity == CheckSeverity::Error)
+    {
+        let stages = VerifyStages {
+            local: local_stage,
+            remote: VerifyStage {
+                ran: false,
+                checks: vec![],
+            },
+            security: VerifyStage {
+                ran: false,
+                checks: vec![],
+            },
+        };
+        let verdict = VerifyLiveReport::compute_verdict(&stages);
+        #[allow(clippy::cast_possible_truncation)]
+        let total_elapsed = start.elapsed().as_millis() as u64;
+        let summary = VerifyLiveReport::compute_summary(&stages, total_elapsed);
+        return VerifyLiveReport {
+            schema_version: "1.0.0".to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            url: opts.url.clone(),
+            bundle_path: opts
+                .bundle_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            verdict,
+            stages,
+            summary,
+            config: VerifyConfig {
+                strict: opts.strict,
+                fail_fast: opts.fail_fast,
+                timeout_ms: opts.probe_config.timeout.as_millis() as u64,
+                retries: opts.probe_config.retries,
+                security_audit: opts.security_audit,
+            },
+        };
+    }
+
     // ── Stage 2: Remote endpoint probes ─────────────────────────────
     let remote_checks = build_remote_checks();
-    let remote_results =
-        crate::probe::run_probe_checks(&opts.url, &remote_checks, &opts.probe_config);
+    let root_url = format!("{}/", opts.url.trim_end_matches('/'));
+    let root_probe_start = std::time::Instant::now();
+    let root_probe = crate::probe::probe_get(&root_url, &opts.probe_config);
+    let root_probe_elapsed = root_probe_start.elapsed();
+    let remote_results: Vec<crate::probe::ProbeCheckResult> = remote_checks
+        .iter()
+        .map(|check| {
+            if is_root_derived_remote_check(check) {
+                build_probe_check_result(check, &root_probe, root_probe_elapsed)
+            } else {
+                run_single_probe_check(&opts.url, check, &opts.probe_config)
+            }
+        })
+        .collect();
     let mut remote_live_checks: Vec<VerifyLiveCheck> =
         remote_results.iter().map(map_probe_result).collect();
 
@@ -592,13 +679,10 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
     let root_passed = root_result.is_some_and(|r| r.passed);
     let content_match_check = if opts.bundle_path.is_some() && root_passed {
         let match_start = std::time::Instant::now();
-        // Get remote body from root probe
-        let remote_body_hash: Option<String> = {
-            let root_url = format!("{}/", opts.url.trim_end_matches('/'));
-            crate::probe::probe_get(&root_url, &opts.probe_config)
-                .ok()
-                .map(|resp| format!("{:x}", Sha256::digest(&resp.body)))
-        };
+        let remote_body_hash: Option<String> = root_probe
+            .as_ref()
+            .ok()
+            .map(|resp| format!("{:x}", Sha256::digest(&resp.body)));
         // Get local index.html hash
         let local_hash: Option<String> = opts.bundle_path.as_ref().and_then(|bp| {
             let index_path = bp.join("index.html");
@@ -665,18 +749,30 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
     // remote.tls: HTTPS connection check (synthesized from root probe)
     let is_https = opts.url.starts_with("https://") || opts.url.starts_with("HTTPS://");
     let tls_check = if is_https {
-        match root_result {
-            Some(r) if r.passed => VerifyLiveCheck {
+        match (&root_probe, root_result) {
+            (Ok(resp), Some(r)) if r.passed && resp.final_url.starts_with("https://") => {
+                VerifyLiveCheck {
+                    id: "remote.tls".to_string(),
+                    description: "HTTPS connection succeeded".to_string(),
+                    severity: CheckSeverity::Error,
+                    passed: true,
+                    message: "HTTPS connection succeeded".to_string(),
+                    elapsed_ms: 0,
+                    http_status: Some(resp.status),
+                    headers_captured: None,
+                }
+            }
+            (Ok(resp), Some(_)) if !resp.final_url.starts_with("https://") => VerifyLiveCheck {
                 id: "remote.tls".to_string(),
                 description: "HTTPS connection succeeded".to_string(),
                 severity: CheckSeverity::Error,
-                passed: true,
-                message: "HTTPS connection succeeded".to_string(),
+                passed: false,
+                message: format!("HTTPS downgraded via redirect to {}", resp.final_url),
                 elapsed_ms: 0,
-                http_status: None,
+                http_status: Some(resp.status),
                 headers_captured: None,
             },
-            Some(r) => VerifyLiveCheck {
+            (_, Some(r)) => VerifyLiveCheck {
                 id: "remote.tls".to_string(),
                 description: "HTTPS connection succeeded".to_string(),
                 severity: CheckSeverity::Error,
@@ -686,7 +782,7 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
                 http_status: r.http_status,
                 headers_captured: None,
             },
-            None => VerifyLiveCheck {
+            _ => VerifyLiveCheck {
                 id: "remote.tls".to_string(),
                 description: "HTTPS connection succeeded".to_string(),
                 severity: CheckSeverity::Error,
@@ -719,29 +815,24 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
     // ── Stage 3: Security header audit ──────────────────────────────
     let security_stage = if opts.security_audit {
         let security_checks = build_security_checks();
-        let security_results =
-            crate::probe::run_probe_checks(&opts.url, &security_checks, &opts.probe_config);
+        let security_results: Vec<crate::probe::ProbeCheckResult> = security_checks
+            .iter()
+            .map(|check| build_probe_check_result(check, &root_probe, root_probe_elapsed))
+            .collect();
         let mut sec_checks: Vec<VerifyLiveCheck> =
             security_results.iter().map(map_probe_result).collect();
 
         // Exact-value checks: COOP and COEP per SPEC.
-        // Use headers captured from remote.coop / remote.coep (Stage 2).
-        let coop_headers = remote_results
-            .iter()
-            .find(|r| r.id == "remote.coop")
-            .map(|r| &r.headers_captured)
-            .cloned()
-            .unwrap_or_default();
-        let coep_headers = remote_results
-            .iter()
-            .find(|r| r.id == "remote.coep")
-            .map(|r| &r.headers_captured)
-            .cloned()
-            .unwrap_or_default();
+        // Use the already-fetched root headers rather than re-probing `/`.
+        let empty_headers = BTreeMap::new();
+        let root_headers = match &root_probe {
+            Ok(resp) => &resp.headers,
+            Err(_) => &empty_headers,
+        };
 
         // security.coop_value: COOP must be "same-origin"
         sec_checks.push(check_header_value(
-            &coop_headers,
+            root_headers,
             "security.coop_value",
             "COOP is same-origin",
             "cross-origin-opener-policy",
@@ -750,7 +841,7 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
         ));
         // security.coep_value: COEP must be "require-corp"
         sec_checks.push(check_header_value(
-            &coep_headers,
+            root_headers,
             "security.coep_value",
             "COEP is require-corp",
             "cross-origin-embedder-policy",
@@ -830,6 +921,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
     }
 
     let mut checks = Vec::new();
+    let mut manifest_json: Option<serde_json::Value> = None;
 
     // ── Required files ──────────────────────────────────────────────
     check_file_exists(
@@ -909,6 +1001,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
         match std::fs::read_to_string(&manifest_path) {
             Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
                 Ok(manifest) => {
+                    manifest_json = Some(manifest.clone());
                     checks.push(DeployCheck {
                         name: "manifest_valid_json".to_string(),
                         passed: true,
@@ -974,6 +1067,11 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
 
     // ── Integrity checksums ─────────────────────────────────────────
     let integrity = compute_integrity(bundle_dir);
+    checks.extend(validate_database_artifacts(
+        bundle_dir,
+        manifest_json.as_ref(),
+        &integrity,
+    ));
 
     // ── Security expectations ───────────────────────────────────────
     let security = build_security_expectations(bundle_dir, &bundle_stats);
@@ -1003,11 +1101,10 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
 /// Generate a GitHub Actions workflow for deploying to GitHub Pages.
 #[must_use]
 pub fn generate_gh_pages_workflow(bundle_dir: &str) -> String {
-    format!(
-        r###"# Deploy MCP Agent Mail static export to GitHub Pages
+    r###"# Deploy MCP Agent Mail static export to GitHub Pages
 #
 # Usage:
-#   1. Place your bundle output in the `{bundle_dir}` directory (or configure path below)
+#   1. Place your bundle output in the `__BUNDLE_DIR__` directory (or configure path below)
 #   2. Enable GitHub Pages in repo Settings > Pages > Source: "GitHub Actions"
 #   3. Push to main branch to trigger deployment
 #
@@ -1019,7 +1116,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '{bundle_dir}/**'
+      - '__BUNDLE_DIR__/**'
   workflow_dispatch:
 
 permissions:
@@ -1039,7 +1136,7 @@ jobs:
 
       - name: Validate bundle
         run: |
-          BUNDLE_DIR="{bundle_dir}"
+          BUNDLE_DIR="__BUNDLE_DIR__"
           echo "=== Pre-flight checks ==="
           test -f "$BUNDLE_DIR/manifest.json" || { echo "FAIL: manifest.json missing"; exit 1; }
           test -f "$BUNDLE_DIR/index.html" || { echo "FAIL: index.html missing"; exit 1; }
@@ -1067,7 +1164,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: {bundle_dir}
+          path: '__BUNDLE_DIR__'
 
       - name: Deploy to GitHub Pages
         id: deployment
@@ -1082,14 +1179,13 @@ jobs:
           echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Triggered by**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
 "###
-    )
+    .replace("__BUNDLE_DIR__", bundle_dir)
 }
 
 /// Generate a GitHub Actions workflow for deploying to Cloudflare Pages.
 #[must_use]
 pub fn generate_cf_pages_workflow(bundle_dir: &str) -> String {
-    format!(
-        r###"# Deploy MCP Agent Mail static export to Cloudflare Pages
+    r###"# Deploy MCP Agent Mail static export to Cloudflare Pages
 #
 # Usage:
 #   1. Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets in repo settings
@@ -1104,7 +1200,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '{bundle_dir}/**'
+      - '__BUNDLE_DIR__/**'
   workflow_dispatch:
 
 concurrency:
@@ -1119,7 +1215,7 @@ jobs:
 
       - name: Validate bundle
         run: |
-          BUNDLE_DIR="{bundle_dir}"
+          BUNDLE_DIR="__BUNDLE_DIR__"
           echo "=== Pre-flight checks ==="
           test -f "$BUNDLE_DIR/manifest.json" || { echo "FAIL: manifest.json missing"; exit 1; }
           test -f "$BUNDLE_DIR/index.html" || { echo "FAIL: index.html missing"; exit 1; }
@@ -1145,7 +1241,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy {bundle_dir} --project-name=agent-mail
+          command: pages deploy "__BUNDLE_DIR__" --project-name=agent-mail
 
       - name: Generate deployment report
         if: always()
@@ -1155,14 +1251,13 @@ jobs:
           echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Triggered by**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
 "###
-    )
+    .replace("__BUNDLE_DIR__", bundle_dir)
 }
 
 /// Generate a Cloudflare Pages deployment configuration.
 #[must_use]
 pub fn generate_cf_pages_config(bundle_dir: &str) -> String {
-    format!(
-        r#"# Cloudflare Pages Configuration
+    r#"# Cloudflare Pages Configuration
 #
 # This file is a template for wrangler.toml when deploying
 # MCP Agent Mail static exports to Cloudflare Pages.
@@ -1170,35 +1265,34 @@ pub fn generate_cf_pages_config(bundle_dir: &str) -> String {
 # Usage:
 #   1. Install wrangler: npm install -g wrangler
 #   2. Login: wrangler login
-#   3. Deploy: wrangler pages deploy {bundle_dir} --project-name=agent-mail
+#   3. Deploy: wrangler pages deploy __BUNDLE_DIR__ --project-name=agent-mail
 
 name = "agent-mail-export"
 compatibility_date = "2024-01-01"
 
 [site]
-bucket = "./{bundle_dir}"
+bucket = "./__BUNDLE_DIR__"
 
 # Cloudflare Pages automatically picks up _headers file
 # for custom response headers (COOP/COEP configured there).
 "#
-    )
+    .replace("__BUNDLE_DIR__", bundle_dir)
 }
 
 /// Generate a Netlify deployment configuration.
 #[must_use]
 pub fn generate_netlify_config(bundle_dir: &str) -> String {
-    format!(
-        r#"# Netlify Configuration
+    r#"# Netlify Configuration
 #
 # Place this file at the repo root when deploying to Netlify.
 #
 # Usage:
 #   1. Connect your repo to Netlify
-#   2. Set publish directory to "{bundle_dir}"
+#   2. Set publish directory to "__BUNDLE_DIR__"
 #   3. No build command needed (static files only)
 
 [build]
-  publish = "{bundle_dir}"
+  publish = "__BUNDLE_DIR__"
 
 # Netlify automatically picks up _headers file
 # for custom response headers (COOP/COEP configured there).
@@ -1216,7 +1310,7 @@ pub fn generate_netlify_config(bundle_dir: &str) -> String {
     Content-Type = "application/octet-stream"
     Cross-Origin-Resource-Policy = "same-origin"
 "#
-    )
+    .replace("__BUNDLE_DIR__", bundle_dir)
 }
 
 /// Generate a deployment validation script (shell).
@@ -1266,9 +1360,9 @@ echo ""
 ERRORS=0
 WARNINGS=0
 
-check() {
-    local severity="$1" name="$2" condition="$3" msg_pass="$4" msg_fail="$5"
-    if eval "$condition"; then
+report_check() {
+    local severity="$1" name="$2" ok="$3" msg_pass="$4" msg_fail="$5"
+    if [ "$ok" = "1" ]; then
         echo "  ✅ $name: $msg_pass"
     else
         if [ "$severity" = "error" ]; then
@@ -1281,12 +1375,30 @@ check() {
     fi
 }
 
+check_file() {
+    local severity="$1" name="$2" path="$3" msg_pass="$4" msg_fail="$5"
+    if [ -f "$path" ]; then
+        report_check "$severity" "$name" "1" "$msg_pass" "$msg_fail"
+    else
+        report_check "$severity" "$name" "0" "$msg_pass" "$msg_fail"
+    fi
+}
+
+check_dir() {
+    local severity="$1" name="$2" path="$3" msg_pass="$4" msg_fail="$5"
+    if [ -d "$path" ]; then
+        report_check "$severity" "$name" "1" "$msg_pass" "$msg_fail"
+    else
+        report_check "$severity" "$name" "0" "$msg_pass" "$msg_fail"
+    fi
+}
+
 echo "--- Compatibility Structure Checks ---"
-check error "manifest" "test -f \"$BUNDLE_DIR/manifest.json\"" "Present" "Missing"
-check error "index.html" "test -f \"$BUNDLE_DIR/index.html\"" "Present" "Missing"
-check warning ".nojekyll" "test -f \"$BUNDLE_DIR/.nojekyll\"" "Present" "Missing (needed for GH Pages)"
-check warning "_headers" "test -f \"$BUNDLE_DIR/_headers\"" "Present" "Missing (needed for COOP/COEP)"
-check warning "viewer" "test -d \"$BUNDLE_DIR/viewer\"" "Present" "Missing"
+check_file error "manifest" "$BUNDLE_DIR/manifest.json" "Present" "Missing"
+check_file error "index.html" "$BUNDLE_DIR/index.html" "Present" "Missing"
+check_file warning ".nojekyll" "$BUNDLE_DIR/.nojekyll" "Present" "Missing (needed for GH Pages)"
+check_file warning "_headers" "$BUNDLE_DIR/_headers" "Present" "Missing (needed for COOP/COEP)"
+check_dir warning "viewer" "$BUNDLE_DIR/viewer" "Present" "Missing"
 echo ""
 
 if [ -n "$DEPLOYED_URL" ]; then
@@ -1373,7 +1485,7 @@ fn build_platform_info(
     hosting_hints: &[crate::hosting::HostingHint],
 ) -> Vec<PlatformInfo> {
     let mut platforms = Vec::new();
-    let bundle_arg = display_bundle_path(bundle_dir);
+    let bundle_arg = shell_quote_bundle_path(bundle_dir);
 
     let detected_ids: Vec<&str> = hosting_hints.iter().map(|h| h.id.as_str()).collect();
 
@@ -1408,7 +1520,9 @@ fn build_platform_info(
         name: "Amazon S3".to_string(),
         detected: detected_ids.contains(&"s3"),
         config_present: false,
-        deploy_command: Some(format!("aws s3 sync {bundle_arg} s3://your-bucket/ --delete")),
+        deploy_command: Some(format!(
+            "aws s3 sync {bundle_arg} s3://your-bucket/ --delete"
+        )),
     });
 
     platforms
@@ -1488,6 +1602,432 @@ fn sha256_file_streaming(path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..count]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn validate_database_artifacts(
+    bundle_dir: &Path,
+    manifest: Option<&serde_json::Value>,
+    integrity: &BTreeMap<String, String>,
+) -> Vec<DeployCheck> {
+    let db_path = bundle_dir.join("mailbox.sqlite3");
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+
+    let mut checks = Vec::new();
+    match run_sqlite_quick_check(&db_path) {
+        Ok(()) => checks.push(DeployCheck {
+            name: "database_quick_check".to_string(),
+            passed: true,
+            message: "PRAGMA quick_check returned ok".to_string(),
+            severity: CheckSeverity::Info,
+        }),
+        Err(message) => checks.push(DeployCheck {
+            name: "database_quick_check".to_string(),
+            passed: false,
+            message,
+            severity: CheckSeverity::Error,
+        }),
+    }
+    match validate_agent_mail_schema(&db_path) {
+        Ok(()) => checks.push(DeployCheck {
+            name: "database_schema_valid".to_string(),
+            passed: true,
+            message: "mailbox.sqlite3 contains the required Agent Mail tables and columns"
+                .to_string(),
+            severity: CheckSeverity::Info,
+        }),
+        Err(message) => checks.push(DeployCheck {
+            name: "database_schema_valid".to_string(),
+            passed: false,
+            message,
+            severity: CheckSeverity::Error,
+        }),
+    }
+
+    let Some(manifest) = manifest else {
+        return checks;
+    };
+    let database = manifest.get("database");
+    let expected_sha = database
+        .and_then(|value| value.get("sha256"))
+        .and_then(|value| value.as_str());
+    match (expected_sha, integrity.get("mailbox.sqlite3")) {
+        (Some(expected), Some(actual)) => checks.push(DeployCheck {
+            name: "database_sha256_matches_manifest".to_string(),
+            passed: actual == expected,
+            message: if actual == expected {
+                format!(
+                    "mailbox.sqlite3 matches manifest SHA-256 ({})",
+                    &actual[..12]
+                )
+            } else {
+                format!(
+                    "mailbox.sqlite3 SHA-256 mismatch: expected {}..., got {}...",
+                    &expected[..12.min(expected.len())],
+                    &actual[..12.min(actual.len())]
+                )
+            },
+            severity: CheckSeverity::Error,
+        }),
+        _ => checks.push(DeployCheck {
+            name: "database_sha256_matches_manifest".to_string(),
+            passed: false,
+            message: "manifest.json is missing database.sha256 for mailbox.sqlite3".to_string(),
+            severity: CheckSeverity::Error,
+        }),
+    }
+
+    let chunked = database
+        .and_then(|value| value.get("chunked"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if chunked {
+        let manifest_chunk = database
+            .and_then(|value| value.get("chunk_manifest"))
+            .cloned()
+            .map(serde_json::from_value::<crate::ChunkManifest>);
+        match manifest_chunk {
+            Some(Ok(chunk_manifest)) => {
+                checks.push(DeployCheck {
+                    name: "database_chunk_manifest_present".to_string(),
+                    passed: true,
+                    message: format!(
+                        "manifest chunk manifest declares {} chunks",
+                        chunk_manifest.chunk_count
+                    ),
+                    severity: CheckSeverity::Info,
+                });
+                checks.extend(validate_chunk_artifacts(bundle_dir, Some(&chunk_manifest)));
+            }
+            Some(Err(err)) => {
+                checks.push(DeployCheck {
+                    name: "database_chunk_manifest_present".to_string(),
+                    passed: false,
+                    message: format!("manifest database.chunk_manifest is invalid: {err}"),
+                    severity: CheckSeverity::Error,
+                });
+                checks.extend(validate_chunk_artifacts(bundle_dir, None));
+            }
+            None => {
+                checks.push(DeployCheck {
+                    name: "database_chunk_manifest_present".to_string(),
+                    passed: false,
+                    message:
+                        "manifest.json marks the database as chunked but omits database.chunk_manifest"
+                            .to_string(),
+                    severity: CheckSeverity::Error,
+                });
+                checks.extend(validate_chunk_artifacts(bundle_dir, None));
+            }
+        }
+    }
+
+    checks
+}
+
+fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
+    let db_path_str = db_path.display().to_string();
+    let conn = SqliteConnection::open_file(&db_path_str)
+        .map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
+    let rows = conn
+        .query_sync("PRAGMA quick_check", &[])
+        .map_err(|e| format!("PRAGMA quick_check failed: {e}"))?;
+    let Some(row) = rows.first() else {
+        return Err("PRAGMA quick_check returned no rows".to_string());
+    };
+    let result = row
+        .get_named::<String>("quick_check")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            row.get_named::<String>("integrity_check")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default();
+    if result.eq_ignore_ascii_case("ok") {
+        Ok(())
+    } else {
+        Err(format!("PRAGMA quick_check reported: {result}"))
+    }
+}
+
+fn validate_agent_mail_schema(db_path: &Path) -> Result<(), String> {
+    let db_path_str = db_path.display().to_string();
+    let conn = SqliteConnection::open_file(&db_path_str)
+        .map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
+    let required = [
+        ("projects", ["id", "slug", "human_key"].as_slice()),
+        ("agents", ["id", "project_id", "name"].as_slice()),
+        (
+            "messages",
+            [
+                "id",
+                "project_id",
+                "sender_id",
+                "subject",
+                "body_md",
+                "importance",
+                "created_ts",
+                "attachments",
+            ]
+            .as_slice(),
+        ),
+        (
+            "message_recipients",
+            ["message_id", "agent_id", "kind"].as_slice(),
+        ),
+    ];
+    let mut issues = Vec::new();
+
+    for (table, required_columns) in required {
+        let table_exists = conn
+            .query_sync(
+                &format!(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{table}' LIMIT 1"
+                ),
+                &[],
+            )
+            .map_err(|e| format!("schema lookup for table {table} failed: {e}"))?;
+        if table_exists.is_empty() {
+            issues.push(format!("missing table {table}"));
+            continue;
+        }
+
+        let column_rows = conn
+            .query_sync(&format!("PRAGMA table_info({table})"), &[])
+            .map_err(|e| format!("schema lookup for columns in {table} failed: {e}"))?;
+        let present_columns = column_rows
+            .iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        let missing_columns = required_columns
+            .iter()
+            .filter(|column| !present_columns.iter().any(|present| present == **column))
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing_columns.is_empty() {
+            issues.push(format!(
+                "table {table} is missing required columns: {}",
+                missing_columns.join(", ")
+            ));
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        let preview = issues
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        if issues.len() > 3 {
+            Err(format!(
+                "mailbox.sqlite3 is not a valid Agent Mail export database: {preview}; and {} more issue(s)",
+                issues.len() - 3
+            ))
+        } else {
+            Err(format!(
+                "mailbox.sqlite3 is not a valid Agent Mail export database: {preview}"
+            ))
+        }
+    }
+}
+
+fn validate_chunk_artifacts(
+    bundle_dir: &Path,
+    manifest_chunk: Option<&crate::ChunkManifest>,
+) -> Vec<DeployCheck> {
+    let mut checks = Vec::new();
+
+    let config_path = bundle_dir.join("mailbox.sqlite3.config.json");
+    let mut expected_chunk_count = manifest_chunk.map(|manifest| manifest.chunk_count);
+    let config_chunk = match std::fs::read_to_string(&config_path) {
+        Ok(text) => match serde_json::from_str::<crate::ChunkManifest>(&text) {
+            Ok(config) => {
+                expected_chunk_count = Some(config.chunk_count);
+                checks.push(DeployCheck {
+                    name: "database_chunk_config_valid".to_string(),
+                    passed: true,
+                    message: format!(
+                        "mailbox.sqlite3.config.json is valid for {} chunks",
+                        config.chunk_count
+                    ),
+                    severity: CheckSeverity::Info,
+                });
+                Some(config)
+            }
+            Err(err) => {
+                checks.push(DeployCheck {
+                    name: "database_chunk_config_valid".to_string(),
+                    passed: false,
+                    message: format!("mailbox.sqlite3.config.json is invalid: {err}"),
+                    severity: CheckSeverity::Error,
+                });
+                None
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            checks.push(DeployCheck {
+                name: "database_chunk_config_valid".to_string(),
+                passed: false,
+                message: "mailbox.sqlite3.config.json is missing".to_string(),
+                severity: CheckSeverity::Error,
+            });
+            None
+        }
+        Err(err) => {
+            checks.push(DeployCheck {
+                name: "database_chunk_config_valid".to_string(),
+                passed: false,
+                message: format!("cannot read mailbox.sqlite3.config.json: {err}"),
+                severity: CheckSeverity::Error,
+            });
+            None
+        }
+    };
+
+    if let (Some(manifest), Some(config)) = (manifest_chunk, config_chunk.as_ref()) {
+        let matches_manifest = manifest.version == config.version
+            && manifest.chunk_size == config.chunk_size
+            && manifest.chunk_count == config.chunk_count
+            && manifest.pattern == config.pattern
+            && manifest.original_bytes == config.original_bytes
+            && manifest.threshold_bytes == config.threshold_bytes;
+        checks.push(DeployCheck {
+            name: "database_chunk_config_matches_manifest".to_string(),
+            passed: matches_manifest,
+            message: if matches_manifest {
+                "chunk config matches manifest.json".to_string()
+            } else {
+                "mailbox.sqlite3.config.json does not match manifest database.chunk_manifest"
+                    .to_string()
+            },
+            severity: CheckSeverity::Error,
+        });
+    }
+
+    let checksum_path = bundle_dir.join("chunks.sha256");
+    let checksum_map = match parse_chunk_checksums(&checksum_path) {
+        Ok(map) => {
+            if expected_chunk_count.is_none() {
+                expected_chunk_count = Some(map.len());
+            }
+            checks.push(DeployCheck {
+                name: "database_chunk_checksums_valid".to_string(),
+                passed: true,
+                message: format!("chunks.sha256 lists {} chunk hashes", map.len()),
+                severity: CheckSeverity::Info,
+            });
+            Some(map)
+        }
+        Err(message) => {
+            checks.push(DeployCheck {
+                name: "database_chunk_checksums_valid".to_string(),
+                passed: false,
+                message,
+                severity: CheckSeverity::Error,
+            });
+            None
+        }
+    };
+
+    if let (Some(expected_chunk_count), Some(checksum_map)) = (expected_chunk_count, checksum_map) {
+        checks.push(DeployCheck {
+            name: "database_chunk_count_matches_manifest".to_string(),
+            passed: checksum_map.len() == expected_chunk_count,
+            message: if checksum_map.len() == expected_chunk_count {
+                format!("found hashes for all {expected_chunk_count} expected chunks")
+            } else {
+                format!(
+                    "chunks.sha256 lists {} chunks but {} were expected",
+                    checksum_map.len(),
+                    expected_chunk_count
+                )
+            },
+            severity: CheckSeverity::Error,
+        });
+
+        let mut issues = Vec::new();
+        for index in 0..expected_chunk_count {
+            let rel = format!("chunks/{index:05}.bin");
+            let chunk_path = bundle_dir.join(&rel);
+            if !chunk_path.is_file() {
+                issues.push(format!("{rel} is missing"));
+                continue;
+            }
+            let Some(expected_hash) = checksum_map.get(&rel) else {
+                issues.push(format!("{rel} is missing from chunks.sha256"));
+                continue;
+            };
+            match sha256_file_streaming(&chunk_path) {
+                Ok(actual_hash) if actual_hash == *expected_hash => {}
+                Ok(_) => issues.push(format!("{rel} checksum mismatch")),
+                Err(err) => issues.push(format!("{rel} could not be hashed: {err}")),
+            }
+        }
+        checks.push(DeployCheck {
+            name: "database_chunk_artifacts_valid".to_string(),
+            passed: issues.is_empty(),
+            message: if issues.is_empty() {
+                format!(
+                    "all {expected_chunk_count} chunk files are present and match chunks.sha256"
+                )
+            } else {
+                let preview = issues
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if issues.len() > 3 {
+                    format!("{preview}; and {} more issue(s)", issues.len() - 3)
+                } else {
+                    preview
+                }
+            },
+            severity: CheckSeverity::Error,
+        });
+    }
+
+    checks
+}
+
+fn parse_chunk_checksums(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            "chunks.sha256 is missing".to_string()
+        } else {
+            format!("cannot read chunks.sha256: {err}")
+        }
+    })?;
+    let mut checksums = BTreeMap::new();
+    for (line_number, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((hash, rel)) = trimmed.split_once("  ") else {
+            return Err(format!(
+                "chunks.sha256 line {} is malformed: expected '<sha256>  <path>'",
+                line_number + 1
+            ));
+        };
+        if hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(format!(
+                "chunks.sha256 line {} has an invalid SHA-256 digest",
+                line_number + 1
+            ));
+        }
+        checksums.insert(rel.to_string(), hash.to_string());
+    }
+    if checksums.is_empty() {
+        return Err("chunks.sha256 does not list any chunks".to_string());
+    }
+    Ok(checksums)
 }
 
 struct FileEntry {
@@ -1601,7 +2141,7 @@ fn build_rollback_guidance(
     bundle_dir: &Path,
     integrity: &BTreeMap<String, String>,
 ) -> RollbackGuidance {
-    let bundle_arg = display_bundle_path(bundle_dir);
+    let bundle_arg = shell_quote_bundle_path(bundle_dir);
     // Compute current content hash from integrity checksums.
     let current_hash = if integrity.is_empty() {
         None
@@ -1661,16 +2201,74 @@ fn display_bundle_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn shell_quote_bundle_path(path: &Path) -> String {
+    let path = display_bundle_path(path);
+    format!("'{}'", path.replace('\'', "'\"'\"'"))
+}
+
+fn is_safe_bundle_tooling_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ' ')
+}
+
+fn validate_bundle_tooling_path(relative: &str) -> ShareResult<()> {
+    if relative == "." {
+        return Ok(());
+    }
+    if relative.is_empty() {
+        return Err(ShareError::Validation {
+            message: "bundle directory path must not be empty".to_string(),
+        });
+    }
+    for segment in relative.split('/') {
+        if segment.is_empty() {
+            return Err(ShareError::Validation {
+                message: format!(
+                    "bundle directory path contains an empty segment and cannot be used in generated CI tooling: {relative}"
+                ),
+            });
+        }
+        if segment == "." || segment == ".." {
+            return Err(ShareError::Validation {
+                message: format!(
+                    "bundle directory path contains a non-portable segment and cannot be used in generated CI tooling: {relative}"
+                ),
+            });
+        }
+        if segment.trim() != segment {
+            return Err(ShareError::Validation {
+                message: format!(
+                    "bundle directory path contains a segment with leading or trailing spaces and cannot be used in generated CI tooling: {relative}"
+                ),
+            });
+        }
+    }
+    if let Some(ch) = relative
+        .chars()
+        .find(|ch| !is_safe_bundle_tooling_char(*ch))
+    {
+        return Err(ShareError::Validation {
+            message: format!(
+                "bundle directory path contains unsupported character {ch:?}; generated CI tooling only supports portable path characters [A-Za-z0-9._-/ ]: {relative}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn bundle_path_relative_to_repo(repo_root: &Path, bundle_dir: &Path) -> ShareResult<String> {
-    let repo_root = repo_root.canonicalize().map_err(|e| ShareError::Validation {
-        message: format!("failed to resolve repo root {}: {e}", repo_root.display()),
-    })?;
-    let bundle_dir = bundle_dir.canonicalize().map_err(|e| ShareError::Validation {
-        message: format!(
-            "failed to resolve bundle directory {}: {e}",
-            bundle_dir.display()
-        ),
-    })?;
+    let repo_root = repo_root
+        .canonicalize()
+        .map_err(|e| ShareError::Validation {
+            message: format!("failed to resolve repo root {}: {e}", repo_root.display()),
+        })?;
+    let bundle_dir = bundle_dir
+        .canonicalize()
+        .map_err(|e| ShareError::Validation {
+            message: format!(
+                "failed to resolve bundle directory {}: {e}",
+                bundle_dir.display()
+            ),
+        })?;
     let relative = bundle_dir
         .strip_prefix(&repo_root)
         .map_err(|_| ShareError::Validation {
@@ -1681,11 +2279,32 @@ fn bundle_path_relative_to_repo(repo_root: &Path, bundle_dir: &Path) -> ShareRes
             ),
         })?;
     let relative = display_bundle_path(relative);
+    validate_bundle_tooling_path(&relative)?;
     Ok(if relative.is_empty() {
         ".".to_string()
     } else {
         relative
     })
+}
+
+fn write_text_file_if_absent_or_identical(path: &Path, content: &str) -> ShareResult<()> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            if existing == content {
+                return Ok(());
+            }
+            return Err(ShareError::Validation {
+                message: format!(
+                    "refusing to overwrite existing file {}; move it aside or reconcile it manually first",
+                    path.display()
+                ),
+            });
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(ShareError::Io(err)),
+    }
+    std::fs::write(path, content)?;
+    Ok(())
 }
 
 /// Load deployment history from the bundle directory.
@@ -1781,15 +2400,15 @@ pub fn build_verify_plan(deployed_url: &str) -> VerifyResult {
 
 // ── Write workflow files to disk ────────────────────────────────────────
 
-/// Write all deployment configuration files to a bundle directory.
+/// Write repo-root deployment tooling plus a bundle-local deploy report.
 ///
 /// Creates:
-/// - `.github/workflows/deploy-pages.yml` (GitHub Actions workflow)
-/// - `.github/workflows/deploy-cf-pages.yml` (Cloudflare Pages CI workflow)
-/// - `wrangler.toml.template` (Cloudflare Pages config)
-/// - `netlify.toml.template` (Netlify config)
-/// - `scripts/validate_deploy.sh` (compatibility wrapper to native `am` validation commands)
-/// - `deploy_report.json` (pre-flight validation report)
+/// - `<repo>/.github/workflows/deploy-pages.yml` (GitHub Actions workflow)
+/// - `<repo>/.github/workflows/deploy-cf-pages.yml` (Cloudflare Pages CI workflow)
+/// - `<repo>/wrangler.toml.template` (Cloudflare Pages config)
+/// - `<repo>/netlify.toml.template` (Netlify config)
+/// - `<repo>/scripts/validate_deploy.sh` (compatibility wrapper to native `am` validation commands)
+/// - `<bundle>/deploy_report.json` (pre-flight validation report)
 pub fn write_deploy_tooling(repo_root: &Path, bundle_dir: &Path) -> ShareResult<Vec<String>> {
     let mut written = Vec::new();
     let bundle_rel = bundle_path_relative_to_repo(repo_root, bundle_dir)?;
@@ -1797,30 +2416,30 @@ pub fn write_deploy_tooling(repo_root: &Path, bundle_dir: &Path) -> ShareResult<
     // GitHub Actions workflow (GH Pages)
     let workflow_dir = repo_root.join(".github").join("workflows");
     std::fs::create_dir_all(&workflow_dir)?;
-    std::fs::write(
-        workflow_dir.join("deploy-pages.yml"),
-        generate_gh_pages_workflow(&bundle_rel),
+    write_text_file_if_absent_or_identical(
+        &workflow_dir.join("deploy-pages.yml"),
+        &generate_gh_pages_workflow(&bundle_rel),
     )?;
     written.push(".github/workflows/deploy-pages.yml".to_string());
 
     // GitHub Actions workflow (Cloudflare Pages)
-    std::fs::write(
-        workflow_dir.join("deploy-cf-pages.yml"),
-        generate_cf_pages_workflow(&bundle_rel),
+    write_text_file_if_absent_or_identical(
+        &workflow_dir.join("deploy-cf-pages.yml"),
+        &generate_cf_pages_workflow(&bundle_rel),
     )?;
     written.push(".github/workflows/deploy-cf-pages.yml".to_string());
 
     // Cloudflare Pages template
-    std::fs::write(
-        repo_root.join("wrangler.toml.template"),
-        generate_cf_pages_config(&bundle_rel),
+    write_text_file_if_absent_or_identical(
+        &repo_root.join("wrangler.toml.template"),
+        &generate_cf_pages_config(&bundle_rel),
     )?;
     written.push("wrangler.toml.template".to_string());
 
     // Netlify template
-    std::fs::write(
-        repo_root.join("netlify.toml.template"),
-        generate_netlify_config(&bundle_rel),
+    write_text_file_if_absent_or_identical(
+        &repo_root.join("netlify.toml.template"),
+        &generate_netlify_config(&bundle_rel),
     )?;
     written.push("netlify.toml.template".to_string());
 
@@ -1828,7 +2447,7 @@ pub fn write_deploy_tooling(repo_root: &Path, bundle_dir: &Path) -> ShareResult<
     let scripts_dir = repo_root.join("scripts");
     std::fs::create_dir_all(&scripts_dir)?;
     let script_path = scripts_dir.join("validate_deploy.sh");
-    std::fs::write(&script_path, generate_validation_script())?;
+    write_text_file_if_absent_or_identical(&script_path, &generate_validation_script())?;
     // Make executable on Unix
     #[cfg(unix)]
     {
@@ -1853,13 +2472,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
     struct TestHttpServer {
         addr: SocketAddr,
         stop: Arc<AtomicBool>,
+        requests: Arc<AtomicUsize>,
         handle: Option<JoinHandle<()>>,
     }
 
@@ -1872,11 +2492,13 @@ mod tests {
             let addr = listener.local_addr().expect("local_addr");
             let stop = Arc::new(AtomicBool::new(false));
             let stop_flag = Arc::clone(&stop);
+            let requests = Arc::new(AtomicUsize::new(0));
+            let request_counter = Arc::clone(&requests);
             let handle = std::thread::spawn(move || {
                 while !stop_flag.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            serve_connection(stream, include_isolation_headers);
+                            serve_connection(stream, include_isolation_headers, &request_counter);
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));
@@ -1888,12 +2510,17 @@ mod tests {
             Self {
                 addr,
                 stop,
+                requests,
                 handle: Some(handle),
             }
         }
 
         fn base_url(&self) -> String {
             format!("http://{}", self.addr)
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::Relaxed)
         }
     }
 
@@ -1907,7 +2534,11 @@ mod tests {
         }
     }
 
-    fn serve_connection(mut stream: TcpStream, include_isolation_headers: bool) {
+    fn serve_connection(
+        mut stream: TcpStream,
+        include_isolation_headers: bool,
+        requests: &AtomicUsize,
+    ) {
         let mut buf = [0_u8; 4096];
         let read = match stream.read(&mut buf) {
             Ok(n) => n,
@@ -1916,6 +2547,7 @@ mod tests {
         if read == 0 {
             return;
         }
+        requests.fetch_add(1, Ordering::Relaxed);
         let req = String::from_utf8_lossy(&buf[..read]);
         let first_line = req.lines().next().unwrap_or_default();
         let path = first_line
@@ -2039,6 +2671,189 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn create_test_agent_mail_sqlite_file(path: &Path) {
+        let conn = SqliteConnection::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                sender_id INTEGER,
+                subject TEXT,
+                body_md TEXT,
+                importance TEXT,
+                created_ts TEXT,
+                attachments TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER,
+                agent_id INTEGER,
+                kind TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'demo', '/tmp/demo')",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Alice')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages (
+                id, project_id, sender_id, subject, body_md, importance, created_ts, attachments
+            ) VALUES (
+                1, 1, 1, 'hello', 'world', 'normal', '2026-01-01T00:00:00Z', '[]'
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to')",
+        )
+        .unwrap();
+    }
+
+    fn write_manifest_with_database(
+        bundle_dir: &Path,
+        db_sha256: &str,
+        chunk_manifest: Option<&crate::ChunkManifest>,
+    ) {
+        let db_path = bundle_dir.join("mailbox.sqlite3");
+        let db_size = std::fs::metadata(&db_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "generated_at": "2024-01-01T00:00:00Z",
+            "database": {
+                "path": "mailbox.sqlite3",
+                "size_bytes": db_size,
+                "sha256": db_sha256,
+                "chunked": chunk_manifest.is_some(),
+                "chunk_manifest": chunk_manifest,
+                "fts_enabled": false,
+            }
+        });
+        std::fs::write(
+            bundle_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_bundle_detects_corrupt_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        std::fs::write(&db_path, b"this is not sqlite").unwrap();
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        write_manifest_with_database(&bundle, &db_sha, None);
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "database_quick_check" && !check.passed),
+            "corrupt database should fail the quick-check gate"
+        );
+    }
+
+    #[test]
+    fn validate_bundle_detects_missing_chunk_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let chunk_manifest = crate::maybe_chunk_database(&db_path, &bundle, 1, 128)
+            .unwrap()
+            .unwrap();
+        write_manifest_with_database(&bundle, &db_sha, Some(&chunk_manifest));
+
+        std::fs::remove_file(bundle.join("chunks/00000.bin")).unwrap();
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "database_chunk_artifacts_valid" && !check.passed),
+            "missing chunk files should fail deploy readiness"
+        );
+    }
+
+    #[test]
+    fn validate_bundle_detects_non_agent_mail_database_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        let conn = SqliteConnection::open_file(db_path.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO items (name) VALUES ('alpha')")
+            .unwrap();
+        drop(conn);
+
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        write_manifest_with_database(&bundle, &db_sha, None);
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "database_schema_valid" && !check.passed),
+            "non-Agent-Mail schemas must fail deploy readiness"
+        );
+    }
+
+    #[test]
+    fn validate_bundle_accepts_valid_chunked_database_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let chunk_manifest = crate::maybe_chunk_database(&db_path, &bundle, 1, 128)
+            .unwrap()
+            .unwrap();
+        write_manifest_with_database(&bundle, &db_sha, Some(&chunk_manifest));
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(
+            report.ready,
+            "valid chunk artifacts should keep the bundle ready"
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "database_chunk_artifacts_valid" && check.passed)
+        );
+    }
+
     // ── bundle stats ────────────────────────────────────────────────
 
     #[test]
@@ -2081,6 +2896,7 @@ mod tests {
         assert!(workflow.contains("permissions:"));
         assert!(workflow.contains("bundle/**"));
         assert!(workflow.contains("BUNDLE_DIR=\"bundle\""));
+        assert!(workflow.contains("path: 'bundle'"));
     }
 
     #[test]
@@ -2106,6 +2922,7 @@ mod tests {
         assert!(script.contains("am share deploy verify-live"));
         assert!(script.contains("compatibility-only"));
         assert!(script.contains("check_url"));
+        assert!(!script.contains("eval "));
     }
 
     // ── write_deploy_tooling ────────────────────────────────────────
@@ -2125,7 +2942,11 @@ mod tests {
         assert!(written.contains(&"bundle/deploy_report.json".to_string()));
 
         // Verify files exist
-        assert!(dir.path().join(".github/workflows/deploy-pages.yml").is_file());
+        assert!(
+            dir.path()
+                .join(".github/workflows/deploy-pages.yml")
+                .is_file()
+        );
         assert!(
             dir.path()
                 .join(".github/workflows/deploy-cf-pages.yml")
@@ -2159,6 +2980,31 @@ mod tests {
         assert!(ids.contains(&"cloudflare_pages"));
         assert!(ids.contains(&"netlify"));
         assert!(ids.contains(&"s3"));
+    }
+
+    #[test]
+    fn generated_commands_shell_quote_bundle_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle dir;touch nope");
+        create_minimal_bundle(&bundle);
+        let quoted_bundle = shell_quote_bundle_path(&bundle);
+
+        let platforms = build_platform_info(&bundle, &[]);
+        let github = platforms
+            .iter()
+            .find(|platform| platform.id == "github_pages")
+            .and_then(|platform| platform.deploy_command.as_deref())
+            .expect("github pages deploy command");
+        assert!(github.contains(&quoted_bundle));
+
+        let rollback = build_rollback_guidance(&bundle, &BTreeMap::new());
+        let github_rollback = rollback
+            .steps
+            .iter()
+            .find(|step| step.platform == "github_pages")
+            .and_then(|step| step.command.as_deref())
+            .expect("github pages rollback command");
+        assert!(github_rollback.contains(&quoted_bundle));
     }
 
     // ── deploy report serialization ─────────────────────────────────
@@ -2216,7 +3062,61 @@ mod tests {
         assert!(workflow.contains("Deploy to Cloudflare Pages"));
         assert!(workflow.contains("cloudflare/wrangler-action@v3"));
         assert!(workflow.contains("CLOUDFLARE_API_TOKEN"));
-        assert!(workflow.contains("pages deploy bundle --project-name=agent-mail"));
+        assert!(workflow.contains("pages deploy \"bundle\" --project-name=agent-mail"));
+    }
+
+    #[test]
+    fn workflows_quote_bundle_paths_with_spaces() {
+        let gh_workflow = generate_gh_pages_workflow("bundle dir");
+        assert!(gh_workflow.contains("BUNDLE_DIR=\"bundle dir\""));
+        assert!(gh_workflow.contains("path: 'bundle dir'"));
+        assert!(gh_workflow.contains("- 'bundle dir/**'"));
+
+        let cf_workflow = generate_cf_pages_workflow("bundle dir");
+        assert!(cf_workflow.contains("BUNDLE_DIR=\"bundle dir\""));
+        assert!(cf_workflow.contains("pages deploy \"bundle dir\" --project-name=agent-mail"));
+    }
+
+    #[test]
+    fn write_deploy_tooling_rejects_non_portable_bundle_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle'bad");
+        create_minimal_bundle(&bundle);
+
+        let err = write_deploy_tooling(dir.path(), &bundle).unwrap_err();
+        assert!(
+            matches!(err, ShareError::Validation { .. }),
+            "expected validation error for non-portable bundle path, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("portable path characters"),
+            "error should explain the generated tooling path restriction: {err}"
+        );
+    }
+
+    #[test]
+    fn write_deploy_tooling_refuses_to_overwrite_existing_repo_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let workflow_path = dir.path().join(".github/workflows/deploy-pages.yml");
+        std::fs::create_dir_all(workflow_path.parent().unwrap()).unwrap();
+        std::fs::write(&workflow_path, "# custom workflow\n").unwrap();
+
+        let err = write_deploy_tooling(dir.path(), &bundle)
+            .expect_err("existing repo-level deploy files must not be overwritten silently");
+        assert!(
+            matches!(err, ShareError::Validation { .. }),
+            "unexpected error type: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("refusing to overwrite existing file"),
+            "error should explain why generation stopped: {err}"
+        );
+        let content = std::fs::read_to_string(&workflow_path).unwrap();
+        assert_eq!(content, "# custom workflow\n");
     }
 
     // ── Security expectations ────────────────────────────────────────
@@ -2815,6 +3715,7 @@ mod tests {
                 .iter()
                 .any(|c| c.id == "security.coep_value" && c.passed)
         );
+        assert_eq!(server.request_count(), 4);
     }
 
     #[test]
@@ -2884,5 +3785,33 @@ mod tests {
         assert!(!report.stages.security.ran);
         assert!(report.stages.remote.checks.is_empty());
         assert!(report.stages.security.checks.is_empty());
+    }
+
+    #[test]
+    fn run_verify_live_fail_fast_short_circuits_on_bundle_error_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_bundle = dir.path().join("missing-bundle");
+
+        let opts = VerifyLiveOptions {
+            url: "http://127.0.0.1:1".to_string(),
+            bundle_path: Some(missing_bundle),
+            security_audit: true,
+            strict: false,
+            fail_fast: true,
+            probe_config: crate::probe::ProbeConfig {
+                timeout: Duration::from_millis(200),
+                retries: 0,
+                retry_delay: Duration::from_millis(1),
+                ..crate::probe::ProbeConfig::default()
+            },
+        };
+
+        let report = run_verify_live(&opts);
+        assert_eq!(report.verdict, VerifyVerdict::Fail);
+        assert!(report.stages.local.ran);
+        assert!(!report.stages.remote.ran);
+        assert!(!report.stages.security.ran);
+        assert_eq!(report.stages.local.checks.len(), 1);
+        assert_eq!(report.stages.local.checks[0].id, "bundle.error");
     }
 }

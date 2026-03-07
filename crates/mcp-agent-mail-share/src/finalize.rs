@@ -163,11 +163,11 @@ pub fn build_materialized_views(
     let conn = open_conn(snapshot_path)?;
     let mut created = Vec::new();
 
-    // Ensure recipients table exists to satisfy LEFT JOINs in view creation.
-    conn.execute_raw(
-        "CREATE TABLE IF NOT EXISTS message_recipients (message_id INTEGER, agent_id INTEGER)",
-    )
-    .map_err(sql_err)?;
+    if !table_exists(&conn, "message_recipients")? {
+        return Err(ShareError::Validation {
+            message: "snapshot missing required table: message_recipients".to_string(),
+        });
+    }
 
     let has_thread_id = column_exists(&conn, "messages", "thread_id")?;
     let has_sender_id = column_exists(&conn, "messages", "sender_id")?;
@@ -473,6 +473,17 @@ fn sql_err(e: impl std::fmt::Display) -> ShareError {
     ShareError::Sqlite {
         message: e.to_string(),
     }
+}
+
+fn table_exists(conn: &SqliteConnection, table: &str) -> Result<bool, ShareError> {
+    let sql = format!(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{}' LIMIT 1",
+        table.replace('\'', "''")
+    );
+    let rows = conn.query_sync(&sql, &[]).map_err(|e| ShareError::Sqlite {
+        message: format!("sqlite_master lookup for {table} failed: {e}"),
+    })?;
+    Ok(!rows.is_empty())
 }
 
 fn column_exists(conn: &SqliteConnection, table: &str, column: &str) -> Result<bool, ShareError> {
@@ -947,6 +958,27 @@ mod tests {
             .unwrap();
         let count: i64 = rows[0].get_named("cnt").unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn materialized_views_missing_recipients_table_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("DROP TABLE message_recipients").unwrap();
+        drop(conn);
+
+        let err =
+            build_materialized_views(&db, false).expect_err("missing recipients table must fail");
+        assert!(
+            matches!(err, ShareError::Validation { .. }),
+            "unexpected error type: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("message_recipients"),
+            "error should identify the missing required table: {err}"
+        );
     }
 
     /// Create a test DB without sender_id column on messages.

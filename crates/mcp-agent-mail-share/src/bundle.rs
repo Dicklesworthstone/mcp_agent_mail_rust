@@ -64,6 +64,35 @@ pub struct AttachmentConfig {
     pub detach_threshold: usize,
 }
 
+fn rewrite_original_path(obj: &mut serde_json::Map<String, Value>, original_path: &Option<String>) {
+    match original_path {
+        Some(path) => {
+            obj.insert("original_path".to_string(), Value::String(path.clone()));
+        }
+        None => {
+            obj.remove("original_path");
+        }
+    }
+}
+
+fn remove_attachment_keys(obj: &mut serde_json::Map<String, Value>, keys: &[&str]) {
+    for key in keys {
+        obj.remove(*key);
+    }
+}
+
+fn snapshot_has_fts_messages(conn: &Conn) -> ShareResult<bool> {
+    let rows = conn
+        .query_sync(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages' LIMIT 1",
+            &[],
+        )
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("fts_messages lookup failed: {e}"),
+        })?;
+    Ok(!rows.is_empty())
+}
+
 /// Chunk manifest when DB is split into pieces.
 ///
 /// Field names and ordering match the legacy Python config exactly.
@@ -117,6 +146,7 @@ pub fn bundle_attachments(
     let mut items = Vec::new();
     // SHA256 -> relative bundle path (for deduplication of identical content)
     let mut dedup_map: HashMap<String, String> = HashMap::new();
+    let mut attachments_rewritten = false;
 
     let mut last_id = 0i64;
     loop {
@@ -199,6 +229,8 @@ pub fn bundle_attachments(
                             media_type,
                             base64::engine::general_purpose::STANDARD.encode(&content)
                         );
+                        remove_attachment_keys(obj, &["path", "note"]);
+                        rewrite_original_path(obj, &original_path);
                         obj.insert("type".to_string(), Value::String("inline".to_string()));
                         obj.insert("data_uri".to_string(), Value::String(data_uri));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
@@ -220,6 +252,8 @@ pub fn bundle_attachments(
                     } else if file_size >= detach_threshold {
                         // External — too large to bundle
                         let sha = sha256_file(source)?;
+                        remove_attachment_keys(obj, &["path", "data_uri"]);
+                        rewrite_original_path(obj, &original_path);
                         obj.insert("type".to_string(), Value::String("external".to_string()));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
                         obj.insert(
@@ -264,6 +298,8 @@ pub fn bundle_attachments(
                             rel
                         };
 
+                        remove_attachment_keys(obj, &["data_uri", "note"]);
+                        rewrite_original_path(obj, &original_path);
                         obj.insert("type".to_string(), Value::String("file".to_string()));
                         obj.insert("path".to_string(), Value::String(bundle_rel.clone()));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
@@ -286,27 +322,31 @@ pub fn bundle_attachments(
                     Ok(())
                 })();
 
-                if let Err(e) = process_result {
-                    if source_file.is_some() && e.kind() != std::io::ErrorKind::NotFound {
-                        // Log warning for unexpected IO errors (permissions, etc)
+                match process_result {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Only a true "not found" case degrades to the synthetic
+                        // missing-attachment state. Other IO failures should fail
+                        // the export instead of rewriting valid attachments.
+                        remove_attachment_keys(
+                            obj,
+                            &["path", "data_uri", "sha256", "bytes", "note"],
+                        );
+                        rewrite_original_path(obj, &original_path);
+                        obj.insert("type".to_string(), Value::String("missing".to_string()));
+                        stats.missing += 1;
+                        items.push(AttachmentItem {
+                            message_id: msg_id,
+                            mode: "missing".to_string(),
+                            sha256: None,
+                            media_type: Some(media_type),
+                            bytes: None,
+                            original_path: original_path.clone(),
+                            bundle_path: None,
+                        });
+                        updated = true;
                     }
-
-                    // Missing fallback
-                    obj.insert("type".to_string(), Value::String("missing".to_string()));
-                    if let Some(ref p) = original_path {
-                        obj.insert("original_path".to_string(), Value::String(p.clone()));
-                    }
-                    stats.missing += 1;
-                    items.push(AttachmentItem {
-                        message_id: msg_id,
-                        mode: "missing".to_string(),
-                        sha256: None,
-                        media_type: Some(media_type),
-                        bytes: None,
-                        original_path: original_path.clone(),
-                        bundle_path: None,
-                    });
-                    updated = true;
+                    Err(e) => return Err(ShareError::Io(e)),
                 }
             }
 
@@ -321,8 +361,16 @@ pub fn bundle_attachments(
                 .map_err(|e| ShareError::Sqlite {
                     message: format!("UPDATE attachments failed: {e}"),
                 })?;
+                attachments_rewritten = true;
             }
         }
+    }
+
+    let fts_enabled = snapshot_has_fts_messages(&conn)?;
+    drop(conn);
+
+    if attachments_rewritten {
+        crate::build_materialized_views(snapshot_path, fts_enabled)?;
     }
 
     // Ensure attachments dir exists even if empty
@@ -1277,6 +1325,17 @@ mod tests {
              created_ts TEXT DEFAULT '', attachments TEXT DEFAULT '[]')",
         )
         .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts TEXT,
+                ack_ts TEXT,
+                PRIMARY KEY(message_id, agent_id)
+            )",
+        )
+        .unwrap();
         conn.execute_raw("INSERT INTO projects VALUES (1, 'proj', '/test', '')")
             .unwrap();
         conn.execute_raw(
@@ -1373,6 +1432,57 @@ mod tests {
     }
 
     #[test]
+    fn bundle_refreshes_attachment_materialized_view_after_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(storage.join("tiny.txt"), b"Hello!").unwrap();
+
+        let att_json = r#"[{"type":"file","path":"tiny.txt","media_type":"text/plain"}]"#;
+        let db = create_bundle_test_db(dir.path(), &[att_json]);
+        crate::build_materialized_views(&db, false).expect("build views before bundling");
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let before_rows = conn
+            .query_sync(
+                "SELECT attachment_type, path FROM attachments_by_message_mv WHERE message_id = 1",
+                &[],
+            )
+            .unwrap();
+        let before_type: String = before_rows[0].get_named("attachment_type").unwrap();
+        let before_path: String = before_rows[0].get_named("path").unwrap();
+        drop(conn);
+
+        assert_eq!(before_type, "file");
+        assert_eq!(before_path, "tiny.txt");
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+        bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .unwrap();
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let after_rows = conn
+            .query_sync(
+                "SELECT attachment_type, path FROM attachments_by_message_mv WHERE message_id = 1",
+                &[],
+            )
+            .unwrap();
+        let after_type: String = after_rows[0].get_named("attachment_type").unwrap();
+        let after_path = after_rows[0].get_named::<String>("path").ok();
+
+        assert_eq!(after_type, "inline");
+        assert_eq!(after_path, None);
+    }
+
+    #[test]
     fn bundle_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path().join("storage");
@@ -1396,6 +1506,86 @@ mod tests {
 
         assert_eq!(result.stats.missing, 1);
         assert_eq!(result.items[0].mode, "missing");
+    }
+
+    #[test]
+    fn bundle_missing_file_clears_stale_materialized_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        let att_json = r#"[{"type":"file","path":"nonexistent.dat","original_path":"nonexistent.dat","data_uri":"data:text/plain;base64,b2xk","sha256":"deadbeef","bytes":3,"note":"stale","media_type":"application/octet-stream"}]"#;
+        let db = create_bundle_test_db(dir.path(), &[att_json]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .unwrap();
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let att: String = rows[0].get_named("attachments").unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&att).unwrap();
+
+        assert_eq!(parsed[0]["type"], "missing");
+        assert_eq!(parsed[0]["original_path"], "nonexistent.dat");
+        assert!(parsed[0].get("path").is_none());
+        assert!(parsed[0].get("data_uri").is_none());
+        assert!(parsed[0].get("sha256").is_none());
+        assert!(parsed[0].get("bytes").is_none());
+        assert!(parsed[0].get("note").is_none());
+    }
+
+    #[test]
+    fn bundle_invalid_attachment_source_errors_instead_of_marking_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        let nested_dir = storage.join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+
+        let att_json =
+            r#"[{"type":"file","path":"nested","media_type":"application/octet-stream"}]"#;
+        let db = create_bundle_test_db(dir.path(), &[att_json]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let err = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .expect_err("non-file attachment sources must fail the export");
+
+        assert!(
+            matches!(err, ShareError::Io(_)),
+            "unexpected error type: {err:?}"
+        );
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let att: String = rows[0].get_named("attachments").unwrap();
+        assert!(
+            att.contains(r#""path":"nested""#),
+            "attachment JSON should be left unchanged on hard IO failures"
+        );
+        assert!(
+            !att.contains(r#""type":"missing""#),
+            "hard IO failures must not be rewritten as missing attachments"
+        );
     }
 
     #[test]

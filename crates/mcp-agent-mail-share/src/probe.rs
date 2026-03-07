@@ -151,9 +151,18 @@ impl ParsedUrl {
             });
         };
 
-        let (host_port, path) = match rest.find('/') {
+        let (host_port, suffix) = match rest.find(['/', '?', '#']) {
             Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
+            None => (rest, ""),
+        };
+
+        let suffix = suffix.split_once('#').map_or(suffix, |(before, _)| before);
+        let path = if suffix.is_empty() {
+            "/".to_string()
+        } else if suffix.starts_with('?') {
+            format!("/{suffix}")
+        } else {
+            suffix.to_string()
         };
 
         let (host, port) = if let Some(bracket_end) = host_port.find(']') {
@@ -198,7 +207,7 @@ impl ParsedUrl {
             scheme,
             host,
             port,
-            path: path.to_string(),
+            path,
         })
     }
 
@@ -233,12 +242,28 @@ const BODY_LIMIT: usize = 1024 * 1024; // 1 MiB
 /// Follows redirects, retries on transient errors, and captures status code,
 /// headers, and body. Returns a structured `ProbeResponse` or `ProbeError`.
 pub fn probe_get(url: &str, config: &ProbeConfig) -> Result<ProbeResponse, ProbeError> {
+    probe_get_inner(url, config, true)
+}
+
+/// Perform an HTTP GET probe while discarding the response body.
+pub fn probe_get_headers_only(
+    url: &str,
+    config: &ProbeConfig,
+) -> Result<ProbeResponse, ProbeError> {
+    probe_get_inner(url, config, false)
+}
+
+fn probe_get_inner(
+    url: &str,
+    config: &ProbeConfig,
+    capture_body: bool,
+) -> Result<ProbeResponse, ProbeError> {
     let start = Instant::now();
     let mut parsed = ParsedUrl::parse(url)?;
     let mut redirects = 0u32;
 
     loop {
-        let result = probe_single_get(&parsed, config);
+        let result = probe_single_get(&parsed, config, capture_body);
         match result {
             Ok(resp) => {
                 // Check for redirect
@@ -267,7 +292,7 @@ pub fn probe_get(url: &str, config: &ProbeConfig) -> Result<ProbeResponse, Probe
             }
             Err(e) if is_retryable(&e) => {
                 // Retry handled below
-                return retry_probe(&parsed, config, start, redirects);
+                return retry_probe(&parsed, config, start, redirects, capture_body);
             }
             Err(e) => return Err(e),
         }
@@ -280,6 +305,7 @@ fn retry_probe(
     config: &ProbeConfig,
     start: Instant,
     redirects: u32,
+    capture_body: bool,
 ) -> Result<ProbeResponse, ProbeError> {
     let mut last_err = None;
 
@@ -288,7 +314,7 @@ fn retry_probe(
             std::thread::sleep(config.retry_delay);
         }
 
-        match probe_single_get(parsed, config) {
+        match probe_single_get(parsed, config, capture_body) {
             Ok(resp) if !is_server_error(resp.status) => {
                 return Ok(ProbeResponse {
                     final_url: parsed.to_url(),
@@ -318,7 +344,11 @@ fn retry_probe(
 }
 
 /// Perform a single HTTP GET request (no redirect following, no retry).
-fn probe_single_get(parsed: &ParsedUrl, config: &ProbeConfig) -> Result<RawResponse, ProbeError> {
+fn probe_single_get(
+    parsed: &ParsedUrl,
+    config: &ProbeConfig,
+    capture_body: bool,
+) -> Result<RawResponse, ProbeError> {
     let addr = format!("{}:{}", parsed.host, parsed.port);
 
     let stream = TcpStream::connect_timeout(
@@ -355,12 +385,12 @@ fn probe_single_get(parsed: &ParsedUrl, config: &ProbeConfig) -> Result<RawRespo
         })?;
 
     match parsed.scheme {
-        Scheme::Http => send_and_receive(stream, parsed, config),
+        Scheme::Http => send_and_receive(stream, parsed, config, capture_body),
         Scheme::Https => {
             // HTTPS uses curl subprocess to avoid native-tls dependency
             // (share crate is #![forbid(unsafe_code)])
             drop(stream);
-            probe_via_curl(parsed, config)
+            probe_via_curl(parsed, config, capture_body)
         }
     }
 }
@@ -370,6 +400,7 @@ fn send_and_receive<S: io::Read + io::Write>(
     mut stream: S,
     parsed: &ParsedUrl,
     _config: &ProbeConfig,
+    capture_body: bool,
 ) -> Result<RawResponse, ProbeError> {
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail/probe\r\nAccept: */*\r\nConnection: close\r\n\r\n",
@@ -433,7 +464,9 @@ fn send_and_receive<S: io::Read + io::Write>(
     }
 
     // Read body
-    let body = if chunked {
+    let body = if !capture_body {
+        Vec::new()
+    } else if chunked {
         read_chunked_body(&mut reader)?
     } else if let Some(len) = content_length {
         let capped = len.min(BODY_LIMIT);
@@ -459,38 +492,70 @@ fn send_and_receive<S: io::Read + io::Write>(
 }
 
 /// Probe via `curl` subprocess for HTTPS (avoids native TLS dependency).
-fn probe_via_curl(parsed: &ParsedUrl, config: &ProbeConfig) -> Result<RawResponse, ProbeError> {
+fn probe_via_curl(
+    parsed: &ParsedUrl,
+    config: &ProbeConfig,
+    capture_body: bool,
+) -> Result<RawResponse, ProbeError> {
     let url = parsed.to_url();
     #[allow(clippy::cast_possible_truncation)]
     let timeout_secs = config.timeout.as_secs().max(1);
 
-    let output = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            "-D",
-            "-", // dump headers to stdout
-            "--max-time",
-            &timeout_secs.to_string(),
-            // Do not follow redirects — we handle them ourselves
-            &url,
-        ])
-        .output()
-        .map_err(|e| ProbeError::ConnectionError {
-            detail: format!("curl not available: {e}"),
-        })?;
+    let mut command = std::process::Command::new("curl");
+    command.args([
+        "-sS",
+        "-D",
+        "-", // dump headers to stdout
+        "--max-time",
+        &timeout_secs.to_string(),
+        // Do not follow redirects — we handle them ourselves
+        &url,
+    ]);
+    if !capture_body {
+        let discard_target = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        command.args(["--output", discard_target]);
+    }
+    let output = command.output().map_err(|e| ProbeError::ConnectionError {
+        detail: format!("curl not available: {e}"),
+    })?;
 
-    if !output.status.success() && output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ProbeError::ConnectionError {
-            detail: format!("curl failed: {stderr}"),
-        });
+    if !output.status.success() {
+        return Err(map_curl_failure(&output, config));
     }
 
-    // Parse curl output (headers + body separated by \r\n\r\n)
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let (header_section, body_str) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+    parse_curl_http_response(&output.stdout, capture_body)
+}
 
-    let mut lines = header_section.lines();
+fn map_curl_failure(output: &std::process::Output, config: &ProbeConfig) -> ProbeError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        format!("curl exited with status {}", output.status)
+    } else {
+        stderr
+    };
+
+    match output.status.code() {
+        Some(6) => ProbeError::DnsError { detail },
+        Some(28) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let timeout_ms = config.timeout.as_millis() as u64;
+            ProbeError::Timeout { timeout_ms }
+        }
+        Some(35 | 51 | 58 | 59 | 60 | 64 | 66 | 77 | 80 | 83 | 90 | 91) => {
+            ProbeError::TlsError { detail }
+        }
+        _ => ProbeError::ConnectionError { detail },
+    }
+}
+
+fn parse_curl_http_response(raw: &[u8], capture_body: bool) -> Result<RawResponse, ProbeError> {
+    let (header_section, body) =
+        split_http_response(raw).ok_or_else(|| ProbeError::ProtocolError {
+            detail: "curl did not return a complete HTTP response".to_string(),
+        })?;
+
+    let header_text = String::from_utf8_lossy(header_section);
+    let mut lines = header_text.lines();
     let status_line = lines.next().unwrap_or("HTTP/1.1 000 Unknown");
     let status = parse_status_line(status_line)?;
 
@@ -501,11 +566,29 @@ fn probe_via_curl(parsed: &ParsedUrl, config: &ProbeConfig) -> Result<RawRespons
         }
     }
 
+    let mut body_bytes = if capture_body {
+        body.to_vec()
+    } else {
+        Vec::new()
+    };
+    if body_bytes.len() > BODY_LIMIT {
+        body_bytes.truncate(BODY_LIMIT);
+    }
+
     Ok(RawResponse {
         status,
         headers,
-        body: body_str.as_bytes().to_vec(),
+        body: body_bytes,
     })
+}
+
+fn split_http_response(raw: &[u8]) -> Option<(&[u8], &[u8])> {
+    if let Some(idx) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+        return Some((&raw[..idx], &raw[idx + 4..]));
+    }
+    raw.windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|idx| (&raw[..idx], &raw[idx + 2..]))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -694,6 +777,87 @@ pub struct ProbeCheckResult {
     pub headers_captured: BTreeMap<String, String>,
 }
 
+/// Evaluate a single probe check against an already-fetched response.
+#[must_use]
+pub(crate) fn evaluate_probe_check(
+    check: &ProbeCheck,
+    resp: &ProbeResponse,
+    elapsed: Duration,
+) -> ProbeCheckResult {
+    let mut passed = true;
+    let mut messages = Vec::new();
+
+    if let Some(expected) = check.expected_status {
+        if resp.status != expected {
+            passed = false;
+            messages.push(format!("expected HTTP {expected}, got {}", resp.status));
+        }
+    } else if resp.status >= 400 {
+        passed = false;
+        messages.push(format!("HTTP {}", resp.status));
+    }
+
+    for header in &check.required_headers {
+        let key = header.to_lowercase();
+        if resp.header(&key).is_none() {
+            passed = false;
+            messages.push(format!("{header} header missing"));
+        }
+    }
+
+    let message = if passed {
+        format!(
+            "GET {} \u{2192} {} ({}ms)",
+            check.path,
+            resp.status,
+            elapsed.as_millis()
+        )
+    } else {
+        messages.join("; ")
+    };
+
+    let mut captured = BTreeMap::new();
+    for key in &check.required_headers {
+        let k = key.to_lowercase();
+        if let Some(val) = resp.header(&k) {
+            captured.insert(k, val.to_string());
+        }
+    }
+    if let Some(ct) = resp.header("content-type") {
+        captured.insert("content-type".to_string(), ct.to_string());
+    }
+
+    ProbeCheckResult {
+        id: check.id.clone(),
+        description: check.description.clone(),
+        passed,
+        message,
+        severity: check.severity,
+        elapsed,
+        http_status: Some(resp.status),
+        headers_captured: captured,
+    }
+}
+
+/// Convert a probe failure into a check result.
+#[must_use]
+pub(crate) fn probe_error_result(
+    check: &ProbeCheck,
+    error: &ProbeError,
+    elapsed: Duration,
+) -> ProbeCheckResult {
+    ProbeCheckResult {
+        id: check.id.clone(),
+        description: check.description.clone(),
+        passed: false,
+        message: error.to_string(),
+        severity: check.severity,
+        elapsed,
+        http_status: None,
+        headers_captured: BTreeMap::new(),
+    }
+}
+
 /// Run a sequence of probe checks against a base URL.
 #[must_use]
 pub fn run_probe_checks(
@@ -710,75 +874,8 @@ pub fn run_probe_checks(
             let start = Instant::now();
 
             match probe_get(&url, config) {
-                Ok(resp) => {
-                    let mut passed = true;
-                    let mut messages = Vec::new();
-
-                    // Check status
-                    if let Some(expected) = check.expected_status {
-                        if resp.status != expected {
-                            passed = false;
-                            messages.push(format!("expected HTTP {expected}, got {}", resp.status));
-                        }
-                    } else if resp.status >= 400 {
-                        passed = false;
-                        messages.push(format!("HTTP {}", resp.status));
-                    }
-
-                    // Check required headers
-                    for header in &check.required_headers {
-                        let key = header.to_lowercase();
-                        if resp.header(&key).is_none() {
-                            passed = false;
-                            messages.push(format!("{header} header missing"));
-                        }
-                    }
-
-                    let message = if passed {
-                        format!(
-                            "GET {} \u{2192} {} ({}ms)",
-                            check.path,
-                            resp.status,
-                            start.elapsed().as_millis()
-                        )
-                    } else {
-                        messages.join("; ")
-                    };
-
-                    // Capture relevant headers
-                    let mut captured = BTreeMap::new();
-                    for key in &check.required_headers {
-                        let k = key.to_lowercase();
-                        if let Some(val) = resp.header(&k) {
-                            captured.insert(k, val.to_string());
-                        }
-                    }
-                    // Always capture content-type
-                    if let Some(ct) = resp.header("content-type") {
-                        captured.insert("content-type".to_string(), ct.to_string());
-                    }
-
-                    ProbeCheckResult {
-                        id: check.id.clone(),
-                        description: check.description.clone(),
-                        passed,
-                        message,
-                        severity: check.severity,
-                        elapsed: start.elapsed(),
-                        http_status: Some(resp.status),
-                        headers_captured: captured,
-                    }
-                }
-                Err(e) => ProbeCheckResult {
-                    id: check.id.clone(),
-                    description: check.description.clone(),
-                    passed: false,
-                    message: e.to_string(),
-                    severity: check.severity,
-                    elapsed: start.elapsed(),
-                    http_status: None,
-                    headers_captured: BTreeMap::new(),
-                },
+                Ok(resp) => evaluate_probe_check(check, &resp, start.elapsed()),
+                Err(e) => probe_error_result(check, &e, start.elapsed()),
             }
         })
         .collect()
@@ -822,6 +919,20 @@ mod tests {
     fn parse_url_no_path() {
         let p = ParsedUrl::parse("https://example.com").unwrap();
         assert_eq!(p.path, "/");
+    }
+
+    #[test]
+    fn parse_url_with_query_but_no_explicit_path() {
+        let p = ParsedUrl::parse("https://example.com?ok=1").unwrap();
+        assert_eq!(p.host, "example.com");
+        assert_eq!(p.path, "/?ok=1");
+    }
+
+    #[test]
+    fn parse_url_with_query_and_fragment_strips_fragment() {
+        let p = ParsedUrl::parse("https://example.com/path?q=1#section").unwrap();
+        assert_eq!(p.host, "example.com");
+        assert_eq!(p.path, "/path?q=1");
     }
 
     #[test]
@@ -893,6 +1004,36 @@ mod tests {
         let base = ParsedUrl::parse("https://a.com/dir/old").unwrap();
         let resolved = resolve_redirect(&base, "new");
         assert_eq!(resolved, "https://a.com/dir/new");
+    }
+
+    #[test]
+    fn parse_curl_http_response_preserves_binary_body_bytes() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n\xff\x00\x80";
+        let response = parse_curl_http_response(raw, true).expect("parse curl response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, vec![0xff, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn parse_curl_http_response_truncates_large_bodies() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', BODY_LIMIT + 17));
+        let response = parse_curl_http_response(&raw, true).expect("parse curl response");
+        assert_eq!(response.body.len(), BODY_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn map_curl_failure_classifies_timeout() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(28 << 8),
+            stdout: Vec::new(),
+            stderr: b"operation timed out".to_vec(),
+        };
+        let err = map_curl_failure(&output, &ProbeConfig::default());
+        assert!(matches!(err, ProbeError::Timeout { .. }));
     }
 
     // ── Helper predicates ───────────────────────────────────────────

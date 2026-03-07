@@ -805,7 +805,7 @@ mod tests {
         assert!(plan.steps.iter().any(|s| s.id == "create_nojekyll"));
         assert!(plan.steps.iter().any(|s| s.id == "create_headers"));
         let copy_step = plan.steps.iter().find(|s| s.id == "copy_bundle").unwrap();
-        let expected_output = bundle.path().join("docs");
+        let expected_output = bundle.path().parent().unwrap().join("docs");
         assert_eq!(
             copy_step.command,
             Some(format!(
