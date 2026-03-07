@@ -324,6 +324,9 @@ struct StartupSignalState {
     db_warmup: DbWarmupState,
 }
 
+/// How far ahead (in microseconds) to warn about expiring reservations (5 min).
+pub(crate) const RESERVATION_EXPIRY_WARN_MICROS: i64 = 5 * 60 * 1_000_000;
+
 #[derive(Debug)]
 pub struct TuiSharedState {
     events: EventRingBuffer,
@@ -903,6 +906,21 @@ impl TuiSharedState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
         )
+    }
+
+    #[must_use]
+    pub fn urgent_cadence_bypass_active(&self, now_micros: i64) -> bool {
+        let snapshot = self
+            .db_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.ack_pending > 0
+            || snapshot.reservation_snapshots.iter().any(|reservation| {
+                reservation.released_ts.is_none()
+                    && reservation.expires_ts > now_micros
+                    && reservation.expires_ts.saturating_sub(now_micros)
+                        <= RESERVATION_EXPIRY_WARN_MICROS
+            })
     }
 
     #[must_use]
@@ -2089,6 +2107,37 @@ mod tests {
         state.record_request(200, 5);
         let gen_after = state.data_generation();
         assert!(gen_after.request_gen > gen_before.request_gen);
+    }
+
+    #[test]
+    fn urgent_cadence_bypass_uses_ack_pending_without_snapshot_clone() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_bridge::DbStatSnapshot {
+            ack_pending: 1,
+            ..crate::tui_bridge::DbStatSnapshot::default()
+        });
+        assert!(state.urgent_cadence_bypass_active(0));
+    }
+
+    #[test]
+    fn urgent_cadence_bypass_uses_expiring_reservations_without_snapshot_clone() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_bridge::DbStatSnapshot {
+            reservation_snapshots: vec![crate::tui_events::ReservationSnapshot {
+                id: 1,
+                project_slug: "alpha".to_string(),
+                agent_name: "BlueLake".to_string(),
+                path_pattern: "src/lib.rs".to_string(),
+                exclusive: true,
+                granted_ts: 0,
+                expires_ts: RESERVATION_EXPIRY_WARN_MICROS - 1,
+                released_ts: None,
+            }],
+            ..crate::tui_bridge::DbStatSnapshot::default()
+        });
+        assert!(state.urgent_cadence_bypass_active(0));
     }
 
     #[test]

@@ -220,18 +220,7 @@ const fn screen_cadence_base_divisor(tier: ScreenCadenceTier) -> u64 {
 }
 
 fn urgent_poller_bypass_active(state: &TuiSharedState) -> bool {
-    let Some(snapshot) = state.db_stats_snapshot() else {
-        return false;
-    };
-    if snapshot.ack_pending > 0 {
-        return true;
-    }
-    let now = now_micros();
-    snapshot.reservation_snapshots.iter().any(|reservation| {
-        reservation.released_ts.is_none()
-            && reservation.expires_ts > now
-            && reservation.expires_ts.saturating_sub(now) <= RESERVATION_EXPIRY_WARN_MICROS
-    })
+    state.urgent_cadence_bypass_active(now_micros())
 }
 
 fn screen_tick_divisor(screen: MailScreenId, active: MailScreenId, urgent_bypass: bool) -> u64 {
@@ -475,8 +464,6 @@ fn toast_reduced_motion_enabled(accessibility: &crate::tui_persist::Accessibilit
 
 /// Duration threshold (ms) for slow tool call toasts.
 const SLOW_TOOL_THRESHOLD_MS: u64 = 5000;
-/// How far ahead (in microseconds) to warn about expiring reservations (5 min).
-const RESERVATION_EXPIRY_WARN_MICROS: i64 = 5 * 60 * 1_000_000;
 /// Keep top-row KPI/header bands free from transient toast borders.
 const TOAST_OVERLAY_CONTENT_TOP_INSET_ROWS: u16 = 2;
 
@@ -3596,7 +3583,7 @@ impl MailAppModel {
                     expired_keys.push(key.clone());
                     continue;
                 }
-                if *expiry - now < RESERVATION_EXPIRY_WARN_MICROS
+                if *expiry - now < crate::tui_bridge::RESERVATION_EXPIRY_WARN_MICROS
                     && !self.warned_reservations.contains(key)
                 {
                     let minutes_left = (*expiry - now) / 60_000_000;
@@ -4655,10 +4642,10 @@ fn spawn_browser_for_url(url: &str) -> std::io::Result<()> {
 
 impl ScreenTickDispatch for MailAppModel {
     fn screen_ids(&self) -> Vec<String> {
-        // Expose only materialized screens to the runtime tick strategy.
-        // Otherwise periodic background ticks instantiate hidden screens,
-        // which can start workers and side effects before the operator ever
-        // visits them.
+        // If the runtime-level screen-dispatch path is ever re-enabled, expose
+        // only materialized screens. Otherwise periodic background ticks can
+        // instantiate hidden screens and start side effects before the
+        // operator ever visits them.
         self.screen_manager
             .materialized_screen_ids()
             .into_iter()
@@ -10193,7 +10180,7 @@ mod tests {
 
         // Check: expiry is within the warning window
         assert!(expiry > now);
-        assert!(expiry - now < RESERVATION_EXPIRY_WARN_MICROS);
+        assert!(expiry - now < crate::tui_bridge::RESERVATION_EXPIRY_WARN_MICROS);
     }
 
     #[test]
@@ -10202,7 +10189,7 @@ mod tests {
         // Reservation expiring in 30 minutes (outside 5-minute window)
         let expiry = now + 30 * 60 * 1_000_000;
         // Should NOT be within warning window
-        assert!(expiry - now >= RESERVATION_EXPIRY_WARN_MICROS);
+        assert!(expiry - now >= crate::tui_bridge::RESERVATION_EXPIRY_WARN_MICROS);
     }
 
     #[test]

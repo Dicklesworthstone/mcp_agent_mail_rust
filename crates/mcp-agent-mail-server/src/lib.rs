@@ -768,6 +768,12 @@ fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Confi
     }
 }
 
+fn startup_search_backfill_spawn_failure_message(error: &std::io::Error) -> String {
+    format!(
+        "[startup-search] failed to spawn background backfill worker; leaving lexical backfill lazy ({error})"
+    )
+}
+
 fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
         Ok((indexed, _skipped)) if indexed > 0 => {
@@ -822,7 +828,6 @@ fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     }
 
     let thread_config = config.clone();
-    let fallback_config = config.clone();
     let spawn = std::thread::Builder::new()
         .name("am-search-backfill".to_string())
         .spawn(move || {
@@ -842,9 +847,9 @@ fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
         STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
         tracing::warn!(
             error = %err,
-            "[startup-search] failed to spawn background backfill worker; running inline"
+            "{}",
+            startup_search_backfill_spawn_failure_message(&err)
         );
-        run_startup_search_backfill(&fallback_config);
     }
 }
 
@@ -1630,6 +1635,27 @@ fn sleep_with_tui_shutdown(
     tui_startup_should_stop(tui_state)
 }
 
+fn tui_deferred_worker_spawn_failure_message(error: &std::io::Error) -> String {
+    format!(
+        "TUI startup: failed to spawn deferred worker starter ({error}); background services remain gated off during this TUI session"
+    )
+}
+
+fn handle_tui_deferred_background_worker_spawn_failure(
+    progress: &Arc<TuiDeferredWorkerProgress>,
+    tui_state: &Arc<tui_bridge::TuiSharedState>,
+    error: &std::io::Error,
+) {
+    tracing::warn!(
+        error = %error,
+        "failed to spawn deferred TUI worker starter; keeping background workers gated off"
+    );
+    tui_state.push_console_log(tui_deferred_worker_spawn_failure_message(error));
+    progress.non_db_started.store(false, Ordering::Release);
+    progress.db_started.store(false, Ordering::Release);
+    progress.advisory_started.store(false, Ordering::Release);
+}
+
 fn spawn_tui_deferred_background_workers(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
@@ -1661,19 +1687,12 @@ fn spawn_tui_deferred_background_workers(
             progress,
         },
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "failed to spawn deferred TUI worker starter; starting deferred workers inline"
+            let _ = inline_config;
+            handle_tui_deferred_background_worker_spawn_failure(
+                &progress,
+                &inline_tui_state,
+                &error,
             );
-            progress.start_non_db_if_needed(&inline_config);
-            if !inline_tui_state.db_ready() {
-                tracing::warn!(
-                    db_warmup = ?inline_tui_state.db_warmup_state(),
-                    "deferred TUI worker thread unavailable; starting DB workers without startup gating"
-                );
-            }
-            progress.start_db_if_needed(&inline_config);
-            progress.start_advisory_if_needed(&inline_config);
             TuiDeferredWorkerHandle {
                 join: None,
                 progress,
@@ -7917,6 +7936,41 @@ mod tests {
             !STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire),
             "memory-backed startup should not spawn lexical backfill worker"
         );
+    }
+
+    #[test]
+    fn startup_search_backfill_spawn_failure_message_preserves_lazy_mode() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+
+        let message = startup_search_backfill_spawn_failure_message(&std::io::Error::other("boom"));
+        assert!(message.contains("leaving lexical backfill lazy"));
+        assert!(!STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn deferred_worker_spawn_failure_stays_gated_and_logs_operator_message() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+        let progress = Arc::new(TuiDeferredWorkerProgress::default());
+
+        handle_tui_deferred_background_worker_spawn_failure(
+            &progress,
+            &state,
+            &std::io::Error::other("boom"),
+        );
+
+        assert!(!progress.non_db_started.load(Ordering::Acquire));
+        assert!(!progress.db_started.load(Ordering::Acquire));
+        assert!(!progress.advisory_started.load(Ordering::Acquire));
+        let logs = state.console_log_since(0);
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].1.contains("background services remain gated off"));
     }
 
     #[test]
