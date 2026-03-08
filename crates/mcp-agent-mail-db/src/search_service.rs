@@ -3055,6 +3055,57 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
     hasher.finish()
 }
 
+fn build_search_cache_key(
+    pool: &DbPool,
+    query: &SearchQuery,
+    options: &SearchOptions,
+    cache_epoch: u64,
+) -> QueryCacheKey {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let filter = query.to_search_filter();
+    let engine_mode = options
+        .search_engine
+        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+    let mode = engine_to_search_mode(engine_mode);
+    let mut discriminator_hasher = DefaultHasher::new();
+    cache_scope_discriminator(query).hash(&mut discriminator_hasher);
+    sqlite_key_for_pool(pool).hash(&mut discriminator_hasher);
+    let scope_discriminator = discriminator_hasher.finish();
+    // Cursor-based pagination: hash cursor token into offset proxy.
+    // Also fold in scope discriminator so product/project scope variants of
+    // the same query never collide in cache.
+    let offset_proxy = query.cursor.as_ref().map_or(0_usize, |c| {
+        let mut h = DefaultHasher::new();
+        c.hash(&mut h);
+        scope_discriminator.hash(&mut h);
+        // Truncation is intentional: this is a hash-based discriminator,
+        // not a precise offset. Losing high bits on 32-bit is fine.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            h.finish() as usize
+        }
+    });
+    let offset_proxy = if query.cursor.is_none() {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            scope_discriminator as usize
+        }
+    } else {
+        offset_proxy
+    };
+
+    QueryCacheKey::new(
+        &query.text,
+        mode,
+        &filter,
+        cache_epoch,
+        offset_proxy,
+        query.effective_limit(),
+    )
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Core execution
 // ────────────────────────────────────────────────────────────────────
@@ -3077,49 +3128,7 @@ pub async fn execute_search(
 
     // ── Cache lookup ──────────────────────────────────────────────────
     let cache = global_search_cache();
-    let cache_key = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let filter = query.to_search_filter();
-        let engine_mode = options
-            .search_engine
-            .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
-        let mode = engine_to_search_mode(engine_mode);
-        let mut discriminator_hasher = DefaultHasher::new();
-        cache_scope_discriminator(query).hash(&mut discriminator_hasher);
-        pool.sqlite_path().hash(&mut discriminator_hasher);
-        let scope_discriminator = discriminator_hasher.finish();
-        // Cursor-based pagination: hash cursor token into offset proxy.
-        // Also fold in scope discriminator so product/project scope variants of
-        // the same query never collide in cache.
-        let offset_proxy = query.cursor.as_ref().map_or(0_usize, |c| {
-            let mut h = DefaultHasher::new();
-            c.hash(&mut h);
-            scope_discriminator.hash(&mut h);
-            // Truncation is intentional: this is a hash-based discriminator,
-            // not a precise offset. Losing high bits on 32-bit is fine.
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                h.finish() as usize
-            }
-        });
-        let offset_proxy = if query.cursor.is_none() {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                scope_discriminator as usize
-            }
-        } else {
-            offset_proxy
-        };
-        QueryCacheKey::new(
-            &query.text,
-            mode,
-            &filter,
-            cache.current_epoch(),
-            offset_proxy,
-            query.effective_limit(),
-        )
-    };
+    let cache_key = build_search_cache_key(pool, query, options, cache.current_epoch());
 
     if let Some(cached) = cache.get(&cache_key) {
         let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -3753,6 +3762,29 @@ mod tests {
         let clone = pool.clone();
 
         assert_eq!(sqlite_key_for_pool(&pool), sqlite_key_for_pool(&clone));
+    }
+
+    #[test]
+    fn build_search_cache_key_distinguishes_memory_pools() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool_a = DbPool::new(&config).expect("pool a");
+        let pool_b = DbPool::new(&config).expect("pool b");
+        let query = SearchQuery {
+            text: "status".to_string(),
+            ..Default::default()
+        };
+        let options = SearchOptions::default();
+
+        let key_a = build_search_cache_key(&pool_a, &query, &options, 7);
+        let key_b = build_search_cache_key(&pool_b, &query, &options, 7);
+
+        assert_ne!(
+            key_a, key_b,
+            "separate in-memory pools must not share search cache entries"
+        );
     }
 
     #[test]

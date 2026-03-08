@@ -618,42 +618,116 @@ pub fn ensure_gitignore_entries(
 // TOML section merge
 // ---------------------------------------------------------------------------
 
-/// Append a TOML section if it doesn't already exist in the file.
-/// If the section header (e.g. `[mcp_servers.mcp_agent_mail]`) is already
-/// present, returns the existing content unchanged.
+/// Merge or append a TOML section, replacing keys in the target section.
 fn merge_toml_section(
     existing: Option<&str>,
     section_header: &str,
     key_values: &[(String, String)],
-) -> Result<String, SetupError> {
-    // Build the section text
-    let mut section = String::new();
-    section.push_str(section_header);
-    section.push('\n');
-    for (k, v) in key_values {
-        section.push_str(&format!("{k} = \"{v}\"\n"));
-    }
+) -> String {
+    use std::collections::HashSet;
+
+    let mut section_lines = Vec::with_capacity(key_values.len() + 1);
+    section_lines.push(section_header.to_string());
+    section_lines.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
 
     match existing {
         Some(text) if !text.trim().is_empty() => {
-            // Already has the section? Return unchanged.
-            if text.contains(section_header) {
-                return Ok(text.to_string());
+            let target_keys: HashSet<&str> = key_values.iter().map(|(k, _)| k.as_str()).collect();
+            let mut merged = Vec::new();
+            let mut in_target_section = false;
+            let mut saw_target_section = false;
+
+            for raw_line in text.lines() {
+                if let Some(section) = parse_toml_section_header(raw_line) {
+                    if in_target_section {
+                        merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
+                        in_target_section = false;
+                    }
+
+                    in_target_section = section == section_header.trim_matches(['[', ']']);
+                    saw_target_section |= in_target_section;
+                    merged.push(raw_line.to_string());
+                    continue;
+                }
+
+                if in_target_section
+                    && raw_line
+                        .split_once('=')
+                        .is_some_and(|(lhs, _)| target_keys.contains(lhs.trim()))
+                {
+                    continue;
+                }
+
+                merged.push(raw_line.to_string());
             }
-            // Append with a blank separator line.
-            let mut out = text.to_string();
-            if !out.ends_with('\n') {
+
+            if in_target_section {
+                merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
+            } else if !saw_target_section {
+                if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
+                    merged.push(String::new());
+                }
+                merged.extend(section_lines);
+            }
+
+            let mut out = merged.join("\n");
+            if text.ends_with('\n') || !out.ends_with('\n') {
                 out.push('\n');
             }
-            out.push('\n');
-            out.push_str(&section);
-            Ok(out)
+            out
         }
         _ => {
             // No existing file — create fresh.
-            Ok(section)
+            let mut section = section_lines.join("\n");
+            section.push('\n');
+            section
         }
     }
+}
+
+fn strip_toml_inline_comment(line: &str) -> &str {
+    let mut in_quote = None;
+
+    for (idx, ch) in line.char_indices() {
+        match in_quote {
+            Some('"') => {
+                if ch == '"' {
+                    in_quote = None;
+                }
+            }
+            Some('\'') => {
+                if ch == '\'' {
+                    in_quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_quote = Some(ch),
+                '#' => return line[..idx].trim_end(),
+                _ => {}
+            },
+            Some(_) => {}
+        }
+    }
+
+    line.trim_end()
+}
+
+fn parse_toml_section_header(line: &str) -> Option<&str> {
+    let line = strip_toml_inline_comment(line).trim();
+    line.strip_prefix('[')?.strip_suffix(']')
+}
+
+fn parse_toml_string_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let line = strip_toml_inline_comment(line);
+    let (lhs, rhs) = line.split_once('=')?;
+    if lhs.trim() != key {
+        return None;
+    }
+    let value = rhs.trim();
+    if let Some(value) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        return Some(value);
+    }
+    value.strip_prefix('\'')?.strip_suffix('\'')
 }
 
 // ---------------------------------------------------------------------------
@@ -669,14 +743,6 @@ fn standard_http_server_value(url: &str, token: &str) -> Value {
             "Authorization": format!("Bearer {token}")
         }
     })
-}
-
-/// Resolve the mcp-agent-mail binary path for stdio configs.
-fn which_mcp_binary() -> String {
-    // Allow override via env var; otherwise use the bare command name
-    // (Codex resolves it from PATH at runtime).
-    std::env::var("MCP_AGENT_MAIL_BIN")
-        .unwrap_or_else(|_| "mcp-agent-mail".to_string())
 }
 
 /// Helper: create a simple project-local JSON merge action.
@@ -732,14 +798,20 @@ impl AgentPlatform {
                 "Windsurf project-local MCP config",
             )],
             Self::Codex => {
-                let binary = which_mcp_binary();
+                let mut key_values = vec![("url".into(), format!("\"{url}\""))];
+                if !token.is_empty() {
+                    key_values.push((
+                        "bearer_token_env_var".into(),
+                        "\"HTTP_BEARER_TOKEN\"".into(),
+                    ));
+                }
                 vec![ConfigAction {
                     platform: self,
                     file_path: home.join(".codex").join("config.toml"),
                     description: "Codex CLI TOML config (~/.codex/config.toml)".into(),
                     content: ConfigContent::TomlSection {
                         section_header: "[mcp_servers.mcp_agent_mail]".into(),
-                        key_values: vec![("command".into(), binary)],
+                        key_values,
                     },
                     permissions: 0o600,
                     backup: true,
@@ -964,7 +1036,7 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
         ConfigContent::TomlSection {
             section_header,
             key_values,
-        } => merge_toml_section(existing.as_deref(), section_header, key_values)?,
+        } => merge_toml_section(existing.as_deref(), section_header, key_values),
     };
 
     // Check if unchanged
@@ -1142,12 +1214,32 @@ fn check_config_file(path: &Path, expected_url: &str) -> (bool, bool) {
         return (false, false);
     };
 
-    // TOML files: check for section header presence
     if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-        let has_section = content.contains("[mcp_servers.mcp_agent_mail]")
-            || content.contains("[mcp_servers.\"mcp-agent-mail\"]");
-        // For stdio TOML configs there is no URL to match; report true if present.
-        return (has_section, has_section);
+        let mut in_target_section = false;
+        let mut has_section = false;
+
+        for raw_line in content.lines() {
+            if let Some(section) = parse_toml_section_header(raw_line) {
+                in_target_section = matches!(
+                    section,
+                    "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
+                );
+                has_section |= in_target_section;
+                continue;
+            }
+
+            if !in_target_section {
+                continue;
+            }
+
+            if let Some(url) = parse_toml_string_value(raw_line, "url")
+                .or_else(|| parse_toml_string_value(raw_line, "httpUrl"))
+            {
+                return (true, urls_match_for_status(url, expected_url));
+            }
+        }
+
+        return (has_section, false);
     }
 
     let Ok(doc) = serde_json::from_str::<Value>(&content) else {
@@ -1481,6 +1573,32 @@ mod tests {
     }
 
     #[test]
+    fn config_actions_codex_uses_http_url() {
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            path: "/api/".into(),
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Codex.config_actions(&params);
+        assert_eq!(actions.len(), 1);
+        match &actions[0].content {
+            ConfigContent::TomlSection {
+                section_header,
+                key_values,
+            } => {
+                assert_eq!(section_header, "[mcp_servers.mcp_agent_mail]");
+                assert!(key_values.contains(&("url".into(), "\"http://127.0.0.1:8765/api/\"".into())));
+                assert!(key_values.contains(&(
+                    "bearer_token_env_var".into(),
+                    "\"HTTP_BEARER_TOKEN\"".into(),
+                )));
+            }
+            _ => panic!("expected TomlSection"),
+        }
+    }
+
+    #[test]
     fn config_actions_opencode_uses_mcp_key_and_remote_type() {
         let params = SetupParams {
             token: "tok".into(),
@@ -1762,6 +1880,24 @@ mod tests {
 
         let (_, wrong_url) = check_config_file(&path, "http://127.0.0.1:9999/mcp/");
         assert!(!wrong_url);
+    }
+
+    #[test]
+    fn check_config_file_detects_toml_http_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8765/api/"
+bearer_token_env_var = "HTTP_BEARER_TOKEN"
+"#,
+        )
+        .unwrap();
+
+        let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/api/");
+        assert!(has_server);
+        assert!(url_matches);
     }
 
     // ── br-3h13: Additional setup.rs test coverage ──────────────────

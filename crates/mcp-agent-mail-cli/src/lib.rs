@@ -9935,6 +9935,7 @@ fn discover_archive_git_repos(storage_root: &Path) -> Vec<PathBuf> {
 enum McpAgentMailEntryKind {
     Rust,
     Python,
+    HttpUrl,
     Unknown,
 }
 
@@ -9942,6 +9943,124 @@ fn parse_json_or_json5(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
         .or_else(|| json5::from_str::<serde_json::Value>(text).ok())
+}
+
+fn strip_toml_inline_comment(line: &str) -> &str {
+    let mut in_quote = None;
+    let mut escaped = false;
+
+    for (idx, ch) in line.char_indices() {
+        match in_quote {
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_quote = None;
+                }
+            }
+            Some('\'') => {
+                if ch == '\'' {
+                    in_quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_quote = Some(ch),
+                '#' => return line[..idx].trim_end(),
+                _ => {}
+            },
+            Some(_) => {}
+        }
+    }
+
+    line.trim_end()
+}
+
+fn parse_simple_toml_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let line = strip_toml_inline_comment(line);
+    let (lhs, rhs) = line.split_once('=')?;
+    if lhs.trim() != key {
+        return None;
+    }
+    Some(rhs.trim())
+}
+
+fn parse_simple_toml_string_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let value = parse_simple_toml_key(line, key)?;
+    if let Some(value) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        return Some(value);
+    }
+    value.strip_prefix('\'')?.strip_suffix('\'')
+}
+
+fn parse_toml_section_header(line: &str) -> Option<&str> {
+    let line = strip_toml_inline_comment(line).trim();
+    line.strip_prefix('[')?.strip_suffix(']')
+}
+
+fn classify_mcp_agent_mail_toml(content: &str, rust_binary: &Path) -> McpAgentMailEntryKind {
+    let rust_binary_str = rust_binary.to_string_lossy();
+    let mut in_target_section = false;
+    let mut saw_target_section = false;
+    let mut saw_url = false;
+
+    for raw_line in content.lines() {
+        if let Some(section) = parse_toml_section_header(raw_line) {
+            if saw_target_section {
+                break;
+            }
+            in_target_section = matches!(
+                section,
+                "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
+            );
+            saw_target_section |= in_target_section;
+            continue;
+        }
+
+        let line = raw_line.trim();
+
+        if !in_target_section || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(command) = parse_simple_toml_string_value(line, "command") {
+            let command_name = Path::new(command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(command)
+                .to_ascii_lowercase();
+            if command == rust_binary_str
+                || matches!(
+                    command_name.as_str(),
+                    "mcp-agent-mail" | "mcp-agent-mail.exe"
+                )
+            {
+                return McpAgentMailEntryKind::Rust;
+            }
+
+            let lowered = command.to_ascii_lowercase();
+            if lowered.contains("python")
+                || lowered.contains("uvx")
+                || lowered.contains("uv ")
+                || lowered.contains("mcp_agent_mail")
+            {
+                return McpAgentMailEntryKind::Python;
+            }
+        }
+
+        if parse_simple_toml_string_value(line, "url").is_some()
+            || parse_simple_toml_string_value(line, "httpUrl").is_some()
+        {
+            saw_url = true;
+        }
+    }
+
+    if saw_url {
+        McpAgentMailEntryKind::HttpUrl
+    } else {
+        McpAgentMailEntryKind::Unknown
+    }
 }
 
 fn find_mcp_agent_mail_entry(doc: &serde_json::Value) -> Option<&serde_json::Value> {
@@ -10005,6 +10124,15 @@ fn classify_mcp_agent_mail_entry(
         );
     if is_rust_command {
         return McpAgentMailEntryKind::Rust;
+    }
+
+    if entry_obj
+        .get("url")
+        .or_else(|| entry_obj.get("httpUrl"))
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        return McpAgentMailEntryKind::HttpUrl;
     }
 
     let combined = format!("{command_lower} {args_lower}");
@@ -10123,6 +10251,20 @@ fn detect_legacy_python_processes() -> Result<Vec<String>, String> {
     {
         Ok(Vec::new())
     }
+}
+
+fn classify_mcp_agent_mail_config(
+    config_path: &Path,
+    content: &str,
+    rust_binary: &Path,
+) -> Option<McpAgentMailEntryKind> {
+    if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        return Some(classify_mcp_agent_mail_toml(content, rust_binary));
+    }
+
+    let doc = parse_json_or_json5(content)?;
+    let entry = find_mcp_agent_mail_entry(&doc)?;
+    Some(classify_mcp_agent_mail_entry(entry, rust_binary))
 }
 
 fn handle_doctor_check_with(
@@ -10795,6 +10937,7 @@ fn handle_doctor_check_with(
         } else {
             let mut pointing_to_rust = 0u32;
             let mut pointing_to_python = 0u32;
+            let mut pointing_to_http_url = 0u32;
             let mut missing_entry = 0u32;
             let mut parse_errors = 0u32;
             let mut detail_parts: Vec<String> = Vec::new();
@@ -10802,16 +10945,21 @@ fn handle_doctor_check_with(
             for loc in &existing {
                 match std::fs::read_to_string(&loc.config_path) {
                     Ok(content) => {
-                        let Some(doc) = parse_json_or_json5(&content) else {
-                            parse_errors += 1;
-                            continue;
-                        };
-                        let Some(entry) = find_mcp_agent_mail_entry(&doc) else {
-                            missing_entry += 1;
+                        let Some(kind) = classify_mcp_agent_mail_config(
+                            &loc.config_path,
+                            &content,
+                            &rust_binary,
+                        ) else {
+                            if loc.config_path.extension().and_then(|e| e.to_str()) == Some("toml")
+                            {
+                                parse_errors += 1;
+                            } else {
+                                missing_entry += 1;
+                            }
                             continue;
                         };
 
-                        match classify_mcp_agent_mail_entry(entry, &rust_binary) {
+                        match kind {
                             McpAgentMailEntryKind::Rust => {
                                 pointing_to_rust += 1;
                             }
@@ -10823,10 +10971,18 @@ fn handle_doctor_check_with(
                                     loc.config_path.display()
                                 ));
                             }
+                            McpAgentMailEntryKind::HttpUrl => {
+                                pointing_to_http_url += 1;
+                                detail_parts.push(format!(
+                                    "{} ({}) → HTTP URL mode",
+                                    loc.tool.slug(),
+                                    loc.config_path.display()
+                                ));
+                            }
                             McpAgentMailEntryKind::Unknown => {
                                 missing_entry += 1;
                                 detail_parts.push(format!(
-                                    "{} ({}) → entry present but unclassified",
+                                    "{} ({}) → entry missing or unclassified",
                                     loc.tool.slug(),
                                     loc.config_path.display()
                                 ));
@@ -10839,7 +10995,7 @@ fn handle_doctor_check_with(
                 }
             }
 
-            let mcp_status = if pointing_to_python > 0 {
+            let mcp_status = if pointing_to_python > 0 || pointing_to_http_url > 0 {
                 "warn"
             } else if pointing_to_rust > 0 {
                 "ok"
@@ -10848,17 +11004,18 @@ fn handle_doctor_check_with(
             };
 
             let summary = format!(
-                "{} config(s) found: {} Rust, {} Python, {} no entry, {} unreadable",
+                "{} config(s) found: {} Rust, {} Python, {} HTTP URL, {} no entry, {} unreadable",
                 existing.len(),
                 pointing_to_rust,
                 pointing_to_python,
+                pointing_to_http_url,
                 missing_entry,
                 parse_errors
             );
 
-            let detail = if pointing_to_python > 0 {
+            let detail = if pointing_to_python > 0 || pointing_to_http_url > 0 {
                 format!(
-                    "{}. Fix: run `am setup` to update: {}",
+                    "{}. Fix: run `am setup` or `am doctor fix` to update: {}",
                     summary,
                     detail_parts.join(", ")
                 )
@@ -11228,13 +11385,31 @@ fn fix_path_order(home: &Path) -> Result<String, String> {
 fn fix_mcp_config_entry(config_path: &Path, rust_binary: &Path) -> Result<String, String> {
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+    let backup_path = backup_path_for_mcp_config(config_path);
+    let rust_binary_str = rust_binary.to_string_lossy().to_string();
+
+    if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        let fixed = fix_mcp_config_toml_text(&content, &rust_binary_str).ok_or_else(|| {
+            format!(
+                "No mcp-agent-mail TOML section found in {}",
+                config_path.display()
+            )
+        })?;
+        std::fs::copy(config_path, &backup_path).map_err(|e| format!("backup failed: {e}"))?;
+        std::fs::write(config_path, fixed).map_err(|e| format!("write failed: {e}"))?;
+        return Ok(format!(
+            "Updated {} (backup: {})",
+            config_path.display(),
+            backup_path.display()
+        ));
+    }
+
     let mut doc: serde_json::Value = serde_json::from_str(&content)
         .or_else(|_| json5::from_str(&content))
         .map_err(|e| format!("cannot parse {}: {e}", config_path.display()))?;
 
     let container_keys = ["mcpServers", "servers", "mcp", "mcp_servers"];
     let entry_keys = ["mcp-agent-mail", "agent-mail"];
-    let rust_binary_str = rust_binary.to_string_lossy().to_string();
 
     let mut updated = false;
     for ck in &container_keys {
@@ -11274,7 +11449,6 @@ fn fix_mcp_config_entry(config_path: &Path, rust_binary: &Path) -> Result<String
     }
 
     // Write back with pretty formatting, preserving backup.
-    let backup_path = config_path.with_extension("json.bak");
     std::fs::copy(config_path, &backup_path).map_err(|e| format!("backup failed: {e}"))?;
     let formatted =
         serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize failed: {e}"))?;
@@ -11285,6 +11459,85 @@ fn fix_mcp_config_entry(config_path: &Path, rust_binary: &Path) -> Result<String
         config_path.display(),
         backup_path.display()
     ))
+}
+
+fn backup_path_for_mcp_config(config_path: &Path) -> PathBuf {
+    let ext = config_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bak");
+    config_path.with_extension(format!("{ext}.bak"))
+}
+
+fn fix_mcp_config_toml_text(content: &str, rust_binary: &str) -> Option<String> {
+    let mut output = Vec::new();
+    let mut in_target_section = false;
+    let mut saw_target_section = false;
+    let mut saw_command_in_section = false;
+    let mut replaced_section = false;
+
+    for raw_line in content.lines() {
+        if let Some(section) = parse_toml_section_header(raw_line) {
+            if in_target_section {
+                if !saw_command_in_section {
+                    output.push(format!("command = \"{rust_binary}\""));
+                    replaced_section = true;
+                }
+                in_target_section = false;
+            }
+
+            let is_target = matches!(
+                section,
+                "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
+            );
+            if is_target {
+                saw_target_section = true;
+                in_target_section = true;
+                saw_command_in_section = false;
+                output.push(raw_line.to_string());
+                continue;
+            }
+        }
+
+        if !in_target_section {
+            output.push(raw_line.to_string());
+            continue;
+        }
+
+        if parse_simple_toml_key(raw_line, "url").is_some()
+            || parse_simple_toml_key(raw_line, "httpUrl").is_some()
+            || parse_simple_toml_key(raw_line, "args").is_some()
+        {
+            replaced_section = true;
+            continue;
+        }
+
+        if parse_simple_toml_key(raw_line, "command").is_some() {
+            output.push(format!("command = \"{rust_binary}\""));
+            saw_command_in_section = true;
+            replaced_section = true;
+            continue;
+        }
+
+        output.push(raw_line.to_string());
+    }
+
+    if in_target_section {
+        if !saw_command_in_section {
+            output.push(format!("command = \"{rust_binary}\""));
+        }
+        replaced_section = true;
+    }
+
+    if !saw_target_section || !replaced_section {
+        return None;
+    }
+
+    let mut fixed = output.join("\n");
+    if content.ends_with('\n') {
+        fixed.push('\n');
+    }
+    Some(fixed)
 }
 
 fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
@@ -11444,20 +11697,22 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
 
         let locations = detect_mcp_config_locations_default();
         let existing: Vec<_> = locations.iter().filter(|l| l.exists).collect();
-        let mut any_python = false;
+        let mut any_fixable = false;
 
         for loc in &existing {
             let Ok(content) = std::fs::read_to_string(&loc.config_path) else {
                 continue;
             };
-            let Some(doc) = parse_json_or_json5(&content) else {
+            let Some(kind) =
+                classify_mcp_agent_mail_config(&loc.config_path, &content, &rust_binary)
+            else {
                 continue;
             };
-            let Some(entry) = find_mcp_agent_mail_entry(&doc) else {
-                continue;
-            };
-            if classify_mcp_agent_mail_entry(entry, &rust_binary) == McpAgentMailEntryKind::Python {
-                any_python = true;
+            if matches!(
+                kind,
+                McpAgentMailEntryKind::Python | McpAgentMailEntryKind::HttpUrl
+            ) {
+                any_fixable = true;
                 if dry_run {
                     ftui_runtime::ftui_eprintln!(
                         "[dry-run] {mode_label}: update {} to point to Rust binary",
@@ -11493,11 +11748,11 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                 }
             }
         }
-        if !any_python {
+        if !any_fixable {
             results.push(serde_json::json!({
                 "check": "mcp_config",
                 "action": "skip",
-                "detail": "No Python-pointing MCP configs found",
+                "detail": "No Python- or HTTP-URL-pointing MCP configs found",
             }));
             skipped_count += 1;
         }
@@ -14143,6 +14398,73 @@ mod tests {
         let kind =
             classify_mcp_agent_mail_entry(entry, Path::new("/home/test/.local/bin/mcp-agent-mail"));
         assert_eq!(kind, McpAgentMailEntryKind::Python);
+    }
+
+    #[test]
+    fn classify_mcp_agent_mail_entry_detects_http_url_mode() {
+        let doc = parse_json_or_json5(
+            r#"{
+                "mcpServers": {
+                    "mcp-agent-mail": {
+                        "url": "http://127.0.0.1:8765/api/"
+                    }
+                }
+            }"#,
+        )
+        .expect("valid config");
+        let entry = find_mcp_agent_mail_entry(&doc).expect("entry present");
+        let kind =
+            classify_mcp_agent_mail_entry(entry, Path::new("/home/test/.local/bin/mcp-agent-mail"));
+        assert_eq!(kind, McpAgentMailEntryKind::HttpUrl);
+    }
+
+    #[test]
+    fn classify_mcp_agent_mail_toml_detects_http_url_mode() {
+        let content = r#"
+[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8765/api/"
+"#;
+        let kind = classify_mcp_agent_mail_toml(
+            content,
+            Path::new("/home/test/.local/bin/mcp-agent-mail"),
+        );
+        assert_eq!(kind, McpAgentMailEntryKind::HttpUrl);
+    }
+
+    #[test]
+    fn classify_mcp_agent_mail_toml_handles_inline_comments_and_single_quotes() {
+        let content = r#"
+[mcp_servers.mcp_agent_mail]
+command = 'mcp-agent-mail' # preferred local binary
+"#;
+        let kind = classify_mcp_agent_mail_toml(
+            content,
+            Path::new("/home/test/.local/bin/mcp-agent-mail"),
+        );
+        assert_eq!(kind, McpAgentMailEntryKind::Rust);
+    }
+
+    #[test]
+    fn classify_mcp_agent_mail_toml_accepts_section_header_comments() {
+        let content = r#"
+[mcp_servers.mcp_agent_mail] # local override
+command = "mcp-agent-mail"
+"#;
+        let kind = classify_mcp_agent_mail_toml(
+            content,
+            Path::new("/home/test/.local/bin/mcp-agent-mail"),
+        );
+        assert_eq!(kind, McpAgentMailEntryKind::Rust);
+    }
+
+    #[test]
+    fn classify_mcp_agent_mail_config_toml_without_entry_returns_unknown() {
+        let kind = classify_mcp_agent_mail_config(
+            Path::new("/tmp/config.toml"),
+            "[mcp_servers.other]\ncommand = \"node\"\n",
+            Path::new("/home/test/.local/bin/mcp-agent-mail"),
+        );
+        assert_eq!(kind, Some(McpAgentMailEntryKind::Unknown));
     }
 
     #[test]
@@ -18732,6 +19054,79 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_updates_toml_url_to_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let rust_bin = dir.path().join("mcp-agent-mail");
+        std::fs::write(
+            &config,
+            r#"[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8765/api/"
+"#,
+        )
+        .unwrap();
+
+        let result = fix_mcp_config_entry(&config, &rust_bin);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(config.with_extension("toml.bak").exists());
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(content.contains("[mcp_servers.mcp_agent_mail]"));
+        assert!(content.contains(&format!("command = \"{}\"", rust_bin.display())));
+        assert!(!content.contains("url = "));
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_preserves_toml_metadata_while_rewriting_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let rust_bin = dir.path().join("mcp-agent-mail");
+        std::fs::write(
+            &config,
+            r#"[mcp_servers.mcp_agent_mail]
+# Keep this token for local runs.
+url = "http://127.0.0.1:8765/api/"
+env = { HTTP_BEARER_TOKEN = "tok123" }
+cwd = "/tmp/mail"
+
+[mcp_servers.other]
+command = "node"
+"#,
+        )
+        .unwrap();
+
+        let result = fix_mcp_config_entry(&config, &rust_bin);
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(content.contains("# Keep this token for local runs."));
+        assert!(content.contains("env = { HTTP_BEARER_TOKEN = \"tok123\" }"));
+        assert!(content.contains("cwd = \"/tmp/mail\""));
+        assert!(content.contains("[mcp_servers.other]"));
+        assert!(content.contains(&format!("command = \"{}\"", rust_bin.display())));
+        assert!(!content.contains("url = "));
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_accepts_toml_section_header_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let rust_bin = dir.path().join("mcp-agent-mail");
+        std::fs::write(
+            &config,
+            r#"[mcp_servers.mcp_agent_mail] # local override
+url = "http://127.0.0.1:8765/api/"
+"#,
+        )
+        .unwrap();
+
+        let result = fix_mcp_config_entry(&config, &rust_bin);
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(content.contains("[mcp_servers.mcp_agent_mail] # local override"));
+        assert!(content.contains(&format!("command = \"{}\"", rust_bin.display())));
+        assert!(!content.contains("url = "));
     }
 
     #[test]

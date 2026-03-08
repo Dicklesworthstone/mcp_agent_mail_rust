@@ -1095,7 +1095,7 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
 /// Read active file reservations from the archive's `file_reservations/` directory.
 ///
 /// Parses each `*.json` file and returns records that are:
-/// - Not released (`released_ts` is null)
+/// - Not released (`released_ts` is null or a legacy zero-like value)
 /// - Not expired (`expires_ts > now`; at exact boundary reservation is expired)
 /// - Exclusive
 fn read_active_reservations_from_archive(
@@ -1128,8 +1128,10 @@ fn read_active_reservations_from_archive(
             Err(_) => continue, // Skip invalid JSON
         };
 
-        // Skip released reservations
-        if !val["released_ts"].is_null() {
+        // Skip released reservations.
+        // Older archive artifacts sometimes persisted zero-like sentinels for
+        // still-active reservations, and the DB layer still treats those as active.
+        if released_ts_marks_record_released(&val["released_ts"]) {
             continue;
         }
 
@@ -1165,6 +1167,33 @@ fn read_active_reservations_from_archive(
     }
 
     Ok(records)
+}
+
+fn released_ts_marks_record_released(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Number(number) => number.as_f64().is_none_or(|value| value > 0.0),
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("null")
+                || trimmed.eq_ignore_ascii_case("none")
+                || trimmed == "0"
+            {
+                return false;
+            }
+
+            if trimmed
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-'))
+            {
+                return trimmed.parse::<f64>().map_or(true, |value| value > 0.0);
+            }
+
+            true
+        }
+        _ => true,
+    }
 }
 
 /// Check if a timestamp string is expired relative to `now`.
@@ -1829,6 +1858,75 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = td.path().join("empty_archive");
         // No file_reservations dir at all
+        let records = read_active_reservations_from_archive(&archive).expect("read");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn read_reservations_keeps_legacy_zero_like_released_ts_values_active() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&dir).expect("create file_reservations");
+
+        let released_values = [
+            serde_json::json!(0),
+            serde_json::json!("0"),
+            serde_json::json!(""),
+            serde_json::json!("null"),
+            serde_json::json!("none"),
+            serde_json::json!(-1),
+        ];
+
+        for (index, released_ts) in released_values.into_iter().enumerate() {
+            let payload = serde_json::json!({
+                "path_pattern": format!("legacy/{index}/*"),
+                "agent_name": format!("Legacy{index}"),
+                "exclusive": true,
+                "expires_ts": "2099-01-01T00:00:00Z",
+                "released_ts": released_ts,
+            });
+            let path = dir.join(format!("legacy-{index}.json"));
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&payload).expect("serialize"),
+            )
+            .expect("write reservation");
+        }
+
+        let records = read_active_reservations_from_archive(&archive).expect("read");
+        assert_eq!(records.len(), 6);
+        for index in 0..6 {
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.path_pattern == format!("legacy/{index}/*")),
+                "missing legacy reservation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_reservations_skips_positive_numeric_released_ts() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&dir).expect("create file_reservations");
+
+        let payload = serde_json::json!({
+            "path_pattern": "released/*",
+            "agent_name": "ReleasedAgent",
+            "exclusive": true,
+            "expires_ts": "2099-01-01T00:00:00Z",
+            "released_ts": 42,
+        });
+        let path = dir.join("released.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&payload).expect("serialize"),
+        )
+        .expect("write reservation");
+
         let records = read_active_reservations_from_archive(&archive).expect("read");
         assert!(records.is_empty());
     }

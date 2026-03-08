@@ -271,10 +271,11 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
         "openai" | "gpt" => {
             let key = get_env_var("OPENAI_API_KEY")
                 .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            let api_model = strip_provider_prefix(model, &["openai", "gpt"]);
             Ok((
                 "https://api.openai.com/v1/chat/completions".to_string(),
                 format!("Bearer {key}"),
-                model.to_string(),
+                api_model.to_string(),
             ))
         }
         "anthropic" | "claude" => {
@@ -282,20 +283,22 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
                 .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
             // Anthropic uses a different header, but litellm-compatible endpoints
             // accept Bearer too
+            let api_model = strip_provider_prefix(model, &["anthropic", "claude"]);
             Ok((
                 "https://api.anthropic.com/v1/messages".to_string(),
                 format!("Bearer {key}"),
-                model.to_string(),
+                api_model.to_string(),
             ))
         }
         "google" | "gemini" => {
             let key = get_env_var("GOOGLE_API_KEY")
                 .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            let api_model = strip_provider_prefix(model, &["google", "gemini"]);
             Ok((
                 "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
                     .to_string(),
                 format!("Bearer {key}"),
-                model.to_string(),
+                api_model.to_string(),
             ))
         }
         "groq" => {
@@ -362,6 +365,17 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
             ))
         }
     }
+}
+
+fn strip_provider_prefix<'a>(model: &'a str, providers: &[&str]) -> &'a str {
+    for provider in providers {
+        if let Some(stripped) = model.strip_prefix(provider) {
+            if let Some(stripped) = stripped.strip_prefix(['/', ':']) {
+                return stripped;
+            }
+        }
+    }
+    model
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1082,53 @@ mod tests {
             choose_best_available_model("openrouter/meta-llama/llama-3.1-8b-instruct"),
             "openrouter/meta-llama/llama-3.1-8b-instruct"
         );
+    }
+
+    #[test]
+    fn strip_provider_prefix_handles_slash_and_colon_variants() {
+        assert_eq!(
+            strip_provider_prefix("openai/gpt-4o-mini", &["openai", "gpt"]),
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            strip_provider_prefix(
+                "anthropic:claude-3-haiku-20240307",
+                &["anthropic", "claude"]
+            ),
+            "claude-3-haiku-20240307"
+        );
+        assert_eq!(
+            strip_provider_prefix("gemini:gemini-1.5-flash", &["google", "gemini"]),
+            "gemini-1.5-flash"
+        );
+        assert_eq!(
+            strip_provider_prefix("gpt-4o-mini", &["openai", "gpt"]),
+            "gpt-4o-mini"
+        );
+    }
+
+    #[test]
+    fn resolve_api_endpoint_strips_provider_prefix_for_direct_providers() {
+        let mut env = bridged_env().lock();
+        env.insert("OPENAI_API_KEY".to_string(), "test-openai".to_string());
+        env.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            "test-anthropic".to_string(),
+        );
+        env.insert("GOOGLE_API_KEY".to_string(), "test-google".to_string());
+        drop(env);
+
+        let (_, _, openai_model) =
+            resolve_api_endpoint("openai/gpt-4o-mini").expect("openai endpoint");
+        assert_eq!(openai_model, "gpt-4o-mini");
+
+        let (_, _, anthropic_model) =
+            resolve_api_endpoint("anthropic/claude-3-haiku-20240307").expect("anthropic endpoint");
+        assert_eq!(anthropic_model, "claude-3-haiku-20240307");
+
+        let (_, _, google_model) =
+            resolve_api_endpoint("gemini:gemini-1.5-flash").expect("google endpoint");
+        assert_eq!(google_model, "gemini-1.5-flash");
     }
 
     // -- merge tests --

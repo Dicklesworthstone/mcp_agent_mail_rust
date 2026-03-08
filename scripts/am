@@ -73,65 +73,90 @@ sync_toml_mcp_url() {
   local desired_url="$2"
   local create_if_missing="${3:-0}"
   local tmp_file="${config_file}.am-sync.$$"
+  local bearer_env_var="HTTP_BEARER_TOKEN"
 
   if [[ ! -f "$config_file" ]]; then
+    if [[ "$create_if_missing" -ne 1 ]]; then
+      return 0
+    fi
+    mkdir -p "$(dirname "$config_file")" 2>/dev/null || true
+    cat > "$config_file" <<EOF
+[mcp_servers.mcp_agent_mail]
+url = "${desired_url}"
+bearer_token_env_var = "${bearer_env_var}"
+EOF
+    echo "am: synced MCP URL to ${desired_url} (${config_file})." >&2
     return 0
   fi
 
-  # If the section already has a `command = ...` entry (stdio transport),
-  # injecting `url = ...` would corrupt a working config. Skip entirely.
-  if awk '
-    BEGIN { in_section = 0; found = 0 }
-    /^\[mcp_servers\.mcp_agent_mail\]/ || /^\[mcp_servers\."mcp-agent-mail"\]/ { in_section = 1; next }
-    /^\[/ { in_section = 0 }
-    in_section && /^[[:space:]]*command[[:space:]]*=/ { found = 1 }
-    END { exit (found ? 0 : 1) }
-  ' "$config_file" 2>/dev/null; then
-    return 0
-  fi
-
-  awk -v desired_url="$desired_url" -v create_if_missing="$create_if_missing" '
+  awk -v desired_url="$desired_url" -v bearer_env_var="$bearer_env_var" -v create_if_missing="$create_if_missing" '
     BEGIN {
       in_section = 0
       saw_section = 0
       saw_url_in_section = 0
+      saw_bearer_env_var_in_section = 0
     }
 
     /^\[mcp_servers\.mcp_agent_mail\][[:space:]]*$/ || /^\[mcp_servers\."mcp-agent-mail"\][[:space:]]*$/ {
-      if (in_section && !saw_url_in_section) {
-        print "url = \"" desired_url "\""
+      if (in_section) {
+        if (!saw_url_in_section) {
+          print "url = \"" desired_url "\""
+        }
+        if (!saw_bearer_env_var_in_section) {
+          print "bearer_token_env_var = \"" bearer_env_var "\""
+        }
       }
       in_section = 1
       saw_section = 1
       saw_url_in_section = 0
+      saw_bearer_env_var_in_section = 0
       print
       next
     }
 
     /^\[/ {
-      if (in_section && !saw_url_in_section) {
-        print "url = \"" desired_url "\""
+      if (in_section) {
+        if (!saw_url_in_section) {
+          print "url = \"" desired_url "\""
+        }
+        if (!saw_bearer_env_var_in_section) {
+          print "bearer_token_env_var = \"" bearer_env_var "\""
+        }
       }
       in_section = 0
     }
 
     {
-      if (in_section && $0 ~ /^[[:space:]]*url[[:space:]]*=/) {
+      if (in_section && $0 ~ /^[[:space:]]*(url|httpUrl)[[:space:]]*=/) {
         print "url = \"" desired_url "\""
         saw_url_in_section = 1
+        next
+      }
+      if (in_section && $0 ~ /^[[:space:]]*bearer_token_env_var[[:space:]]*=/) {
+        print "bearer_token_env_var = \"" bearer_env_var "\""
+        saw_bearer_env_var_in_section = 1
+        next
+      }
+      if (in_section && $0 ~ /^[[:space:]]*(command|args)[[:space:]]*=/) {
         next
       }
       print
     }
 
     END {
-      if (in_section && !saw_url_in_section) {
-        print "url = \"" desired_url "\""
+      if (in_section) {
+        if (!saw_url_in_section) {
+          print "url = \"" desired_url "\""
+        }
+        if (!saw_bearer_env_var_in_section) {
+          print "bearer_token_env_var = \"" bearer_env_var "\""
+        }
       }
       if (!saw_section && create_if_missing == 1) {
         print ""
         print "[mcp_servers.mcp_agent_mail]"
         print "url = \"" desired_url "\""
+        print "bearer_token_env_var = \"" bearer_env_var "\""
       }
     }
   ' "$config_file" > "$tmp_file"
@@ -227,10 +252,6 @@ sync_path_mcp_url() {
   local config_file="$1"
   local desired_url="$2"
   local create_if_missing="${3:-0}"
-
-  if [[ ! -f "$config_file" ]]; then
-    return 0
-  fi
 
   case "$config_file" in
     *.toml) sync_toml_mcp_url "$config_file" "$desired_url" "$create_if_missing" ;;

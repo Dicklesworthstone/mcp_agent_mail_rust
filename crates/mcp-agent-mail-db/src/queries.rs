@@ -25,6 +25,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
+fn cache_scope_for_pool(pool: &DbPool) -> String {
+    pool.sqlite_identity_key()
+}
+
 // =============================================================================
 // Tracked query wrappers
 // =============================================================================
@@ -1023,7 +1027,11 @@ async fn cleanup_committed_agent_after_consistency_failure(
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     drop(conn);
 
-    crate::cache::read_cache().invalidate_agent_scoped(pool.sqlite_path(), project_id, agent_name);
+    crate::cache::read_cache().invalidate_agent_scoped(
+        &cache_scope_for_pool(pool),
+        project_id,
+        agent_name,
+    );
     Outcome::Ok(())
 }
 
@@ -1135,9 +1143,9 @@ async fn cleanup_committed_message_after_consistency_failure(
     drop(conn);
 
     let cache = crate::cache::read_cache();
-    let cache_scope = pool.sqlite_path();
+    let cache_scope = cache_scope_for_pool(pool);
     for agent_id in affected_agent_ids {
-        cache.invalidate_inbox_stats_scoped(cache_scope, agent_id);
+        cache.invalidate_inbox_stats_scoped(&cache_scope, agent_id);
     }
     Outcome::Ok(())
 }
@@ -1219,9 +1227,10 @@ pub async fn ensure_project(
     }
 
     let slug = generate_slug(human_key);
+    let cache_scope = cache_scope_for_pool(pool);
 
     // Fast path: check cache first
-    if let Some(cached) = crate::cache::read_cache().get_project(&slug) {
+    if let Some(cached) = crate::cache::read_cache().get_project_scoped(&cache_scope, &slug) {
         return Outcome::Ok(cached);
     }
 
@@ -1243,7 +1252,7 @@ pub async fn ensure_project(
             if let Some(r) = rows.first() {
                 match decode_project_row(r) {
                     Ok(row) => {
-                        crate::cache::read_cache().put_project(&row);
+                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
                         return Outcome::Ok(row);
                     }
                     Err(e) => return Outcome::Err(e),
@@ -1293,7 +1302,7 @@ pub async fn ensure_project(
     };
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    crate::cache::read_cache().put_project(&fresh);
+    crate::cache::read_cache().put_project_scoped(&cache_scope, &fresh);
     Outcome::Ok(fresh)
 }
 
@@ -1303,7 +1312,8 @@ pub async fn get_project_by_slug(
     pool: &DbPool,
     slug: &str,
 ) -> Outcome<ProjectRow, DbError> {
-    if let Some(cached) = crate::cache::read_cache().get_project(slug) {
+    let cache_scope = cache_scope_for_pool(pool);
+    if let Some(cached) = crate::cache::read_cache().get_project_scoped(&cache_scope, slug) {
         return Outcome::Ok(cached);
     }
 
@@ -1324,7 +1334,7 @@ pub async fn get_project_by_slug(
             || Outcome::Err(DbError::not_found("Project", slug)),
             |r| match decode_project_row(r) {
                 Ok(row) => {
-                    crate::cache::read_cache().put_project(&row);
+                    crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
                     Outcome::Ok(row)
                 }
                 Err(e) => Outcome::Err(e),
@@ -1342,7 +1352,10 @@ pub async fn get_project_by_human_key(
     pool: &DbPool,
     human_key: &str,
 ) -> Outcome<ProjectRow, DbError> {
-    if let Some(cached) = crate::cache::read_cache().get_project_by_human_key(human_key) {
+    let cache_scope = cache_scope_for_pool(pool);
+    if let Some(cached) =
+        crate::cache::read_cache().get_project_by_human_key_scoped(&cache_scope, human_key)
+    {
         return Outcome::Ok(cached);
     }
 
@@ -1363,7 +1376,7 @@ pub async fn get_project_by_human_key(
             || Outcome::Err(DbError::not_found("Project", human_key)),
             |r| match decode_project_row(r) {
                 Ok(row) => {
-                    crate::cache::read_cache().put_project(&row);
+                    crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
                     Outcome::Ok(row)
                 }
                 Err(e) => Outcome::Err(e),
@@ -1633,7 +1646,7 @@ pub async fn register_agent(
         );
     }
 
-    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &final_agent);
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &final_agent);
     Outcome::Ok(final_agent)
 }
 
@@ -1818,7 +1831,7 @@ pub async fn create_agent(
         );
     }
 
-    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &final_agent);
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &final_agent);
     Outcome::Ok(final_agent)
 }
 
@@ -1830,7 +1843,7 @@ pub async fn get_agent(
     name: &str,
 ) -> Outcome<AgentRow, DbError> {
     if let Some(cached) =
-        crate::cache::read_cache().get_agent_scoped(pool.sqlite_path(), project_id, name)
+        crate::cache::read_cache().get_agent_scoped(&cache_scope_for_pool(pool), project_id, name)
     {
         return Outcome::Ok(cached);
     }
@@ -1856,7 +1869,7 @@ pub async fn get_agent(
             || Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}"))),
             |row| {
                 let agent = decode_agent_row_indexed(row);
-                crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &agent);
+                crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
                 Outcome::Ok(agent)
             },
         ),
@@ -1869,7 +1882,7 @@ pub async fn get_agent(
 /// Get agent by id (cache-first).
 pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<AgentRow, DbError> {
     if let Some(cached) =
-        crate::cache::read_cache().get_agent_by_id_scoped(pool.sqlite_path(), agent_id)
+        crate::cache::read_cache().get_agent_by_id_scoped(&cache_scope_for_pool(pool), agent_id)
     {
         return Outcome::Ok(cached);
     }
@@ -1894,7 +1907,7 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
             || Outcome::Err(DbError::not_found("Agent", agent_id.to_string())),
             |row| {
                 let agent = decode_agent_row_indexed(row);
-                crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &agent);
+                crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
                 Outcome::Ok(agent)
             },
         ),
@@ -1962,8 +1975,9 @@ pub async fn get_agents_by_ids(
     let mut missing_ids = Vec::with_capacity(agent_ids.len());
 
     let cache = crate::cache::read_cache();
+    let cache_scope = cache_scope_for_pool(pool);
     for id in agent_ids {
-        if let Some(cached) = cache.get_agent_by_id_scoped(pool.sqlite_path(), *id) {
+        if let Some(cached) = cache.get_agent_by_id_scoped(&cache_scope, *id) {
             out.push(cached);
         } else {
             missing_ids.push(*id);
@@ -2000,7 +2014,7 @@ pub async fn get_agents_by_ids(
             Outcome::Ok(rows) => {
                 for row in rows {
                     let agent = decode_agent_row_indexed(&row);
-                    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &agent);
+                    crate::cache::read_cache().put_agent_scoped(&cache_scope, &agent);
                     out.push(agent);
                 }
             }
@@ -2020,7 +2034,8 @@ pub async fn get_agents_by_ids(
 /// round-trip on every single tool invocation.
 pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<(), DbError> {
     let now = now_micros();
-    let should_flush = crate::cache::read_cache().enqueue_touch(agent_id, now);
+    let cache_scope = cache_scope_for_pool(pool);
+    let should_flush = crate::cache::read_cache().enqueue_touch_scoped(&cache_scope, agent_id, now);
 
     if should_flush {
         flush_deferred_touches(cx, pool).await
@@ -2033,10 +2048,11 @@ pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<(), D
 /// Call this on server shutdown or when precise `last_active_ts` is needed.
 pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
     let read_cache = crate::cache::read_cache();
+    let cache_scope = cache_scope_for_pool(pool);
     if !read_cache.has_pending_touches() {
         return Outcome::Ok(());
     }
-    let pending = read_cache.drain_touches();
+    let pending = read_cache.drain_touches_scoped(&cache_scope);
     if pending.is_empty() {
         return Outcome::Ok(());
     }
@@ -2044,15 +2060,15 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => {
-            re_enqueue_touches(&pending);
+            re_enqueue_touches(&cache_scope, &pending);
             return Outcome::Err(e);
         }
         Outcome::Cancelled(r) => {
-            re_enqueue_touches(&pending);
+            re_enqueue_touches(&cache_scope, &pending);
             return Outcome::Cancelled(r);
         }
         Outcome::Panicked(p) => {
-            re_enqueue_touches(&pending);
+            re_enqueue_touches(&cache_scope, &pending);
             return Outcome::Panicked(p);
         }
     };
@@ -2063,7 +2079,7 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
     match begin_concurrent_tx(cx, &tracked).await {
         Outcome::Ok(()) => {}
         other => {
-            re_enqueue_touches(&pending);
+            re_enqueue_touches(&cache_scope, &pending);
             return match other {
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -2099,17 +2115,17 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
             Outcome::Ok(_) => {}
             Outcome::Err(e) => {
                 let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-                re_enqueue_touches(&pending);
+                re_enqueue_touches(&cache_scope, &pending);
                 return Outcome::Err(e);
             }
             Outcome::Cancelled(r) => {
                 let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-                re_enqueue_touches(&pending);
+                re_enqueue_touches(&cache_scope, &pending);
                 return Outcome::Cancelled(r);
             }
             Outcome::Panicked(p) => {
                 let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-                re_enqueue_touches(&pending);
+                re_enqueue_touches(&cache_scope, &pending);
                 return Outcome::Panicked(p);
             }
         }
@@ -2119,27 +2135,27 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
         Outcome::Ok(_) => Outcome::Ok(()),
         Outcome::Err(e) => {
             let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-            re_enqueue_touches(&pending);
+            re_enqueue_touches(&cache_scope, &pending);
             Outcome::Err(e)
         }
         Outcome::Cancelled(r) => {
             let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-            re_enqueue_touches(&pending);
+            re_enqueue_touches(&cache_scope, &pending);
             Outcome::Cancelled(r)
         }
         Outcome::Panicked(p) => {
             let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-            re_enqueue_touches(&pending);
+            re_enqueue_touches(&cache_scope, &pending);
             Outcome::Panicked(p)
         }
     }
 }
 
 /// Re-enqueue touches that failed to flush, so they aren't lost.
-fn re_enqueue_touches(pending: &std::collections::HashMap<i64, i64>) {
+fn re_enqueue_touches(scope: &str, pending: &std::collections::HashMap<i64, i64>) {
     let cache = crate::cache::read_cache();
     for (&agent_id, &ts) in pending {
-        cache.enqueue_touch(agent_id, ts);
+        cache.enqueue_touch_scoped(scope, agent_id, ts);
     }
 }
 
@@ -2190,7 +2206,7 @@ pub async fn set_agent_contact_policy(
     };
     let agent = decode_agent_row_indexed(row);
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &agent);
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
     Outcome::Ok(agent)
 }
 
@@ -2278,7 +2294,7 @@ pub async fn set_agent_contact_policy_by_name(
         )));
     };
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &agent);
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
     Outcome::Ok(agent)
 }
 
@@ -2690,9 +2706,9 @@ pub async fn create_message_with_recipients(
 
     // Invalidate cached inbox stats for all recipients.
     let cache = crate::cache::read_cache();
-    let cache_scope = pool.sqlite_path();
+    let cache_scope = cache_scope_for_pool(pool);
     for agent_id in &recipient_agent_ids {
-        cache.invalidate_inbox_stats_scoped(cache_scope, *agent_id);
+        cache.invalidate_inbox_stats_scoped(&cache_scope, *agent_id);
     }
     Outcome::Ok(row)
 }
@@ -4468,7 +4484,7 @@ pub async fn mark_message_read(
     );
 
     // Invalidate cached inbox stats (unread_count may have changed).
-    crate::cache::read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
+    crate::cache::read_cache().invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
     // Read back the actual stored timestamp (may differ from `now` on
     // idempotent calls where COALESCE preserved the original value).
@@ -4548,7 +4564,7 @@ pub async fn mark_all_messages_read_in_project(
         map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
     );
 
-    crate::cache::read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
+    crate::cache::read_cache().invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
@@ -4596,7 +4612,7 @@ pub async fn acknowledge_message(
     );
 
     // Invalidate cached inbox stats (ack_pending_count may have changed).
-    crate::cache::read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
+    crate::cache::read_cache().invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
     // Read back the actual stored timestamps (may differ from `now` on
     // idempotent calls where COALESCE preserved the original values).
@@ -4668,8 +4684,9 @@ pub async fn get_inbox_stats(
     agent_id: i64,
 ) -> Outcome<Option<InboxStatsRow>, DbError> {
     // Check cache first (30s TTL).
-    let cache_scope = pool.sqlite_path();
-    if let Some(cached) = crate::cache::read_cache().get_inbox_stats_scoped(cache_scope, agent_id) {
+    let cache_scope = cache_scope_for_pool(pool);
+    if let Some(cached) = crate::cache::read_cache().get_inbox_stats_scoped(&cache_scope, agent_id)
+    {
         return Outcome::Ok(Some(cached));
     }
 
@@ -4716,7 +4733,7 @@ pub async fn get_inbox_stats(
                     },
                 };
                 // Populate cache for next lookup.
-                crate::cache::read_cache().put_inbox_stats_scoped(cache_scope, &stats);
+                crate::cache::read_cache().put_inbox_stats_scoped(&cache_scope, &stats);
                 Outcome::Ok(Some(stats))
             }
         }
@@ -6824,7 +6841,7 @@ pub async fn insert_system_agent(
     };
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    crate::cache::read_cache().put_agent_scoped(pool.sqlite_path(), &found);
+    crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &found);
     Outcome::Ok(found)
 }
 
@@ -6835,6 +6852,123 @@ pub async fn insert_system_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn set_agent_last_active_for_test(cx: &Cx, pool: &DbPool, agent_id: i64, ts: i64) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                "UPDATE agents SET last_active_ts = ? WHERE id = ?",
+                &[Value::BigInt(ts), Value::BigInt(agent_id)],
+            )
+            .await,
+        )
+        .into_result()
+        .expect("update last_active_ts");
+    }
+
+    async fn read_agent_last_active_for_test(cx: &Cx, pool: &DbPool, agent_id: i64) -> i64 {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        let rows = map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT last_active_ts FROM agents WHERE id = ?",
+                &[Value::BigInt(agent_id)],
+            )
+            .await,
+        )
+        .into_result()
+        .expect("query last_active_ts");
+        let row = rows.first().expect("agent row");
+        row.get_named("last_active_ts")
+            .expect("decode last_active_ts")
+    }
+
+    async fn count_projects_for_human_key_for_test(cx: &Cx, pool: &DbPool, human_key: &str) -> i64 {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        let rows = map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT COUNT(*) AS cnt FROM projects WHERE human_key = ?",
+                &[Value::Text(human_key.to_string())],
+            )
+            .await,
+        )
+        .into_result()
+        .expect("count projects");
+        let row = rows.first().expect("count row");
+        row.get_named("cnt").expect("decode count")
+    }
+
+    #[test]
+    fn cache_scope_for_pool_distinguishes_memory_pools() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool_a = DbPool::new(&config).expect("pool a");
+        let pool_b = DbPool::new(&config).expect("pool b");
+
+        assert_ne!(cache_scope_for_pool(&pool_a), cache_scope_for_pool(&pool_b));
+    }
+
+    #[test]
+    fn ensure_project_cache_is_scoped_to_memory_pool() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool_a = crate::create_pool(&cfg).expect("create pool a");
+        let pool_b = crate::create_pool(&cfg).expect("create pool b");
+        let human_key = "/tmp/scoped-project-cache";
+
+        rt.block_on(async {
+            ensure_project(&cx, &pool_a, human_key)
+                .await
+                .into_result()
+                .expect("ensure project a");
+            ensure_project(&cx, &pool_b, human_key)
+                .await
+                .into_result()
+                .expect("ensure project b");
+
+            assert_eq!(
+                count_projects_for_human_key_for_test(&cx, &pool_a, human_key).await,
+                1,
+                "pool a should persist its project row"
+            );
+            assert_eq!(
+                count_projects_for_human_key_for_test(&cx, &pool_b, human_key).await,
+                1,
+                "pool b should persist its own project row instead of reusing pool a cache"
+            );
+        });
+    }
 
     #[test]
     fn begin_concurrent_fallback_detects_parser_error() {
@@ -11032,7 +11166,11 @@ mod tests {
                 .expect("flush_deferred_touches should succeed without REINDEX");
 
             // Seed the touch cache and verify flush works
-            crate::cache::read_cache().enqueue_touch(agent_id, now_micros());
+            crate::cache::read_cache().enqueue_touch_scoped(
+                &cache_scope_for_pool(&pool),
+                agent_id,
+                now_micros(),
+            );
             flush_deferred_touches(&cx, &pool)
                 .await
                 .into_result()
@@ -11046,6 +11184,98 @@ mod tests {
             assert!(
                 refetched.last_active_ts > 0,
                 "last_active_ts should be updated after touch flush"
+            );
+        });
+    }
+
+    #[test]
+    fn deferred_touch_flush_is_scoped_to_memory_pool() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool_a = crate::create_pool(&cfg).expect("create pool a");
+        let pool_b = crate::create_pool(&cfg).expect("create pool b");
+
+        rt.block_on(async {
+            let project_a = ensure_project(&cx, &pool_a, "/tmp/deferred-touch-scope-a")
+                .await
+                .into_result()
+                .expect("ensure project a");
+            let project_b = ensure_project(&cx, &pool_b, "/tmp/deferred-touch-scope-b")
+                .await
+                .into_result()
+                .expect("ensure project b");
+
+            let agent_a = register_agent(
+                &cx,
+                &pool_a,
+                project_a.id.expect("project a id"),
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent a");
+            let agent_b = register_agent(
+                &cx,
+                &pool_b,
+                project_b.id.expect("project b id"),
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent b");
+
+            let agent_a_id = agent_a.id.expect("agent a id");
+            let agent_b_id = agent_b.id.expect("agent b id");
+            assert_eq!(
+                agent_a_id, agent_b_id,
+                "fresh in-memory pools should allocate matching first agent ids"
+            );
+
+            set_agent_last_active_for_test(&cx, &pool_a, agent_a_id, 0).await;
+            set_agent_last_active_for_test(&cx, &pool_b, agent_b_id, 0).await;
+
+            touch_agent(&cx, &pool_a, agent_a_id)
+                .await
+                .into_result()
+                .expect("queue deferred touch in pool a");
+
+            flush_deferred_touches(&cx, &pool_b)
+                .await
+                .into_result()
+                .expect("flush deferred touches for pool b");
+            assert_eq!(
+                read_agent_last_active_for_test(&cx, &pool_b, agent_b_id).await,
+                0,
+                "pool b flush must not consume deferred touches from pool a"
+            );
+
+            flush_deferred_touches(&cx, &pool_a)
+                .await
+                .into_result()
+                .expect("flush deferred touches for pool a");
+            assert!(
+                read_agent_last_active_for_test(&cx, &pool_a, agent_a_id).await > 0,
+                "pool a flush should still apply its own deferred touch"
             );
         });
     }

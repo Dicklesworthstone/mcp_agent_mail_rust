@@ -2265,7 +2265,6 @@ dependencies = [
 name = "fsqlite-mvcc"
 version = "0.1.1"
 dependencies = [
- "asupersync",
  "blake3",
  "crossbeam-epoch",
  "fsqlite-error",
