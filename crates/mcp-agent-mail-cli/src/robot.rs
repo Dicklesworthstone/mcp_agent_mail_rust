@@ -1590,6 +1590,62 @@ fn build_inbox(
     })
 }
 
+fn load_recipient_display_names(
+    conn: &DbConn,
+    message_id: i64,
+    context: &'static str,
+) -> Result<Vec<String>, CliError> {
+    let primary_rows = conn
+        .query_sync(
+            "SELECT a.name AS name
+             FROM message_recipients mr
+             JOIN agents a ON a.id = mr.agent_id
+             WHERE mr.message_id = ? AND mr.kind = 'to'
+             ORDER BY a.name COLLATE NOCASE ASC, a.name ASC",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| CliError::Other(format!("{context} recipient to-query failed: {e}")))?;
+    let primary_names: Vec<String> = primary_rows
+        .iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !primary_names.is_empty() {
+        return Ok(primary_names);
+    }
+
+    let fallback_rows = conn
+        .query_sync(
+            "SELECT mr.kind AS kind, a.name AS name
+             FROM message_recipients mr
+             JOIN agents a ON a.id = mr.agent_id
+             WHERE mr.message_id = ?
+             ORDER BY CASE mr.kind
+                        WHEN 'cc' THEN 0
+                        WHEN 'bcc' THEN 1
+                        ELSE 2
+                      END ASC,
+                      a.name COLLATE NOCASE ASC,
+                      a.name ASC",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| CliError::Other(format!("{context} recipient fallback query failed: {e}")))?;
+    Ok(fallback_rows
+        .iter()
+        .filter_map(|row| {
+            let name = row.get_named::<String>("name").ok()?;
+            if name.is_empty() {
+                return None;
+            }
+            let kind = row.get_named::<String>("kind").ok().unwrap_or_default();
+            Some(match kind.as_str() {
+                "cc" | "bcc" => format!("{kind}: {name}"),
+                _ => name,
+            })
+        })
+        .collect())
+}
+
 fn build_outbox_entries(
     conn: &DbConn,
     project_id: i64,
@@ -1624,55 +1680,30 @@ fn build_outbox_entries(
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
         let ack_rows = conn
             .query_sync(
-                "SELECT mr.id
+                "SELECT COUNT(*) AS cnt
                  FROM message_recipients mr
                  WHERE mr.message_id = ? AND mr.ack_ts IS NOT NULL",
                 &[Value::BigInt(id)],
             )
             .map_err(|e| CliError::Other(format!("outbox ack_count query failed: {e}")))?;
-        let acked_count = i64::try_from(ack_rows.len()).unwrap_or(0);
+        let acked_count = ack_rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("cnt").ok())
+            .unwrap_or(0);
 
         let recipient_rows_count = conn
             .query_sync(
-                "SELECT mr.id
+                "SELECT COUNT(*) AS cnt
                  FROM message_recipients mr
                  WHERE mr.message_id = ?",
                 &[Value::BigInt(id)],
             )
             .map_err(|e| CliError::Other(format!("outbox recipient_count query failed: {e}")))?;
-        let recipient_count = i64::try_from(recipient_rows_count.len()).unwrap_or(0);
-
-        let to_rows = conn
-            .query_sync(
-                "SELECT a.name AS name
-                 FROM message_recipients mr
-                 JOIN agents a ON a.id = mr.agent_id
-                 WHERE mr.message_id = ? AND mr.kind = 'to'",
-                &[Value::BigInt(id)],
-            )
-            .map_err(|e| CliError::Other(format!("outbox recipient to-query failed: {e}")))?;
-        let recipient_rows = if to_rows.is_empty() {
-            conn.query_sync(
-                "SELECT a.name AS name
-                 FROM message_recipients mr
-                 JOIN agents a ON a.id = mr.agent_id
-                 WHERE mr.message_id = ?",
-                &[Value::BigInt(id)],
-            )
-            .map_err(|e| CliError::Other(format!("outbox recipient fallback query failed: {e}")))?
-        } else {
-            to_rows
-        };
-        let recipient_names = recipient_rows
-            .iter()
-            .filter_map(|r| {
-                r.get_named::<String>("name")
-                    .ok()
-                    .or_else(|| r.get_as::<String>(0).ok())
-            })
-            .filter(|name| !name.is_empty())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let recipient_count = recipient_rows_count
+            .first()
+            .and_then(|row| row.get_named::<i64>("cnt").ok())
+            .unwrap_or(0);
+        let recipient_names = load_recipient_display_names(conn, id, "outbox")?.join(", ");
         let recipient_names = if recipient_names.is_empty() {
             "(no recipients)".to_string()
         } else {
@@ -1819,18 +1850,7 @@ fn build_thread(
         }
 
         // Get recipients for this message
-        let recipients = conn
-            .query_sync(
-                "SELECT a.name FROM message_recipients mr
-                 JOIN agents a ON a.id = mr.agent_id
-                 WHERE mr.message_id = ?",
-                &[Value::BigInt(msg_id)],
-            )
-            .map_err(|e| CliError::Other(format!("thread recipients query failed: {e}")))?;
-        let to_names: Vec<String> = recipients
-            .iter()
-            .filter_map(|r| r.get_named::<String>("name").ok())
-            .collect();
+        let to_names = load_recipient_display_names(conn, msg_id, "thread")?;
 
         // Check ack status
         let ack_status = if ack_required == 0 {
@@ -2055,18 +2075,7 @@ fn build_message(
     let thread_ref = canonical_thread_ref(message_id, &thread_id);
 
     // Recipients
-    let recipient_rows = conn
-        .query_sync(
-            "SELECT a.name FROM message_recipients mr
-             JOIN agents a ON a.id = mr.agent_id
-             WHERE mr.message_id = ?",
-            &[Value::BigInt(message_id)],
-        )
-        .map_err(|e| CliError::Other(format!("message recipients query failed: {e}")))?;
-    let to: Vec<String> = recipient_rows
-        .iter()
-        .filter_map(|r| r.get_named::<String>("name").ok())
-        .collect();
+    let to = load_recipient_display_names(conn, message_id, "message")?;
 
     // Ack status
     let ack_status = if ack_required == 0 {
@@ -7148,6 +7157,33 @@ mod tests {
     }
 
     #[test]
+    fn test_build_thread_to_field_prefers_primary_recipients() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (112, 1, 1, 'Recipient kinds', 'RECIPIENT-KINDS', 'normal', 0, ?, 'body', '[]')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts)],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (20, 112, 2, 'to', NULL, NULL),
+                (21, 112, 3, 'cc', NULL, NULL),
+                (22, 112, 1, 'bcc', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let thread =
+            build_thread(&conn, 1, "RECIPIENT-KINDS", Some(10), None, false).expect("build thread");
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.messages[0].to, "Bob");
+    }
+
+    #[test]
     fn test_build_thread_missing_thread_errors() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let err = build_thread(&conn, 1, "does-not-exist", Some(10), None, false)
@@ -7270,6 +7306,188 @@ mod tests {
         assert_eq!(message.attachments[1].name, "notes.txt");
         assert_eq!(message.attachments[1].size, "98");
         assert_eq!(message.attachments[1].mime_type, "text/plain");
+    }
+
+    #[test]
+    fn test_load_recipient_display_names_labels_non_to_recipients_when_primary_is_absent() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (30, 101, 3, 'cc', NULL, NULL),
+                (31, 101, 1, 'bcc', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let recipients =
+            load_recipient_display_names(&conn, 101, "test").expect("load display names");
+        assert_eq!(
+            recipients,
+            vec!["cc: Carol".to_string(), "bcc: Alice".to_string()],
+            "fallback recipients should preserve kind labels when no primary recipient exists"
+        );
+    }
+
+    #[test]
+    fn test_load_recipient_display_names_supports_real_schema_without_recipient_id_column() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_recipients_real_schema.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER,
+                PRIMARY KEY (message_id, agent_id)
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES
+                (1, 1, 'Alice'),
+                (2, 1, 'Bob'),
+                (3, 1, 'Carol')",
+            &empty,
+        )
+        .expect("insert agents");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES
+                (42, 2, 'to', NULL, NULL),
+                (42, 3, 'cc', NULL, NULL)",
+            &empty,
+        )
+        .expect("insert recipients");
+
+        let recipients =
+            load_recipient_display_names(&conn, 42, "test").expect("load recipient display names");
+        assert_eq!(recipients, vec!["Bob".to_string()]);
+    }
+
+    #[test]
+    fn test_build_outbox_entries_supports_real_schema_without_recipient_id_column() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_outbox_real_schema.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                thread_id TEXT,
+                importance TEXT NOT NULL,
+                ack_required INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                body_md TEXT NOT NULL,
+                attachments TEXT NOT NULL DEFAULT '[]'
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER,
+                PRIMARY KEY (message_id, agent_id, kind)
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES
+                (1, 1, 'Sender'),
+                (2, 1, 'Bob'),
+                (3, 1, 'Carol')",
+            &empty,
+        )
+        .expect("insert agents");
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (42, 1, 1, 'Schema-safe outbox', 'OUTBOX-42', 'normal', 1, 100, 'body', '[]')",
+            &empty,
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES
+                (42, 2, 'to', NULL, 150),
+                (42, 3, 'cc', NULL, NULL)",
+            &empty,
+        )
+        .expect("insert recipients");
+
+        let entries = build_outbox_entries(&conn, 1, 1, 10, false).expect("build outbox");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].from, "Bob");
+        assert_eq!(entries[0].ack_status, "partial (1/2)");
+    }
+
+    #[test]
+    fn test_build_message_to_field_only_shows_primary_recipients() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES
+                (102, 1, 1, 'Primary recipients', 'RECIPIENTS', 'normal', 0, ?, 'body', '[]'),
+                (103, 1, 1, 'Non-primary recipients', 'RECIPIENTS', 'normal', 0, ?, 'body', '[]')",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts + 1),
+            ],
+        )
+        .expect("insert messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (30, 102, 2, 'to', NULL, NULL),
+                (31, 102, 3, 'cc', NULL, NULL),
+                (32, 102, 1, 'bcc', NULL, NULL),
+                (33, 103, 3, 'cc', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let primary = build_message(&conn, 1, 102).expect("build primary message");
+        assert_eq!(primary.to, vec!["Bob".to_string()]);
+
+        let no_primary = build_message(&conn, 1, 103).expect("build message without to");
+        assert!(
+            no_primary.to == vec!["cc: Carol".to_string()],
+            "cc-only recipients should remain visible with an explicit kind label"
+        );
     }
 
     #[test]

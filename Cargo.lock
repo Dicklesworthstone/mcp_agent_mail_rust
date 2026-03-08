@@ -2239,6 +2239,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-types",
+ "getrandom 0.2.17",
  "rand 0.8.5",
  "tracing",
 ]
@@ -2264,6 +2265,7 @@ dependencies = [
 name = "fsqlite-mvcc"
 version = "0.1.1"
 dependencies = [
+ "asupersync",
  "blake3",
  "crossbeam-epoch",
  "fsqlite-error",
@@ -2347,6 +2349,7 @@ dependencies = [
  "bitflags",
  "blake3",
  "fsqlite-error",
+ "parking_lot",
  "serde",
  "smallvec",
  "xxhash-rust",
@@ -2415,6 +2418,14 @@ dependencies = [
  "ftui-style",
  "ftui-text",
  "ftui-widgets",
+]
+
+[[package]]
+name = "ftui-a11y"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "ftui-core",
 ]
 
 [[package]]
@@ -2572,6 +2583,7 @@ version = "0.2.1"
 dependencies = [
  "ahash",
  "bitflags",
+ "ftui-a11y",
  "ftui-core",
  "ftui-layout",
  "ftui-render",

@@ -1047,6 +1047,7 @@ pub async fn summarize_thread(
             let user = llm::multi_thread_user_prompt(&thread_context);
 
             match llm::complete_system_user(
+                ctx.cx(),
                 system,
                 &user,
                 llm_model.as_deref(),
@@ -1112,6 +1113,7 @@ pub async fn summarize_thread(
             let user = llm::single_thread_user_prompt(&msg_tuples);
 
             match llm::complete_system_user(
+                ctx.cx(),
                 system,
                 &user,
                 llm_model.as_deref(),

@@ -7741,6 +7741,7 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
 
     let api_url = self_update_api_url();
     let response = match rt.block_on(async move {
+        let cx = asupersync::Cx::for_testing();
         let client = asupersync::http::h1::HttpClient::new();
         let headers = vec![
             ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
@@ -7750,7 +7751,13 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
             ),
         ];
         client
-            .request(asupersync::http::h1::Method::Get, &api_url, headers, vec![])
+            .request(
+                &cx,
+                asupersync::http::h1::Method::Get,
+                &api_url,
+                headers,
+                vec![],
+            )
             .await
     }) {
         Ok(resp) => resp,
@@ -7890,6 +7897,7 @@ fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
 
     let url_owned = url.to_string();
     let result = rt.block_on(async move {
+        let cx = asupersync::Cx::for_testing();
         let client = asupersync::http::h1::HttpClient::new();
         let headers = vec![
             ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
@@ -7897,6 +7905,7 @@ fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
         ];
         client
             .request(
+                &cx,
                 asupersync::http::h1::Method::Get,
                 &url_owned,
                 headers,
@@ -23929,7 +23938,7 @@ mod tests {
                 .await
                 .expect_err("missing agent should error");
             assert!(
-                matches!(err, CliError::InvalidArgument(message) if message.contains("agent not found: MissingAgent")),
+                matches!(err, CliError::InvalidArgument(ref message) if message.contains("agent not found: MissingAgent")),
                 "unexpected error: {err}"
             );
         });
@@ -23982,7 +23991,7 @@ mod tests {
     fn validate_reservation_ttl_seconds_rejects_short_values() {
         let err = validate_reservation_ttl_seconds(59).expect_err("short ttl should fail");
         assert!(
-            matches!(err, CliError::InvalidArgument(message) if message.contains("ttl must be at least 60 seconds")),
+            matches!(err, CliError::InvalidArgument(ref message) if message.contains("ttl must be at least 60 seconds")),
             "unexpected error: {err}"
         );
     }
@@ -28445,7 +28454,9 @@ async fn post_jsonrpc_request(
         headers.push(("Authorization".to_string(), format!("Bearer {tok}")));
     }
 
-    let request = Box::pin(products_http_client().request(Method::Post, server_url, headers, body));
+    let cx = asupersync::Cx::for_testing();
+    let request =
+        Box::pin(products_http_client().request(&cx, Method::Post, server_url, headers, body));
     let response = match timeout(wall_now(), Duration::from_secs(timeout_seconds), request).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {

@@ -204,9 +204,10 @@ else
 fi
 
 # Check remediation content (D4)
-e2e_assert_contains "mentions env var" "${BODY}" "AGENTMAIL_HTTP_BEARER_TOKEN"
+e2e_assert_contains "mentions env var" "${BODY}" "HTTP_BEARER_TOKEN"
 e2e_assert_contains "has fix instructions" "${BODY}" "How to fix"
 e2e_assert_contains "mentions localhost tip" "${BODY}" "localhost"
+e2e_assert_contains "mentions localhost bypass env var" "${BODY}" "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED"
 e2e_mark_case_end "case03_no_auth_html"
 
 # ---------------------------------------------------------------------------

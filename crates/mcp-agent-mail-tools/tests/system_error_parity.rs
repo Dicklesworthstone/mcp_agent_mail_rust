@@ -210,9 +210,29 @@ fn register_agent_under_sqlite_lock_maps_to_resource_busy() {
             .expect("RESOURCE_BUSY should include detail");
         assert!(
             detail.contains("locked") || detail.contains("busy"),
-            "expected lock-like sqlite detail, got: {detail}"
+            "expected retryable contention detail, got: {detail}"
         );
     });
+}
+
+#[test]
+fn post_commit_visibility_probe_maps_to_resource_busy() {
+    let err = db_error_to_mcp_error(DbError::Internal(
+        "message recipient rows not visible after commit for message_id=42: expected=1 actual=0"
+            .into(),
+    ));
+    let p = error_payload(&err);
+
+    assert_eq!(p["type"], "RESOURCE_BUSY");
+    assert_eq!(
+        p["message"],
+        "Resource is temporarily busy. Wait a moment and try again."
+    );
+    assert_eq!(p["recoverable"], true);
+    assert_eq!(
+        p["data"]["error_detail"],
+        "message recipient rows not visible after commit for message_id=42: expected=1 actual=0"
+    );
 }
 
 // -----------------------------------------------------------------------

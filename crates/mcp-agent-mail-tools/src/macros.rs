@@ -287,6 +287,7 @@ pub async fn macro_prepare_thread(
         let user = llm::single_thread_user_prompt(&msg_tuples);
 
         match llm::complete_system_user(
+            ctx.cx(),
             system,
             &user,
             llm_model.as_deref(),

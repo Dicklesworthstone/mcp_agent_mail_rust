@@ -100,7 +100,7 @@ pub mod tool_util {
     }
 
     fn is_retryable_post_commit_visibility_probe(message: &str) -> bool {
-        message.contains("row not visible after commit")
+        message.contains("not visible after commit")
     }
 
     #[allow(clippy::too_many_lines)]
@@ -935,6 +935,16 @@ pub mod tool_util {
         fn db_error_to_mcp_error_maps_post_commit_visibility_probe_as_resource_busy() {
             let err = db_error_to_mcp_error(DbError::Internal(
                 "agent row not visible after commit for 1:BlueLake".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_post_commit_recipient_visibility_probe_as_resource_busy() {
+            let err = db_error_to_mcp_error(DbError::Internal(
+                "message recipient rows not visible after commit for message_id=42: expected=1 actual=0".into(),
             ));
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "RESOURCE_BUSY");

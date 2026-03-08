@@ -812,11 +812,27 @@ async fn verify_message_recipients_visible_after_commit(
     Outcome::Ok(())
 }
 
-fn is_hard_post_commit_probe_error(error: &DbError) -> bool {
-    matches!(
-        error,
-        DbError::Internal(_) | DbError::IntegrityCorruption { .. } | DbError::Schema(_)
-    )
+fn is_hard_post_commit_probe_error(_error: &DbError) -> bool {
+    // Post-commit durability probes exist to prove that a write is query-visible
+    // from an independent handle before we report success. Any probe error means
+    // that proof failed, so none of these errors are advisory.
+    true
+}
+
+fn post_commit_probe_cancelled_error(operation: &'static str, detail: &str) -> DbError {
+    DbError::ResourceBusy(format!(
+        "{operation} durability probe cancelled after commit for {detail}"
+    ))
+}
+
+fn post_commit_probe_panicked_error(
+    operation: &'static str,
+    detail: &str,
+    panic_message: &str,
+) -> DbError {
+    DbError::Internal(format!(
+        "{operation} durability probe panicked after commit for {detail}: {panic_message}"
+    ))
 }
 
 fn log_advisory_post_commit_probe_error(operation: &'static str, detail: &str, error: &str) {
@@ -828,11 +844,195 @@ fn log_advisory_post_commit_probe_error(operation: &'static str, detail: &str, e
     );
 }
 
+async fn cleanup_created_agent_after_post_commit_probe_failure(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    agent_name: &str,
+    error: DbError,
+) -> DbError {
+    let error_text = error.to_string();
+    match cleanup_committed_agent_after_consistency_failure(
+        cx, pool, project_id, agent_id, agent_name,
+    )
+    .await
+    {
+        Outcome::Ok(()) => error,
+        Outcome::Err(cleanup_err) => DbError::Internal(format!(
+            "post-commit agent visibility failed for project_id={project_id} name={agent_name}: {error_text}; cleanup failed: {cleanup_err}"
+        )),
+        Outcome::Cancelled(_) => DbError::Internal(format!(
+            "post-commit agent visibility failed for project_id={project_id} name={agent_name}: {error_text}; cleanup was cancelled"
+        )),
+        Outcome::Panicked(p) => DbError::Internal(format!(
+            "post-commit agent visibility failed for project_id={project_id} name={agent_name}: {error_text}; cleanup panicked: {}",
+            p.message()
+        )),
+    }
+}
+
+async fn finalize_register_agent_post_commit_probe(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+    provisional: &AgentRow,
+    inserted_new: bool,
+    probe_result: Outcome<AgentRow, DbError>,
+) -> Outcome<Option<AgentRow>, DbError> {
+    let probe_detail = format!("{project_id}:{name}");
+    let provisional_id = provisional.id.unwrap_or(0);
+    match probe_result {
+        Outcome::Ok(agent) => Outcome::Ok(Some(agent)),
+        Outcome::Err(error) => {
+            if inserted_new {
+                Outcome::Err(
+                    cleanup_created_agent_after_post_commit_probe_failure(
+                        cx,
+                        pool,
+                        project_id,
+                        provisional_id,
+                        name,
+                        error,
+                    )
+                    .await,
+                )
+            } else {
+                log_advisory_post_commit_probe_error(
+                    "register_agent",
+                    &probe_detail,
+                    &error.to_string(),
+                );
+                Outcome::Ok(None)
+            }
+        }
+        Outcome::Cancelled(_) => {
+            if inserted_new {
+                Outcome::Err(
+                    cleanup_created_agent_after_post_commit_probe_failure(
+                        cx,
+                        pool,
+                        project_id,
+                        provisional_id,
+                        name,
+                        post_commit_probe_cancelled_error("register_agent", &probe_detail),
+                    )
+                    .await,
+                )
+            } else {
+                tracing::warn!(
+                    project_id,
+                    agent = %name,
+                    "register_agent durability probe cancelled after commit; returning committed result"
+                );
+                Outcome::Ok(None)
+            }
+        }
+        Outcome::Panicked(panic) => {
+            if inserted_new {
+                Outcome::Err(
+                    cleanup_created_agent_after_post_commit_probe_failure(
+                        cx,
+                        pool,
+                        project_id,
+                        provisional_id,
+                        name,
+                        post_commit_probe_panicked_error(
+                            "register_agent",
+                            &probe_detail,
+                            panic.message(),
+                        ),
+                    )
+                    .await,
+                )
+            } else {
+                tracing::error!(
+                    project_id,
+                    agent = %name,
+                    panic = %panic.message(),
+                    "register_agent durability probe panicked after commit; returning committed result"
+                );
+                Outcome::Ok(None)
+            }
+        }
+    }
+}
+
+async fn cleanup_message_after_post_commit_probe_failure(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    message_id: i64,
+    recipient_agent_ids: &[i64],
+    error: DbError,
+) -> DbError {
+    let error_text = error.to_string();
+    match cleanup_committed_message_after_consistency_failure(
+        cx,
+        pool,
+        project_id,
+        message_id,
+        recipient_agent_ids,
+    )
+    .await
+    {
+        Outcome::Ok(()) => error,
+        Outcome::Err(cleanup_err) => DbError::Internal(format!(
+            "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup failed: {cleanup_err}"
+        )),
+        Outcome::Cancelled(_) => DbError::Internal(format!(
+            "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup was cancelled"
+        )),
+        Outcome::Panicked(p) => DbError::Internal(format!(
+            "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup panicked: {}",
+            p.message()
+        )),
+    }
+}
+
+async fn cleanup_committed_agent_after_consistency_failure(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    agent_name: &str,
+) -> Outcome<(), DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                "DELETE FROM agents WHERE id = ? AND project_id = ?",
+                &[Value::BigInt(agent_id), Value::BigInt(project_id)],
+            )
+            .await,
+        )
+    );
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    drop(conn);
+
+    crate::cache::read_cache().invalidate_agent_scoped(pool.sqlite_path(), project_id, agent_name);
+    Outcome::Ok(())
+}
+
 async fn cleanup_committed_message_after_consistency_failure(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
     message_id: i64,
+    recipient_agent_ids: &[i64],
 ) -> Outcome<(), DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -858,7 +1058,13 @@ async fn cleanup_committed_message_after_consistency_failure(
         )
     );
 
-    let mut affected_agent_ids = Vec::with_capacity(recipient_rows.len());
+    let mut affected_agent_ids =
+        Vec::with_capacity(recipient_agent_ids.len() + recipient_rows.len());
+    for agent_id in recipient_agent_ids {
+        if !affected_agent_ids.contains(agent_id) {
+            affected_agent_ids.push(*agent_id);
+        }
+    }
     for row in &recipient_rows {
         let agent_id: i64 = match row.get_as(0) {
             Ok(value) => value,
@@ -867,7 +1073,9 @@ async fn cleanup_committed_message_after_consistency_failure(
                 return Outcome::Err(map_sql_error(&e));
             }
         };
-        affected_agent_ids.push(agent_id);
+        if !affected_agent_ids.contains(&agent_id) {
+            affected_agent_ids.push(agent_id);
+        }
     }
 
     let delete_recipients_sql = "DELETE FROM message_recipients WHERE message_id = ?";
@@ -1258,7 +1466,7 @@ pub async fn register_agent(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
-        let provisional = {
+        let (provisional, inserted_new) = {
             let tracked = tracked(&*conn);
             // Defaults for INSERT (new row).
             let insert_attach_pol = attachments_policy.unwrap_or("auto");
@@ -1323,6 +1531,7 @@ pub async fn register_agent(
                 map_sql_outcome(traw_query(cx, &tracked, exists_sql, &exists_params).await)
             );
 
+            let mut inserted_new = false;
             if exists_rows.is_empty() {
                 let insert_sql = "INSERT INTO agents \
                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
@@ -1340,7 +1549,9 @@ pub async fn register_agent(
                 ];
                 match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
                 {
-                    Outcome::Ok(_) => {}
+                    Outcome::Ok(_) => {
+                        inserted_new = true;
+                    }
                     Outcome::Err(e) if is_agent_unique_violation(&e) => {
                         // Concurrent insert race: row now exists, so apply normalize update.
                         let mut retry_params = normalize_base_params;
@@ -1389,37 +1600,24 @@ pub async fn register_agent(
             };
 
             try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-            fresh
+            (fresh, inserted_new)
         };
         drop(conn);
-        let durable = match verify_agent_visible_after_commit(cx, pool, project_id, name).await {
-            Outcome::Ok(agent) => Some(agent),
-            Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => return Outcome::Err(e),
-            Outcome::Err(e) => {
-                log_advisory_post_commit_probe_error(
-                    "register_agent",
-                    &format!("{project_id}:{name}"),
-                    &e.to_string(),
-                );
-                None
-            }
-            Outcome::Cancelled(_) => {
-                tracing::warn!(
-                    project_id,
-                    agent = %name,
-                    "register_agent durability probe cancelled after commit; returning committed result"
-                );
-                None
-            }
-            Outcome::Panicked(p) => {
-                tracing::error!(
-                    project_id,
-                    agent = %name,
-                    panic = %p.message(),
-                    "register_agent durability probe panicked after commit; returning committed result"
-                );
-                None
-            }
+        let durable = match finalize_register_agent_post_commit_probe(
+            cx,
+            pool,
+            project_id,
+            name,
+            &provisional,
+            inserted_new,
+            verify_agent_visible_after_commit(cx, pool, project_id, name).await,
+        )
+        .await
+        {
+            Outcome::Ok(agent) => agent,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
         (provisional, durable)
     };
@@ -1558,33 +1756,52 @@ pub async fn create_agent(
             found
         };
         drop(conn);
+        let probe_detail = format!("{project_id}:{name}");
+        let provisional_id = provisional.id.unwrap_or(0);
         let durable = match verify_agent_visible_after_commit(cx, pool, project_id, name).await {
             Outcome::Ok(agent) => Some(agent),
-            Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => return Outcome::Err(e),
             Outcome::Err(e) => {
-                log_advisory_post_commit_probe_error(
-                    "create_agent",
-                    &format!("{project_id}:{name}"),
-                    &e.to_string(),
+                return Outcome::Err(
+                    cleanup_created_agent_after_post_commit_probe_failure(
+                        cx,
+                        pool,
+                        project_id,
+                        provisional_id,
+                        name,
+                        e,
+                    )
+                    .await,
                 );
-                None
             }
             Outcome::Cancelled(_) => {
-                tracing::warn!(
-                    project_id,
-                    agent = %name,
-                    "create_agent durability probe cancelled after commit; returning committed result"
+                return Outcome::Err(
+                    cleanup_created_agent_after_post_commit_probe_failure(
+                        cx,
+                        pool,
+                        project_id,
+                        provisional_id,
+                        name,
+                        post_commit_probe_cancelled_error("create_agent", &probe_detail),
+                    )
+                    .await,
                 );
-                None
             }
             Outcome::Panicked(p) => {
-                tracing::error!(
-                    project_id,
-                    agent = %name,
-                    panic = %p.message(),
-                    "create_agent durability probe panicked after commit; returning committed result"
+                return Outcome::Err(
+                    cleanup_created_agent_after_post_commit_probe_failure(
+                        cx,
+                        pool,
+                        project_id,
+                        provisional_id,
+                        name,
+                        post_commit_probe_panicked_error(
+                            "create_agent",
+                            &probe_detail,
+                            p.message(),
+                        ),
+                    )
+                    .await,
                 );
-                None
             }
         };
         (provisional, durable)
@@ -2435,66 +2652,46 @@ pub async fn create_message_with_recipients(
             "message commit succeeded but returned row has no id".to_string(),
         ));
     };
-    match verify_message_recipients_visible_after_commit(
+    let recipient_agent_ids: Vec<i64> = recipients
+        .iter()
+        .map(|(agent_id, _kind)| *agent_id)
+        .collect();
+    let post_commit_probe_error = match verify_message_recipients_visible_after_commit(
         cx, pool, project_id, message_id, recipients,
     )
     .await
     {
-        Outcome::Ok(()) => {}
-        Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => {
-            let error_text = e.to_string();
-            match cleanup_committed_message_after_consistency_failure(
-                cx, pool, project_id, message_id,
+        Outcome::Ok(()) => None,
+        Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => Some(e),
+        Outcome::Err(e) => Some(e),
+        Outcome::Cancelled(_) => Some(post_commit_probe_cancelled_error(
+            "create_message_with_recipients",
+            &format!("{project_id}:{message_id}"),
+        )),
+        Outcome::Panicked(p) => Some(post_commit_probe_panicked_error(
+            "create_message_with_recipients",
+            &format!("{project_id}:{message_id}"),
+            p.message(),
+        )),
+    };
+    if let Some(error) = post_commit_probe_error {
+        return Outcome::Err(
+            cleanup_message_after_post_commit_probe_failure(
+                cx,
+                pool,
+                project_id,
+                message_id,
+                &recipient_agent_ids,
+                error,
             )
-            .await
-            {
-                Outcome::Ok(()) => return Outcome::Err(e),
-                Outcome::Err(cleanup_err) => {
-                    return Outcome::Err(DbError::Internal(format!(
-                        "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup failed: {cleanup_err}"
-                    )));
-                }
-                Outcome::Cancelled(_) => {
-                    return Outcome::Err(DbError::Internal(format!(
-                        "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup was cancelled"
-                    )));
-                }
-                Outcome::Panicked(p) => {
-                    return Outcome::Err(DbError::Internal(format!(
-                        "post-commit recipient visibility failed for message_id={message_id}: {error_text}; cleanup panicked: {}",
-                        p.message()
-                    )));
-                }
-            }
-        }
-        Outcome::Err(e) => {
-            log_advisory_post_commit_probe_error(
-                "create_message_with_recipients",
-                &format!("{project_id}:{message_id}"),
-                &e.to_string(),
-            );
-        }
-        Outcome::Cancelled(_) => {
-            tracing::warn!(
-                project_id,
-                message_id,
-                "message recipient durability probe cancelled after commit; returning committed result"
-            );
-        }
-        Outcome::Panicked(p) => {
-            tracing::error!(
-                project_id,
-                message_id,
-                panic = %p.message(),
-                "message recipient durability probe panicked after commit; returning committed result"
-            );
-        }
+            .await,
+        );
     }
 
     // Invalidate cached inbox stats for all recipients.
     let cache = crate::cache::read_cache();
     let cache_scope = pool.sqlite_path();
-    for (agent_id, _kind) in recipients {
+    for agent_id in &recipient_agent_ids {
         cache.invalidate_inbox_stats_scoped(cache_scope, *agent_id);
     }
     Outcome::Ok(row)
@@ -7918,7 +8115,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
-            cleanup_committed_message_after_consistency_failure(&cx, &pool, 1, 1)
+            cleanup_committed_message_after_consistency_failure(&cx, &pool, 1, 1, &[2])
                 .await
                 .into_result()
                 .expect("cleanup should succeed");
@@ -7956,6 +8153,192 @@ mod tests {
             stats_rows[0].get_named::<i64>("count").unwrap_or(-1),
             0,
             "cleanup must rebuild inbox_stats so stale recipient counts are removed"
+        );
+    }
+
+    #[test]
+    fn cleanup_committed_message_after_consistency_failure_rebuilds_stats_when_recipient_rows_are_missing()
+     {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("cleanup_committed_message_missing_recipients.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "CREATE TABLE IF NOT EXISTS inbox_stats (
+                    agent_id INTEGER PRIMARY KEY,
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    ack_pending_count INTEGER NOT NULL DEFAULT 0,
+                    last_message_ts INTEGER
+                )",
+            )
+            .expect("ensure inbox_stats");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'cleanup-project', '/tmp/am-cleanup-message-missing-recips', 0)",
+            )
+            .expect("seed project");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                 VALUES
+                    (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'),
+                    (2, 1, 'GreenStone', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed agents");
+        init_conn
+            .execute_raw(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+                 VALUES (1, 1, 1, 'THREAD-CLEANUP', 'cleanup', 'body', 'normal', 1, 100, '[]')",
+            )
+            .expect("seed message");
+        init_conn
+            .execute_raw(
+                "INSERT OR REPLACE INTO inbox_stats
+                 (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
+                 VALUES (2, 1, 1, 1, 100)",
+            )
+            .expect("seed stale inbox stats");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            cleanup_committed_message_after_consistency_failure(&cx, &pool, 1, 1, &[2])
+                .await
+                .into_result()
+                .expect("cleanup should succeed");
+        });
+
+        let verify_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open verify connection");
+        let message_rows = verify_conn
+            .query_sync("SELECT COUNT(*) AS count FROM messages WHERE id = 1", &[])
+            .expect("query messages after cleanup");
+        let stats_rows = verify_conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM inbox_stats WHERE agent_id = 2",
+                &[],
+            )
+            .expect("query inbox_stats after cleanup");
+
+        assert_eq!(
+            message_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            0,
+            "cleanup must delete the orphaned message row"
+        );
+        assert_eq!(
+            stats_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            0,
+            "cleanup must clear stale inbox_stats even when recipient rows are already missing"
+        );
+    }
+
+    #[test]
+    fn cleanup_committed_agent_after_consistency_failure_removes_orphaned_agent_state() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("cleanup_committed_agent_after_probe_failure.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'cleanup-project', '/tmp/am-cleanup-agent', 0)",
+            )
+            .expect("seed project");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                 VALUES (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed agent");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let cached = get_agent(&cx, &pool, 1, "BlueLake")
+                .await
+                .into_result()
+                .expect("populate cache");
+            assert_eq!(cached.id, Some(1));
+
+            cleanup_committed_agent_after_consistency_failure(&cx, &pool, 1, 1, "BlueLake")
+                .await
+                .into_result()
+                .expect("cleanup should succeed");
+        });
+
+        let verify_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open verify connection");
+        let agent_rows = verify_conn
+            .query_sync("SELECT COUNT(*) AS count FROM agents WHERE id = 1", &[])
+            .expect("query agents after cleanup");
+        assert_eq!(
+            agent_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            0,
+            "cleanup must delete the orphaned agent row"
+        );
+        assert!(
+            crate::cache::read_cache()
+                .get_agent_scoped(pool.sqlite_path(), 1, "BlueLake")
+                .is_none(),
+            "cleanup must invalidate cached agent rows"
         );
     }
 
@@ -8341,6 +8724,207 @@ mod tests {
 
             assert_eq!(probed.name, "BlueLake");
             assert_eq!(probed.project_id, 1);
+        });
+    }
+
+    #[test]
+    fn post_commit_probe_errors_are_never_advisory() {
+        assert!(is_hard_post_commit_probe_error(&DbError::Sqlite(
+            "disk I/O error".to_string(),
+        )));
+        assert!(is_hard_post_commit_probe_error(&DbError::Pool(
+            "database is locked".to_string(),
+        )));
+        assert!(is_hard_post_commit_probe_error(&DbError::PoolExhausted {
+            message: "pool exhausted".to_string(),
+            pool_size: 1,
+            max_overflow: 0,
+        }));
+        assert!(is_hard_post_commit_probe_error(&DbError::ResourceBusy(
+            "probe cancelled".to_string(),
+        )));
+        assert!(is_hard_post_commit_probe_error(&DbError::Internal(
+            "probe panicked".to_string(),
+        )));
+    }
+
+    #[test]
+    fn post_commit_probe_cancelled_and_panicked_are_deterministic_errors() {
+        match post_commit_probe_cancelled_error("register_agent", "1:BlueLake") {
+            DbError::ResourceBusy(message) => {
+                assert!(message.contains("register_agent"));
+                assert!(message.contains("1:BlueLake"));
+                assert!(message.contains("cancelled"));
+            }
+            other => panic!("expected ResourceBusy, got {other:?}"),
+        }
+
+        match post_commit_probe_panicked_error("create_message_with_recipients", "1:42", "boom") {
+            DbError::Internal(message) => {
+                assert!(message.contains("create_message_with_recipients"));
+                assert!(message.contains("1:42"));
+                assert!(message.contains("boom"));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cleanup_created_agent_after_probe_failure_deletes_agent_row() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("create_agent_probe_cleanup.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'cleanup-project', '/tmp/am-create-agent-cleanup', 0)",
+            )
+            .expect("seed project");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (7, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'cleanup target', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed agent");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let err = cleanup_created_agent_after_post_commit_probe_failure(
+                &cx,
+                &pool,
+                1,
+                7,
+                "BlueLake",
+                DbError::Internal("agent row not visible after commit for 1:BlueLake".into()),
+            )
+            .await;
+            assert!(
+                matches!(err, DbError::Internal(ref message) if message.contains("agent row not visible after commit")),
+                "unexpected cleanup result: {err:?}"
+            );
+
+            let rows = durability_probe_query(
+                &cx,
+                &pool,
+                "SELECT COUNT(*) FROM agents WHERE project_id = ? AND name = ?",
+                &[Value::BigInt(1), Value::Text("BlueLake".to_string())],
+            )
+            .await
+            .into_result()
+            .expect("count query should succeed");
+            let remaining = rows.first().and_then(row_first_i64).expect("count row");
+            assert_eq!(remaining, 0, "cleanup should delete the committed agent");
+        });
+    }
+
+    #[test]
+    fn finalize_register_agent_post_commit_probe_returns_committed_existing_agent_on_probe_error() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_agent_probe_existing_row.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'durability-project', '/tmp/am-register-existing', 0)",
+            )
+            .expect("seed project");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (7, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'existing', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed agent");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let existing = get_agent(&cx, &pool, 1, "BlueLake")
+                .await
+                .into_result()
+                .expect("fetch existing agent");
+            let durable = finalize_register_agent_post_commit_probe(
+                &cx,
+                &pool,
+                1,
+                "BlueLake",
+                &existing,
+                false,
+                Outcome::Err(DbError::Internal(
+                    "agent row not visible after commit for 1:BlueLake".into(),
+                )),
+            )
+            .await
+            .into_result()
+            .expect("existing-row probe errors should stay advisory");
+            assert!(
+                durable.is_none(),
+                "existing-row register_agent should fall back to the committed row"
+            );
+
+            let rows = durability_probe_query(
+                &cx,
+                &pool,
+                "SELECT COUNT(*) FROM agents WHERE project_id = ? AND name = ?",
+                &[Value::BigInt(1), Value::Text("BlueLake".to_string())],
+            )
+            .await
+            .into_result()
+            .expect("count query should succeed");
+            let remaining = rows.first().and_then(row_first_i64).expect("count row");
+            assert_eq!(remaining, 1, "existing agent row must not be deleted");
         });
     }
 

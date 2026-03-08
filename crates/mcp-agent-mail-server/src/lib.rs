@@ -5046,7 +5046,7 @@ h1{color:#c0392b}code{background:#f4f4f4;padding:2px 6px;border-radius:3px}
 <div class="steps">
 <h3>How to fix this</h3>
 <ol>
-<li>Set <code>AGENTMAIL_HTTP_BEARER_TOKEN</code> in your <code>.env</code> file
+<li>Set <code>HTTP_BEARER_TOKEN</code> in your <code>.env</code> file
 (or environment) to match the server's configured token.</li>
 <li>Use the generated health link from the TUI — it embeds the token
 as <code>?token=…</code> in the URL automatically.</li>
@@ -5055,7 +5055,7 @@ as <code>?token=…</code> in the URL automatically.</li>
 </ol>
 </div>
 <p><strong>Tip:</strong> If you're accessing from <code>localhost</code>,
-enable <code>AGENTMAIL_HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true</code>
+enable <code>HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true</code>
 to skip auth for local requests.</p>
 </body></html>"#;
         self.raw_response(
@@ -5373,8 +5373,26 @@ to skip auth for local requests.</p>
     ) -> Option<Http1Response> {
         let (kind, tool_name) = classify_request(json_rpc);
         let is_local_ok = self.allow_local_unauthenticated(req);
+        let local_bypass_jwt_sub = if self.config.http_rate_limit_enabled
+            && is_local_ok
+            && self.config.http_jwt_enabled
+            && !self.has_expected_bearer_header(req)
+        {
+            self.decode_jwt(req).await.ok().and_then(|ctx| ctx.sub)
+        } else {
+            None
+        };
 
-        let (roles, jwt_sub) = if self.config.http_jwt_enabled {
+        let (roles, jwt_sub) = if is_local_ok {
+            // Localhost bypass is a full auth bypass for local development, so
+            // do not enforce JWT/static-token auth later in the path. When a
+            // valid JWT is present, still preserve its subject so localhost
+            // callers keep distinct rate-limit buckets.
+            (
+                vec![self.config.http_rbac_default_role.clone()],
+                local_bypass_jwt_sub,
+            )
+        } else if self.config.http_jwt_enabled {
             if self.has_expected_bearer_header(req) {
                 (vec![self.config.http_rbac_default_role.clone()], None)
             } else {
@@ -16885,7 +16903,7 @@ mod tests {
         );
         let body = String::from_utf8_lossy(&resp.body);
         assert!(
-            body.contains("AGENTMAIL_HTTP_BEARER_TOKEN"),
+            body.contains("HTTP_BEARER_TOKEN"),
             "HTML must mention env var"
         );
         assert!(
@@ -17521,6 +17539,90 @@ mod tests {
             resp.is_none(),
             "localhost bypass should allow unauthenticated requests from 127.0.0.1"
         );
+    }
+
+    #[test]
+    fn localhost_bypass_allows_unauthenticated_when_jwt_enabled() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("jwt-secret".to_string()),
+            http_allow_localhost_unauthenticated: true,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[],
+            Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 1)).expect("json");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 200,
+            "localhost bypass must allow unauthenticated requests even when JWT auth is enabled"
+        );
+    }
+
+    #[test]
+    fn localhost_bypass_preserves_valid_jwt_sub_for_rate_limit_identity() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: true,
+            http_rbac_enabled: false,
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let claims_a = serde_json::json!({ "sub": "local-user-a", "role": "writer" });
+        let claims_b = serde_json::json!({ "sub": "local-user-b", "role": "writer" });
+        let auth_a = format!("Bearer {}", hs256_token(b"secret", &claims_a));
+        let auth_b = format!("Bearer {}", hs256_token(b"secret", &claims_b));
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"name": "health_check", "arguments": {}})),
+            1,
+        );
+        let peer = SocketAddr::from(([127, 0, 0, 1], 1234));
+
+        let req_a1 = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth_a.as_str())],
+            Some(peer),
+        );
+        assert!(
+            block_on(state.check_rbac_and_rate_limit(&req_a1, &json_rpc)).is_none(),
+            "first localhost request should pass"
+        );
+
+        let req_b1 = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth_b.as_str())],
+            Some(peer),
+        );
+        assert!(
+            block_on(state.check_rbac_and_rate_limit(&req_b1, &json_rpc)).is_none(),
+            "different localhost JWT subjects must not share a rate-limit bucket"
+        );
+
+        let req_a2 = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth_a.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req_a2, &json_rpc))
+            .expect("same localhost JWT subject should hit the one-request bucket");
+        assert_eq!(resp.status, 429);
     }
 
     #[test]

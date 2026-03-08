@@ -1781,6 +1781,26 @@ fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn has_quarantined_primary_artifact(primary_path: &Path) -> bool {
+    let Some(file_name) = primary_path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let parent = primary_path.parent().unwrap_or_else(|| Path::new("."));
+    let scan_dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let corrupt_prefix = format!("{file_name}.corrupt-");
+
+    std::fs::read_dir(scan_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .any(|name| name.starts_with(&corrupt_prefix))
+}
+
 #[must_use]
 fn resolve_sqlite_path_with_absolute_fallback(sqlite_path: &str) -> String {
     if sqlite_path == ":memory:" {
@@ -2016,11 +2036,11 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<(), SqlError> {
-    let exists = primary_path.exists();
-    if exists && sqlite_file_is_healthy(primary_path)? {
+    let had_primary = primary_path.exists();
+    if had_primary && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
-    if exists {
+    if had_primary {
         match try_repair_index_only_corruption(primary_path) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
@@ -2041,8 +2061,14 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         tracing::warn!(
             "backup restore didn't produce a healthy file; falling through to archive reconstruction"
         );
-    } else if !exists {
+    } else if !had_primary {
         // Missing file, no backup.
+        if has_quarantined_primary_artifact(primary_path) {
+            return Err(SqlError::Custom(format!(
+                "database file {} is missing but quarantined corrupt artifact(s) exist; refusing blank reinitialization without operator action",
+                primary_path.display()
+            )));
+        }
         if !storage_root.join("projects").is_dir() {
             // Normal fresh startup (no projects directory).
             return Ok(());
@@ -2078,6 +2104,12 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     match crate::reconstruct::reconstruct_from_archive(primary_path, storage_root) {
         Ok(stats) => {
             if sqlite_file_is_healthy(primary_path)? {
+                if had_primary && stats.agents == 0 && stats.messages == 0 {
+                    return Err(SqlError::Custom(format!(
+                        "database file {} was quarantined for archive-aware recovery, but archive reconstruction restored no durable mail state; refusing blank reinitialization to avoid data loss",
+                        primary_path.display()
+                    )));
+                }
                 tracing::warn!(
                     %stats,
                     "database successfully reconstructed from Git archive"
@@ -2094,6 +2126,13 @@ pub fn ensure_sqlite_file_healthy_with_archive(
                 "archive reconstruction failed; falling through to blank reinitialize"
             );
         }
+    }
+
+    if had_primary {
+        return Err(SqlError::Custom(format!(
+            "database file {} was quarantined for archive-aware recovery, but reconstruction did not produce a healthy database; refusing blank reinitialization to avoid data loss",
+            primary_path.display()
+        )));
     }
 
     // Priority 3: Blank reinitialization
@@ -3637,9 +3676,10 @@ mod tests {
         assert!(count >= 1, "should have at least 1 message from archive");
     }
 
-    /// Archive-aware recovery should fall back to blank reinit when archive is empty.
+    /// Archive-aware recovery must fail closed when a real DB was quarantined
+    /// and no backup/archive path can produce a healthy replacement.
     #[test]
-    fn archive_recovery_reinits_with_empty_archive() {
+    fn archive_recovery_refuses_blank_reinit_with_empty_archive() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -3648,11 +3688,49 @@ mod tests {
         std::fs::write(&primary, b"corrupted-data").unwrap();
         std::fs::create_dir_all(storage_root.join("projects")).unwrap();
 
-        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
+        let err = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("should refuse to blank-reinitialize after quarantining a real DB");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("refusing blank reinitialization to avoid data loss"),
+            "unexpected error: {err_text}"
+        );
 
         assert!(
-            sqlite_file_is_healthy(&primary).unwrap(),
-            "reinitialized DB should be healthy"
+            !primary.exists(),
+            "primary DB should stay absent after fail-closed recovery"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")),
+            "quarantined corrupt artifact should be preserved for manual recovery"
+        );
+    }
+
+    #[test]
+    fn archive_recovery_missing_primary_with_quarantined_artifact_is_not_treated_as_fresh_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        std::fs::write(
+            dir.path()
+                .join("storage.sqlite3.corrupt-20260307_000000_000"),
+            b"quarantined-corrupt-db",
+        )
+        .unwrap();
+
+        let err = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("quarantined corrupt artifacts should block blank reinit");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("quarantined corrupt artifact"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !primary.exists(),
+            "recovery must not silently create a fresh DB when only quarantined state exists"
         );
     }
 

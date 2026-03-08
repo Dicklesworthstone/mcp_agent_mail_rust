@@ -381,6 +381,7 @@ fn get_http_client() -> &'static asupersync::http::h1::HttpClient {
 /// On failure with the primary model, retries with `choose_best_available_model`
 /// if that yields a different model.
 pub async fn complete_system_user(
+    cx: &asupersync::Cx,
     system: &str,
     user: &str,
     model: Option<&str>,
@@ -398,7 +399,7 @@ pub async fn complete_system_user(
         });
     }
 
-    match complete_single(&resolved, system, user, temperature, max_tokens).await {
+    match complete_single(cx, &resolved, system, user, temperature, max_tokens).await {
         Ok(output) => Ok(output),
         Err(e) => {
             // Retry with best available if different
@@ -407,13 +408,14 @@ pub async fn complete_system_user(
                 Err(e)
             } else {
                 tracing::warn!("LLM call failed with {resolved}, retrying with {fallback}: {e}");
-                complete_single(&fallback, system, user, temperature, max_tokens).await
+                complete_single(cx, &fallback, system, user, temperature, max_tokens).await
             }
         }
     }
 }
 
 async fn complete_single(
+    cx: &asupersync::Cx,
     model: &str,
     system: &str,
     user: &str,
@@ -462,6 +464,7 @@ async fn complete_single(
     let client = get_http_client();
     let response = client
         .request(
+            cx,
             asupersync::http::h1::Method::Post,
             &url,
             headers,
