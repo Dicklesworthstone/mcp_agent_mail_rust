@@ -13,7 +13,22 @@ use sqlmodel_core::Value;
 
 use crate::CliError;
 
-fn legacy_active_reservation_predicate_sql(table_ref: &str) -> String {
+fn has_file_reservations_released_ts_column(conn: &DbConn) -> bool {
+    conn.query_sync("PRAGMA table_info(file_reservations)", &[])
+        .ok()
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.get_named::<String>("name").ok().as_deref() == Some("released_ts"))
+        })
+}
+
+fn legacy_active_reservation_predicate_sql(
+    table_ref: &str,
+    has_legacy_released_ts_column: bool,
+) -> String {
+    if !has_legacy_released_ts_column {
+        return "1 = 1".to_string();
+    }
     let table_ref = table_ref.trim().trim_end_matches('.');
     let predicate = mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE;
     if table_ref.is_empty() || table_ref == "file_reservations" {
@@ -53,39 +68,46 @@ fn active_reservation_release_join_sql(
 
 fn active_reservation_filter_sql(
     has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
     table_ref: &str,
     release_alias: &str,
 ) -> String {
-    let legacy = legacy_active_reservation_predicate_sql(table_ref);
-    if has_release_ledger {
-        format!("({legacy}) AND {release_alias}.reservation_id IS NULL")
-    } else {
-        legacy
+    let legacy = legacy_active_reservation_predicate_sql(table_ref, has_legacy_released_ts_column);
+    match (has_release_ledger, has_legacy_released_ts_column) {
+        (true, true) => format!("({legacy}) AND {release_alias}.reservation_id IS NULL"),
+        (true, false) => format!("{release_alias}.reservation_id IS NULL"),
+        (false, _) => legacy,
     }
 }
 
 fn reservation_released_ts_sql(
     has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
     table_ref: &str,
     release_alias: &str,
 ) -> String {
     let table_ref = table_ref.trim().trim_end_matches('.');
-    let release_expr = format!(
-        "CASE \
-             WHEN {table_ref}.released_ts IS NULL THEN NULL \
-             WHEN typeof({table_ref}.released_ts) = 'text' THEN \
-                 CAST(strftime('%s', REPLACE(REPLACE({table_ref}.released_ts, 'T', ' '), 'Z', '')) AS INTEGER) * 1000000 + \
-                 CASE WHEN instr({table_ref}.released_ts, '.') > 0 \
-                      THEN CAST(substr({table_ref}.released_ts || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
-                      ELSE 0 \
-                 END \
-             ELSE {table_ref}.released_ts \
-         END"
-    );
-    if has_release_ledger {
-        format!("COALESCE({release_alias}.released_ts, {release_expr})")
-    } else {
-        release_expr
+    let legacy_release_expr = has_legacy_released_ts_column.then(|| {
+        format!(
+            "CASE \
+                 WHEN {table_ref}.released_ts IS NULL THEN NULL \
+                 WHEN typeof({table_ref}.released_ts) = 'text' THEN \
+                     CAST(strftime('%s', REPLACE(REPLACE({table_ref}.released_ts, 'T', ' '), 'Z', '')) AS INTEGER) * 1000000 + \
+                     CASE WHEN instr({table_ref}.released_ts, '.') > 0 \
+                          THEN CAST(substr({table_ref}.released_ts || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
+                          ELSE 0 \
+                     END \
+                 ELSE {table_ref}.released_ts \
+             END"
+        )
+    });
+    match (has_release_ledger, legacy_release_expr) {
+        (true, Some(legacy_release_expr)) => {
+            format!("COALESCE({release_alias}.released_ts, {legacy_release_expr})")
+        }
+        (true, None) => format!("{release_alias}.released_ts"),
+        (false, Some(legacy_release_expr)) => legacy_release_expr,
+        (false, None) => "NULL".to_string(),
     }
 }
 
@@ -1167,10 +1189,15 @@ fn build_status(
     let now_us = mcp_agent_mail_db::now_micros();
     let _now_s = now_us / 1_000_000;
     let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let active_reservation_join =
         active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate =
-        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
 
     // 1. Inbox counts (agent-specific, if resolved)
     let (unread, urgent, ack_required, ack_overdue) = if let Some((agent_id, _)) = &agent {
@@ -2520,10 +2547,15 @@ fn build_reservations(
     let now_us = mcp_agent_mail_db::now_micros();
     let expiring_threshold = now_us + i64::from(expiring_minutes.unwrap_or(10)) * 60 * 1_000_000;
     let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let active_reservation_join =
         active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate =
-        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
 
     // Fetch all active reservations
     let all_rows = conn
@@ -2727,8 +2759,14 @@ fn build_timeline(
     // Reservation events
     if kind_filter.is_none() || kind_filter == Some("reservation") {
         let has_release_ledger = has_file_reservation_release_ledger(conn);
+        let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
         let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-        let released_ts_sql = reservation_released_ts_sql(has_release_ledger, "fr", "rr");
+        let released_ts_sql = reservation_released_ts_sql(
+            has_release_ledger,
+            has_legacy_released_ts_column,
+            "fr",
+            "rr",
+        );
         let res_rows = conn
             .query_sync(
                 &format!(
@@ -2831,10 +2869,15 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
 
     let now_us = mcp_agent_mail_db::now_micros();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let active_reservation_join =
         active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate =
-        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
 
     let rows = conn
         .query_sync("SELECT id, slug FROM projects ORDER BY slug ASC", &[])
@@ -2969,10 +3012,19 @@ fn build_analytics(
         active_reservation_release_join_sql(has_release_ledger, "fr1", "rr1");
     let active_reservation_join_fr2 =
         active_reservation_release_join_sql(has_release_ledger, "fr2", "rr2");
-    let active_reservation_predicate_fr1 =
-        active_reservation_filter_sql(has_release_ledger, "fr1", "rr1");
-    let active_reservation_predicate_fr2 =
-        active_reservation_filter_sql(has_release_ledger, "fr2", "rr2");
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let active_reservation_predicate_fr1 = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr1",
+        "rr1",
+    );
+    let active_reservation_predicate_fr2 = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr2",
+        "rr2",
+    );
     let conflict_rows = conn
         .query_sync(
             &format!(
@@ -3019,8 +3071,12 @@ fn build_analytics(
     let expiring_threshold = now_us + 10 * 60 * 1_000_000;
     let active_reservation_join =
         active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate =
-        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
     let expiring_count: i64 = if let Some((agent_id, _)) = &agent {
         conn.query_sync(
             &format!(
@@ -3263,10 +3319,15 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
 fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let active_reservation_join =
         active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate =
-        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
 
     let rows = conn
         .query_sync(
@@ -3469,16 +3530,26 @@ fn build_navigate(
                 .is_none_or(|value| parse_resource_bool(Some(value)));
             let now_us = mcp_agent_mail_db::now_micros();
             let has_release_ledger = has_file_reservation_release_ledger(conn);
+            let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
             let active_reservation_join =
                 active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-            let active_reservation_predicate =
-                active_reservation_filter_sql(has_release_ledger, "fr", "rr");
-            let released_ts_sql = reservation_released_ts_sql(has_release_ledger, "fr", "rr");
+            let active_reservation_predicate = active_reservation_filter_sql(
+                has_release_ledger,
+                has_legacy_released_ts_column,
+                "fr",
+                "rr",
+            );
+            let released_ts_sql = reservation_released_ts_sql(
+                has_release_ledger,
+                has_legacy_released_ts_column,
+                "fr",
+                "rr",
+            );
 
             let (sql, params) = if active_only {
                 (
                     format!(
-                        "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, fr.released_ts, fr.created_ts
+                        "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
                          FROM file_reservations fr{active_reservation_join}
                          JOIN agents a ON a.id = fr.agent_id
                          WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
@@ -6755,6 +6826,140 @@ mod tests {
             }
             other => panic!("unexpected all reservations result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn active_reservation_helpers_omit_legacy_column_when_schema_lacks_it() {
+        let active_with_ledger = active_reservation_filter_sql(true, false, "fr", "rr");
+        assert_eq!(active_with_ledger, "rr.reservation_id IS NULL");
+
+        let released_with_ledger = reservation_released_ts_sql(true, false, "fr", "rr");
+        assert_eq!(released_with_ledger, "rr.released_ts");
+
+        let active_without_ledger = active_reservation_filter_sql(false, false, "fr", "rr");
+        assert_eq!(active_without_ledger, "1 = 1");
+
+        let released_without_ledger = reservation_released_ts_sql(false, false, "fr", "rr");
+        assert_eq!(released_without_ledger, "NULL");
+    }
+
+    #[test]
+    fn test_build_navigate_active_only_file_reservations_supports_release_ledger_without_legacy_released_ts_column()
+     {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir
+            .path()
+            .join("robot_navigate_reservation_active_only_release_ledger.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                task_description TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                contact_policy TEXT,
+                attachments_policy TEXT,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                \"exclusive\" INTEGER NOT NULL,
+                reason TEXT,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create file reservations");
+        conn.query_sync(
+            "CREATE TABLE file_reservation_releases (
+                reservation_id INTEGER PRIMARY KEY,
+                released_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create file reservation releases");
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'proj', '/tmp/proj', 1000)",
+            &empty,
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (
+                id, project_id, name, program, model, task_description,
+                created_at, updated_at, contact_policy, attachments_policy, last_active_ts
+             ) VALUES (
+                1, 1, 'Sender', 'codex-cli', 'gpt-5', 'task',
+                1000, 1000, 'auto', 'inline', 1000
+             )",
+            &empty,
+        )
+        .expect("insert agent");
+
+        let now = mcp_agent_mail_db::now_micros();
+        let active_expiry = now + 3_600_000_000;
+        conn.query_sync(
+            "INSERT INTO file_reservations (
+                id, project_id, agent_id, path_pattern, \"exclusive\",
+                reason, created_ts, expires_ts
+             ) VALUES (
+                1, 1, 1, 'src/**', 1, 'active', 1000, ?
+             )",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                active_expiry,
+            )],
+        )
+        .expect("insert active reservation");
+
+        let (active_only_result, active_scope) = build_navigate(
+            &conn,
+            "resource://file_reservations/%2Ftmp%2Fproj",
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate active-only reservations with release ledger");
+
+        match active_only_result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "file_reservations");
+                let reservations = data["reservations"].as_array().expect("reservations array");
+                assert_eq!(reservations.len(), 1);
+                assert_eq!(reservations[0]["path"], "src/**");
+                assert_eq!(reservations[0]["released"], false);
+            }
+            other => panic!("unexpected active-only reservations result: {other:?}"),
+        }
+        assert_eq!(active_scope.as_deref(), Some("proj"));
     }
 
     #[test]
