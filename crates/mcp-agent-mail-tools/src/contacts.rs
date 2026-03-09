@@ -626,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_policies_are_not_silently_coerced() {
+    fn normalize_contact_policy_preserves_unknown_values() {
         assert_eq!(normalize_contact_policy(""), "");
         assert_eq!(normalize_contact_policy("invalid"), "invalid");
         assert_eq!(normalize_contact_policy("reject"), "reject");
