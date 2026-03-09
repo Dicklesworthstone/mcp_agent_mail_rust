@@ -780,11 +780,6 @@ pub async fn renew_file_reservations(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
-    // Convert paths to slice of &str
-    let _paths_ref: Option<Vec<&str>> = normalized_paths
-        .as_ref()
-        .map(|p| p.iter().map(String::as_str).collect());
-
     let existing_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, true).await,
     )?;

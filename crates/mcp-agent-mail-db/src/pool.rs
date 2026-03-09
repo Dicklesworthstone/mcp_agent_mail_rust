@@ -1031,7 +1031,10 @@ fn sqlite_identity_path_cache_insert(path: &str, normalized: &str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !cache.contains_key(path)
         && cache.len() >= SQLITE_IDENTITY_PATH_CACHE_MAX_ENTRIES
-        && let Some(victim) = cache.keys().next().cloned()
+        && let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.validated_at)
+            .map(|(k, _)| k.clone())
     {
         cache.remove(&victim);
     }

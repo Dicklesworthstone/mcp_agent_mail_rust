@@ -3950,7 +3950,7 @@ pub async fn search_messages(
     // Sanitize the FTS query; None means "no meaningful results possible"
     let sanitized = sanitize_fts_query(query);
 
-    let rows_out = if let Some(_) = sanitized {
+    let rows_out = if sanitized.is_some() {
         // FTS5-backed search was decommissioned (br-2tnl.8.4).
         // Fall back directly to LIKE with extracted terms for legacy/fallback path.
         let terms = extract_like_terms(query, 5);
@@ -4042,7 +4042,7 @@ pub async fn search_messages_for_product(
     };
 
     let sanitized = sanitize_fts_query(query);
-    let rows_out = if let Some(_) = sanitized {
+    let rows_out = if sanitized.is_some() {
         // FTS5-backed search was decommissioned (br-2tnl.8.4).
         // Fall back directly to LIKE with extracted terms for legacy/fallback path.
         let terms = extract_like_terms(query, 5);
@@ -4332,7 +4332,7 @@ pub async fn search_messages_global(
     };
 
     let sanitized = sanitize_fts_query(query);
-    let rows_out = if let Some(_) = sanitized {
+    let rows_out = if sanitized.is_some() {
         // FTS5-backed search was decommissioned (br-2tnl.8.4).
         // Fall back directly to LIKE with extracted terms for legacy/fallback path.
         let terms = extract_like_terms(query, 5);
