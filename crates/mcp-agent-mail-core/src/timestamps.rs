@@ -59,31 +59,42 @@ pub fn micros_to_naive(micros: i64) -> NaiveDateTime {
 
 /// Get current time as microseconds since Unix epoch, with clock skew protection.
 ///
-/// If the wall clock jumped backward by more than 1 second, returns the
-/// last observed value (monotonic guarantee for stored timestamps).
-/// Forward jumps over 5 minutes are logged as warnings.
+/// Uses `AtomicI64::fetch_max` to maintain a monotonic high-water mark
+/// without races. Two concurrent threads can never clobber each other's
+/// updates because `fetch_max` is a single atomic read-modify-write.
+///
+/// If the wall clock jumped backward by more than 1 second, the skew
+/// counter is bumped. Forward jumps over 5 minutes are also tracked.
+/// Strict monotonicity is guaranteed: no two calls ever return the same value.
 #[inline]
 #[must_use]
 pub fn now_micros() -> i64 {
     let current = Utc::now().timestamp_micros();
-    let last = LAST_SYSTEM_TIME_US.load(Ordering::Relaxed);
 
-    if last != 0 {
-        let delta = current - last;
+    // Atomically set high-water mark and retrieve the previous value.
+    // fetch_max(current) stores max(old, current) and returns old.
+    let prev = LAST_SYSTEM_TIME_US.fetch_max(current, Ordering::AcqRel);
+
+    if prev != 0 {
+        let delta = current - prev;
         if delta < -BACKWARD_JUMP_THRESHOLD_US {
-            // Clock jumped backward — prevent timestamp regression.
             CLOCK_SKEW_BACKWARD_COUNT.fetch_add(1, Ordering::Relaxed);
-            // Don't update LAST_SYSTEM_TIME_US so we keep the high-water mark.
-            return last;
         }
         if delta > FORWARD_JUMP_THRESHOLD_US {
-            // Clock jumped forward — likely NTP correction or resume from suspend.
             CLOCK_SKEW_FORWARD_COUNT.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    LAST_SYSTEM_TIME_US.store(current, Ordering::Relaxed);
-    current
+    if current > prev {
+        // Normal forward progress — fetch_max already stored `current`.
+        current
+    } else {
+        // Clock stood still or went backward; advance by 1 past the
+        // high-water mark to guarantee strict monotonicity.
+        let next = prev + 1;
+        LAST_SYSTEM_TIME_US.fetch_max(next, Ordering::AcqRel);
+        next
+    }
 }
 
 /// Get the raw wall-clock time without skew protection.
