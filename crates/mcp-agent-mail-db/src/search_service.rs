@@ -1270,7 +1270,8 @@ fn scored_results_to_search_results(hits: Vec<ScoredResult>) -> Vec<SearchResult
             redacted: false,
             redaction_reason: None,
             ..SearchResult::default()
-            })        .collect()
+        })
+        .collect()
 }
 
 #[cfg(feature = "hybrid")]
@@ -3084,6 +3085,85 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
     hasher.finish()
 }
 
+fn default_scope_context() -> ScopeContext {
+    ScopeContext {
+        viewer: None,
+        approved_contacts: Vec::new(),
+        viewer_project_ids: Vec::new(),
+        sender_policies: Vec::new(),
+        recipient_map: Vec::new(),
+    }
+}
+
+/// Authorization-aware discriminator for query-cache keying.
+///
+/// Search results are cached *after* scope filtering and redaction, so the cache
+/// key must include the effective authorization context and redaction policy that
+/// produced the response. Otherwise operator/scoped or differently redacted
+/// responses can collide and be replayed incorrectly.
+fn cache_authorization_discriminator(options: &SearchOptions) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let scope_ctx = options
+        .scope_ctx
+        .clone()
+        .unwrap_or_else(default_scope_context);
+    let redaction = options.redaction_policy.clone().unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+
+    match scope_ctx.viewer {
+        Some(viewer) => {
+            "viewer".hash(&mut hasher);
+            viewer.project_id.hash(&mut hasher);
+            viewer.agent_id.hash(&mut hasher);
+        }
+        None => {
+            "operator".hash(&mut hasher);
+        }
+    }
+
+    let mut approved_contacts = scope_ctx.approved_contacts;
+    approved_contacts.sort_unstable();
+    approved_contacts.dedup();
+    approved_contacts.hash(&mut hasher);
+
+    let mut viewer_project_ids = scope_ctx.viewer_project_ids;
+    viewer_project_ids.sort_unstable();
+    viewer_project_ids.dedup();
+    viewer_project_ids.hash(&mut hasher);
+
+    let mut sender_policies = scope_ctx
+        .sender_policies
+        .into_iter()
+        .map(|policy| (policy.project_id, policy.agent_id, policy.policy.as_str()))
+        .collect::<Vec<_>>();
+    sender_policies.sort_unstable();
+    sender_policies.dedup();
+    sender_policies.hash(&mut hasher);
+
+    let mut recipient_map = scope_ctx
+        .recipient_map
+        .into_iter()
+        .map(|entry| {
+            let mut agent_ids = entry.agent_ids;
+            agent_ids.sort_unstable();
+            agent_ids.dedup();
+            (entry.message_id, agent_ids)
+        })
+        .collect::<Vec<_>>();
+    recipient_map.sort_unstable();
+    recipient_map.dedup();
+    recipient_map.hash(&mut hasher);
+
+    redaction.redact_body.hash(&mut hasher);
+    redaction.redact_sender.hash(&mut hasher);
+    redaction.redact_thread.hash(&mut hasher);
+    redaction.body_placeholder.hash(&mut hasher);
+
+    hasher.finish()
+}
+
 fn build_search_cache_key(
     pool: &DbPool,
     query: &SearchQuery,
@@ -3100,6 +3180,7 @@ fn build_search_cache_key(
     let mode = engine_to_search_mode(engine_mode);
     let mut discriminator_hasher = DefaultHasher::new();
     cache_scope_discriminator(query).hash(&mut discriminator_hasher);
+    cache_authorization_discriminator(options).hash(&mut discriminator_hasher);
     sqlite_key_for_pool(pool).hash(&mut discriminator_hasher);
     let scope_discriminator = discriminator_hasher.finish();
     // Cursor-based pagination: hash cursor token into offset proxy.
@@ -3202,7 +3283,8 @@ pub async fn execute_search(
                         redacted: false,
                         redaction_reason: None,
                         ..SearchResult::default()
-                        })                    .collect(),
+                    })
+                    .collect(),
                 Outcome::Err(err) => return Outcome::Err(err),
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
@@ -3236,7 +3318,8 @@ pub async fn execute_search(
                         redacted: false,
                         redaction_reason: None,
                         ..SearchResult::default()
-                        })                    .collect(),
+                    })
+                    .collect(),
                 Outcome::Err(err) => return Outcome::Err(err),
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
@@ -3262,7 +3345,8 @@ pub async fn execute_search(
                         redacted: false,
                         redaction_reason: None,
                         ..SearchResult::default()
-                        })                    .collect(),
+                    })
+                    .collect(),
                 Outcome::Err(err) => return Outcome::Err(err),
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
@@ -3538,13 +3622,10 @@ fn finish_scoped_response(
     let sql_row_count = raw_results.len();
     let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
     let redaction = options.redaction_policy.clone().unwrap_or_default();
-    let scope_ctx = options.scope_ctx.clone().unwrap_or_else(|| ScopeContext {
-        viewer: None,
-        approved_contacts: Vec::new(),
-        viewer_project_ids: Vec::new(),
-        sender_policies: Vec::new(),
-        recipient_map: Vec::new(),
-    });
+    let scope_ctx = options
+        .scope_ctx
+        .clone()
+        .unwrap_or_else(default_scope_context);
     let (scoped_results, audit_summary) = apply_scope(raw_results, &scope_ctx, &redaction);
     let guidance = generate_zero_result_guidance(query, scoped_results.len(), assistance.as_ref());
     let explain = if query.explain {
@@ -3656,6 +3737,9 @@ fn micros_to_f64_for_cursor(micros: i64) -> f64 {
 mod tests {
     use super::*;
     use crate::search_planner::{Importance, RankingMode, SearchCursor};
+    use crate::search_scope::{
+        ContactPolicyKind, RecipientEntry, ScopeContext, SenderPolicy, ViewerIdentity,
+    };
     use mcp_agent_mail_core::metrics::global_metrics;
     use std::sync::{LazyLock, Mutex};
     #[cfg(feature = "hybrid")]
@@ -4045,6 +4129,177 @@ mod tests {
         assert_eq!(
             cache_scope_discriminator(&q1),
             cache_scope_discriminator(&q2)
+        );
+    }
+
+    #[test]
+    fn build_search_cache_key_distinguishes_authorization_context() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+        let query = SearchQuery {
+            text: "shared".to_string(),
+            ..Default::default()
+        };
+
+        let viewer_a = SearchOptions {
+            scope_ctx: Some(ScopeContext {
+                viewer: Some(ViewerIdentity {
+                    project_id: 1,
+                    agent_id: 101,
+                }),
+                approved_contacts: vec![(1, 201)],
+                viewer_project_ids: vec![1, 2],
+                sender_policies: vec![SenderPolicy {
+                    project_id: 1,
+                    agent_id: 301,
+                    policy: ContactPolicyKind::ContactsOnly,
+                }],
+                recipient_map: vec![RecipientEntry {
+                    message_id: 77,
+                    agent_ids: vec![101, 202],
+                }],
+            }),
+            ..SearchOptions::default()
+        };
+        let viewer_b = SearchOptions {
+            scope_ctx: Some(ScopeContext {
+                viewer: Some(ViewerIdentity {
+                    project_id: 1,
+                    agent_id: 102,
+                }),
+                approved_contacts: vec![(1, 201)],
+                viewer_project_ids: vec![1, 2],
+                sender_policies: vec![SenderPolicy {
+                    project_id: 1,
+                    agent_id: 301,
+                    policy: ContactPolicyKind::ContactsOnly,
+                }],
+                recipient_map: vec![RecipientEntry {
+                    message_id: 77,
+                    agent_ids: vec![102, 202],
+                }],
+            }),
+            ..SearchOptions::default()
+        };
+
+        assert_ne!(
+            build_search_cache_key(&pool, &query, &viewer_a, 9),
+            build_search_cache_key(&pool, &query, &viewer_b, 9),
+            "different authorization contexts must not share scoped search cache entries"
+        );
+    }
+
+    #[test]
+    fn build_search_cache_key_scope_context_is_order_invariant() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+        let query = SearchQuery {
+            text: "shared".to_string(),
+            ..Default::default()
+        };
+
+        let opts_a = SearchOptions {
+            scope_ctx: Some(ScopeContext {
+                viewer: Some(ViewerIdentity {
+                    project_id: 1,
+                    agent_id: 101,
+                }),
+                approved_contacts: vec![(2, 9), (1, 8)],
+                viewer_project_ids: vec![3, 1, 2],
+                sender_policies: vec![
+                    SenderPolicy {
+                        project_id: 2,
+                        agent_id: 22,
+                        policy: ContactPolicyKind::Auto,
+                    },
+                    SenderPolicy {
+                        project_id: 1,
+                        agent_id: 11,
+                        policy: ContactPolicyKind::Open,
+                    },
+                ],
+                recipient_map: vec![
+                    RecipientEntry {
+                        message_id: 90,
+                        agent_ids: vec![5, 4, 4],
+                    },
+                    RecipientEntry {
+                        message_id: 91,
+                        agent_ids: vec![8, 7],
+                    },
+                ],
+            }),
+            ..SearchOptions::default()
+        };
+        let opts_b = SearchOptions {
+            scope_ctx: Some(ScopeContext {
+                viewer: Some(ViewerIdentity {
+                    project_id: 1,
+                    agent_id: 101,
+                }),
+                approved_contacts: vec![(1, 8), (2, 9), (1, 8)],
+                viewer_project_ids: vec![2, 3, 1, 2],
+                sender_policies: vec![
+                    SenderPolicy {
+                        project_id: 1,
+                        agent_id: 11,
+                        policy: ContactPolicyKind::Open,
+                    },
+                    SenderPolicy {
+                        project_id: 2,
+                        agent_id: 22,
+                        policy: ContactPolicyKind::Auto,
+                    },
+                ],
+                recipient_map: vec![
+                    RecipientEntry {
+                        message_id: 91,
+                        agent_ids: vec![7, 8],
+                    },
+                    RecipientEntry {
+                        message_id: 90,
+                        agent_ids: vec![4, 5],
+                    },
+                ],
+            }),
+            ..SearchOptions::default()
+        };
+
+        assert_eq!(
+            build_search_cache_key(&pool, &query, &opts_a, 9),
+            build_search_cache_key(&pool, &query, &opts_b, 9),
+            "equivalent scope contexts should hash identically regardless of input ordering"
+        );
+    }
+
+    #[test]
+    fn build_search_cache_key_distinguishes_redaction_policy() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+        let query = SearchQuery {
+            text: "shared".to_string(),
+            ..Default::default()
+        };
+
+        let default_redaction = SearchOptions::default();
+        let strict_redaction = SearchOptions {
+            redaction_policy: Some(crate::search_scope::RedactionPolicy::strict()),
+            ..SearchOptions::default()
+        };
+
+        assert_ne!(
+            build_search_cache_key(&pool, &query, &default_redaction, 9),
+            build_search_cache_key(&pool, &query, &strict_redaction, 9),
+            "differently redacted search responses must not share cache entries"
         );
     }
 

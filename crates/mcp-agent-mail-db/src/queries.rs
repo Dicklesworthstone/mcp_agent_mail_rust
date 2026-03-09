@@ -6636,14 +6636,32 @@ pub async fn get_reservations_by_ids(
 ///
 /// Marks all given IDs as released in the sidecar release ledger when they are
 /// still logically active under [`ACTIVE_RESERVATION_PREDICATE`].
+/// Returns the IDs newly marked released, in input order.
+pub async fn release_reservations_by_ids_returning_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    ids: &[i64],
+) -> Outcome<Vec<i64>, DbError> {
+    match release_reservations_by_ids_matching_expiry(cx, pool, ids, None).await {
+        Outcome::Ok(markers) => Outcome::Ok(markers.into_iter().map(|marker| marker.id).collect()),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Release specific file reservations by their IDs.
+///
+/// Marks all given IDs as released in the sidecar release ledger when they are
+/// still logically active under [`ACTIVE_RESERVATION_PREDICATE`].
 /// Returns the number of reservations newly marked released.
 pub async fn release_reservations_by_ids(
     cx: &Cx,
     pool: &DbPool,
     ids: &[i64],
 ) -> Outcome<usize, DbError> {
-    match release_reservations_by_ids_matching_expiry(cx, pool, ids, None).await {
-        Outcome::Ok(markers) => Outcome::Ok(markers.len()),
+    match release_reservations_by_ids_returning_ids(cx, pool, ids).await {
+        Outcome::Ok(released_ids) => Outcome::Ok(released_ids.len()),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -8347,6 +8365,68 @@ mod tests {
                 .into_result()
                 .expect("list active reservations");
             assert_eq!(active.len(), 1, "reservation should remain active");
+        });
+    }
+
+    #[test]
+    fn release_reservations_by_ids_returning_ids_omits_already_released_rows() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("release_ids_exact.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-release-ids-exact-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+
+            let created = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/main.rs", "src/lib.rs"],
+                3600,
+                true,
+                "test",
+            )
+            .await
+            .into_result()
+            .expect("create reservations");
+            let first_id = created[0].id.expect("first reservation id");
+            let second_id = created[1].id.expect("second reservation id");
+
+            release_reservations_by_ids(&cx, &pool, &[first_id])
+                .await
+                .into_result()
+                .expect("release first reservation");
+
+            let released_ids =
+                release_reservations_by_ids_returning_ids(&cx, &pool, &[first_id, second_id])
+                    .await
+                    .into_result()
+                    .expect("release exact id set");
+            assert_eq!(released_ids, vec![second_id]);
         });
     }
 
