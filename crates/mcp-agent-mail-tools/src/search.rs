@@ -358,7 +358,8 @@ pub(crate) fn summarize_messages(
             let upper = stripped.to_ascii_uppercase();
             if keywords.iter().any(|k| upper.contains(k)) {
                 if seen_actions.insert(stripped.to_string()) {
-                    if upper.contains("FIXME") || upper.contains("TODO") || upper.contains("ACTION") {
+                    if upper.contains("FIXME") || upper.contains("TODO") || upper.contains("ACTION")
+                    {
                         open_actions += 1;
                     }
                     action_items.push(stripped.to_string());
@@ -396,6 +397,25 @@ pub(crate) fn summarize_messages(
         mentions,
         code_references: code_refs,
     }
+}
+
+fn backtick_snippets(line: &str) -> Vec<&str> {
+    let mut snippets = Vec::new();
+    let mut start = None;
+
+    for (idx, ch) in line.char_indices() {
+        if ch != '`' {
+            continue;
+        }
+
+        match start.take() {
+            Some(content_start) if content_start < idx => snippets.push(&line[content_start..idx]),
+            Some(_) => {}
+            None => start = Some(idx + ch.len_utf8()),
+        }
+    }
+
+    snippets
 }
 
 /// Parse a search mode string, returning a helpful error for invalid values.
