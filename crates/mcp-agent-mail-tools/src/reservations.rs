@@ -258,14 +258,21 @@ fn released_ts_json_value(released_ts: Option<i64>) -> serde_json::Value {
     })
 }
 
-fn normalize_repo_path(input: &str) -> PathBuf {
+fn normalize_repo_path(input: &str) -> McpResult<PathBuf> {
     let path = expand_tilde(input);
-    if path.is_absolute() {
-        return path;
+    if path.as_os_str().is_empty() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Repository path must not be empty.",
+        ));
     }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(&path))
-        .unwrap_or(path)
+    if !path.is_absolute() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!("Repository path must be absolute (or use ~/...): {}", input),
+        ));
+    }
+    Ok(path)
 }
 
 fn renewal_filter_matches(
@@ -283,7 +290,9 @@ fn renewal_filter_matches(
     {
         return false;
     }
-    if let Some(path_patterns) = paths && !path_patterns.is_empty() {
+    if let Some(path_patterns) = paths
+        && !path_patterns.is_empty()
+    {
         let mut matched = false;
         for pat in path_patterns {
             if row.path_pattern == *pat {
@@ -663,7 +672,12 @@ pub async fn release_file_reservations(
         )?;
         let mut ids = Vec::new();
         for res in existing_rows {
-            if renewal_filter_matches(&res, agent_id, normalized_paths.as_deref(), file_reservation_ids.as_deref()) {
+            if renewal_filter_matches(
+                &res,
+                agent_id,
+                normalized_paths.as_deref(),
+                file_reservation_ids.as_deref(),
+            ) {
                 if let Some(rid) = res.id {
                     ids.push(rid);
                 }
@@ -1261,7 +1275,7 @@ pub fn install_precommit_guard(
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }
 
-    let repo_path = normalize_repo_path(&code_repo_path);
+    let repo_path = normalize_repo_path(&code_repo_path)?;
 
     if !repo_path.exists() {
         return Err(McpError::new(
@@ -1335,13 +1349,13 @@ pub fn install_precommit_guard(
 /// Restores any previously preserved hooks.
 ///
 /// # Parameters
-/// - `code_repo_path`: Path to the code repository
+/// - `code_repo_path`: Absolute path to the git repository
 ///
 /// # Returns
 /// `{"removed": true}` if guard artifacts were removed, `{"removed": false}` otherwise.
 #[tool(description = "")]
 pub fn uninstall_precommit_guard(_ctx: &McpContext, code_repo_path: String) -> McpResult<String> {
-    let repo_path = normalize_repo_path(&code_repo_path);
+    let repo_path = normalize_repo_path(&code_repo_path)?;
 
     if !repo_path.exists() {
         return Err(McpError::new(
@@ -1452,23 +1466,21 @@ mod tests {
     #[test]
     fn normalize_absolute_path_unchanged() {
         assert_eq!(
-            normalize_repo_path("/data/projects/repo"),
+            normalize_repo_path("/data/projects/repo").unwrap(),
             PathBuf::from("/data/projects/repo")
         );
     }
 
     #[test]
-    fn normalize_relative_path_joins_cwd() {
-        let result = normalize_repo_path("src/main.rs");
-        // Should be absolute (joined with cwd)
-        assert!(result.is_absolute());
-        assert!(result.to_string_lossy().ends_with("src/main.rs"));
+    fn normalize_relative_path_rejected() {
+        let err = normalize_repo_path("src/main.rs").expect_err("relative path must fail");
+        assert!(err.to_string().contains("must be absolute"));
     }
 
     #[test]
     fn normalize_tilde_path_expanded() {
         if std::env::var_os("HOME").is_some() {
-            let result = normalize_repo_path("~/projects/repo");
+            let result = normalize_repo_path("~/projects/repo").unwrap();
             assert!(result.is_absolute());
             assert!(result.to_string_lossy().ends_with("projects/repo"));
         }
@@ -1780,15 +1792,14 @@ mod tests {
 
     #[test]
     fn normalize_repo_path_empty_string() {
-        let result = normalize_repo_path("");
-        // Empty string joined with CWD gives CWD
-        assert!(result.is_absolute());
+        let err = normalize_repo_path("").expect_err("empty path must fail");
+        assert!(err.to_string().contains("must not be empty"));
     }
 
     #[test]
     fn normalize_repo_path_dot() {
-        let result = normalize_repo_path(".");
-        assert!(result.is_absolute());
+        let err = normalize_repo_path(".").expect_err("dot path must fail");
+        assert!(err.to_string().contains("must be absolute"));
     }
 
     // ── TTL validation edge cases ──

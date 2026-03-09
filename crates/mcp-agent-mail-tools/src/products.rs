@@ -63,8 +63,13 @@ fn generate_product_uid(now_micros: i64) -> String {
 
 fn parse_fetch_inbox_product_limit(limit: Option<i32>) -> McpResult<usize> {
     let mut msg_limit = limit.unwrap_or(20);
-    if msg_limit <= 0 {
-        return Ok(0);
+    if msg_limit < 1 {
+        return Err(legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit must be at least 1, got {msg_limit}. Use a positive integer."),
+            true,
+            serde_json::json!({ "provided": msg_limit, "min": 1, "max": 1000 }),
+        ));
     }
     if msg_limit > 1000 {
         tracing::info!(
@@ -99,14 +104,41 @@ fn parse_product_since_ts(since_ts: Option<&str>) -> Option<i64> {
     }
 }
 
-fn parse_product_thread_limit(per_thread_limit: Option<i32>) -> Option<usize> {
-    per_thread_limit.and_then(|limit| {
-        if limit <= 0 {
-            None
-        } else {
-            usize::try_from(limit).ok()
-        }
+fn parse_product_thread_limit(per_thread_limit: Option<i32>) -> McpResult<usize> {
+    let msg_limit_raw = per_thread_limit.unwrap_or(50);
+    if msg_limit_raw < 1 {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: per_thread_limit must be at least 1. Check that all parameters have valid values.",
+            true,
+            serde_json::json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
+        ));
+    }
+    usize::try_from(msg_limit_raw).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: per_thread_limit exceeds supported range. Check that all parameters have valid values.",
+            true,
+            serde_json::json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
+        )
     })
+}
+
+fn parse_product_search_limit(limit: Option<i32>) -> usize {
+    let max_results_raw = match limit {
+        Some(value) if value > 0 => value.clamp(1, 1000),
+        _ => 20,
+    };
+    max_results_raw.unsigned_abs() as usize
+}
+
+fn is_not_found_tool_error(err: &McpError) -> bool {
+    err.data
+        .as_ref()
+        .and_then(|data| data.get("error"))
+        .and_then(|error| error.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|ty| ty == "NOT_FOUND")
 }
 
 async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Option<ProductRow>> {
@@ -379,7 +411,7 @@ pub async fn search_messages_product(
     }
 
     let pool = get_db_pool()?;
-    let max_results = usize::try_from(limit.unwrap_or(20).clamp(1, 1000)).unwrap_or(20);
+    let max_results = parse_product_search_limit(limit);
 
     // Parse optional ranking mode
     let ranking_mode = match &ranking {
@@ -519,9 +551,6 @@ pub async fn fetch_inbox_product(
     )?;
 
     let max_messages = parse_fetch_inbox_product_limit(limit)?;
-    if max_messages == 0 {
-        return Ok("[]".to_string());
-    }
     let urgent = urgent_only.unwrap_or(false);
     let with_bodies = include_bodies.unwrap_or(false);
     let since_micros = parse_product_since_ts(since_ts.as_deref());
@@ -529,12 +558,15 @@ pub async fn fetch_inbox_product(
     let mut items: Vec<(i64, i64, InboxMessage)> = Vec::with_capacity(max_messages); // (created_ts, id, msg)
     for p in projects {
         let project_id = p.id.unwrap_or(0);
-        // Skip if agent doesn't exist in this project.
-        let Ok(agent) =
-            resolve_agent(ctx, &pool, project_id, &agent_name, &p.slug, &p.human_key).await
-        else {
-            continue;
-        };
+        let agent =
+            match resolve_agent(ctx, &pool, project_id, &agent_name, &p.slug, &p.human_key).await {
+                Ok(agent) => agent,
+                Err(err) if is_not_found_tool_error(&err) => {
+                    // Product inbox spans linked projects, so absence in one project is fine.
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
         let rows = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::fetch_inbox(
                 ctx.cx(),
@@ -648,9 +680,8 @@ pub async fn summarize_thread_product(
         mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
     )?;
 
-    let msg_limit = parse_product_thread_limit(per_thread_limit);
-    let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> =
-        Vec::with_capacity(msg_limit.unwrap_or(50));
+    let msg_limit = parse_product_thread_limit(per_thread_limit)?;
+    let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> = Vec::with_capacity(msg_limit);
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         let msgs = db_outcome_to_mcp_result(
@@ -659,7 +690,7 @@ pub async fn summarize_thread_product(
                 &pool,
                 project_id,
                 &thread_id,
-                msg_limit,
+                Some(msg_limit),
             )
             .await,
         )?;
@@ -1111,16 +1142,13 @@ mod tests {
     }
 
     #[test]
-    fn fetch_inbox_product_non_positive_limit_returns_empty_result_window() {
-        assert_eq!(
-            parse_fetch_inbox_product_limit(Some(0)).expect("zero limit should be accepted"),
-            0
-        );
-        assert_eq!(
-            parse_fetch_inbox_product_limit(Some(-5))
-                .expect("negative limit should collapse to empty window"),
-            0
-        );
+    fn fetch_inbox_product_limit_must_be_positive() {
+        let err = parse_fetch_inbox_product_limit(Some(0)).expect_err("zero limit should fail");
+        assert!(err.to_string().contains("limit must be at least 1"));
+
+        let err =
+            parse_fetch_inbox_product_limit(Some(-5)).expect_err("negative limit should fail");
+        assert!(err.to_string().contains("limit must be at least 1"));
     }
 
     #[test]
@@ -1132,15 +1160,64 @@ mod tests {
     }
 
     #[test]
+    fn product_search_limit_defaults_for_non_positive_inputs() {
+        assert_eq!(parse_product_search_limit(None), 20);
+        assert_eq!(parse_product_search_limit(Some(0)), 20);
+        assert_eq!(parse_product_search_limit(Some(-5)), 20);
+    }
+
+    #[test]
+    fn product_search_limit_caps_large_values() {
+        assert_eq!(parse_product_search_limit(Some(5_000)), 1000);
+    }
+
+    #[test]
     fn fetch_inbox_product_invalid_since_ts_is_ignored() {
         assert_eq!(parse_product_since_ts(Some("2026/03/09 12:00:00")), None);
     }
 
     #[test]
-    fn summarize_thread_product_non_positive_limit_means_unbounded() {
-        assert_eq!(parse_product_thread_limit(Some(0)), None);
-        assert_eq!(parse_product_thread_limit(Some(-5)), None);
-        assert_eq!(parse_product_thread_limit(Some(7)), Some(7));
+    fn summarize_thread_product_limit_must_be_positive() {
+        let err =
+            parse_product_thread_limit(Some(0)).expect_err("zero per_thread_limit should fail");
+        assert!(
+            err.to_string()
+                .contains("per_thread_limit must be at least 1")
+        );
+
+        let err = parse_product_thread_limit(Some(-5))
+            .expect_err("negative per_thread_limit should fail");
+        assert!(
+            err.to_string()
+                .contains("per_thread_limit must be at least 1")
+        );
+    }
+
+    #[test]
+    fn summarize_thread_product_positive_limit_is_accepted() {
+        assert_eq!(
+            parse_product_thread_limit(Some(7)).expect("positive limit should pass"),
+            7
+        );
+    }
+
+    #[test]
+    fn not_found_tool_error_helper_matches_only_not_found() {
+        let not_found = legacy_tool_error(
+            "NOT_FOUND",
+            "missing agent",
+            true,
+            serde_json::json!({"agent_name":"GreenPlateau"}),
+        );
+        assert!(is_not_found_tool_error(&not_found));
+
+        let resource_busy = legacy_tool_error(
+            "RESOURCE_BUSY",
+            "database is locked",
+            true,
+            serde_json::json!({"resource":"sqlite"}),
+        );
+        assert!(!is_not_found_tool_error(&resource_busy));
     }
 
     #[test]
