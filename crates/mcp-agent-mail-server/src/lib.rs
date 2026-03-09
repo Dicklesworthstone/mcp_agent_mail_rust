@@ -5603,11 +5603,15 @@ to skip auth for local requests.</p>
             "tools/call" => {
                 let mut params: fastmcp_protocol::CallToolParams = parse_params(request.params)?;
                 let tool_name = params.name.clone();
+
                 if (tool_name == "send_message" || tool_name == "reply_message")
                     && let Some(arguments) = params.arguments.as_mut()
                 {
+                    // Keep alias normalization tool-specific so one cluster cannot
+                    // silently rewrite another tool's documented parameters.
                     mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
                 }
+
                 // Extract format param before dispatch (TOON support)
                 let format_value = params
                     .arguments
@@ -7884,6 +7888,7 @@ mod tests {
 
     static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
     static TUI_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TOOL_DISPATCH_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     /// Regression test: Budget deadline must be relative to `wall_now()`, not absolute.
@@ -8426,6 +8431,39 @@ mod tests {
         let server_capabilities = server.capabilities().clone();
         let router = Arc::new(server.into_router());
         HttpState::new(router, server_info, server_capabilities, config)
+    }
+
+    fn with_serialized_tool_dispatch_env<F, T>(f: F) -> T
+    where
+        F: FnOnce(String) -> T,
+    {
+        let _lock = TOOL_DISPATCH_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tool dispatch tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let project_root = temp.path().join("project-root");
+        std::fs::create_dir_all(&storage_root).expect("tool dispatch storage root");
+        std::fs::create_dir_all(&project_root).expect("tool dispatch project root");
+
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("tool dispatch storage root utf-8")
+            .to_string();
+        let project_key = project_root
+            .to_str()
+            .expect("tool dispatch project root utf-8")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            || f(project_key),
+        )
     }
 
     fn make_request(method: Http1Method, uri: &str, headers: &[(&str, &str)]) -> Http1Request {
@@ -9451,6 +9489,85 @@ mod tests {
             resp.error.is_some(),
             "unknown method must return an error response"
         );
+    }
+
+    #[test]
+    fn dispatch_request_contact_preserves_contact_parameter_names() {
+        with_serialized_tool_dispatch_env(|project_key| {
+            let config = mcp_agent_mail_core::Config::from_env();
+            let state = build_state(config);
+
+            let ensure_project = state.dispatch_inner(JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "ensure_project",
+                    "arguments": {
+                        "human_key": project_key.as_str(),
+                    }
+                })),
+                1_i64,
+            ));
+            assert!(
+                ensure_project.is_ok(),
+                "ensure_project should succeed before contact flow: {ensure_project:?}"
+            );
+
+            let register_sender = state.dispatch_inner(JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "register_agent",
+                    "arguments": {
+                        "project_key": project_key.as_str(),
+                        "program": "codex-cli",
+                        "model": "gpt-5",
+                        "name": "BlueLake",
+                        "task_description": "server regression test",
+                    }
+                })),
+                2_i64,
+            ));
+            assert!(
+                register_sender.is_ok(),
+                "sender registration should succeed: {register_sender:?}"
+            );
+
+            let register_recipient = state.dispatch_inner(JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "register_agent",
+                    "arguments": {
+                        "project_key": project_key.as_str(),
+                        "program": "codex-cli",
+                        "model": "gpt-5",
+                        "name": "RedPeak",
+                        "task_description": "server regression test",
+                    }
+                })),
+                3_i64,
+            ));
+            assert!(
+                register_recipient.is_ok(),
+                "recipient registration should succeed: {register_recipient:?}"
+            );
+
+            let request_contact = state.dispatch_inner(JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "request_contact",
+                    "arguments": {
+                        "project_key": project_key.as_str(),
+                        "from_agent": "BlueLake",
+                        "to_agent": "RedPeak",
+                        "reason": "regression test",
+                    }
+                })),
+                4_i64,
+            ));
+            assert!(
+                request_contact.is_ok(),
+                "request_contact should accept documented from_agent/to_agent fields unchanged: {request_contact:?}"
+            );
+        });
     }
 
     #[test]
