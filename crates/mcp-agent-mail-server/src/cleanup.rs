@@ -529,7 +529,10 @@ fn check_git_listed_activity(
     now_us: i64,
     grace_us: i64,
 ) -> Option<bool> {
-    let output = std::process::Command::new("git")
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("git")
         .args([
             "-C",
             &workspace.to_string_lossy(),
@@ -540,19 +543,33 @@ fn check_git_listed_activity(
             "--",
             pathspec,
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines().take(ACTIVITY_PROBE_PATH_LIMIT) {
-        if path_modified_within_grace(&workspace.join(line), now_us, grace_us) {
-            return Some(true);
+    let mut found_activity = false;
+    let mut count = 0;
+
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if path_modified_within_grace(&workspace.join(line), now_us, grace_us) {
+                found_activity = true;
+                break;
+            }
+            count += 1;
+            if count >= ACTIVITY_PROBE_PATH_LIMIT {
+                break;
+            }
         }
     }
-    Some(false)
+
+    // Kill the process if we exited the loop early
+    let _ = child.kill();
+    let _ = child.wait();
+
+    Some(found_activity)
 }
 
 fn check_directory_activity_fallback(dir: &Path, now_us: i64, grace_us: i64) -> bool {

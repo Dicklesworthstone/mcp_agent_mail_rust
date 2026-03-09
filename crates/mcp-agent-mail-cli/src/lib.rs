@@ -4511,6 +4511,11 @@ where
         mcp_agent_mail_db::DbError::ResourceBusy(message) => CliError::Other(format!(
             "Resource is temporarily busy. Wait a moment and try again. ({message})"
         )),
+        mcp_agent_mail_db::DbError::Sqlite(message)
+        | mcp_agent_mail_db::DbError::Pool(message)
+        | mcp_agent_mail_db::DbError::Schema(message)
+        | mcp_agent_mail_db::DbError::Serialization(message)
+        | mcp_agent_mail_db::DbError::Internal(message) => CliError::Other(message),
         other => CliError::Other(other.to_string()),
     })
 }

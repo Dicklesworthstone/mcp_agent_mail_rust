@@ -577,7 +577,7 @@ def check_conflicts(paths, reservations):
                 break
             
             # Directory prefix matching
-            has_glob = any(c in pattern for c in "*?[{")
+            has_glob = any(c in pattern for c in "*?[{{")
             
             # 2. Reverse check: pattern is inside touched path (e.g. dir replaced by file)
             # This handles cases where a concrete parent directory is touched.
@@ -1033,7 +1033,8 @@ fn check_path_conflicts(
             // (e.g. path "src", pattern "src/main.rs" or "src/**")
             if res.normalized_pattern.starts_with(&normalized)
                 && (normalized.is_empty()
-                    || res.normalized_pattern
+                    || res
+                        .normalized_pattern
                         .as_bytes()
                         .get(normalized.len())
                         .is_some_and(|&c| c == b'/'))
@@ -1850,6 +1851,8 @@ mod tests {
             exclusive,
             expires_ts: "2099-01-01T00:00:00Z".to_string(),
             released_ts: None,
+            normalized_pattern: normalize_path(pattern, false),
+            has_glob: contains_glob(pattern),
         }
     }
 
@@ -1858,7 +1861,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = make_archive_with_reservations(td.path());
 
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         // Should have: res1 (active exclusive), res4 (active non-exclusive), res5 (active exclusive self)
         // res2 (released) and res3 (expired) should be filtered out
         assert_eq!(
@@ -1879,7 +1882,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = td.path().join("empty_archive");
         // No file_reservations dir at all
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         assert!(records.is_empty());
     }
 
@@ -1915,7 +1918,7 @@ mod tests {
             .expect("write reservation");
         }
 
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         assert_eq!(records.len(), 6);
         for index in 0..6 {
             assert!(
@@ -1948,7 +1951,7 @@ mod tests {
         )
         .expect("write reservation");
 
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         assert!(records.is_empty());
     }
 
@@ -1961,7 +1964,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = make_archive_with_reservations(td.path());
 
-        let reservations = read_active_reservations_from_archive(&archive).expect("read");
+        let reservations = read_active_reservations_from_archive(&archive, false).expect("read");
         let paths = vec!["app/api/users.py".to_string()];
 
         let conflicts =
@@ -1977,7 +1980,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = make_archive_with_reservations(td.path());
 
-        let reservations = read_active_reservations_from_archive(&archive).expect("read");
+        let reservations = read_active_reservations_from_archive(&archive, false).expect("read");
         let paths = vec!["my/stuff/file.txt".to_string()];
 
         // "MyAgent" should not conflict with its own reservation
@@ -2004,7 +2007,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = make_archive_with_reservations(td.path());
 
-        let reservations = read_active_reservations_from_archive(&archive).expect("read");
+        let reservations = read_active_reservations_from_archive(&archive, false).expect("read");
         let paths = vec!["shared/README.md".to_string()];
 
         // SharedAgent's non-exclusive reservation should not block
@@ -2021,7 +2024,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = make_archive_with_reservations(td.path());
 
-        let reservations = read_active_reservations_from_archive(&archive).expect("read");
+        let reservations = read_active_reservations_from_archive(&archive, false).expect("read");
         let paths = vec!["unrelated/file.txt".to_string()];
 
         let conflicts =
@@ -2034,7 +2037,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = make_archive_with_reservations(td.path());
 
-        let reservations = read_active_reservations_from_archive(&archive).expect("read");
+        let reservations = read_active_reservations_from_archive(&archive, false).expect("read");
         let paths = vec![
             "app/api/users.py".to_string(),
             "app/api/models.py".to_string(),
@@ -2609,7 +2612,7 @@ mod tests {
         });
         std::fs::write(res_dir.join("valid.json"), valid.to_string()).expect("write");
 
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         // Malformed JSON should be skipped, valid one should be read
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].agent_name, "ValidAgent");
@@ -2626,7 +2629,7 @@ mod tests {
         std::fs::write(res_dir.join("readme.txt"), "this is a readme").expect("write");
         std::fs::write(res_dir.join("notes.md"), "# notes").expect("write");
 
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         assert!(records.is_empty(), "non-json files should be ignored");
     }
 
@@ -2647,7 +2650,7 @@ mod tests {
         });
         std::fs::write(res_dir.join("empty.json"), empty_pattern.to_string()).expect("write");
 
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         assert!(records.is_empty(), "empty path_pattern should be skipped");
     }
 
@@ -2669,7 +2672,7 @@ mod tests {
         });
         std::fs::write(res_dir.join("noagent.json"), alt_key.to_string()).expect("write");
 
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].agent_name, "FallbackAgent");
     }
@@ -2684,14 +2687,13 @@ mod tests {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let no_agent = serde_json::json!({
             "path_pattern": "src/**",
-            "agent_name": "Agent",
             "exclusive": true,
             "expires_ts": future.to_rfc3339(),
             "released_ts": null
         });
         std::fs::write(res_dir.join("noagent.json"), no_agent.to_string()).expect("write");
 
-        let records = read_active_reservations_from_archive(&archive).expect("read");
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].agent_name, "unknown");
     }
@@ -3016,6 +3018,7 @@ mod tests {
         assert!(script.contains("core.ignorecase"));
         assert!(script.contains("self_agent = AGENT_NAME.lower()"));
         assert!(script.contains("if holder.lower() == self_agent:"));
+        assert!(script.contains("has_glob = any(c in pattern for c in \"*?[{\")"));
         assert!(script.contains("file_reservation_releases"));
         assert!(script.contains("sys.exit(2)"));
     }
