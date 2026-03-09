@@ -74,6 +74,7 @@ pub mod tui_widgets;
 mod tui_ws_input;
 mod tui_ws_state;
 
+use asupersync::channel::mpsc;
 use asupersync::http::h1::HttpClient;
 use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig};
 use asupersync::http::h1::server::Http1Config;
@@ -81,9 +82,9 @@ use asupersync::http::h1::types::{
     Method as Http1Method, Request as Http1Request, Response as Http1Response, default_reason,
 };
 use asupersync::messaging::RedisClient;
-use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
-use asupersync::time::{timeout, wall_now};
+use asupersync::runtime::{JoinHandle as AsyncJoinHandle, Runtime, RuntimeBuilder, RuntimeHandle};
+use asupersync::time::{sleep, timeout, wall_now};
 use asupersync::{Budget, Cx};
 use fastmcp::prelude::*;
 use fastmcp_core::{McpError, McpErrorCode, SessionState, block_on};
@@ -125,10 +126,13 @@ use mcp_agent_mail_tools::{
     ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Read, Write};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::future::Future;
+use std::io::IsTerminal;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -281,20 +285,19 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
 
         mcp_agent_mail_tools::record_call_idx(self.tool_index);
 
-        // Emit ToolCallStart with masked params
-        let (project, agent) = extract_project_agent(&arguments);
-        let masked = console::mask_json(&arguments);
-        emit_tui_event(tui_events::MailEvent::tool_call_start(
-            self.tool_name,
-            masked,
-            project.clone(),
-            agent.clone(),
-        ));
-
         let qt_before = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
         let start = Instant::now();
         let call_arguments = arguments.clone();
         Box::pin(async move {
+            // Emit ToolCallStart with masked params
+            emit_tui_event_async(tui_events::MailEvent::tool_call_start(
+                self.tool_name,
+                masked,
+                project.clone(),
+                agent.clone(),
+            ))
+            .await;
+
             let out = self.inner.call_async(ctx, arguments).await;
             let is_error = !matches!(out, fastmcp_core::Outcome::Ok(_));
             if is_error {
@@ -322,10 +325,10 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                     project.as_deref(),
                     agent.as_deref(),
                 ) {
-                    emit_tui_event(event);
+                    emit_tui_event_async(event).await;
                 }
             }
-            emit_tui_event(tui_events::MailEvent::tool_call_end(
+            emit_tui_event_async(tui_events::MailEvent::tool_call_end(
                 self.tool_name,
                 duration_ms,
                 result_preview,
@@ -334,7 +337,8 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 per_table,
                 project,
                 agent,
-            ));
+            ))
+            .await;
 
             out
         })
@@ -1021,6 +1025,7 @@ const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD: u32 = 3;
 const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
 const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const HTTP_SUPERVISOR_CONTROL_CHANNEL_CAPACITY: usize = 32;
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS: u64 = 200;
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
 const HTTP_SERVER_STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1309,37 +1314,42 @@ fn normalized_probe_host(http_host: &str) -> &str {
     }
 }
 
-fn probe_http_healthz(config: &mcp_agent_mail_core::Config) -> bool {
-    let probe_host = normalized_probe_host(&config.http_host);
-    let addr = format!("{probe_host}:{}", config.http_port);
-    let Ok(addrs) = addr.to_socket_addrs() else {
-        return false;
-    };
-
-    for socket_addr in addrs {
-        let Ok(mut stream) =
-            std::net::TcpStream::connect_timeout(&socket_addr, HTTP_SUPERVISOR_PROBE_TIMEOUT)
-        else {
-            continue;
-        };
-        let _ = stream.set_read_timeout(Some(HTTP_SUPERVISOR_PROBE_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(HTTP_SUPERVISOR_PROBE_TIMEOUT));
-
-        let request =
-            format!("GET /healthz HTTP/1.1\r\nHost: {probe_host}\r\nConnection: close\r\n\r\n");
-        if stream.write_all(request.as_bytes()).is_err() {
-            continue;
-        }
-        let mut buf = [0_u8; 12];
-        if stream.read_exact(&mut buf).is_err() {
-            continue;
-        }
-        if buf.starts_with(b"HTTP/1.1 200") || buf.starts_with(b"HTTP/1.0 200") {
-            return true;
-        }
+fn format_http_authority_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
     }
+}
 
-    false
+async fn probe_http_healthz(
+    cx: &Cx,
+    client: &HttpClient,
+    config: &mcp_agent_mail_core::Config,
+) -> bool {
+    let probe_host = normalized_probe_host(&config.http_host);
+    let authority_host = format_http_authority_host(probe_host);
+    let url = format!("http://{authority_host}:{}{}", config.http_port, "/healthz");
+    match timeout(
+        wall_now(),
+        HTTP_SUPERVISOR_PROBE_TIMEOUT,
+        client.get(cx, &url),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response.status == 200,
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
+fn build_http_runtime() -> std::io::Result<Runtime> {
+    let reactor = create_reactor()?;
+    RuntimeBuilder::new()
+        .with_reactor(reactor)
+        .worker_threads(resolve_http_runtime_worker_threads())
+        .enable_parking(true)
+        .build()
+        .map_err(|err| map_asupersync_err(&err))
 }
 
 fn restart_backoff_ms(previous_ms: u64) -> u64 {
@@ -1359,109 +1369,18 @@ fn reset_probe_state() -> (u32, Instant, Instant) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_http_headless_supervisor(mut config: mcp_agent_mail_core::Config) -> std::io::Result<()> {
-    let (updated_config, mut instance) = spawn_http_server_instance(config.clone())?;
-    config = updated_config;
-
+fn run_http_headless_supervisor(config: mcp_agent_mail_core::Config) -> std::io::Result<()> {
     tracing::info!(
         host = %config.http_host,
         port = config.http_port,
         workers = resolve_http_runtime_worker_threads(),
         "HTTP server supervisor started"
     );
-
-    let mut last_restart_sleep_ms: u64 = 0;
-    let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) = reset_probe_state();
-
-    loop {
-        if instance.join.is_finished() {
-            tracing::warn!("HTTP server instance exited unexpectedly; restarting");
-            if let Err(err) = stop_http_server_instance(instance) {
-                tracing::warn!("failed to stop exited HTTP server instance cleanly: {err}");
-            }
-
-            let restart_host = config.http_host.clone();
-            let restart_port = config.http_port;
-            instance = respawn_http_server_instance_with_retry(
-                &mut config,
-                &mut last_restart_sleep_ms,
-                || false,
-                |err, backoff_ms| {
-                    tracing::error!(
-                        error = %err,
-                        backoff_ms,
-                        host = %restart_host,
-                        port = restart_port,
-                        "HTTP server restart failed after unexpected exit; retrying"
-                    );
-                },
-            )?;
-            tracing::info!(
-                host = %config.http_host,
-                port = config.http_port,
-                backoff_ms = last_restart_sleep_ms,
-                "HTTP server auto-restarted after unexpected exit"
-            );
-            (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
-            continue;
-        }
-
-        std::thread::sleep(Duration::from_millis(200));
-        let now = Instant::now();
-        if now < next_probe_at {
-            continue;
-        }
-        next_probe_at = now + HTTP_SUPERVISOR_PROBE_INTERVAL;
-
-        if probe_http_healthz(&config) {
-            liveness_failures = 0;
-            continue;
-        }
-        if now < probe_grace_until {
-            continue;
-        }
-
-        liveness_failures = liveness_failures.saturating_add(1);
-        tracing::warn!(
-            failures = liveness_failures,
-            threshold = HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD,
-            host = %config.http_host,
-            port = config.http_port,
-            "HTTP liveness probe failed"
-        );
-        if liveness_failures < HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD {
-            continue;
-        }
-
-        tracing::warn!("HTTP server unresponsive; forcing supervised restart");
-        if let Err(err) = stop_http_server_instance(instance) {
-            tracing::warn!("failed to stop unresponsive HTTP server instance cleanly: {err}");
-        }
-
-        let restart_host = config.http_host.clone();
-        let restart_port = config.http_port;
-        instance = respawn_http_server_instance_with_retry(
-            &mut config,
-            &mut last_restart_sleep_ms,
-            || false,
-            |err, backoff_ms| {
-                tracing::error!(
-                    error = %err,
-                    backoff_ms,
-                    host = %restart_host,
-                    port = restart_port,
-                    "HTTP server restart failed after liveness probe failures; retrying"
-                );
-            },
-        )?;
-        tracing::info!(
-            host = %config.http_host,
-            port = config.http_port,
-            backoff_ms = last_restart_sleep_ms,
-            "HTTP server auto-restarted after liveness probe failures"
-        );
-        (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
-    }
+    let runtime = build_http_runtime()?;
+    let result_rx = spawn_http_supervisor_task(runtime.handle().clone(), config, None, None, None)?;
+    let result = recv_http_supervisor_result(result_rx);
+    drop(runtime);
+    result
 }
 
 fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
@@ -1848,50 +1767,47 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 
     // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
     let tui_state = tui_bridge::TuiSharedState::new(config);
+    let http_runtime = match build_http_runtime() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            mcp_agent_mail_storage::wbq_shutdown();
+            mcp_agent_mail_storage::flush_async_commits();
+            return Err(err);
+        }
+    };
     set_tui_state_handle(Some(Arc::clone(&tui_state)));
+
+    // ── 4. HTTP runtime + supervisor task (supports mode switching) ─
+    let (server_ctl_tx, server_ctl_rx) =
+        mpsc::channel::<tui_bridge::ServerControlMsg>(HTTP_SUPERVISOR_CONTROL_CHANNEL_CAPACITY);
+    tui_state.set_server_control_sender(server_ctl_tx.clone());
+    let supervisor_fail_fast_active = Arc::new(AtomicBool::new(true));
+    let supervisor_result_rx = match spawn_http_supervisor_task(
+        http_runtime.handle().clone(),
+        config.clone(),
+        Some(Arc::clone(&tui_state)),
+        Some(server_ctl_rx),
+        Some(Arc::clone(&supervisor_fail_fast_active)),
+    ) {
+        Ok(result_rx) => result_rx,
+        Err(err) => {
+            set_tui_state_handle(None);
+            drop(http_runtime);
+            mcp_agent_mail_storage::wbq_shutdown();
+            mcp_agent_mail_storage::flush_async_commits();
+            return Err(err);
+        }
+    };
+
     // Keep first paint fast: screens and the DB poller already degrade
     // gracefully while SQLite is still warming up, so do not block the
     // interactive handoff on migrations/readiness work here.
     spawn_tui_readiness_warmup(config, &tui_state);
     let mut deferred_workers = spawn_tui_deferred_background_workers(config, &tui_state);
 
-    // ── 4. DB poller on dedicated thread ────────────────────────────
+    // ── 5. DB poller on dedicated thread ────────────────────────────
     let mut db_poller =
         tui_poller::DbPoller::new(Arc::clone(&tui_state), config.database_url.clone()).start();
-
-    // ── 5. HTTP server supervisor thread (supports mode switching) ──
-    let (server_ctl_tx, server_ctl_rx) = std::sync::mpsc::channel::<tui_bridge::ServerControlMsg>();
-    tui_state.set_server_control_sender(server_ctl_tx.clone());
-    let server_config = config.clone();
-    let supervisor_state = Arc::clone(&tui_state);
-    let (supervisor_exit_tx, supervisor_exit_rx) = std::sync::mpsc::channel::<()>();
-    let supervisor_thread = std::thread::Builder::new()
-        .name("mcp-http-supervisor".into())
-        .spawn(move || {
-            let rt = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .map_err(|err| std::io::Error::other(format!("build supervisor runtime: {err}")))?;
-            let result = rt.block_on(async move {
-                run_http_server_supervisor_thread(server_config, &supervisor_state, &server_ctl_rx)
-            });
-            let _ = supervisor_exit_tx.send(());
-            result
-        })
-        .map_err(|err| std::io::Error::other(format!("spawn HTTP supervisor thread: {err}")))?;
-    let supervisor_watch_state = Arc::clone(&tui_state);
-    let supervisor_watchdog = std::thread::Builder::new()
-        .name("mcp-http-supervisor-watch".into())
-        .spawn(move || {
-            let _ = supervisor_exit_rx.recv();
-            if !supervisor_watch_state.is_shutdown_requested() {
-                tracing::error!(
-                    "HTTP supervisor thread exited while TUI remained active; requesting shutdown"
-                );
-                let _ = supervisor_watch_state.push_event(tui_events::MailEvent::server_shutdown());
-                supervisor_watch_state.request_shutdown();
-            }
-        })
-        .map_err(|err| std::io::Error::other(format!("spawn HTTP supervisor watchdog: {err}")))?;
 
     let startup_watchdog = TuiSpinWatchdog::start(&tui_state);
 
@@ -1916,12 +1832,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         set_tui_state_handle(None);
         db_poller.stop();
 
-        let supervisor_result = supervisor_thread
-            .join()
-            .map_err(|_| std::io::Error::other("HTTP supervisor thread panicked"))?;
-        supervisor_watchdog
-            .join()
-            .map_err(|_| std::io::Error::other("HTTP supervisor watchdog thread panicked"))?;
+        supervisor_fail_fast_active.store(false, Ordering::SeqCst);
+        let supervisor_result = recv_http_supervisor_result(supervisor_result_rx);
+        drop(http_runtime);
 
         retention::shutdown();
         tool_metrics::shutdown();
@@ -1936,17 +1849,14 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     }
 
     // ── 7. Graceful shutdown ────────────────────────────────────────
+    supervisor_fail_fast_active.store(false, Ordering::SeqCst);
     tui_state.request_shutdown();
-    let _ = server_ctl_tx.send(tui_bridge::ServerControlMsg::Shutdown);
+    let _ = server_ctl_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
     db_poller.stop();
     deferred_workers.join();
 
-    let supervisor_result = supervisor_thread
-        .join()
-        .map_err(|_| std::io::Error::other("HTTP supervisor thread panicked"))?;
-    supervisor_watchdog
-        .join()
-        .map_err(|_| std::io::Error::other("HTTP supervisor watchdog thread panicked"))?;
+    let supervisor_result = recv_http_supervisor_result(supervisor_result_rx);
+    drop(http_runtime);
 
     // Shutdown background workers
     set_tui_state_handle(None);
@@ -1964,208 +1874,210 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 }
 
 struct HttpServerInstance {
-    join: std::thread::JoinHandle<std::io::Result<()>>,
+    join: AsyncJoinHandle<std::io::Result<()>>,
     shutdown: asupersync::server::shutdown::ShutdownSignal,
 }
 
-struct HttpServerReady {
-    shutdown: asupersync::server::shutdown::ShutdownSignal,
-    local_addr: std::net::SocketAddr,
+struct PanicAsIoFuture<F> {
+    label: &'static str,
+    future: Pin<Box<F>>,
 }
 
-/// Run the HTTP server inside a dedicated thread and send the bound `ShutdownSignal`
-/// back to the supervisor so it can trigger graceful shutdown/restarts.
-fn run_http_server_thread(
-    config: mcp_agent_mail_core::Config,
-    ready_tx: std::sync::mpsc::SyncSender<std::io::Result<HttpServerReady>>,
+impl<F> PanicAsIoFuture<F> {
+    fn new(label: &'static str, future: F) -> Self {
+        Self {
+            label,
+            future: Box::pin(future),
+        }
+    }
+}
+
+impl<F, T> Future for PanicAsIoFuture<F>
+where
+    F: Future<Output = std::io::Result<T>>,
+{
+    type Output = std::io::Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let label = self.label;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.future.as_mut().poll(cx)
+        })) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(result)) => Poll::Ready(result),
+            Err(_) => Poll::Ready(Err(std::io::Error::other(format!("{label} panicked")))),
+        }
+    }
+}
+
+fn recv_http_supervisor_result(
+    result_rx: std::sync::mpsc::Receiver<std::io::Result<()>>,
 ) -> std::io::Result<()> {
+    result_rx
+        .recv()
+        .map_err(|_| std::io::Error::other("HTTP supervisor task exited without reporting"))?
+}
+
+fn record_http_server_started(
+    tui_state: Option<&tui_bridge::TuiSharedState>,
+    config: &mcp_agent_mail_core::Config,
+    detail: String,
+) {
+    if let Some(tui_state) = tui_state {
+        tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(config));
+        let _ = tui_state.push_event(tui_events::MailEvent::server_started(
+            format!(
+                "http://{}:{}{}",
+                config.http_host, config.http_port, config.http_path
+            ),
+            detail,
+        ));
+    }
+}
+
+fn record_http_server_shutdown(tui_state: Option<&tui_bridge::TuiSharedState>) {
+    if let Some(tui_state) = tui_state {
+        let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+    }
+}
+
+fn spawn_http_supervisor_task(
+    runtime_handle: RuntimeHandle,
+    config: mcp_agent_mail_core::Config,
+    tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
+    control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    fail_fast_active: Option<Arc<AtomicBool>>,
+) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let runtime_handle_for_task = runtime_handle.clone();
+    let supervisor_state = tui_state.clone();
+    let fail_fast_state = tui_state.clone();
+    runtime_handle
+        .try_spawn_with_cx(move |cx| async move {
+            let result = PanicAsIoFuture::new(
+                "HTTP supervisor task",
+                run_http_server_supervisor(
+                    &cx,
+                    runtime_handle_for_task,
+                    config,
+                    supervisor_state,
+                    control_rx,
+                ),
+            )
+            .await;
+
+            if fail_fast_active
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                && fail_fast_state
+                    .as_ref()
+                    .is_some_and(|state| !state.is_shutdown_requested())
+            {
+                tracing::error!(
+                    "HTTP supervisor task exited while TUI remained active; requesting shutdown"
+                );
+                if let Some(tui_state) = fail_fast_state.as_ref() {
+                    let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+                    tui_state.request_shutdown();
+                }
+            }
+
+            let _ = result_tx.send(result);
+        })
+        .map_err(|err| std::io::Error::other(format!("spawn HTTP supervisor task: {err}")))?;
+
+    Ok(result_rx)
+}
+
+async fn spawn_http_server_instance(
+    runtime_handle: &RuntimeHandle,
+    config: mcp_agent_mail_core::Config,
+) -> std::io::Result<(mcp_agent_mail_core::Config, HttpServerInstance)> {
     let server = build_server(&config);
     let server_info = server.info().clone();
     let server_capabilities = server.capabilities().clone();
     let router = Arc::new(server.into_router());
-
     let addr = format!("{}:{}", config.http_host, config.http_port);
     let state = Arc::new(HttpState::new(
         router,
         server_info,
         server_capabilities,
-        config,
+        config.clone(),
     ));
 
-    let reactor = create_reactor()?;
-    let runtime = RuntimeBuilder::new()
-        .with_reactor(reactor)
-        // Match `run_http`: isolate requests so one bad connection cannot
-        // starve the entire HTTP surface.
-        .worker_threads(resolve_http_runtime_worker_threads())
-        // Keep worker parking explicit to guard against upstream default drift.
-        .enable_parking(true)
-        .build()
-        .map_err(|e| map_asupersync_err(&e))?;
+    let handler_state = Arc::clone(&state);
+    let listener = Http1Listener::bind_with_config(
+        addr,
+        move |req| {
+            let inner = Arc::clone(&handler_state);
+            async move { inner.handle(req).await }
+        },
+        hardened_http_listener_config(),
+    )
+    .await?;
 
-    let handle = runtime.handle();
-    runtime.block_on(async move {
-        let handler_state = Arc::clone(&state);
-        let listener = Http1Listener::bind_with_config(
-            addr,
-            move |req| {
-                let inner = Arc::clone(&handler_state);
-                async move { inner.handle(req).await }
-            },
-            hardened_http_listener_config(),
-        )
-        .await;
-
-        let listener = match listener {
-            Ok(l) => l,
-            Err(err) => {
-                // Propagate the original error to the supervisor thread while preserving the
-                // original error for this thread's return path.
-                let send_err = std::io::Error::new(err.kind(), err.to_string());
-                let _ = ready_tx.send(Err(send_err));
-                return Err(err);
-            }
-        };
-
-        let local_addr = match listener.local_addr() {
-            Ok(addr) => addr,
-            Err(err) => {
-                // Avoid moving `err` into the channel send; we still want to return it.
-                let send_err = std::io::Error::new(err.kind(), err.to_string());
-                let _ = ready_tx.send(Err(send_err));
-                return Err(err);
-            }
-        };
-        let shutdown = listener.shutdown_signal();
-        if ready_tx
-            .send(Ok(HttpServerReady {
-                shutdown: shutdown.clone(),
-                local_addr,
-            }))
-            .is_err()
-        {
-            let _ = shutdown.begin_force_close();
-            return Err(std::io::Error::other(
-                "server readiness handshake receiver dropped before startup completed",
-            ));
-        }
-
-        // See `run_http`: listener must run in a spawned runtime task to avoid
-        // fallback wake-loops when polled from root `block_on`.
-        let run_handle = handle
-            .clone()
-            .try_spawn(async move { listener.run(&handle).await })
-            .map_err(|err| {
-                std::io::Error::other(format!("failed to spawn HTTP listener: {err}"))
-            })?;
-
-        let _stats = run_handle.await?;
-        Ok::<(), std::io::Error>(())
-    })
-}
-
-fn spawn_http_server_instance(
-    config: mcp_agent_mail_core::Config,
-) -> std::io::Result<(mcp_agent_mail_core::Config, HttpServerInstance)> {
-    let config_for_thread = config.clone();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<std::io::Result<HttpServerReady>>(0);
-    let join = std::thread::Builder::new()
-        .name("mcp-http-server".into())
-        .spawn(move || run_http_server_thread(config_for_thread, ready_tx))
-        .map_err(|err| std::io::Error::other(format!("spawn HTTP server thread: {err}")))?;
-
-    let ready = ready_rx
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|_| std::io::Error::other("server bind handshake timed out"))??;
+    let local_addr = listener.local_addr()?;
+    let shutdown = listener.shutdown_signal();
+    let listener_runtime_handle = runtime_handle.clone();
+    let join = runtime_handle
+        .clone()
+        .try_spawn(PanicAsIoFuture::new("HTTP listener task", async move {
+            let _stats = listener.run(&listener_runtime_handle).await?;
+            Ok::<(), std::io::Error>(())
+        }))
+        .map_err(|err| std::io::Error::other(format!("failed to spawn HTTP listener: {err}")))?;
 
     let mut updated_config = config;
     if updated_config.http_port == 0 {
-        updated_config.http_port = ready.local_addr.port();
+        updated_config.http_port = local_addr.port();
     }
 
-    Ok((
-        updated_config,
-        HttpServerInstance {
-            join,
-            shutdown: ready.shutdown,
-        },
-    ))
+    Ok((updated_config, HttpServerInstance { join, shutdown }))
 }
 
-fn stop_http_server_instance(instance: HttpServerInstance) -> std::io::Result<()> {
+async fn stop_http_server_instance(instance: HttpServerInstance) -> std::io::Result<()> {
     stop_http_server_instance_with_timeouts(
         instance,
         HTTP_SERVER_STOP_JOIN_TIMEOUT,
         HTTP_SERVER_FORCE_CLOSE_JOIN_TIMEOUT,
     )
+    .await
 }
 
-fn stop_http_server_instance_with_timeouts(
+async fn stop_http_server_instance_with_timeouts(
     instance: HttpServerInstance,
     join_timeout: Duration,
     force_close_timeout: Duration,
 ) -> std::io::Result<()> {
     let HttpServerInstance { join, shutdown } = instance;
-    let _ = shutdown.begin_drain(Duration::from_secs(2));
-    join_http_server_thread(join, &shutdown, join_timeout, force_close_timeout)
-}
-
-fn join_http_server_thread(
-    join: std::thread::JoinHandle<std::io::Result<()>>,
-    shutdown: &asupersync::server::shutdown::ShutdownSignal,
-    join_timeout: Duration,
-    force_close_timeout: Duration,
-) -> std::io::Result<()> {
-    let result_rx = spawn_http_server_join_waiter(join)?;
-    match result_rx.recv_timeout(join_timeout) {
+    let mut join = Box::pin(join);
+    let _ = shutdown.begin_drain(HTTP_LISTENER_DRAIN_TIMEOUT);
+    match timeout(wall_now(), join_timeout, &mut join).await {
         Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        Err(_) => {
             let forced = shutdown.begin_force_close();
             tracing::warn!(
                 forced,
                 join_timeout_ms = join_timeout.as_millis(),
                 force_close_timeout_ms = force_close_timeout.as_millis(),
-                "HTTP server thread exceeded drain timeout; escalating to force-close"
+                "HTTP server task exceeded drain timeout; escalating to force-close"
             );
-            match result_rx.recv_timeout(force_close_timeout) {
+            match timeout(wall_now(), force_close_timeout, &mut join).await {
                 Ok(result) => result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                Err(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "server thread did not stop within {:?} drain + {:?} force-close window",
+                        "server task did not stop within {:?} drain + {:?} force-close window",
                         join_timeout, force_close_timeout
                     ),
                 )),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
-                    "server join waiter disconnected before reporting a force-close result",
-                )),
             }
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
-            "server join waiter disconnected before reporting a result",
-        )),
     }
 }
 
-fn spawn_http_server_join_waiter(
-    join: std::thread::JoinHandle<std::io::Result<()>>,
-) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("mcp-http-join-wait".into())
-        .spawn(move || {
-            let result = join
-                .join()
-                .map_err(|_| std::io::Error::other("server thread panicked"))?;
-            let _ = result_tx.send(result);
-            Ok::<(), std::io::Error>(())
-        })
-        .map_err(|err| std::io::Error::other(format!("spawn server join waiter: {err}")))?;
-
-    Ok(result_rx)
-}
-
-fn respawn_http_server_instance_with_retry<AbortFn, RetryFn>(
+async fn respawn_http_server_instance_with_retry<AbortFn, RetryFn>(
+    runtime_handle: &RuntimeHandle,
     config: &mut mcp_agent_mail_core::Config,
     last_restart_sleep_ms: &mut u64,
     should_abort: AbortFn,
@@ -2180,12 +2092,20 @@ where
         last_restart_sleep_ms,
         should_abort,
         on_retry_error,
-        spawn_http_server_instance,
-        std::thread::sleep,
+        |cfg| spawn_http_server_instance(runtime_handle, cfg),
+        |duration| sleep(wall_now(), duration),
     )
+    .await
 }
 
-fn respawn_http_server_instance_with_retry_using<AbortFn, RetryFn, SpawnFn, SleepFn>(
+async fn respawn_http_server_instance_with_retry_using<
+    AbortFn,
+    RetryFn,
+    SpawnFn,
+    SpawnFut,
+    SleepFn,
+    SleepFut,
+>(
     config: &mut mcp_agent_mail_core::Config,
     last_restart_sleep_ms: &mut u64,
     mut should_abort: AbortFn,
@@ -2196,10 +2116,10 @@ fn respawn_http_server_instance_with_retry_using<AbortFn, RetryFn, SpawnFn, Slee
 where
     AbortFn: FnMut() -> bool,
     RetryFn: FnMut(&std::io::Error, u64),
-    SpawnFn: FnMut(
-        mcp_agent_mail_core::Config,
-    ) -> std::io::Result<(mcp_agent_mail_core::Config, HttpServerInstance)>,
-    SleepFn: FnMut(Duration),
+    SpawnFn: FnMut(mcp_agent_mail_core::Config) -> SpawnFut,
+    SpawnFut: Future<Output = std::io::Result<(mcp_agent_mail_core::Config, HttpServerInstance)>>,
+    SleepFn: FnMut(Duration) -> SleepFut,
+    SleepFut: Future<Output = ()>,
 {
     loop {
         if should_abort() {
@@ -2209,7 +2129,7 @@ where
             ));
         }
 
-        match spawn_fn(config.clone()) {
+        match spawn_fn(config.clone()).await {
             Ok((new_cfg, new_instance)) => {
                 *config = new_cfg;
                 return Ok(new_instance);
@@ -2217,55 +2137,80 @@ where
             Err(err) => {
                 *last_restart_sleep_ms = restart_backoff_ms(*last_restart_sleep_ms);
                 on_retry_error(&err, *last_restart_sleep_ms);
-                sleep_fn(Duration::from_millis(*last_restart_sleep_ms));
+                sleep_fn(Duration::from_millis(*last_restart_sleep_ms)).await;
             }
         }
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_http_server_supervisor_thread(
+async fn run_http_server_supervisor(
+    cx: &Cx,
+    runtime_handle: RuntimeHandle,
     mut config: mcp_agent_mail_core::Config,
-    tui_state: &tui_bridge::TuiSharedState,
-    control_rx: &std::sync::mpsc::Receiver<tui_bridge::ServerControlMsg>,
+    tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
+    mut control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
 ) -> std::io::Result<()> {
-    let (updated_config, mut instance) = spawn_http_server_instance(config.clone())?;
+    let (updated_config, mut instance) =
+        spawn_http_server_instance(&runtime_handle, config.clone()).await?;
     config = updated_config;
 
-    // Ensure the TUI state reflects the bound runtime port (port=0 in tests).
-    tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(&config));
-    let _ = tui_state.push_event(tui_events::MailEvent::server_started(
+    record_http_server_started(
+        tui_state.as_deref(),
+        &config,
         format!(
-            "http://{}:{}{}",
-            config.http_host, config.http_port, config.http_path
-        ),
-        format!(
-            "tui=on auth={} mode={}",
+            "tui={} auth={} mode={}",
+            if tui_state.is_some() { "on" } else { "off" },
             config.http_bearer_token.is_some(),
             tui_bridge::TransportBase::from_http_path(&config.http_path)
                 .map_or("custom", tui_bridge::TransportBase::as_str)
         ),
-    ));
+    );
 
+    let probe_client = HttpClient::builder()
+        .max_connections_per_host(1)
+        .max_total_connections(2)
+        .build();
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) = reset_probe_state();
 
     loop {
-        if tui_state.is_shutdown_requested() {
-            let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
-            return stop_http_server_instance(instance);
+        if cx.is_cancel_requested() {
+            record_http_server_shutdown(tui_state.as_deref());
+            let _ = stop_http_server_instance(instance).await;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "HTTP supervisor cancelled",
+            ));
+        }
+
+        if tui_state
+            .as_ref()
+            .is_some_and(|state| state.is_shutdown_requested())
+        {
+            record_http_server_shutdown(tui_state.as_deref());
+            return stop_http_server_instance(instance).await;
         }
 
         if instance.join.is_finished() {
-            let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
-            let _ = stop_http_server_instance(instance);
+            tracing::warn!("HTTP server instance exited unexpectedly; restarting");
+            record_http_server_shutdown(tui_state.as_deref());
+            if let Err(err) = stop_http_server_instance(instance).await {
+                tracing::warn!("failed to stop exited HTTP server instance cleanly: {err}");
+            }
 
             let restart_host = config.http_host.clone();
             let restart_port = config.http_port;
             instance = respawn_http_server_instance_with_retry(
+                &runtime_handle,
                 &mut config,
                 &mut last_restart_sleep_ms,
-                || tui_state.is_shutdown_requested(),
+                || {
+                    cx.is_cancel_requested()
+                        || tui_state
+                            .as_ref()
+                            .is_some_and(|state| state.is_shutdown_requested())
+                },
                 |err, backoff_ms| {
                     tracing::error!(
                         error = %err,
@@ -2275,105 +2220,151 @@ fn run_http_server_supervisor_thread(
                         "HTTP server restart failed after unexpected exit; retrying"
                     );
                 },
-            )?;
-            tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(&config));
-            let _ = tui_state.push_event(tui_events::MailEvent::server_started(
-                format!(
-                    "http://{}:{}{}",
-                    config.http_host, config.http_port, config.http_path
-                ),
+            )
+            .await?;
+            record_http_server_started(
+                tui_state.as_deref(),
+                &config,
                 "auto-restarted after unexpected exit".to_string(),
-            ));
+            );
+            tracing::info!(
+                host = %config.http_host,
+                port = config.http_port,
+                backoff_ms = last_restart_sleep_ms,
+                "HTTP server auto-restarted after unexpected exit"
+            );
             (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
             continue;
         }
 
-        match control_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(tui_bridge::ServerControlMsg::ToggleTransportBase) => {
-                let current = tui_bridge::TransportBase::from_http_path(&config.http_path)
-                    .unwrap_or(tui_bridge::TransportBase::Mcp);
-                let desired = current.toggle();
-                instance = handle_transport_switch(&mut config, tui_state, instance, desired)?;
-                last_restart_sleep_ms = 0;
-                (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
-            }
-            Ok(tui_bridge::ServerControlMsg::SetTransportBase(desired)) => {
-                instance = handle_transport_switch(&mut config, tui_state, instance, desired)?;
-                last_restart_sleep_ms = 0;
-                (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
-            }
-            Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(envelope)) => {
-                dispatch_compose_envelope(&config.database_url, tui_state, &envelope);
-            }
-            Ok(tui_bridge::ServerControlMsg::Shutdown)
-            | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
-                return stop_http_server_instance(instance);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let now = Instant::now();
-                if now < next_probe_at {
-                    continue;
+        let mut handled_control = false;
+        if let Some(control_rx) = control_rx.as_mut() {
+            match timeout(wall_now(), Duration::from_millis(200), control_rx.recv(cx)).await {
+                Ok(Ok(tui_bridge::ServerControlMsg::ToggleTransportBase)) => {
+                    let current = tui_bridge::TransportBase::from_http_path(&config.http_path)
+                        .unwrap_or(tui_bridge::TransportBase::Mcp);
+                    let desired = current.toggle();
+                    instance = handle_transport_switch(
+                        &runtime_handle,
+                        &mut config,
+                        tui_state.as_deref(),
+                        instance,
+                        desired,
+                    )
+                    .await?;
+                    last_restart_sleep_ms = 0;
+                    (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+                    handled_control = true;
                 }
-                next_probe_at = now + HTTP_SUPERVISOR_PROBE_INTERVAL;
-
-                if probe_http_healthz(&config) {
-                    liveness_failures = 0;
-                    continue;
+                Ok(Ok(tui_bridge::ServerControlMsg::SetTransportBase(desired))) => {
+                    instance = handle_transport_switch(
+                        &runtime_handle,
+                        &mut config,
+                        tui_state.as_deref(),
+                        instance,
+                        desired,
+                    )
+                    .await?;
+                    last_restart_sleep_ms = 0;
+                    (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+                    handled_control = true;
                 }
-                if now < probe_grace_until {
-                    continue;
+                Ok(Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(envelope))) => {
+                    if let Some(tui_state) = tui_state.as_deref() {
+                        dispatch_compose_envelope(&config.database_url, tui_state, &envelope);
+                    }
+                    handled_control = true;
                 }
-
-                liveness_failures = liveness_failures.saturating_add(1);
-                tracing::warn!(
-                    failures = liveness_failures,
-                    threshold = HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD,
-                    host = %config.http_host,
-                    port = config.http_port,
-                    "HTTP liveness probe failed"
-                );
-
-                if liveness_failures < HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD {
-                    continue;
+                Ok(Ok(tui_bridge::ServerControlMsg::Shutdown))
+                | Ok(Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled)) => {
+                    record_http_server_shutdown(tui_state.as_deref());
+                    return stop_http_server_instance(instance).await;
                 }
-
-                let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
-                let _ = stop_http_server_instance(instance);
-
-                let restart_host = config.http_host.clone();
-                let restart_port = config.http_port;
-                instance = respawn_http_server_instance_with_retry(
-                    &mut config,
-                    &mut last_restart_sleep_ms,
-                    || tui_state.is_shutdown_requested(),
-                    |err, backoff_ms| {
-                        tracing::error!(
-                            error = %err,
-                            backoff_ms,
-                            host = %restart_host,
-                            port = restart_port,
-                            "HTTP server restart failed after liveness probe failures; retrying"
-                        );
-                    },
-                )?;
-                tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(&config));
-                let _ = tui_state.push_event(tui_events::MailEvent::server_started(
-                    format!(
-                        "http://{}:{}{}",
-                        config.http_host, config.http_port, config.http_path
-                    ),
-                    "auto-restarted after liveness probe failures".to_string(),
-                ));
-                (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+                Ok(Err(mpsc::RecvError::Empty)) | Err(_) => {}
             }
+        } else {
+            sleep(wall_now(), Duration::from_millis(200)).await;
         }
+
+        if handled_control {
+            continue;
+        }
+
+        let now = Instant::now();
+        if now < next_probe_at {
+            continue;
+        }
+        next_probe_at = now + HTTP_SUPERVISOR_PROBE_INTERVAL;
+
+        if probe_http_healthz(cx, &probe_client, &config).await {
+            liveness_failures = 0;
+            continue;
+        }
+        if now < probe_grace_until {
+            continue;
+        }
+
+        liveness_failures = liveness_failures.saturating_add(1);
+        tracing::warn!(
+            failures = liveness_failures,
+            threshold = HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD,
+            host = %config.http_host,
+            port = config.http_port,
+            "HTTP liveness probe failed"
+        );
+
+        if liveness_failures < HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD {
+            continue;
+        }
+
+        tracing::warn!("HTTP server unresponsive; forcing supervised restart");
+        record_http_server_shutdown(tui_state.as_deref());
+        if let Err(err) = stop_http_server_instance(instance).await {
+            tracing::warn!("failed to stop unresponsive HTTP server instance cleanly: {err}");
+        }
+
+        let restart_host = config.http_host.clone();
+        let restart_port = config.http_port;
+        instance = respawn_http_server_instance_with_retry(
+            &runtime_handle,
+            &mut config,
+            &mut last_restart_sleep_ms,
+            || {
+                cx.is_cancel_requested()
+                    || tui_state
+                        .as_ref()
+                        .is_some_and(|state| state.is_shutdown_requested())
+            },
+            |err, backoff_ms| {
+                tracing::error!(
+                    error = %err,
+                    backoff_ms,
+                    host = %restart_host,
+                    port = restart_port,
+                    "HTTP server restart failed after liveness probe failures; retrying"
+                );
+            },
+        )
+        .await?;
+        record_http_server_started(
+            tui_state.as_deref(),
+            &config,
+            "auto-restarted after liveness probe failures".to_string(),
+        );
+        tracing::info!(
+            host = %config.http_host,
+            port = config.http_port,
+            backoff_ms = last_restart_sleep_ms,
+            "HTTP server auto-restarted after liveness probe failures"
+        );
+        (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
     }
 }
 
-fn handle_transport_switch(
+async fn handle_transport_switch(
+    runtime_handle: &RuntimeHandle,
     config: &mut mcp_agent_mail_core::Config,
-    tui_state: &tui_bridge::TuiSharedState,
+    tui_state: Option<&tui_bridge::TuiSharedState>,
     instance: HttpServerInstance,
     desired: tui_bridge::TransportBase,
 ) -> std::io::Result<HttpServerInstance> {
@@ -2382,43 +2373,44 @@ fn handle_transport_switch(
     }
 
     let prev_path = config.http_path.clone();
-    let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
-    let _ = stop_http_server_instance(instance);
+    record_http_server_shutdown(tui_state);
+    if let Err(err) = stop_http_server_instance(instance).await {
+        tracing::warn!("failed to stop HTTP server before transport switch: {err}");
+    }
 
     config.http_path = desired.http_path().to_string();
-    let start = spawn_http_server_instance(config.clone());
-    match start {
+    match spawn_http_server_instance(runtime_handle, config.clone()).await {
         Ok((new_cfg, new_instance)) => {
             *config = new_cfg;
-            tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(config));
-            let _ = tui_state.push_event(tui_events::MailEvent::server_started(
-                format!(
-                    "http://{}:{}{}",
-                    config.http_host, config.http_port, config.http_path
-                ),
+            record_http_server_started(
+                tui_state,
+                config,
                 format!("mode switched to {}", desired.as_str()),
-            ));
+            );
             Ok(new_instance)
         }
-        Err(err) => rollback_http_transport_switch(config, tui_state, prev_path, err),
+        Err(err) => {
+            rollback_http_transport_switch(runtime_handle, config, tui_state, prev_path, err).await
+        }
     }
 }
 
-fn rollback_http_transport_switch(
+async fn rollback_http_transport_switch(
+    runtime_handle: &RuntimeHandle,
     config: &mut mcp_agent_mail_core::Config,
-    tui_state: &tui_bridge::TuiSharedState,
+    tui_state: Option<&tui_bridge::TuiSharedState>,
     prev_path: String,
     switch_err: std::io::Error,
 ) -> std::io::Result<HttpServerInstance> {
-    // Preserve availability even if the first rollback bind races with the prior listener closing.
     config.http_path = prev_path;
     let rollback_host = config.http_host.clone();
     let rollback_port = config.http_port;
     let mut last_restart_sleep_ms = 0_u64;
     let rollback_instance = respawn_http_server_instance_with_retry(
+        runtime_handle,
         config,
         &mut last_restart_sleep_ms,
-        || tui_state.is_shutdown_requested(),
+        || tui_state.is_some_and(|state| state.is_shutdown_requested()),
         |err, backoff_ms| {
             tracing::error!(
                 error = %err,
@@ -2428,15 +2420,13 @@ fn rollback_http_transport_switch(
                 "HTTP transport rollback restart failed; retrying"
             );
         },
-    )?;
-    tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(config));
-    let _ = tui_state.push_event(tui_events::MailEvent::server_started(
-        format!(
-            "http://{}:{}{}",
-            config.http_host, config.http_port, config.http_path
-        ),
+    )
+    .await?;
+    record_http_server_started(
+        tui_state,
+        config,
         format!("mode switch failed; rolled back ({switch_err})"),
-    ));
+    );
     Ok(rollback_instance)
 }
 
@@ -2573,6 +2563,15 @@ fn set_tui_state_handle(state: Option<Arc<tui_bridge::TuiSharedState>>) {
 fn emit_tui_event(event: tui_events::MailEvent) {
     if let Some(state) = tui_state_handle() {
         let _ = state.push_event(event);
+    }
+}
+
+/// Asynchronous version of [`emit_tui_event`] that uses non-blocking retry.
+///
+/// No-op when TUI mode is not active.
+async fn emit_tui_event_async(event: tui_events::MailEvent) {
+    if let Some(state) = tui_state_handle() {
+        let _ = state.push_event_async(event).await;
     }
 }
 
@@ -18754,64 +18753,79 @@ mod tests {
     }
 
     #[test]
-    fn stop_http_server_instance_returns_join_result_when_thread_exits() {
+    fn stop_http_server_instance_returns_join_result_when_task_exits() {
+        let runtime = build_http_runtime().expect("build test HTTP runtime");
         let instance = HttpServerInstance {
-            join: std::thread::Builder::new()
-                .name("test-http-server-stop-ok".into())
-                .spawn(|| Ok(()))
-                .expect("spawn joinable thread"),
+            join: runtime
+                .handle()
+                .clone()
+                .try_spawn(async { Ok::<(), std::io::Error>(()) })
+                .expect("spawn joinable task"),
             shutdown: asupersync::server::shutdown::ShutdownSignal::new(),
         };
 
-        stop_http_server_instance(instance).expect("server stop should succeed");
+        runtime.block_on(async {
+            stop_http_server_instance(instance)
+                .await
+                .expect("server stop should succeed");
+        });
     }
 
     #[test]
     fn stop_http_server_instance_force_closes_after_drain_timeout() {
+        let runtime = build_http_runtime().expect("build test HTTP runtime");
         let shutdown = asupersync::server::shutdown::ShutdownSignal::new();
-        let thread_shutdown = shutdown.clone();
+        let task_shutdown = shutdown.clone();
         let instance = HttpServerInstance {
-            join: std::thread::Builder::new()
-                .name("test-http-server-force-close".into())
-                .spawn(move || {
-                    while thread_shutdown.phase()
+            join: runtime
+                .handle()
+                .clone()
+                .try_spawn(async move {
+                    while task_shutdown.phase()
                         != asupersync::server::shutdown::ShutdownPhase::ForceClosing
                     {
-                        std::thread::sleep(Duration::from_millis(10));
+                        sleep(wall_now(), Duration::from_millis(10)).await;
                     }
-                    Ok(())
+                    Ok::<(), std::io::Error>(())
                 })
-                .expect("spawn force-close aware thread"),
+                .expect("spawn force-close aware task"),
             shutdown,
         };
 
-        stop_http_server_instance_with_timeouts(
-            instance,
-            Duration::from_millis(50),
-            Duration::from_millis(250),
-        )
-        .expect("force-close should unblock shutdown");
+        runtime.block_on(async {
+            stop_http_server_instance_with_timeouts(
+                instance,
+                Duration::from_millis(50),
+                Duration::from_millis(250),
+            )
+            .await
+            .expect("force-close should unblock shutdown");
+        });
     }
 
     #[test]
-    fn stop_http_server_instance_times_out_when_join_never_completes() {
+    fn stop_http_server_instance_times_out_when_task_never_completes() {
+        let runtime = build_http_runtime().expect("build test HTTP runtime");
         let instance = HttpServerInstance {
-            join: std::thread::Builder::new()
-                .name("test-http-server-stop-stuck".into())
-                .spawn(|| {
-                    std::thread::sleep(Duration::from_secs(30));
-                    Ok(())
+            join: runtime
+                .handle()
+                .clone()
+                .try_spawn(async {
+                    sleep(wall_now(), Duration::from_secs(30)).await;
+                    Ok::<(), std::io::Error>(())
                 })
-                .expect("spawn blocking thread"),
+                .expect("spawn blocking task"),
             shutdown: asupersync::server::shutdown::ShutdownSignal::new(),
         };
 
         let join_timeout = Duration::from_millis(50);
         let force_close_timeout = Duration::from_millis(50);
         let start = std::time::Instant::now();
-        let err =
+        let err = runtime.block_on(async {
             stop_http_server_instance_with_timeouts(instance, join_timeout, force_close_timeout)
-                .expect_err("stuck join must time out");
+                .await
+                .expect_err("stuck join must time out")
+        });
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(
             start.elapsed() < join_timeout + force_close_timeout + Duration::from_secs(1),
@@ -18821,43 +18835,51 @@ mod tests {
 
     #[test]
     fn respawn_http_server_instance_with_retry_retries_until_success() {
+        let runtime = build_http_runtime().expect("build test HTTP runtime");
+        let runtime_handle = runtime.handle().clone();
         let mut config = mcp_agent_mail_core::Config::default();
         let mut last_restart_sleep_ms = 0_u64;
         let mut retry_backoffs = Vec::new();
         let mut attempts = 0_u32;
         let mut slept = Vec::new();
 
-        let instance = respawn_http_server_instance_with_retry_using(
-            &mut config,
-            &mut last_restart_sleep_ms,
-            || false,
-            |err, backoff_ms| {
-                assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-                retry_backoffs.push(backoff_ms);
-            },
-            |cfg| {
-                attempts = attempts.saturating_add(1);
-                if attempts < 3 {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::AddrInUse,
-                        "address already in use",
-                    ))
-                } else {
-                    Ok((
-                        cfg,
-                        HttpServerInstance {
-                            join: std::thread::Builder::new()
-                                .name("test-http-server-retry-success".into())
-                                .spawn(|| Ok(()))
-                                .expect("spawn joinable retry thread"),
-                            shutdown: asupersync::server::shutdown::ShutdownSignal::new(),
-                        },
-                    ))
-                }
-            },
-            |duration| slept.push(duration),
-        )
-        .expect("retry helper should eventually succeed");
+        let instance = runtime.block_on(async {
+            respawn_http_server_instance_with_retry_using(
+                &mut config,
+                &mut last_restart_sleep_ms,
+                || false,
+                |err, backoff_ms| {
+                    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+                    retry_backoffs.push(backoff_ms);
+                },
+                |cfg| {
+                    attempts = attempts.saturating_add(1);
+                    std::future::ready(if attempts < 3 {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "address already in use",
+                        ))
+                    } else {
+                        Ok((
+                            cfg,
+                            HttpServerInstance {
+                                join: runtime_handle
+                                    .clone()
+                                    .try_spawn(async { Ok::<(), std::io::Error>(()) })
+                                    .expect("spawn joinable retry task"),
+                                shutdown: asupersync::server::shutdown::ShutdownSignal::new(),
+                            },
+                        ))
+                    })
+                },
+                |duration| {
+                    slept.push(duration);
+                    std::future::ready(())
+                },
+            )
+            .await
+            .expect("retry helper should eventually succeed")
+        });
 
         assert_eq!(attempts, 3, "two transient failures then success");
         assert_eq!(
@@ -18879,6 +18901,10 @@ mod tests {
             restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS)
         );
 
-        stop_http_server_instance(instance).expect("retry helper instance should stop cleanly");
+        runtime.block_on(async {
+            stop_http_server_instance(instance)
+                .await
+                .expect("retry helper instance should stop cleanly");
+        });
     }
 }

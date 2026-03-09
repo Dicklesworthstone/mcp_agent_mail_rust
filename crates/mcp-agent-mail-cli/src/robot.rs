@@ -1950,7 +1950,7 @@ fn load_thread_subject(
     let rows = conn
         .query_sync(
             &format!(
-                "SELECT m.subject
+                "SELECT m.subject, m.created_ts, m.id
                  FROM messages m
                  WHERE {thread_where}
                  {order_clause}

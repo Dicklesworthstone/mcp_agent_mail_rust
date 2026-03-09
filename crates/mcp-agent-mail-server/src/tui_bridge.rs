@@ -4,10 +4,11 @@ use crate::console;
 use crate::tui_events::{
     DbStatSnapshot, EventRingBuffer, EventRingStats, EventSeverity, MailEvent,
 };
+use asupersync::channel::mpsc::{self, SendError, Sender};
+use asupersync::time::{sleep, wall_now};
 use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4096;
 const CONSOLE_LOG_CAPACITY: usize = 2000;
 /// Max retained screen diagnostics snapshots.
 const SCREEN_DIAGNOSTIC_CAPACITY: usize = 512;
+const SERVER_CONTROL_SEND_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
+const SERVER_CONTROL_SEND_RETRY_SLEEP: Duration = Duration::from_millis(5);
 
 #[derive(Debug)]
 struct AtomicSparkline {
@@ -429,6 +432,34 @@ impl TuiSharedState {
         let mut backoff = std::time::Duration::from_millis(2);
         for _ in 0..3 {
             std::thread::sleep(backoff);
+            if self.events.try_push(event.clone()).is_some() {
+                return true;
+            }
+            backoff = backoff
+                .checked_mul(2)
+                .unwrap_or_else(|| std::time::Duration::from_millis(8))
+                .min(std::time::Duration::from_millis(8));
+        }
+
+        false
+    }
+
+    /// Asynchronous version of `push_event` that uses `asupersync::time::sleep`.
+    ///
+    /// Use this in async contexts (like MCP tool handlers) to avoid blocking
+    /// worker threads.
+    pub async fn push_event_async(&self, event: MailEvent) -> bool {
+        if self.events.try_push(event.clone()).is_some() {
+            return true;
+        }
+
+        if event.severity() < EventSeverity::Info {
+            return false;
+        }
+
+        let mut backoff = std::time::Duration::from_millis(2);
+        for _ in 0..3 {
+            let _ = sleep(wall_now(), backoff).await;
             if self.events.try_push(event.clone()).is_some() {
                 return true;
             }
@@ -911,12 +942,31 @@ impl TuiSharedState {
 
     #[must_use]
     pub fn try_send_server_control(&self, msg: ServerControlMsg) -> bool {
-        self.server_control_tx
+        let Some(tx) = self
+            .server_control_tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .cloned()
-            .is_some_and(|tx| tx.send(msg).is_ok())
+        else {
+            return false;
+        };
+
+        let deadline = Instant::now() + SERVER_CONTROL_SEND_RETRY_TIMEOUT;
+        let mut pending = msg;
+        loop {
+            match tx.try_send(pending) {
+                Ok(()) => return true,
+                Err(SendError::Disconnected(_) | SendError::Cancelled(_)) => return false,
+                Err(SendError::Full(msg)) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    pending = msg;
+                    std::thread::sleep(SERVER_CONTROL_SEND_RETRY_SLEEP);
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -1580,8 +1630,9 @@ mod tests {
     fn server_control_with_dropped_receiver_returns_false() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, mut rx) = mpsc::channel(1);
         state.set_server_control_sender(tx);
+        rx.close();
         drop(rx); // Drop receiver
         assert!(!state.try_send_server_control(ServerControlMsg::Shutdown));
     }
@@ -1590,13 +1641,55 @@ mod tests {
     fn server_control_with_live_receiver_succeeds() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, mut rx) = mpsc::channel(1);
         state.set_server_control_sender(tx);
 
         assert!(state.try_send_server_control(ServerControlMsg::ToggleTransportBase));
         assert_eq!(
-            rx.recv_timeout(Duration::from_millis(100)).ok(),
+            rx.try_recv().ok(),
             Some(ServerControlMsg::ToggleTransportBase)
+        );
+    }
+
+    #[test]
+    fn server_control_retries_when_queue_is_temporarily_full() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let (tx, mut rx) = mpsc::channel(1);
+        let fill_tx = tx.clone();
+        state.set_server_control_sender(tx);
+        fill_tx
+            .try_send(ServerControlMsg::ToggleTransportBase)
+            .expect("fill control queue");
+
+        let drain = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let first = rx.try_recv().ok();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            let second = loop {
+                match rx.try_recv() {
+                    Ok(msg) => break Some(msg),
+                    Err(mpsc::RecvError::Empty) => {
+                        if Instant::now() >= deadline {
+                            break None;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => break None,
+                }
+            };
+            (first, second)
+        });
+
+        assert!(
+            state.try_send_server_control(ServerControlMsg::SetTransportBase(TransportBase::Api,))
+        );
+
+        let (first, second) = drain.join().expect("join drain thread");
+        assert_eq!(first, Some(ServerControlMsg::ToggleTransportBase));
+        assert_eq!(
+            second,
+            Some(ServerControlMsg::SetTransportBase(TransportBase::Api))
         );
     }
 

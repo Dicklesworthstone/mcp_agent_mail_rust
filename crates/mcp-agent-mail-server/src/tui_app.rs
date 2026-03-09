@@ -7536,11 +7536,11 @@ mod tests {
 
     #[test]
     fn global_m_key_sends_transport_toggle() {
-        use std::sync::mpsc;
+        use asupersync::channel::mpsc;
 
         let config = Config::default();
         let state = TuiSharedState::new(&config);
-        let (tx, rx) = mpsc::channel::<ServerControlMsg>();
+        let (tx, mut rx) = mpsc::channel::<ServerControlMsg>(1);
         state.set_server_control_sender(tx);
 
         let mut model = MailAppModel::new(Arc::clone(&state));

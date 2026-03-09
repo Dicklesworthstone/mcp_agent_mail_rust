@@ -2326,7 +2326,7 @@ fn fetch_threads(
     // Second pass: fetch latest subject/sender and enrich participant list
     // with recipients (the main query only counts senders).
     for thread in &mut threads {
-        let detail_sql = "SELECT m.subject, a_sender.name AS sender_name \
+        let detail_sql = "SELECT m.subject, a_sender.name AS sender_name, m.created_ts \
              FROM messages m \
              JOIN agents a_sender ON a_sender.id = m.sender_id \
              WHERE m.thread_id = ? \

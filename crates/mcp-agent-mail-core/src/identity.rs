@@ -67,20 +67,24 @@ fn resolve_path_cache() -> &'static Mutex<HashMap<String, ResolvePathCacheEntry>
     RESOLVE_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn resolve_path_cache_key_ref(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.to_string_lossy()
+}
+
 fn resolve_path_cache_key(path: &Path) -> String {
-    path.to_string_lossy().to_string()
+    path.to_string_lossy().into_owned()
 }
 
 fn resolve_path_cache_get(path: &Path) -> Option<PathBuf> {
-    let key = resolve_path_cache_key(path);
+    let key_ref = resolve_path_cache_key_ref(path);
     let mut cache = resolve_path_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = cache.get(&key)?;
+    let entry = cache.get(key_ref.as_ref())?;
     if entry.validated_at.elapsed() <= RESOLVE_PATH_CACHE_FRESHNESS {
         return Some(entry.canonical.clone());
     }
-    cache.remove(&key);
+    cache.remove(key_ref.as_ref());
     None
 }
 
@@ -105,11 +109,11 @@ fn resolve_path_cache_insert(path: &Path, canonical: &Path) {
 }
 
 fn resolve_path_cache_remove(path: &Path) {
-    let key = resolve_path_cache_key(path);
+    let key_ref = resolve_path_cache_key_ref(path);
     let mut cache = resolve_path_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.remove(&key);
+    cache.remove(key_ref.as_ref());
 }
 
 /// Normalize a human-readable value into a slug.

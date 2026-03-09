@@ -56,11 +56,10 @@ impl ReservationIndex {
 
         for (raw_pattern, rref) in reservations {
             let compiled = CompiledPattern::new(&raw_pattern);
-            let norm = compiled.normalized().to_owned();
 
             if !compiled.is_glob() {
                 // Exact path: group by first segment for prefix-scoped scans.
-                let prefix = first_segment(&norm).unwrap_or("").to_owned();
+                let prefix = first_segment(compiled.normalized()).unwrap_or("").to_owned();
                 exact_by_prefix
                     .entry(prefix)
                     .or_default()

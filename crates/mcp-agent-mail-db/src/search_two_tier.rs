@@ -1209,17 +1209,17 @@ impl Iterator for TwoTierSearchIter<'_> {
                         self.search_metrics.fast_embed_us =
                             u64::try_from(fast_embed_start.elapsed().as_micros())
                                 .unwrap_or(u64::MAX);
-                        warn!(error = %e, "Fast embedding failed");
-
-                        if self.searcher.config.quality_only {
-                            self.phase = 2;
-                            drop(_embed_fast_span);
-                            drop(_search_guard);
-                            return Some(self.run_refinement_phase());
-                        }
+                        warn!(error = %e, "Fast embedding failed; falling back to quality refinement if available");
 
                         self.phase = 2;
-                        None
+                        drop(_embed_fast_span);
+                        drop(_search_guard);
+
+                        if self.searcher.quality_embedder.is_some() {
+                            Some(self.run_refinement_phase())
+                        } else {
+                            None
+                        }
                     }
                 }
             }

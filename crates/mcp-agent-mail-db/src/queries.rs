@@ -16,6 +16,7 @@ use crate::models::{
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
 use asupersync::Outcome;
+use asupersync::time::{sleep, wall_now};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use sqlmodel::prelude::*;
 use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
@@ -525,18 +526,14 @@ fn build_approved_contact_sql_with_placeholders(placeholders: &str) -> String {
     )
 }
 
-fn approved_contact_sql(item_count: usize) -> String {
+fn approved_contact_sql(item_count: usize) -> &'static str {
     let capped = item_count.min(MAX_IN_CLAUSE_ITEMS);
-    if capped == 0 {
-        return build_approved_contact_sql_with_placeholders("");
-    }
-
     let cache = APPROVED_CONTACT_SQL_CACHE.get_or_init(|| {
-        (1..=MAX_IN_CLAUSE_ITEMS)
+        (0..=MAX_IN_CLAUSE_ITEMS)
             .map(|count| build_approved_contact_sql_with_placeholders(&placeholders(count)))
             .collect::<Vec<_>>()
     });
-    cache[capped - 1].clone()
+    &cache[capped]
 }
 
 fn build_recent_contact_union_sql_with_placeholders(placeholders: &str) -> String {
@@ -557,18 +554,14 @@ fn build_recent_contact_union_sql_with_placeholders(placeholders: &str) -> Strin
     )
 }
 
-fn recent_contact_union_sql(item_count: usize) -> String {
+fn recent_contact_union_sql(item_count: usize) -> &'static str {
     let capped = item_count.min(MAX_IN_CLAUSE_ITEMS);
-    if capped == 0 {
-        return build_recent_contact_union_sql_with_placeholders("");
-    }
-
     let cache = RECENT_CONTACT_SQL_CACHE.get_or_init(|| {
-        (1..=MAX_IN_CLAUSE_ITEMS)
+        (0..=MAX_IN_CLAUSE_ITEMS)
             .map(|count| build_recent_contact_union_sql_with_placeholders(&placeholders(count)))
             .collect::<Vec<_>>()
     });
-    cache[capped - 1].clone()
+    &cache[capped]
 }
 
 async fn acquire_conn(
@@ -1178,7 +1171,7 @@ fn is_mvcc_error(e: &DbError) -> bool {
 /// Sleep with exponential backoff for MVCC retry.
 ///
 /// Base: 10 ms, max: 200 ms, ±25 % jitter (via existing LCG in `retry` module).
-fn mvcc_backoff(attempt: u32) {
+async fn mvcc_backoff(attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(10),
@@ -1186,7 +1179,7 @@ fn mvcc_backoff(attempt: u32) {
         use_circuit_breaker: false,
         ..Default::default()
     };
-    std::thread::sleep(config.delay_for_attempt(attempt));
+    let _ = sleep(wall_now(), config.delay_for_attempt(attempt)).await;
 }
 
 /// Snapshot of MVCC retry metrics for health/diagnostics.
@@ -2626,7 +2619,7 @@ pub async fn create_message_with_recipients(
                             error = %e,
                             "MVCC write conflict in create_message, retrying"
                         );
-                        mvcc_backoff(attempt);
+                        mvcc_backoff(attempt).await;
                     }
                     Outcome::Err(e) if is_mvcc_error(&e) => {
                         MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3199,15 +3192,28 @@ pub async fn list_message_recipient_names_for_messages(
 
     let mut out = Vec::new();
 
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let get_sql = |count: usize| -> &'static str {
+        let capped = count.min(MAX_IN_CLAUSE_ITEMS);
+        let cache = CACHE.get_or_init(|| {
+            (0..=MAX_IN_CLAUSE_ITEMS)
+                .map(|c| {
+                    format!(
+                        "SELECT DISTINCT a.name \
+                         FROM message_recipients r \
+                         JOIN agents a ON a.id = r.agent_id \
+                         JOIN messages m ON m.id = r.message_id \
+                         WHERE m.project_id = ? AND r.message_id IN ({})",
+                        placeholders(c)
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        &cache[capped]
+    };
+
     for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-        let placeholders = placeholders(chunk.len());
-        let sql = format!(
-            "SELECT DISTINCT a.name \
-             FROM message_recipients r \
-             JOIN agents a ON a.id = r.agent_id \
-             JOIN messages m ON m.id = r.message_id \
-             WHERE m.project_id = ? AND r.message_id IN ({placeholders})"
-        );
+        let sql = get_sql(chunk.len());
 
         let mut params: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
         params.push(Value::BigInt(project_id));
@@ -3215,7 +3221,7 @@ pub async fn list_message_recipient_names_for_messages(
             params.push(Value::BigInt(*id));
         }
 
-        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
             Outcome::Ok(rows) => {
                 for row in rows {
                     let name: String = match row.get_named("name") {
@@ -6397,15 +6403,28 @@ pub async fn get_agent_last_mail_activity(
 
     let tracked = tracked(&*conn);
 
-    // Check messages sent
-    let sql_sent =
-        "SELECT MAX(created_ts) as max_ts FROM messages WHERE sender_id = ? AND project_id = ?";
-    let params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-    let sent_ts = match map_sql_outcome(traw_query(cx, &tracked, sql_sent, &params).await) {
+    // Check messages sent, read, and acked in a single combined query to reduce round-trips
+    let sql = "
+        SELECT MAX(latest_ts) FROM (
+            SELECT MAX(created_ts) as latest_ts FROM messages WHERE sender_id = ? AND project_id = ?
+            UNION ALL
+            SELECT MAX(MAX(COALESCE(r.read_ts, 0)), MAX(COALESCE(r.ack_ts, 0))) as latest_ts
+            FROM message_recipients r
+            JOIN messages m ON m.id = r.message_id
+            WHERE r.agent_id = ? AND m.project_id = ?
+        )
+    ";
+    let params = [
+        Value::BigInt(agent_id),
+        Value::BigInt(project_id),
+        Value::BigInt(agent_id),
+        Value::BigInt(project_id),
+    ];
+    let max_ts = match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(rows) => rows.first().and_then(|r| {
             r.get(0).and_then(|v| match v {
-                Value::BigInt(n) => Some(*n),
-                Value::Int(n) => Some(i64::from(*n)),
+                Value::BigInt(n) if *n > 0 => Some(*n),
+                Value::Int(n) if *n > 0 => Some(i64::from(*n)),
                 _ => None,
             })
         }),
@@ -6413,40 +6432,6 @@ pub async fn get_agent_last_mail_activity(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-
-    // Check message reads/acks by this agent
-    let sql_read = "SELECT MAX(COALESCE(r.read_ts, 0)), MAX(COALESCE(r.ack_ts, 0)) \
-                    FROM message_recipients r \
-                    JOIN messages m ON m.id = r.message_id \
-                    WHERE r.agent_id = ? AND m.project_id = ?";
-    let params2 = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-    let (read_ts, ack_ts) =
-        match map_sql_outcome(traw_query(cx, &tracked, sql_read, &params2).await) {
-            Outcome::Ok(rows) => {
-                let row = rows.first();
-                let read = row.and_then(|r| {
-                    r.get(0).and_then(|v| match v {
-                        Value::BigInt(n) if *n > 0 => Some(*n),
-                        Value::Int(n) if *n > 0 => Some(i64::from(*n)),
-                        _ => None,
-                    })
-                });
-                let ack = row.and_then(|r| {
-                    r.get(1).and_then(|v| match v {
-                        Value::BigInt(n) if *n > 0 => Some(*n),
-                        Value::Int(n) if *n > 0 => Some(i64::from(*n)),
-                        _ => None,
-                    })
-                });
-                (read, ack)
-            }
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
-
-    // Return the maximum of all timestamps
-    let max_ts = [sent_ts, read_ts, ack_ts].into_iter().flatten().max();
 
     Outcome::Ok(max_ts)
 }
