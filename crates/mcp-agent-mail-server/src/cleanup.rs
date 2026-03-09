@@ -18,7 +18,7 @@ use mcp_agent_mail_db::{
     queries::{
         self, get_agent_last_mail_activity, list_unreleased_file_reservations,
         project_ids_with_active_reservations, release_expired_reservations,
-        release_reservations_by_ids,
+        release_reservations_by_ids_returning_ids,
     },
 };
 use std::collections::HashMap;
@@ -413,8 +413,9 @@ fn detect_and_release_stale(
     }
 
     // Bulk-release stale reservations.
-    match block_on(async { release_reservations_by_ids(cx, pool, &stale_ids).await }) {
-        Outcome::Ok(_) => Ok(stale_ids),
+    match block_on(async { release_reservations_by_ids_returning_ids(cx, pool, &stale_ids).await })
+    {
+        Outcome::Ok(released_ids) => Ok(released_ids),
         other => Err(format!("failed to release stale reservations: {other:?}")),
     }
 }
@@ -550,6 +551,7 @@ fn check_git_listed_activity(
 
     let mut found_activity = false;
     let mut count = 0;
+    let mut found_probe_limit = false;
 
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
@@ -560,26 +562,82 @@ fn check_git_listed_activity(
             }
             count += 1;
             if count >= ACTIVITY_PROBE_PATH_LIMIT {
+                found_probe_limit = true;
                 break;
             }
         }
     }
 
-    // Kill the process if we exited the loop early
-    let _ = child.kill();
-    let _ = child.wait();
+    if found_activity {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Some(true);
+    }
 
-    Some(found_activity)
+    if found_probe_limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+
+    let status = child.wait().ok()?;
+    if status.success() {
+        Some(found_activity)
+    } else {
+        None
+    }
 }
 
-fn check_directory_activity_fallback(dir: &Path, now_us: i64, grace_us: i64) -> bool {
-    walkdir::WalkDir::new(dir)
+fn check_directory_activity_fallback(dir: &Path, now_us: i64, grace_us: i64) -> Option<bool> {
+    let mut scanned = 0usize;
+    for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .take(ACTIVITY_PROBE_PATH_LIMIT)
-        .any(|entry| path_modified_within_grace(entry.path(), now_us, grace_us))
+    {
+        if scanned >= ACTIVITY_PROBE_PATH_LIMIT {
+            return None;
+        }
+        if path_modified_within_grace(entry.path(), now_us, grace_us) {
+            return Some(true);
+        }
+        scanned += 1;
+    }
+    Some(false)
+}
+
+fn check_glob_activity_fallback(
+    workspace: &Path,
+    pattern: &str,
+    now_us: i64,
+    grace_us: i64,
+) -> Option<bool> {
+    let base_str = workspace.to_string_lossy().replace('\\', "/");
+    let base_escaped = glob::Pattern::escape(&base_str);
+    // We use format! instead of Path::join because base_escaped is a string
+    // that may contain glob escape sequences that Path::join could mishandle.
+    let full_pattern = if base_str.ends_with('/') {
+        format!("{base_escaped}{pattern}")
+    } else {
+        format!("{base_escaped}/{pattern}")
+    };
+
+    let Ok(paths) = glob::glob(&full_pattern) else {
+        return Some(false);
+    };
+
+    let mut scanned = 0usize;
+    for entry in paths.flatten() {
+        if scanned >= ACTIVITY_PROBE_PATH_LIMIT {
+            return None;
+        }
+        if path_modified_within_grace(&entry, now_us, grace_us) {
+            return Some(true);
+        }
+        scanned += 1;
+    }
+    Some(false)
 }
 
 /// Check if any matched files have recent filesystem activity.
@@ -611,32 +669,16 @@ fn check_filesystem_activity(
             return recent;
         }
 
-        // Fallback: unbounded glob (slow, but works outside git repos)
-        let base_str = workspace.to_string_lossy().replace('\\', "/");
-        let base_escaped = glob::Pattern::escape(&base_str);
-        // We use format! instead of Path::join because base_escaped is a string
-        // that may contain glob escape sequences that Path::join could mishandle.
-        let full_pattern = if base_str.ends_with('/') {
-            format!("{base_escaped}{pattern}")
-        } else {
-            format!("{base_escaped}/{pattern}")
-        };
-
-        if let Ok(paths) = glob::glob(&full_pattern) {
-            // Cap the fallback traversal so it doesn't freeze the server completely.
-            for entry in paths.flatten().take(ACTIVITY_PROBE_PATH_LIMIT) {
-                if path_modified_within_grace(&entry, now_us, grace_us) {
-                    return true;
-                }
-            }
-        }
+        // Fallback: glob traversal for non-git workspaces or truncated git scans.
+        // If the fallback also truncates, fail closed and keep the reservation.
+        return check_glob_activity_fallback(workspace, &pattern, now_us, grace_us).unwrap_or(true);
     } else {
         let candidate = workspace.join(&pattern);
         if candidate.is_dir() {
             if let Some(recent) = check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
                 return recent;
             }
-            return check_directory_activity_fallback(&candidate, now_us, grace_us);
+            return check_directory_activity_fallback(&candidate, now_us, grace_us).unwrap_or(true);
         }
         if candidate.exists() && path_modified_within_grace(&candidate, now_us, grace_us) {
             return true;
@@ -1178,6 +1220,72 @@ mod tests {
             now + 10_000_000,
             1_000_000
         ));
+    }
+
+    #[test]
+    fn check_filesystem_activity_falls_back_when_git_glob_probe_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let nested_dir = workspace.join("src");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("lib.rs");
+        std::fs::write(&nested_file, "pub fn nested() {}\n").unwrap();
+
+        let now = now_micros();
+        assert!(
+            check_filesystem_activity(workspace, "src/**/*.rs", now, 1_000_000),
+            "non-git workspaces should fall back to glob scanning when git ls-files fails"
+        );
+    }
+
+    #[test]
+    fn check_filesystem_activity_falls_back_when_git_directory_probe_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let nested_dir = workspace.join("src");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("lib.rs");
+        std::fs::write(&nested_file, "pub fn nested() {}\n").unwrap();
+
+        let now = now_micros();
+        assert!(
+            check_filesystem_activity(workspace, "src", now, 1_000_000),
+            "non-git workspaces should fall back to directory scanning when git ls-files fails"
+        );
+    }
+
+    #[test]
+    fn check_filesystem_activity_glob_probe_limit_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let src = workspace.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for idx in 0..=ACTIVITY_PROBE_PATH_LIMIT {
+            std::fs::write(src.join(format!("file_{idx:04}.rs")), "pub fn stale() {}\n").unwrap();
+        }
+
+        let now = now_micros().saturating_add(10_000_000);
+        assert!(
+            check_filesystem_activity(workspace, "src/**/*.rs", now, 1_000_000),
+            "truncated glob scans must fail closed to avoid releasing active reservations unsafely"
+        );
+    }
+
+    #[test]
+    fn check_filesystem_activity_directory_probe_limit_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let src = workspace.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for idx in 0..=ACTIVITY_PROBE_PATH_LIMIT {
+            std::fs::write(src.join(format!("file_{idx:04}.rs")), "pub fn stale() {}\n").unwrap();
+        }
+
+        let now = now_micros().saturating_add(10_000_000);
+        assert!(
+            check_filesystem_activity(workspace, "src", now, 1_000_000),
+            "truncated directory scans must fail closed to avoid releasing active reservations unsafely"
+        );
     }
 
     #[test]
